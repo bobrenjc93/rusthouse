@@ -27,8 +27,13 @@ pub enum Engine {
 
 #[derive(Debug)]
 pub struct TimedOutput {
-    pub elapsed: Duration,
     pub stdout: String,
+}
+
+#[derive(Debug)]
+pub struct TimedBatch {
+    pub elapsed: Duration,
+    pub query_repetitions: usize,
 }
 
 impl EnginePaths {
@@ -37,17 +42,41 @@ impl EnginePaths {
         validate_clickhouse(&self.clickhouse)
     }
 
-    pub fn execute(
+    pub fn execute_correctness(
         &self,
         engine: Engine,
         setup_sql: &str,
         query_sql: &str,
     ) -> Result<TimedOutput, String> {
-        let mut batch = String::with_capacity(setup_sql.len() + query_sql.len() + 1);
-        batch.push_str(setup_sql);
-        batch.push_str(query_sql);
-        batch.push('\n');
+        let batch = sql_batch(setup_sql, query_sql, 1)?;
+        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+        Ok(TimedOutput {
+            stdout: stdout.expect("captured execution returns stdout"),
+        })
+    }
 
+    pub fn execute_timed(
+        &self,
+        engine: Engine,
+        setup_sql: &str,
+        query_sql: &str,
+        query_repetitions: usize,
+    ) -> Result<TimedBatch, String> {
+        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
+        let (elapsed, stdout) = self.execute_batch(engine, &batch, false)?;
+        debug_assert!(stdout.is_none());
+        Ok(TimedBatch {
+            elapsed,
+            query_repetitions,
+        })
+    }
+
+    fn execute_batch(
+        &self,
+        engine: Engine,
+        batch: &str,
+        capture_stdout: bool,
+    ) -> Result<(Duration, Option<String>), String> {
         let mut command = match engine {
             Engine::RustHouse => {
                 let mut command = Command::new(&self.rusthouse);
@@ -62,7 +91,11 @@ impl EnginePaths {
         };
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(if capture_stdout {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::piped());
 
         let started = Instant::now();
@@ -92,10 +125,38 @@ impl EnginePaths {
                 summarize_stderr(&output.stderr)
             ));
         }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|error| format!("{} emitted non-UTF-8 output: {error}", engine.name()))?;
-        Ok(TimedOutput { elapsed, stdout })
+        let stdout =
+            if capture_stdout {
+                Some(String::from_utf8(output.stdout).map_err(|error| {
+                    format!("{} emitted non-UTF-8 output: {error}", engine.name())
+                })?)
+            } else {
+                None
+            };
+        Ok((elapsed, stdout))
     }
+}
+
+fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Result<String, String> {
+    if query_repetitions == 0 {
+        return Err("query repetition count must be positive".to_owned());
+    }
+    let query_bytes = query_sql
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_mul(query_repetitions))
+        .ok_or_else(|| "amplified SQL batch is too large".to_owned())?;
+    let capacity = setup_sql
+        .len()
+        .checked_add(query_bytes)
+        .ok_or_else(|| "amplified SQL batch is too large".to_owned())?;
+    let mut batch = String::with_capacity(capacity);
+    batch.push_str(setup_sql);
+    for _ in 0..query_repetitions {
+        batch.push_str(query_sql);
+        batch.push('\n');
+    }
+    Ok(batch)
 }
 
 impl Engine {
@@ -203,5 +264,23 @@ fn summarize_stderr(stderr: &[u8]) -> String {
         "<no stderr>".to_owned()
     } else {
         summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amplification_repeats_the_same_query_exactly() {
+        let batch =
+            sql_batch("CREATE TABLE t (n Int64);\n", "SELECT n FROM t;", 3).expect("valid batch");
+        assert_eq!(batch.matches("CREATE TABLE").count(), 1);
+        assert_eq!(batch.matches("SELECT n FROM t;").count(), 3);
+    }
+
+    #[test]
+    fn amplification_must_be_positive() {
+        assert!(sql_batch("", "SELECT 1;", 0).is_err());
     }
 }
