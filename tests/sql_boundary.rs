@@ -297,3 +297,84 @@ fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
         0
     );
 }
+
+#[test]
+fn avg_int64_accumulates_exactly_before_final_conversion() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE avg_samples (forward_order Bool, value Int64);
+             INSERT INTO avg_samples VALUES
+                (true, 9007199254740993),
+                (true, 1),
+                (true, -9007199254740993),
+                (false, 9007199254740993),
+                (false, -9007199254740993),
+                (false, 1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT forward_order, AVG(value) AS mean
+         FROM avg_samples
+         GROUP BY forward_order
+         ORDER BY forward_order;",
+    );
+    let one_third = 1.0 / 3.0;
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Bool(false), Value::Float64(one_third)],
+            vec![Value::Bool(true), Value::Float64(one_third)],
+        ]
+    );
+}
+
+#[test]
+fn boolean_literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE"] {
+        let mut database = Database::new();
+        let error = database
+            .execute(&format!(
+                "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
+            ))
+            .expect_err("Boolean literal names are reserved");
+
+        assert!(matches!(
+            error,
+            Error::ReservedIdentifier {
+                identifier: rejected,
+                context,
+            } if rejected.eq_ignore_ascii_case(identifier) && context == "column name"
+        ));
+        assert!(matches!(
+            database.catalog().table("reserved_names"),
+            Err(Error::TableNotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn creates_a_fifty_thousand_column_schema() {
+    let column_count = 50_000;
+    let definitions = (0..column_count)
+        .map(|index| format!("c{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+
+    database
+        .execute(&format!("CREATE TABLE wide ({definitions})"))
+        .expect("wide schema should validate in linear time");
+
+    assert_eq!(
+        database
+            .catalog()
+            .table("wide")
+            .expect("wide table exists")
+            .schema()
+            .len(),
+        column_count
+    );
+}

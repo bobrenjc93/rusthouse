@@ -376,7 +376,8 @@ enum AggregateState {
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
-    Avg { sum: f64, count: u64 },
+    AvgInt { sum: i128, count: u64 },
+    AvgFloat { sum: f64, count: u64 },
 }
 
 impl AggregateState {
@@ -387,7 +388,10 @@ impl AggregateState {
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg => Self::Avg { sum: 0.0, count: 0 },
+            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+                Self::AvgInt { sum: 0, count: 0 }
+            }
+            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
         }
     }
 
@@ -430,18 +434,27 @@ impl AggregateState {
                     *current = Some(value);
                 }
             }
-            Self::Avg { sum, count } => {
-                let value = match value.expect("AVG has a column argument") {
-                    Value::Int64(value) => value as f64,
-                    Value::Float64(value) => value,
-                    _ => unreachable!("AVG input type is resolved"),
+            Self::AvgInt { sum, count } => {
+                let Some(Value::Int64(value)) = value else {
+                    unreachable!("AVG input type is resolved")
+                };
+                *sum = sum
+                    .checked_add(i128::from(value))
+                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
+            Self::AvgFloat { sum, count } => {
+                let Some(Value::Float64(value)) = value else {
+                    unreachable!("AVG input type is resolved")
                 };
                 *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
                 if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("AVG sum".to_owned()));
+                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
                 }
             }
         }
@@ -453,14 +466,17 @@ impl AggregateState {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(*value)),
             Self::SumFloat(value) => Ok(Value::Float64(*value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value.clone()),
-            Self::Avg { sum, count } if *count > 0 => Ok(Value::Float64(*sum / *count as f64)),
+            Self::AvgInt { sum, count } if *count > 0 => {
+                Ok(Value::Float64(*sum as f64 / *count as f64))
+            }
+            Self::AvgFloat { sum, count } if *count > 0 => Ok(Value::Float64(*sum / *count as f64)),
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),
             Self::Max(None) => Err(Error::InvalidQuery(
                 "MAX is undefined for an empty input".to_owned(),
             )),
-            Self::Avg { .. } => Err(Error::InvalidQuery(
+            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
                 "AVG is undefined for an empty input".to_owned(),
             )),
         }

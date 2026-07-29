@@ -10,6 +10,10 @@ pub enum Error {
     TableAlreadyExists(String),
     TableNotFound(String),
     DuplicateColumn(String),
+    ReservedIdentifier {
+        identifier: String,
+        context: String,
+    },
     ColumnNotFound {
         table: String,
         column: String,
@@ -39,6 +43,13 @@ impl fmt::Display for Error {
             Self::TableAlreadyExists(table) => write!(f, "table '{table}' already exists"),
             Self::TableNotFound(table) => write!(f, "table '{table}' does not exist"),
             Self::DuplicateColumn(column) => write!(f, "duplicate column '{column}'"),
+            Self::ReservedIdentifier {
+                identifier,
+                context,
+            } => write!(
+                f,
+                "{context} {identifier:?} is reserved; TRUE and FALSE are Boolean literals"
+            ),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
             }

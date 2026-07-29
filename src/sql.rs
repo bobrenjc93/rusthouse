@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::storage::ColumnDef;
+use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
@@ -390,6 +390,12 @@ impl Parser {
         let mut columns = Vec::new();
         loop {
             let column_name = self.expect_identifier("column name")?;
+            if is_reserved_column_name(&column_name) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: column_name,
+                    context: "column name".to_owned(),
+                });
+            }
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {

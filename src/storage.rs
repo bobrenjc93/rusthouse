@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::error::{Error, Result};
 use crate::value::{DataType, Value};
 
@@ -6,6 +8,10 @@ use crate::value::{DataType, Value};
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+}
+
+pub(crate) fn is_reserved_column_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
 }
 
 /// A physical column. Each variant owns a contiguous vector of one Rust type.
@@ -90,11 +96,15 @@ impl Table {
                 "a table must contain at least one column".to_owned(),
             ));
         }
-        for (index, field) in schema.iter().enumerate() {
-            if schema[..index]
-                .iter()
-                .any(|existing| existing.name.eq_ignore_ascii_case(&field.name))
-            {
+        let mut column_names = HashSet::with_capacity(schema.len());
+        for field in &schema {
+            if is_reserved_column_name(&field.name) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: field.name.clone(),
+                    context: "column name".to_owned(),
+                });
+            }
+            if !column_names.insert(field.name.to_ascii_lowercase()) {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
