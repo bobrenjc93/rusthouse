@@ -1,5 +1,6 @@
 [package]
 name = "rusthouse"
+default-run = "rusthouse"
 version = "0.1.0"
 edition = "2024"
 description = "A small, understandable analytical database written in Rust"
