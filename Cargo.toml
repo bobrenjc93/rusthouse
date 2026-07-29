@@ -7,3 +7,7 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+
+[[bin]]
+name = "clickhouse-parity-bench"
+path = "benchmark/main.rs"
