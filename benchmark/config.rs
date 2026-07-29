@@ -20,11 +20,15 @@ impl Mode {
                 row_counts: vec![256, 2_048],
                 warmups: 1,
                 samples: 3,
+                query_amplification: 256,
+                end_to_end_samples: 3,
             },
             Self::Default => BenchmarkSettings {
                 row_counts: vec![1_000, 10_000, 50_000],
                 warmups: 2,
                 samples: 7,
+                query_amplification: 256,
+                end_to_end_samples: 3,
             },
         }
     }
@@ -35,6 +39,8 @@ pub struct BenchmarkSettings {
     pub row_counts: Vec<usize>,
     pub warmups: usize,
     pub samples: usize,
+    pub query_amplification: usize,
+    pub end_to_end_samples: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +192,8 @@ mod tests {
             assert!(settings.row_counts.len() >= 2);
             assert!(settings.warmups >= 1);
             assert!(settings.samples >= 3);
+            assert!(settings.query_amplification > 1);
+            assert!(settings.end_to_end_samples >= 3);
         }
     }
 

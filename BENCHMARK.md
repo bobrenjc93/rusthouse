@@ -27,7 +27,7 @@ Build both shipped binaries first so compilation is never included:
 cargo build --release --bins
 ~~~
 
-A quick local check uses two row counts, one warmup, and three measured samples:
+A quick local check uses two row counts, one amplified warmup, three amplified samples, and three end-to-end samples:
 
 ~~~bash
 RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
@@ -37,7 +37,7 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-quick.json
 ~~~
 
-The decision-grade default uses 1,000, 10,000, and 50,000 rows, two warmups, and seven measured samples:
+The decision-grade default uses 1,000, 10,000, and 50,000 rows, two amplified warmups, seven amplified samples, and three end-to-end samples:
 
 ~~~bash
 RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
@@ -49,7 +49,7 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. The --details option adds samples, medians, ratios, paths, seed, modes, and the ClickHouse identity to a separate JSON file. Setup, execution, version, checksum, parse, or correctness failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -80,24 +80,36 @@ The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both e
 
 ## Correctness gate and normalization
 
-Every warmup and measured execution is checked. Timings enter the sample vectors only after both processes succeed and their results match. Any mismatch rejects the entire run.
+Correctness and timing use separate processes. Before any timing for a case, the harness runs setup plus one unamplified query on each engine, captures both outputs, and opens that case's timing gate only after normalization succeeds. Amplified and end-to-end sample acceptance both require the open gate. Any process or comparison failure rejects the entire run; failed or absent gates cannot contribute timings.
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, score anchor points, and the rule that a correctness failure cannot accept a timing.
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
 
-## Timing and score
+## Timing and calibration
 
-Each sample measures a fresh child process handling table creation, insertion, and one query. Engine order alternates to reduce systematic thermal and scheduling bias. Warmup process pairs are correctness-checked but discarded. The median of repeated wall-clock samples is reported for each workload and row count.
+The primary sample starts one process, creates and inserts the dataset once, and executes the identical workload query 256 times against that in-memory table. Both engines receive exactly 256 repetitions; the runner rejects a mismatched count. Stdout goes to the null sink for timing processes. Total positive wall time is divided by 256, so startup and setup contribute only 1/256 to the reported per-query sample. Warmup process pairs are discarded, engine order alternates, and the median of measured samples is used.
 
-A case ratio is ClickHouse median divided by RustHouse median.
+The fixed 256x factor is the calibration for both quick and default modes. It was selected to make repeated analytical work the majority of ClickHouse Local batch time across the retained scales while keeping quick mode practical. A fixed shared factor avoids engine-dependent adaptive stopping and gives every case the same amortization. The harness deliberately performs no startup subtraction: subtracting independently noisy process measurements can create zero, negative, or highly unstable derived timings. Samples must remain positive, and a greater-than-10x max/min spread rejects the run.
 
-The final score is a robust geometric-style aggregate of these ratios. Ratios are bounded to the range 0.01 through 100 in log space, and the outer 10% is trimmed when at least ten cases exist. The result is capped at 100: parity is 100, while RustHouse taking 10 times as long maps near 10. Faster-than-ClickHouse cases can offset slower cases geometrically but cannot make the overall score exceed the parity target.
+A separate end-to-end metric times fresh processes containing setup plus one query. It uses three samples per case and includes startup, SQL parsing, table creation, insertion, execution, formatting, and process shutdown. This preserves the real CLI lifecycle signal instead of silently discarding it.
+
+## Score aggregation
+
+Each case ratio is ClickHouse median divided by RustHouse median. Ratios below 0.01 are floored and ratios above 1 are capped at parity before aggregation, so one unusually favorable RustHouse case cannot compensate for a slow family.
+
+Aggregation is hierarchical in log space:
+
+1. Workloads receive equal weight within each family and row count.
+2. Row counts receive equal weight within each family.
+3. Workload families receive equal weight in the final geometric mean.
+
+The same aggregation produces primary and end-to-end scores. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default rejects a result if every primary case reaches the 100 cap because that indicates no useful optimization headroom was measured. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
 
 ## Fairness, limitations, and anti-gaming
 
-RustHouse currently exposes only an in-memory, run-to-completion CLI. There is no persistent server session or protocol through which an external harness can load once and time individual statements. Consequently every timing includes process startup, SQL parsing, table creation, and insertion. ClickHouse Local's substantial startup work is therefore unavoidable and visible. The same lifecycle and SQL batch are imposed on RustHouse, but these numbers are end-to-end CLI comparisons, not isolated execution-kernel measurements. A future public session interface should add a separately named query-only benchmark rather than silently changing this one.
+Amplification measures repeated work on one loaded in-memory table. It can benefit CPU caches and repeated planning paths, does not model concurrency, and still retains 1/256 of process startup and setup. The startup-inclusive score must be consulted for one-shot CLI use. Neither metric isolates only an execution kernel.
 
-OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, storage, or concurrency, and this benchmark makes no such claim.
+OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, per-execution correctness gates, retained raw samples, medians, and a bounded and trimmed log aggregate. No single special-case query or favorable seed can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
