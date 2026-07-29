@@ -68,8 +68,10 @@ impl Value {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(right)),
             (Self::Float64(left), Self::Float64(right)) => left.partial_cmp(right),
-            (Self::Int64(left), Self::Float64(right)) => (*left as f64).partial_cmp(right),
-            (Self::Float64(left), Self::Int64(right)) => left.partial_cmp(&(*right as f64)),
+            (Self::Int64(left), Self::Float64(right)) => int_float_cmp(*left, *right),
+            (Self::Float64(left), Self::Int64(right)) => {
+                int_float_cmp(*right, *left).map(Ordering::reverse)
+            }
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             _ => None,
@@ -83,6 +85,26 @@ impl Value {
             Self::Bool(_) => 2,
             Self::String(_) => 3,
         }
+    }
+}
+
+fn int_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+
+    if float.is_nan() {
+        return None;
+    }
+    if float >= I64_UPPER_EXCLUSIVE {
+        return Some(Ordering::Less);
+    }
+    if float < i64::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+
+    let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal => (truncated as f64).partial_cmp(&float),
+        ordering => Some(ordering),
     }
 }
 
@@ -159,5 +181,36 @@ mod tests {
     fn renders_integral_floats_unambiguously() {
         assert_eq!(Value::Float64(2.0).as_display_string(), "2.0");
         assert_eq!(Value::Float64(2.5).as_display_string(), "2.5");
+    }
+
+    #[test]
+    fn compares_mixed_numbers_without_losing_integer_precision() {
+        let beyond_exact_f64 = Value::Int64(9_007_199_254_740_993);
+        let rounded_float = Value::Float64(9_007_199_254_740_992.0);
+        assert_eq!(
+            beyond_exact_f64.sql_cmp(&rounded_float),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            rounded_float.sql_cmp(&beyond_exact_f64),
+            Some(Ordering::Less)
+        );
+
+        assert_eq!(
+            Value::Int64(i64::MAX).sql_cmp(&Value::Float64(9_223_372_036_854_775_808.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Int64(i64::MAX).sql_cmp(&Value::Float64(9_223_372_036_854_774_784.0)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::Int64(i64::MIN).sql_cmp(&Value::Float64(-9_223_372_036_854_775_808.0)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Int64(-1).sql_cmp(&Value::Float64(-1.5)),
+            Some(Ordering::Greater)
+        );
     }
 }

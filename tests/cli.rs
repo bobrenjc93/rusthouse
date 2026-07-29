@@ -17,11 +17,52 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
-        "[{\"name\":\"a\",\"n\":1},{\"name\":\"b\",\"n\":2}]\n"
+        "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"String\"},{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[\"a\",1],[\"b\",2]]}]}\n"
     );
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stderr.contains("CREATE TABLE"));
     assert!(stderr.contains("INSERT 2"));
+}
+
+#[test]
+fn multiple_selects_emit_one_json_document() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE numbers (n Int64);
+             INSERT INTO numbers VALUES (1), (2);
+             SELECT n FROM numbers WHERE n = 1;
+             SELECT n FROM numbers WHERE n = 2;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[2]]}]}\n"
+    );
+}
+
+#[test]
+fn positional_json_preserves_duplicate_alias_values() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE items (id Int64, label String);
+             INSERT INTO items VALUES (1, 'one');
+             SELECT id, label AS id FROM items;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"id\",\"type\":\"String\"}],\"rows\":[[1,\"one\"]]}]}\n"
+    );
 }
 
 #[test]

@@ -50,8 +50,9 @@ impl Database {
 
     /// Execute one or more semicolon-separated statements in order.
     ///
-    /// The database remains in memory and earlier successful statements remain
-    /// applied if a later statement in the same batch fails.
+    /// The complete batch is parsed before execution, so a syntax error applies
+    /// nothing. Once parsing succeeds, statements execute in order and earlier
+    /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         sql::parse(sql)?
             .into_iter()

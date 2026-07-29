@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, StatementResult};
+use rusthouse::{Database, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -18,6 +18,7 @@ OPTIONS:
 
 With no --execute option, SQL is read to EOF from standard input.
 Command acknowledgements are written to stderr; query data is written to stdout.
+JSON output is an object containing a results array, one entry per SELECT.
 ";
 
 fn main() -> ExitCode {
@@ -48,7 +49,7 @@ fn run() -> Result<(), String> {
 
     let mut database = Database::new();
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
-    let mut printed_query = false;
+    let mut queries = Vec::new();
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
@@ -58,20 +59,35 @@ fn run() -> Result<(), String> {
                     eprintln!("{tag}");
                 }
             }
-            StatementResult::Query(result) => {
-                if printed_query {
-                    println!();
-                }
-                let output = render(&result, config.format);
-                print!("{output}");
-                if !output.ends_with('\n') {
-                    println!();
-                }
-                printed_query = true;
-            }
+            StatementResult::Query(result) => queries.push(result),
         }
     }
+    print!("{}", render_query_results(&queries, config.format));
     Ok(())
+}
+
+fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {
+    if format == OutputFormat::Json {
+        let rendered = results
+            .iter()
+            .map(|result| render(result, format))
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("{{\"results\":[{rendered}]}}\n");
+    }
+
+    let mut output = String::new();
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let rendered = render(result, format);
+        output.push_str(&rendered);
+        if !rendered.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
 }
 
 #[derive(Debug)]
@@ -128,6 +144,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusthouse::{DataType, ResultColumn, Value};
 
     #[test]
     fn parses_equals_style_options() {
@@ -147,5 +164,21 @@ mod tests {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
         assert!(error.contains("table, csv, or json"));
+    }
+
+    #[test]
+    fn wraps_multiple_json_query_results_in_one_document() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "n".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: vec![vec![Value::Int64(1)]],
+        };
+
+        assert_eq!(
+            render_query_results(&[result.clone(), result], OutputFormat::Json),
+            "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
+        );
     }
 }

@@ -228,3 +228,72 @@ fn invalid_grouping_and_aggregate_types_are_rejected() {
         } if expected == "Int64 or Float64" && actual == "String"
     ));
 }
+
+#[test]
+fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE boundaries (id Int64);
+             INSERT INTO boundaries VALUES
+                (-9223372036854775808),
+                (9007199254740992),
+                (9007199254740993),
+                (9223372036854775807);",
+        )
+        .expect("setup succeeds");
+
+    let above_f64_precision = execute_query(
+        &mut database,
+        "SELECT id FROM boundaries
+         WHERE id > 9007199254740992.0
+         ORDER BY id;",
+    );
+    assert_eq!(
+        above_f64_precision.rows,
+        vec![
+            vec![Value::Int64(9_007_199_254_740_993)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+
+    let below_i64_upper_bound = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS count FROM boundaries
+         WHERE id < 9223372036854775808.0;",
+    );
+    assert_eq!(below_i64_upper_bound.rows, vec![vec![Value::Int64(4)]]);
+}
+
+#[test]
+fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
+    let mut database = Database::new();
+
+    let parse_error = database
+        .execute(
+            "CREATE TABLE not_applied (id Int64);
+             SELECT id FORM not_applied;",
+        )
+        .expect_err("the complete batch is parsed first");
+    assert!(matches!(parse_error, Error::Sql { .. }));
+    assert!(matches!(
+        database.catalog().table("not_applied"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    let execution_error = database
+        .execute(
+            "CREATE TABLE applied (id Int64);
+             INSERT INTO applied VALUES (false);",
+        )
+        .expect_err("execution stops at the invalid insert");
+    assert!(matches!(execution_error, Error::TypeMismatch { .. }));
+    assert_eq!(
+        database
+            .catalog()
+            .table("applied")
+            .expect("earlier CREATE remains applied")
+            .row_count(),
+        0
+    );
+}
