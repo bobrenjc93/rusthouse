@@ -2,6 +2,9 @@ use crate::error::{Error, Result};
 use crate::storage::ColumnDef;
 use crate::value::{DataType, Value};
 
+const MAX_PREDICATE_DEPTH: usize = 64;
+const MAX_PREDICATE_NODES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
@@ -338,11 +341,18 @@ impl<'a> Lexer<'a> {
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    predicate_depth: usize,
+    predicate_nodes: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, current: 0 }
+        Self {
+            tokens,
+            current: 0,
+            predicate_depth: 0,
+            predicate_nodes: 0,
+        }
     }
 
     fn parse_script(mut self) -> Result<Vec<Statement>> {
@@ -437,6 +447,8 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
 
         let predicate = if self.eat_keyword("WHERE") {
+            self.predicate_depth = 0;
+            self.predicate_nodes = 0;
             Some(self.parse_or_predicate()?)
         } else {
             None
@@ -536,7 +548,9 @@ impl Parser {
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
         let mut predicate = self.parse_and_predicate()?;
         while self.eat_keyword("OR") {
-            predicate = Predicate::Or(Box::new(predicate), Box::new(self.parse_and_predicate()?));
+            let right = self.parse_and_predicate()?;
+            self.record_predicate_node()?;
+            predicate = Predicate::Or(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
     }
@@ -544,15 +558,25 @@ impl Parser {
     fn parse_and_predicate(&mut self) -> Result<Predicate> {
         let mut predicate = self.parse_predicate_atom()?;
         while self.eat_keyword("AND") {
-            predicate = Predicate::And(Box::new(predicate), Box::new(self.parse_predicate_atom()?));
+            let right = self.parse_predicate_atom()?;
+            self.record_predicate_node()?;
+            predicate = Predicate::And(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
         if self.eat(&TokenKind::LeftParen) {
-            let predicate = self.parse_or_predicate()?;
-            self.expect(&TokenKind::RightParen, "')' after predicate")?;
+            if self.predicate_depth >= MAX_PREDICATE_DEPTH {
+                return self.error(format!(
+                    "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
+                ));
+            }
+            self.predicate_depth += 1;
+            let predicate = self.parse_or_predicate();
+            self.predicate_depth -= 1;
+            let predicate = predicate?;
+            self.expect(&TokenKind::RightParen, "right parenthesis after predicate")?;
             return Ok(predicate);
         }
 
@@ -568,11 +592,22 @@ impl Parser {
         };
         self.current += 1;
         let right = self.parse_operand()?;
+        self.record_predicate_node()?;
         Ok(Predicate::Comparison {
             left,
             operator,
             right,
         })
+    }
+
+    fn record_predicate_node(&mut self) -> Result<()> {
+        if self.predicate_nodes >= MAX_PREDICATE_NODES {
+            return self.error(format!(
+                "predicate is too complex; maximum {MAX_PREDICATE_NODES} expression nodes"
+            ));
+        }
+        self.predicate_nodes += 1;
+        Ok(())
     }
 
     fn parse_operand(&mut self) -> Result<Operand> {
@@ -747,5 +782,34 @@ mod tests {
     fn reports_syntax_position() {
         let error = parse("SELECT id FROM things WHERE id ! 2").expect_err("bad operator");
         assert!(matches!(error, Error::Sql { position: 31, .. }));
+    }
+
+    #[test]
+    fn rejects_fifty_thousand_nested_predicates() {
+        let depth = 50_000;
+        let sql = format!(
+            "SELECT id FROM things WHERE {}id = 1{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+
+        let error = parse(&sql).expect_err("nesting limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("predicate nesting exceeds limit of 64")
+        ));
+    }
+
+    #[test]
+    fn rejects_fifty_thousand_flat_predicate_terms() {
+        let predicate = vec!["id = 1"; 50_000].join(" OR ");
+        let sql = format!("SELECT id FROM things WHERE {predicate}");
+
+        let error = parse(&sql).expect_err("node limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
     }
 }

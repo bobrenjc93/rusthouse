@@ -109,3 +109,48 @@ fn sql_errors_are_reported_with_nonzero_status() {
     assert!(stderr.contains("type mismatch for column 't.id'"));
     assert!(stderr.contains("expected Int64, found String"));
 }
+
+#[test]
+fn excessive_predicates_return_cli_errors_without_aborting() {
+    let cases = [
+        (
+            format!(
+                "SELECT id FROM things WHERE {}id = 1{}",
+                "(".repeat(50_000),
+                ")".repeat(50_000)
+            ),
+            "predicate nesting exceeds limit of 64",
+        ),
+        (
+            format!(
+                "SELECT id FROM things WHERE {}",
+                vec!["id = 1"; 50_000].join(" OR ")
+            ),
+            "predicate is too complex; maximum 256 expression nodes",
+        ),
+    ];
+
+    for (sql, expected_error) in cases {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn CLI");
+        child
+            .stdin
+            .take()
+            .expect("stdin pipe")
+            .write_all(sql.as_bytes())
+            .expect("write large SQL query");
+
+        let output = child.wait_with_output().expect("wait for CLI");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            stderr.contains(expected_error),
+            "unexpected stderr: {stderr}"
+        );
+        assert!(!stderr.contains("stack overflow"));
+    }
+}
