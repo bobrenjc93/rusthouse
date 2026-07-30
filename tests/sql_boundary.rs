@@ -692,3 +692,32 @@ fn arithmetic_rejects_non_numeric_operands_during_resolution() {
             if expected == "Int64 or Float64" && actual == "String"
     ));
 }
+
+#[test]
+fn contextual_keyword_columns_and_parenthesized_i64_min_work_end_to_end() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE contextual_words (or Int64, and Int64);
+             INSERT INTO contextual_words VALUES (1, 2), (3, 4);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT or,
+                -(9223372036854775808) AS minimum,
+                -((9223372036854775808)) AS nested_minimum
+         FROM contextual_words
+         WHERE (or + 1) > 2 AND (and * 2) >= 4;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(3),
+            Value::Int64(i64::MIN),
+            Value::Int64(i64::MIN),
+        ]]
+    );
+}

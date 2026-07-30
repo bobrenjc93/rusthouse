@@ -746,6 +746,8 @@ impl Parser {
         Ok(())
     }
 
+    // A predicate group must contain a comparison before its matching ')';
+    // otherwise this parenthesis belongs to a scalar expression.
     fn parenthesized_predicate_ahead(&self) -> bool {
         if !self.at(&TokenKind::LeftParen) {
             return false;
@@ -766,12 +768,6 @@ impl Parser {
                 | TokenKind::LessOrEqual
                 | TokenKind::Greater
                 | TokenKind::GreaterOrEqual => return true,
-                TokenKind::Identifier(keyword)
-                    if keyword.eq_ignore_ascii_case("AND")
-                        || keyword.eq_ignore_ascii_case("OR") =>
-                {
-                    return true;
-                }
                 _ => {}
             }
         }
@@ -840,11 +836,7 @@ impl Parser {
             return self.parse_primary_expression();
         };
 
-        // i64::MIN has no positive Int64 magnitude to place below a unary minus.
-        if operator == UnaryOperator::Minus
-            && matches!(self.peek(), TokenKind::Number(number) if number == "9223372036854775808")
-        {
-            self.current += 1;
+        if operator == UnaryOperator::Minus && self.take_i64_min_magnitude()? {
             self.record_expression_node()?;
             return Ok(ScalarExpression::Literal(Value::Int64(i64::MIN)));
         }
@@ -858,6 +850,45 @@ impl Parser {
             operator,
             expression: Box::new(expression),
         })
+    }
+
+    /// Consumes the one integer magnitude that only becomes valid after unary
+    /// minus, allowing parentheses that do not change the expression's value.
+    fn take_i64_min_magnitude(&mut self) -> Result<bool> {
+        let mut cursor = self.current;
+        let mut parentheses = 0_usize;
+        while matches!(
+            self.tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::LeftParen)
+        ) {
+            parentheses += 1;
+            cursor += 1;
+        }
+
+        if !matches!(
+            self.tokens.get(cursor).map(|token| &token.kind),
+            Some(TokenKind::Number(number)) if number == "9223372036854775808"
+        ) {
+            return Ok(false);
+        }
+        cursor += 1;
+        for _ in 0..parentheses {
+            if !matches!(
+                self.tokens.get(cursor).map(|token| &token.kind),
+                Some(TokenKind::RightParen)
+            ) {
+                return Ok(false);
+            }
+            cursor += 1;
+        }
+
+        if self.expression_depth + parentheses + 1 > MAX_EXPRESSION_DEPTH {
+            return self.error(format!(
+                "expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+            ));
+        }
+        self.current = cursor;
+        Ok(true)
     }
 
     fn parse_primary_expression(&mut self) -> Result<ScalarExpression> {
@@ -1172,6 +1203,37 @@ mod tests {
     }
 
     #[test]
+    fn contextual_boolean_keywords_parse_as_parenthesized_columns() {
+        parse(
+            "SELECT or FROM logic_words \
+             WHERE (or + 1) > 2 AND (and * 2) >= 4",
+        )
+        .expect("AND and OR are valid column names inside arithmetic");
+    }
+
+    #[test]
+    fn parentheses_do_not_change_i64_min_literal_validity() {
+        for expression in [
+            "-9223372036854775808",
+            "-(9223372036854775808)",
+            "-((9223372036854775808))",
+        ] {
+            let statements = parse(&format!("SELECT {expression} FROM numbers"))
+                .expect("minimum Int64 is valid");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            assert!(matches!(
+                &select.items[0],
+                SelectItem::Expression {
+                    expression: ScalarExpression::Literal(Value::Int64(value)),
+                    ..
+                } if *value == i64::MIN
+            ));
+        }
+    }
+
+    #[test]
     fn rejects_fifty_thousand_nested_predicates() {
         let depth = 50_000;
         let sql = format!(
@@ -1205,6 +1267,23 @@ mod tests {
         let depth = 50_000;
         let sql = format!(
             "SELECT {}value{} FROM things",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+
+        let error = parse(&sql).expect_err("nesting limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("expression nesting exceeds limit of 64")
+        ));
+    }
+
+    #[test]
+    fn parenthesized_i64_min_cannot_bypass_expression_depth_limit() {
+        let depth = 50_000;
+        let sql = format!(
+            "SELECT -{}9223372036854775808{} FROM things",
             "(".repeat(depth),
             ")".repeat(depth)
         );
