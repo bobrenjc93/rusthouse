@@ -1,5 +1,6 @@
 use std::env;
-use std::io::{self, Read};
+use std::fmt;
+use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
@@ -22,18 +23,39 @@ JSON output is an object containing a results array, one entry per SELECT.
 ";
 
 fn main() -> ExitCode {
-    match run() {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut stdout = BufWriter::new(stdout.lock());
+    let mut stderr = BufWriter::new(stderr.lock());
+
+    let result = run(&mut stdout, &mut stderr).and_then(|()| {
+        stderr.flush().map_err(CliError::Stderr)?;
+        stdout.flush().map_err(CliError::Stdout)
+    });
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("error: {message}");
+        Err(CliError::Stdout(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+            let _ = stderr.flush();
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = write_error(&mut stderr, &error);
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<(), String> {
-    let Some(config) = parse_arguments(env::args().skip(1))? else {
-        print!("{HELP}");
+fn write_error(stderr: &mut impl Write, error: &CliError) -> io::Result<()> {
+    writeln!(stderr, "error: {error}")?;
+    stderr.flush()
+}
+
+fn run(stdout: &mut impl Write, stderr: &mut impl Write) -> Result<(), CliError> {
+    let Some(config) = parse_arguments(env::args().skip(1)).map_err(CliError::Message)? else {
+        stdout
+            .write_all(HELP.as_bytes())
+            .map_err(CliError::Stdout)?;
         return Ok(());
     };
 
@@ -41,29 +63,50 @@ fn run() -> Result<(), String> {
         sql
     } else {
         let mut sql = String::new();
-        io::stdin()
-            .read_to_string(&mut sql)
-            .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
+        io::stdin().read_to_string(&mut sql).map_err(|error| {
+            CliError::Message(format!("could not read SQL from stdin: {error}"))
+        })?;
         sql
     };
 
     let mut database = Database::new();
-    let results = database.execute(&sql).map_err(|error| error.to_string())?;
+    let results = database
+        .execute(&sql)
+        .map_err(|error| CliError::Message(error.to_string()))?;
     let mut queries = Vec::new();
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
                 if tag == "INSERT" {
-                    eprintln!("{tag} {affected_rows}");
+                    writeln!(stderr, "{tag} {affected_rows}").map_err(CliError::Stderr)?;
                 } else {
-                    eprintln!("{tag}");
+                    writeln!(stderr, "{tag}").map_err(CliError::Stderr)?;
                 }
             }
             StatementResult::Query(result) => queries.push(result),
         }
     }
-    print!("{}", render_query_results(&queries, config.format));
+    stdout
+        .write_all(render_query_results(&queries, config.format).as_bytes())
+        .map_err(CliError::Stdout)?;
     Ok(())
+}
+
+#[derive(Debug)]
+enum CliError {
+    Message(String),
+    Stdout(io::Error),
+    Stderr(io::Error),
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Stdout(error) => write!(formatter, "could not write to stdout: {error}"),
+            Self::Stderr(error) => write!(formatter, "could not write to stderr: {error}"),
+        }
+    }
 }
 
 fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {

@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+use std::io::Read;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -91,6 +93,57 @@ fn stdin_and_csv_output_work_together() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
         "label,active\n\"hello, world\",true\n"
+    );
+}
+
+#[test]
+fn closed_stdout_pipe_is_successful_while_writing_a_large_result() {
+    let label = "0123456789abcdef".repeat(8);
+
+    let mut values = String::new();
+    for id in 0..25_000 {
+        if id > 0 {
+            values.push(',');
+        }
+        write!(values, "({id},'{label}')").expect("write SQL value");
+    }
+    let sql = format!(
+        "CREATE TABLE items (id Int64, label String);\
+         INSERT INTO items VALUES {values};\
+         SELECT id, label FROM items;"
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "csv"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn CLI");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(sql.as_bytes())
+        .expect("write SQL");
+
+    let mut stdout = child.stdout.take().expect("stdout pipe");
+    let mut first_chunk = [0; 4096];
+    stdout
+        .read_exact(&mut first_chunk)
+        .expect("read start of large result");
+    assert!(
+        child.try_wait().expect("check CLI status").is_none(),
+        "CLI exited before the stdout reader closed"
+    );
+    drop(stdout);
+
+    let output = child.wait_with_output().expect("wait for CLI");
+    assert!(
+        output.status.success(),
+        "CLI failed after its stdout reader closed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
