@@ -98,6 +98,7 @@ impl ValueRef<'_> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn sql_cmp(self, other: Self) -> Option<Ordering> {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(&right)),
@@ -122,7 +123,7 @@ impl ValueRef<'_> {
     }
 }
 
-fn int_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
+pub(crate) fn int_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
     const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 
     if float.is_nan() {

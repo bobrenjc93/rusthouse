@@ -3,9 +3,9 @@ use std::collections::HashMap;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
+use crate::predicate::{RowSelection, select_rows};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, OrderBy, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -92,19 +92,10 @@ impl Database {
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
-        let predicate = select
-            .predicate
-            .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
-            .transpose()?;
-
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
+        let matching_rows = match &select.predicate {
+            Some(predicate) => select_rows(table, predicate)?,
+            None => RowSelection::all(table.row_count()),
+        };
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -123,9 +114,18 @@ impl Database {
                 select.limit,
             );
             grouped.project(&selected_groups, &items)
+        } else if ordering.is_empty() {
+            execute_projection(
+                table,
+                matching_rows
+                    .iter()
+                    .take(select.limit.unwrap_or(usize::MAX)),
+                &items,
+            )
         } else {
+            let mut matching_rows = matching_rows.iter().collect::<Vec<_>>();
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            execute_projection(table, matching_rows.into_iter(), &items)
         };
 
         Ok(QueryResult {
@@ -300,16 +300,15 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 
 fn execute_projection(
     table: &Table,
-    matching_rows: &[usize],
+    matching_rows: impl Iterator<Item = usize>,
     items: &[ResolvedItem],
 ) -> Vec<Vec<Value>> {
     matching_rows
-        .iter()
         .map(|row| {
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(row),
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
@@ -321,7 +320,7 @@ fn execute_projection(
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    matching_rows: &RowSelection,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
@@ -339,8 +338,8 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in matching_rows.iter() {
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +348,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -765,121 +764,6 @@ fn sort_and_limit(
         indices.truncate(limit);
     }
     indices.sort_unstable_by(|left, right| compare(*left, *right));
-}
-
-#[derive(Debug)]
-enum CompiledPredicate {
-    Comparison {
-        left: CompiledOperand,
-        operator: ComparisonOperator,
-        right: CompiledOperand,
-    },
-    And(Box<Self>, Box<Self>),
-    Or(Box<Self>, Box<Self>),
-}
-
-impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
-        match self {
-            Self::Comparison {
-                left,
-                operator,
-                right,
-            } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
-                match operator {
-                    ComparisonOperator::Equal => comparison == Ordering::Equal,
-                    ComparisonOperator::NotEqual => comparison != Ordering::Equal,
-                    ComparisonOperator::Less => comparison == Ordering::Less,
-                    ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
-                    ComparisonOperator::Greater => comparison == Ordering::Greater,
-                    ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
-                }
-            }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum CompiledOperand {
-    Column { index: usize, data_type: DataType },
-    Literal(Value),
-}
-
-impl CompiledOperand {
-    fn data_type(&self) -> DataType {
-        match self {
-            Self::Column { data_type, .. } => *data_type,
-            Self::Literal(value) => value.data_type(),
-        }
-    }
-
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
-        match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
-            Self::Literal(value) => value.as_ref(),
-        }
-    }
-}
-
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
-    match predicate {
-        Predicate::Comparison {
-            left,
-            operator,
-            right,
-        } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
-            if !comparable(left.data_type(), right.data_type()) {
-                return Err(Error::TypeMismatch {
-                    context: "WHERE comparison".to_owned(),
-                    expected: left.data_type().to_string(),
-                    actual: right.data_type().to_string(),
-                });
-            }
-            Ok(CompiledPredicate::Comparison {
-                left,
-                operator: *operator,
-                right,
-            })
-        }
-        Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
-        )),
-        Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
-        )),
-    }
-}
-
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
-    match operand {
-        Operand::Column(name) => {
-            let index = table.column_index(name)?;
-            Ok(CompiledOperand::Column {
-                index,
-                data_type: table.schema()[index].data_type,
-            })
-        }
-        Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
-    }
-}
-
-fn comparable(left: DataType, right: DataType) -> bool {
-    left == right
-        || matches!(
-            (left, right),
-            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
-        )
 }
 
 #[cfg(test)]

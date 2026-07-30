@@ -70,6 +70,21 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             ],
         },
         Workload {
+            name: "typed_predicate_decision_scale",
+            family: Family::CompoundFilter,
+            sql: format!(
+                "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total FROM parity_data \
+                 WHERE (id >= {} AND id < {} AND flag = true AND uniform_num < 500000) \
+                    OR (low_key = 'amber' AND score >= -2500.0 AND skewed_num >= 5);",
+                row_count / 5,
+                row_count * 4 / 5,
+            ),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
             name: "nonselective_filter_aggregate",
             family: Family::NonselectiveFilter,
             sql: "SELECT COUNT(*) AS matched, SUM(skewed_num) AS total FROM parity_data WHERE uniform_num >= -950000;".to_owned(),
@@ -149,6 +164,10 @@ mod tests {
                 .iter()
                 .any(|workload| workload.sql.contains(" AND "))
         );
+        assert!(workloads.iter().any(|workload| {
+            workload.name == "typed_predicate_decision_scale"
+                && workload.sql.matches(" AND ").count() >= 5
+        }));
         assert!(
             workloads
                 .iter()

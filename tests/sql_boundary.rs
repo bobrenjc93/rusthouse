@@ -412,6 +412,81 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
 }
 
 #[test]
+fn typed_predicate_forms_are_equivalent_for_projection_and_aggregation() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE decisions (
+                id Int64, score Float64, active Bool, label String, amount Int64
+             );
+             INSERT INTO decisions VALUES
+                (1, 1.0, true, 'normal', 10),
+                (2, 2.5, false, 'fallback', 20),
+                (3, 3.0, true, 'normal', 30),
+                (4, 3.5, true, 'fallback', 40),
+                (9007199254740993, 9007199254740992.0, true, 'boundary', 50);",
+        )
+        .expect("setup succeeds");
+
+    let forms = [
+        "(id >= 3 AND active = true) OR label = 'fallback'",
+        "'fallback' = label OR (true = active AND 3 <= id)",
+        "(label = 'fallback' OR active = true) AND \
+         (label = 'fallback' OR id >= 3)",
+    ];
+    let projected = forms.map(|predicate| {
+        execute_query(
+            &mut database,
+            &format!("SELECT id, label FROM decisions WHERE {predicate} ORDER BY id;"),
+        )
+    });
+    assert!(projected.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(projected[0].rows.len(), 4);
+
+    let aggregated = forms.map(|predicate| {
+        execute_query(
+            &mut database,
+            &format!(
+                "SELECT COUNT(*) AS matched, SUM(amount) AS total \
+                 FROM decisions WHERE {predicate};"
+            ),
+        )
+    });
+    assert!(aggregated.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(
+        aggregated[0].rows,
+        vec![vec![Value::Int64(4), Value::Int64(140)]]
+    );
+
+    let exact_forward = execute_query(
+        &mut database,
+        "SELECT id FROM decisions WHERE id > score ORDER BY id;",
+    );
+    let exact_reversed = execute_query(
+        &mut database,
+        "SELECT id FROM decisions WHERE score < id ORDER BY id;",
+    );
+    assert_eq!(exact_forward, exact_reversed);
+    assert_eq!(
+        exact_forward.rows,
+        vec![
+            vec![Value::Int64(4)],
+            vec![Value::Int64(9_007_199_254_740_993)]
+        ]
+    );
+
+    let float_forward = execute_query(
+        &mut database,
+        "SELECT id FROM decisions WHERE score >= 3.0 ORDER BY id;",
+    );
+    let float_reversed = execute_query(
+        &mut database,
+        "SELECT id FROM decisions WHERE 3.0 <= score ORDER BY id;",
+    );
+    assert_eq!(float_forward, float_reversed);
+}
+
+#[test]
 fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
     let mut database = Database::new();
 
