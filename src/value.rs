@@ -2,11 +2,16 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+use crate::error::{Error, Result};
+
+pub const MAX_DECIMAL128_PRECISION: u8 = 38;
+
+/// The physical column types supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Int64,
     Float64,
+    Decimal128 { precision: u8, scale: u8 },
     Bool,
     String,
 }
@@ -28,10 +33,193 @@ impl fmt::Display for DataType {
         f.write_str(match self {
             Self::Int64 => "Int64",
             Self::Float64 => "Float64",
+            Self::Decimal128 { precision, scale } => {
+                return write!(f, "Decimal128({precision}, {scale})");
+            }
             Self::Bool => "Bool",
             Self::String => "String",
         })
     }
+}
+
+/// An exact fixed-point value stored as an integer coefficient and a scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Decimal128 {
+    coefficient: i128,
+    precision: u8,
+    scale: u8,
+}
+
+impl fmt::Display for Decimal128 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&format_decimal(*self))
+    }
+}
+
+impl Decimal128 {
+    pub fn new(coefficient: i128, precision: u8, scale: u8) -> Result<Self> {
+        validate_decimal_type(precision, scale)?;
+        if !coefficient_fits_precision(coefficient, precision) {
+            return Err(Error::NumericOverflow(format!(
+                "Decimal128({precision}, {scale}) value"
+            )));
+        }
+        Ok(Self {
+            coefficient,
+            precision,
+            scale,
+        })
+    }
+
+    pub(crate) fn parse(literal: &str, precision: u8, scale: u8) -> Result<Self> {
+        validate_decimal_type(precision, scale)?;
+        let (negative, unsigned) = literal
+            .strip_prefix('-')
+            .map_or((false, literal), |value| (true, value));
+        let (mantissa, exponent) = split_exponent(unsigned, literal)?;
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|value| value.is_ascii_digit())
+            || !fraction.bytes().all(|value| value.is_ascii_digit())
+        {
+            return Err(invalid_decimal_literal(literal));
+        }
+
+        let combined = format!("{whole}{fraction}");
+        let digits = combined.trim_start_matches('0');
+        if digits.is_empty() {
+            return Self::new(0, precision, scale);
+        }
+
+        let shift = exponent
+            .checked_sub(i64::try_from(fraction.len()).unwrap_or(i64::MAX))
+            .and_then(|value| value.checked_add(i64::from(scale)))
+            .ok_or_else(|| invalid_decimal_literal(literal))?;
+        let mut coefficient_digits = if shift >= 0 {
+            let zeros = usize::try_from(shift).map_err(|_| invalid_decimal_literal(literal))?;
+            if digits.len().saturating_add(zeros) > usize::from(precision) {
+                return Err(decimal_literal_overflow(literal, precision, scale));
+            }
+            let mut value = String::with_capacity(digits.len() + zeros);
+            value.push_str(digits);
+            value.extend(std::iter::repeat_n('0', zeros));
+            value
+        } else {
+            let dropped = shift
+                .checked_neg()
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(usize::MAX);
+            let kept = digits.len().saturating_sub(dropped);
+            let mut value = digits[..kept].trim_start_matches('0').to_owned();
+            let round_up = dropped <= digits.len()
+                && digits
+                    .as_bytes()
+                    .get(kept)
+                    .is_some_and(|digit| *digit >= b'5');
+            if round_up {
+                increment_decimal_digits(&mut value);
+            }
+            value
+        };
+
+        if coefficient_digits.is_empty() {
+            coefficient_digits.push('0');
+        }
+        if coefficient_digits.len() > usize::from(precision) {
+            return Err(decimal_literal_overflow(literal, precision, scale));
+        }
+        let magnitude = coefficient_digits
+            .parse::<i128>()
+            .map_err(|_| decimal_literal_overflow(literal, precision, scale))?;
+        let coefficient = if negative && magnitude != 0 {
+            -magnitude
+        } else {
+            magnitude
+        };
+        Self::new(coefficient, precision, scale)
+    }
+
+    pub(crate) fn from_validated(coefficient: i128, precision: u8, scale: u8) -> Self {
+        debug_assert!(validate_decimal_type(precision, scale).is_ok());
+        debug_assert!(coefficient_fits_precision(coefficient, precision));
+        Self {
+            coefficient,
+            precision,
+            scale,
+        }
+    }
+
+    #[must_use]
+    pub fn coefficient(self) -> i128 {
+        self.coefficient
+    }
+
+    #[must_use]
+    pub fn precision(self) -> u8 {
+        self.precision
+    }
+
+    #[must_use]
+    pub fn scale(self) -> u8 {
+        self.scale
+    }
+}
+
+pub(crate) fn validate_decimal_type(precision: u8, scale: u8) -> Result<()> {
+    if !(1..=MAX_DECIMAL128_PRECISION).contains(&precision) {
+        return Err(Error::InvalidQuery(format!(
+            "Decimal128 precision must be between 1 and {MAX_DECIMAL128_PRECISION}; found {precision}"
+        )));
+    }
+    if scale > precision {
+        return Err(Error::InvalidQuery(format!(
+            "Decimal128 scale {scale} exceeds precision {precision}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn coefficient_fits_precision(coefficient: i128, precision: u8) -> bool {
+    coefficient.unsigned_abs() < 10_u128.pow(u32::from(precision))
+}
+
+fn split_exponent<'a>(unsigned: &'a str, literal: &str) -> Result<(&'a str, i64)> {
+    let Some(index) = unsigned.find(['e', 'E']) else {
+        return Ok((unsigned, 0));
+    };
+    let mantissa = &unsigned[..index];
+    let exponent = &unsigned[index + 1..];
+    if exponent.is_empty() {
+        return Err(invalid_decimal_literal(literal));
+    }
+    let exponent = exponent
+        .parse::<i64>()
+        .map_err(|_| invalid_decimal_literal(literal))?;
+    Ok((mantissa, exponent))
+}
+
+fn increment_decimal_digits(digits: &mut String) {
+    let mut bytes = digits.as_bytes().to_vec();
+    for digit in bytes.iter_mut().rev() {
+        if *digit < b'9' {
+            *digit += 1;
+            *digits = String::from_utf8(bytes).expect("decimal digits are ASCII");
+            return;
+        }
+        *digit = b'0';
+    }
+    bytes.insert(0, b'1');
+    *digits = String::from_utf8(bytes).expect("decimal digits are ASCII");
+}
+
+fn invalid_decimal_literal(literal: &str) -> Error {
+    Error::InvalidQuery(format!("invalid Decimal128 literal '{literal}'"))
+}
+
+fn decimal_literal_overflow(literal: &str, precision: u8, scale: u8) -> Error {
+    Error::NumericOverflow(format!(
+        "Decimal128({precision}, {scale}) literal '{literal}'"
+    ))
 }
 
 /// A scalar value read from or written to a typed column.
@@ -39,6 +227,7 @@ impl fmt::Display for DataType {
 pub enum Value {
     Int64(i64),
     Float64(f64),
+    Decimal128(Decimal128),
     Bool(bool),
     String(String),
 }
@@ -48,6 +237,7 @@ pub enum Value {
 pub(crate) enum ValueRef<'a> {
     Int64(i64),
     Float64(f64),
+    Decimal128(Decimal128),
     Bool(bool),
     String(&'a str),
 }
@@ -58,6 +248,10 @@ impl Value {
         match self {
             Self::Int64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
+            Self::Decimal128(value) => DataType::Decimal128 {
+                precision: value.precision,
+                scale: value.scale,
+            },
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
         }
@@ -68,6 +262,7 @@ impl Value {
         match self {
             Self::Int64(value) => value.to_string(),
             Self::Float64(value) => format_float(*value),
+            Self::Decimal128(value) => format_decimal(*value),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => value.clone(),
         }
@@ -77,6 +272,7 @@ impl Value {
         match self {
             Self::Int64(value) => ValueRef::Int64(*value),
             Self::Float64(value) => ValueRef::Float64(*value),
+            Self::Decimal128(value) => ValueRef::Decimal128(*value),
             Self::Bool(value) => ValueRef::Bool(*value),
             Self::String(value) => ValueRef::String(value),
         }
@@ -93,6 +289,7 @@ impl ValueRef<'_> {
         match self {
             Self::Int64(value) => Value::Int64(value),
             Self::Float64(value) => Value::Float64(value),
+            Self::Decimal128(value) => Value::Decimal128(value),
             Self::Bool(value) => Value::Bool(value),
             Self::String(value) => Value::String(value.to_owned()),
         }
@@ -106,6 +303,13 @@ impl ValueRef<'_> {
             (Self::Float64(left), Self::Int64(right)) => {
                 int_float_cmp(right, left).map(Ordering::reverse)
             }
+            (Self::Decimal128(left), Self::Decimal128(right)) => Some(decimal_cmp(left, right)),
+            (Self::Decimal128(left), Self::Int64(right)) => {
+                Some(decimal_cmp(left, integer_decimal(right)))
+            }
+            (Self::Int64(left), Self::Decimal128(right)) => {
+                Some(decimal_cmp(integer_decimal(left), right))
+            }
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             _ => None,
@@ -116,10 +320,68 @@ impl ValueRef<'_> {
         match self {
             Self::Int64(_) => 0,
             Self::Float64(_) => 1,
-            Self::Bool(_) => 2,
-            Self::String(_) => 3,
+            Self::Decimal128(_) => 2,
+            Self::Bool(_) => 3,
+            Self::String(_) => 4,
         }
     }
+}
+
+fn integer_decimal(value: i64) -> Decimal128 {
+    Decimal128 {
+        coefficient: i128::from(value),
+        precision: 19,
+        scale: 0,
+    }
+}
+
+fn decimal_cmp(left: Decimal128, right: Decimal128) -> Ordering {
+    match (left.coefficient.signum(), right.coefficient.signum()) {
+        (left_sign, right_sign) if left_sign != right_sign => left_sign.cmp(&right_sign),
+        (0, 0) => Ordering::Equal,
+        (sign, _) => {
+            let magnitude = decimal_magnitude_cmp(left, right);
+            if sign < 0 {
+                magnitude.reverse()
+            } else {
+                magnitude
+            }
+        }
+    }
+}
+
+fn decimal_magnitude_cmp(left: Decimal128, right: Decimal128) -> Ordering {
+    let left_scale_factor = 10_u128.pow(u32::from(left.scale));
+    let right_scale_factor = 10_u128.pow(u32::from(right.scale));
+    let left_magnitude = left.coefficient.unsigned_abs();
+    let right_magnitude = right.coefficient.unsigned_abs();
+    let integer_cmp =
+        (left_magnitude / left_scale_factor).cmp(&(right_magnitude / right_scale_factor));
+    if integer_cmp != Ordering::Equal {
+        return integer_cmp;
+    }
+
+    let common_scale = left.scale.max(right.scale);
+    let left_fraction =
+        (left_magnitude % left_scale_factor) * 10_u128.pow(u32::from(common_scale - left.scale));
+    let right_fraction =
+        (right_magnitude % right_scale_factor) * 10_u128.pow(u32::from(common_scale - right.scale));
+    left_fraction.cmp(&right_fraction)
+}
+
+fn format_decimal(value: Decimal128) -> String {
+    let mut digits = value.coefficient.unsigned_abs().to_string();
+    if value.scale > 0 {
+        let minimum = usize::from(value.scale) + 1;
+        if digits.len() < minimum {
+            digits.insert_str(0, &"0".repeat(minimum - digits.len()));
+        }
+        digits.insert(digits.len() - usize::from(value.scale), '.');
+    }
+    if value.coefficient < 0 {
+        digits.insert(0, '-');
+    }
+    digits
 }
 
 fn int_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
@@ -208,6 +470,7 @@ impl Ord for ValueRef<'_> {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => left.cmp(right),
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
+            (Self::Decimal128(left), Self::Decimal128(right)) => decimal_cmp(*left, *right),
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
             (Self::String(left), Self::String(right)) => left.cmp(right),
             _ => self.variant_index().cmp(&other.variant_index()),
@@ -227,6 +490,16 @@ impl Hash for ValueRef<'_> {
         match self {
             Self::Int64(value) => value.hash(state),
             Self::Float64(value) => canonical_float_bits(*value).hash(state),
+            Self::Decimal128(value) => {
+                let mut coefficient = value.coefficient;
+                let mut scale = value.scale;
+                while scale > 0 && coefficient % 10 == 0 {
+                    coefficient /= 10;
+                    scale -= 1;
+                }
+                coefficient.hash(state);
+                scale.hash(state);
+            }
             Self::Bool(value) => value.hash(state),
             Self::String(value) => value.hash(state),
         }

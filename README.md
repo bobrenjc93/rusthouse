@@ -1,10 +1,10 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, scaled `Vec<i128>`, `Vec<bool>`, or `Vec<String>`).
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Decimal128(precision, scale), Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -16,6 +16,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Decimal128 supports 1 to 38 digits of precision with a scale no greater than its precision. SQL numeric spellings are converted directly to a scaled `i128` against the target Decimal schema and never pass through `f64`. INSERT and Decimal comparisons round excess fractional digits to the declared scale, with ties rounded away from zero. Decimal AVG returns the input Decimal type and uses the same tie rule; SUM, AVG accumulation, and rounding use checked arithmetic and report overflow rather than wrapping. Table, CSV, and JSON output always includes all declared fractional digits.
 
 ## CLI
 
@@ -85,7 +87,7 @@ RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted i
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+On empty input, COUNT and SUM return a correctly typed numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 
 ## Development
 

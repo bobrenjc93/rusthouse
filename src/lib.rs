@@ -13,7 +13,7 @@ pub mod value;
 
 pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
 pub use error::{Error, Result};
-pub use value::{DataType, Value};
+pub use value::{DataType, Decimal128, Value};
 
 /// Returns the product name.
 pub fn product_name() -> &'static str {

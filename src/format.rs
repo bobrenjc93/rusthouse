@@ -182,6 +182,9 @@ fn write_json_value(output: &mut String, value: &Value) {
     match value {
         Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
+        Value::Decimal128(value) => {
+            output.push_str(&Value::Decimal128(*value).as_display_string());
+        }
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
     }

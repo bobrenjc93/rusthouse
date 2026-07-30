@@ -371,7 +371,7 @@ fn invalid_grouping_and_aggregate_types_are_rejected() {
             expected,
             actual,
             ..
-        } if expected == "Int64 or Float64" && actual == "String"
+        } if expected == "Int64, Float64, or Decimal128" && actual == "String"
     ));
 }
 

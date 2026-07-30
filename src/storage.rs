@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
-use crate::value::{DataType, Value, ValueRef};
+use crate::value::{DataType, Decimal128, Value, ValueRef, validate_decimal_type};
 
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,11 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
 pub enum Column {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
+    Decimal128 {
+        precision: u8,
+        scale: u8,
+        values: Vec<i128>,
+    },
     Bool(Vec<bool>),
     String(Vec<String>),
 }
@@ -29,6 +34,11 @@ impl Column {
         match data_type {
             DataType::Int64 => Self::Int64(Vec::new()),
             DataType::Float64 => Self::Float64(Vec::new()),
+            DataType::Decimal128 { precision, scale } => Self::Decimal128 {
+                precision,
+                scale,
+                values: Vec::new(),
+            },
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
         }
@@ -39,6 +49,12 @@ impl Column {
         match self {
             Self::Int64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
+            Self::Decimal128 {
+                precision, scale, ..
+            } => DataType::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
         }
@@ -49,6 +65,7 @@ impl Column {
         match self {
             Self::Int64(values) => values.len(),
             Self::Float64(values) => values.len(),
+            Self::Decimal128 { values, .. } => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
         }
@@ -68,6 +85,11 @@ impl Column {
         match self {
             Self::Int64(values) => ValueRef::Int64(values[row]),
             Self::Float64(values) => ValueRef::Float64(values[row]),
+            Self::Decimal128 {
+                precision,
+                scale,
+                values,
+            } => ValueRef::Decimal128(Decimal128::from_validated(values[row], *precision, *scale)),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
         }
@@ -81,6 +103,9 @@ impl Column {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(value),
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
+            (Self::Decimal128 { values, .. }, Value::Decimal128(value)) => {
+                values.push(value.coefficient());
+            }
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
             _ => unreachable!("values are validated before insertion"),
@@ -106,6 +131,9 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
+            if let DataType::Decimal128 { precision, scale } = field.data_type {
+                validate_decimal_type(precision, scale)?;
+            }
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
@@ -240,5 +268,30 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn stores_decimal_coefficients_in_an_i128_column() {
+        let mut table = Table::new(
+            "prices".to_owned(),
+            vec![ColumnDef {
+                name: "amount".to_owned(),
+                data_type: DataType::Decimal128 {
+                    precision: 6,
+                    scale: 2,
+                },
+            }],
+        )
+        .expect("valid schema");
+        table
+            .insert_row(vec![Value::Decimal128(
+                Decimal128::new(-12_345, 6, 2).expect("valid decimal"),
+            )])
+            .expect("valid row");
+
+        assert!(matches!(
+            &table.columns()[0],
+            Column::Decimal128 { values, .. } if values == &[-12_345]
+        ));
     }
 }

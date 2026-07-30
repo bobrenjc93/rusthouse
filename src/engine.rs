@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, Literal, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
-use crate::value::{DataType, Value, ValueRef};
+use crate::value::{DataType, Decimal128, Value, ValueRef, coefficient_fits_precision};
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
@@ -71,12 +71,12 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
+                let rows = {
                     let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
+                    rows.iter()
+                        .map(|row| coerce_insert_row(target, row))
+                        .collect::<Result<Vec<_>>>()?
+                };
                 let target = self.catalog.table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
@@ -132,6 +132,54 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+fn coerce_insert_row(table: &Table, literals: &[Literal]) -> Result<Vec<Value>> {
+    if literals.len() != table.schema().len() {
+        return Err(Error::RowLength {
+            table: table.name().to_owned(),
+            expected: table.schema().len(),
+            actual: literals.len(),
+        });
+    }
+    let row = literals
+        .iter()
+        .zip(table.schema())
+        .map(|(literal, field)| coerce_insert_literal(literal, field.data_type))
+        .collect::<Result<Vec<_>>>()?;
+    table.validate_row(&row)?;
+    Ok(row)
+}
+
+fn coerce_insert_literal(literal: &Literal, data_type: DataType) -> Result<Value> {
+    match (literal, data_type) {
+        (Literal::Number(number), DataType::Decimal128 { precision, scale }) => {
+            Decimal128::parse(number, precision, scale).map(Value::Decimal128)
+        }
+        _ => literal_value(literal),
+    }
+}
+
+fn literal_value(literal: &Literal) -> Result<Value> {
+    match literal {
+        Literal::String(value) => Ok(Value::String(value.clone())),
+        Literal::Bool(value) => Ok(Value::Bool(*value)),
+        Literal::Number(number) if number.contains(['.', 'e', 'E']) => {
+            let value = number
+                .parse::<f64>()
+                .map_err(|_| Error::InvalidQuery(format!("invalid Float64 literal '{number}'")))?;
+            if !value.is_finite() {
+                return Err(Error::InvalidQuery(
+                    "Float64 literal must be finite".to_owned(),
+                ));
+            }
+            Ok(Value::Float64(value))
+        }
+        Literal::Number(number) => number
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| Error::InvalidQuery(format!("invalid Int64 literal '{number}'"))),
     }
 }
 
@@ -276,12 +324,15 @@ fn resolve_select_items(
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+        && !matches!(
+            input_type,
+            Some(DataType::Int64 | DataType::Float64 | DataType::Decimal128 { .. })
+        )
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
             context: format!("{} argument", function.name()),
-            expected: "Int64 or Float64".to_owned(),
+            expected: "Int64, Float64, or Decimal128".to_owned(),
             actual,
         });
     }
@@ -291,6 +342,9 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
+        AggregateFunction::Avg if matches!(input_type, Some(DataType::Decimal128 { .. })) => {
+            input_type.expect("validated Decimal128 argument")
+        }
         AggregateFunction::Avg => DataType::Float64,
         AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
             input_type.expect("validated column argument")
@@ -526,10 +580,27 @@ enum AggregateState {
     Count(i64),
     SumInt(i64),
     SumFloat(f64),
+    SumDecimal {
+        sum: i128,
+        precision: u8,
+        scale: u8,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
-    AvgInt { sum: i128, count: u64 },
-    AvgFloat { sum: f64, count: u64 },
+    AvgInt {
+        sum: i128,
+        count: u64,
+    },
+    AvgFloat {
+        sum: f64,
+        count: u64,
+    },
+    AvgDecimal {
+        sum: i128,
+        count: u64,
+        precision: u8,
+        scale: u8,
+    },
 }
 
 impl AggregateState {
@@ -537,13 +608,34 @@ impl AggregateState {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum => {
+                if let Some(DataType::Decimal128 { precision, scale }) = spec.input_type {
+                    Self::SumDecimal {
+                        sum: 0,
+                        precision,
+                        scale,
+                    }
+                } else {
+                    Self::SumFloat(0.0)
+                }
+            }
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
             AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
                 Self::AvgInt { sum: 0, count: 0 }
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Avg => {
+                if let Some(DataType::Decimal128 { precision, scale }) = spec.input_type {
+                    Self::AvgDecimal {
+                        sum: 0,
+                        count: 0,
+                        precision,
+                        scale,
+                    }
+                } else {
+                    Self::AvgFloat { sum: 0.0, count: 0 }
+                }
+            }
         }
     }
 
@@ -573,6 +665,20 @@ impl AggregateState {
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
+            }
+            Self::SumDecimal {
+                sum,
+                precision,
+                scale,
+            } => {
+                let Column::Decimal128 { values, .. } =
+                    &table.columns()[spec.argument.expect("SUM argument")]
+                else {
+                    unreachable!("SUM input type is resolved")
+                };
+                *sum = sum.checked_add(values[row]).ok_or_else(|| {
+                    Error::NumericOverflow(format!("SUM(Decimal128({precision}, {scale}))"))
+                })?;
             }
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
@@ -620,6 +726,24 @@ impl AggregateState {
                     return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
                 }
             }
+            Self::AvgDecimal {
+                sum,
+                count,
+                precision,
+                scale,
+            } => {
+                let Column::Decimal128 { values, .. } =
+                    &table.columns()[spec.argument.expect("AVG argument")]
+                else {
+                    unreachable!("AVG input type is resolved")
+                };
+                *sum = sum.checked_add(values[row]).ok_or_else(|| {
+                    Error::NumericOverflow(format!("AVG(Decimal128({precision}, {scale})) sum"))
+                })?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
         }
         Ok(())
     }
@@ -628,22 +752,67 @@ impl AggregateState {
         match self {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::SumDecimal {
+                sum,
+                precision,
+                scale,
+            } => {
+                if !coefficient_fits_precision(sum, precision) {
+                    return Err(Error::NumericOverflow(format!(
+                        "SUM(Decimal128({precision}, {scale}))"
+                    )));
+                }
+                Ok(Value::Decimal128(Decimal128::from_validated(
+                    sum, precision, scale,
+                )))
+            }
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
+            Self::AvgDecimal {
+                sum,
+                count,
+                precision,
+                scale,
+            } if count > 0 => {
+                let coefficient = divide_round_half_away_from_zero(sum, count)?;
+                if !coefficient_fits_precision(coefficient, precision) {
+                    return Err(Error::NumericOverflow(format!(
+                        "AVG(Decimal128({precision}, {scale}))"
+                    )));
+                }
+                Ok(Value::Decimal128(Decimal128::from_validated(
+                    coefficient,
+                    precision,
+                    scale,
+                )))
+            }
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),
             Self::Max(None) => Err(Error::InvalidQuery(
                 "MAX is undefined for an empty input".to_owned(),
             )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::AvgInt { .. } | Self::AvgFloat { .. } | Self::AvgDecimal { .. } => Err(
+                Error::InvalidQuery("AVG is undefined for an empty input".to_owned()),
+            ),
         }
     }
+}
+
+fn divide_round_half_away_from_zero(dividend: i128, divisor: u64) -> Result<i128> {
+    let divisor = i128::from(divisor);
+    let quotient = dividend / divisor;
+    let remainder = dividend % divisor;
+    let threshold = divisor / 2 + divisor % 2;
+    if remainder.unsigned_abs() < threshold.unsigned_abs() {
+        return Ok(quotient);
+    }
+    quotient
+        .checked_add(remainder.signum())
+        .ok_or_else(|| Error::NumericOverflow("Decimal128 AVG rounding".to_owned()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -835,8 +1004,10 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let left_column_type = operand_column_type(table, left)?;
+            let right_column_type = operand_column_type(table, right)?;
+            let left = compile_operand(table, left, right_column_type)?;
+            let right = compile_operand(table, right, left_column_type)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -861,7 +1032,21 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn operand_column_type(table: &Table, operand: &Operand) -> Result<Option<DataType>> {
+    match operand {
+        Operand::Column(name) => {
+            let index = table.column_index(name)?;
+            Ok(Some(table.schema()[index].data_type))
+        }
+        Operand::Literal(_) => Ok(None),
+    }
+}
+
+fn compile_operand(
+    table: &Table,
+    operand: &Operand,
+    comparison_type: Option<DataType>,
+) -> Result<CompiledOperand> {
     match operand {
         Operand::Column(name) => {
             let index = table.column_index(name)?;
@@ -870,7 +1055,15 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
                 data_type: table.schema()[index].data_type,
             })
         }
-        Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+        Operand::Literal(literal) => {
+            let value = match (literal, comparison_type) {
+                (Literal::Number(number), Some(DataType::Decimal128 { precision, scale })) => {
+                    Value::Decimal128(Decimal128::parse(number, precision, scale)?)
+                }
+                _ => literal_value(literal)?,
+            };
+            Ok(CompiledOperand::Literal(value))
+        }
     }
 }
 
@@ -878,7 +1071,11 @@ fn comparable(left: DataType, right: DataType) -> bool {
     left == right
         || matches!(
             (left, right),
-            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+            (DataType::Int64, DataType::Float64)
+                | (DataType::Float64, DataType::Int64)
+                | (DataType::Int64, DataType::Decimal128 { .. })
+                | (DataType::Decimal128 { .. }, DataType::Int64)
+                | (DataType::Decimal128 { .. }, DataType::Decimal128 { .. })
         )
 }
 

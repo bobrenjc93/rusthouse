@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, is_reserved_column_name};
-use crate::value::{DataType, Value};
+use crate::value::{DataType, validate_decimal_type};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
@@ -13,7 +13,7 @@ pub enum Statement {
     },
     Insert {
         table: String,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Vec<Literal>>,
     },
     Select(Select),
 }
@@ -95,7 +95,15 @@ pub enum Predicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Column(String),
-    Literal(Value),
+    Literal(Literal),
+}
+
+/// A SQL literal whose numeric spelling is retained until a schema is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Literal {
+    Number(String),
+    String(String),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,14 +404,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_data_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -414,6 +415,42 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_data_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("DECIMAL128") {
+            self.expect(&TokenKind::LeftParen, "'(' after Decimal128")?;
+            let precision = self.parse_decimal_parameter("precision")?;
+            self.expect(&TokenKind::Comma, "',' after Decimal128 precision")?;
+            let scale = self.parse_decimal_parameter("scale")?;
+            self.expect(&TokenKind::RightParen, "')' after Decimal128 scale")?;
+            validate_decimal_type(precision, scale).map_err(|error| Error::Sql {
+                position,
+                message: error.to_string(),
+            })?;
+            return Ok(DataType::Decimal128 { precision, scale });
+        }
+
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Decimal128(precision, scale), Bool, or String"
+            ),
+        })
+    }
+
+    fn parse_decimal_parameter(&mut self, name: &str) -> Result<u8> {
+        let position = self.position();
+        let number = self.take_number().ok_or_else(|| Error::Sql {
+            position,
+            message: format!("expected integer Decimal128 {name}"),
+        })?;
+        number.parse::<u8>().map_err(|_| Error::Sql {
+            position,
+            message: format!("invalid Decimal128 {name} '{number}'"),
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -633,10 +670,10 @@ impl Parser {
         }
     }
 
-    fn parse_literal(&mut self) -> Result<Value> {
+    fn parse_literal(&mut self) -> Result<Literal> {
         if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
-            return Ok(Value::String(value));
+            return Ok(Literal::String(value));
         }
 
         let negative = self.eat(&TokenKind::Minus);
@@ -646,34 +683,21 @@ impl Parser {
             } else {
                 number
             };
-            if signed.contains(['.', 'e', 'E']) {
-                let value = signed.parse::<f64>().map_err(|_| Error::Sql {
-                    position: self.position(),
-                    message: format!("invalid Float64 literal '{signed}'"),
-                })?;
-                if !value.is_finite() {
-                    return self.error("Float64 literal must be finite");
-                }
-                return Ok(Value::Float64(value));
+            if !valid_number_spelling(&signed) {
+                return self.error(format!("invalid numeric literal '{signed}'"));
             }
-            return signed
-                .parse::<i64>()
-                .map(Value::Int64)
-                .map_err(|_| Error::Sql {
-                    position: self.position(),
-                    message: format!("invalid Int64 literal '{signed}'"),
-                });
+            return Ok(Literal::Number(signed));
         }
         if negative {
             return self.error("expected a number after '-'");
         }
 
         if self.eat_keyword("TRUE") {
-            Ok(Value::Bool(true))
+            Ok(Literal::Bool(true))
         } else if self.eat_keyword("FALSE") {
-            Ok(Value::Bool(false))
+            Ok(Literal::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected a numeric, Bool, or String literal")
         }
     }
 
@@ -750,6 +774,33 @@ impl Parser {
     }
 }
 
+fn valid_number_spelling(value: &str) -> bool {
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let mut exponent_parts = unsigned.split(['e', 'E']);
+    let mantissa = exponent_parts.next().unwrap_or_default();
+    let exponent = exponent_parts.next();
+    if exponent_parts.next().is_some() {
+        return false;
+    }
+    if let Some(exponent) = exponent {
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+            return false;
+        }
+    }
+
+    let mut mantissa_parts = mantissa.split('.');
+    let whole = mantissa_parts.next().unwrap_or_default();
+    let fraction = mantissa_parts.next();
+    if mantissa_parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|digit| digit.is_ascii_digit())
+    {
+        return false;
+    }
+    fraction.is_none_or(|digits| digits.bytes().all(|digit| digit.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,7 +831,7 @@ mod tests {
         let Statement::Insert { rows, .. } = &statements[0] else {
             panic!("expected insert");
         };
-        assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
+        assert_eq!(rows[0][1], Literal::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
     }
 
