@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 
 pub const TABLE_NAME: &str = "parity_data";
+pub const MEDIUM_KEY_COUNT: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -9,6 +10,7 @@ pub struct Row {
     pub skewed_num: i64,
     pub score: f64,
     pub low_key: String,
+    pub medium_key: String,
     pub high_key: String,
     pub payload: String,
     pub flag: bool,
@@ -56,6 +58,7 @@ impl Dataset {
             };
             let score = ((random.next() % 160_001) as i64 - 80_000) as f64 / 8.0;
             let low_key = low_keys[(random.next() as usize) % low_keys.len()].to_owned();
+            let medium_key = format!("segment_{:04}", index % MEDIUM_KEY_COUNT);
             let high_key = format!("entity_{index:08}");
             let word = words[(random.next() as usize) % words.len()];
             let suffix_len = (random.next() % 13) as usize;
@@ -86,6 +89,7 @@ impl Dataset {
                 skewed_num,
                 score,
                 low_key,
+                medium_key,
                 high_key,
                 payload,
                 flag,
@@ -97,10 +101,10 @@ impl Dataset {
     }
 
     pub fn setup_sql(&self) -> String {
-        let mut sql = String::with_capacity(self.rows.len().saturating_mul(150));
+        let mut sql = String::with_capacity(self.rows.len().saturating_mul(175));
         writeln!(
             sql,
-            "CREATE TABLE {TABLE_NAME} (id Int64, uniform_num Int64, skewed_num Int64, score Float64, low_key String, high_key String, payload String, flag Bool, large_int Int64);"
+            "CREATE TABLE {TABLE_NAME} (id Int64, uniform_num Int64, skewed_num Int64, score Float64, low_key String, medium_key String, high_key String, payload String, flag Bool, large_int Int64);"
         )
         .expect("writing to String cannot fail");
         write!(sql, "INSERT INTO {TABLE_NAME} VALUES ").expect("writing to String cannot fail");
@@ -110,12 +114,13 @@ impl Dataset {
             }
             write!(
                 sql,
-                "({},{},{},{:.3},'{}','{}','{}',{},{})",
+                "({},{},{},{:.3},'{}','{}','{}','{}',{},{})",
                 row.id,
                 row.uniform_num,
                 row.skewed_num,
                 row.score,
                 escape_sql_string(&row.low_key),
+                escape_sql_string(&row.medium_key),
                 escape_sql_string(&row.high_key),
                 escape_sql_string(&row.payload),
                 row.flag,
@@ -178,6 +183,11 @@ mod tests {
             .iter()
             .map(|row| &row.low_key)
             .collect::<std::collections::BTreeSet<_>>();
+        let medium_keys = dataset
+            .rows
+            .iter()
+            .map(|row| &row.medium_key)
+            .collect::<std::collections::BTreeSet<_>>();
         let high_keys = dataset
             .rows
             .iter()
@@ -186,6 +196,7 @@ mod tests {
 
         assert!(near_zero > dataset.rows.len() * 4 / 5);
         assert!(low_keys.len() <= 8);
+        assert_eq!(medium_keys.len(), MEDIUM_KEY_COUNT);
         assert_eq!(high_keys.len(), dataset.rows.len());
         assert!(dataset.rows.iter().any(|row| row.uniform_num < 0));
         assert!(dataset.rows.iter().any(|row| row.uniform_num > 0));
@@ -223,5 +234,44 @@ mod tests {
         assert!(sql.contains("quote''s payload"));
         assert!(sql.starts_with("CREATE TABLE parity_data"));
         assert!(sql.ends_with(";\n"));
+    }
+
+    #[test]
+    fn deterministic_medium_keys_support_stable_filter_selectivities() {
+        let dataset = Dataset::generate(11, 100_000);
+        let ten_percent = dataset
+            .rows
+            .iter()
+            .filter(|row| row.uniform_num >= 800_000)
+            .count();
+        let half = dataset
+            .rows
+            .iter()
+            .filter(|row| row.uniform_num >= 0)
+            .count();
+        let nonselective = dataset
+            .rows
+            .iter()
+            .filter(|row| row.uniform_num >= -950_000)
+            .count();
+        let equality = dataset
+            .rows
+            .iter()
+            .filter(|row| row.medium_key == "segment_0042")
+            .count();
+        let range = dataset
+            .rows
+            .iter()
+            .filter(|row| {
+                row.medium_key.as_str() >= "segment_0100"
+                    && row.medium_key.as_str() < "segment_0200"
+            })
+            .count();
+
+        assert!((8_000..=12_000).contains(&ten_percent));
+        assert!((48_000..=52_000).contains(&half));
+        assert!((96_000..=99_000).contains(&nonselective));
+        assert_eq!(equality, 98);
+        assert!((9_700..=9_800).contains(&range));
     }
 }

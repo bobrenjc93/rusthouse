@@ -6,7 +6,9 @@ pub enum Family {
     SelectiveFilter,
     CompoundFilter,
     NonselectiveFilter,
+    StringFilter,
     LowCardinalityGroupBy,
+    MediumCardinalityGroupBy,
     HighCardinalityGroupBy,
     OrderByLimit,
 }
@@ -18,7 +20,9 @@ impl Family {
             Self::SelectiveFilter => "selective_filter",
             Self::CompoundFilter => "compound_filter",
             Self::NonselectiveFilter => "nonselective_filter",
+            Self::StringFilter => "string_filter",
             Self::LowCardinalityGroupBy => "low_cardinality_group_by",
+            Self::MediumCardinalityGroupBy => "medium_cardinality_group_by",
             Self::HighCardinalityGroupBy => "high_cardinality_group_by",
             Self::OrderByLimit => "order_by_limit",
         }
@@ -39,13 +43,16 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
         Workload {
             name: "full_scan_aggregate",
             family: Family::FullScanAggregate,
-            sql: "SELECT COUNT(*) AS row_count, SUM(uniform_num) AS uniform_total, SUM(skewed_num) AS skewed_total, MIN(large_int) AS large_min, MAX(large_int) AS large_max, AVG(score) AS score_mean FROM parity_data;".to_owned(),
+            sql: "SELECT COUNT(*) AS row_count, SUM(uniform_num) AS uniform_total, SUM(skewed_num) AS skewed_total, MIN(large_int) AS large_min, MAX(large_int) AS large_max, SUM(score) AS score_total, MIN(score) AS score_min, MAX(score) AS score_max, AVG(score) AS score_mean FROM parity_data;".to_owned(),
             columns: vec![
                 ("row_count", ColumnType::Integer),
                 ("uniform_total", ColumnType::Integer),
                 ("skewed_total", ColumnType::Integer),
                 ("large_min", ColumnType::Integer),
                 ("large_max", ColumnType::Integer),
+                ("score_total", ColumnType::Float),
+                ("score_min", ColumnType::Float),
+                ("score_max", ColumnType::Float),
                 ("score_mean", ColumnType::Float),
             ],
         },
@@ -61,12 +68,52 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             ],
         },
         Workload {
+            name: "ten_percent_numeric_filter",
+            family: Family::SelectiveFilter,
+            sql: "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total, SUM(score) AS score_total FROM parity_data WHERE uniform_num >= 800000;".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+                ("score_total", ColumnType::Float),
+            ],
+        },
+        Workload {
+            name: "half_selectivity_numeric_filter",
+            family: Family::SelectiveFilter,
+            sql: "SELECT COUNT(*) AS matched, SUM(skewed_num) AS total FROM parity_data WHERE uniform_num >= 0;".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
             name: "compound_filter_aggregate",
             family: Family::CompoundFilter,
             sql: "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total FROM parity_data WHERE (flag = true AND uniform_num < -250000) OR (flag = false AND skewed_num >= 5);".to_owned(),
             columns: vec![
                 ("matched", ColumnType::Integer),
                 ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
+            name: "string_equality_projection",
+            family: Family::StringFilter,
+            sql: "SELECT id, medium_key, payload, score, flag FROM parity_data WHERE medium_key = 'segment_0042' ORDER BY id;".to_owned(),
+            columns: vec![
+                ("id", ColumnType::Integer),
+                ("medium_key", ColumnType::String),
+                ("payload", ColumnType::String),
+                ("score", ColumnType::Float),
+                ("flag", ColumnType::Boolean),
+            ],
+        },
+        Workload {
+            name: "string_range_filter",
+            family: Family::StringFilter,
+            sql: "SELECT COUNT(*) AS matched, SUM(score) AS score_total FROM parity_data WHERE medium_key >= 'segment_0100' AND medium_key < 'segment_0200';".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("score_total", ColumnType::Float),
             ],
         },
         Workload {
@@ -87,6 +134,18 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
                 ("flag", ColumnType::Boolean),
                 ("row_count", ColumnType::Integer),
                 ("total", ColumnType::Integer),
+                ("mean_score", ColumnType::Float),
+            ],
+        },
+        Workload {
+            name: "medium_cardinality_group_by",
+            family: Family::MediumCardinalityGroupBy,
+            sql: "SELECT medium_key, COUNT(*) AS row_count, SUM(uniform_num) AS total, SUM(score) AS score_total, AVG(score) AS mean_score FROM parity_data GROUP BY medium_key ORDER BY medium_key;".to_owned(),
+            columns: vec![
+                ("medium_key", ColumnType::String),
+                ("row_count", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+                ("score_total", ColumnType::Float),
                 ("mean_score", ColumnType::Float),
             ],
         },
@@ -138,11 +197,17 @@ mod tests {
             .map(|workload| workload.family)
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(families.len(), 7);
+        assert_eq!(workloads.len(), 13);
+        assert_eq!(families.len(), 9);
         assert!(
             workloads
                 .iter()
                 .any(|workload| workload.sql.contains("AVG("))
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.sql.contains("SUM(score)"))
         );
         assert!(
             workloads
@@ -162,12 +227,36 @@ mod tests {
         assert!(
             workloads
                 .iter()
+                .any(|workload| workload.sql.contains("GROUP BY medium_key"))
+        );
+        assert!(
+            workloads
+                .iter()
                 .any(|workload| workload.sql.contains("GROUP BY high_key"))
         );
         assert!(
             workloads
                 .iter()
                 .any(|workload| workload.sql.contains("ORDER BY payload"))
+        );
+        assert!(workloads.iter().any(|workload| {
+            workload.sql.contains("medium_key = 'segment_0042'")
+                && workload.sql.contains("ORDER BY id")
+                && !workload.sql.contains("LIMIT")
+        }));
+        assert!(workloads.iter().any(|workload| {
+            workload.sql.contains("medium_key >= 'segment_0100'")
+                && workload.sql.contains("medium_key < 'segment_0200'")
+        }));
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.sql.contains("uniform_num >= 800000"))
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.sql.contains("uniform_num >= 0"))
         );
         assert!(workloads.iter().all(|workload| workload.sql.ends_with(';')));
     }

@@ -17,30 +17,57 @@ impl Mode {
     pub fn settings(self) -> BenchmarkSettings {
         match self {
             Self::Quick => BenchmarkSettings {
-                row_counts: vec![256, 2_048],
+                row_counts: &QUICK_ROW_COUNTS,
                 warmups: 1,
                 samples: 3,
-                query_amplification: 256,
+                amplification: Amplification::Fixed(256),
                 end_to_end_samples: 3,
             },
             Self::Default => BenchmarkSettings {
-                row_counts: vec![1_000, 10_000, 50_000],
+                row_counts: &DEFAULT_ROW_COUNTS,
                 warmups: 2,
                 samples: 7,
-                query_amplification: 256,
+                amplification: Amplification::RowVisitBudget(DEFAULT_TARGET_ROW_VISITS),
                 end_to_end_samples: 3,
             },
         }
     }
 }
 
-#[derive(Debug, Clone)]
+const QUICK_ROW_COUNTS: [usize; 2] = [256, 2_048];
+const DEFAULT_ROW_COUNTS: [usize; 2] = [100_000, 1_000_000];
+pub const DEFAULT_TARGET_ROW_VISITS: usize = 16_000_000;
+
+#[derive(Debug, Clone, Copy)]
+enum Amplification {
+    Fixed(usize),
+    RowVisitBudget(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct BenchmarkSettings {
-    pub row_counts: Vec<usize>,
+    pub row_counts: &'static [usize],
     pub warmups: usize,
     pub samples: usize,
-    pub query_amplification: usize,
+    amplification: Amplification,
     pub end_to_end_samples: usize,
+}
+
+impl BenchmarkSettings {
+    pub fn query_amplification(self, row_count: usize) -> usize {
+        assert!(row_count > 0, "benchmark row counts must be positive");
+        match self.amplification {
+            Amplification::Fixed(repetitions) => repetitions,
+            Amplification::RowVisitBudget(row_visits) => row_visits.div_ceil(row_count).max(1),
+        }
+    }
+
+    pub fn target_row_visits(self) -> Option<usize> {
+        match self.amplification {
+            Amplification::Fixed(_) => None,
+            Amplification::RowVisitBudget(row_visits) => Some(row_visits),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,9 +219,32 @@ mod tests {
             assert!(settings.row_counts.len() >= 2);
             assert!(settings.warmups >= 1);
             assert!(settings.samples >= 3);
-            assert!(settings.query_amplification > 1);
+            assert!(
+                settings
+                    .row_counts
+                    .iter()
+                    .all(|row_count| settings.query_amplification(*row_count) > 1)
+            );
             assert!(settings.end_to_end_samples >= 3);
         }
+    }
+
+    #[test]
+    fn default_scales_derive_equal_work_from_the_fixed_budget() {
+        let settings = Mode::Default.settings();
+        assert_eq!(settings.row_counts, [100_000, 1_000_000]);
+        assert_eq!(
+            settings
+                .row_counts
+                .iter()
+                .map(|row_count| settings.query_amplification(*row_count))
+                .collect::<Vec<_>>(),
+            [160, 16]
+        );
+        assert_eq!(settings.target_row_visits(), Some(16_000_000));
+        assert!(settings.row_counts.iter().all(|row_count| {
+            row_count * settings.query_amplification(*row_count) == DEFAULT_TARGET_ROW_VISITS
+        }));
     }
 
     #[test]

@@ -128,8 +128,7 @@ fn emit_failure(error: String) -> ExitCode {
         summary: "Benchmark rejected: no timing score was accepted.".to_owned(),
         evidence: vec![error],
         suggestions: vec![
-            "Fix the reported setup or correctness failure and rerun the identical command."
-                .to_owned(),
+            "Address the reported rejection and rerun the identical command.".to_owned(),
         ],
     };
     println!("{}", report.to_json());
@@ -156,6 +155,7 @@ fn run(config: Config) -> Result<Report, String> {
     let mut correctness_checks = 0_usize;
 
     for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
+        let query_amplification = settings.query_amplification(row_count);
         let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
         let dataset = Dataset::generate(dataset_seed, row_count);
         let setup_sql = dataset.setup_sql();
@@ -165,7 +165,7 @@ fn run(config: Config) -> Result<Report, String> {
                 "benchmarking {} at {} rows ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
                 workload.name,
                 row_count,
-                settings.query_amplification,
+                query_amplification,
                 settings.warmups,
                 settings.samples,
                 settings.end_to_end_samples
@@ -194,14 +194,14 @@ fn run(config: Config) -> Result<Report, String> {
                     &paths,
                     &setup_sql,
                     &workload.sql,
-                    settings.query_amplification,
+                    query_amplification,
                     rusthouse_first,
                 )?;
                 accept_timed_pair(
                     &correctness_gate,
                     &rusthouse,
                     &clickhouse,
-                    settings.query_amplification,
+                    query_amplification,
                     iteration >= settings.warmups,
                     &mut primary,
                 )?;
@@ -273,7 +273,7 @@ fn run(config: Config) -> Result<Report, String> {
                 workload: workload.name,
                 family: workload.family.name(),
                 row_count,
-                query_amplification: settings.query_amplification,
+                query_amplification,
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
@@ -289,9 +289,11 @@ fn run(config: Config) -> Result<Report, String> {
     }
 
     let primary_score = score_cases(&cases, |case| case.primary_ratio)?;
-    if config.mode == config::Mode::Default {
-        ensure_primary_headroom(&primary_score, cases.len())?;
-    }
+    let headroom = if config.mode == config::Mode::Default {
+        ensure_primary_headroom(&primary_score, cases.len())
+    } else {
+        Ok(())
+    };
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
 
     if let Some(path) = &config.details {
@@ -302,10 +304,12 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            headroom.is_ok(),
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
     }
+    headroom?;
 
     let mut evidence = vec![
         format!(
@@ -318,10 +322,7 @@ fn run(config: Config) -> Result<Report, String> {
             "primary score {:.2}; startup-inclusive end-to-end score {:.2}",
             primary_score.score, end_to_end_score.score
         ),
-        format!(
-            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
-            settings.query_amplification, settings.query_amplification
-        ),
+        primary_timing_evidence(settings),
         format!(
             "primary parity caps: {}/{} cases; end-to-end parity caps: {}/{} cases",
             primary_score.saturated_cases,
@@ -339,10 +340,7 @@ fn run(config: Config) -> Result<Report, String> {
             identity.sha256
         ),
         format!("ClickHouse identity: {}", identity.version_output),
-        format!(
-            "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
-            settings.query_amplification
-        ),
+        "limitation: amplification measures repeated warm in-process work, retains one divided by the case amplification of startup/setup, and does not model concurrency, durable storage, or network access".to_owned(),
     ];
     evidence.extend(cases.iter().map(|case| {
         format!(
@@ -359,7 +357,7 @@ fn run(config: Config) -> Result<Report, String> {
     }));
     let suggestions = if config.mode == config::Mode::Quick {
         vec![
-            "Use --mode default for the decision-grade 1k/10k/50k-row suite.".to_owned(),
+            "Use --mode default for the decision-grade 100k/1m-row suite.".to_owned(),
             "Rerun with several explicit --seed values before drawing optimization conclusions."
                 .to_owned(),
         ]
@@ -401,13 +399,40 @@ fn score_cases(
 }
 
 fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<(), String> {
-    if score.saturated_cases == case_count {
-        return Err(
-            "primary timing saturated: every case reached the parity cap; increase query amplification before accepting this benchmark"
-                .to_owned(),
-        );
+    if score.saturated_cases > case_count / 2 {
+        return Err(format!(
+            "primary timing saturated: {}/{} cases reached the parity cap, exceeding the 50% limit for a default run",
+            score.saturated_cases, case_count
+        ));
     }
     Ok(())
+}
+
+fn scale_calibration(settings: config::BenchmarkSettings) -> String {
+    settings
+        .row_counts
+        .iter()
+        .map(|row_count| {
+            format!(
+                "{row_count} rows={}x",
+                settings.query_amplification(*row_count)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn primary_timing_evidence(settings: config::BenchmarkSettings) -> String {
+    let calibration = match settings.target_row_visits() {
+        Some(row_visits) => format!(
+            "derives symmetric per-scale amplification from a fixed {row_visits}-row-visit budget"
+        ),
+        None => "uses fixed shared amplification".to_owned(),
+    };
+    format!(
+        "primary timing {calibration} ({}), divides positive batch wall time by that amplification, discards stdout, and performs no startup subtraction",
+        scale_calibration(settings)
+    )
 }
 
 fn execute_correctness_pair(
@@ -535,12 +560,21 @@ fn details_json(
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    accepted: bool,
 ) -> String {
     let settings = config.mode.settings();
+    let target_row_visits = settings
+        .target_row_visits()
+        .map_or_else(|| "null".to_owned(), |value| value.to_string());
+    let calibration = if settings.target_row_visits().is_some() {
+        "fixed_target_row_visit_budget"
+    } else {
+        "fixed_shared_repetitions"
+    };
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"accepted\":{accepted},\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"target_row_visit_budget\":{target_row_visits},\"scales\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -557,17 +591,22 @@ fn details_json(
         if index > 0 {
             output.push(',');
         }
-        write!(output, "{row_count}").expect("writing to String cannot fail");
+        write!(
+            output,
+            "{{\"row_count\":{row_count},\"query_amplification\":{}}}",
+            settings.query_amplification(*row_count)
+        )
+        .expect("writing to String cannot fail");
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
-        settings.query_amplification,
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":{},\"symmetric_between_engines\":true,\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        json_string(calibration),
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.version_output),
         json_string(&identity.sha256),
-        json_string("amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup"),
+        json_string("amplification measures repeated warm in-process work and retains one divided by the case amplification of startup and setup"),
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
@@ -776,12 +815,78 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_capped_primary_score_is_rejected() {
-        let score = ScoreBreakdown {
+    fn more_than_half_of_primary_cases_at_the_cap_is_rejected() {
+        let at_limit = ScoreBreakdown {
             score: 100.0,
-            saturated_cases: 8,
+            saturated_cases: 4,
         };
-        assert!(ensure_primary_headroom(&score, 8).is_err());
+        let over_limit = ScoreBreakdown {
+            score: 100.0,
+            saturated_cases: 5,
+        };
+
+        ensure_primary_headroom(&at_limit, 8).expect("exactly half remains acceptable");
+        let error = ensure_primary_headroom(&over_limit, 8)
+            .expect_err("more than half must reject the default run");
+        assert!(error.contains("5/8"));
+        assert!(error.contains("50%"));
+        assert!(ensure_primary_headroom(&at_limit, 7).is_err());
+    }
+
+    #[test]
+    fn details_retain_budget_calibration_and_both_timing_series() {
+        let config = Config {
+            mode: config::Mode::Default,
+            seed: 42,
+            rusthouse: PathBuf::from("rusthouse"),
+            clickhouse: PathBuf::from("clickhouse"),
+            details: None,
+        };
+        let identity = ClickHouseIdentity {
+            version_output: "ClickHouse 26.7.1".to_owned(),
+            sha256: "abc".to_owned(),
+        };
+        let case = CaseResult {
+            workload: "workload",
+            family: "family",
+            row_count: 100_000,
+            query_amplification: 160,
+            primary: TimingSeries {
+                rusthouse_batch_ms: vec![2.0],
+                clickhouse_batch_ms: vec![1.0],
+                rusthouse_per_query_ms: vec![0.02],
+                clickhouse_per_query_ms: vec![0.01],
+            },
+            rusthouse_primary_batch_median_ms: 2.0,
+            clickhouse_primary_batch_median_ms: 1.0,
+            rusthouse_primary_median_ms: 0.02,
+            clickhouse_primary_median_ms: 0.01,
+            primary_ratio: 0.5,
+            end_to_end: TimingSeries {
+                rusthouse_batch_ms: vec![4.0],
+                clickhouse_batch_ms: vec![3.0],
+                rusthouse_per_query_ms: vec![4.0],
+                clickhouse_per_query_ms: vec![3.0],
+            },
+            rusthouse_end_to_end_median_ms: 4.0,
+            clickhouse_end_to_end_median_ms: 3.0,
+            end_to_end_ratio: 0.75,
+        };
+        let score = ScoreBreakdown {
+            score: 50.0,
+            saturated_cases: 0,
+        };
+
+        let details = details_json(&config, &identity, &[case], score, score, 1, false);
+
+        assert!(details.contains("\"schema_version\":3,\"accepted\":false"));
+        assert!(details.contains("\"target_row_visit_budget\":16000000"));
+        assert!(details.contains(
+            "\"scales\":[{\"row_count\":100000,\"query_amplification\":160},{\"row_count\":1000000,\"query_amplification\":16}]"
+        ));
+        assert!(details.contains("\"rusthouse_batch_samples_ms\":[2.000000]"));
+        assert!(details.contains("\"clickhouse_per_query_samples_ms\":[0.010000]"));
+        assert!(details.contains("\"rusthouse_samples_ms\":[4.000000]"));
     }
 
     #[test]
