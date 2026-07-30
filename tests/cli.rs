@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -108,6 +109,31 @@ fn sql_errors_are_reported_with_nonzero_status() {
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stderr.contains("type mismatch for column 't.id'"));
     assert!(stderr.contains("expected Int64, found String"));
+}
+
+#[test]
+fn copy_reports_affected_rows() {
+    let path = std::env::temp_dir().join(format!("rusthouse-cli-copy-{}.csv", std::process::id()));
+    fs::write(&path, "id\n1\n2\n3\n").expect("write CSV fixture");
+    let sql_path = path
+        .to_str()
+        .expect("temporary path is UTF-8")
+        .replace('\'', "''");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--execute",
+            &format!(
+                "CREATE TABLE copied (id Int64); COPY copied FROM '{sql_path}' FORMAT CSV WITH HEADER"
+            ),
+        ])
+        .output()
+        .expect("run CLI");
+    let _ = fs::remove_file(path);
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("COPY 3"), "unexpected stderr: {stderr}");
 }
 
 #[test]

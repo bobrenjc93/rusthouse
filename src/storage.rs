@@ -86,6 +86,20 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Int64(values) => values.truncate(len),
+            Self::Float64(values) => values.truncate(len),
+            Self::Bool(values) => values.truncate(len),
+            Self::String(values) => values.truncate(len),
+        }
+    }
+}
+
+pub(crate) struct TableCheckpoint {
+    column_lengths: Vec<usize>,
+    row_count: usize,
 }
 
 /// A table stores one typed vector per schema field.
@@ -190,11 +204,41 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.push_row(row);
+        Ok(())
+    }
+
+    /// Validates a complete batch before mutating any physical column.
+    pub fn insert_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<usize> {
+        for row in &rows {
+            self.validate_row(row)?;
+        }
+        let affected_rows = rows.len();
+        for row in rows {
+            self.push_row(row);
+        }
+        Ok(affected_rows)
+    }
+
+    pub(crate) fn checkpoint(&self) -> TableCheckpoint {
+        TableCheckpoint {
+            column_lengths: self.columns.iter().map(Column::len).collect(),
+            row_count: self.row_count,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, checkpoint: &TableCheckpoint) {
+        for (column, len) in self.columns.iter_mut().zip(&checkpoint.column_lengths) {
+            column.truncate(*len);
+        }
+        self.row_count = checkpoint.row_count;
+    }
+
+    fn push_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 }
 
@@ -235,6 +279,21 @@ mod tests {
         let mut table = test_table();
         let error = table
             .insert_row(vec![Value::Int64(7), Value::Bool(true)])
+            .expect_err("wrong type");
+
+        assert!(matches!(error, Error::TypeMismatch { .. }));
+        assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejected_batches_do_not_partially_mutate_columns() {
+        let mut table = test_table();
+        let error = table
+            .insert_batch(vec![
+                vec![Value::Int64(1), Value::String("valid".to_owned())],
+                vec![Value::Int64(2), Value::Bool(false)],
+            ])
             .expect_err("wrong type");
 
         assert!(matches!(error, Error::TypeMismatch { .. }));

@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::catalog::Catalog;
+use crate::copy::copy_csv;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
@@ -70,19 +71,22 @@ impl Database {
                 })
             }
             Statement::Insert { table, rows } => {
-                let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
                 let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                let affected_rows = target.insert_batch(rows)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::Copy {
+                table,
+                path,
+                header,
+            } => {
+                let target = self.catalog.table_mut(&table)?;
+                let affected_rows = copy_csv(target, &path, header)?;
+                Ok(StatementResult::Command {
+                    tag: "COPY",
                     affected_rows,
                 })
             }

@@ -1,11 +1,12 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
 
 ## What works
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- streaming `COPY table FROM 'path.csv' FORMAT CSV [WITH HEADER]`
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -16,6 +17,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+CSV COPY parses quoted delimiters, newlines, and doubled quotes incrementally. It converts fields against the target schema in 1,024-row batches and rolls the entire COPY back if any record fails. Decoded fields are limited to 1 MiB and records to 8 MiB.
 
 ## CLI
 
@@ -89,7 +92,7 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+The only runtime dependency is the small `csv-core` parser used by streaming COPY. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check

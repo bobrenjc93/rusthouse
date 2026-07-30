@@ -30,6 +30,16 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    Csv {
+        path: String,
+        record: usize,
+        field: Option<usize>,
+        message: String,
+    },
+    Io {
+        path: String,
+        message: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +82,21 @@ impl fmt::Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
+            }
+            Self::Csv {
+                path,
+                record,
+                field,
+                message,
+            } => {
+                write!(f, "CSV error in '{path}' at record {record}")?;
+                if let Some(field) = field {
+                    write!(f, ", field {field}")?;
+                }
+                write!(f, ": {message}")
+            }
+            Self::Io { path, message } => {
+                write!(f, "I/O error reading '{path}': {message}")
             }
         }
     }
