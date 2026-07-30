@@ -1,5 +1,6 @@
 mod config;
 mod dataset;
+mod digest;
 mod normalize;
 mod process;
 mod score;
@@ -15,10 +16,10 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
+use normalize::{ColumnType, compare_output_sequences};
 use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
-use workload::workloads;
+use workload::{QUERY_SEQUENCE_METHODOLOGY, QuerySequence, repeated_query_sequence, workloads};
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
 
@@ -56,12 +57,20 @@ struct CaseResult {
     family: &'static str,
     row_count: usize,
     query_amplification: usize,
+    query_sequence: QuerySequence,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
     clickhouse_primary_batch_median_ms: f64,
     rusthouse_primary_median_ms: f64,
     clickhouse_primary_median_ms: f64,
     primary_ratio: f64,
+    identical_query_transition_sha256: String,
+    identical_query_transition: TimingSeries,
+    rusthouse_identical_query_transition_batch_median_ms: f64,
+    clickhouse_identical_query_transition_batch_median_ms: f64,
+    rusthouse_identical_query_transition_median_ms: f64,
+    clickhouse_identical_query_transition_median_ms: f64,
+    identical_query_transition_ratio: f64,
     end_to_end: TimingSeries,
     rusthouse_end_to_end_median_ms: f64,
     clickhouse_end_to_end_median_ms: f64,
@@ -70,7 +79,8 @@ struct CaseResult {
 
 #[derive(Debug, Default)]
 struct CorrectnessGate {
-    passed: bool,
+    sequence_sha256: Option<String>,
+    query_count: usize,
 }
 
 impl CorrectnessGate {
@@ -79,9 +89,26 @@ impl CorrectnessGate {
         columns: &[(&str, ColumnType)],
         rusthouse: &TimedOutput,
         clickhouse: &TimedOutput,
+        sequence: &QuerySequence,
     ) -> Result<(), String> {
-        compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
-        self.passed = true;
+        if rusthouse.query_count != sequence.query_count()
+            || clickhouse.query_count != sequence.query_count()
+            || rusthouse.sequence_sha256 != sequence.sha256
+            || clickhouse.sequence_sha256 != sequence.sha256
+        {
+            return Err(
+                "correctness processes did not receive the expected byte-identical query sequence"
+                    .to_owned(),
+            );
+        }
+        compare_output_sequences(
+            &rusthouse.stdout,
+            &clickhouse.stdout,
+            columns,
+            sequence.query_count(),
+        )?;
+        self.sequence_sha256 = Some(sequence.sha256.clone());
+        self.query_count = sequence.query_count();
         Ok(())
     }
 }
@@ -171,54 +198,138 @@ fn run(config: Config) -> Result<Report, String> {
                 settings.end_to_end_samples
             );
 
-            let correctness_order = (row_count_index + workload_index).is_multiple_of(2);
-            let (rusthouse_output, clickhouse_output) =
-                execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
-            let mut correctness_gate = CorrectnessGate::default();
-            correctness_gate
-                .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
-                .map_err(|error| {
+            let query_sequence =
+                workload.query_sequence(row_count, config.seed, settings.query_amplification);
+            let identical_query_transition_sequence =
+                repeated_query_sequence(&workload.sql, settings.query_amplification);
+            let end_to_end_sequence = repeated_query_sequence(&workload.sql, 1);
+            for (label, sequence) in [
+                ("query-diverse primary", &query_sequence),
+                (
+                    "identical-query transition",
+                    &identical_query_transition_sequence,
+                ),
+                ("end-to-end", &end_to_end_sequence),
+            ] {
+                sequence.validate().map_err(|error| {
                     format!(
-                        "correctness gate failed for '{}' at {row_count} rows: {error}",
+                        "invalid {label} sequence for '{}' at {row_count} rows: {error}",
                         workload.name
                     )
                 })?;
-            correctness_checks += 1;
+            }
+
+            let correctness_order = (row_count_index + workload_index).is_multiple_of(2);
+            let (rusthouse_output, clickhouse_output) =
+                execute_correctness_pair(&paths, &setup_sql, &query_sequence, correctness_order)?;
+            let mut primary_gate = CorrectnessGate::default();
+            primary_gate
+                .verify(
+                    &workload.columns,
+                    &rusthouse_output,
+                    &clickhouse_output,
+                    &query_sequence,
+                )
+                .map_err(|error| {
+                    format!(
+                        "query-diverse correctness gate failed for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
+
+            let (rusthouse_output, clickhouse_output) = execute_correctness_pair(
+                &paths,
+                &setup_sql,
+                &identical_query_transition_sequence,
+                !correctness_order,
+            )?;
+            let mut identical_query_transition_gate = CorrectnessGate::default();
+            identical_query_transition_gate
+                .verify(
+                    &workload.columns,
+                    &rusthouse_output,
+                    &clickhouse_output,
+                    &identical_query_transition_sequence,
+                )
+                .map_err(|error| {
+                    format!(
+                        "identical-query transition correctness gate failed for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
+
+            let (rusthouse_output, clickhouse_output) = execute_correctness_pair(
+                &paths,
+                &setup_sql,
+                &end_to_end_sequence,
+                correctness_order,
+            )?;
+            let mut end_to_end_gate = CorrectnessGate::default();
+            end_to_end_gate
+                .verify(
+                    &workload.columns,
+                    &rusthouse_output,
+                    &clickhouse_output,
+                    &end_to_end_sequence,
+                )
+                .map_err(|error| {
+                    format!(
+                        "end-to-end correctness gate failed for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
+            correctness_checks += 3;
 
             let mut primary = TimingSeries::default();
             let primary_iterations = settings.warmups + settings.samples;
             for iteration in 0..primary_iterations {
                 let rusthouse_first =
                     (row_count_index + workload_index + iteration + 1).is_multiple_of(2);
+                let (rusthouse, clickhouse) =
+                    execute_timed_pair(&paths, &setup_sql, &query_sequence, rusthouse_first)?;
+                accept_timed_pair(
+                    &primary_gate,
+                    &rusthouse,
+                    &clickhouse,
+                    &query_sequence,
+                    iteration >= settings.warmups,
+                    &mut primary,
+                )?;
+            }
+
+            let mut identical_query_transition = TimingSeries::default();
+            for iteration in 0..primary_iterations {
+                let rusthouse_first =
+                    (row_count_index + workload_index + iteration + primary_iterations)
+                        .is_multiple_of(2);
                 let (rusthouse, clickhouse) = execute_timed_pair(
                     &paths,
                     &setup_sql,
-                    &workload.sql,
-                    settings.query_amplification,
+                    &identical_query_transition_sequence,
                     rusthouse_first,
                 )?;
                 accept_timed_pair(
-                    &correctness_gate,
+                    &identical_query_transition_gate,
                     &rusthouse,
                     &clickhouse,
-                    settings.query_amplification,
+                    &identical_query_transition_sequence,
                     iteration >= settings.warmups,
-                    &mut primary,
+                    &mut identical_query_transition,
                 )?;
             }
 
             let mut end_to_end = TimingSeries::default();
             for iteration in 0..settings.end_to_end_samples {
                 let rusthouse_first =
-                    (row_count_index + workload_index + iteration + primary_iterations)
+                    (row_count_index + workload_index + iteration + primary_iterations * 2)
                         .is_multiple_of(2);
                 let (rusthouse, clickhouse) =
-                    execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
+                    execute_timed_pair(&paths, &setup_sql, &end_to_end_sequence, rusthouse_first)?;
                 accept_timed_pair(
-                    &correctness_gate,
+                    &end_to_end_gate,
                     &rusthouse,
                     &clickhouse,
-                    1,
+                    &end_to_end_sequence,
                     true,
                     &mut end_to_end,
                 )?;
@@ -248,6 +359,30 @@ fn run(config: Config) -> Result<Report, String> {
                 workload.name,
                 row_count,
             )?;
+            let rusthouse_identical_query_transition_batch_median = stable_median(
+                &identical_query_transition.rusthouse_batch_ms,
+                "RustHouse identical-query transition batch",
+                workload.name,
+                row_count,
+            )?;
+            let clickhouse_identical_query_transition_batch_median = stable_median(
+                &identical_query_transition.clickhouse_batch_ms,
+                "ClickHouse identical-query transition batch",
+                workload.name,
+                row_count,
+            )?;
+            let rusthouse_identical_query_transition_median = stable_median(
+                &identical_query_transition.rusthouse_per_query_ms,
+                "RustHouse identical-query transition amortized query",
+                workload.name,
+                row_count,
+            )?;
+            let clickhouse_identical_query_transition_median = stable_median(
+                &identical_query_transition.clickhouse_per_query_ms,
+                "ClickHouse identical-query transition amortized query",
+                workload.name,
+                row_count,
+            )?;
             let rusthouse_end_to_end_median = stable_median(
                 &end_to_end.rusthouse_batch_ms,
                 "RustHouse end-to-end",
@@ -261,12 +396,15 @@ fn run(config: Config) -> Result<Report, String> {
                 row_count,
             )?;
             let primary_ratio = clickhouse_primary_median / rusthouse_primary_median;
+            let identical_query_transition_ratio = clickhouse_identical_query_transition_median
+                / rusthouse_identical_query_transition_median;
             let end_to_end_ratio = clickhouse_end_to_end_median / rusthouse_end_to_end_median;
             eprintln!(
-                "  primary/query: RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end ratio {:.3}",
+                "  diverse/query: RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; identical-query transition ratio {:.3}; end-to-end ratio {:.3}",
                 rusthouse_primary_median,
                 clickhouse_primary_median,
                 primary_ratio,
+                identical_query_transition_ratio,
                 end_to_end_ratio
             );
             cases.push(CaseResult {
@@ -274,12 +412,24 @@ fn run(config: Config) -> Result<Report, String> {
                 family: workload.family.name(),
                 row_count,
                 query_amplification: settings.query_amplification,
+                query_sequence,
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
                 rusthouse_primary_median_ms: rusthouse_primary_median,
                 clickhouse_primary_median_ms: clickhouse_primary_median,
                 primary_ratio,
+                identical_query_transition_sha256: identical_query_transition_sequence.sha256,
+                identical_query_transition,
+                rusthouse_identical_query_transition_batch_median_ms:
+                    rusthouse_identical_query_transition_batch_median,
+                clickhouse_identical_query_transition_batch_median_ms:
+                    clickhouse_identical_query_transition_batch_median,
+                rusthouse_identical_query_transition_median_ms:
+                    rusthouse_identical_query_transition_median,
+                clickhouse_identical_query_transition_median_ms:
+                    clickhouse_identical_query_transition_median,
+                identical_query_transition_ratio,
                 end_to_end,
                 rusthouse_end_to_end_median_ms: rusthouse_end_to_end_median,
                 clickhouse_end_to_end_median_ms: clickhouse_end_to_end_median,
@@ -292,6 +442,8 @@ fn run(config: Config) -> Result<Report, String> {
     if config.mode == config::Mode::Default {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
+    let identical_query_transition_score =
+        score_cases(&cases, |case| case.identical_query_transition_ratio)?;
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
 
     if let Some(path) = &config.details {
@@ -300,6 +452,7 @@ fn run(config: Config) -> Result<Report, String> {
             &identity,
             &cases,
             primary_score,
+            identical_query_transition_score,
             end_to_end_score,
             correctness_checks,
         );
@@ -309,22 +462,24 @@ fn run(config: Config) -> Result<Report, String> {
 
     let mut evidence = vec![
         format!(
-            "{} separate correctness pairs passed across {} cases and {} row counts",
+            "{} sequence-level correctness pairs passed across {} cases and {} row counts",
             correctness_checks,
             cases.len(),
             settings.row_counts.len()
         ),
         format!(
-            "primary score {:.2}; startup-inclusive end-to-end score {:.2}",
-            primary_score.score, end_to_end_score.score
+            "query-diverse primary score {:.2}; identical-query transition score {:.2}; startup-inclusive end-to-end score {:.2}",
+            primary_score.score, identical_query_transition_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
-            settings.query_amplification, settings.query_amplification
+            "{} primary timing uses setup plus {} seed-derived query variants per process, divides positive batch wall time by {}, discards timed stdout, and performs no startup subtraction",
+            QUERY_SEQUENCE_METHODOLOGY, settings.query_amplification, settings.query_amplification
         ),
         format!(
-            "primary parity caps: {}/{} cases; end-to-end parity caps: {}/{} cases",
+            "primary parity caps: {}/{} cases; identical-query transition parity caps: {}/{} cases; end-to-end parity caps: {}/{} cases",
             primary_score.saturated_cases,
+            cases.len(),
+            identical_query_transition_score.saturated_cases,
             cases.len(),
             end_to_end_score.saturated_cases,
             cases.len()
@@ -340,18 +495,20 @@ fn run(config: Config) -> Result<Report, String> {
         ),
         format!("ClickHouse identity: {}", identity.version_output),
         format!(
-            "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
+            "limitation: amplification measures warm in-process work, retains 1/{} of startup/setup, and does not model cold caches, concurrency, durable storage, or network access",
             settings.query_amplification
         ),
     ];
     evidence.extend(cases.iter().map(|case| {
         format!(
-            "{} / {} rows: primary/query RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}",
+            "{} / {} rows / sequence {}: diverse/query RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; identical-query transition ratio {:.3}; end-to-end RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}",
             case.workload,
             case.row_count,
+            case.query_sequence.sha256,
             case.rusthouse_primary_median_ms,
             case.clickhouse_primary_median_ms,
             case.primary_ratio,
+            case.identical_query_transition_ratio,
             case.rusthouse_end_to_end_median_ms,
             case.clickhouse_end_to_end_median_ms,
             case.end_to_end_ratio
@@ -375,8 +532,9 @@ fn run(config: Config) -> Result<Report, String> {
     Ok(Report {
         score: primary_score.score,
         summary: format!(
-            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
+            "RustHouse query-diverse sustained-work score {:.2}; identical-query transition score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
             primary_score.score,
+            identical_query_transition_score.score,
             end_to_end_score.score,
             cases.len()
         ),
@@ -413,16 +571,36 @@ fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<
 fn execute_correctness_pair(
     paths: &EnginePaths,
     setup_sql: &str,
-    query_sql: &str,
+    sequence: &QuerySequence,
     rusthouse_first: bool,
 ) -> Result<(TimedOutput, TimedOutput), String> {
     if rusthouse_first {
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
+        let rusthouse = paths.execute_correctness(
+            Engine::RustHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
+        let clickhouse = paths.execute_correctness(
+            Engine::ClickHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
+        let clickhouse = paths.execute_correctness(
+            Engine::ClickHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
+        let rusthouse = paths.execute_correctness(
+            Engine::RustHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -430,21 +608,36 @@ fn execute_correctness_pair(
 fn execute_timed_pair(
     paths: &EnginePaths,
     setup_sql: &str,
-    query_sql: &str,
-    query_repetitions: usize,
+    sequence: &QuerySequence,
     rusthouse_first: bool,
 ) -> Result<(TimedBatch, TimedBatch), String> {
     if rusthouse_first {
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse = paths.execute_timed(
+            Engine::RustHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
+        let clickhouse = paths.execute_timed(
+            Engine::ClickHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_timed(
+            Engine::ClickHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
+        let rusthouse = paths.execute_timed(
+            Engine::RustHouse,
+            setup_sql,
+            &sequence.sql,
+            sequence.query_count(),
+        )?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -453,27 +646,35 @@ fn accept_timed_pair(
     gate: &CorrectnessGate,
     rusthouse: &TimedBatch,
     clickhouse: &TimedBatch,
-    expected_repetitions: usize,
+    sequence: &QuerySequence,
     record: bool,
     samples: &mut TimingSeries,
 ) -> Result<(), String> {
-    if !gate.passed {
+    if gate.sequence_sha256.as_deref() != Some(&sequence.sha256)
+        || gate.query_count != sequence.query_count()
+    {
         return Err("timed batch was not preceded by a passing correctness run".to_owned());
     }
-    if rusthouse.query_repetitions != clickhouse.query_repetitions
-        || rusthouse.query_repetitions != expected_repetitions
+    if rusthouse.query_count != clickhouse.query_count
+        || rusthouse.query_count != sequence.query_count()
+        || rusthouse.sequence_sha256 != clickhouse.sequence_sha256
+        || rusthouse.sequence_sha256 != sequence.sha256
     {
         return Err(format!(
-            "query amplification mismatch: expected {expected_repetitions}, RustHouse used {}, ClickHouse used {}",
-            rusthouse.query_repetitions, clickhouse.query_repetitions
+            "query sequence mismatch: expected {} queries with digest {}, RustHouse used {} / {}, ClickHouse used {} / {}",
+            sequence.query_count(),
+            sequence.sha256,
+            rusthouse.query_count,
+            rusthouse.sequence_sha256,
+            clickhouse.query_count,
+            clickhouse.sequence_sha256
         ));
     }
 
     let rusthouse_batch_ms = rusthouse.elapsed.as_secs_f64() * 1_000.0;
     let clickhouse_batch_ms = clickhouse.elapsed.as_secs_f64() * 1_000.0;
-    let rusthouse_per_query_ms = per_query_millis(rusthouse_batch_ms, rusthouse.query_repetitions)?;
-    let clickhouse_per_query_ms =
-        per_query_millis(clickhouse_batch_ms, clickhouse.query_repetitions)?;
+    let rusthouse_per_query_ms = per_query_millis(rusthouse_batch_ms, rusthouse.query_count)?;
+    let clickhouse_per_query_ms = per_query_millis(clickhouse_batch_ms, clickhouse.query_count)?;
 
     if record {
         samples.rusthouse_batch_ms.push(rusthouse_batch_ms);
@@ -533,6 +734,7 @@ fn details_json(
     identity: &ClickHouseIdentity,
     cases: &[CaseResult],
     primary_score: ScoreBreakdown,
+    identical_query_transition_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
 ) -> String {
@@ -540,11 +742,13 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"identical_query_transition_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"identical_query_transition_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
+        identical_query_transition_score.score,
         end_to_end_score.score,
         primary_score.saturated_cases,
+        identical_query_transition_score.saturated_cases,
         end_to_end_score.saturated_cases,
         json_string(config.mode.name()),
         config.seed,
@@ -561,13 +765,16 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"version\":3,\"name\":{},\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"sequence_digest\":\"sha256\",\"complete_amplified_output_check\":true,\"byte_identical_sequences\":true,\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"transition_metric\":{{\"name\":\"identical_query_amplification_v2\",\"label\":\"non_primary_transition_only\",\"query_amplification\":{}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{},{}],\"cases\":[",
+        json_string(QUERY_SEQUENCE_METHODOLOGY),
+        settings.query_amplification,
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.version_output),
         json_string(&identity.sha256),
-        json_string("amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup"),
+        json_string("query-diverse amplification measures warm in-process work, does not model cold caches, and retains one divided by the amplification factor of startup and setup"),
+        json_string("the identical-query score is retained only as a transition metric and is not the reported Burner score"),
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
@@ -578,11 +785,19 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"query_sequence\":{{\"seed\":{},\"sha256\":{},\"resolved_parameters\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
             case.query_amplification,
+            case.query_sequence.seed,
+            json_string(&case.query_sequence.sha256),
+        )
+        .expect("writing to String cannot fail");
+        write_resolved_variants(&mut output, &case.query_sequence);
+        write!(
+            output,
+            "}},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
@@ -599,6 +814,36 @@ fn details_json(
         write_number_array(&mut output, &case.primary.clickhouse_per_query_ms);
         write!(
             output,
+            "}},\"identical_query_transition\":{{\"sequence_sha256\":{},\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            json_string(&case.identical_query_transition_sha256),
+            case.rusthouse_identical_query_transition_batch_median_ms,
+            case.clickhouse_identical_query_transition_batch_median_ms,
+            case.rusthouse_identical_query_transition_median_ms,
+            case.clickhouse_identical_query_transition_median_ms,
+            case.identical_query_transition_ratio,
+        )
+        .expect("writing to String cannot fail");
+        write_number_array(
+            &mut output,
+            &case.identical_query_transition.rusthouse_batch_ms,
+        );
+        output.push_str(",\"clickhouse_batch_samples_ms\":");
+        write_number_array(
+            &mut output,
+            &case.identical_query_transition.clickhouse_batch_ms,
+        );
+        output.push_str(",\"rusthouse_per_query_samples_ms\":");
+        write_number_array(
+            &mut output,
+            &case.identical_query_transition.rusthouse_per_query_ms,
+        );
+        output.push_str(",\"clickhouse_per_query_samples_ms\":");
+        write_number_array(
+            &mut output,
+            &case.identical_query_transition.clickhouse_per_query_ms,
+        );
+        write!(
+            output,
             "}},\"end_to_end\":{{\"rusthouse_median_ms\":{:.6},\"clickhouse_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_samples_ms\":",
             case.rusthouse_end_to_end_median_ms,
             case.clickhouse_end_to_end_median_ms,
@@ -612,6 +857,22 @@ fn details_json(
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_resolved_variants(output: &mut String, sequence: &QuerySequence) {
+    output.push('[');
+    for (variant_index, variant) in sequence.variants.iter().enumerate() {
+        if variant_index > 0 {
+            output.push(',');
+        }
+        write!(output, "{{\"ordinal\":{}", variant.ordinal).expect("writing to String cannot fail");
+        for (name, value) in &variant.parameters {
+            write!(output, ",{}:{}", json_string(name), json_string(value))
+                .expect("writing to String cannot fail");
+        }
+        output.push('}');
+    }
+    output.push(']');
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -672,42 +933,52 @@ fn json_string(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn batch(milliseconds: f64, repetitions: usize) -> TimedBatch {
+    fn sequence(count: usize) -> QuerySequence {
+        repeated_query_sequence("SELECT 1 AS n;", count)
+    }
+
+    fn batch(milliseconds: f64, sequence: &QuerySequence) -> TimedBatch {
         TimedBatch {
             elapsed: Duration::from_secs_f64(milliseconds / 1_000.0),
-            query_repetitions: repetitions,
+            query_count: sequence.query_count(),
+            sequence_sha256: sequence.sha256.clone(),
         }
     }
 
-    fn output(csv: &str) -> TimedOutput {
+    fn output(csv: &str, sequence: &QuerySequence) -> TimedOutput {
         TimedOutput {
             stdout: csv.to_owned(),
+            query_count: sequence.query_count(),
+            sequence_sha256: sequence.sha256.clone(),
         }
     }
 
     #[test]
     fn correctness_failure_leaves_timing_gate_closed() {
+        let sequence = sequence(1);
         let mut gate = CorrectnessGate::default();
         let error = gate
             .verify(
                 &[("n", ColumnType::Integer)],
-                &output("n\n1\n"),
-                &output("n\n2\n"),
+                &output("n\n1\n", &sequence),
+                &output("n\n2\n", &sequence),
+                &sequence,
             )
             .expect_err("mismatch must fail");
 
         assert!(error.contains("result mismatch"));
-        assert!(!gate.passed);
+        assert!(gate.sequence_sha256.is_none());
     }
 
     #[test]
     fn timed_batches_require_a_correctness_gate() {
+        let sequence = sequence(64);
         let mut samples = TimingSeries::default();
         let error = accept_timed_pair(
             &CorrectnessGate::default(),
-            &batch(10.0, 64),
-            &batch(10.0, 64),
-            64,
+            &batch(10.0, &sequence),
+            &batch(10.0, &sequence),
+            &sequence,
             true,
             &mut samples,
         )
@@ -720,18 +991,25 @@ mod tests {
 
     #[test]
     fn amplification_must_match_for_both_engines() {
+        let sequence = sequence(64);
+        let gate = CorrectnessGate {
+            sequence_sha256: Some(sequence.sha256.clone()),
+            query_count: sequence.query_count(),
+        };
+        let mut clickhouse = batch(10.0, &sequence);
+        clickhouse.query_count = 63;
         let mut samples = TimingSeries::default();
         let error = accept_timed_pair(
-            &CorrectnessGate { passed: true },
-            &batch(10.0, 64),
-            &batch(10.0, 63),
-            64,
+            &gate,
+            &batch(10.0, &sequence),
+            &clickhouse,
+            &sequence,
             true,
             &mut samples,
         )
         .expect_err("different amplification must fail");
 
-        assert!(error.contains("amplification mismatch"));
+        assert!(error.contains("query sequence mismatch"));
         assert!(samples.rusthouse_batch_ms.is_empty());
         assert!(samples.clickhouse_batch_ms.is_empty());
     }
@@ -753,20 +1031,22 @@ mod tests {
 
     #[test]
     fn normalized_match_opens_gate_and_accepts_positive_timing() {
+        let sequence = sequence(64);
         let mut gate = CorrectnessGate::default();
         gate.verify(
             &[("enabled", ColumnType::Boolean)],
-            &output("enabled\ntrue\n"),
-            &output("enabled\n1\n"),
+            &output(&"enabled\ntrue\n".repeat(64), &sequence),
+            &output(&"enabled\n1\n".repeat(64), &sequence),
+            &sequence,
         )
         .expect("matching output");
 
         let mut samples = TimingSeries::default();
         accept_timed_pair(
             &gate,
-            &batch(64.0, 64),
-            &batch(32.0, 64),
-            64,
+            &batch(64.0, &sequence),
+            &batch(32.0, &sequence),
+            &sequence,
             true,
             &mut samples,
         )

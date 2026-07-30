@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::digest::sha256_hex;
+
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
 pub const CLICKHOUSE_SHA256: &str =
     "6611c5aadcfac188031fa0fdf2676ec311771f96654a62b918b146b60dd11075";
@@ -28,12 +30,15 @@ pub enum Engine {
 #[derive(Debug)]
 pub struct TimedOutput {
     pub stdout: String,
+    pub query_count: usize,
+    pub sequence_sha256: String,
 }
 
 #[derive(Debug)]
 pub struct TimedBatch {
     pub elapsed: Duration,
-    pub query_repetitions: usize,
+    pub query_count: usize,
+    pub sequence_sha256: String,
 }
 
 impl EnginePaths {
@@ -46,12 +51,15 @@ impl EnginePaths {
         &self,
         engine: Engine,
         setup_sql: &str,
-        query_sql: &str,
+        query_sequence_sql: &str,
+        query_count: usize,
     ) -> Result<TimedOutput, String> {
-        let batch = sql_batch(setup_sql, query_sql, 1)?;
+        let batch = sql_batch(setup_sql, query_sequence_sql, query_count)?;
         let (_, stdout) = self.execute_batch(engine, &batch, true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),
+            query_count,
+            sequence_sha256: sha256_hex(query_sequence_sql.as_bytes()),
         })
     }
 
@@ -59,15 +67,16 @@ impl EnginePaths {
         &self,
         engine: Engine,
         setup_sql: &str,
-        query_sql: &str,
-        query_repetitions: usize,
+        query_sequence_sql: &str,
+        query_count: usize,
     ) -> Result<TimedBatch, String> {
-        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
+        let batch = sql_batch(setup_sql, query_sequence_sql, query_count)?;
         let (elapsed, stdout) = self.execute_batch(engine, &batch, false)?;
         debug_assert!(stdout.is_none());
         Ok(TimedBatch {
             elapsed,
-            query_repetitions,
+            query_count,
+            sequence_sha256: sha256_hex(query_sequence_sql.as_bytes()),
         })
     }
 
@@ -137,25 +146,24 @@ impl EnginePaths {
     }
 }
 
-fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Result<String, String> {
-    if query_repetitions == 0 {
-        return Err("query repetition count must be positive".to_owned());
+fn sql_batch(
+    setup_sql: &str,
+    query_sequence_sql: &str,
+    query_count: usize,
+) -> Result<String, String> {
+    if query_count == 0 {
+        return Err("query sequence count must be positive".to_owned());
     }
-    let query_bytes = query_sql
-        .len()
-        .checked_add(1)
-        .and_then(|length| length.checked_mul(query_repetitions))
-        .ok_or_else(|| "amplified SQL batch is too large".to_owned())?;
+    if query_sequence_sql.is_empty() {
+        return Err("query sequence SQL must not be empty".to_owned());
+    }
     let capacity = setup_sql
         .len()
-        .checked_add(query_bytes)
+        .checked_add(query_sequence_sql.len())
         .ok_or_else(|| "amplified SQL batch is too large".to_owned())?;
     let mut batch = String::with_capacity(capacity);
     batch.push_str(setup_sql);
-    for _ in 0..query_repetitions {
-        batch.push_str(query_sql);
-        batch.push('\n');
-    }
+    batch.push_str(query_sequence_sql);
     Ok(batch)
 }
 
@@ -272,15 +280,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn amplification_repeats_the_same_query_exactly() {
-        let batch =
-            sql_batch("CREATE TABLE t (n Int64);\n", "SELECT n FROM t;", 3).expect("valid batch");
+    fn batch_preserves_the_query_sequence_bytes_exactly() {
+        let sequence = "SELECT n FROM t WHERE n = 1;\nSELECT n FROM t WHERE n = 2;\n";
+        let batch = sql_batch("CREATE TABLE t (n Int64);\n", sequence, 2).expect("valid batch");
         assert_eq!(batch.matches("CREATE TABLE").count(), 1);
-        assert_eq!(batch.matches("SELECT n FROM t;").count(), 3);
+        assert_eq!(&batch["CREATE TABLE t (n Int64);\n".len()..], sequence);
+        assert_eq!(
+            sha256_hex(sequence.as_bytes()),
+            sha256_hex(&batch.as_bytes()["CREATE TABLE t (n Int64);\n".len()..])
+        );
     }
 
     #[test]
     fn amplification_must_be_positive() {
-        assert!(sql_batch("", "SELECT 1;", 0).is_err());
+        assert!(sql_batch("", "SELECT 1;\n", 0).is_err());
+        assert!(sql_batch("", "", 1).is_err());
     }
 }
