@@ -80,12 +80,17 @@ impl EnginePaths {
         let mut command = match engine {
             Engine::RustHouse => {
                 let mut command = Command::new(&self.rusthouse);
-                command.args(["--format", "csv"]);
+                command.args(["--format", engine.output_format(capture_stdout)]);
                 command
             }
             Engine::ClickHouse => {
                 let mut command = Command::new(&self.clickhouse);
-                command.args(["local", "--multiquery", "--output-format", "CSVWithNames"]);
+                command.args([
+                    "local",
+                    "--multiquery",
+                    "--output-format",
+                    engine.output_format(capture_stdout),
+                ]);
                 command
             }
         };
@@ -171,6 +176,15 @@ impl Engine {
         match self {
             Self::RustHouse => &paths.rusthouse,
             Self::ClickHouse => &paths.clickhouse,
+        }
+    }
+
+    fn output_format(self, correctness_output: bool) -> &'static str {
+        match (self, correctness_output) {
+            (Self::RustHouse, true) => "csv-with-names-and-types",
+            (Self::ClickHouse, true) => "CSVWithNamesAndTypes",
+            (Self::RustHouse, false) => "csv",
+            (Self::ClickHouse, false) => "CSVWithNames",
         }
     }
 }
@@ -282,5 +296,19 @@ mod tests {
     #[test]
     fn amplification_must_be_positive() {
         assert!(sql_batch("", "SELECT 1;", 0).is_err());
+    }
+
+    #[test]
+    fn correctness_outputs_are_typed_without_changing_timed_formats() {
+        assert_eq!(
+            Engine::RustHouse.output_format(true),
+            "csv-with-names-and-types"
+        );
+        assert_eq!(
+            Engine::ClickHouse.output_format(true),
+            "CSVWithNamesAndTypes"
+        );
+        assert_eq!(Engine::RustHouse.output_format(false), "csv");
+        assert_eq!(Engine::ClickHouse.output_format(false), "CSVWithNames");
     }
 }

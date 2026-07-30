@@ -1,4 +1,30 @@
-use crate::normalize::ColumnType;
+use crate::normalize::{ColumnSpec, ColumnType};
+
+const INT64: &[&str] = &["Int64"];
+const UINT64: &[&str] = &["UInt64"];
+const FLOAT64: &[&str] = &["Float64"];
+const BOOL: &[&str] = &["Bool"];
+const STRING: &[&str] = &["String"];
+
+const fn integer(name: &'static str) -> ColumnSpec {
+    ColumnSpec::new(name, ColumnType::Integer, INT64, INT64)
+}
+
+const fn count(name: &'static str) -> ColumnSpec {
+    ColumnSpec::new(name, ColumnType::Integer, INT64, UINT64)
+}
+
+const fn float(name: &'static str) -> ColumnSpec {
+    ColumnSpec::new(name, ColumnType::Float, FLOAT64, FLOAT64)
+}
+
+const fn boolean(name: &'static str) -> ColumnSpec {
+    ColumnSpec::new(name, ColumnType::Boolean, BOOL, BOOL)
+}
+
+const fn string(name: &'static str) -> ColumnSpec {
+    ColumnSpec::new(name, ColumnType::String, STRING, STRING)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Family {
@@ -30,7 +56,7 @@ pub struct Workload {
     pub name: &'static str,
     pub family: Family,
     pub sql: String,
-    pub columns: Vec<(&'static str, ColumnType)>,
+    pub columns: Vec<ColumnSpec>,
 }
 
 pub fn workloads(row_count: usize) -> Vec<Workload> {
@@ -41,12 +67,12 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::FullScanAggregate,
             sql: "SELECT COUNT(*) AS row_count, SUM(uniform_num) AS uniform_total, SUM(skewed_num) AS skewed_total, MIN(large_int) AS large_min, MAX(large_int) AS large_max, AVG(score) AS score_mean FROM parity_data;".to_owned(),
             columns: vec![
-                ("row_count", ColumnType::Integer),
-                ("uniform_total", ColumnType::Integer),
-                ("skewed_total", ColumnType::Integer),
-                ("large_min", ColumnType::Integer),
-                ("large_max", ColumnType::Integer),
-                ("score_mean", ColumnType::Float),
+                count("row_count"),
+                integer("uniform_total"),
+                integer("skewed_total"),
+                integer("large_min"),
+                integer("large_max"),
+                float("score_mean"),
             ],
         },
         Workload {
@@ -54,10 +80,10 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::SelectiveFilter,
             sql: format!("SELECT id, payload, large_int, flag FROM parity_data WHERE id = {selected_id} ORDER BY id;"),
             columns: vec![
-                ("id", ColumnType::Integer),
-                ("payload", ColumnType::String),
-                ("large_int", ColumnType::Integer),
-                ("flag", ColumnType::Boolean),
+                integer("id"),
+                string("payload"),
+                integer("large_int"),
+                boolean("flag"),
             ],
         },
         Workload {
@@ -65,8 +91,8 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::CompoundFilter,
             sql: "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total FROM parity_data WHERE (flag = true AND uniform_num < -250000) OR (flag = false AND skewed_num >= 5);".to_owned(),
             columns: vec![
-                ("matched", ColumnType::Integer),
-                ("total", ColumnType::Integer),
+                count("matched"),
+                integer("total"),
             ],
         },
         Workload {
@@ -74,8 +100,8 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::NonselectiveFilter,
             sql: "SELECT COUNT(*) AS matched, SUM(skewed_num) AS total FROM parity_data WHERE uniform_num >= -950000;".to_owned(),
             columns: vec![
-                ("matched", ColumnType::Integer),
-                ("total", ColumnType::Integer),
+                count("matched"),
+                integer("total"),
             ],
         },
         Workload {
@@ -83,11 +109,11 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::LowCardinalityGroupBy,
             sql: "SELECT low_key, flag, COUNT(*) AS row_count, SUM(uniform_num) AS total, AVG(score) AS mean_score FROM parity_data GROUP BY low_key, flag ORDER BY low_key, flag;".to_owned(),
             columns: vec![
-                ("low_key", ColumnType::String),
-                ("flag", ColumnType::Boolean),
-                ("row_count", ColumnType::Integer),
-                ("total", ColumnType::Integer),
-                ("mean_score", ColumnType::Float),
+                string("low_key"),
+                boolean("flag"),
+                count("row_count"),
+                integer("total"),
+                float("mean_score"),
             ],
         },
         Workload {
@@ -95,9 +121,9 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::HighCardinalityGroupBy,
             sql: "SELECT high_key, COUNT(*) AS row_count, SUM(skewed_num) AS total FROM parity_data GROUP BY high_key ORDER BY high_key LIMIT 100;".to_owned(),
             columns: vec![
-                ("high_key", ColumnType::String),
-                ("row_count", ColumnType::Integer),
-                ("total", ColumnType::Integer),
+                string("high_key"),
+                count("row_count"),
+                integer("total"),
             ],
         },
         Workload {
@@ -105,10 +131,10 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::OrderByLimit,
             sql: "SELECT id, score, payload, uniform_num FROM parity_data ORDER BY score DESC, id LIMIT 25;".to_owned(),
             columns: vec![
-                ("id", ColumnType::Integer),
-                ("score", ColumnType::Float),
-                ("payload", ColumnType::String),
-                ("uniform_num", ColumnType::Integer),
+                integer("id"),
+                float("score"),
+                string("payload"),
+                integer("uniform_num"),
             ],
         },
         Workload {
@@ -116,9 +142,9 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             family: Family::OrderByLimit,
             sql: "SELECT payload, id, flag FROM parity_data ORDER BY payload, id DESC LIMIT 25;".to_owned(),
             columns: vec![
-                ("payload", ColumnType::String),
-                ("id", ColumnType::Integer),
-                ("flag", ColumnType::Boolean),
+                string("payload"),
+                integer("id"),
+                boolean("flag"),
             ],
         },
     ]
@@ -176,5 +202,17 @@ mod tests {
     fn selective_predicate_varies_with_row_count() {
         assert!(workloads(100)[1].sql.contains("id = 50"));
         assert!(workloads(1_000)[1].sql.contains("id = 500"));
+    }
+
+    #[test]
+    fn emitted_type_compatibility_is_expression_specific() {
+        let workloads = workloads(1_000);
+        let count = workloads[0].columns[0];
+        let projected_id = workloads[1].columns[0];
+
+        assert_eq!(count.compatible_types.rusthouse, &["Int64"]);
+        assert_eq!(count.compatible_types.clickhouse, &["UInt64"]);
+        assert_eq!(projected_id.compatible_types.rusthouse, &["Int64"]);
+        assert_eq!(projected_id.compatible_types.clickhouse, &["Int64"]);
     }
 }

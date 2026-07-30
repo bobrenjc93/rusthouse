@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
+use normalize::{ColumnSpec, ObservedColumn, OutputSchemas, compare_outputs};
 use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
@@ -56,6 +56,7 @@ struct CaseResult {
     family: &'static str,
     row_count: usize,
     query_amplification: usize,
+    schemas: OutputSchemas,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
     clickhouse_primary_batch_median_ms: f64,
@@ -76,13 +77,13 @@ struct CorrectnessGate {
 impl CorrectnessGate {
     fn verify(
         &mut self,
-        columns: &[(&str, ColumnType)],
+        columns: &[ColumnSpec],
         rusthouse: &TimedOutput,
         clickhouse: &TimedOutput,
-    ) -> Result<(), String> {
-        compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
+    ) -> Result<OutputSchemas, String> {
+        let schemas = compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
         self.passed = true;
-        Ok(())
+        Ok(schemas)
     }
 }
 
@@ -175,7 +176,7 @@ fn run(config: Config) -> Result<Report, String> {
             let (rusthouse_output, clickhouse_output) =
                 execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
             let mut correctness_gate = CorrectnessGate::default();
-            correctness_gate
+            let schemas = correctness_gate
                 .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
                 .map_err(|error| {
                     format!(
@@ -274,6 +275,7 @@ fn run(config: Config) -> Result<Report, String> {
                 family: workload.family.name(),
                 row_count,
                 query_amplification: settings.query_amplification,
+                schemas,
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
@@ -540,7 +542,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -578,11 +580,19 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"rusthouse_schema\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
-            case.query_amplification,
+            case.query_amplification
+        )
+        .expect("writing to String cannot fail");
+        write_schema(&mut output, &case.schemas.rusthouse);
+        output.push_str(",\"clickhouse_schema\":");
+        write_schema(&mut output, &case.schemas.clickhouse);
+        write!(
+            output,
+            ",\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
@@ -612,6 +622,23 @@ fn details_json(
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_schema(output: &mut String, schema: &[ObservedColumn]) {
+    output.push('[');
+    for (index, column) in schema.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(
+            output,
+            "{{\"name\":{},\"type\":{}}}",
+            json_string(&column.name),
+            json_string(&column.data_type)
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push(']');
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -671,6 +698,18 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normalize::ColumnType;
+
+    const INT64: &[&str] = &["Int64"];
+    const BOOL: &[&str] = &["Bool"];
+
+    fn column(
+        name: &'static str,
+        value_type: ColumnType,
+        emitted_types: &'static [&'static str],
+    ) -> ColumnSpec {
+        ColumnSpec::new(name, value_type, emitted_types, emitted_types)
+    }
 
     fn batch(milliseconds: f64, repetitions: usize) -> TimedBatch {
         TimedBatch {
@@ -690,9 +729,9 @@ mod tests {
         let mut gate = CorrectnessGate::default();
         let error = gate
             .verify(
-                &[("n", ColumnType::Integer)],
-                &output("n\n1\n"),
-                &output("n\n2\n"),
+                &[column("n", ColumnType::Integer, INT64)],
+                &output("n\nInt64\n1\n"),
+                &output("n\nInt64\n2\n"),
             )
             .expect_err("mismatch must fail");
 
@@ -755,9 +794,9 @@ mod tests {
     fn normalized_match_opens_gate_and_accepts_positive_timing() {
         let mut gate = CorrectnessGate::default();
         gate.verify(
-            &[("enabled", ColumnType::Boolean)],
-            &output("enabled\ntrue\n"),
-            &output("enabled\n1\n"),
+            &[column("enabled", ColumnType::Boolean, BOOL)],
+            &output("enabled\nBool\ntrue\n"),
+            &output("enabled\nBool\n1\n"),
         )
         .expect("matching output");
 
@@ -782,6 +821,72 @@ mod tests {
             saturated_cases: 8,
         };
         assert!(ensure_primary_headroom(&score, 8).is_err());
+    }
+
+    #[test]
+    fn details_retain_both_observed_schemas() {
+        let timing = || TimingSeries {
+            rusthouse_batch_ms: vec![1.0],
+            clickhouse_batch_ms: vec![2.0],
+            rusthouse_per_query_ms: vec![1.0],
+            clickhouse_per_query_ms: vec![2.0],
+        };
+        let cases = [CaseResult {
+            workload: "count",
+            family: "aggregate",
+            row_count: 1,
+            query_amplification: 256,
+            schemas: OutputSchemas {
+                rusthouse: vec![ObservedColumn {
+                    name: "row_count".to_owned(),
+                    data_type: "Int64".to_owned(),
+                }],
+                clickhouse: vec![ObservedColumn {
+                    name: "row_count".to_owned(),
+                    data_type: "UInt64".to_owned(),
+                }],
+            },
+            primary: timing(),
+            rusthouse_primary_batch_median_ms: 1.0,
+            clickhouse_primary_batch_median_ms: 2.0,
+            rusthouse_primary_median_ms: 1.0,
+            clickhouse_primary_median_ms: 2.0,
+            primary_ratio: 2.0,
+            end_to_end: timing(),
+            rusthouse_end_to_end_median_ms: 1.0,
+            clickhouse_end_to_end_median_ms: 2.0,
+            end_to_end_ratio: 2.0,
+        }];
+        let score = ScoreBreakdown {
+            score: 100.0,
+            saturated_cases: 1,
+        };
+        let details = details_json(
+            &Config {
+                mode: config::Mode::Quick,
+                seed: 1,
+                rusthouse: PathBuf::from("rusthouse"),
+                clickhouse: PathBuf::from("clickhouse"),
+                details: None,
+            },
+            &ClickHouseIdentity {
+                version_output: "ClickHouse 26.7.1".to_owned(),
+                sha256: "checksum".to_owned(),
+            },
+            &cases,
+            score,
+            score,
+            1,
+        );
+
+        assert!(details.contains("\"schema_version\":3"));
+        assert!(
+            details.contains("\"rusthouse_schema\":[{\"name\":\"row_count\",\"type\":\"Int64\"}]")
+        );
+        assert!(
+            details
+                .contains("\"clickhouse_schema\":[{\"name\":\"row_count\",\"type\":\"UInt64\"}]")
+        );
     }
 
     #[test]

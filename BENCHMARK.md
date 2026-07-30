@@ -64,7 +64,7 @@ The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 1
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, both observed result schemas, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -97,9 +97,11 @@ The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both e
 
 Correctness and timing use separate processes. Before any timing for a case, the harness runs setup plus one unamplified query on each engine, captures both outputs, and opens that case's timing gate only after normalization succeeds. Amplified and end-to-end sample acceptance both require the open gate. Any process or comparison failure rejects the entire run; failed or absent gates cannot contribute timings.
 
-The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
+Correctness processes use typed CSV: RustHouse's `csv-with-names-and-types` and ClickHouse's `CSVWithNamesAndTypes` each emit a name row, a type row, and value rows. Every selected expression declares compatible emitted types for each engine. For example, `COUNT(*)` explicitly permits RustHouse `Int64` and ClickHouse `UInt64`, while an `Int64` projection requires `Int64` from both. Both complete schemas are validated before any cell is interpreted, so textually equal values cannot hide an incompatible schema, and the observed schemas are retained per case in details JSON. Timing processes retain the prior names-only formats and discard stdout, so this gate does not alter timing or score normalization.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+After schema validation, the normalizer compares values using declared semantic types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
+
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, typed CSV normalization, incompatible-schema rejection, observed-schema retention, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
 
 ## Timing and calibration
 

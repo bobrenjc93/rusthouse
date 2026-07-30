@@ -7,6 +7,7 @@ use crate::value::Value;
 pub enum OutputFormat {
     Table,
     Csv,
+    CsvWithNamesAndTypes,
     Json,
 }
 
@@ -16,6 +17,7 @@ impl OutputFormat {
         match value.to_ascii_lowercase().as_str() {
             "table" => Some(Self::Table),
             "csv" => Some(Self::Csv),
+            "csv-with-names-and-types" | "csvwithnamesandtypes" => Some(Self::CsvWithNamesAndTypes),
             "json" => Some(Self::Json),
             _ => None,
         }
@@ -27,6 +29,7 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     match format {
         OutputFormat::Table => render_table(result),
         OutputFormat::Csv => render_csv(result),
+        OutputFormat::CsvWithNamesAndTypes => render_csv_with_names_and_types(result),
         OutputFormat::Json => render_json(result),
     }
 }
@@ -122,6 +125,25 @@ fn render_csv(result: &QueryResult) -> String {
         &mut output,
         result.columns.iter().map(|column| column.name.as_str()),
     );
+    for row in &result.rows {
+        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
+        write_csv_row(&mut output, values.iter().map(String::as_str));
+    }
+    output
+}
+
+fn render_csv_with_names_and_types(result: &QueryResult) -> String {
+    let mut output = String::new();
+    write_csv_row(
+        &mut output,
+        result.columns.iter().map(|column| column.name.as_str()),
+    );
+    let types = result
+        .columns
+        .iter()
+        .map(|column| column.data_type.to_string())
+        .collect::<Vec<_>>();
+    write_csv_row(&mut output, types.iter().map(String::as_str));
     for row in &result.rows {
         let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
         write_csv_row(&mut output, values.iter().map(String::as_str));
@@ -237,6 +259,14 @@ mod tests {
         assert_eq!(
             render(&result(), OutputFormat::Csv),
             "id,note\n1,\"quote: \"\", comma\"\n"
+        );
+    }
+
+    #[test]
+    fn renders_csv_with_names_types_and_values() {
+        assert_eq!(
+            render(&result(), OutputFormat::CsvWithNamesAndTypes),
+            "id,note\nInt64,String\n1,\"quote: \"\", comma\"\n"
         );
     }
 

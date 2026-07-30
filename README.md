@@ -12,7 +12,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
-- table, CSV, and JSON output from the CLI
+- table, CSV, typed CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
@@ -37,7 +37,7 @@ cargo run -- --execute "
 "
 ~~~
 
-Choose table (the default), csv, or json:
+Choose `table` (the default), `csv`, `csv-with-names-and-types`, or `json`. Typed CSV writes a column-name row followed by a type-name row and the values:
 
 ~~~bash
 cargo run -- --format json --execute \

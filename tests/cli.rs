@@ -95,6 +95,27 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn typed_csv_emits_names_types_and_values() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format",
+            "csv-with-names-and-types",
+            "--execute",
+            "CREATE TABLE notes (label String, active Bool);\
+             INSERT INTO notes VALUES ('hello, world', true);\
+             SELECT * FROM notes;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "label,active\nString,Bool\n\"hello, world\",true\n"
+    );
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

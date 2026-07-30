@@ -13,7 +13,7 @@ USAGE:
 
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
-    -f, --format <FORMAT>     Output format: table (default), csv, or json
+    -f, --format <FORMAT>     Output format: table (default), csv, csv-with-names-and-types, or json
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -119,7 +119,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     .next()
                     .ok_or_else(|| format!("{argument} requires a format"))?;
                 format = OutputFormat::parse(&value).ok_or_else(|| {
-                    format!("unknown output format '{value}'; expected table, csv, or json")
+                    format!("unknown output format '{value}'; expected table, csv, csv-with-names-and-types, or json")
                 })?;
             }
             _ if argument.starts_with("--execute=") => {
@@ -131,7 +131,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
             _ if argument.starts_with("--format=") => {
                 let value = &argument["--format=".len()..];
                 format = OutputFormat::parse(value).ok_or_else(|| {
-                    format!("unknown output format '{value}'; expected table, csv, or json")
+                    format!("unknown output format '{value}'; expected table, csv, csv-with-names-and-types, or json")
                 })?;
             }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
@@ -163,7 +163,7 @@ mod tests {
     fn rejects_unknown_formats() {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
-        assert!(error.contains("table, csv, or json"));
+        assert!(error.contains("table, csv, csv-with-names-and-types, or json"));
     }
 
     #[test]
