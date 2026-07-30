@@ -15,6 +15,11 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
+    AlterTableAddColumn {
+        table: String,
+        column: ColumnDef,
+        after: Option<String>,
+    },
     Select(Select),
 }
 
@@ -374,12 +379,14 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_keyword("CREATE") {
             self.parse_create()
+        } else if self.eat_keyword("ALTER") {
+            self.parse_alter()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, ALTER, INSERT, or SELECT")
         }
     }
 
@@ -389,31 +396,50 @@ impl Parser {
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
-            let column_name = self.expect_identifier("column name")?;
-            if is_reserved_column_name(&column_name) {
-                return Err(Error::ReservedIdentifier {
-                    identifier: column_name,
-                    context: "column name".to_owned(),
-                });
-            }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
-            columns.push(ColumnDef {
-                name: column_name,
-                data_type,
-            });
+            columns.push(self.parse_column_definition()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("ADD")?;
+        self.expect_keyword("COLUMN")?;
+        let column = self.parse_column_definition()?;
+        let after = if self.eat_keyword("AFTER") {
+            Some(self.expect_identifier("column name after AFTER")?)
+        } else {
+            None
+        };
+        Ok(Statement::AlterTableAddColumn {
+            table,
+            column,
+            after,
+        })
+    }
+
+    fn parse_column_definition(&mut self) -> Result<ColumnDef> {
+        let name = self.expect_identifier("column name")?;
+        if is_reserved_column_name(&name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: name,
+                context: "column name".to_owned(),
+            });
+        }
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+            ),
+        })?;
+        Ok(ColumnDef { name, data_type })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -782,6 +808,32 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_add_column_with_optional_placement() {
+        let statements = parse("ALTER TABLE events ADD COLUMN score Float64 AFTER id")
+            .expect("valid alter table");
+        let Statement::AlterTableAddColumn {
+            table,
+            column,
+            after,
+        } = &statements[0]
+        else {
+            panic!("expected alter table");
+        };
+
+        assert_eq!(table, "events");
+        assert_eq!(column.name, "score");
+        assert_eq!(column.data_type, DataType::Float64);
+        assert_eq!(after.as_deref(), Some("id"));
+
+        let statements =
+            parse("ALTER TABLE events ADD COLUMN active Bool").expect("valid appended column");
+        assert!(matches!(
+            &statements[0],
+            Statement::AlterTableAddColumn { after: None, .. }
+        ));
     }
 
     #[test]

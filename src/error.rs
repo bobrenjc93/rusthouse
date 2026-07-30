@@ -30,6 +30,7 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    Capacity(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +74,7 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::Capacity(context) => write!(f, "unable to allocate storage for {context}"),
         }
     }
 }

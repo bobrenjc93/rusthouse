@@ -1,3 +1,4 @@
+use rusthouse::storage::Column;
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
@@ -9,6 +10,184 @@ fn last_query(results: Vec<StatementResult>) -> QueryResult {
 
 fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
     last_query(database.execute(sql).expect("SQL succeeds"))
+}
+
+#[test]
+fn add_column_backfills_every_scalar_and_changes_positional_width() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE facts (id Int64, label String);
+             INSERT INTO facts VALUES (1, 'one'), (2, 'two');
+             ALTER TABLE facts ADD COLUMN count Int64 AFTER id;
+             ALTER TABLE facts ADD COLUMN ratio Float64 AFTER COUNT;
+             ALTER TABLE facts ADD COLUMN enabled Bool;
+             ALTER TABLE facts ADD COLUMN note String AFTER ratio;",
+        )
+        .expect("schema evolution succeeds");
+
+    let result = execute_query(&mut database, "SELECT * FROM facts ORDER BY id;");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", DataType::Int64),
+            ("count", DataType::Int64),
+            ("ratio", DataType::Float64),
+            ("note", DataType::String),
+            ("label", DataType::String),
+            ("enabled", DataType::Bool),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Float64(0.0),
+                Value::String(String::new()),
+                Value::String("one".to_owned()),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(0),
+                Value::Float64(0.0),
+                Value::String(String::new()),
+                Value::String("two".to_owned()),
+                Value::Bool(false),
+            ],
+        ]
+    );
+
+    let width_error = database
+        .execute("INSERT INTO facts VALUES (3, 'three');")
+        .expect_err("old positional width is rejected");
+    assert_eq!(
+        width_error,
+        Error::RowLength {
+            table: "facts".to_owned(),
+            expected: 6,
+            actual: 2,
+        }
+    );
+
+    database
+        .execute("INSERT INTO facts VALUES (3, 7, 1.5, 'new', 'three', true);")
+        .expect("new positional width succeeds");
+    let inserted = execute_query(&mut database, "SELECT * FROM facts WHERE id = 3;");
+    assert_eq!(
+        inserted.rows,
+        vec![vec![
+            Value::Int64(3),
+            Value::Int64(7),
+            Value::Float64(1.5),
+            Value::String("new".to_owned()),
+            Value::String("three".to_owned()),
+            Value::Bool(true),
+        ]]
+    );
+}
+
+#[test]
+fn failed_add_column_rolls_back_schema_indexes_and_data() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String);
+             INSERT INTO events VALUES (1, 'kept');",
+        )
+        .expect("setup succeeds");
+
+    let duplicate = database
+        .execute("ALTER TABLE events ADD COLUMN ID Bool;")
+        .expect_err("case-insensitive duplicate");
+    assert_eq!(duplicate, Error::DuplicateColumn("ID".to_owned()));
+
+    let missing = database
+        .execute("ALTER TABLE events ADD COLUMN active Bool AFTER absent;")
+        .expect_err("missing placement target");
+    assert_eq!(
+        missing,
+        Error::ColumnNotFound {
+            table: "events".to_owned(),
+            column: "absent".to_owned(),
+        }
+    );
+
+    let bad_type = database
+        .execute("ALTER TABLE events ADD COLUMN score Decimal;")
+        .expect_err("unknown type");
+    assert!(matches!(bad_type, Error::Sql { .. }));
+
+    let unchanged = execute_query(&mut database, "SELECT * FROM events;");
+    assert_eq!(
+        unchanged
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "label"]
+    );
+    assert_eq!(
+        unchanged.rows,
+        vec![vec![Value::Int64(1), Value::String("kept".to_owned())]]
+    );
+
+    database
+        .execute("ALTER TABLE events ADD COLUMN active Bool AFTER ID;")
+        .expect("indexes remain usable after errors");
+    let table = database.catalog().table("events").expect("table remains");
+    assert_eq!(table.column_index("id"), Ok(0));
+    assert_eq!(table.column_index("ACTIVE"), Ok(1));
+    assert_eq!(table.column_index("label"), Ok(2));
+}
+
+#[test]
+fn add_column_backfills_a_large_table() {
+    const ROWS: usize = 50_000;
+    let values = (0..ROWS)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE large_table (id Int64);")
+        .expect("create table");
+    database
+        .execute(&format!("INSERT INTO large_table VALUES {values}"))
+        .expect("insert large table");
+
+    database
+        .execute(
+            "ALTER TABLE large_table ADD COLUMN marker String AFTER id;
+             ALTER TABLE large_table ADD COLUMN enabled Bool;",
+        )
+        .expect("backfill large table");
+
+    let table = database
+        .catalog()
+        .table("large_table")
+        .expect("large table");
+    assert_eq!(table.row_count(), ROWS);
+    assert!(matches!(
+        &table.columns()[1],
+        Column::String(values) if values.len() == ROWS && values.iter().all(String::is_empty)
+    ));
+    assert!(matches!(
+        &table.columns()[2],
+        Column::Bool(values) if values.len() == ROWS && values.iter().all(|value| !value)
+    ));
+
+    let count = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows FROM large_table WHERE marker = '' AND enabled = false;",
+    );
+    assert_eq!(count.rows, vec![vec![Value::Int64(ROWS as i64)]]);
 }
 
 #[test]

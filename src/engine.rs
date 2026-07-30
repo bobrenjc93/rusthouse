@@ -86,6 +86,17 @@ impl Database {
                     affected_rows,
                 })
             }
+            Statement::AlterTableAddColumn {
+                table,
+                column,
+                after,
+            } => {
+                self.catalog.add_column(&table, column, after.as_deref())?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
     }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::value::{DataType, Value, ValueRef};
@@ -31,6 +31,24 @@ impl Column {
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
+        }
+    }
+
+    fn with_default(data_type: DataType, len: usize) -> Result<Self> {
+        fn filled<T: Clone>(value: T, len: usize) -> Result<Vec<T>> {
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(len)
+                .map_err(|_| Error::Capacity(format!("a default-filled column with {len} rows")))?;
+            values.resize(len, value);
+            Ok(values)
+        }
+
+        match data_type {
+            DataType::Int64 => filled(0, len).map(Self::Int64),
+            DataType::Float64 => filled(0.0, len).map(Self::Float64),
+            DataType::Bool => filled(false, len).map(Self::Bool),
+            DataType::String => filled(String::new(), len).map(Self::String),
         }
     }
 
@@ -94,6 +112,7 @@ pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
+    column_indexes: HashMap<String, usize>,
     row_count: usize,
 }
 
@@ -104,15 +123,18 @@ impl Table {
                 "a table must contain at least one column".to_owned(),
             ));
         }
-        let mut column_names = HashSet::with_capacity(schema.len());
-        for field in &schema {
+        let mut column_indexes = HashMap::with_capacity(schema.len());
+        for (index, field) in schema.iter().enumerate() {
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
                     context: "column name".to_owned(),
                 });
             }
-            if !column_names.insert(field.name.to_ascii_lowercase()) {
+            if column_indexes
+                .insert(normalize(&field.name), index)
+                .is_some()
+            {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
@@ -124,6 +146,7 @@ impl Table {
             name,
             schema,
             columns,
+            column_indexes,
             row_count: 0,
         })
     }
@@ -149,13 +172,61 @@ impl Table {
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
-        self.schema
-            .iter()
-            .position(|field| field.name.eq_ignore_ascii_case(name))
+        self.column_indexes
+            .get(&normalize(name))
+            .copied()
             .ok_or_else(|| Error::ColumnNotFound {
                 table: self.name.clone(),
                 column: name.to_owned(),
             })
+    }
+
+    /// Adds a default-filled physical column and its schema entry as one operation.
+    pub fn add_column(&mut self, field: ColumnDef, after: Option<&str>) -> Result<()> {
+        if is_reserved_column_name(&field.name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: field.name,
+                context: "column name".to_owned(),
+            });
+        }
+
+        let key = normalize(&field.name);
+        if self.column_indexes.contains_key(&key) {
+            return Err(Error::DuplicateColumn(field.name));
+        }
+
+        let insertion_index = match after {
+            Some(target) => self.column_index(target)? + 1,
+            None => self.schema.len(),
+        };
+        let column = Column::with_default(field.data_type, self.row_count)?;
+
+        self.schema
+            .try_reserve(1)
+            .map_err(|_| Error::Capacity("table schema".to_owned()))?;
+        self.columns
+            .try_reserve(1)
+            .map_err(|_| Error::Capacity("table columns".to_owned()))?;
+        self.column_indexes
+            .try_reserve(1)
+            .map_err(|_| Error::Capacity("column-name index".to_owned()))?;
+
+        for index in self.column_indexes.values_mut() {
+            if *index >= insertion_index {
+                *index += 1;
+            }
+        }
+        self.schema.insert(insertion_index, field);
+        self.columns.insert(insertion_index, column);
+        self.column_indexes.insert(key, insertion_index);
+
+        debug_assert_eq!(self.schema.len(), self.columns.len());
+        debug_assert!(
+            self.columns
+                .iter()
+                .all(|column| column.len() == self.row_count)
+        );
+        Ok(())
     }
 
     /// Checks a row without mutating any physical column.
@@ -196,6 +267,10 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+}
+
+fn normalize(identifier: &str) -> String {
+    identifier.to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -240,5 +315,71 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn added_columns_backfill_and_shift_name_indexes() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+
+        table
+            .add_column(
+                ColumnDef {
+                    name: "active".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                Some("ID"),
+            )
+            .expect("add column");
+
+        assert_eq!(table.column_index("id"), Ok(0));
+        assert_eq!(table.column_index("ACTIVE"), Ok(1));
+        assert_eq!(table.column_index("label"), Ok(2));
+        assert!(matches!(&table.columns()[1], Column::Bool(values) if values == &[false]));
+    }
+
+    #[test]
+    fn failed_add_column_leaves_schema_and_rows_unchanged() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+        let schema = table.schema().to_vec();
+
+        let duplicate = table
+            .add_column(
+                ColumnDef {
+                    name: "ID".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                None,
+            )
+            .expect_err("duplicate name");
+        assert_eq!(duplicate, Error::DuplicateColumn("ID".to_owned()));
+
+        let missing_target = table
+            .add_column(
+                ColumnDef {
+                    name: "active".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                Some("missing"),
+            )
+            .expect_err("missing AFTER target");
+        assert_eq!(
+            missing_target,
+            Error::ColumnNotFound {
+                table: "events".to_owned(),
+                column: "missing".to_owned(),
+            }
+        );
+
+        assert_eq!(table.schema(), schema);
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.columns()[0].value(0), Value::Int64(7));
+        assert_eq!(table.columns()[1].value(0), Value::String("ok".to_owned()));
+        assert!(table.column_index("active").is_err());
     }
 }

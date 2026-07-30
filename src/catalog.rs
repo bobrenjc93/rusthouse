@@ -36,6 +36,15 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    pub fn add_column(
+        &mut self,
+        table: &str,
+        column: ColumnDef,
+        after: Option<&str>,
+    ) -> Result<()> {
+        self.table_mut(table)?.add_column(column, after)
+    }
 }
 
 fn normalize(identifier: &str) -> String {

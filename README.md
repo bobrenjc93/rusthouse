@@ -5,6 +5,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 ## What works
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
+- ALTER TABLE ... ADD COLUMN name Type [AFTER column], with typed default backfill
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -28,6 +29,7 @@ cargo run -- --execute "
     ('west', 10, true),
     ('east', 4, false),
     ('west', 7, true);
+  ALTER TABLE sales ADD COLUMN note String AFTER region;
   SELECT region, COUNT(*) AS orders, SUM(amount) AS total, AVG(amount) AS mean
   FROM sales
   WHERE online = true
