@@ -6,10 +6,11 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
-- SELECT * and named projections, with optional AS aliases
-- WHERE comparisons using =, !=, <>, <, <=, >, and >=
+- SELECT *, named columns, and numeric expressions, with optional AS aliases
+- checked numeric expressions with unary signs and +, -, *, and / precedence
+- WHERE comparisons using =, !=, <>, <, <=, >, and >=, including expression operands
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- COUNT, SUM, MIN, MAX, and AVG, including expression arguments
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
@@ -81,9 +82,11 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+Int64 expressions retain Int64 results (including integer division); mixing in a Float64 produces Float64. Expression types are resolved before scanning. Integer overflow, division by zero, and non-finite Float64 results are returned as explicit errors.
+
+To keep recursive processing bounded, each numeric expression and WHERE predicate is limited to 64 levels of nesting and 256 AST nodes. Queries over either limit return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

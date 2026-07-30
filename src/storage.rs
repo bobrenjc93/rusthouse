@@ -73,10 +73,6 @@ impl Column {
         }
     }
 
-    pub(crate) fn cmp_at(&self, left: usize, right: usize) -> std::cmp::Ordering {
-        self.value_ref(left).cmp(&self.value_ref(right))
-    }
-
     fn push(&mut self, value: Value) {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(value),

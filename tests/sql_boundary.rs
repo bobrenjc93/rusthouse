@@ -524,3 +524,169 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn checked_expressions_work_across_query_surfaces() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales_expr (
+                category String, price Float64, quantity Int64, adjustment Int64
+             );
+             INSERT INTO sales_expr VALUES
+                ('a', 10.0, 2, 1),
+                ('a', 5.0, 3, -1),
+                ('b', 4.0, 4, 2);",
+        )
+        .expect("setup succeeds");
+
+    let projected = execute_query(
+        &mut database,
+        "SELECT quantity + adjustment * 2 AS score,
+                -(quantity - adjustment) AS delta,
+                +price / 2.0 AS half,
+                quantity / 2 AS whole
+         FROM sales_expr
+         WHERE price * quantity + adjustment >= 14
+         ORDER BY score DESC;",
+    );
+    assert_eq!(
+        projected
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Int64,
+        ]
+    );
+    assert_eq!(
+        projected.rows,
+        vec![
+            vec![
+                Value::Int64(8),
+                Value::Int64(-2),
+                Value::Float64(2.0),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::Int64(-1),
+                Value::Float64(5.0),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Int64(-4),
+                Value::Float64(2.5),
+                Value::Int64(1),
+            ],
+        ]
+    );
+
+    let aggregated = execute_query(
+        &mut database,
+        "SELECT category,
+                SUM(price * quantity + adjustment) AS total,
+                AVG(quantity + adjustment) AS mean,
+                MIN(-quantity) AS lowest
+         FROM sales_expr
+         GROUP BY category
+         ORDER BY total DESC;",
+    );
+    assert_eq!(
+        aggregated.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Float64(35.0),
+                Value::Float64(2.5),
+                Value::Int64(-3),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Float64(18.0),
+                Value::Float64(6.0),
+                Value::Int64(-4),
+            ],
+        ]
+    );
+
+    let grouped_expression = execute_query(
+        &mut database,
+        "SELECT quantity * 2 AS doubled, SUM(price) AS total
+         FROM sales_expr
+         GROUP BY quantity
+         ORDER BY doubled;",
+    );
+    assert_eq!(
+        grouped_expression.rows,
+        vec![
+            vec![Value::Int64(4), Value::Float64(10.0)],
+            vec![Value::Int64(6), Value::Float64(5.0)],
+            vec![Value::Int64(8), Value::Float64(4.0)],
+        ]
+    );
+}
+
+#[test]
+fn expression_types_are_compiled_before_scanning_rows() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE empty_expr (label String, amount Int64);")
+        .expect("create succeeds");
+
+    let projection = database
+        .execute("SELECT label + 1 FROM empty_expr;")
+        .expect_err("non-numeric projection is invalid even with no rows");
+    assert!(matches!(
+        projection,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "Int64 or Float64" && actual == "String"
+    ));
+
+    let aggregate = database
+        .execute("SELECT SUM(label * 2) FROM empty_expr;")
+        .expect_err("non-numeric aggregate expression is invalid");
+    assert!(matches!(aggregate, Error::TypeMismatch { actual, .. } if actual == "String"));
+}
+
+#[test]
+fn checked_expressions_report_each_numeric_failure() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE checked_values (
+                maximum Int64, minimum Int64, zero Int64, huge Float64
+             );
+             INSERT INTO checked_values VALUES
+                (9223372036854775807, -9223372036854775808, 0, 1e308);",
+        )
+        .expect("setup succeeds");
+
+    for sql in [
+        "SELECT maximum + 1 FROM checked_values;",
+        "SELECT -minimum FROM checked_values;",
+        "SELECT minimum / -1 FROM checked_values;",
+    ] {
+        assert!(matches!(
+            database.execute(sql),
+            Err(Error::NumericOverflow(_))
+        ));
+    }
+
+    assert!(matches!(
+        database.execute("SELECT maximum / zero FROM checked_values;"),
+        Err(Error::DivisionByZero(_))
+    ));
+    assert!(matches!(
+        database.execute("SELECT huge * huge FROM checked_values;"),
+        Err(Error::NonFiniteFloat(_))
+    ));
+}
