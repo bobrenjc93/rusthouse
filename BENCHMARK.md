@@ -49,7 +49,7 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
 
 ## Candidate-versus-baseline regression gates
 
-Passing `--baseline` opts into a second, isolated RustHouse-only suite after every candidate-versus-ClickHouse measurement is complete. `--rusthouse` names the candidate. The baseline may be supplied by `RUSTHOUSE_BASELINE_BIN`; baseline mode requires `--details` so every completed gate retains its evidence.
+Passing `--baseline` opts into a second, isolated RustHouse-only suite after every candidate-versus-ClickHouse measurement is complete. `--rusthouse` names the candidate. The baseline may be supplied by `RUSTHOUSE_BASELINE_BIN`; baseline mode requires `--details` so every completed gate retains its evidence. The harness does not copy, execute, hash, or otherwise inspect the baseline path until both ClickHouse scores have been computed.
 
 ~~~bash
 RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
@@ -63,11 +63,13 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
 
 For every case, the candidate and baseline receive byte-identical setup and query SQL, the same fixed amplification, the same sample count, and alternating candidate-first/baseline-first launch order. Their unamplified outputs must pass the same typed normalizer before timing. The details file records each measured launch order, all raw batch and per-query samples, medians, and SHA-256 hashes for both binaries.
 
+RustHouse paths are copied to separate private snapshots before use. The snapshot executable and its directory are made non-writable, all samples resolve the snapshot path, and the snapshot is hashed again after its final sample. Concurrent rebuilds, renames, or symlink changes at the supplied candidate or baseline path therefore cannot mix executable versions. Any change to a snapshot itself rejects the run. The reported SHA-256 values identify the bytes actually executed, while the reported paths preserve the supplied source provenance.
+
 The uncapped ratio is `baseline median / candidate median`: values above one are improvements and values below one are regressions. Case ratios are reported directly. Family ratios use the same equal-workload and equal-scale log-space weighting as the ClickHouse score, without a floor or parity cap. The overall regression ratio gives families equal weight.
 
 The sustained-work gate fails when any case is more than 20% slower than its baseline or any family is more than 10% slower. These deliberately noise-tolerant limits are fixed in the harness. End-to-end candidate/baseline ratios are retained as cold-start diagnostics but are not gated. A gate failure writes full details, emits the already-computed ClickHouse score unchanged, and exits nonzero. Process, correctness, identity, timing-stability, or artifact-write failures remain fail-closed.
 
-The RustHouse-only suite starts only after the complete ClickHouse suite, so baseline work cannot perturb later official cases. Its ratios and gates are separate from `parity_score`; enabling it does not alter ClickHouse ratio capping, family weighting, headroom rejection, or score math.
+The RustHouse-only suite, including baseline snapshot creation and validation, starts only after the complete ClickHouse suite, so baseline work cannot perturb official cases. Its ratios and gates are separate from `parity_score`; enabling it does not alter ClickHouse ratio capping, family weighting, headroom rejection, or score math.
 
 ## Grouping and top-k optimization measurement
 
@@ -149,4 +151,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, hashed candidate and baseline binaries, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples and launch order, conservative ClickHouse per-case caps, uncapped regression evidence, and equal family/scale weighting. No single special-case query, favorable seed, duplicated workload, or saturated ClickHouse case can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, sealed and post-run-verified candidate and baseline snapshots, deferred baseline access, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples and launch order, conservative ClickHouse per-case caps, uncapped regression evidence, and equal family/scale weighting. No single special-case query, favorable seed, duplicated workload, or saturated ClickHouse case can legitimately stand in for the suite.

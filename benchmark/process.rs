@@ -1,6 +1,8 @@
+use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
@@ -22,6 +24,12 @@ pub struct ClickHouseIdentity {
 #[derive(Debug, Clone)]
 pub struct RustHouseIdentity {
     pub sha256: String,
+}
+
+#[derive(Debug)]
+pub struct RustHouseSnapshot {
+    directory: PathBuf,
+    executable: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +157,156 @@ impl EnginePaths {
                 None
             };
         Ok((elapsed, stdout))
+    }
+}
+
+impl RustHouseSnapshot {
+    pub fn create(source: &Path, label: &str) -> Result<Self, String> {
+        let directory = create_snapshot_directory(label)?;
+        let executable = directory.join(format!("rusthouse{}", std::env::consts::EXE_SUFFIX));
+        let snapshot = Self {
+            directory,
+            executable,
+        };
+        fs::copy(source, &snapshot.executable).map_err(|error| {
+            format!(
+                "could not snapshot {label} RustHouse binary '{}' to '{}': {error}",
+                source.display(),
+                snapshot.executable.display()
+            )
+        })?;
+        make_snapshot_read_only(&snapshot.executable).map_err(|error| {
+            format!(
+                "could not make {label} RustHouse snapshot '{}' read-only: {error}",
+                snapshot.executable.display()
+            )
+        })?;
+        seal_snapshot_directory(&snapshot.directory).map_err(|error| {
+            format!(
+                "could not seal {label} RustHouse snapshot directory '{}': {error}",
+                snapshot.directory.display()
+            )
+        })?;
+        Ok(snapshot)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.executable
+    }
+
+    pub fn verify_unchanged(
+        &self,
+        identity: &RustHouseIdentity,
+        label: &str,
+    ) -> Result<(), String> {
+        let observed = sha256(&self.executable, &format!("{label} RustHouse snapshot"))?;
+        if observed != identity.sha256 {
+            return Err(format!(
+                "{label} RustHouse snapshot changed during the benchmark: expected SHA-256 {}, got {observed}",
+                identity.sha256
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RustHouseSnapshot {
+    fn drop(&mut self) {
+        make_snapshot_directory_writable(&self.directory);
+        make_snapshot_writable(&self.executable);
+        let _ = fs::remove_file(&self.executable);
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_snapshot_directory(label: &str) -> Result<PathBuf, String> {
+    for _ in 0..100 {
+        let sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "rusthouse-benchmark-{}-{label}-{sequence}",
+            std::process::id()
+        ));
+        match create_private_directory(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create RustHouse snapshot directory '{}': {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Err("could not allocate a unique RustHouse snapshot directory".to_owned())
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn seal_snapshot_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+}
+
+#[cfg(not(unix))]
+fn seal_snapshot_directory(path: &Path) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn make_snapshot_directory_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn make_snapshot_directory_writable(path: &Path) {
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(unix)]
+fn make_snapshot_read_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+}
+
+#[cfg(not(unix))]
+fn make_snapshot_read_only(path: &Path) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn make_snapshot_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn make_snapshot_writable(path: &Path) {
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
     }
 }
 
@@ -304,5 +462,66 @@ mod tests {
     #[test]
     fn amplification_must_be_positive() {
         assert!(sql_batch("", "SELECT 1;", 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_is_bound_to_copied_bytes_not_the_source_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_directory = create_snapshot_directory("source-test").expect("source directory");
+        let source = source_directory.join("rusthouse");
+        fs::write(&source, "#!/bin/sh\nexit 0\n").expect("source binary");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).expect("permissions");
+
+        let snapshot = RustHouseSnapshot::create(&source, "candidate").expect("snapshot");
+        let identity = validate_rusthouse(snapshot.path()).expect("identity");
+        assert_eq!(
+            fs::metadata(&snapshot.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        assert_eq!(
+            fs::metadata(snapshot.path()).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        fs::write(&source, "#!/bin/sh\nexit 9\n").expect("replace source bytes");
+
+        validate_rusthouse(snapshot.path()).expect("snapshot remains executable");
+        snapshot
+            .verify_unchanged(&identity, "candidate")
+            .expect("snapshot hash remains bound");
+
+        fs::remove_file(source).expect("remove source");
+        fs::remove_dir(source_directory).expect("remove source directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tampering_is_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_directory =
+            create_snapshot_directory("tamper-source").expect("source directory");
+        let source = source_directory.join("rusthouse");
+        fs::write(&source, "#!/bin/sh\nexit 0\n").expect("source binary");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).expect("permissions");
+
+        let snapshot = RustHouseSnapshot::create(&source, "baseline").expect("snapshot");
+        let identity = validate_rusthouse(snapshot.path()).expect("identity");
+        make_snapshot_writable(snapshot.path());
+        fs::write(snapshot.path(), "#!/bin/sh\nexit 7\n").expect("tamper snapshot");
+        make_snapshot_read_only(snapshot.path()).expect("restore snapshot permissions");
+
+        let error = snapshot
+            .verify_unchanged(&identity, "baseline")
+            .expect_err("changed snapshot must fail");
+        assert!(error.contains("changed during the benchmark"));
+
+        fs::remove_file(source).expect("remove source");
+        fs::remove_dir(source_directory).expect("remove source directory");
     }
 }

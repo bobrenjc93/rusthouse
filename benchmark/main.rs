@@ -17,8 +17,8 @@ use config::{Config, ParseResult};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs, compare_outputs_named};
 use process::{
-    BenchmarkIdentity, Engine, EnginePaths, RustHouseIdentity, TimedBatch, TimedOutput,
-    validate_rusthouse,
+    BenchmarkIdentity, Engine, EnginePaths, RustHouseIdentity, RustHouseSnapshot, TimedBatch,
+    TimedOutput, validate_rusthouse,
 };
 use score::{
     RatioObservation, ScoreBreakdown, UncappedRatioBreakdown, median, parity_score, uncapped_ratio,
@@ -203,25 +203,12 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 
 fn run(config: Config) -> Result<RunOutcome, String> {
     let settings = config.mode.settings();
+    let candidate_snapshot = RustHouseSnapshot::create(&config.rusthouse, "candidate")?;
     let paths = EnginePaths {
-        rusthouse: config.rusthouse.clone(),
+        rusthouse: candidate_snapshot.path().to_owned(),
         clickhouse: config.clickhouse.clone(),
     };
     let identity = paths.validate()?;
-    let (baseline_paths, baseline_identity) = match &config.baseline {
-        Some(baseline) => {
-            let baseline_identity = validate_rusthouse(baseline)
-                .map_err(|error| format!("baseline validation failed: {error}"))?;
-            (
-                Some(EnginePaths {
-                    rusthouse: baseline.clone(),
-                    clickhouse: config.clickhouse.clone(),
-                }),
-                Some(baseline_identity),
-            )
-        }
-        None => (None, None),
-    };
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
     let mut regression_correctness_checks = 0_usize;
@@ -365,10 +352,18 @@ fn run(config: Config) -> Result<RunOutcome, String> {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
-    if let Some(baseline_paths) = &baseline_paths {
+    let mut baseline_identity = None;
+    if let Some(baseline_source) = &config.baseline {
         eprintln!(
-            "starting isolated candidate/baseline regression suite after ClickHouse scoring completed"
+            "preparing baseline snapshot after ClickHouse scoring completed; starting isolated candidate/baseline regression suite"
         );
+        let baseline_snapshot = RustHouseSnapshot::create(baseline_source, "baseline")?;
+        let identity = validate_rusthouse(baseline_snapshot.path())
+            .map_err(|error| format!("baseline validation failed: {error}"))?;
+        let baseline_paths = EnginePaths {
+            rusthouse: baseline_snapshot.path().to_owned(),
+            clickhouse: config.clickhouse.clone(),
+        };
         let mut case_index = 0_usize;
         for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
             let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
@@ -379,7 +374,7 @@ fn run(config: Config) -> Result<RunOutcome, String> {
                 let candidate_first = (row_count_index + workload_index).is_multiple_of(2);
                 let (candidate_output, baseline_output) = execute_regression_correctness_pair(
                     &paths,
-                    baseline_paths,
+                    &baseline_paths,
                     &setup_sql,
                     &workload.sql,
                     candidate_first,
@@ -401,7 +396,7 @@ fn run(config: Config) -> Result<RunOutcome, String> {
                 let gate = CorrectnessGate { passed: true };
                 let regression = measure_regression_case(
                     &paths,
-                    baseline_paths,
+                    &baseline_paths,
                     &gate,
                     &setup_sql,
                     &workload.sql,
@@ -431,7 +426,10 @@ fn run(config: Config) -> Result<RunOutcome, String> {
                 "candidate/baseline suite produced fewer cases than ClickHouse suite".to_owned(),
             );
         }
+        baseline_snapshot.verify_unchanged(&identity, "baseline")?;
+        baseline_identity = Some(identity);
     }
+    candidate_snapshot.verify_unchanged(&identity.rusthouse, "candidate")?;
     let regression_analysis = if config.baseline.is_some() {
         let primary = regression_ratios(&cases, |regression| regression.primary_ratio)?;
         let end_to_end = regression_ratios(&cases, |regression| regression.end_to_end_ratio)?;
@@ -498,7 +496,10 @@ fn run(config: Config) -> Result<RunOutcome, String> {
             "ClickHouse identity: {}",
             identity.clickhouse.version_output
         ),
-        format!("candidate RustHouse SHA-256={}", identity.rusthouse.sha256),
+        format!(
+            "candidate RustHouse immutable snapshot verified after timing; SHA-256={}",
+            identity.rusthouse.sha256
+        ),
         format!(
             "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
             settings.query_amplification
@@ -520,7 +521,7 @@ fn run(config: Config) -> Result<RunOutcome, String> {
     if let (Some(baseline_identity), Some(regression)) = (&baseline_identity, &regression_analysis)
     {
         evidence.push(format!(
-            "candidate/baseline primary ratio {:.4} and end-to-end ratio {:.4} (uncapped baseline/candidate); baseline SHA-256={}",
+            "candidate/baseline primary ratio {:.4} and end-to-end ratio {:.4} (uncapped baseline/candidate); deferred baseline snapshot verified after timing; SHA-256={}",
             regression.primary.ratio,
             regression.end_to_end.ratio,
             baseline_identity.sha256
@@ -1164,7 +1165,7 @@ fn write_regression_metadata(
     };
     write!(
         output,
-        "\"candidate_baseline\":{{\"candidate_path\":{},\"candidate_sha256\":{},\"baseline_path\":{},\"baseline_sha256\":{},\"correctness_checks\":{},\"ratio_definition\":{},\"counterbalance\":{},\"gates\":{{\"metric\":\"primary_sustained_work\",\"max_case_regression_fraction\":{MAX_CASE_REGRESSION:.6},\"max_family_regression_fraction\":{MAX_FAMILY_REGRESSION:.6}}},\"passed\":{},\"primary_overall_ratio\":{:.9},\"end_to_end_overall_ratio\":{:.9},\"primary_family_ratios\":",
+        "\"candidate_baseline\":{{\"candidate_path\":{},\"candidate_sha256\":{},\"baseline_path\":{},\"baseline_sha256\":{},\"correctness_checks\":{},\"ratio_definition\":{},\"counterbalance\":{},\"binary_isolation\":{},\"gates\":{{\"metric\":\"primary_sustained_work\",\"max_case_regression_fraction\":{MAX_CASE_REGRESSION:.6},\"max_family_regression_fraction\":{MAX_FAMILY_REGRESSION:.6}}},\"passed\":{},\"primary_overall_ratio\":{:.9},\"end_to_end_overall_ratio\":{:.9},\"primary_family_ratios\":",
         json_string(&config.rusthouse.display().to_string()),
         json_string(&candidate_identity.sha256),
         json_string(&baseline_path.display().to_string()),
@@ -1172,6 +1173,7 @@ fn write_regression_metadata(
         correctness_checks,
         json_string("uncapped baseline median divided by candidate median; values below one are regressions"),
         json_string("candidate-first and baseline-first launch order alternates per case and is retained per sample"),
+        json_string("all RustHouse samples execute sealed snapshots whose hashes are verified after timing; baseline snapshot preparation begins after ClickHouse scoring"),
         regression.violations.is_empty(),
         regression.primary.ratio,
         regression.end_to_end.ratio
