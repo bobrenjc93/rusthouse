@@ -1,9 +1,11 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 
-use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::format::{CsvWriter, JsonWriter, OutputFormat, render};
+use rusthouse::{
+    Database, QueryResult, ResultColumn, RowBatch, RowBatchSink, StatementResult, StreamError,
+};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -25,7 +27,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("error: {message}");
+            let _ = writeln!(io::stderr().lock(), "error: {message}");
             ExitCode::FAILURE
         }
     }
@@ -33,8 +35,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let Some(config) = parse_arguments(env::args().skip(1))? else {
-        print!("{HELP}");
-        return Ok(());
+        return handle_output(io::stdout().lock().write_all(HELP.as_bytes()));
     };
 
     let sql = if let Some(sql) = config.execute {
@@ -48,22 +49,98 @@ fn run() -> Result<(), String> {
     };
 
     let mut database = Database::new();
-    let results = database.execute(&sql).map_err(|error| error.to_string())?;
-    let mut queries = Vec::new();
-    for result in results {
-        match result {
-            StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
-                    eprintln!("{tag} {affected_rows}");
-                } else {
-                    eprintln!("{tag}");
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    match config.format {
+        OutputFormat::Csv => {
+            let mut sink = CliSink::new(CsvWriter::new(&mut output));
+            handle_stream(database.execute_stream(&sql, &mut sink))?;
+        }
+        OutputFormat::Json => {
+            let mut sink = CliSink::new(JsonWriter::new(&mut output));
+            handle_stream(database.execute_stream(&sql, &mut sink))?;
+        }
+        OutputFormat::Table => {
+            let results = database.execute(&sql).map_err(|error| error.to_string())?;
+            let mut queries = Vec::new();
+            for result in results {
+                match result {
+                    StatementResult::Command { tag, affected_rows } => {
+                        report_command(tag, affected_rows).map_err(|error| error.to_string())?;
+                    }
+                    StatementResult::Query(result) => queries.push(result),
                 }
             }
-            StatementResult::Query(result) => queries.push(result),
+            let rendered = render_query_results(&queries, config.format);
+            handle_output(output.write_all(rendered.as_bytes()))?;
         }
     }
-    print!("{}", render_query_results(&queries, config.format));
-    Ok(())
+    handle_output(output.flush())
+}
+
+fn handle_stream(result: std::result::Result<(), StreamError<io::Error>>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(StreamError::Database(error)) => Err(error.to_string()),
+        Err(StreamError::Sink(error)) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(StreamError::Sink(error)) => Err(format!("could not write output: {error}")),
+    }
+}
+
+fn handle_output(result: io::Result<()>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(format!("could not write output: {error}")),
+    }
+}
+
+fn report_command(tag: &'static str, affected_rows: usize) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    if tag == "INSERT" {
+        writeln!(stderr, "{tag} {affected_rows}")
+    } else {
+        writeln!(stderr, "{tag}")
+    }
+}
+
+struct CliSink<S> {
+    output: S,
+}
+
+impl<S> CliSink<S> {
+    fn new(output: S) -> Self {
+        Self { output }
+    }
+}
+
+impl<S: RowBatchSink<Error = io::Error>> RowBatchSink for CliSink<S> {
+    type Error = io::Error;
+
+    fn start(&mut self) -> io::Result<()> {
+        self.output.start()
+    }
+
+    fn command(&mut self, tag: &'static str, affected_rows: usize) -> io::Result<()> {
+        report_command(tag, affected_rows)?;
+        self.output.command(tag, affected_rows)
+    }
+
+    fn start_query(&mut self, columns: &[ResultColumn]) -> io::Result<()> {
+        self.output.start_query(columns)
+    }
+
+    fn write_batch(&mut self, batch: RowBatch<'_>) -> io::Result<()> {
+        self.output.write_batch(batch)
+    }
+
+    fn finish_query(&mut self) -> io::Result<()> {
+        self.output.finish_query()
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.output.finish()
+    }
 }
 
 fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {

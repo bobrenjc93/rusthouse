@@ -1,6 +1,7 @@
-use std::fmt::Write;
+use std::fmt::Write as _;
+use std::io::{self, Write as IoWrite};
 
-use crate::engine::QueryResult;
+use crate::engine::{QueryResult, ResultColumn, RowBatch, RowBatchSink};
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,221 @@ impl OutputFormat {
             _ => None,
         }
     }
+}
+
+/// A row-batch sink that writes each query as CSV as rows arrive.
+///
+/// Multiple SELECT results are separated by one blank line.
+#[derive(Debug)]
+pub struct CsvWriter<W> {
+    writer: W,
+    query_count: usize,
+}
+
+impl<W> CsvWriter<W> {
+    #[must_use]
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            query_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+impl<W: IoWrite> RowBatchSink for CsvWriter<W> {
+    type Error = io::Error;
+
+    fn start(&mut self) -> std::result::Result<(), Self::Error> {
+        self.query_count = 0;
+        Ok(())
+    }
+
+    fn start_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
+        if self.query_count > 0 {
+            self.writer.write_all(b"\n")?;
+        }
+        self.query_count += 1;
+        write_csv_fields(
+            &mut self.writer,
+            columns.iter().map(|column| column.name.as_str()),
+        )
+    }
+
+    fn write_batch(&mut self, batch: RowBatch<'_>) -> std::result::Result<(), Self::Error> {
+        for row in batch.rows() {
+            for (index, value) in row.iter().enumerate() {
+                if index > 0 {
+                    self.writer.write_all(b",")?;
+                }
+                match value {
+                    Value::Int64(value) => write!(self.writer, "{value}")?,
+                    Value::Float64(_) => {
+                        self.writer
+                            .write_all(value.as_display_string().as_bytes())?;
+                    }
+                    Value::Bool(value) => write!(self.writer, "{value}")?,
+                    Value::String(value) => write_csv_field(&mut self.writer, value)?,
+                }
+            }
+            self.writer.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), Self::Error> {
+        self.writer.flush()
+    }
+}
+
+/// A row-batch sink that incrementally writes the CLI's JSON results document.
+#[derive(Debug)]
+pub struct JsonWriter<W> {
+    writer: W,
+    query_count: usize,
+    row_count: usize,
+}
+
+impl<W> JsonWriter<W> {
+    #[must_use]
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            query_count: 0,
+            row_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+impl<W: IoWrite> RowBatchSink for JsonWriter<W> {
+    type Error = io::Error;
+
+    fn start(&mut self) -> std::result::Result<(), Self::Error> {
+        self.query_count = 0;
+        self.row_count = 0;
+        self.writer.write_all(b"{\"results\":[")
+    }
+
+    fn start_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
+        if self.query_count > 0 {
+            self.writer.write_all(b",")?;
+        }
+        self.query_count += 1;
+        self.row_count = 0;
+        self.writer.write_all(b"{\"columns\":[")?;
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                self.writer.write_all(b",")?;
+            }
+            self.writer.write_all(b"{\"name\":")?;
+            write_json_string_to(&mut self.writer, &column.name)?;
+            self.writer.write_all(b",\"type\":")?;
+            write_json_string_to(&mut self.writer, &column.data_type.to_string())?;
+            self.writer.write_all(b"}")?;
+        }
+        self.writer.write_all(b"],\"rows\":[")
+    }
+
+    fn write_batch(&mut self, batch: RowBatch<'_>) -> std::result::Result<(), Self::Error> {
+        for row in batch.rows() {
+            if self.row_count > 0 {
+                self.writer.write_all(b",")?;
+            }
+            self.row_count += 1;
+            self.writer.write_all(b"[")?;
+            for (index, value) in row.iter().enumerate() {
+                if index > 0 {
+                    self.writer.write_all(b",")?;
+                }
+                write_json_value_to(&mut self.writer, value)?;
+            }
+            self.writer.write_all(b"]")?;
+        }
+        Ok(())
+    }
+
+    fn finish_query(&mut self) -> std::result::Result<(), Self::Error> {
+        self.writer.write_all(b"]}")
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), Self::Error> {
+        self.writer.write_all(b"]}\n")?;
+        self.writer.flush()
+    }
+}
+
+fn write_csv_fields<'a>(
+    writer: &mut impl IoWrite,
+    values: impl Iterator<Item = &'a str>,
+) -> io::Result<()> {
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        write_csv_field(writer, value)?;
+    }
+    writer.write_all(b"\n")
+}
+
+fn write_csv_field(writer: &mut impl IoWrite, value: &str) -> io::Result<()> {
+    if !value.contains([',', '"', '\n', '\r']) {
+        return writer.write_all(value.as_bytes());
+    }
+
+    writer.write_all(b"\"")?;
+    for (index, part) in value.split('"').enumerate() {
+        if index > 0 {
+            writer.write_all(b"\"\"")?;
+        }
+        writer.write_all(part.as_bytes())?;
+    }
+    writer.write_all(b"\"")
+}
+
+fn write_json_value_to(writer: &mut impl IoWrite, value: &Value) -> io::Result<()> {
+    match value {
+        Value::Int64(value) => write!(writer, "{value}"),
+        Value::Float64(_) => writer.write_all(value.as_display_string().as_bytes()),
+        Value::Bool(value) => write!(writer, "{value}"),
+        Value::String(value) => write_json_string_to(writer, value),
+    }
+}
+
+fn write_json_string_to(writer: &mut impl IoWrite, value: &str) -> io::Result<()> {
+    writer.write_all(b"\"")?;
+    let mut unescaped_start = 0;
+    for (index, character) in value.char_indices() {
+        let escape = match character {
+            '"' => Some("\\\""),
+            '\\' => Some("\\\\"),
+            '\u{08}' => Some("\\b"),
+            '\u{0c}' => Some("\\f"),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            _ => None,
+        };
+        if escape.is_some() || character.is_control() {
+            writer.write_all(&value.as_bytes()[unescaped_start..index])?;
+            if let Some(escape) = escape {
+                writer.write_all(escape.as_bytes())?;
+            } else {
+                write!(writer, "\\u{:04x}", character as u32)?;
+            }
+            unescaped_start = index + character.len_utf8();
+        }
+    }
+    writer.write_all(&value.as_bytes()[unescaped_start..])?;
+    writer.write_all(b"\"")
 }
 
 #[must_use]

@@ -154,3 +154,34 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         assert!(!stderr.contains("stack overflow"));
     }
 }
+
+#[test]
+fn closed_stdout_pipe_exits_cleanly() {
+    let values = (0..5_000)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "CREATE TABLE numbers (id Int64); \
+         INSERT INTO numbers VALUES {values}; \
+         SELECT id FROM numbers;"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "csv"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn CLI");
+
+    drop(child.stdout.take().expect("stdout pipe"));
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(sql.as_bytes())
+        .expect("write SQL");
+
+    let status = child.wait().expect("wait for CLI");
+    assert!(status.success(), "closed stdout should not be an error");
+}

@@ -11,8 +11,9 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- bounded row-batch query streaming for library consumers
 - semicolon-separated SQL batches
-- table, CSV, and JSON output from the CLI
+- table, incrementally written CSV, and incrementally written JSON from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
@@ -77,6 +78,29 @@ let StatementResult::Query(result) = &results[0] else {
 assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
+~~~
+
+For results that should not be collected in memory, `execute_stream` sends at
+most `ROW_BATCH_SIZE` (1,024) rows to a `RowBatchSink` callback. Unordered
+projections are emitted directly from the table scan. Ordering retains source
+row indices, while grouping retains group keys and aggregate state.
+
+The CSV and JSON sinks write batches directly to any `std::io::Write`:
+
+~~~rust
+use rusthouse::Database;
+use rusthouse::format::CsvWriter;
+
+let mut database = Database::new();
+database.execute("CREATE TABLE events (id Int64, name String)")?;
+database.execute("INSERT INTO events VALUES (1, 'launch')")?;
+
+let mut output = Vec::new();
+let mut csv = CsvWriter::new(&mut output);
+database.execute_stream("SELECT * FROM events", &mut csv)?;
+assert_eq!(String::from_utf8(output).unwrap(), "id,name\n1,launch\n");
+
+# Ok::<(), Box<dyn std::error::Error>>(())
 ~~~
 
 ## Current boundaries

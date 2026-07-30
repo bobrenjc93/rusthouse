@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::fmt;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -37,6 +39,100 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// The maximum number of rows passed to a [`RowBatchSink`] at once.
+pub const ROW_BATCH_SIZE: usize = 1_024;
+
+/// A borrowed, non-empty batch of result rows.
+///
+/// Batches emitted by [`Database::execute_stream`] never contain more than
+/// [`ROW_BATCH_SIZE`] rows. A batch is only valid for the duration of the
+/// callback, allowing the engine to reuse its bounded allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct RowBatch<'a> {
+    rows: &'a [Vec<Value>],
+}
+
+impl<'a> RowBatch<'a> {
+    #[must_use]
+    pub fn rows(self) -> &'a [Vec<Value>] {
+        self.rows
+    }
+
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.rows.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// Receives statement metadata and bounded batches of query rows.
+///
+/// The default methods are no-ops so sinks can implement only the events they
+/// need. Returning an error stops execution immediately.
+pub trait RowBatchSink {
+    type Error;
+
+    fn start(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn command(
+        &mut self,
+        _tag: &'static str,
+        _affected_rows: usize,
+    ) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn start_query(&mut self, _columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn write_batch(&mut self, _batch: RowBatch<'_>) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn finish_query(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// An engine or sink failure from [`Database::execute_stream`].
+#[derive(Debug)]
+pub enum StreamError<E> {
+    Database(Error),
+    Sink(E),
+}
+
+impl<E: fmt::Display> fmt::Display for StreamError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(error) => error.fmt(formatter),
+            Self::Sink(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E> std::error::Error for StreamError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -54,66 +150,96 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
-    }
-
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
-        match statement {
-            Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
-                Ok(StatementResult::Command {
-                    tag: "CREATE TABLE",
-                    affected_rows: 0,
-                })
-            }
-            Statement::Insert { table, rows } => {
-                let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
-                let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
-                Ok(StatementResult::Command {
-                    tag: "INSERT",
-                    affected_rows,
-                })
-            }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+        let mut sink = CollectingSink::default();
+        match self.execute_stream(sql, &mut sink) {
+            Ok(()) => Ok(sink.results),
+            Err(StreamError::Database(error)) => Err(error),
+            Err(StreamError::Sink(error)) => match error {},
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+    /// Execute statements while emitting query results in bounded row batches.
+    ///
+    /// The complete SQL batch is parsed before the sink is started or any
+    /// statement is applied. Unordered projections are emitted directly while
+    /// scanning; grouping and ordering retain their required operator state.
+    pub fn execute_stream<S: RowBatchSink>(
+        &mut self,
+        sql: &str,
+        sink: &mut S,
+    ) -> std::result::Result<(), StreamError<S::Error>> {
+        let statements = sql::parse(sql).map_err(StreamError::Database)?;
+        sink.start().map_err(StreamError::Sink)?;
+
+        for statement in statements {
+            match statement {
+                Statement::CreateTable { name, columns } => {
+                    self.catalog
+                        .create_table(name, columns)
+                        .map_err(StreamError::Database)?;
+                    sink.command("CREATE TABLE", 0).map_err(StreamError::Sink)?;
+                }
+                Statement::Insert { table, rows } => {
+                    let affected_rows = rows.len();
+                    {
+                        let target = self.catalog.table(&table).map_err(StreamError::Database)?;
+                        for row in &rows {
+                            target.validate_row(row).map_err(StreamError::Database)?;
+                        }
+                    }
+                    let target = self
+                        .catalog
+                        .table_mut(&table)
+                        .map_err(StreamError::Database)?;
+                    for row in rows {
+                        target.insert_row(row).map_err(StreamError::Database)?;
+                    }
+                    sink.command("INSERT", affected_rows)
+                        .map_err(StreamError::Sink)?;
+                }
+                Statement::Select(select) => self.execute_select(select, sink)?,
+            }
+        }
+
+        sink.finish().map_err(StreamError::Sink)
+    }
+
+    fn execute_select<S: RowBatchSink>(
+        &self,
+        select: Select,
+        sink: &mut S,
+    ) -> std::result::Result<(), StreamError<S::Error>> {
+        let table = self
+            .catalog
+            .table(&select.table)
+            .map_err(StreamError::Database)?;
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
-            .transpose()?;
+            .transpose()
+            .map_err(StreamError::Database)?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
+        let group_columns =
+            resolve_group_columns(table, &select.group_by).map_err(StreamError::Database)?;
+        let (items, result_columns, aggregate_specs) =
+            resolve_select_items(table, &select.items, &group_columns)
+                .map_err(StreamError::Database)?;
+        let ordering =
+            resolve_ordering(&result_columns, &select.order_by).map_err(StreamError::Database)?;
+
+        let matching_rows = || {
+            (0..table.row_count()).filter(|row| {
                 predicate
                     .as_ref()
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
-            .collect::<Vec<_>>();
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        };
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+        if grouped {
+            let grouped = execute_grouped(table, matching_rows(), &group_columns, &aggregate_specs)
+                .map_err(StreamError::Database)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -122,17 +248,92 @@ impl Database {
                 &ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
+            sink.start_query(&result_columns)
+                .map_err(StreamError::Sink)?;
+            emit_rows(sink, selected_groups, |group| {
+                grouped.project_row(group, &items)
+            })?;
+        } else if ordering.is_empty() {
+            sink.start_query(&result_columns)
+                .map_err(StreamError::Sink)?;
+            emit_rows(
+                sink,
+                matching_rows().take(select.limit.unwrap_or(usize::MAX)),
+                |row| project_source_row(table, row, &items),
+            )?;
         } else {
+            let mut matching_rows = matching_rows().collect::<Vec<_>>();
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
-        };
+            sink.start_query(&result_columns)
+                .map_err(StreamError::Sink)?;
+            emit_rows(sink, matching_rows, |row| {
+                project_source_row(table, row, &items)
+            })?;
+        }
 
-        Ok(QueryResult {
-            columns: result_columns,
-            rows,
-        })
+        sink.finish_query().map_err(StreamError::Sink)
     }
+}
+
+#[derive(Default)]
+struct CollectingSink {
+    results: Vec<StatementResult>,
+}
+
+impl RowBatchSink for CollectingSink {
+    type Error = Infallible;
+
+    fn command(
+        &mut self,
+        tag: &'static str,
+        affected_rows: usize,
+    ) -> std::result::Result<(), Self::Error> {
+        self.results
+            .push(StatementResult::Command { tag, affected_rows });
+        Ok(())
+    }
+
+    fn start_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
+        self.results.push(StatementResult::Query(QueryResult {
+            columns: columns.to_vec(),
+            rows: Vec::new(),
+        }));
+        Ok(())
+    }
+
+    fn write_batch(&mut self, batch: RowBatch<'_>) -> std::result::Result<(), Self::Error> {
+        let Some(StatementResult::Query(query)) = self.results.last_mut() else {
+            unreachable!("a row batch follows query metadata")
+        };
+        query.rows.extend_from_slice(batch.rows());
+        Ok(())
+    }
+}
+
+fn emit_rows<S, I, F>(
+    sink: &mut S,
+    rows: I,
+    mut project: F,
+) -> std::result::Result<(), StreamError<S::Error>>
+where
+    S: RowBatchSink,
+    I: IntoIterator<Item = usize>,
+    F: FnMut(usize) -> Vec<Value>,
+{
+    let mut batch = Vec::with_capacity(ROW_BATCH_SIZE);
+    for row in rows {
+        batch.push(project(row));
+        if batch.len() == ROW_BATCH_SIZE {
+            sink.write_batch(RowBatch { rows: &batch })
+                .map_err(StreamError::Sink)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        sink.write_batch(RowBatch { rows: &batch })
+            .map_err(StreamError::Sink)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -298,36 +499,27 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-fn execute_projection(
-    table: &Table,
-    matching_rows: &[usize],
-    items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
-    matching_rows
+fn project_source_row(table: &Table, row: usize, items: &[ResolvedItem]) -> Vec<Value> {
+    items
         .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
-                .collect()
+        .map(|item| match item {
+            ResolvedItem::Column { source, .. } => table.columns()[*source].value(row),
+            ResolvedItem::Aggregate { .. } => {
+                unreachable!("projection does not contain aggregates")
+            }
         })
         .collect()
 }
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    matching_rows: impl Iterator<Item = usize>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let mut groups = GroupIndex::new(group_columns.len(), table.row_count());
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let initial_capacity = table.row_count().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -340,7 +532,7 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +541,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -496,26 +688,19 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
+    fn project_row(&self, group: usize, items: &[ResolvedItem]) -> Vec<Value> {
+        items
             .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
+            .map(|item| match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => self.keys[group].value(*position).to_owned(),
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => self.aggregates[*state][group].clone(),
             })
             .collect()
     }
