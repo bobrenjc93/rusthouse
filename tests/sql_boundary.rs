@@ -524,3 +524,163 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn inner_join_preserves_left_and_right_match_order_for_duplicate_keys() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE left_rows (key Int64, label String);
+             CREATE TABLE right_rows (key Int64, label String);
+             INSERT INTO left_rows VALUES (1, 'left-1'), (2, 'left-2'), (1, 'left-3');
+             INSERT INTO right_rows VALUES (1, 'right-1'), (1, 'right-2'), (2, 'right-3');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT l.label AS left_label, r.label AS right_label
+         FROM left_rows l
+         INNER JOIN right_rows AS r ON r.key = l.key;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("left-1".to_owned()),
+                Value::String("right-1".to_owned()),
+            ],
+            vec![
+                Value::String("left-1".to_owned()),
+                Value::String("right-2".to_owned()),
+            ],
+            vec![
+                Value::String("left-2".to_owned()),
+                Value::String("right-3".to_owned()),
+            ],
+            vec![
+                Value::String("left-3".to_owned()),
+                Value::String("right-1".to_owned()),
+            ],
+            vec![
+                Value::String("left-3".to_owned()),
+                Value::String("right-2".to_owned()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn inner_join_handles_empty_inputs_on_either_side() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE empty_left (id Int64);
+             CREATE TABLE populated_left (id Int64);
+             CREATE TABLE empty_right (id Int64);
+             CREATE TABLE populated_right (id Int64);
+             INSERT INTO populated_left VALUES (1);
+             INSERT INTO populated_right VALUES (1);",
+        )
+        .expect("setup succeeds");
+
+    let empty_left = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS matches FROM empty_left l
+         INNER JOIN populated_right r ON l.id = r.id;",
+    );
+    assert_eq!(empty_left.rows, vec![vec![Value::Int64(0)]]);
+
+    let empty_right = execute_query(
+        &mut database,
+        "SELECT l.id, r.id FROM populated_left l
+         INNER JOIN empty_right r ON l.id = r.id;",
+    );
+    assert!(empty_right.rows.is_empty());
+}
+
+#[test]
+fn inner_join_uses_exact_mixed_numeric_equality() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE integer_keys (id Int64, label String);
+             CREATE TABLE float_keys (id Float64, label String);
+             INSERT INTO integer_keys VALUES
+                (2, 'exact'), (9007199254740993, 'not-rounded');
+             INSERT INTO float_keys VALUES
+                (2.0, 'two'), (9007199254740992.0, 'rounded');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT i.label, f.label FROM integer_keys i
+         INNER JOIN float_keys f ON i.id = f.id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::String("exact".to_owned()),
+            Value::String("two".to_owned()),
+        ]]
+    );
+}
+
+#[test]
+fn inner_join_rejects_ambiguous_unqualified_columns() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE parents (id Int64);
+             CREATE TABLE children (id Int64, parent_id Int64);
+             INSERT INTO parents VALUES (1);
+             INSERT INTO children VALUES (10, 1);",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute(
+            "SELECT id FROM parents p
+             INNER JOIN children c ON p.id = c.parent_id;",
+        )
+        .expect_err("id exists in both relations");
+    assert!(
+        matches!(error, Error::InvalidQuery(message) if message.contains("column 'id' is ambiguous"))
+    );
+}
+
+#[test]
+fn joined_rows_support_filter_group_aggregate_order_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE products (id Int64, category String);
+             CREATE TABLE sales (product_id Int64, amount Int64, included Bool);
+             INSERT INTO products VALUES (1, 'hardware'), (2, 'books'), (3, 'hardware');
+             INSERT INTO sales VALUES
+                (1, 8, true), (1, 5, false), (2, 7, true),
+                (3, 11, true), (3, 2, true);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT p.category, COUNT(*) AS sale_count, SUM(s.amount) AS total
+         FROM products p
+         INNER JOIN sales s ON p.id = s.product_id
+         WHERE s.included = true
+         GROUP BY p.category
+         ORDER BY total DESC
+         LIMIT 1;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::String("hardware".to_owned()),
+            Value::Int64(3),
+            Value::Int64(21),
+        ]]
+    );
+}
