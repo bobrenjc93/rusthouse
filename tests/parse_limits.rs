@@ -57,14 +57,19 @@ fn statement_limit_accepts_the_boundary_and_rejects_the_next_statement() {
 #[test]
 fn identifier_limit_accepts_the_boundary_and_rejects_the_next_byte() {
     let limits = ParseLimits {
-        max_identifier_bytes: 8,
+        max_identifier_bytes: 1,
         ..ParseLimits::default()
     };
-    parse_with_limits("SELECT * FROM abcdefgh", &limits).expect("eight-byte identifier succeeds");
+    parse_with_limits(
+        "CREATE TABLE t (a Float64); \
+         INSERT INTO t VALUES (true); \
+         SELECT AVG(a) AS m FROM t WHERE a = false GROUP BY a ORDER BY m",
+        &limits,
+    )
+    .expect("syntax and one-byte user identifiers succeed");
     assert_sql_limit(
-        parse_with_limits("SELECT * FROM abcdefghi", &limits)
-            .expect_err("nine-byte identifier fails"),
-        "identifier exceeds limit of 8 bytes",
+        parse_with_limits("SELECT * FROM aa", &limits).expect_err("two-byte user identifier fails"),
+        "identifier exceeds limit of 1 bytes",
     );
 }
 
@@ -127,6 +132,44 @@ fn select_item_limit_accepts_the_boundary_and_rejects_the_next_item() {
         parse_with_limits("SELECT a, b, c FROM t", &limits).expect_err("third item fails"),
         "SELECT list exceeds limit of 2 items",
     );
+}
+
+#[test]
+fn order_by_item_limit_accepts_the_boundary_and_rejects_the_next_item() {
+    let limits = ParseLimits {
+        max_order_by_items: 2,
+        ..ParseLimits::default()
+    };
+    parse_with_limits("SELECT a, b FROM t ORDER BY a, b", &limits)
+        .expect("two ordering keys succeed");
+    assert_sql_limit(
+        parse_with_limits("SELECT a, b FROM t ORDER BY a, b, a", &limits)
+            .expect_err("third ordering key fails"),
+        "ORDER BY clause exceeds limit of 2 items",
+    );
+}
+
+#[test]
+fn order_by_limit_failure_leaves_the_entire_batch_unapplied() {
+    let limits = ParseLimits {
+        max_order_by_items: 1,
+        ..ParseLimits::default()
+    };
+    let mut database = Database::with_parse_limits(limits);
+
+    assert_sql_limit(
+        database
+            .execute(
+                "CREATE TABLE order_not_applied (a Int64); \
+                 SELECT a FROM order_not_applied ORDER BY a, a",
+            )
+            .expect_err("ordering limit rejects the parsed batch"),
+        "ORDER BY clause exceeds limit of 1 items",
+    );
+    assert!(matches!(
+        database.catalog().table("order_not_applied"),
+        Err(Error::TableNotFound(_))
+    ));
 }
 
 #[test]

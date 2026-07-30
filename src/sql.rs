@@ -19,6 +19,7 @@ pub struct ParseLimits {
     pub max_literal_bytes: usize,
     pub max_schema_columns: usize,
     pub max_select_items: usize,
+    pub max_order_by_items: usize,
     pub max_values_cells: usize,
 }
 
@@ -32,6 +33,7 @@ impl Default for ParseLimits {
             max_literal_bytes: 1024 * 1024,
             max_schema_columns: 1_024,
             max_select_items: 1_024,
+            max_order_by_items: 64,
             max_values_cells: 1_000_000,
         }
     }
@@ -96,13 +98,18 @@ impl AggregateFunction {
     }
 
     fn parse(name: &str) -> Option<Self> {
-        match name.to_ascii_uppercase().as_str() {
-            "COUNT" => Some(Self::Count),
-            "SUM" => Some(Self::Sum),
-            "MIN" => Some(Self::Min),
-            "MAX" => Some(Self::Max),
-            "AVG" => Some(Self::Avg),
-            _ => None,
+        if name.eq_ignore_ascii_case("COUNT") {
+            Some(Self::Count)
+        } else if name.eq_ignore_ascii_case("SUM") {
+            Some(Self::Sum)
+        } else if name.eq_ignore_ascii_case("MIN") {
+            Some(Self::Min)
+        } else if name.eq_ignore_ascii_case("MAX") {
+            Some(Self::Max)
+        } else if name.eq_ignore_ascii_case("AVG") {
+            Some(Self::Avg)
+        } else {
+            None
         }
     }
 }
@@ -164,14 +171,14 @@ pub fn parse_with_limits(input: &str, limits: &ParseLimits) -> Result<Vec<Statem
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Token {
-    kind: TokenKind,
+struct Token<'a> {
+    kind: TokenKind<'a>,
     position: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum TokenKind {
-    Identifier(String),
+enum TokenKind<'a> {
+    Identifier(&'a str),
     Number(String),
     String(String),
     Comma,
@@ -204,7 +211,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>> {
+    fn tokenize(mut self) -> Result<Vec<Token<'a>>> {
         let mut tokens = Vec::new();
         loop {
             self.skip_ignored();
@@ -289,7 +296,7 @@ impl<'a> Lexer<'a> {
                 '\'' => TokenKind::String(self.scan_string(position)?),
                 value if value.is_ascii_digit() => TokenKind::Number(self.scan_number(position)?),
                 value if value.is_ascii_alphabetic() || value == '_' => {
-                    TokenKind::Identifier(self.scan_identifier(position)?)
+                    TokenKind::Identifier(self.scan_identifier())
                 }
                 _ => {
                     return self.error(position, format!("unexpected character '{character}'"));
@@ -324,24 +331,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn scan_identifier(&mut self, position: usize) -> Result<String> {
+    fn scan_identifier(&mut self) -> &'a str {
         let start = self.position;
         while self
             .current()
             .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_')
         {
             self.advance();
-            if self.position - start > self.limits.max_identifier_bytes {
-                return self.error(
-                    position,
-                    format!(
-                        "identifier exceeds limit of {} bytes",
-                        self.limits.max_identifier_bytes
-                    ),
-                );
-            }
         }
-        Ok(self.input[start..self.position].to_owned())
+        &self.input[start..self.position]
     }
 
     fn scan_number(&mut self, position: usize) -> Result<String> {
@@ -438,16 +436,16 @@ impl<'a> Lexer<'a> {
     }
 }
 
-struct Parser<'a> {
-    tokens: Vec<Token>,
+struct Parser<'input, 'limits> {
+    tokens: Vec<Token<'input>>,
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
-    limits: &'a ParseLimits,
+    limits: &'limits ParseLimits,
 }
 
-impl<'a> Parser<'a> {
-    fn new(tokens: Vec<Token>, limits: &'a ParseLimits) -> Self {
+impl<'input, 'limits> Parser<'input, 'limits> {
+    fn new(tokens: Vec<Token<'input>>, limits: &'limits ParseLimits) -> Self {
         Self {
             tokens,
             current: 0,
@@ -511,8 +509,8 @@ impl<'a> Parser<'a> {
                 });
             }
             let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            let type_name = self.expect_syntax_identifier("column type")?;
+            let data_type = DataType::parse(type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
                     "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
@@ -603,6 +601,12 @@ impl<'a> Parser<'a> {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
+                if order_by.len() >= self.limits.max_order_by_items {
+                    return self.error(format!(
+                        "ORDER BY clause exceeds limit of {} items",
+                        self.limits.max_order_by_items
+                    ));
+                }
                 let name = self.expect_identifier("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true
@@ -647,9 +651,9 @@ impl<'a> Parser<'a> {
         }
 
         let position = self.position();
-        let name = self.expect_identifier("column or aggregate function")?;
+        let name = self.expect_syntax_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
-            let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
+            let function = AggregateFunction::parse(name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
@@ -666,6 +670,7 @@ impl<'a> Parser<'a> {
                 alias,
             })
         } else {
+            let name = self.user_identifier(name, position)?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Column { name, alias })
         }
@@ -842,12 +847,32 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
-        if let TokenKind::Identifier(value) = self.peek().clone() {
+        let position = self.position();
+        let value = self.expect_syntax_identifier(description)?;
+        self.user_identifier(value, position)
+    }
+
+    fn expect_syntax_identifier(&mut self, description: &str) -> Result<&'input str> {
+        if let TokenKind::Identifier(value) = self.peek() {
+            let value = *value;
             self.current += 1;
             Ok(value)
         } else {
             self.error(format!("expected {description}"))
         }
+    }
+
+    fn user_identifier(&self, value: &str, position: usize) -> Result<String> {
+        if value.len() > self.limits.max_identifier_bytes {
+            return Err(Error::Sql {
+                position,
+                message: format!(
+                    "identifier exceeds limit of {} bytes",
+                    self.limits.max_identifier_bytes
+                ),
+            });
+        }
+        Ok(value.to_owned())
     }
 
     fn take_number(&mut self) -> Option<String> {
@@ -859,7 +884,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, expected: &TokenKind, description: &str) -> Result<()> {
+    fn expect(&mut self, expected: &TokenKind<'_>, description: &str) -> Result<()> {
         if self.eat(expected) {
             Ok(())
         } else {
@@ -867,7 +892,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn eat(&mut self, expected: &TokenKind) -> bool {
+    fn eat(&mut self, expected: &TokenKind<'_>) -> bool {
         if self.at(expected) {
             self.current += 1;
             true
@@ -876,11 +901,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn at(&self, expected: &TokenKind) -> bool {
+    fn at(&self, expected: &TokenKind<'_>) -> bool {
         self.peek() == expected
     }
 
-    fn peek(&self) -> &TokenKind {
+    fn peek(&self) -> &TokenKind<'input> {
         &self.tokens[self.current].kind
     }
 

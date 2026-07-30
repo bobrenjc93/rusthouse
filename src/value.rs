@@ -13,12 +13,16 @@ pub enum DataType {
 
 impl DataType {
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_uppercase().as_str() {
-            "INT64" => Some(Self::Int64),
-            "FLOAT64" => Some(Self::Float64),
-            "BOOL" | "BOOLEAN" => Some(Self::Bool),
-            "STRING" => Some(Self::String),
-            _ => None,
+        if value.eq_ignore_ascii_case("INT64") {
+            Some(Self::Int64)
+        } else if value.eq_ignore_ascii_case("FLOAT64") {
+            Some(Self::Float64)
+        } else if value.eq_ignore_ascii_case("BOOL") || value.eq_ignore_ascii_case("BOOLEAN") {
+            Some(Self::Bool)
+        } else if value.eq_ignore_ascii_case("STRING") {
+            Some(Self::String)
+        } else {
+            None
         }
     }
 }
