@@ -169,12 +169,17 @@ impl Workload {
                 }
             }
             VariantKind::HighCardinalityGroupBy => {
-                let uniform_threshold = nonselective_threshold(seed, index);
+                let limit = 75 + permuted(seed, index, 51, 0);
+                let descending = permuted(seed, index, 2, 1) == 1;
+                let direction = if descending { "DESC" } else { "ASC" };
                 QueryVariant {
                     sql: format!(
-                        "SELECT high_key, COUNT(*) AS row_count, SUM(skewed_num) AS total FROM parity_data WHERE uniform_num >= {uniform_threshold} GROUP BY high_key ORDER BY high_key LIMIT 100;"
+                        "SELECT high_key, COUNT(*) AS row_count, SUM(skewed_num) AS total FROM parity_data GROUP BY high_key ORDER BY high_key {direction} LIMIT {limit};"
                     ),
-                    parameters: vec![integer_parameter("uniform_threshold", uniform_threshold)],
+                    parameters: vec![
+                        integer_parameter("limit", limit),
+                        boolean_parameter("descending", descending),
+                    ],
                 }
             }
             VariantKind::NumericOrderByLimit => {
@@ -386,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn variants_are_seeded_reproducible_and_not_exact_repetitions() {
+    fn variants_are_seeded_reproducible_and_broadly_varied() {
         for workload in workloads(2_048) {
             let first = workload.variants(42, 256).expect("variants");
             let repeated = workload.variants(42, 256).expect("variants");
@@ -395,15 +400,15 @@ mod tests {
             assert_eq!(first, repeated, "{} reproducibility", workload.name);
             assert_ne!(first, other_seed, "{} seed variation", workload.name);
             assert_eq!(first.queries.len(), 256);
-            assert_eq!(
+            assert!(
                 first
                     .queries
                     .iter()
                     .map(|variant| variant.sql.as_str())
                     .collect::<BTreeSet<_>>()
-                    .len(),
-                256,
-                "{} unique SQL variants",
+                    .len()
+                    >= 100,
+                "{} must retain broad SQL variation",
                 workload.name
             );
             assert!(
@@ -425,6 +430,37 @@ mod tests {
             };
             assert!((0..1_000).contains(&selected_id));
         }
+    }
+
+    #[test]
+    fn high_cardinality_variants_preserve_full_input_and_calibrated_top_k() {
+        let workload = workloads(50_000).remove(5);
+        let variants = workload.variants(20_260_729, 256).expect("variants");
+        let distinct_sql = variants
+            .queries
+            .iter()
+            .map(|variant| variant.sql.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut limits = Vec::new();
+        let mut directions = BTreeSet::new();
+
+        for variant in &variants.queries {
+            assert!(!variant.sql.contains(" WHERE "));
+            let ParameterValue::Integer(limit) = variant.parameters[0].value else {
+                panic!("limit must be an integer");
+            };
+            let ParameterValue::Boolean(descending) = variant.parameters[1].value else {
+                panic!("direction must be Boolean");
+            };
+            limits.push(limit);
+            directions.insert(descending);
+        }
+
+        assert_eq!(distinct_sql.len(), 102);
+        assert_eq!(directions, BTreeSet::from([false, true]));
+        assert!(limits.iter().all(|limit| (75..=125).contains(limit)));
+        let mean_limit = limits.iter().sum::<i64>() as f64 / limits.len() as f64;
+        assert!((mean_limit - 100.0).abs() < 1.0);
     }
 
     #[test]
