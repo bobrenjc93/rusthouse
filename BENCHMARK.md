@@ -47,6 +47,17 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
+Add the non-scoring resource mode when ingestion and peak-memory evidence is needed. It takes three resource samples per engine and scale and requires `--details` so no raw measurement can be silently discarded:
+
+~~~bash
+RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
+  target/release/clickhouse-parity-bench \
+  --mode default \
+  --seed 20260729 \
+  --resources \
+  --details /tmp/rusthouse-parity-default-resources.json
+~~~
+
 ## Grouping and top-k optimization measurement
 
 On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
@@ -64,7 +75,7 @@ The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 1
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. With `--resources`, schema version 3 also retains raw ingestion and peak-RSS samples, medians, normalization metadata, SQL byte counts, and independent resource correctness counts. Setup, execution, version, checksum, parse, correctness, timing-stability, unsupported resource collection, incomplete telemetry, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -95,11 +106,11 @@ The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both e
 
 ## Correctness gate and normalization
 
-Correctness and timing use separate processes. Before any timing for a case, the harness runs setup plus one unamplified query on each engine, captures both outputs, and opens that case's timing gate only after normalization succeeds. Amplified and end-to-end sample acceptance both require the open gate. Any process or comparison failure rejects the entire run; failed or absent gates cannot contribute timings.
+Correctness and timing use separate processes. Before any timing for a case, the harness runs setup plus one unamplified query on each engine, captures both outputs, and opens that case's timing gate only after normalization succeeds. Amplified and end-to-end sample acceptance both require the open gate. Resource mode likewise runs the byte-identical setup and full-scan correctness query for both engines at every scale before accepting ingestion or RSS samples. Any process or comparison failure rejects the entire run; failed or absent gates cannot contribute measurements.
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, family/scale weighting, resource sample completeness, platform RSS normalization, and real child-process RSS collection.
 
 ## Timing and calibration
 
@@ -108,6 +119,14 @@ The primary sample starts one process, creates and inserts the dataset once, and
 The fixed 256x factor is the calibration for both quick and default modes. It was selected to make repeated analytical work the majority of ClickHouse Local batch time across the retained scales while keeping quick mode practical. A fixed shared factor avoids engine-dependent adaptive stopping and gives every case the same amortization. The harness deliberately performs no startup subtraction: subtracting independently noisy process measurements can create zero, negative, or highly unstable derived timings. Samples must remain positive, and a greater-than-10x max/min spread rejects the run.
 
 A separate end-to-end metric times fresh processes containing setup plus one query. It uses three samples per case and includes startup, SQL parsing, table creation, insertion, execution, formatting, and process shutdown. This preserves the real CLI lifecycle signal instead of silently discarding it.
+
+## Non-scoring resource mode
+
+Resource mode runs after all scored samples, so its processes cannot alter the scoring inputs. For each configured row count it first repeats the full-scan correctness gate, passing the same generated setup and query bytes to both engines. It then alternates engine order across three setup-only processes per engine. The generated `CREATE TABLE` and `INSERT` bytes are passed unchanged to each process.
+
+Ingestion wall time is the raw duration from immediately before process spawn through successful setup-only process exit. It deliberately includes startup, stdin transfer, SQL parsing, table creation, insertion, and shutdown; no independently noisy baseline is subtracted. Peak RSS is collected for the same process with `wait4`. macOS reports `ru_maxrss` in bytes; Linux reports KiB, which the harness multiplies by 1,024 before writing integer byte values. Other platforms fail closed rather than emitting incomparable or missing memory data. Zero durations, zero RSS, missing samples, mismatched result data, excessive wall-time spread, or an incomplete scale set reject the entire benchmark.
+
+The details JSON retains every raw wall-time and normalized RSS sample plus per-engine medians. Peak RSS is a whole-process high-water mark, not incremental table memory: it includes the executable, parser, input representation, allocator behavior, and loaded table. These resource measurements are evidence only. They do not produce ratios, enter `parity_score`, change caps or weights, or alter either reported score.
 
 ## Score aggregation
 
@@ -127,4 +146,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, byte-identical resource SQL, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.

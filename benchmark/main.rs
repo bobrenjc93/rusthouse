@@ -16,7 +16,10 @@ use std::time::Duration;
 use config::{Config, ParseResult};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use process::{
+    ClickHouseIdentity, Engine, EnginePaths, ResourceMeasurement, TimedBatch, TimedOutput,
+    ensure_resource_measurement_supported, peak_rss_normalization,
+};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -35,6 +38,7 @@ OPTIONS:
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
     --details <PATH>        Write detailed JSON without changing stdout
+    --resources             Collect non-scoring ingestion/RSS data (requires --details)
     -h, --help              Print this help
 
 RUSTHOUSE_CLICKHOUSE_BIN supplies --clickhouse when the flag is absent.
@@ -66,6 +70,33 @@ struct CaseResult {
     rusthouse_end_to_end_median_ms: f64,
     clickhouse_end_to_end_median_ms: f64,
     end_to_end_ratio: f64,
+}
+
+#[derive(Debug, Default)]
+struct ResourceSeries {
+    rusthouse_ingestion_ms: Vec<f64>,
+    clickhouse_ingestion_ms: Vec<f64>,
+    rusthouse_peak_rss_bytes: Vec<u64>,
+    clickhouse_peak_rss_bytes: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct ResourceScaleResult {
+    row_count: usize,
+    correctness_workload: &'static str,
+    setup_sql_bytes: usize,
+    correctness_query_bytes: usize,
+    samples: ResourceSeries,
+    rusthouse_ingestion_median_ms: f64,
+    clickhouse_ingestion_median_ms: f64,
+    rusthouse_peak_rss_median_bytes: u64,
+    clickhouse_peak_rss_median_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ResourceResults {
+    correctness_checks: usize,
+    scales: Vec<ResourceScaleResult>,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +178,9 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 
 fn run(config: Config) -> Result<Report, String> {
     let settings = config.mode.settings();
+    if config.resources {
+        ensure_resource_measurement_supported()?;
+    }
     let paths = EnginePaths {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
@@ -293,6 +327,11 @@ fn run(config: Config) -> Result<Report, String> {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
+    let resource_results = if config.resources {
+        Some(collect_resource_results(&config, &paths)?)
+    } else {
+        None
+    };
 
     if let Some(path) = &config.details {
         let details = details_json(
@@ -302,6 +341,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            resource_results.as_ref(),
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
@@ -344,6 +384,14 @@ fn run(config: Config) -> Result<Report, String> {
             settings.query_amplification
         ),
     ];
+    if let Some(resources) = &resource_results {
+        evidence.push(format!(
+            "non-scoring resource mode retained {} ingestion/RSS samples per engine across {} scales after {} independent correctness pairs",
+            settings.resource_samples,
+            resources.scales.len(),
+            resources.correctness_checks
+        ));
+    }
     evidence.extend(cases.iter().map(|case| {
         format!(
             "{} / {} rows: primary/query RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}",
@@ -383,6 +431,193 @@ fn run(config: Config) -> Result<Report, String> {
         evidence,
         suggestions,
     })
+}
+
+fn collect_resource_results(
+    config: &Config,
+    paths: &EnginePaths,
+) -> Result<ResourceResults, String> {
+    let settings = config.mode.settings();
+    if settings.resource_samples == 0 {
+        return Err("resource sample count must be positive".to_owned());
+    }
+    let mut scales = Vec::with_capacity(settings.row_counts.len());
+    let mut correctness_checks = 0;
+
+    for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
+        let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+        let dataset = Dataset::generate(dataset_seed, row_count);
+        let setup_sql = dataset.setup_sql();
+        let correctness_workload = workloads(row_count)
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no correctness workload exists at {row_count} rows"))?;
+        eprintln!(
+            "measuring non-scoring resources at {} rows ({} samples per engine)",
+            row_count, settings.resource_samples
+        );
+
+        let correctness_order = row_count_index.is_multiple_of(2);
+        let (rusthouse_output, clickhouse_output) = execute_correctness_pair(
+            paths,
+            &setup_sql,
+            &correctness_workload.sql,
+            correctness_order,
+        )?;
+        let mut gate = CorrectnessGate::default();
+        gate.verify(
+            &correctness_workload.columns,
+            &rusthouse_output,
+            &clickhouse_output,
+        )
+        .map_err(|error| {
+            format!(
+                "resource correctness gate failed at {row_count} rows for '{}': {error}",
+                correctness_workload.name
+            )
+        })?;
+        correctness_checks += 1;
+
+        let mut samples = ResourceSeries::default();
+        for iteration in 0..settings.resource_samples {
+            let rusthouse_first = (row_count_index + iteration + 1).is_multiple_of(2);
+            let (rusthouse, clickhouse) =
+                execute_ingestion_pair(paths, &setup_sql, rusthouse_first)?;
+            accept_resource_pair(&gate, &rusthouse, &clickhouse, &mut samples)?;
+        }
+        validate_resource_sample_counts(&samples, settings.resource_samples, row_count)?;
+
+        let rusthouse_ingestion_median_ms = stable_median(
+            &samples.rusthouse_ingestion_ms,
+            "RustHouse ingestion wall time",
+            correctness_workload.name,
+            row_count,
+        )?;
+        let clickhouse_ingestion_median_ms = stable_median(
+            &samples.clickhouse_ingestion_ms,
+            "ClickHouse ingestion wall time",
+            correctness_workload.name,
+            row_count,
+        )?;
+        let rusthouse_peak_rss_median_bytes =
+            median_u64(&samples.rusthouse_peak_rss_bytes, "RustHouse peak RSS")?;
+        let clickhouse_peak_rss_median_bytes =
+            median_u64(&samples.clickhouse_peak_rss_bytes, "ClickHouse peak RSS")?;
+
+        eprintln!(
+            "  ingestion medians: RustHouse {:.3} ms / {:.2} MiB peak, ClickHouse {:.3} ms / {:.2} MiB peak",
+            rusthouse_ingestion_median_ms,
+            rusthouse_peak_rss_median_bytes as f64 / (1024.0 * 1024.0),
+            clickhouse_ingestion_median_ms,
+            clickhouse_peak_rss_median_bytes as f64 / (1024.0 * 1024.0)
+        );
+        scales.push(ResourceScaleResult {
+            row_count,
+            correctness_workload: correctness_workload.name,
+            setup_sql_bytes: setup_sql.len(),
+            correctness_query_bytes: correctness_workload.sql.len(),
+            samples,
+            rusthouse_ingestion_median_ms,
+            clickhouse_ingestion_median_ms,
+            rusthouse_peak_rss_median_bytes,
+            clickhouse_peak_rss_median_bytes,
+        });
+    }
+
+    if scales.len() != settings.row_counts.len() || correctness_checks != settings.row_counts.len()
+    {
+        return Err(format!(
+            "resource measurement was incomplete: expected {} scales and correctness checks, got {} scales and {correctness_checks} checks",
+            settings.row_counts.len(),
+            scales.len()
+        ));
+    }
+    Ok(ResourceResults {
+        correctness_checks,
+        scales,
+    })
+}
+
+fn execute_ingestion_pair(
+    paths: &EnginePaths,
+    setup_sql: &str,
+    rusthouse_first: bool,
+) -> Result<(ResourceMeasurement, ResourceMeasurement), String> {
+    if rusthouse_first {
+        let rusthouse = paths.execute_ingestion(Engine::RustHouse, setup_sql)?;
+        let clickhouse = paths.execute_ingestion(Engine::ClickHouse, setup_sql)?;
+        Ok((rusthouse, clickhouse))
+    } else {
+        let clickhouse = paths.execute_ingestion(Engine::ClickHouse, setup_sql)?;
+        let rusthouse = paths.execute_ingestion(Engine::RustHouse, setup_sql)?;
+        Ok((rusthouse, clickhouse))
+    }
+}
+
+fn accept_resource_pair(
+    gate: &CorrectnessGate,
+    rusthouse: &ResourceMeasurement,
+    clickhouse: &ResourceMeasurement,
+    samples: &mut ResourceSeries,
+) -> Result<(), String> {
+    if !gate.passed {
+        return Err("resource sample was not preceded by a passing correctness run".to_owned());
+    }
+    let rusthouse_ms = rusthouse.elapsed.as_secs_f64() * 1_000.0;
+    let clickhouse_ms = clickhouse.elapsed.as_secs_f64() * 1_000.0;
+    if !rusthouse_ms.is_finite() || rusthouse_ms <= 0.0 {
+        return Err("RustHouse ingestion wall time was incomplete".to_owned());
+    }
+    if !clickhouse_ms.is_finite() || clickhouse_ms <= 0.0 {
+        return Err("ClickHouse ingestion wall time was incomplete".to_owned());
+    }
+    if rusthouse.peak_rss_bytes == 0 || clickhouse.peak_rss_bytes == 0 {
+        return Err("peak RSS measurement was incomplete".to_owned());
+    }
+    samples.rusthouse_ingestion_ms.push(rusthouse_ms);
+    samples.clickhouse_ingestion_ms.push(clickhouse_ms);
+    samples
+        .rusthouse_peak_rss_bytes
+        .push(rusthouse.peak_rss_bytes);
+    samples
+        .clickhouse_peak_rss_bytes
+        .push(clickhouse.peak_rss_bytes);
+    Ok(())
+}
+
+fn validate_resource_sample_counts(
+    samples: &ResourceSeries,
+    expected: usize,
+    row_count: usize,
+) -> Result<(), String> {
+    let counts = [
+        samples.rusthouse_ingestion_ms.len(),
+        samples.clickhouse_ingestion_ms.len(),
+        samples.rusthouse_peak_rss_bytes.len(),
+        samples.clickhouse_peak_rss_bytes.len(),
+    ];
+    if counts.iter().any(|count| *count != expected) {
+        return Err(format!(
+            "resource measurement was incomplete at {row_count} rows: expected {expected} samples for all metrics, got {counts:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn median_u64(values: &[u64], metric: &str) -> Result<u64, String> {
+    if values.is_empty() || values.contains(&0) {
+        return Err(format!("{metric} samples are incomplete"));
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        Ok(sorted[middle])
+    } else {
+        let lower = sorted[middle - 1];
+        let upper = sorted[middle];
+        Ok(lower + (upper - lower) / 2)
+    }
 }
 
 fn score_cases(
@@ -535,12 +770,13 @@ fn details_json(
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    resources: Option<&ResourceResults>,
 ) -> String {
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,7 +797,7 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"resource_mode\":",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
@@ -571,6 +807,8 @@ fn details_json(
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
+    write_resource_details(&mut output, resources, settings.resource_samples);
+    output.push_str(",\"cases\":[");
 
     for (index, case) in cases.iter().enumerate() {
         if index > 0 {
@@ -614,6 +852,54 @@ fn details_json(
     output
 }
 
+fn write_resource_details(
+    output: &mut String,
+    resources: Option<&ResourceResults>,
+    expected_samples: usize,
+) {
+    let Some(resources) = resources else {
+        output.push_str("{\"enabled\":false,\"scoring\":false}");
+        return;
+    };
+    let normalization = peak_rss_normalization()
+        .expect("successful resource collection has a supported RSS normalization");
+    write!(
+        output,
+        "{{\"enabled\":true,\"scoring\":false,\"samples_per_engine_per_scale\":{expected_samples},\"correctness_checks\":{},\"setup_sql_identical_between_engines\":true,\"correctness_query_identical_between_engines\":true,\"ingestion_wall_time_scope\":{},\"peak_rss_unit\":\"bytes\",\"peak_rss_normalization\":{},\"scales\":[",
+        resources.correctness_checks,
+        json_string("raw child-process wall time from pre-spawn through successful setup-only exit; no startup or shutdown subtraction"),
+        json_string(normalization)
+    )
+    .expect("writing to String cannot fail");
+    for (index, scale) in resources.scales.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(
+            output,
+            "{{\"row_count\":{},\"correctness_workload\":{},\"setup_sql_bytes\":{},\"correctness_query_bytes\":{},\"rusthouse_ingestion_median_ms\":{:.6},\"clickhouse_ingestion_median_ms\":{:.6},\"rusthouse_peak_rss_median_bytes\":{},\"clickhouse_peak_rss_median_bytes\":{},\"rusthouse_ingestion_samples_ms\":",
+            scale.row_count,
+            json_string(scale.correctness_workload),
+            scale.setup_sql_bytes,
+            scale.correctness_query_bytes,
+            scale.rusthouse_ingestion_median_ms,
+            scale.clickhouse_ingestion_median_ms,
+            scale.rusthouse_peak_rss_median_bytes,
+            scale.clickhouse_peak_rss_median_bytes
+        )
+        .expect("writing to String cannot fail");
+        write_number_array(output, &scale.samples.rusthouse_ingestion_ms);
+        output.push_str(",\"clickhouse_ingestion_samples_ms\":");
+        write_number_array(output, &scale.samples.clickhouse_ingestion_ms);
+        output.push_str(",\"rusthouse_peak_rss_samples_bytes\":");
+        write_u64_array(output, &scale.samples.rusthouse_peak_rss_bytes);
+        output.push_str(",\"clickhouse_peak_rss_samples_bytes\":");
+        write_u64_array(output, &scale.samples.clickhouse_peak_rss_bytes);
+        output.push('}');
+    }
+    output.push_str("]}");
+}
+
 fn write_number_array(output: &mut String, values: &[f64]) {
     output.push('[');
     for (index, value) in values.iter().enumerate() {
@@ -621,6 +907,17 @@ fn write_number_array(output: &mut String, values: &[f64]) {
             output.push(',');
         }
         write!(output, "{value:.6}").expect("writing to String cannot fail");
+    }
+    output.push(']');
+}
+
+fn write_u64_array(output: &mut String, values: &[u64]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{value}").expect("writing to String cannot fail");
     }
     output.push(']');
 }
@@ -676,6 +973,13 @@ mod tests {
         TimedBatch {
             elapsed: Duration::from_secs_f64(milliseconds / 1_000.0),
             query_repetitions: repetitions,
+        }
+    }
+
+    fn resource(milliseconds: f64, peak_rss_bytes: u64) -> ResourceMeasurement {
+        ResourceMeasurement {
+            elapsed: Duration::from_secs_f64(milliseconds / 1_000.0),
+            peak_rss_bytes,
         }
     }
 
@@ -773,6 +1077,87 @@ mod tests {
         .expect("gated sample");
         assert_eq!(samples.rusthouse_per_query_ms, [1.0]);
         assert_eq!(samples.clickhouse_per_query_ms, [0.5]);
+    }
+
+    #[test]
+    fn resource_samples_require_a_correctness_gate() {
+        let mut samples = ResourceSeries::default();
+        let error = accept_resource_pair(
+            &CorrectnessGate::default(),
+            &resource(10.0, 1_024),
+            &resource(20.0, 2_048),
+            &mut samples,
+        )
+        .expect_err("ungated resource data must fail");
+
+        assert!(error.contains("correctness"));
+        assert!(samples.rusthouse_ingestion_ms.is_empty());
+        assert!(samples.clickhouse_peak_rss_bytes.is_empty());
+    }
+
+    #[test]
+    fn resource_samples_are_complete_and_use_raw_rss_medians() {
+        let mut samples = ResourceSeries::default();
+        for (rusthouse_rss, clickhouse_rss) in [(3_000, 8_000), (1_000, 4_000), (2_000, 6_000)] {
+            accept_resource_pair(
+                &CorrectnessGate { passed: true },
+                &resource(10.0, rusthouse_rss),
+                &resource(20.0, clickhouse_rss),
+                &mut samples,
+            )
+            .expect("complete resource sample");
+        }
+
+        validate_resource_sample_counts(&samples, 3, 100).expect("all series are complete");
+        assert_eq!(
+            median_u64(&samples.rusthouse_peak_rss_bytes, "RSS").expect("median"),
+            2_000
+        );
+        assert_eq!(
+            median_u64(&samples.clickhouse_peak_rss_bytes, "RSS").expect("median"),
+            6_000
+        );
+        assert!(validate_resource_sample_counts(&samples, 4, 100).is_err());
+    }
+
+    #[test]
+    fn disabled_resource_details_are_explicitly_non_scoring() {
+        let mut output = String::new();
+        write_resource_details(&mut output, None, 3);
+        assert_eq!(output, "{\"enabled\":false,\"scoring\":false}");
+    }
+
+    #[test]
+    fn resource_details_retain_samples_medians_and_sql_contract() {
+        let resources = ResourceResults {
+            correctness_checks: 1,
+            scales: vec![ResourceScaleResult {
+                row_count: 100,
+                correctness_workload: "full_scan_aggregate",
+                setup_sql_bytes: 1_234,
+                correctness_query_bytes: 120,
+                samples: ResourceSeries {
+                    rusthouse_ingestion_ms: vec![1.0, 2.0, 3.0],
+                    clickhouse_ingestion_ms: vec![4.0, 5.0, 6.0],
+                    rusthouse_peak_rss_bytes: vec![1_024, 2_048, 3_072],
+                    clickhouse_peak_rss_bytes: vec![4_096, 5_120, 6_144],
+                },
+                rusthouse_ingestion_median_ms: 2.0,
+                clickhouse_ingestion_median_ms: 5.0,
+                rusthouse_peak_rss_median_bytes: 2_048,
+                clickhouse_peak_rss_median_bytes: 5_120,
+            }],
+        };
+        let mut output = String::new();
+        write_resource_details(&mut output, Some(&resources), 3);
+
+        assert!(output.contains("\"scoring\":false"));
+        assert!(output.contains("\"setup_sql_identical_between_engines\":true"));
+        assert!(output.contains("\"correctness_query_identical_between_engines\":true"));
+        assert!(output.contains("\"rusthouse_ingestion_median_ms\":2.000000"));
+        assert!(output.contains("\"clickhouse_peak_rss_median_bytes\":5120"));
+        assert!(output.contains("\"rusthouse_ingestion_samples_ms\":[1.000000,2.000000,3.000000]"));
+        assert!(output.contains("\"clickhouse_peak_rss_samples_bytes\":[4096,5120,6144]"));
     }
 
     #[test]

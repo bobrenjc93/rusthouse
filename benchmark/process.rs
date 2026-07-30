@@ -1,7 +1,11 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{mem::MaybeUninit, os::unix::process::ExitStatusExt as _};
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
 pub const CLICKHOUSE_SHA256: &str =
@@ -34,6 +38,32 @@ pub struct TimedOutput {
 pub struct TimedBatch {
     pub elapsed: Duration,
     pub query_repetitions: usize,
+}
+
+#[derive(Debug)]
+pub struct ResourceMeasurement {
+    pub elapsed: Duration,
+    pub peak_rss_bytes: u64,
+}
+
+pub fn ensure_resource_measurement_supported() -> Result<(), String> {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "resource measurement is unsupported on {}; peak RSS collection requires macOS or Linux wait4",
+            std::env::consts::OS
+        ))
+    }
+}
+
+pub fn peak_rss_normalization() -> Result<&'static str, String> {
+    ensure_resource_measurement_supported()?;
+    if cfg!(target_os = "macos") {
+        Ok("macOS wait4 ru_maxrss bytes")
+    } else {
+        Ok("Linux wait4 ru_maxrss KiB multiplied by 1024")
+    }
 }
 
 impl EnginePaths {
@@ -71,24 +101,86 @@ impl EnginePaths {
         })
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn execute_ingestion(
+        &self,
+        engine: Engine,
+        setup_sql: &str,
+    ) -> Result<ResourceMeasurement, String> {
+        if setup_sql.is_empty() {
+            return Err("resource measurement setup SQL must not be empty".to_owned());
+        }
+        let mut command = self.command(engine);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "could not start {} at '{}': {error}",
+                engine.name(),
+                engine.path(self).display()
+            )
+        })?;
+        let input_result = child
+            .stdin
+            .take()
+            .expect("configured resource stdin is piped")
+            .write_all(setup_sql.as_bytes());
+
+        let mut stderr = Vec::new();
+        let stderr_result = child
+            .stderr
+            .take()
+            .expect("configured resource stderr is piped")
+            .read_to_end(&mut stderr);
+        let (status, usage) = wait_with_rusage(&child)?;
+        let elapsed = started.elapsed();
+
+        if !status.success() {
+            return Err(format!(
+                "{} resource process exited with {}: {}",
+                engine.name(),
+                status,
+                summarize_stderr(&stderr)
+            ));
+        }
+        input_result
+            .map_err(|error| format!("could not write setup SQL to {}: {error}", engine.name()))?;
+        stderr_result
+            .map_err(|error| format!("could not read {} stderr: {error}", engine.name()))?;
+        let peak_rss_bytes = normalize_peak_rss_bytes(usage.ru_maxrss)?;
+        if elapsed.is_zero() {
+            return Err(format!(
+                "{} ingestion wall time was zero; measurement is incomplete",
+                engine.name()
+            ));
+        }
+        Ok(ResourceMeasurement {
+            elapsed,
+            peak_rss_bytes,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn execute_ingestion(
+        &self,
+        _engine: Engine,
+        _setup_sql: &str,
+    ) -> Result<ResourceMeasurement, String> {
+        ensure_resource_measurement_supported()?;
+        unreachable!("unsupported resource measurement was accepted")
+    }
+
     fn execute_batch(
         &self,
         engine: Engine,
         batch: &str,
         capture_stdout: bool,
     ) -> Result<(Duration, Option<String>), String> {
-        let mut command = match engine {
-            Engine::RustHouse => {
-                let mut command = Command::new(&self.rusthouse);
-                command.args(["--format", "csv"]);
-                command
-            }
-            Engine::ClickHouse => {
-                let mut command = Command::new(&self.clickhouse);
-                command.args(["local", "--multiquery", "--output-format", "CSVWithNames"]);
-                command
-            }
-        };
+        let mut command = self.command(engine);
         command
             .stdin(Stdio::piped())
             .stdout(if capture_stdout {
@@ -134,6 +226,63 @@ impl EnginePaths {
                 None
             };
         Ok((elapsed, stdout))
+    }
+
+    fn command(&self, engine: Engine) -> Command {
+        match engine {
+            Engine::RustHouse => {
+                let mut command = Command::new(&self.rusthouse);
+                command.args(["--format", "csv"]);
+                command
+            }
+            Engine::ClickHouse => {
+                let mut command = Command::new(&self.clickhouse);
+                command.args(["local", "--multiquery", "--output-format", "CSVWithNames"]);
+                command
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_with_rusage(
+    child: &std::process::Child,
+) -> Result<(std::process::ExitStatus, libc::rusage), String> {
+    let pid = libc::pid_t::try_from(child.id())
+        .map_err(|_| format!("child PID {} does not fit pid_t", child.id()))?;
+    let mut status = 0;
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    loop {
+        // Stderr has already been drained, and wait4 atomically returns the
+        // child's exit status and per-process high-water RSS.
+        let waited = unsafe { libc::wait4(pid, &mut status, 0, usage.as_mut_ptr()) };
+        if waited == pid {
+            // wait4 initialized rusage when it returned this child's PID.
+            let usage = unsafe { usage.assume_init() };
+            return Ok((std::process::ExitStatus::from_raw(status), usage));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(format!("could not collect child resource usage: {error}"));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn normalize_peak_rss_bytes(native_peak_rss: libc::c_long) -> Result<u64, String> {
+    let native_peak_rss = u64::try_from(native_peak_rss).map_err(|_| {
+        format!("peak RSS was negative ({native_peak_rss}); measurement is incomplete")
+    })?;
+    if native_peak_rss == 0 {
+        return Err("peak RSS was zero; measurement is incomplete".to_owned());
+    }
+    if cfg!(target_os = "linux") {
+        native_peak_rss
+            .checked_mul(1_024)
+            .ok_or_else(|| "peak RSS overflowed while normalizing KiB to bytes".to_owned())
+    } else {
+        Ok(native_peak_rss)
     }
 }
 
@@ -282,5 +431,45 @@ mod tests {
     #[test]
     fn amplification_must_be_positive() {
         assert!(sql_batch("", "SELECT 1;", 0).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn peak_rss_is_positive_and_normalized_to_bytes() {
+        assert!(normalize_peak_rss_bytes(0).is_err());
+        let normalized = normalize_peak_rss_bytes(1_024).expect("positive RSS");
+        if cfg!(target_os = "linux") {
+            assert_eq!(normalized, 1_048_576);
+        } else {
+            assert_eq!(normalized, 1_024);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ingestion_measurement_collects_real_child_rss() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = std::env::temp_dir().join(format!(
+            "rusthouse-resource-measurement-{}",
+            std::process::id()
+        ));
+        std::fs::write(&script, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n")
+            .expect("write test command");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).expect("make test command executable");
+
+        let paths = EnginePaths {
+            rusthouse: script.clone(),
+            clickhouse: script.clone(),
+        };
+        let measurement = paths
+            .execute_ingestion(Engine::RustHouse, "CREATE TABLE t (n Int64);\n")
+            .expect("resource measurement");
+        let _ = std::fs::remove_file(script);
+
+        assert!(!measurement.elapsed.is_zero());
+        assert!(measurement.peak_rss_bytes > 0);
     }
 }

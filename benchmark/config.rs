@@ -22,6 +22,7 @@ impl Mode {
                 samples: 3,
                 query_amplification: 256,
                 end_to_end_samples: 3,
+                resource_samples: 3,
             },
             Self::Default => BenchmarkSettings {
                 row_counts: vec![1_000, 10_000, 50_000],
@@ -29,6 +30,7 @@ impl Mode {
                 samples: 7,
                 query_amplification: 256,
                 end_to_end_samples: 3,
+                resource_samples: 3,
             },
         }
     }
@@ -41,6 +43,7 @@ pub struct BenchmarkSettings {
     pub samples: usize,
     pub query_amplification: usize,
     pub end_to_end_samples: usize,
+    pub resource_samples: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +53,7 @@ pub struct Config {
     pub rusthouse: PathBuf,
     pub clickhouse: PathBuf,
     pub details: Option<PathBuf>,
+    pub resources: bool,
 }
 
 pub enum ParseResult {
@@ -70,6 +74,7 @@ pub fn parse(
         .map(PathBuf::from)
         .unwrap_or(default_rusthouse);
     let mut details = None;
+    let mut resources = false;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
@@ -109,6 +114,7 @@ pub fn parse(
                         .ok_or_else(|| "--details requires a path".to_owned())?,
                 ));
             }
+            "--resources" | "--resource-mode" => resources = true,
             _ if argument.starts_with("--mode=") => {
                 mode = parse_mode(&argument["--mode=".len()..])?;
             }
@@ -131,12 +137,18 @@ pub fn parse(
     let clickhouse = clickhouse.ok_or_else(|| {
         "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN".to_owned()
     })?;
+    if resources && details.is_none() {
+        return Err(
+            "--resources requires --details so raw resource samples are retained".to_owned(),
+        );
+    }
     Ok(ParseResult::Run(Config {
         mode,
         seed,
         rusthouse,
         clickhouse,
         details,
+        resources,
     }))
 }
 
@@ -167,6 +179,7 @@ mod tests {
                 "--clickhouse=/command/clickhouse",
                 "--rusthouse=/command/rusthouse",
                 "--details=details.json",
+                "--resources",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -183,6 +196,7 @@ mod tests {
         assert_eq!(config.clickhouse, PathBuf::from("/command/clickhouse"));
         assert_eq!(config.rusthouse, PathBuf::from("/command/rusthouse"));
         assert_eq!(config.details, Some(PathBuf::from("details.json")));
+        assert!(config.resources);
     }
 
     #[test]
@@ -194,6 +208,7 @@ mod tests {
             assert!(settings.samples >= 3);
             assert!(settings.query_amplification > 1);
             assert!(settings.end_to_end_samples >= 3);
+            assert!(settings.resource_samples >= 3);
         }
     }
 
@@ -204,5 +219,21 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("RUSTHOUSE_CLICKHOUSE_BIN"));
+    }
+
+    #[test]
+    fn resource_mode_requires_details_output() {
+        let error = match parse(
+            ["--resources", "--clickhouse=/clickhouse"]
+                .into_iter()
+                .map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        ) {
+            Ok(_) => panic!("resource samples without details should fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires --details"));
     }
 }
