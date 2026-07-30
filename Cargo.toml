@@ -8,6 +8,8 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+serde = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [[bin]]
 name = "clickhouse-parity-bench"

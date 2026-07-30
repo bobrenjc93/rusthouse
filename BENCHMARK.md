@@ -47,24 +47,33 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
-## Grouping and top-k optimization measurement
+## Retained benchmark evidence
 
-On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
+The raw schema-version 3 artifact at `benchmark/results/default-20260729.json` is the evidence behind the repository's benchmark claims. It was produced by the default command with seed `20260729`, release binaries, and the pinned ClickHouse build. All 24 correctness gates passed. Offline replay computes a sustained score of 99.705102 and a startup-inclusive score of 100.000000; 23 of 24 sustained cases and all 24 startup-inclusive cases reached the parity cap.
 
-| Case | Rows | Before (ms) | After (ms) | Speedup | After ratio |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| High-cardinality group by | 10,000 | 2.652 | 0.882 | 3.01x | 1.610 |
-| High-cardinality group by | 50,000 | 15.124 | 4.317 | 3.50x | 0.952 |
-| Numeric order by limit | 10,000 | 1.077 | 0.251 | 4.29x | 5.018 |
-| Numeric order by limit | 50,000 | 6.458 | 1.096 | 5.89x | 2.935 |
-| String order by limit | 10,000 | 1.769 | 0.442 | 4.00x | 2.685 |
-| String order by limit | 50,000 | 11.596 | 1.985 | 5.84x | 1.279 |
+Representative seven-sample RustHouse sustained medians and their uncapped ClickHouse/RustHouse ratios are:
 
-The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
+| Case | Rows | RustHouse median (ms) | Ratio |
+| --- | ---: | ---: | ---: |
+| High-cardinality group by | 10,000 | 0.905 | 1.741 |
+| High-cardinality group by | 50,000 | 4.391 | 0.940 |
+| Numeric order by limit | 10,000 | 0.273 | 4.960 |
+| Numeric order by limit | 50,000 | 1.062 | 2.739 |
+| String order by limit | 10,000 | 0.459 | 2.672 |
+| String order by limit | 50,000 | 1.975 | 1.298 |
+
+Verify every retained field without a ClickHouse or RustHouse executable:
+
+~~~bash
+cargo run --release --bin clickhouse-parity-bench -- \
+  --verify-details benchmark/results/default-20260729.json
+~~~
+
+Verification requires the exact workload/row-count matrix for the declared mode and rejects duplicate, missing, renamed, or re-family cases. It also checks the fixed mode configuration and pinned ClickHouse identity, derives per-query samples from raw batch samples, reapplies sample-count and stability gates, and recomputes every median, ratio, saturation count, and hierarchical score. Unknown, missing, or mismatched reported fields fail closed. No engine path is read or executed.
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, round-trip-precise medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, verification, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -99,7 +108,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, family/scale weighting, offline evidence replay, exact case-matrix enforcement, and sample, score, configuration, and identity tampering.
 
 ## Timing and calibration
 

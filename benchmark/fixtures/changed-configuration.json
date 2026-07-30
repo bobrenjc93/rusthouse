@@ -1,0 +1,6 @@
+{
+  "name": "changed sample configuration",
+  "pointer": "/primary_samples",
+  "replacement": 3,
+  "expected_error": "details.primary_samples mismatch"
+}

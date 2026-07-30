@@ -54,6 +54,7 @@ pub struct Config {
 
 pub enum ParseResult {
     Run(Config),
+    Verify(PathBuf),
     Help,
 }
 
@@ -70,25 +71,33 @@ pub fn parse(
         .map(PathBuf::from)
         .unwrap_or(default_rusthouse);
     let mut details = None;
+    let mut verify_details = None;
+    let mut benchmark_option_seen = false;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(ParseResult::Help),
-            "--quick" => mode = Mode::Quick,
+            "--quick" => {
+                benchmark_option_seen = true;
+                mode = Mode::Quick;
+            }
             "--mode" => {
+                benchmark_option_seen = true;
                 let value = arguments
                     .next()
                     .ok_or_else(|| "--mode requires quick or default".to_owned())?;
                 mode = parse_mode(&value)?;
             }
             "--seed" => {
+                benchmark_option_seen = true;
                 let value = arguments
                     .next()
                     .ok_or_else(|| "--seed requires an unsigned integer".to_owned())?;
                 seed = parse_seed(&value)?;
             }
             "--clickhouse" => {
+                benchmark_option_seen = true;
                 clickhouse = Some(PathBuf::from(
                     arguments
                         .next()
@@ -96,6 +105,7 @@ pub fn parse(
                 ));
             }
             "--rusthouse" => {
+                benchmark_option_seen = true;
                 rusthouse = PathBuf::from(
                     arguments
                         .next()
@@ -103,29 +113,61 @@ pub fn parse(
                 );
             }
             "--details" => {
+                benchmark_option_seen = true;
                 details = Some(PathBuf::from(
                     arguments
                         .next()
                         .ok_or_else(|| "--details requires a path".to_owned())?,
                 ));
             }
+            "--verify-details" => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--verify-details requires a path".to_owned())?;
+                if verify_details.replace(PathBuf::from(path)).is_some() {
+                    return Err("--verify-details may only be specified once".to_owned());
+                }
+            }
             _ if argument.starts_with("--mode=") => {
+                benchmark_option_seen = true;
                 mode = parse_mode(&argument["--mode=".len()..])?;
             }
             _ if argument.starts_with("--seed=") => {
+                benchmark_option_seen = true;
                 seed = parse_seed(&argument["--seed=".len()..])?;
             }
             _ if argument.starts_with("--clickhouse=") => {
+                benchmark_option_seen = true;
                 clickhouse = Some(PathBuf::from(&argument["--clickhouse=".len()..]));
             }
             _ if argument.starts_with("--rusthouse=") => {
+                benchmark_option_seen = true;
                 rusthouse = PathBuf::from(&argument["--rusthouse=".len()..]);
             }
             _ if argument.starts_with("--details=") => {
+                benchmark_option_seen = true;
                 details = Some(PathBuf::from(&argument["--details=".len()..]));
+            }
+            _ if argument.starts_with("--verify-details=") => {
+                let value = &argument["--verify-details=".len()..];
+                if value.is_empty() {
+                    return Err("--verify-details requires a path".to_owned());
+                }
+                if verify_details.replace(PathBuf::from(value)).is_some() {
+                    return Err("--verify-details may only be specified once".to_owned());
+                }
             }
             _ => return Err(format!("unknown argument {argument:?}; try --help")),
         }
+    }
+
+    if let Some(path) = verify_details {
+        if benchmark_option_seen {
+            return Err(
+                "--verify-details cannot be combined with benchmark execution options".to_owned(),
+            );
+        }
+        return Ok(ParseResult::Verify(path));
     }
 
     let clickhouse = clickhouse.ok_or_else(|| {
@@ -204,5 +246,35 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("RUSTHOUSE_CLICKHOUSE_BIN"));
+    }
+
+    #[test]
+    fn verification_is_offline_and_exclusive() {
+        let parsed = parse(
+            ["--verify-details", "evidence.json"]
+                .into_iter()
+                .map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("/missing/rusthouse"),
+        )
+        .expect("offline verification configuration");
+        assert!(matches!(
+            parsed,
+            ParseResult::Verify(path) if path.as_path() == std::path::Path::new("evidence.json")
+        ));
+
+        let error = match parse(
+            ["--quick", "--verify-details=evidence.json"]
+                .into_iter()
+                .map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        ) {
+            Ok(_) => panic!("verification and execution options should conflict"),
+            Err(error) => error,
+        };
+        assert!(error.contains("cannot be combined"));
     }
 }

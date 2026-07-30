@@ -1,0 +1,6 @@
+{
+  "name": "changed hierarchical score",
+  "pointer": "/score",
+  "replacement": 1.0,
+  "expected_error": "details.score mismatch"
+}

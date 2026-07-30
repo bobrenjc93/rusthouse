@@ -1,0 +1,6 @@
+{
+  "name": "changed case identity",
+  "pointer": "/cases/0/workload",
+  "replacement": "renamed_workload",
+  "expected_error": "unexpected benchmark case identity"
+}

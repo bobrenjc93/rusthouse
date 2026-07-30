@@ -1,0 +1,6 @@
+{
+  "name": "changed raw sample",
+  "pointer": "/cases/0/primary/rusthouse_per_query_samples_ms/0",
+  "replacement": 999.0,
+  "expected_error": "raw batch sample"
+}

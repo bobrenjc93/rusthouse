@@ -3,6 +3,7 @@ mod dataset;
 mod normalize;
 mod process;
 mod score;
+mod verify;
 mod workload;
 
 use std::env;
@@ -35,6 +36,7 @@ OPTIONS:
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
     --details <PATH>        Write detailed JSON without changing stdout
+    --verify-details <FILE> Verify saved details without running either engine
     -h, --help              Print this help
 
 RUSTHOUSE_CLICKHOUSE_BIN supplies --clickhouse when the flag is absent.
@@ -108,6 +110,30 @@ fn main() -> ExitCode {
         Ok(ParseResult::Help) => {
             print!("{HELP}");
             return ExitCode::SUCCESS;
+        }
+        Ok(ParseResult::Verify(path)) => {
+            return match verify::verify_details_file(&path) {
+                Ok(verified) => {
+                    let report = Report {
+                        score: verified.primary_score,
+                        summary: format!(
+                            "Verified {} benchmark details: primary score {:.2}; startup-inclusive end-to-end score {:.2}; {} canonical cases.",
+                            verified.mode,
+                            verified.primary_score,
+                            verified.end_to_end_score,
+                            verified.case_count
+                        ),
+                        evidence: vec![format!(
+                            "Offline replay validated raw samples, stability gates, medians, ratios, saturation counts, and hierarchical scores for seed {} without executing either engine",
+                            verified.seed
+                        )],
+                        suggestions: Vec::new(),
+                    };
+                    println!("{}", report.to_json());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => emit_failure(format!("details verification failed: {error}")),
+            };
         }
         Ok(ParseResult::Run(config)) => config,
         Err(error) => return emit_failure(error),
@@ -540,7 +566,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{},\"primary_score\":{},\"end_to_end_score\":{},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -578,7 +604,7 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{},\"clickhouse_batch_median_ms\":{},\"rusthouse_per_query_median_ms\":{},\"clickhouse_per_query_median_ms\":{},\"clickhouse_rusthouse_ratio\":{},\"rusthouse_batch_samples_ms\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
@@ -599,7 +625,7 @@ fn details_json(
         write_number_array(&mut output, &case.primary.clickhouse_per_query_ms);
         write!(
             output,
-            "}},\"end_to_end\":{{\"rusthouse_median_ms\":{:.6},\"clickhouse_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_samples_ms\":",
+            "}},\"end_to_end\":{{\"rusthouse_median_ms\":{},\"clickhouse_median_ms\":{},\"clickhouse_rusthouse_ratio\":{},\"rusthouse_samples_ms\":",
             case.rusthouse_end_to_end_median_ms,
             case.clickhouse_end_to_end_median_ms,
             case.end_to_end_ratio
@@ -620,7 +646,7 @@ fn write_number_array(output: &mut String, values: &[f64]) {
         if index > 0 {
             output.push(',');
         }
-        write!(output, "{value:.6}").expect("writing to String cannot fail");
+        write!(output, "{value}").expect("writing to String cannot fail");
     }
     output.push(']');
 }
