@@ -91,6 +91,10 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
+        let has_requested_aggregate = select
+            .items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate { .. }));
         let left_table = self.catalog.table(&select.table)?;
         let left_binding = select
             .table_alias
@@ -105,7 +109,7 @@ impl Database {
                 right_table,
                 right_binding,
                 join,
-                select.limit != Some(0),
+                select.limit != Some(0) || has_requested_aggregate,
             )?
         } else {
             RowSource::single(left_table, left_binding)
@@ -120,7 +124,7 @@ impl Database {
             resolve_select_items(&source, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&source, &items, &result_columns, &select.order_by)?;
 
-        if select.limit == Some(0) {
+        if select.limit == Some(0) && aggregate_specs.is_empty() {
             return Ok(QueryResult {
                 columns: result_columns,
                 rows: Vec::new(),

@@ -311,6 +311,34 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn limit_zero_preserves_aggregate_execution_errors() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE empty_values (value Int64);
+             CREATE TABLE overflowing_values (value Int64);
+             INSERT INTO overflowing_values VALUES (9223372036854775807), (1);",
+        )
+        .expect("setup succeeds");
+
+    let empty_avg = database
+        .execute("SELECT AVG(value) FROM empty_values LIMIT 0;")
+        .expect_err("AVG still executes before LIMIT");
+    assert!(matches!(
+        empty_avg,
+        Error::InvalidQuery(message) if message == "AVG is undefined for an empty input"
+    ));
+
+    let overflowing_sum = database
+        .execute("SELECT SUM(value) FROM overflowing_values LIMIT 0;")
+        .expect_err("SUM overflow still occurs before LIMIT");
+    assert_eq!(
+        overflowing_sum,
+        Error::NumericOverflow("SUM(Int64)".to_owned())
+    );
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
