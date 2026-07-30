@@ -49,12 +49,101 @@ pub fn compare_outputs(
     Ok(())
 }
 
+pub fn validate_amplified_output(
+    single_csv: &str,
+    amplified_csv: &str,
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+    expected_repetitions: usize,
+) -> Result<usize, String> {
+    if expected_repetitions == 0 {
+        return Err("amplified validation requires at least one repetition".to_owned());
+    }
+
+    let expected = normalize(single_csv, columns, engine)?;
+    let records = parse_csv(amplified_csv).map_err(|error| format!("{engine} CSV: {error}"))?;
+    let expected_header = columns
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let records_per_result = expected
+        .rows
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| "amplified validation result is too large".to_owned())?;
+    let mut record_index = 0;
+
+    for repetition in 0..expected_repetitions {
+        if repetition > 0 {
+            while records
+                .get(record_index)
+                .is_some_and(|record| is_blank_record(record))
+            {
+                record_index += 1;
+            }
+        }
+
+        let end = record_index
+            .checked_add(records_per_result)
+            .ok_or_else(|| "amplified validation result is too large".to_owned())?;
+        let result_records = records.get(record_index..end).ok_or_else(|| {
+            format!(
+                "{engine} amplified output is missing repetition {} of {expected_repetitions}",
+                repetition + 1
+            )
+        })?;
+        if result_records.first() != Some(&expected_header) {
+            return Err(format!(
+                "{engine} amplified output expected header {expected_header:?} for repetition {}, got {:?}",
+                repetition + 1,
+                result_records.first()
+            ));
+        }
+
+        let actual = normalize_records(result_records, columns, engine).map_err(|error| {
+            format!(
+                "{engine} amplified repetition {} of {expected_repetitions}: {error}",
+                repetition + 1
+            )
+        })?;
+        compare_normalized(&expected, &actual, columns).map_err(|error| {
+            format!(
+                "{engine} amplified repetition {} of {expected_repetitions}: {error}",
+                repetition + 1
+            )
+        })?;
+        record_index = end;
+    }
+
+    while records
+        .get(record_index)
+        .is_some_and(|record| is_blank_record(record))
+    {
+        record_index += 1;
+    }
+    if record_index != records.len() {
+        return Err(format!(
+            "{engine} amplified output has extra output after {expected_repetitions} repetitions"
+        ));
+    }
+
+    Ok(expected_repetitions)
+}
+
 fn normalize(
     csv: &str,
     columns: &[(&str, ColumnType)],
     engine: &str,
 ) -> Result<NormalizedTable, String> {
     let records = parse_csv(csv).map_err(|error| format!("{engine} CSV: {error}"))?;
+    normalize_records(&records, columns, engine)
+}
+
+fn normalize_records(
+    records: &[Vec<String>],
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+) -> Result<NormalizedTable, String> {
     let (header, rows) = records
         .split_first()
         .ok_or_else(|| format!("{engine} returned no CSV header"))?;
@@ -95,6 +184,41 @@ fn normalize(
     Ok(NormalizedTable {
         rows: normalized_rows,
     })
+}
+
+fn compare_normalized(
+    expected: &NormalizedTable,
+    actual: &NormalizedTable,
+    columns: &[(&str, ColumnType)],
+) -> Result<(), String> {
+    if expected.rows.len() != actual.rows.len() {
+        return Err(format!(
+            "row count mismatch: expected {}, got {}",
+            expected.rows.len(),
+            actual.rows.len()
+        ));
+    }
+
+    for (row_index, (expected_row, actual_row)) in
+        expected.rows.iter().zip(&actual.rows).enumerate()
+    {
+        for (column_index, (expected_value, actual_value)) in
+            expected_row.iter().zip(actual_row).enumerate()
+        {
+            if !values_equal(expected_value, actual_value) {
+                return Err(format!(
+                    "result mismatch at row {}, column '{}': expected={expected_value:?}, got={actual_value:?}",
+                    row_index + 1,
+                    columns[column_index].0
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_blank_record(record: &[String]) -> bool {
+    record.len() == 1 && record[0].is_empty()
 }
 
 fn normalize_value(value: &str, column_type: ColumnType) -> Result<NormalizedValue, String> {
@@ -232,5 +356,36 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn validates_every_result_in_an_amplified_csv_stream() {
+        let columns = [("n", ColumnType::Integer), ("label", ColumnType::String)];
+        let single = "n,label\n1,first\n2,second\n";
+        let amplified = concat!(
+            "n,label\n1,first\n2,second\n",
+            "\n",
+            "n,label\r\n1,first\r\n2,second\r\n",
+            "n,label\n1,first\n2,second\n"
+        );
+
+        assert_eq!(
+            validate_amplified_output(single, amplified, &columns, "fake", 3)
+                .expect("all repetitions match"),
+            3
+        );
+    }
+
+    #[test]
+    fn amplified_validation_rejects_missing_reordered_and_extra_output() {
+        let columns = [("n", ColumnType::Integer)];
+        let single = "n\n1\n2\n";
+        let missing = "n\n1\n2\nn\n1\n2\n";
+        let reordered = "n\n1\n2\nn\n2\n1\nn\n1\n2\n";
+        let extra = "n\n1\n2\nn\n1\n2\nn\n1\n2\nn\n1\n2\n";
+
+        assert!(validate_amplified_output(single, missing, &columns, "fake", 3).is_err());
+        assert!(validate_amplified_output(single, reordered, &columns, "fake", 3).is_err());
+        assert!(validate_amplified_output(single, extra, &columns, "fake", 3).is_err());
     }
 }

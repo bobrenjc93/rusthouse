@@ -1,5 +1,6 @@
 mod config;
 mod dataset;
+mod digest;
 mod normalize;
 mod process;
 mod score;
@@ -15,8 +16,9 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use digest::sha256_hex;
+use normalize::{ColumnType, compare_outputs, validate_amplified_output};
+use process::{CapturedBatch, ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -56,6 +58,7 @@ struct CaseResult {
     family: &'static str,
     row_count: usize,
     query_amplification: usize,
+    amplified_validation: AmplifiedValidation,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
     clickhouse_primary_batch_median_ms: f64,
@@ -68,21 +71,91 @@ struct CaseResult {
     end_to_end_ratio: f64,
 }
 
+#[derive(Debug)]
+struct EngineValidation {
+    validated_repetitions: usize,
+    single_query_output_sha256: String,
+    amplified_output_sha256: String,
+}
+
+#[derive(Debug)]
+struct AmplifiedValidation {
+    expected_repetitions: usize,
+    rusthouse: EngineValidation,
+    clickhouse: EngineValidation,
+}
+
 #[derive(Debug, Default)]
 struct CorrectnessGate {
-    passed: bool,
+    single_query_passed: bool,
+    amplified_validation_passed: bool,
 }
 
 impl CorrectnessGate {
-    fn verify(
+    fn verify_single_query(
         &mut self,
         columns: &[(&str, ColumnType)],
         rusthouse: &TimedOutput,
         clickhouse: &TimedOutput,
     ) -> Result<(), String> {
         compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
-        self.passed = true;
+        self.single_query_passed = true;
         Ok(())
+    }
+
+    fn verify_amplified(
+        &mut self,
+        columns: &[(&str, ColumnType)],
+        rusthouse_single: &TimedOutput,
+        clickhouse_single: &TimedOutput,
+        rusthouse_amplified: &CapturedBatch,
+        clickhouse_amplified: &CapturedBatch,
+        expected_repetitions: usize,
+    ) -> Result<AmplifiedValidation, String> {
+        if !self.single_query_passed {
+            return Err(
+                "amplified validation was not preceded by a passing single-query comparison"
+                    .to_owned(),
+            );
+        }
+        if rusthouse_amplified.query_repetitions != expected_repetitions
+            || clickhouse_amplified.query_repetitions != expected_repetitions
+        {
+            return Err(format!(
+                "amplified validation count mismatch: expected {expected_repetitions}, RustHouse used {}, ClickHouse used {}",
+                rusthouse_amplified.query_repetitions, clickhouse_amplified.query_repetitions
+            ));
+        }
+
+        let rusthouse_repetitions = validate_amplified_output(
+            &rusthouse_single.stdout,
+            &rusthouse_amplified.stdout,
+            columns,
+            "RustHouse",
+            expected_repetitions,
+        )?;
+        let clickhouse_repetitions = validate_amplified_output(
+            &clickhouse_single.stdout,
+            &clickhouse_amplified.stdout,
+            columns,
+            "ClickHouse",
+            expected_repetitions,
+        )?;
+
+        self.amplified_validation_passed = true;
+        Ok(AmplifiedValidation {
+            expected_repetitions,
+            rusthouse: EngineValidation {
+                validated_repetitions: rusthouse_repetitions,
+                single_query_output_sha256: sha256_hex(rusthouse_single.stdout.as_bytes()),
+                amplified_output_sha256: sha256_hex(rusthouse_amplified.stdout.as_bytes()),
+            },
+            clickhouse: EngineValidation {
+                validated_repetitions: clickhouse_repetitions,
+                single_query_output_sha256: sha256_hex(clickhouse_single.stdout.as_bytes()),
+                amplified_output_sha256: sha256_hex(clickhouse_amplified.stdout.as_bytes()),
+            },
+        })
     }
 }
 
@@ -176,7 +249,7 @@ fn run(config: Config) -> Result<Report, String> {
                 execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
             let mut correctness_gate = CorrectnessGate::default();
             correctness_gate
-                .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
+                .verify_single_query(&workload.columns, &rusthouse_output, &clickhouse_output)
                 .map_err(|error| {
                     format!(
                         "correctness gate failed for '{}' at {row_count} rows: {error}",
@@ -184,6 +257,29 @@ fn run(config: Config) -> Result<Report, String> {
                     )
                 })?;
             correctness_checks += 1;
+
+            let (rusthouse_validation, clickhouse_validation) = execute_validation_pair(
+                &paths,
+                &setup_sql,
+                &workload.sql,
+                settings.query_amplification,
+                !correctness_order,
+            )?;
+            let amplified_validation = correctness_gate
+                .verify_amplified(
+                    &workload.columns,
+                    &rusthouse_output,
+                    &clickhouse_output,
+                    &rusthouse_validation,
+                    &clickhouse_validation,
+                    settings.query_amplification,
+                )
+                .map_err(|error| {
+                    format!(
+                        "amplified validation failed for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
 
             let mut primary = TimingSeries::default();
             let primary_iterations = settings.warmups + settings.samples;
@@ -274,6 +370,7 @@ fn run(config: Config) -> Result<Report, String> {
                 family: workload.family.name(),
                 row_count,
                 query_amplification: settings.query_amplification,
+                amplified_validation,
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
@@ -309,17 +406,28 @@ fn run(config: Config) -> Result<Report, String> {
 
     let mut evidence = vec![
         format!(
-            "{} separate correctness pairs passed across {} cases and {} row counts",
+            "{} single-query correctness pairs and {} captured amplified engine batches passed across {} cases and {} row counts",
             correctness_checks,
+            cases.len() * 2,
             cases.len(),
             settings.row_counts.len()
+        ),
+        format!(
+            "validated {} repeated query results before timing; details retain per-engine counts and CSV SHA-256 digests",
+            cases
+                .iter()
+                .map(
+                    |case| case.amplified_validation.rusthouse.validated_repetitions
+                        + case.amplified_validation.clickhouse.validated_repetitions
+                )
+                .sum::<usize>()
         ),
         format!(
             "primary score {:.2}; startup-inclusive end-to-end score {:.2}",
             primary_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
+            "after separate captured validation, primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
             settings.query_amplification, settings.query_amplification
         ),
         format!(
@@ -449,6 +557,36 @@ fn execute_timed_pair(
     }
 }
 
+fn execute_validation_pair(
+    paths: &EnginePaths,
+    setup_sql: &str,
+    query_sql: &str,
+    query_repetitions: usize,
+    rusthouse_first: bool,
+) -> Result<(CapturedBatch, CapturedBatch), String> {
+    if rusthouse_first {
+        let rusthouse =
+            paths.execute_validation(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_validation(
+            Engine::ClickHouse,
+            setup_sql,
+            query_sql,
+            query_repetitions,
+        )?;
+        Ok((rusthouse, clickhouse))
+    } else {
+        let clickhouse = paths.execute_validation(
+            Engine::ClickHouse,
+            setup_sql,
+            query_sql,
+            query_repetitions,
+        )?;
+        let rusthouse =
+            paths.execute_validation(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        Ok((rusthouse, clickhouse))
+    }
+}
+
 fn accept_timed_pair(
     gate: &CorrectnessGate,
     rusthouse: &TimedBatch,
@@ -457,8 +595,11 @@ fn accept_timed_pair(
     record: bool,
     samples: &mut TimingSeries,
 ) -> Result<(), String> {
-    if !gate.passed {
-        return Err("timed batch was not preceded by a passing correctness run".to_owned());
+    if !gate.single_query_passed || !gate.amplified_validation_passed {
+        return Err(
+            "timed batch was not preceded by passing single-query and amplified validation runs"
+                .to_owned(),
+        );
     }
     if rusthouse.query_repetitions != clickhouse.query_repetitions
         || rusthouse.query_repetitions != expected_repetitions
@@ -537,10 +678,17 @@ fn details_json(
     correctness_checks: usize,
 ) -> String {
     let settings = config.mode.settings();
+    let amplified_validation_repetitions = cases
+        .iter()
+        .map(|case| {
+            case.amplified_validation.rusthouse.validated_repetitions
+                + case.amplified_validation.clickhouse.validated_repetitions
+        })
+        .sum::<usize>();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,8 +709,9 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"amplified_validation_before_timing\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"amplified_validation_batches\":{},\"amplified_validation_repetitions\":{amplified_validation_repetitions},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
+        cases.len() * 2,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.version_output),
@@ -578,11 +727,38 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"amplified_validation\":{{\"expected_repetitions_per_engine\":{},\"rusthouse\":{{\"validated_repetitions\":{},\"single_query_output_sha256\":{},\"amplified_output_sha256\":{}}},\"clickhouse\":{{\"validated_repetitions\":{},\"single_query_output_sha256\":{},\"amplified_output_sha256\":{}}}}},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
             case.query_amplification,
+            case.amplified_validation.expected_repetitions,
+            case.amplified_validation.rusthouse.validated_repetitions,
+            json_string(
+                &case
+                    .amplified_validation
+                    .rusthouse
+                    .single_query_output_sha256
+            ),
+            json_string(
+                &case
+                    .amplified_validation
+                    .rusthouse
+                    .amplified_output_sha256
+            ),
+            case.amplified_validation.clickhouse.validated_repetitions,
+            json_string(
+                &case
+                    .amplified_validation
+                    .clickhouse
+                    .single_query_output_sha256
+            ),
+            json_string(
+                &case
+                    .amplified_validation
+                    .clickhouse
+                    .amplified_output_sha256
+            ),
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
@@ -671,6 +847,10 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn batch(milliseconds: f64, repetitions: usize) -> TimedBatch {
         TimedBatch {
@@ -685,11 +865,74 @@ mod tests {
         }
     }
 
+    fn captured(csv: &str, repetitions: usize) -> CapturedBatch {
+        CapturedBatch {
+            stdout: csv.to_owned(),
+            query_repetitions: repetitions,
+        }
+    }
+
+    fn open_gate() -> CorrectnessGate {
+        CorrectnessGate {
+            single_query_passed: true,
+            amplified_validation_passed: true,
+        }
+    }
+
+    #[cfg(unix)]
+    struct FakeEngine {
+        directory: PathBuf,
+        executable: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeEngine {
+        fn new(stdout: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let directory = env::temp_dir().join(format!(
+                "rusthouse-fake-engine-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&directory).expect("create fake-engine directory");
+            let executable = directory.join("engine");
+            let escaped = stdout.replace('\'', "'\\''");
+            fs::write(
+                &executable,
+                format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{escaped}'\n"),
+            )
+            .expect("write fake engine");
+            let mut permissions = fs::metadata(&executable)
+                .expect("fake-engine metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&executable, permissions).expect("make fake engine executable");
+            Self {
+                directory,
+                executable,
+            }
+        }
+
+        fn paths(&self) -> EnginePaths {
+            EnginePaths {
+                rusthouse: self.executable.clone(),
+                clickhouse: self.executable.clone(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeEngine {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.directory).expect("remove fake-engine directory");
+        }
+    }
+
     #[test]
     fn correctness_failure_leaves_timing_gate_closed() {
         let mut gate = CorrectnessGate::default();
         let error = gate
-            .verify(
+            .verify_single_query(
                 &[("n", ColumnType::Integer)],
                 &output("n\n1\n"),
                 &output("n\n2\n"),
@@ -697,7 +940,8 @@ mod tests {
             .expect_err("mismatch must fail");
 
         assert!(error.contains("result mismatch"));
-        assert!(!gate.passed);
+        assert!(!gate.single_query_passed);
+        assert!(!gate.amplified_validation_passed);
     }
 
     #[test]
@@ -713,7 +957,7 @@ mod tests {
         )
         .expect_err("ungated timing must fail");
 
-        assert!(error.contains("correctness"));
+        assert!(error.contains("single-query"));
         assert!(samples.rusthouse_batch_ms.is_empty());
         assert!(samples.clickhouse_batch_ms.is_empty());
     }
@@ -722,7 +966,7 @@ mod tests {
     fn amplification_must_match_for_both_engines() {
         let mut samples = TimingSeries::default();
         let error = accept_timed_pair(
-            &CorrectnessGate { passed: true },
+            &open_gate(),
             &batch(10.0, 64),
             &batch(10.0, 63),
             64,
@@ -754,12 +998,23 @@ mod tests {
     #[test]
     fn normalized_match_opens_gate_and_accepts_positive_timing() {
         let mut gate = CorrectnessGate::default();
-        gate.verify(
+        let rusthouse_single = output("enabled\ntrue\n");
+        let clickhouse_single = output("enabled\n1\n");
+        gate.verify_single_query(
             &[("enabled", ColumnType::Boolean)],
-            &output("enabled\ntrue\n"),
-            &output("enabled\n1\n"),
+            &rusthouse_single,
+            &clickhouse_single,
         )
         .expect("matching output");
+        gate.verify_amplified(
+            &[("enabled", ColumnType::Boolean)],
+            &rusthouse_single,
+            &clickhouse_single,
+            &captured("enabled\ntrue\n\nenabled\ntrue\n", 2),
+            &captured("enabled\n1\nenabled\n1\n", 2),
+            2,
+        )
+        .expect("matching amplified output");
 
         let mut samples = TimingSeries::default();
         accept_timed_pair(
@@ -776,12 +1031,141 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn adversarial_fake_engine_cannot_emit_only_one_result_for_an_amplified_batch() {
+        let fake = FakeEngine::new("n\n1\n");
+        let paths = fake.paths();
+        let single = paths
+            .execute_correctness(Engine::RustHouse, "", "SELECT 1 AS n;")
+            .expect("single fake-engine query");
+        let amplified = paths
+            .execute_validation(Engine::RustHouse, "", "SELECT 1 AS n;", 3)
+            .expect("amplified fake-engine query");
+
+        let error = validate_amplified_output(
+            &single.stdout,
+            &amplified.stdout,
+            &[("n", ColumnType::Integer)],
+            "fake engine",
+            3,
+        )
+        .expect_err("one result must not stand in for three");
+        assert!(error.contains("missing repetition 2"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adversarial_fake_engines_cannot_reorder_rows_or_append_results() {
+        let cases = [
+            ("n\n1\n2\nn\n2\n1\nn\n1\n2\n", "reordered rows must fail"),
+            (
+                "n\n1\n2\nn\n1\n2\nn\n1\n2\nn\n1\n2\n",
+                "extra result must fail",
+            ),
+        ];
+        for (stdout, message) in cases {
+            let fake = FakeEngine::new(stdout);
+            let amplified = fake
+                .paths()
+                .execute_validation(Engine::RustHouse, "", "SELECT n FROM t;", 3)
+                .expect("amplified fake-engine query");
+            assert!(
+                validate_amplified_output(
+                    "n\n1\n2\n",
+                    &amplified.stdout,
+                    &[("n", ColumnType::Integer)],
+                    "fake engine",
+                    3,
+                )
+                .is_err(),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn a_fully_capped_primary_score_is_rejected() {
         let score = ScoreBreakdown {
             score: 100.0,
             saturated_cases: 8,
         };
         assert!(ensure_primary_headroom(&score, 8).is_err());
+    }
+
+    #[test]
+    fn details_record_amplified_validation_counts_and_digests() {
+        let series = || TimingSeries {
+            rusthouse_batch_ms: vec![2.0],
+            clickhouse_batch_ms: vec![1.0],
+            rusthouse_per_query_ms: vec![1.0],
+            clickhouse_per_query_ms: vec![0.5],
+        };
+        let rusthouse_digest = sha256_hex(b"rusthouse output");
+        let clickhouse_digest = sha256_hex(b"clickhouse output");
+        let cases = [CaseResult {
+            workload: "test workload",
+            family: "test family",
+            row_count: 256,
+            query_amplification: 3,
+            amplified_validation: AmplifiedValidation {
+                expected_repetitions: 3,
+                rusthouse: EngineValidation {
+                    validated_repetitions: 3,
+                    single_query_output_sha256: rusthouse_digest.clone(),
+                    amplified_output_sha256: rusthouse_digest.clone(),
+                },
+                clickhouse: EngineValidation {
+                    validated_repetitions: 3,
+                    single_query_output_sha256: clickhouse_digest.clone(),
+                    amplified_output_sha256: clickhouse_digest.clone(),
+                },
+            },
+            primary: series(),
+            rusthouse_primary_batch_median_ms: 2.0,
+            clickhouse_primary_batch_median_ms: 1.0,
+            rusthouse_primary_median_ms: 1.0,
+            clickhouse_primary_median_ms: 0.5,
+            primary_ratio: 0.5,
+            end_to_end: series(),
+            rusthouse_end_to_end_median_ms: 2.0,
+            clickhouse_end_to_end_median_ms: 1.0,
+            end_to_end_ratio: 0.5,
+        }];
+        let details = details_json(
+            &Config {
+                mode: config::Mode::Quick,
+                seed: 1,
+                rusthouse: PathBuf::from("rusthouse"),
+                clickhouse: PathBuf::from("clickhouse"),
+                details: None,
+            },
+            &ClickHouseIdentity {
+                version_output: "26.7.1".to_owned(),
+                sha256: "reference digest".to_owned(),
+            },
+            &cases,
+            ScoreBreakdown {
+                score: 50.0,
+                saturated_cases: 0,
+            },
+            ScoreBreakdown {
+                score: 50.0,
+                saturated_cases: 0,
+            },
+            1,
+        );
+
+        assert!(details.contains("\"schema_version\":3"));
+        assert!(details.contains("\"amplified_validation_batches\":2"));
+        assert!(details.contains("\"amplified_validation_repetitions\":6"));
+        assert!(details.contains(&format!(
+            "\"single_query_output_sha256\":{}",
+            json_string(&rusthouse_digest)
+        )));
+        assert!(details.contains(&format!(
+            "\"amplified_output_sha256\":{}",
+            json_string(&clickhouse_digest)
+        )));
     }
 
     #[test]

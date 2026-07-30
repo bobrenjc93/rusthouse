@@ -31,6 +31,12 @@ pub struct TimedOutput {
 }
 
 #[derive(Debug)]
+pub struct CapturedBatch {
+    pub stdout: String,
+    pub query_repetitions: usize,
+}
+
+#[derive(Debug)]
 pub struct TimedBatch {
     pub elapsed: Duration,
     pub query_repetitions: usize,
@@ -67,6 +73,21 @@ impl EnginePaths {
         debug_assert!(stdout.is_none());
         Ok(TimedBatch {
             elapsed,
+            query_repetitions,
+        })
+    }
+
+    pub fn execute_validation(
+        &self,
+        engine: Engine,
+        setup_sql: &str,
+        query_sql: &str,
+        query_repetitions: usize,
+    ) -> Result<CapturedBatch, String> {
+        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
+        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+        Ok(CapturedBatch {
+            stdout: stdout.expect("captured execution returns stdout"),
             query_repetitions,
         })
     }
