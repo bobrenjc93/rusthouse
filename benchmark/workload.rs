@@ -1,4 +1,7 @@
 use crate::normalize::ColumnType;
+use crate::seed::{bounded, derive};
+
+const POINT_FILTER_DOMAIN: u64 = 0x706f_696e_745f_6964;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Family {
@@ -33,8 +36,8 @@ pub struct Workload {
     pub columns: Vec<(&'static str, ColumnType)>,
 }
 
-pub fn workloads(row_count: usize) -> Vec<Workload> {
-    let selected_id = row_count / 2;
+pub fn workloads(seed: u64, row_count: usize) -> Vec<Workload> {
+    let selected_id = selected_point_id(seed, row_count);
     vec![
         Workload {
             name: "full_scan_aggregate",
@@ -124,6 +127,10 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
     ]
 }
 
+fn selected_point_id(seed: u64, row_count: usize) -> usize {
+    bounded(derive(seed, POINT_FILTER_DOMAIN), row_count)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -132,7 +139,7 @@ mod tests {
 
     #[test]
     fn workload_diversity_invariants_are_explicit() {
-        let workloads = workloads(10_000);
+        let workloads = workloads(7, 10_000);
         let families = workloads
             .iter()
             .map(|workload| workload.family)
@@ -173,8 +180,32 @@ mod tests {
     }
 
     #[test]
-    fn selective_predicate_varies_with_row_count() {
-        assert!(workloads(100)[1].sql.contains("id = 50"));
-        assert!(workloads(1_000)[1].sql.contains("id = 500"));
+    fn point_filter_id_is_reproducible_seed_sensitive_and_in_range() {
+        assert_eq!(selected_point_id(41, 10_000), selected_point_id(41, 10_000));
+        assert_ne!(selected_point_id(41, 10_000), selected_point_id(42, 10_000));
+        assert!(selected_point_id(41, 100) < 100);
+        assert!(selected_point_id(41, 1_000) < 1_000);
+    }
+
+    #[test]
+    fn only_the_point_filter_query_varies_with_seed() {
+        let first = workloads(41, 1_000);
+        let repeated = workloads(41, 1_000);
+        let second = workloads(42, 1_000);
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|workload| &workload.sql)
+                .collect::<Vec<_>>(),
+            repeated
+                .iter()
+                .map(|workload| &workload.sql)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(first[1].sql, second[1].sql);
+        for index in [0, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(first[index].sql, second[index].sql);
+        }
     }
 }

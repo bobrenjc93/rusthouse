@@ -42,14 +42,8 @@ impl EnginePaths {
         validate_clickhouse(&self.clickhouse)
     }
 
-    pub fn execute_correctness(
-        &self,
-        engine: Engine,
-        setup_sql: &str,
-        query_sql: &str,
-    ) -> Result<TimedOutput, String> {
-        let batch = sql_batch(setup_sql, query_sql, 1)?;
-        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+    pub fn execute_correctness(&self, engine: Engine, batch: &str) -> Result<TimedOutput, String> {
+        let (_, stdout) = self.execute_batch(engine, batch, true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),
         })
@@ -58,12 +52,10 @@ impl EnginePaths {
     pub fn execute_timed(
         &self,
         engine: Engine,
-        setup_sql: &str,
-        query_sql: &str,
+        batch: &str,
         query_repetitions: usize,
     ) -> Result<TimedBatch, String> {
-        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
-        let (elapsed, stdout) = self.execute_batch(engine, &batch, false)?;
+        let (elapsed, stdout) = self.execute_batch(engine, batch, false)?;
         debug_assert!(stdout.is_none());
         Ok(TimedBatch {
             elapsed,
@@ -137,7 +129,11 @@ impl EnginePaths {
     }
 }
 
-fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Result<String, String> {
+pub fn sql_batch(
+    setup_sql: &str,
+    query_sql: &str,
+    query_repetitions: usize,
+) -> Result<String, String> {
     if query_repetitions == 0 {
         return Err("query repetition count must be positive".to_owned());
     }

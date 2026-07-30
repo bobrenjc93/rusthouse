@@ -1,8 +1,10 @@
 mod config;
 mod dataset;
+mod digest;
 mod normalize;
 mod process;
 mod score;
+mod seed;
 mod workload;
 
 use std::env;
@@ -15,10 +17,11 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
+use digest::Sha256;
 use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput, sql_batch};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
-use workload::workloads;
+use workload::{Workload, workloads};
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
 
@@ -93,6 +96,12 @@ struct Report {
     suggestions: Vec<String>,
 }
 
+struct GeneratedScale {
+    row_count: usize,
+    setup_sql: String,
+    workloads: Vec<Workload>,
+}
+
 fn main() -> ExitCode {
     let default_rusthouse = match default_rusthouse_path() {
         Ok(path) => path,
@@ -152,15 +161,15 @@ fn run(config: Config) -> Result<Report, String> {
         clickhouse: config.clickhouse.clone(),
     };
     let identity = paths.validate()?;
+    let generated_scales = generate_scales(config.seed, &settings.row_counts);
+    let dataset_workload_sha256 = dataset_workload_sha256(&generated_scales);
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
 
-    for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
-        let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
-        let dataset = Dataset::generate(dataset_seed, row_count);
-        let setup_sql = dataset.setup_sql();
+    for (row_count_index, generated) in generated_scales.into_iter().enumerate() {
+        let row_count = generated.row_count;
 
-        for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
+        for (workload_index, workload) in generated.workloads.into_iter().enumerate() {
             eprintln!(
                 "benchmarking {} at {} rows ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
                 workload.name,
@@ -172,8 +181,12 @@ fn run(config: Config) -> Result<Report, String> {
             );
 
             let correctness_order = (row_count_index + workload_index).is_multiple_of(2);
-            let (rusthouse_output, clickhouse_output) =
-                execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
+            let (rusthouse_output, clickhouse_output) = execute_correctness_pair(
+                &paths,
+                &generated.setup_sql,
+                &workload.sql,
+                correctness_order,
+            )?;
             let mut correctness_gate = CorrectnessGate::default();
             correctness_gate
                 .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
@@ -192,7 +205,7 @@ fn run(config: Config) -> Result<Report, String> {
                     (row_count_index + workload_index + iteration + 1).is_multiple_of(2);
                 let (rusthouse, clickhouse) = execute_timed_pair(
                     &paths,
-                    &setup_sql,
+                    &generated.setup_sql,
                     &workload.sql,
                     settings.query_amplification,
                     rusthouse_first,
@@ -212,8 +225,13 @@ fn run(config: Config) -> Result<Report, String> {
                 let rusthouse_first =
                     (row_count_index + workload_index + iteration + primary_iterations)
                         .is_multiple_of(2);
-                let (rusthouse, clickhouse) =
-                    execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
+                let (rusthouse, clickhouse) = execute_timed_pair(
+                    &paths,
+                    &generated.setup_sql,
+                    &workload.sql,
+                    1,
+                    rusthouse_first,
+                )?;
                 accept_timed_pair(
                     &correctness_gate,
                     &rusthouse,
@@ -302,6 +320,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            &dataset_workload_sha256,
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
@@ -338,6 +357,7 @@ fn run(config: Config) -> Result<Report, String> {
             settings.end_to_end_samples,
             identity.sha256
         ),
+        format!("dataset/workload SHA-256={dataset_workload_sha256}"),
         format!("ClickHouse identity: {}", identity.version_output),
         format!(
             "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
@@ -385,6 +405,42 @@ fn run(config: Config) -> Result<Report, String> {
     })
 }
 
+fn generate_scales(runtime_seed: u64, row_counts: &[usize]) -> Vec<GeneratedScale> {
+    row_counts
+        .iter()
+        .copied()
+        .map(|row_count| {
+            let scale_seed = runtime_seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+            GeneratedScale {
+                row_count,
+                setup_sql: Dataset::generate(scale_seed, row_count).setup_sql(),
+                workloads: workloads(scale_seed, row_count),
+            }
+        })
+        .collect()
+}
+
+fn dataset_workload_sha256(scales: &[GeneratedScale]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rusthouse-dataset-workload-v1\0");
+    digest.update(&(scales.len() as u64).to_be_bytes());
+    for scale in scales {
+        digest.update(&(scale.row_count as u64).to_be_bytes());
+        digest_part(&mut digest, b'S', scale.setup_sql.as_bytes());
+        digest.update(&(scale.workloads.len() as u64).to_be_bytes());
+        for workload in &scale.workloads {
+            digest_part(&mut digest, b'Q', workload.sql.as_bytes());
+        }
+    }
+    digest.finalize_hex()
+}
+
+fn digest_part(digest: &mut Sha256, tag: u8, bytes: &[u8]) {
+    digest.update(&[tag]);
+    digest.update(&(bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
 fn score_cases(
     cases: &[CaseResult],
     ratio: impl Fn(&CaseResult) -> f64,
@@ -416,13 +472,14 @@ fn execute_correctness_pair(
     query_sql: &str,
     rusthouse_first: bool,
 ) -> Result<(TimedOutput, TimedOutput), String> {
+    let batch = sql_batch(setup_sql, query_sql, 1)?;
     if rusthouse_first {
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
+        let rusthouse = paths.execute_correctness(Engine::RustHouse, &batch)?;
+        let clickhouse = paths.execute_correctness(Engine::ClickHouse, &batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
+        let clickhouse = paths.execute_correctness(Engine::ClickHouse, &batch)?;
+        let rusthouse = paths.execute_correctness(Engine::RustHouse, &batch)?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -434,17 +491,14 @@ fn execute_timed_pair(
     query_repetitions: usize,
     rusthouse_first: bool,
 ) -> Result<(TimedBatch, TimedBatch), String> {
+    let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
     if rusthouse_first {
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse = paths.execute_timed(Engine::RustHouse, &batch, query_repetitions)?;
+        let clickhouse = paths.execute_timed(Engine::ClickHouse, &batch, query_repetitions)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_timed(Engine::ClickHouse, &batch, query_repetitions)?;
+        let rusthouse = paths.execute_timed(Engine::RustHouse, &batch, query_repetitions)?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -535,12 +589,13 @@ fn details_json(
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    dataset_workload_sha256: &str,
 ) -> String {
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"dataset_workload_sha256\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -548,6 +603,7 @@ fn details_json(
         end_to_end_score.saturated_cases,
         json_string(config.mode.name()),
         config.seed,
+        json_string(dataset_workload_sha256),
         settings.warmups,
         settings.samples,
         settings.end_to_end_samples
@@ -799,5 +855,17 @@ mod tests {
             "{\"score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
         );
         assert!(!report.contains('\n'));
+    }
+
+    #[test]
+    fn generated_dataset_workload_digest_is_reproducible_and_seed_sensitive() {
+        let first = dataset_workload_sha256(&generate_scales(41, &[256, 2_048]));
+        let repeated = dataset_workload_sha256(&generate_scales(41, &[256, 2_048]));
+        let second = dataset_workload_sha256(&generate_scales(42, &[256, 2_048]));
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
     }
 }
