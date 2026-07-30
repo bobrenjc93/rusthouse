@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RatioObservation<'a> {
+    pub seed: u64,
     pub family: &'a str,
     pub scale: usize,
     pub ratio: f64,
@@ -38,8 +39,8 @@ pub fn median(samples: &[f64]) -> Result<f64, String> {
 /// compensate for slow families.
 ///
 /// Case ratios are capped at parity and floored at 0.01. Workloads within a
-/// family/scale, scales within a family, and finally families receive equal
-/// log-space weight at each level.
+/// family/scale, scales within a family, families within a seed, and finally
+/// seeds receive equal log-space weight at each level.
 pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakdown, String> {
     if observations.is_empty() {
         return Err("cannot score an empty benchmark".to_owned());
@@ -51,9 +52,11 @@ pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakd
         return Err("benchmark ratios must be finite and positive".to_owned());
     }
 
-    let mut grouped = BTreeMap::<&str, BTreeMap<usize, Vec<f64>>>::new();
+    let mut grouped = BTreeMap::<u64, BTreeMap<&str, BTreeMap<usize, Vec<f64>>>>::new();
     for observation in observations {
         grouped
+            .entry(observation.seed)
+            .or_default()
             .entry(observation.family)
             .or_default()
             .entry(observation.scale)
@@ -61,17 +64,23 @@ pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakd
             .push(observation.ratio.clamp(0.01, 1.0).ln());
     }
 
-    let family_logs = grouped
+    let seed_logs = grouped
         .values()
-        .map(|scales| {
-            let scale_logs = scales
+        .map(|families| {
+            let family_logs = families
                 .values()
-                .map(|case_logs| mean(case_logs))
+                .map(|scales| {
+                    let scale_logs = scales
+                        .values()
+                        .map(|case_logs| mean(case_logs))
+                        .collect::<Vec<_>>();
+                    mean(&scale_logs)
+                })
                 .collect::<Vec<_>>();
-            mean(&scale_logs)
+            mean(&family_logs)
         })
         .collect::<Vec<_>>();
-    let score = (100.0 * mean(&family_logs).exp()).clamp(0.0, 100.0);
+    let score = (100.0 * mean(&seed_logs).exp()).clamp(0.0, 100.0);
     let saturated_cases = observations
         .iter()
         .filter(|observation| observation.ratio >= 1.0)
@@ -120,6 +129,27 @@ mod tests {
     }
 
     #[test]
+    fn equal_weighting_applies_across_seeds() {
+        let mut values = vec![RatioObservation {
+            seed: 1,
+            family: "scan",
+            scale: 10,
+            ratio: 0.01,
+        }];
+        values.extend(std::iter::repeat_n(
+            RatioObservation {
+                seed: 2,
+                family: "scan",
+                scale: 10,
+                ratio: 1.0,
+            },
+            100,
+        ));
+        let breakdown = parity_score(&values).expect("score");
+        assert!((breakdown.score - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn median_handles_odd_and_even_sample_counts() {
         assert_eq!(median(&[9.0, 1.0, 3.0]).expect("median"), 3.0);
         assert_eq!(median(&[9.0, 1.0, 3.0, 5.0]).expect("median"), 4.0);
@@ -140,6 +170,7 @@ mod tests {
         values
             .iter()
             .map(|(family, scale, ratio)| RatioObservation {
+                seed: 1,
                 family,
                 scale: *scale,
                 ratio: *ratio,

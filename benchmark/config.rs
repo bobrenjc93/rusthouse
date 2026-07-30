@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub enum Mode {
     Quick,
     Default,
+    Audit,
 }
 
 impl Mode {
@@ -11,36 +12,82 @@ impl Mode {
         match self {
             Self::Quick => "quick",
             Self::Default => "default",
+            Self::Audit => "audit",
         }
     }
 
     pub fn settings(self) -> BenchmarkSettings {
         match self {
             Self::Quick => BenchmarkSettings {
-                row_counts: vec![256, 2_048],
+                scales: vec![ScaleSettings::new(256, 256), ScaleSettings::new(2_048, 256)],
                 warmups: 1,
                 samples: 3,
-                query_amplification: 256,
                 end_to_end_samples: 3,
             },
             Self::Default => BenchmarkSettings {
-                row_counts: vec![1_000, 10_000, 50_000],
+                scales: vec![
+                    ScaleSettings::new(1_000, 256),
+                    ScaleSettings::new(10_000, 256),
+                    ScaleSettings::new(50_000, 256),
+                ],
                 warmups: 2,
                 samples: 7,
-                query_amplification: 256,
                 end_to_end_samples: 3,
             },
+            Self::Audit => BenchmarkSettings {
+                scales: vec![
+                    ScaleSettings::new(50_000, 256),
+                    ScaleSettings::new(250_000, 64),
+                    ScaleSettings::new(1_000_000, 16),
+                ],
+                warmups: 2,
+                samples: 5,
+                end_to_end_samples: 3,
+            },
+        }
+    }
+
+    pub fn seeds(self, base_seed: u64) -> Vec<u64> {
+        match self {
+            Self::Quick | Self::Default => vec![base_seed],
+            Self::Audit => (1..=3)
+                .map(|index| {
+                    splitmix64_output(
+                        base_seed.wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(index)),
+                    )
+                })
+                .collect(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkSettings {
-    pub row_counts: Vec<usize>,
+    pub scales: Vec<ScaleSettings>,
     pub warmups: usize,
     pub samples: usize,
-    pub query_amplification: usize,
     pub end_to_end_samples: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaleSettings {
+    pub row_count: usize,
+    pub query_amplification: usize,
+}
+
+impl ScaleSettings {
+    const fn new(row_count: usize, query_amplification: usize) -> Self {
+        Self {
+            row_count,
+            query_amplification,
+        }
+    }
+}
+
+fn splitmix64_output(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +126,7 @@ pub fn parse(
             "--mode" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "--mode requires quick or default".to_owned())?;
+                    .ok_or_else(|| "--mode requires quick, default, or audit".to_owned())?;
                 mode = parse_mode(&value)?;
             }
             "--seed" => {
@@ -144,7 +191,10 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
     match value {
         "quick" => Ok(Mode::Quick),
         "default" => Ok(Mode::Default),
-        _ => Err(format!("unknown mode {value:?}; expected quick or default")),
+        "audit" => Ok(Mode::Audit),
+        _ => Err(format!(
+            "unknown mode {value:?}; expected quick, default, or audit"
+        )),
     }
 }
 
@@ -187,14 +237,90 @@ mod tests {
 
     #[test]
     fn modes_use_multiple_row_counts_and_repeated_samples() {
-        for mode in [Mode::Quick, Mode::Default] {
+        for mode in [Mode::Quick, Mode::Default, Mode::Audit] {
             let settings = mode.settings();
-            assert!(settings.row_counts.len() >= 2);
+            assert!(settings.scales.len() >= 2);
             assert!(settings.warmups >= 1);
             assert!(settings.samples >= 3);
-            assert!(settings.query_amplification > 1);
+            assert!(
+                settings
+                    .scales
+                    .iter()
+                    .all(|scale| scale.query_amplification > 1)
+            );
             assert!(settings.end_to_end_samples >= 3);
         }
+    }
+
+    #[test]
+    fn audit_mode_is_accepted_from_the_command_line() {
+        let ParseResult::Run(config) = parse(
+            ["--mode=audit", "--clickhouse=/clickhouse"]
+                .into_iter()
+                .map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("/rusthouse"),
+        )
+        .expect("audit configuration") else {
+            panic!("expected run");
+        };
+        assert_eq!(config.mode, Mode::Audit);
+    }
+
+    #[test]
+    fn audit_uses_three_derived_seeds_and_reaches_one_million_rows() {
+        let seeds = Mode::Audit.seeds(99);
+        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds, Mode::Audit.seeds(99));
+        assert_ne!(seeds, Mode::Audit.seeds(100));
+        assert_eq!(
+            seeds
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+
+        let settings = Mode::Audit.settings();
+        assert_eq!(settings.scales.last().expect("scale").row_count, 1_000_000);
+        assert_eq!(
+            settings
+                .scales
+                .iter()
+                .map(|scale| (scale.row_count, scale.query_amplification))
+                .collect::<Vec<_>>(),
+            [(50_000, 256), (250_000, 64), (1_000_000, 16)]
+        );
+        assert!(
+            settings
+                .scales
+                .windows(2)
+                .all(|pair| pair[0].query_amplification > pair[1].query_amplification)
+        );
+    }
+
+    #[test]
+    fn quick_and_default_keep_their_original_calibration() {
+        assert_eq!(
+            Mode::Quick
+                .settings()
+                .scales
+                .iter()
+                .map(|scale| (scale.row_count, scale.query_amplification))
+                .collect::<Vec<_>>(),
+            [(256, 256), (2_048, 256)]
+        );
+        assert_eq!(
+            Mode::Default
+                .settings()
+                .scales
+                .iter()
+                .map(|scale| (scale.row_count, scale.query_amplification))
+                .collect::<Vec<_>>(),
+            [(1_000, 256), (10_000, 256), (50_000, 256)]
+        );
     }
 
     #[test]

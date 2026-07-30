@@ -42,13 +42,14 @@ impl EnginePaths {
         validate_clickhouse(&self.clickhouse)
     }
 
-    pub fn execute_correctness(
+    pub fn execute_captured(
         &self,
         engine: Engine,
         setup_sql: &str,
         query_sql: &str,
+        query_repetitions: usize,
     ) -> Result<TimedOutput, String> {
-        let batch = sql_batch(setup_sql, query_sql, 1)?;
+        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
         let (_, stdout) = self.execute_batch(engine, &batch, true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),

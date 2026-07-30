@@ -7,8 +7,12 @@ pub enum Family {
     CompoundFilter,
     NonselectiveFilter,
     LowCardinalityGroupBy,
+    IntermediateCardinalityGroupBy,
     HighCardinalityGroupBy,
     OrderByLimit,
+    SelectivitySweep,
+    StringPredicate,
+    ProjectionScan,
 }
 
 impl Family {
@@ -19,8 +23,12 @@ impl Family {
             Self::CompoundFilter => "compound_filter",
             Self::NonselectiveFilter => "nonselective_filter",
             Self::LowCardinalityGroupBy => "low_cardinality_group_by",
+            Self::IntermediateCardinalityGroupBy => "intermediate_cardinality_group_by",
             Self::HighCardinalityGroupBy => "high_cardinality_group_by",
             Self::OrderByLimit => "order_by_limit",
+            Self::SelectivitySweep => "selectivity_sweep",
+            Self::StringPredicate => "string_predicate",
+            Self::ProjectionScan => "projection_scan",
         }
     }
 }
@@ -124,6 +132,95 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
     ]
 }
 
+pub fn audit_workloads(row_count: usize) -> Vec<Workload> {
+    let mut audit = workloads(row_count);
+    audit.extend([
+        Workload {
+            name: "float_full_scan_aggregate",
+            family: Family::FullScanAggregate,
+            sql: "SELECT COUNT(*) AS row_count, SUM(score) AS score_total, MIN(score) AS score_min, MAX(score) AS score_max, AVG(score) AS score_mean FROM parity_data;".to_owned(),
+            columns: vec![
+                ("row_count", ColumnType::Integer),
+                ("score_total", ColumnType::Float),
+                ("score_min", ColumnType::Float),
+                ("score_max", ColumnType::Float),
+                ("score_mean", ColumnType::Float),
+            ],
+        },
+        Workload {
+            name: "numeric_selectivity_1pct",
+            family: Family::SelectivitySweep,
+            sql: "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total FROM parity_data WHERE uniform_num < -980000;".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
+            name: "numeric_selectivity_10pct",
+            family: Family::SelectivitySweep,
+            sql: "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total FROM parity_data WHERE uniform_num < -800000;".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
+            name: "numeric_selectivity_50pct",
+            family: Family::SelectivitySweep,
+            sql: "SELECT COUNT(*) AS matched, SUM(uniform_num) AS total FROM parity_data WHERE uniform_num < 0;".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
+            name: "string_equality_aggregate",
+            family: Family::StringPredicate,
+            sql: "SELECT COUNT(*) AS matched, SUM(skewed_num) AS total, AVG(score) AS mean_score FROM parity_data WHERE low_key = 'amber';".to_owned(),
+            columns: vec![
+                ("matched", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+                ("mean_score", ColumnType::Float),
+            ],
+        },
+        Workload {
+            name: "intermediate_cardinality_group_by",
+            family: Family::IntermediateCardinalityGroupBy,
+            sql: "SELECT payload, flag, COUNT(*) AS row_count, SUM(uniform_num) AS total FROM parity_data GROUP BY payload, flag ORDER BY payload, flag;".to_owned(),
+            columns: vec![
+                ("payload", ColumnType::String),
+                ("flag", ColumnType::Boolean),
+                ("row_count", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
+            name: "numeric_projection_scan",
+            family: Family::ProjectionScan,
+            sql: "SELECT id, uniform_num, score, payload FROM parity_data WHERE uniform_num < -990000 ORDER BY id;".to_owned(),
+            columns: vec![
+                ("id", ColumnType::Integer),
+                ("uniform_num", ColumnType::Integer),
+                ("score", ColumnType::Float),
+                ("payload", ColumnType::String),
+            ],
+        },
+        Workload {
+            name: "string_projection_scan",
+            family: Family::ProjectionScan,
+            sql: "SELECT id, low_key, payload, flag FROM parity_data WHERE low_key = 'amber' AND uniform_num < -950000 ORDER BY id;".to_owned(),
+            columns: vec![
+                ("id", ColumnType::Integer),
+                ("low_key", ColumnType::String),
+                ("payload", ColumnType::String),
+                ("flag", ColumnType::Boolean),
+            ],
+        },
+    ]);
+    audit
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -176,5 +273,41 @@ mod tests {
     fn selective_predicate_varies_with_row_count() {
         assert!(workloads(100)[1].sql.contains("id = 50"));
         assert!(workloads(1_000)[1].sql.contains("id = 500"));
+    }
+
+    #[test]
+    fn audit_adds_required_query_shapes_without_changing_default_workloads() {
+        let default = workloads(10_000);
+        let audit = audit_workloads(10_000);
+
+        assert_eq!(default.len(), 8);
+        assert_eq!(audit.len(), 16);
+        assert!(
+            audit
+                .iter()
+                .any(|workload| workload.sql.contains("SUM(score)"))
+        );
+        assert!(audit.iter().any(|workload| {
+            workload.family == Family::IntermediateCardinalityGroupBy
+                && !workload.sql.contains(" LIMIT ")
+        }));
+        assert!(audit.iter().any(|workload| {
+            workload.family == Family::StringPredicate && workload.sql.contains("low_key = 'amber'")
+        }));
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|workload| workload.family == Family::ProjectionScan)
+                .filter(|workload| !workload.sql.contains(" LIMIT "))
+                .count(),
+            2
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|workload| workload.family == Family::SelectivitySweep)
+                .count(),
+            3
+        );
     }
 }

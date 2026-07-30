@@ -27,9 +27,78 @@ pub fn compare_outputs(
     let rusthouse = normalize(rusthouse_csv, columns, "RustHouse")?;
     let clickhouse = normalize(clickhouse_csv, columns, "ClickHouse")?;
 
+    compare_tables(
+        &rusthouse,
+        &clickhouse,
+        columns,
+        "RustHouse",
+        "ClickHouse",
+        "",
+    )
+}
+
+pub fn compare_repeated_outputs(
+    rusthouse_csv: &str,
+    clickhouse_csv: &str,
+    columns: &[(&str, ColumnType)],
+    expected_repetitions: usize,
+) -> Result<(), String> {
+    if expected_repetitions < 2 {
+        return Err("amplified correctness requires at least two repetitions".to_owned());
+    }
+    let rusthouse = normalize_repeated(rusthouse_csv, columns, "RustHouse")?;
+    let clickhouse = normalize_repeated(clickhouse_csv, columns, "ClickHouse")?;
+    if rusthouse.len() != expected_repetitions || clickhouse.len() != expected_repetitions {
+        return Err(format!(
+            "amplified output count mismatch: expected {expected_repetitions}, RustHouse returned {}, ClickHouse returned {}",
+            rusthouse.len(),
+            clickhouse.len()
+        ));
+    }
+
+    for index in 0..expected_repetitions {
+        let context = format!(" in amplified repetition {}", index + 1);
+        compare_tables(
+            &rusthouse[index],
+            &clickhouse[index],
+            columns,
+            "RustHouse",
+            "ClickHouse",
+            &context,
+        )?;
+        if index > 0 {
+            compare_tables(
+                &rusthouse[0],
+                &rusthouse[index],
+                columns,
+                "RustHouse repetition 1",
+                &format!("RustHouse repetition {}", index + 1),
+                " in amplified output",
+            )?;
+            compare_tables(
+                &clickhouse[0],
+                &clickhouse[index],
+                columns,
+                "ClickHouse repetition 1",
+                &format!("ClickHouse repetition {}", index + 1),
+                " in amplified output",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn compare_tables(
+    rusthouse: &NormalizedTable,
+    clickhouse: &NormalizedTable,
+    columns: &[(&str, ColumnType)],
+    left_label: &str,
+    right_label: &str,
+    context: &str,
+) -> Result<(), String> {
     if rusthouse.rows.len() != clickhouse.rows.len() {
         return Err(format!(
-            "row count mismatch: RustHouse returned {}, ClickHouse returned {}",
+            "row count mismatch{context}: {left_label} returned {}, {right_label} returned {}",
             rusthouse.rows.len(),
             clickhouse.rows.len()
         ));
@@ -39,7 +108,7 @@ pub fn compare_outputs(
         for (column_index, (left, right)) in left.iter().zip(right).enumerate() {
             if !values_equal(left, right) {
                 return Err(format!(
-                    "result mismatch at row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
+                    "result mismatch{context} at row {}, column '{}': {left_label}={left:?}, {right_label}={right:?}",
                     row_index + 1,
                     columns[column_index].0
                 ));
@@ -47,6 +116,42 @@ pub fn compare_outputs(
         }
     }
     Ok(())
+}
+
+fn normalize_repeated(
+    csv: &str,
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+) -> Result<Vec<NormalizedTable>, String> {
+    let records = parse_csv(csv).map_err(|error| format!("{engine} CSV: {error}"))?;
+    let expected_header = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let mut tables = Vec::new();
+    let mut rows = None::<Vec<Vec<String>>>;
+
+    for record in records {
+        if record
+            .iter()
+            .map(String::as_str)
+            .eq(expected_header.iter().copied())
+        {
+            if let Some(previous_rows) = rows.replace(Vec::new()) {
+                tables.push(normalize_rows(&previous_rows, columns, engine)?);
+            }
+        } else if let Some(rows) = &mut rows {
+            rows.push(record);
+        } else {
+            return Err(format!(
+                "{engine} amplified output did not start with the expected header"
+            ));
+        }
+    }
+    if let Some(rows) = rows {
+        tables.push(normalize_rows(&rows, columns, engine)?);
+    }
+    if tables.is_empty() {
+        return Err(format!("{engine} returned no amplified CSV results"));
+    }
+    Ok(tables)
 }
 
 fn normalize(
@@ -65,6 +170,14 @@ fn normalize(
         ));
     }
 
+    normalize_rows(rows, columns, engine)
+}
+
+fn normalize_rows(
+    rows: &[Vec<String>],
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+) -> Result<NormalizedTable, String> {
     let mut normalized_rows = Vec::with_capacity(rows.len());
     for (row_index, row) in rows.iter().enumerate() {
         if row.len() != columns.len() {
@@ -232,5 +345,25 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn amplified_output_validates_count_cross_engine_parity_and_repeatability() {
+        let columns = [("n", ColumnType::Integer), ("mean", ColumnType::Float)];
+        let rusthouse = "n,mean\n1,0.3333333333333333\nn,mean\n1,0.3333333333333333\n";
+        let clickhouse = "n,mean\r\n1,0.33333333333333331\r\nn,mean\r\n1,0.33333333333333331\r\n";
+        compare_repeated_outputs(rusthouse, clickhouse, &columns, 2)
+            .expect("equivalent repeated output");
+
+        assert!(compare_repeated_outputs(rusthouse, clickhouse, &columns, 3).is_err());
+        assert!(
+            compare_repeated_outputs(
+                rusthouse,
+                "n,mean\n1,0.3333333333333333\nn,mean\n2,0.3333333333333333\n",
+                &columns,
+                2
+            )
+            .is_err()
+        );
     }
 }
