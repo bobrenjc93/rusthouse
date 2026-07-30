@@ -48,6 +48,7 @@ pub struct Config {
     pub mode: Mode,
     pub seed: u64,
     pub rusthouse: PathBuf,
+    pub baseline: Option<PathBuf>,
     pub clickhouse: PathBuf,
     pub details: Option<PathBuf>,
 }
@@ -61,6 +62,7 @@ pub fn parse(
     arguments: impl IntoIterator<Item = String>,
     clickhouse_from_env: Option<String>,
     rusthouse_from_env: Option<String>,
+    baseline_from_env: Option<String>,
     default_rusthouse: PathBuf,
 ) -> Result<ParseResult, String> {
     let mut mode = Mode::Default;
@@ -69,6 +71,7 @@ pub fn parse(
     let mut rusthouse = rusthouse_from_env
         .map(PathBuf::from)
         .unwrap_or(default_rusthouse);
+    let mut baseline = baseline_from_env.map(PathBuf::from);
     let mut details = None;
     let mut arguments = arguments.into_iter();
 
@@ -102,6 +105,13 @@ pub fn parse(
                         .ok_or_else(|| "--rusthouse requires a path".to_owned())?,
                 );
             }
+            "--baseline" | "--baseline-rusthouse" => {
+                baseline = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a path"))?,
+                ));
+            }
             "--details" => {
                 details = Some(PathBuf::from(
                     arguments
@@ -121,6 +131,12 @@ pub fn parse(
             _ if argument.starts_with("--rusthouse=") => {
                 rusthouse = PathBuf::from(&argument["--rusthouse=".len()..]);
             }
+            _ if argument.starts_with("--baseline=") => {
+                baseline = Some(PathBuf::from(&argument["--baseline=".len()..]));
+            }
+            _ if argument.starts_with("--baseline-rusthouse=") => {
+                baseline = Some(PathBuf::from(&argument["--baseline-rusthouse=".len()..]));
+            }
             _ if argument.starts_with("--details=") => {
                 details = Some(PathBuf::from(&argument["--details=".len()..]));
             }
@@ -131,10 +147,17 @@ pub fn parse(
     let clickhouse = clickhouse.ok_or_else(|| {
         "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN".to_owned()
     })?;
+    if baseline.is_some() && details.is_none() {
+        return Err(
+            "--baseline requires --details PATH so raw regression samples and binary hashes are retained"
+                .to_owned(),
+        );
+    }
     Ok(ParseResult::Run(Config {
         mode,
         seed,
         rusthouse,
+        baseline,
         clickhouse,
         details,
     }))
@@ -172,6 +195,7 @@ mod tests {
             .map(str::to_owned),
             Some("/environment/clickhouse".to_owned()),
             None,
+            None,
             PathBuf::from("/default/rusthouse"),
         )
         .expect("configuration") else {
@@ -199,10 +223,49 @@ mod tests {
 
     #[test]
     fn clickhouse_path_is_required() {
-        let error = match parse(std::iter::empty(), None, None, PathBuf::from("rusthouse")) {
+        let error = match parse(
+            std::iter::empty(),
+            None,
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        ) {
             Ok(_) => panic!("missing ClickHouse path should fail"),
             Err(error) => error,
         };
         assert!(error.contains("RUSTHOUSE_CLICKHOUSE_BIN"));
+    }
+
+    #[test]
+    fn baseline_mode_requires_details_and_cli_overrides_environment() {
+        let missing_details = match parse(
+            ["--clickhouse=/clickhouse"].into_iter().map(str::to_owned),
+            None,
+            None,
+            Some("/environment/baseline".to_owned()),
+            PathBuf::from("/candidate"),
+        ) {
+            Ok(_) => panic!("baseline evidence must be retained"),
+            Err(error) => error,
+        };
+        assert!(missing_details.contains("--details"));
+
+        let ParseResult::Run(config) = parse(
+            [
+                "--clickhouse=/clickhouse",
+                "--baseline-rusthouse=/command/baseline",
+                "--details=details.json",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+            None,
+            None,
+            Some("/environment/baseline".to_owned()),
+            PathBuf::from("/candidate"),
+        )
+        .expect("configuration") else {
+            panic!("expected run");
+        };
+        assert_eq!(config.baseline, Some(PathBuf::from("/command/baseline")));
     }
 }

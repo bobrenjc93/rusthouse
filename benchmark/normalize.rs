@@ -24,22 +24,38 @@ pub fn compare_outputs(
     clickhouse_csv: &str,
     columns: &[(&str, ColumnType)],
 ) -> Result<(), String> {
-    let rusthouse = normalize(rusthouse_csv, columns, "RustHouse")?;
-    let clickhouse = normalize(clickhouse_csv, columns, "ClickHouse")?;
+    compare_outputs_named(
+        rusthouse_csv,
+        "RustHouse",
+        clickhouse_csv,
+        "ClickHouse",
+        columns,
+    )
+}
 
-    if rusthouse.rows.len() != clickhouse.rows.len() {
+pub fn compare_outputs_named(
+    left_csv: &str,
+    left_name: &str,
+    right_csv: &str,
+    right_name: &str,
+    columns: &[(&str, ColumnType)],
+) -> Result<(), String> {
+    let left_table = normalize(left_csv, columns, left_name)?;
+    let right_table = normalize(right_csv, columns, right_name)?;
+
+    if left_table.rows.len() != right_table.rows.len() {
         return Err(format!(
-            "row count mismatch: RustHouse returned {}, ClickHouse returned {}",
-            rusthouse.rows.len(),
-            clickhouse.rows.len()
+            "row count mismatch: {left_name} returned {}, {right_name} returned {}",
+            left_table.rows.len(),
+            right_table.rows.len()
         ));
     }
 
-    for (row_index, (left, right)) in rusthouse.rows.iter().zip(&clickhouse.rows).enumerate() {
+    for (row_index, (left, right)) in left_table.rows.iter().zip(&right_table.rows).enumerate() {
         for (column_index, (left, right)) in left.iter().zip(right).enumerate() {
             if !values_equal(left, right) {
                 return Err(format!(
-                    "result mismatch at row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
+                    "result mismatch at row {}, column '{}': {left_name}={left:?}, {right_name}={right:?}",
                     row_index + 1,
                     columns[column_index].0
                 ));
@@ -232,5 +248,19 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn named_comparison_identifies_candidate_and_baseline() {
+        let error = compare_outputs_named(
+            "value\nleft\n",
+            "candidate RustHouse",
+            "value\nright\n",
+            "baseline RustHouse",
+            &[("value", ColumnType::String)],
+        )
+        .expect_err("mismatch");
+        assert!(error.contains("candidate RustHouse"));
+        assert!(error.contains("baseline RustHouse"));
     }
 }

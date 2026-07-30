@@ -19,6 +19,17 @@ pub struct ClickHouseIdentity {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RustHouseIdentity {
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkIdentity {
+    pub clickhouse: ClickHouseIdentity,
+    pub rusthouse: RustHouseIdentity,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Engine {
     RustHouse,
@@ -37,9 +48,13 @@ pub struct TimedBatch {
 }
 
 impl EnginePaths {
-    pub fn validate(&self) -> Result<ClickHouseIdentity, String> {
-        validate_rusthouse(&self.rusthouse)?;
-        validate_clickhouse(&self.clickhouse)
+    pub fn validate(&self) -> Result<BenchmarkIdentity, String> {
+        let rusthouse = validate_rusthouse(&self.rusthouse)?;
+        let clickhouse = validate_clickhouse(&self.clickhouse)?;
+        Ok(BenchmarkIdentity {
+            clickhouse,
+            rusthouse,
+        })
     }
 
     pub fn execute_correctness(
@@ -175,7 +190,7 @@ impl Engine {
     }
 }
 
-fn validate_rusthouse(path: &Path) -> Result<(), String> {
+pub fn validate_rusthouse(path: &Path) -> Result<RustHouseIdentity, String> {
     let output = Command::new(path).arg("--help").output().map_err(|error| {
         format!(
             "could not execute RustHouse at '{}': {error}",
@@ -189,7 +204,9 @@ fn validate_rusthouse(path: &Path) -> Result<(), String> {
             summarize_stderr(&output.stderr)
         ));
     }
-    Ok(())
+    Ok(RustHouseIdentity {
+        sha256: sha256(path, "RustHouse")?,
+    })
 }
 
 fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
@@ -219,14 +236,29 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
         ));
     }
 
+    let sha256 = sha256(path, "ClickHouse")?;
+
+    if sha256 != CLICKHOUSE_SHA256 {
+        return Err(format!(
+            "ClickHouse checksum mismatch: expected {CLICKHOUSE_SHA256}, got {sha256}"
+        ));
+    }
+
+    Ok(ClickHouseIdentity {
+        version_output,
+        sha256,
+    })
+}
+
+fn sha256(path: &Path, binary_name: &str) -> Result<String, String> {
     let checksum = Command::new("shasum")
         .args(["-a", "256"])
         .arg(path)
         .output()
-        .map_err(|error| format!("could not calculate ClickHouse SHA-256: {error}"))?;
+        .map_err(|error| format!("could not calculate {binary_name} SHA-256: {error}"))?;
     if !checksum.status.success() {
         return Err(format!(
-            "ClickHouse checksum failed with {}: {}",
+            "{binary_name} checksum failed with {}: {}",
             checksum.status,
             summarize_stderr(&checksum.stderr)
         ));
@@ -241,17 +273,7 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
         })
         .ok_or_else(|| format!("unexpected shasum output: {checksum_output:?}"))?
         .to_ascii_lowercase();
-
-    if sha256 != CLICKHOUSE_SHA256 {
-        return Err(format!(
-            "ClickHouse checksum mismatch: expected {CLICKHOUSE_SHA256}, got {sha256}"
-        ));
-    }
-
-    Ok(ClickHouseIdentity {
-        version_output,
-        sha256,
-    })
+    Ok(sha256)
 }
 
 fn summarize_stderr(stderr: &[u8]) -> String {

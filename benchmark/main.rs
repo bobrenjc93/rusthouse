@@ -15,12 +15,19 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
-use score::{RatioObservation, ScoreBreakdown, median, parity_score};
+use normalize::{ColumnType, compare_outputs, compare_outputs_named};
+use process::{
+    BenchmarkIdentity, Engine, EnginePaths, RustHouseIdentity, TimedBatch, TimedOutput,
+    validate_rusthouse,
+};
+use score::{
+    RatioObservation, ScoreBreakdown, UncappedRatioBreakdown, median, parity_score, uncapped_ratio,
+};
 use workload::workloads;
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
+const MAX_CASE_REGRESSION: f64 = 0.20;
+const MAX_FAMILY_REGRESSION: f64 = 0.10;
 
 const HELP: &str = "\
 RustHouse / ClickHouse Local black-box parity benchmark
@@ -33,12 +40,15 @@ OPTIONS:
     --quick                 Alias for --mode quick
     --seed <U64>            Deterministic runtime seed (default: 20260729)
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
-    --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
+    --rusthouse <PATH>      Candidate RustHouse CLI (default: sibling binary)
+    --baseline <PATH>       Enable regression gates against this RustHouse CLI
     --details <PATH>        Write detailed JSON without changing stdout
     -h, --help              Print this help
 
 RUSTHOUSE_CLICKHOUSE_BIN supplies --clickhouse when the flag is absent.
 RUSTHOUSE_BIN supplies --rusthouse when the flag is absent.
+RUSTHOUSE_BASELINE_BIN supplies --baseline when the flag is absent.
+Baseline mode requires --details to retain raw samples and binary hashes.
 Build release binaries before benchmarking; compilation is never timed.
 ";
 
@@ -48,6 +58,29 @@ struct TimingSeries {
     clickhouse_batch_ms: Vec<f64>,
     rusthouse_per_query_ms: Vec<f64>,
     clickhouse_per_query_ms: Vec<f64>,
+}
+
+#[derive(Debug, Default)]
+struct RegressionTimingSeries {
+    candidate_batch_ms: Vec<f64>,
+    baseline_batch_ms: Vec<f64>,
+    candidate_per_query_ms: Vec<f64>,
+    baseline_per_query_ms: Vec<f64>,
+    candidate_first: Vec<bool>,
+}
+
+#[derive(Debug)]
+struct RegressionCaseResult {
+    primary: RegressionTimingSeries,
+    candidate_primary_batch_median_ms: f64,
+    baseline_primary_batch_median_ms: f64,
+    candidate_primary_median_ms: f64,
+    baseline_primary_median_ms: f64,
+    primary_ratio: f64,
+    end_to_end: RegressionTimingSeries,
+    candidate_end_to_end_median_ms: f64,
+    baseline_end_to_end_median_ms: f64,
+    end_to_end_ratio: f64,
 }
 
 #[derive(Debug)]
@@ -66,6 +99,7 @@ struct CaseResult {
     rusthouse_end_to_end_median_ms: f64,
     clickhouse_end_to_end_median_ms: f64,
     end_to_end_ratio: f64,
+    regression: Option<RegressionCaseResult>,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +127,23 @@ struct Report {
     suggestions: Vec<String>,
 }
 
+struct RunOutcome {
+    report: Report,
+    regression_failed: bool,
+}
+
+struct RegressionAnalysis {
+    primary: UncappedRatioBreakdown<'static>,
+    end_to_end: UncappedRatioBreakdown<'static>,
+    violations: Vec<String>,
+}
+
+struct RegressionDetails<'a> {
+    correctness_checks: usize,
+    baseline_identity: Option<&'a RustHouseIdentity>,
+    analysis: Option<&'a RegressionAnalysis>,
+}
+
 fn main() -> ExitCode {
     let default_rusthouse = match default_rusthouse_path() {
         Ok(path) => path,
@@ -102,6 +153,7 @@ fn main() -> ExitCode {
         env::args().skip(1),
         env::var("RUSTHOUSE_CLICKHOUSE_BIN").ok(),
         env::var("RUSTHOUSE_BIN").ok(),
+        env::var("RUSTHOUSE_BASELINE_BIN").ok(),
         default_rusthouse,
     );
     let config = match parsed {
@@ -114,9 +166,13 @@ fn main() -> ExitCode {
     };
 
     match run(config) {
-        Ok(report) => {
-            println!("{}", report.to_json());
-            ExitCode::SUCCESS
+        Ok(outcome) => {
+            println!("{}", outcome.report.to_json());
+            if outcome.regression_failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => emit_failure(error),
     }
@@ -145,15 +201,30 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
     Ok(directory.join(format!("rusthouse{}", env::consts::EXE_SUFFIX)))
 }
 
-fn run(config: Config) -> Result<Report, String> {
+fn run(config: Config) -> Result<RunOutcome, String> {
     let settings = config.mode.settings();
     let paths = EnginePaths {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
     };
     let identity = paths.validate()?;
+    let (baseline_paths, baseline_identity) = match &config.baseline {
+        Some(baseline) => {
+            let baseline_identity = validate_rusthouse(baseline)
+                .map_err(|error| format!("baseline validation failed: {error}"))?;
+            (
+                Some(EnginePaths {
+                    rusthouse: baseline.clone(),
+                    clickhouse: config.clickhouse.clone(),
+                }),
+                Some(baseline_identity),
+            )
+        }
+        None => (None, None),
+    };
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
+    let mut regression_correctness_checks = 0_usize;
 
     for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
         let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
@@ -284,6 +355,7 @@ fn run(config: Config) -> Result<Report, String> {
                 rusthouse_end_to_end_median_ms: rusthouse_end_to_end_median,
                 clickhouse_end_to_end_median_ms: clickhouse_end_to_end_median,
                 end_to_end_ratio,
+                regression: None,
             });
         }
     }
@@ -293,6 +365,85 @@ fn run(config: Config) -> Result<Report, String> {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
+    if let Some(baseline_paths) = &baseline_paths {
+        eprintln!(
+            "starting isolated candidate/baseline regression suite after ClickHouse scoring completed"
+        );
+        let mut case_index = 0_usize;
+        for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
+            let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+            let dataset = Dataset::generate(dataset_seed, row_count);
+            let setup_sql = dataset.setup_sql();
+
+            for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
+                let candidate_first = (row_count_index + workload_index).is_multiple_of(2);
+                let (candidate_output, baseline_output) = execute_regression_correctness_pair(
+                    &paths,
+                    baseline_paths,
+                    &setup_sql,
+                    &workload.sql,
+                    candidate_first,
+                )?;
+                compare_outputs_named(
+                    &candidate_output.stdout,
+                    "candidate RustHouse",
+                    &baseline_output.stdout,
+                    "baseline RustHouse",
+                    &workload.columns,
+                )
+                .map_err(|error| {
+                    format!(
+                        "candidate/baseline correctness gate failed for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
+                regression_correctness_checks += 1;
+                let gate = CorrectnessGate { passed: true };
+                let regression = measure_regression_case(
+                    &paths,
+                    baseline_paths,
+                    &gate,
+                    &setup_sql,
+                    &workload.sql,
+                    workload.name,
+                    row_count,
+                    row_count_index + workload_index,
+                    settings.warmups,
+                    settings.samples,
+                    settings.query_amplification,
+                    settings.end_to_end_samples,
+                )?;
+                let case = cases.get_mut(case_index).ok_or_else(|| {
+                    "candidate/baseline suite produced more cases than ClickHouse suite".to_owned()
+                })?;
+                if case.workload != workload.name || case.row_count != row_count {
+                    return Err(
+                        "candidate/baseline suite case order diverged from ClickHouse suite"
+                            .to_owned(),
+                    );
+                }
+                case.regression = Some(regression);
+                case_index += 1;
+            }
+        }
+        if case_index != cases.len() {
+            return Err(
+                "candidate/baseline suite produced fewer cases than ClickHouse suite".to_owned(),
+            );
+        }
+    }
+    let regression_analysis = if config.baseline.is_some() {
+        let primary = regression_ratios(&cases, |regression| regression.primary_ratio)?;
+        let end_to_end = regression_ratios(&cases, |regression| regression.end_to_end_ratio)?;
+        let violations = regression_violations(&cases, &primary);
+        Some(RegressionAnalysis {
+            primary,
+            end_to_end,
+            violations,
+        })
+    } else {
+        None
+    };
 
     if let Some(path) = &config.details {
         let details = details_json(
@@ -302,6 +453,11 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            RegressionDetails {
+                correctness_checks: regression_correctness_checks,
+                baseline_identity: baseline_identity.as_ref(),
+                analysis: regression_analysis.as_ref(),
+            },
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
@@ -336,9 +492,13 @@ fn run(config: Config) -> Result<Report, String> {
             settings.warmups,
             settings.samples,
             settings.end_to_end_samples,
-            identity.sha256
+            identity.clickhouse.sha256
         ),
-        format!("ClickHouse identity: {}", identity.version_output),
+        format!(
+            "ClickHouse identity: {}",
+            identity.clickhouse.version_output
+        ),
+        format!("candidate RustHouse SHA-256={}", identity.rusthouse.sha256),
         format!(
             "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
             settings.query_amplification
@@ -357,6 +517,33 @@ fn run(config: Config) -> Result<Report, String> {
             case.end_to_end_ratio
         )
     }));
+    if let (Some(baseline_identity), Some(regression)) = (&baseline_identity, &regression_analysis)
+    {
+        evidence.push(format!(
+            "candidate/baseline primary ratio {:.4} and end-to-end ratio {:.4} (uncapped baseline/candidate); baseline SHA-256={}",
+            regression.primary.ratio,
+            regression.end_to_end.ratio,
+            baseline_identity.sha256
+        ));
+        evidence.extend(regression.primary.families.iter().map(|family| {
+            format!(
+                "candidate/baseline family {}: primary uncapped ratio {:.4}",
+                family.family, family.ratio
+            )
+        }));
+        evidence.extend(cases.iter().filter_map(|case| {
+            case.regression.as_ref().map(|case_regression| {
+                format!(
+                    "candidate/baseline {} / {} rows: primary uncapped ratio {:.4}; end-to-end uncapped ratio {:.4}",
+                    case.workload,
+                    case.row_count,
+                    case_regression.primary_ratio,
+                    case_regression.end_to_end_ratio
+                )
+            })
+        }));
+        evidence.extend(regression.violations.iter().cloned());
+    }
     let suggestions = if config.mode == config::Mode::Quick {
         vec![
             "Use --mode default for the decision-grade 1k/10k/50k-row suite.".to_owned(),
@@ -372,16 +559,37 @@ fn run(config: Config) -> Result<Report, String> {
         ]
     };
 
-    Ok(Report {
-        score: primary_score.score,
-        summary: format!(
-            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
-            primary_score.score,
-            end_to_end_score.score,
-            cases.len()
+    let regression_failed = regression_analysis
+        .as_ref()
+        .is_some_and(|analysis| !analysis.violations.is_empty());
+    let regression_status = match &regression_analysis {
+        Some(analysis) if analysis.violations.is_empty() => {
+            format!(
+                " Candidate/baseline regression gates passed at {:.4}.",
+                analysis.primary.ratio
+            )
+        }
+        Some(analysis) => format!(
+            " Candidate/baseline regression gates failed with {} violation(s); ClickHouse score is unchanged.",
+            analysis.violations.len()
         ),
-        evidence,
-        suggestions,
+        None => String::new(),
+    };
+
+    Ok(RunOutcome {
+        report: Report {
+            score: primary_score.score,
+            summary: format!(
+                "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.{}",
+                primary_score.score,
+                end_to_end_score.score,
+                cases.len(),
+                regression_status
+            ),
+            evidence,
+            suggestions,
+        },
+        regression_failed,
     })
 }
 
@@ -398,6 +606,193 @@ fn score_cases(
         })
         .collect::<Vec<_>>();
     parity_score(&observations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_regression_case(
+    candidate_paths: &EnginePaths,
+    baseline_paths: &EnginePaths,
+    gate: &CorrectnessGate,
+    setup_sql: &str,
+    query_sql: &str,
+    workload: &str,
+    row_count: usize,
+    order_offset: usize,
+    warmups: usize,
+    samples: usize,
+    query_amplification: usize,
+    end_to_end_samples: usize,
+) -> Result<RegressionCaseResult, String> {
+    let mut primary = RegressionTimingSeries::default();
+    for iteration in 0..warmups + samples {
+        let candidate_first = candidate_runs_first(order_offset, iteration);
+        let (candidate, baseline) = execute_regression_timed_pair(
+            candidate_paths,
+            baseline_paths,
+            setup_sql,
+            query_sql,
+            query_amplification,
+            candidate_first,
+        )?;
+        accept_regression_timed_pair(
+            gate,
+            &candidate,
+            &baseline,
+            query_amplification,
+            iteration >= warmups,
+            candidate_first,
+            &mut primary,
+        )?;
+    }
+
+    let mut end_to_end = RegressionTimingSeries::default();
+    for iteration in 0..end_to_end_samples {
+        let candidate_first = candidate_runs_first(order_offset, warmups + samples + iteration);
+        let (candidate, baseline) = execute_regression_timed_pair(
+            candidate_paths,
+            baseline_paths,
+            setup_sql,
+            query_sql,
+            1,
+            candidate_first,
+        )?;
+        accept_regression_timed_pair(
+            gate,
+            &candidate,
+            &baseline,
+            1,
+            true,
+            candidate_first,
+            &mut end_to_end,
+        )?;
+    }
+
+    let candidate_primary_batch_median_ms = stable_median(
+        &primary.candidate_batch_ms,
+        "candidate RustHouse amplified batch",
+        workload,
+        row_count,
+    )?;
+    let baseline_primary_batch_median_ms = stable_median(
+        &primary.baseline_batch_ms,
+        "baseline RustHouse amplified batch",
+        workload,
+        row_count,
+    )?;
+    let candidate_primary_median_ms = stable_median(
+        &primary.candidate_per_query_ms,
+        "candidate RustHouse amortized query",
+        workload,
+        row_count,
+    )?;
+    let baseline_primary_median_ms = stable_median(
+        &primary.baseline_per_query_ms,
+        "baseline RustHouse amortized query",
+        workload,
+        row_count,
+    )?;
+    let candidate_end_to_end_median_ms = stable_median(
+        &end_to_end.candidate_batch_ms,
+        "candidate RustHouse end-to-end",
+        workload,
+        row_count,
+    )?;
+    let baseline_end_to_end_median_ms = stable_median(
+        &end_to_end.baseline_batch_ms,
+        "baseline RustHouse end-to-end",
+        workload,
+        row_count,
+    )?;
+    let primary_ratio = baseline_primary_median_ms / candidate_primary_median_ms;
+    let end_to_end_ratio = baseline_end_to_end_median_ms / candidate_end_to_end_median_ms;
+
+    eprintln!(
+        "  candidate/baseline: primary uncapped ratio {:.3}; end-to-end uncapped ratio {:.3}",
+        primary_ratio, end_to_end_ratio
+    );
+    Ok(RegressionCaseResult {
+        primary,
+        candidate_primary_batch_median_ms,
+        baseline_primary_batch_median_ms,
+        candidate_primary_median_ms,
+        baseline_primary_median_ms,
+        primary_ratio,
+        end_to_end,
+        candidate_end_to_end_median_ms,
+        baseline_end_to_end_median_ms,
+        end_to_end_ratio,
+    })
+}
+
+fn candidate_runs_first(order_offset: usize, iteration: usize) -> bool {
+    (order_offset + iteration).is_multiple_of(2)
+}
+
+fn regression_ratios(
+    cases: &[CaseResult],
+    ratio: impl Fn(&RegressionCaseResult) -> f64,
+) -> Result<UncappedRatioBreakdown<'static>, String> {
+    let observations = cases
+        .iter()
+        .map(|case| {
+            let regression = case.regression.as_ref().ok_or_else(|| {
+                format!(
+                    "missing candidate/baseline timing for '{}' at {} rows",
+                    case.workload, case.row_count
+                )
+            })?;
+            Ok(RatioObservation {
+                family: case.family,
+                scale: case.row_count,
+                ratio: ratio(regression),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    uncapped_ratio(&observations)
+}
+
+fn regression_violations(
+    cases: &[CaseResult],
+    primary: &UncappedRatioBreakdown<'_>,
+) -> Vec<String> {
+    let mut violations = cases
+        .iter()
+        .filter_map(|case| {
+            let ratio = case.regression.as_ref()?.primary_ratio;
+            regression_exceeds_limit(ratio, MAX_CASE_REGRESSION).then(|| {
+                format!(
+                    "regression gate: '{}' at {} rows is {:.2}% slower than baseline (uncapped ratio {:.4}; limit {:.0}%)",
+                    case.workload,
+                    case.row_count,
+                    (1.0 / ratio - 1.0) * 100.0,
+                    ratio,
+                    MAX_CASE_REGRESSION * 100.0
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    violations.extend(
+        primary
+            .families
+            .iter()
+            .filter(|family| {
+                regression_exceeds_limit(family.ratio, MAX_FAMILY_REGRESSION)
+            })
+            .map(|family| {
+            format!(
+                "regression gate: family '{}' is {:.2}% slower than baseline (uncapped ratio {:.4}; limit {:.0}%)",
+                family.family,
+                (1.0 / family.ratio - 1.0) * 100.0,
+                family.ratio,
+                MAX_FAMILY_REGRESSION * 100.0
+            )
+            }),
+    );
+    violations
+}
+
+fn regression_exceeds_limit(baseline_candidate_ratio: f64, maximum_regression: f64) -> bool {
+    baseline_candidate_ratio < 1.0 / (1.0 + maximum_regression)
 }
 
 fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<(), String> {
@@ -427,6 +822,32 @@ fn execute_correctness_pair(
     }
 }
 
+fn execute_regression_correctness_pair(
+    candidate_paths: &EnginePaths,
+    baseline_paths: &EnginePaths,
+    setup_sql: &str,
+    query_sql: &str,
+    candidate_first: bool,
+) -> Result<(TimedOutput, TimedOutput), String> {
+    let execute_candidate = || {
+        candidate_paths
+            .execute_correctness(Engine::RustHouse, setup_sql, query_sql)
+            .map_err(|error| format!("candidate correctness execution failed: {error}"))
+    };
+    let execute_baseline = || {
+        baseline_paths
+            .execute_correctness(Engine::RustHouse, setup_sql, query_sql)
+            .map_err(|error| format!("baseline correctness execution failed: {error}"))
+    };
+    if candidate_first {
+        Ok((execute_candidate()?, execute_baseline()?))
+    } else {
+        let baseline = execute_baseline()?;
+        let candidate = execute_candidate()?;
+        Ok((candidate, baseline))
+    }
+}
+
 fn execute_timed_pair(
     paths: &EnginePaths,
     setup_sql: &str,
@@ -446,6 +867,33 @@ fn execute_timed_pair(
         let rusthouse =
             paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
         Ok((rusthouse, clickhouse))
+    }
+}
+
+fn execute_regression_timed_pair(
+    candidate_paths: &EnginePaths,
+    baseline_paths: &EnginePaths,
+    setup_sql: &str,
+    query_sql: &str,
+    query_repetitions: usize,
+    candidate_first: bool,
+) -> Result<(TimedBatch, TimedBatch), String> {
+    let execute_candidate = || {
+        candidate_paths
+            .execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)
+            .map_err(|error| format!("candidate timing failed: {error}"))
+    };
+    let execute_baseline = || {
+        baseline_paths
+            .execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)
+            .map_err(|error| format!("baseline timing failed: {error}"))
+    };
+    if candidate_first {
+        Ok((execute_candidate()?, execute_baseline()?))
+    } else {
+        let baseline = execute_baseline()?;
+        let candidate = execute_candidate()?;
+        Ok((candidate, baseline))
     }
 }
 
@@ -482,6 +930,44 @@ fn accept_timed_pair(
         samples
             .clickhouse_per_query_ms
             .push(clickhouse_per_query_ms);
+    }
+    Ok(())
+}
+
+fn accept_regression_timed_pair(
+    gate: &CorrectnessGate,
+    candidate: &TimedBatch,
+    baseline: &TimedBatch,
+    expected_repetitions: usize,
+    record: bool,
+    candidate_first: bool,
+    samples: &mut RegressionTimingSeries,
+) -> Result<(), String> {
+    if !gate.passed {
+        return Err(
+            "candidate/baseline timed batch was not preceded by a passing correctness run"
+                .to_owned(),
+        );
+    }
+    if candidate.query_repetitions != baseline.query_repetitions
+        || candidate.query_repetitions != expected_repetitions
+    {
+        return Err(format!(
+            "candidate/baseline amplification mismatch: expected {expected_repetitions}, candidate used {}, baseline used {}",
+            candidate.query_repetitions, baseline.query_repetitions
+        ));
+    }
+
+    let candidate_batch_ms = candidate.elapsed.as_secs_f64() * 1_000.0;
+    let baseline_batch_ms = baseline.elapsed.as_secs_f64() * 1_000.0;
+    let candidate_per_query_ms = per_query_millis(candidate_batch_ms, candidate.query_repetitions)?;
+    let baseline_per_query_ms = per_query_millis(baseline_batch_ms, baseline.query_repetitions)?;
+    if record {
+        samples.candidate_batch_ms.push(candidate_batch_ms);
+        samples.baseline_batch_ms.push(baseline_batch_ms);
+        samples.candidate_per_query_ms.push(candidate_per_query_ms);
+        samples.baseline_per_query_ms.push(baseline_per_query_ms);
+        samples.candidate_first.push(candidate_first);
     }
     Ok(())
 }
@@ -530,17 +1016,18 @@ fn stable_median(
 
 fn details_json(
     config: &Config,
-    identity: &ClickHouseIdentity,
+    identity: &BenchmarkIdentity,
     cases: &[CaseResult],
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    regression_details: RegressionDetails<'_>,
 ) -> String {
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,16 +1048,26 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"rusthouse_sha256\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
+        json_string(&identity.rusthouse.sha256),
         json_string(&config.clickhouse.display().to_string()),
-        json_string(&identity.version_output),
-        json_string(&identity.sha256),
+        json_string(&identity.clickhouse.version_output),
+        json_string(&identity.clickhouse.sha256),
         json_string("amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup"),
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
+    write_regression_metadata(
+        &mut output,
+        config,
+        regression_details.correctness_checks,
+        &identity.rusthouse,
+        regression_details.baseline_identity,
+        regression_details.analysis,
+    );
+    output.push_str("\"cases\":[");
 
     for (index, case) in cases.iter().enumerate() {
         if index > 0 {
@@ -608,10 +1105,101 @@ fn details_json(
         write_number_array(&mut output, &case.end_to_end.rusthouse_batch_ms);
         output.push_str(",\"clickhouse_samples_ms\":");
         write_number_array(&mut output, &case.end_to_end.clickhouse_batch_ms);
-        output.push_str("}}");
+        output.push('}');
+        if let Some(regression) = &case.regression {
+            output.push_str(",\"candidate_baseline\":{\"primary\":{");
+            write!(
+                output,
+                "\"candidate_batch_median_ms\":{:.6},\"baseline_batch_median_ms\":{:.6},\"candidate_per_query_median_ms\":{:.6},\"baseline_per_query_median_ms\":{:.6},\"baseline_candidate_ratio\":{:.9},\"candidate_batch_samples_ms\":",
+                regression.candidate_primary_batch_median_ms,
+                regression.baseline_primary_batch_median_ms,
+                regression.candidate_primary_median_ms,
+                regression.baseline_primary_median_ms,
+                regression.primary_ratio
+            )
+            .expect("writing to String cannot fail");
+            write_number_array(&mut output, &regression.primary.candidate_batch_ms);
+            output.push_str(",\"baseline_batch_samples_ms\":");
+            write_number_array(&mut output, &regression.primary.baseline_batch_ms);
+            output.push_str(",\"candidate_per_query_samples_ms\":");
+            write_number_array(&mut output, &regression.primary.candidate_per_query_ms);
+            output.push_str(",\"baseline_per_query_samples_ms\":");
+            write_number_array(&mut output, &regression.primary.baseline_per_query_ms);
+            output.push_str(",\"candidate_first\":");
+            write_bool_array(&mut output, &regression.primary.candidate_first);
+            write!(
+                output,
+                "}},\"end_to_end\":{{\"candidate_median_ms\":{:.6},\"baseline_median_ms\":{:.6},\"baseline_candidate_ratio\":{:.9},\"candidate_samples_ms\":",
+                regression.candidate_end_to_end_median_ms,
+                regression.baseline_end_to_end_median_ms,
+                regression.end_to_end_ratio
+            )
+            .expect("writing to String cannot fail");
+            write_number_array(&mut output, &regression.end_to_end.candidate_batch_ms);
+            output.push_str(",\"baseline_samples_ms\":");
+            write_number_array(&mut output, &regression.end_to_end.baseline_batch_ms);
+            output.push_str(",\"candidate_first\":");
+            write_bool_array(&mut output, &regression.end_to_end.candidate_first);
+            output.push_str("}}");
+        }
+        output.push('}');
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_regression_metadata(
+    output: &mut String,
+    config: &Config,
+    correctness_checks: usize,
+    candidate_identity: &RustHouseIdentity,
+    baseline_identity: Option<&RustHouseIdentity>,
+    regression: Option<&RegressionAnalysis>,
+) {
+    let (Some(baseline_path), Some(baseline_identity), Some(regression)) =
+        (&config.baseline, baseline_identity, regression)
+    else {
+        output.push_str("\"candidate_baseline\":null,");
+        return;
+    };
+    write!(
+        output,
+        "\"candidate_baseline\":{{\"candidate_path\":{},\"candidate_sha256\":{},\"baseline_path\":{},\"baseline_sha256\":{},\"correctness_checks\":{},\"ratio_definition\":{},\"counterbalance\":{},\"gates\":{{\"metric\":\"primary_sustained_work\",\"max_case_regression_fraction\":{MAX_CASE_REGRESSION:.6},\"max_family_regression_fraction\":{MAX_FAMILY_REGRESSION:.6}}},\"passed\":{},\"primary_overall_ratio\":{:.9},\"end_to_end_overall_ratio\":{:.9},\"primary_family_ratios\":",
+        json_string(&config.rusthouse.display().to_string()),
+        json_string(&candidate_identity.sha256),
+        json_string(&baseline_path.display().to_string()),
+        json_string(&baseline_identity.sha256),
+        correctness_checks,
+        json_string("uncapped baseline median divided by candidate median; values below one are regressions"),
+        json_string("candidate-first and baseline-first launch order alternates per case and is retained per sample"),
+        regression.violations.is_empty(),
+        regression.primary.ratio,
+        regression.end_to_end.ratio
+    )
+    .expect("writing to String cannot fail");
+    write_family_ratios(output, &regression.primary);
+    output.push_str(",\"end_to_end_family_ratios\":");
+    write_family_ratios(output, &regression.end_to_end);
+    output.push_str(",\"violations\":[");
+    write_string_array(output, &regression.violations);
+    output.push_str("]},");
+}
+
+fn write_family_ratios(output: &mut String, ratios: &UncappedRatioBreakdown<'_>) {
+    output.push('[');
+    for (index, family) in ratios.families.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(
+            output,
+            "{{\"family\":{},\"baseline_candidate_ratio\":{:.9}}}",
+            json_string(family.family),
+            family.ratio
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push(']');
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -621,6 +1209,17 @@ fn write_number_array(output: &mut String, values: &[f64]) {
             output.push(',');
         }
         write!(output, "{value:.6}").expect("writing to String cannot fail");
+    }
+    output.push(']');
+}
+
+fn write_bool_array(output: &mut String, values: &[bool]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(if *value { "true" } else { "false" });
     }
     output.push(']');
 }
@@ -773,6 +1372,57 @@ mod tests {
         .expect("gated sample");
         assert_eq!(samples.rusthouse_per_query_ms, [1.0]);
         assert_eq!(samples.clickhouse_per_query_ms, [0.5]);
+    }
+
+    #[test]
+    fn regression_samples_require_equal_amplification_and_retain_order() {
+        let gate = CorrectnessGate { passed: true };
+        let mut samples = RegressionTimingSeries::default();
+        accept_regression_timed_pair(
+            &gate,
+            &batch(64.0, 64),
+            &batch(32.0, 64),
+            64,
+            true,
+            false,
+            &mut samples,
+        )
+        .expect("symmetric pair");
+        assert_eq!(samples.candidate_per_query_ms, [1.0]);
+        assert_eq!(samples.baseline_per_query_ms, [0.5]);
+        assert_eq!(samples.candidate_first, [false]);
+
+        let error = accept_regression_timed_pair(
+            &gate,
+            &batch(64.0, 64),
+            &batch(32.0, 63),
+            64,
+            true,
+            true,
+            &mut samples,
+        )
+        .expect_err("asymmetric amplification must fail");
+        assert!(error.contains("amplification mismatch"));
+        assert_eq!(samples.candidate_first, [false]);
+    }
+
+    #[test]
+    fn candidate_baseline_order_is_counterbalanced() {
+        let orders = (0..7)
+            .map(|iteration| candidate_runs_first(0, iteration))
+            .collect::<Vec<_>>();
+        assert_eq!(orders, [true, false, true, false, true, false, true]);
+        assert_eq!(orders.iter().filter(|value| **value).count(), 4);
+        assert_eq!(orders.iter().filter(|value| !**value).count(), 3);
+        assert!(!candidate_runs_first(1, 0));
+    }
+
+    #[test]
+    fn regression_limits_use_slowdown_not_ratio_point_loss() {
+        assert!(!regression_exceeds_limit(1.0 / 1.20, 0.20));
+        assert!(regression_exceeds_limit(1.0 / 1.201, 0.20));
+        assert!(!regression_exceeds_limit(1.0 / 1.10, 0.10));
+        assert!(regression_exceeds_limit(1.0 / 1.101, 0.10));
     }
 
     #[test]

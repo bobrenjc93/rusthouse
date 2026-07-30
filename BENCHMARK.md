@@ -47,6 +47,28 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
+## Candidate-versus-baseline regression gates
+
+Passing `--baseline` opts into a second, isolated RustHouse-only suite after every candidate-versus-ClickHouse measurement is complete. `--rusthouse` names the candidate. The baseline may be supplied by `RUSTHOUSE_BASELINE_BIN`; baseline mode requires `--details` so every completed gate retains its evidence.
+
+~~~bash
+RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
+  target/release/clickhouse-parity-bench \
+  --mode default \
+  --seed 20260729 \
+  --rusthouse /path/to/candidate/rusthouse \
+  --baseline /path/to/baseline/rusthouse \
+  --details /tmp/rusthouse-regression-gate.json
+~~~
+
+For every case, the candidate and baseline receive byte-identical setup and query SQL, the same fixed amplification, the same sample count, and alternating candidate-first/baseline-first launch order. Their unamplified outputs must pass the same typed normalizer before timing. The details file records each measured launch order, all raw batch and per-query samples, medians, and SHA-256 hashes for both binaries.
+
+The uncapped ratio is `baseline median / candidate median`: values above one are improvements and values below one are regressions. Case ratios are reported directly. Family ratios use the same equal-workload and equal-scale log-space weighting as the ClickHouse score, without a floor or parity cap. The overall regression ratio gives families equal weight.
+
+The sustained-work gate fails when any case is more than 20% slower than its baseline or any family is more than 10% slower. These deliberately noise-tolerant limits are fixed in the harness. End-to-end candidate/baseline ratios are retained as cold-start diagnostics but are not gated. A gate failure writes full details, emits the already-computed ClickHouse score unchanged, and exits nonzero. Process, correctness, identity, timing-stability, or artifact-write failures remain fail-closed.
+
+The RustHouse-only suite starts only after the complete ClickHouse suite, so baseline work cannot perturb later official cases. Its ratios and gates are separate from `parity_score`; enabling it does not alter ClickHouse ratio capping, family weighting, headroom rejection, or score math.
+
 ## Grouping and top-k optimization measurement
 
 On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
@@ -62,9 +84,9 @@ On 2026-07-29, the default command above was run on the same Apple Silicon host 
 
 The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
 
-The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
+The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the candidate rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. `--baseline-rusthouse` is accepted as an alias for `--baseline`. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, binary paths and hashes, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero. A completed baseline regression gate is the exception described above: its nonzero exit preserves the already accepted ClickHouse score.
 
 ## Dataset and workloads
 
@@ -99,7 +121,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, family/scale weighting, uncapped aggregation, baseline evidence requirements, counterbalanced order, and regression thresholds.
 
 ## Timing and calibration
 
@@ -127,4 +149,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, hashed candidate and baseline binaries, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples and launch order, conservative ClickHouse per-case caps, uncapped regression evidence, and equal family/scale weighting. No single special-case query, favorable seed, duplicated workload, or saturated ClickHouse case can legitimately stand in for the suite.

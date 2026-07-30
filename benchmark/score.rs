@@ -13,6 +13,18 @@ pub struct ScoreBreakdown {
     pub saturated_cases: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FamilyRatio<'a> {
+    pub family: &'a str,
+    pub ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UncappedRatioBreakdown<'a> {
+    pub ratio: f64,
+    pub families: Vec<FamilyRatio<'a>>,
+}
+
 pub fn median(samples: &[f64]) -> Result<f64, String> {
     if samples.is_empty() {
         return Err("cannot compute a median without samples".to_owned());
@@ -41,15 +53,7 @@ pub fn median(samples: &[f64]) -> Result<f64, String> {
 /// family/scale, scales within a family, and finally families receive equal
 /// log-space weight at each level.
 pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakdown, String> {
-    if observations.is_empty() {
-        return Err("cannot score an empty benchmark".to_owned());
-    }
-    if observations
-        .iter()
-        .any(|observation| !observation.ratio.is_finite() || observation.ratio <= 0.0)
-    {
-        return Err("benchmark ratios must be finite and positive".to_owned());
-    }
+    validate_observations(observations)?;
 
     let mut grouped = BTreeMap::<&str, BTreeMap<usize, Vec<f64>>>::new();
     for observation in observations {
@@ -80,6 +84,59 @@ pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakd
         score,
         saturated_cases,
     })
+}
+
+/// Aggregate uncapped ratios with the same workload, scale, and family
+/// weighting used by the official parity score.
+pub fn uncapped_ratio<'a>(
+    observations: &[RatioObservation<'a>],
+) -> Result<UncappedRatioBreakdown<'a>, String> {
+    validate_observations(observations)?;
+
+    let mut grouped = BTreeMap::<&str, BTreeMap<usize, Vec<f64>>>::new();
+    for observation in observations {
+        grouped
+            .entry(observation.family)
+            .or_default()
+            .entry(observation.scale)
+            .or_default()
+            .push(observation.ratio.ln());
+    }
+
+    let families = grouped
+        .into_iter()
+        .map(|(family, scales)| {
+            let scale_logs = scales
+                .values()
+                .map(|case_logs| mean(case_logs))
+                .collect::<Vec<_>>();
+            FamilyRatio {
+                family,
+                ratio: mean(&scale_logs).exp(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let ratio = mean(
+        &families
+            .iter()
+            .map(|family| family.ratio.ln())
+            .collect::<Vec<_>>(),
+    )
+    .exp();
+    Ok(UncappedRatioBreakdown { ratio, families })
+}
+
+fn validate_observations(observations: &[RatioObservation<'_>]) -> Result<(), String> {
+    if observations.is_empty() {
+        return Err("cannot score an empty benchmark".to_owned());
+    }
+    if observations
+        .iter()
+        .any(|observation| !observation.ratio.is_finite() || observation.ratio <= 0.0)
+    {
+        return Err("benchmark ratios must be finite and positive".to_owned());
+    }
+    Ok(())
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -130,6 +187,20 @@ mod tests {
         assert!(parity_score(&[]).is_err());
         assert!(parity_score(&observations(&[("a", 1, 0.0)])).is_err());
         assert!(parity_score(&observations(&[("a", 1, f64::NAN)])).is_err());
+    }
+
+    #[test]
+    fn uncapped_ratios_preserve_speedups_and_family_scale_weighting() {
+        let balanced = observations(&[("a", 1, 4.0), ("a", 1, 4.0), ("a", 2, 1.0), ("b", 1, 0.25)]);
+        let breakdown = uncapped_ratio(&balanced).expect("ratio");
+
+        assert!((breakdown.families[0].ratio - 2.0).abs() < 1e-12);
+        assert!((breakdown.families[1].ratio - 0.25).abs() < 1e-12);
+        assert!((breakdown.ratio - 0.5_f64.sqrt()).abs() < 1e-12);
+        assert!(breakdown.families[0].ratio > 1.0);
+
+        let favorable = observations(&[("family", 1, 25.0)]);
+        assert!((uncapped_ratio(&favorable).expect("ratio").ratio - 25.0).abs() < 1e-12);
     }
 
     fn score(values: &[(&'static str, usize, f64)]) -> f64 {
