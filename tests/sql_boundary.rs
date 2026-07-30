@@ -639,3 +639,31 @@ fn truncate_and_drop_enforce_missing_table_semantics() {
         }]
     );
 }
+
+#[test]
+fn drop_targets_keyword_like_table_names() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE IF (id Int64); INSERT INTO IF VALUES (1)")
+        .expect("keyword-like table name is valid");
+
+    let schema = execute_query(&mut database, "DESCRIBE IF");
+    assert_eq!(
+        schema.rows,
+        vec![vec![
+            Value::String("id".to_owned()),
+            Value::String("Int64".to_owned()),
+        ]]
+    );
+    assert_eq!(
+        database.execute("DROP TABLE IF").expect("drop succeeds"),
+        vec![StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }]
+    );
+    assert!(matches!(
+        database.catalog().table("IF"),
+        Err(Error::TableNotFound(name)) if name == "IF"
+    ));
+}

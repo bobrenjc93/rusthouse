@@ -417,12 +417,10 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
-        let if_exists = if self.eat_keyword("IF") {
-            self.expect_keyword("EXISTS")?;
-            true
-        } else {
-            false
-        };
+        let if_exists = self.keyword_at(0, "IF") && self.keyword_at(1, "EXISTS");
+        if if_exists {
+            self.current += 2;
+        }
         let name = self.expect_identifier("table name")?;
         Ok(Statement::DropTable { name, if_exists })
     }
@@ -736,13 +734,21 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.keyword_at(0, expected) {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn keyword_at(&self, offset: usize, expected: &str) -> bool {
+        matches!(
+            self.tokens
+                .get(self.current + offset)
+                .map(|token| &token.kind),
+            Some(TokenKind::Identifier(value)) if value.eq_ignore_ascii_case(expected)
+        )
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
@@ -860,6 +866,24 @@ mod tests {
                     name: "events".to_owned(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parses_if_as_a_drop_target_without_exists() {
+        assert_eq!(
+            parse("DROP TABLE IF").expect("IF is a valid table identifier"),
+            vec![Statement::DropTable {
+                name: "IF".to_owned(),
+                if_exists: false,
+            }]
+        );
+        assert_eq!(
+            parse("DROP TABLE IF EXISTS IF").expect("optional clause remains supported"),
+            vec![Statement::DropTable {
+                name: "IF".to_owned(),
+                if_exists: true,
+            }]
         );
     }
 

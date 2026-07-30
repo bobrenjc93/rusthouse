@@ -18,7 +18,7 @@ OPTIONS:
 
 With no --execute option, SQL is read to EOF from standard input.
 Command acknowledgements are written to stderr; query data is written to stdout.
-JSON output is an object containing a results array, one entry per SELECT.
+JSON output contains one results-array entry per SELECT, SHOW TABLES, or DESCRIBE.
 ";
 
 fn main() -> ExitCode {

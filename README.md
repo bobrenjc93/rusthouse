@@ -57,7 +57,7 @@ printf '%s\n' \
 ~~~
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
-JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
+JSON output is always one document with a top-level results array. Each query-producing statement (`SELECT`, `SHOW TABLES`, or `DESCRIBE`) adds one result with explicit column name/type metadata and positional row arrays, preserving every value even when SELECT aliases repeat.
 
 ## Library API
 
