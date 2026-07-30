@@ -40,6 +40,11 @@ pub enum SelectItem {
         argument: AggregateArgument,
         alias: Option<String>,
     },
+    Window {
+        function: WindowFunction,
+        specification: WindowSpec,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +54,33 @@ pub enum AggregateFunction {
     Min,
     Max,
     Avg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunction {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
+impl WindowFunction {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RowNumber => "ROW_NUMBER",
+            Self::Rank => "RANK",
+            Self::DenseRank => "DENSE_RANK",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "ROW_NUMBER" => Some(Self::RowNumber),
+            "RANK" => Some(Self::Rank),
+            "DENSE_RANK" => Some(Self::DenseRank),
+            _ => None,
+        }
+    }
 }
 
 impl AggregateFunction {
@@ -112,6 +144,12 @@ pub enum ComparisonOperator {
 pub struct OrderBy {
     pub name: String,
     pub descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowSpec {
+    pub partition_by: Vec<String>,
+    pub order_by: Vec<OrderBy>,
 }
 
 /// Parse one or more semicolon-separated SQL statements.
@@ -471,23 +509,12 @@ impl Parser {
             }
         }
 
-        let mut order_by = Vec::new();
-        if self.eat_keyword("ORDER") {
+        let order_by = if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
-            loop {
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
-                let descending = if self.eat_keyword("DESC") {
-                    true
-                } else {
-                    self.eat_keyword("ASC");
-                    false
-                };
-                order_by.push(OrderBy { name, descending });
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
+            self.parse_ordering("ORDER BY output column or alias")?
+        } else {
+            Vec::new()
+        };
 
         let limit = if self.eat_keyword("LIMIT") {
             let position = self.position();
@@ -521,9 +548,21 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
+            if let Some(function) = WindowFunction::parse(&name) {
+                self.expect(&TokenKind::RightParen, "')' after window function")?;
+                self.expect_keyword("OVER")?;
+                let specification = self.parse_window_spec()?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Window {
+                    function,
+                    specification,
+                    alias,
+                });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
-                message: format!("unknown aggregate function '{name}'"),
+                message: format!("unknown aggregate or window function '{name}'"),
             })?;
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
@@ -531,6 +570,11 @@ impl Parser {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            if self.eat_keyword("OVER") {
+                return self.error(
+                    "aggregate window functions are not supported; expected ROW_NUMBER, RANK, or DENSE_RANK",
+                );
+            }
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
@@ -541,6 +585,56 @@ impl Parser {
             let alias = self.parse_alias()?;
             Ok(SelectItem::Column { name, alias })
         }
+    }
+
+    fn parse_window_spec(&mut self) -> Result<WindowSpec> {
+        self.expect(&TokenKind::LeftParen, "'(' after OVER")?;
+        self.expect_keyword("PARTITION")?;
+        self.expect_keyword("BY")?;
+        let partition_by = self.parse_identifier_list("PARTITION BY column")?;
+
+        self.expect_keyword("ORDER")?;
+        self.expect_keyword("BY")?;
+        let order_by = self.parse_ordering("window ORDER BY column")?;
+
+        if matches!(self.peek(), TokenKind::Identifier(value) if
+            value.eq_ignore_ascii_case("ROWS")
+                || value.eq_ignore_ascii_case("RANGE")
+                || value.eq_ignore_ascii_case("GROUPS"))
+        {
+            return self.error("window frames are not supported");
+        }
+        self.expect(&TokenKind::RightParen, "')' after window specification")?;
+        Ok(WindowSpec {
+            partition_by,
+            order_by,
+        })
+    }
+
+    fn parse_identifier_list(&mut self, description: &str) -> Result<Vec<String>> {
+        let mut names = vec![self.expect_identifier(description)?];
+        while self.eat(&TokenKind::Comma) {
+            names.push(self.expect_identifier(description)?);
+        }
+        Ok(names)
+    }
+
+    fn parse_ordering(&mut self, description: &str) -> Result<Vec<OrderBy>> {
+        let mut ordering = Vec::new();
+        loop {
+            let name = self.expect_identifier(description)?;
+            let descending = if self.eat_keyword("DESC") {
+                true
+            } else {
+                self.eat_keyword("ASC");
+                false
+            };
+            ordering.push(OrderBy { name, descending });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(ordering)
     }
 
     fn parse_alias(&mut self) -> Result<Option<String>> {
@@ -771,6 +865,35 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_bounded_ranking_window() {
+        let statements = parse(
+            "SELECT DENSE_RANK() OVER (
+                PARTITION BY region, active ORDER BY amount DESC, sequence ASC
+             ) AS place FROM sales ORDER BY place LIMIT 10;",
+        )
+        .expect("valid ranking window");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let SelectItem::Window {
+            function,
+            specification,
+            alias,
+        } = &select.items[0]
+        else {
+            panic!("expected window item");
+        };
+        assert_eq!(*function, WindowFunction::DenseRank);
+        assert_eq!(specification.partition_by, ["region", "active"]);
+        assert_eq!(specification.order_by[0].name, "amount");
+        assert!(specification.order_by[0].descending);
+        assert_eq!(specification.order_by[1].name, "sequence");
+        assert!(!specification.order_by[1].descending);
+        assert_eq!(alias.as_deref(), Some("place"));
     }
 
     #[test]

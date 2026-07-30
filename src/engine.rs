@@ -5,7 +5,7 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    Select, SelectItem, Statement, WindowFunction,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -107,7 +107,7 @@ impl Database {
             .collect::<Vec<_>>();
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
+        let (items, result_columns, aggregate_specs, window_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
@@ -124,8 +124,16 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            let windows = execute_windows(table, &matching_rows, &window_specs)?;
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &items,
+                &windows,
+                &ordering,
+                select.limit,
+            );
+            execute_projection(table, &matching_rows, &items, &windows)
         };
 
         Ok(QueryResult {
@@ -144,6 +152,9 @@ enum ResolvedItem {
     Aggregate {
         state: usize,
     },
+    Window {
+        state: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +163,26 @@ struct AggregateSpec {
     argument: Option<usize>,
     input_type: Option<DataType>,
 }
+
+#[derive(Debug)]
+struct WindowSpec {
+    function: WindowFunction,
+    partition_by: Vec<usize>,
+    order_by: Vec<WindowOrder>,
+}
+
+#[derive(Debug)]
+struct WindowOrder {
+    source: usize,
+    descending: bool,
+}
+
+type ResolvedSelectItems = (
+    Vec<ResolvedItem>,
+    Vec<ResultColumn>,
+    Vec<AggregateSpec>,
+    Vec<WindowSpec>,
+);
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
@@ -171,10 +202,18 @@ fn resolve_select_items(
     table: &Table,
     requested: &[SelectItem],
     group_columns: &[usize],
-) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+) -> Result<ResolvedSelectItems> {
     let has_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
+    let has_window = requested
+        .iter()
+        .any(|item| matches!(item, SelectItem::Window { .. }));
+    if has_window && (has_aggregate || !group_columns.is_empty()) {
+        return Err(Error::InvalidQuery(
+            "window functions cannot be combined with aggregates or GROUP BY".to_owned(),
+        ));
+    }
     if has_aggregate
         && requested
             .iter()
@@ -188,6 +227,7 @@ fn resolve_select_items(
     let mut items = Vec::new();
     let mut result_columns = Vec::new();
     let mut aggregate_specs = Vec::new();
+    let mut window_specs = Vec::new();
 
     for requested_item in requested {
         match requested_item {
@@ -268,10 +308,68 @@ fn resolve_select_items(
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
+            SelectItem::Window {
+                function,
+                specification,
+                alias,
+            } => {
+                let state = window_specs.len();
+                window_specs.push(resolve_window_spec(table, *function, specification)?);
+                items.push(ResolvedItem::Window { state });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("{}()", function.name())),
+                    data_type: DataType::Int64,
+                });
+            }
         }
     }
 
-    Ok((items, result_columns, aggregate_specs))
+    Ok((items, result_columns, aggregate_specs, window_specs))
+}
+
+fn resolve_window_spec(
+    table: &Table,
+    function: WindowFunction,
+    requested: &sql::WindowSpec,
+) -> Result<WindowSpec> {
+    let mut partition_by = Vec::with_capacity(requested.partition_by.len());
+    for name in &requested.partition_by {
+        let source = table.column_index(name)?;
+        if partition_by.contains(&source) {
+            return Err(Error::InvalidQuery(format!(
+                "{} PARTITION BY column '{name}' is listed more than once",
+                function.name()
+            )));
+        }
+        partition_by.push(source);
+    }
+
+    let mut order_by = Vec::with_capacity(requested.order_by.len());
+    for order in &requested.order_by {
+        let source = table.column_index(&order.name)?;
+        if order_by
+            .iter()
+            .any(|resolved: &WindowOrder| resolved.source == source)
+        {
+            return Err(Error::InvalidQuery(format!(
+                "{} window ORDER BY column '{}' is listed more than once",
+                function.name(),
+                order.name
+            )));
+        }
+        order_by.push(WindowOrder {
+            source,
+            descending: order.descending,
+        });
+    }
+
+    Ok(WindowSpec {
+        function,
+        partition_by,
+        order_by,
+    })
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -302,6 +400,7 @@ fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
+    windows: &[Vec<i64>],
 ) -> Vec<Vec<Value>> {
     matching_rows
         .iter()
@@ -313,10 +412,104 @@ fn execute_projection(
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
+                    ResolvedItem::Window { state } => Value::Int64(windows[*state][*row]),
                 })
                 .collect()
         })
         .collect()
+}
+
+fn execute_windows(
+    table: &Table,
+    matching_rows: &[usize],
+    specifications: &[WindowSpec],
+) -> Result<Vec<Vec<i64>>> {
+    specifications
+        .iter()
+        .map(|specification| execute_window(table, matching_rows, specification))
+        .collect()
+}
+
+fn execute_window(
+    table: &Table,
+    matching_rows: &[usize],
+    specification: &WindowSpec,
+) -> Result<Vec<i64>> {
+    let mut sorted_rows = matching_rows.to_vec();
+    sorted_rows.sort_unstable_by(|left, right| {
+        compare_partition_rows(table, specification, *left, *right)
+            .then_with(|| compare_window_order(table, specification, *left, *right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut values = vec![0; table.row_count()];
+    let mut previous_row = None;
+    let mut partition_position = 0_usize;
+    let mut rank = 0_usize;
+    let mut dense_rank = 0_usize;
+
+    for row in sorted_rows {
+        let new_partition = previous_row.is_none_or(|previous| {
+            compare_partition_rows(table, specification, previous, row) != Ordering::Equal
+        });
+        if new_partition {
+            partition_position = 1;
+            rank = 1;
+            dense_rank = 1;
+        } else {
+            partition_position += 1;
+            let previous = previous_row.expect("a continued partition has a previous row");
+            if compare_window_order(table, specification, previous, row) != Ordering::Equal {
+                rank = partition_position;
+                dense_rank += 1;
+            }
+        }
+
+        let value = match specification.function {
+            WindowFunction::RowNumber => partition_position,
+            WindowFunction::Rank => rank,
+            WindowFunction::DenseRank => dense_rank,
+        };
+        values[row] = i64::try_from(value)
+            .map_err(|_| Error::NumericOverflow(specification.function.name().to_owned()))?;
+        previous_row = Some(row);
+    }
+
+    Ok(values)
+}
+
+fn compare_partition_rows(
+    table: &Table,
+    specification: &WindowSpec,
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for source in &specification.partition_by {
+        let comparison = table.columns()[*source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return comparison;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_window_order(
+    table: &Table,
+    specification: &WindowSpec,
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for order in &specification.order_by {
+        let comparison = table.columns()[order.source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    Ordering::Equal
 }
 
 fn execute_grouped<'a>(
@@ -514,6 +707,9 @@ impl GroupedData<'_> {
                         ResolvedItem::Aggregate { state } => {
                             self.aggregates[*state][*group].clone()
                         }
+                        ResolvedItem::Window { .. } => {
+                            unreachable!("grouped projections cannot contain windows")
+                        }
                     })
                     .collect()
             })
@@ -687,6 +883,7 @@ fn order_source_rows(
     rows: &mut Vec<usize>,
     table: &Table,
     items: &[ResolvedItem],
+    windows: &[Vec<i64>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) {
@@ -699,10 +896,13 @@ fn order_source_rows(
 
     sort_and_limit(rows, limit, |left, right| {
         for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
+            let comparison = match items[order.output] {
+                ResolvedItem::Column { source, .. } => table.columns()[source].cmp_at(left, right),
+                ResolvedItem::Window { state } => windows[state][left].cmp(&windows[state][right]),
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                }
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -737,6 +937,9 @@ fn order_grouped_rows(
                 } => unreachable!("grouped columns are validated"),
                 ResolvedItem::Aggregate { state } => {
                     data.aggregates[state][left].cmp(&data.aggregates[state][right])
+                }
+                ResolvedItem::Window { .. } => {
+                    unreachable!("grouped projections cannot contain windows")
                 }
             };
             if comparison != Ordering::Equal {

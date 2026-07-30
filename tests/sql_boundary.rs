@@ -107,6 +107,190 @@ fn order_by_limit_preserves_input_order_for_ties_and_accepts_zero() {
 }
 
 #[test]
+fn ranking_windows_support_numeric_partitions_ties_and_final_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE scores (team Int64, score Int64, label String);
+             INSERT INTO scores VALUES
+                (2, 100, 'two top'),
+                (1, 90, 'first tie'),
+                (1, 70, 'lower'),
+                (1, 90, 'second tie'),
+                (2, 50, 'two lower'),
+                (1, 60, 'limited out');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT team, label,
+                ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC) AS row_number,
+                RANK() OVER (PARTITION BY team ORDER BY score DESC) AS rank,
+                DENSE_RANK() OVER (PARTITION BY team ORDER BY score DESC) AS dense_rank
+         FROM scores
+         ORDER BY team, row_number
+         LIMIT 5;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::String,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::String("first tie".to_owned()),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("second tie".to_owned()),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("lower".to_owned()),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("limited out".to_owned()),
+                Value::Int64(4),
+                Value::Int64(4),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("two top".to_owned()),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn ranking_windows_support_string_and_boolean_partitions() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (
+                id Int64, department String, active Bool, score Int64, label String
+             );
+             INSERT INTO events VALUES
+                (1, 'sales', true, 8, 'bravo'),
+                (2, 'engineering', false, 5, 'delta'),
+                (3, 'sales', false, 8, 'alpha'),
+                (4, 'engineering', true, 9, 'charlie'),
+                (5, 'sales', true, 3, 'echo');",
+        )
+        .expect("setup succeeds");
+
+    let strings = execute_query(
+        &mut database,
+        "SELECT id, department,
+                DENSE_RANK() OVER (PARTITION BY department ORDER BY score DESC) AS place
+         FROM events
+         WHERE active = true
+         ORDER BY department, place;",
+    );
+    assert_eq!(
+        strings.rows,
+        vec![
+            vec![
+                Value::Int64(4),
+                Value::String("engineering".to_owned()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("sales".to_owned()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(5),
+                Value::String("sales".to_owned()),
+                Value::Int64(2),
+            ],
+        ]
+    );
+
+    let booleans = execute_query(
+        &mut database,
+        "SELECT id, active,
+                RANK() OVER (PARTITION BY active ORDER BY label) AS place
+         FROM events
+         ORDER BY active, place;",
+    );
+    assert_eq!(
+        booleans.rows,
+        vec![
+            vec![Value::Int64(3), Value::Bool(false), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Bool(false), Value::Int64(2)],
+            vec![Value::Int64(1), Value::Bool(true), Value::Int64(1)],
+            vec![Value::Int64(4), Value::Bool(true), Value::Int64(2)],
+            vec![Value::Int64(5), Value::Bool(true), Value::Int64(3)],
+        ]
+    );
+}
+
+#[test]
+fn ranking_window_frames_and_grouped_windows_are_rejected_explicitly() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE scores (team Int64, score Int64);
+             INSERT INTO scores VALUES (1, 10);",
+        )
+        .expect("setup succeeds");
+
+    for frame in [
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        "RANGE UNBOUNDED PRECEDING",
+        "GROUPS CURRENT ROW",
+    ] {
+        let error = database
+            .execute(&format!(
+                "SELECT RANK() OVER (PARTITION BY team ORDER BY score {frame}) FROM scores;"
+            ))
+            .expect_err("window frames are outside the supported slice");
+        assert!(
+            matches!(error, Error::Sql { message, .. } if message == "window frames are not supported")
+        );
+    }
+
+    let error = database
+        .execute(
+            "SELECT team, COUNT(*) AS count,
+                    ROW_NUMBER() OVER (PARTITION BY team ORDER BY score) AS row_number
+             FROM scores GROUP BY team;",
+        )
+        .expect_err("grouped windows are outside the supported slice");
+    assert!(matches!(error, Error::InvalidQuery(message)
+            if message == "window functions cannot be combined with aggregates or GROUP BY"));
+}
+
+#[test]
 fn grouped_top_k_retains_deterministic_multi_column_ordering() {
     let mut database = Database::new();
     database

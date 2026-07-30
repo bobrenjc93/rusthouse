@@ -10,12 +10,17 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
+- ROW_NUMBER, RANK, and DENSE_RANK ranking windows
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Ranking windows use the bounded form
+`FUNCTION() OVER (PARTITION BY column [, ...] ORDER BY column [ASC|DESC] [, ...])`.
+Partition and window-order names refer to source columns. Windows run after `WHERE` and before the final output `ORDER BY` and `LIMIT`. `RANK` leaves gaps after peers while `DENSE_RANK` does not; peers are rows equal on every window `ORDER BY` column. For deterministic `ROW_NUMBER` results, rows tied on every window-order column retain insertion order. The final output ordering is independent and should be specified when callers require ranked rows in a particular presentation order.
 
 ## CLI
 
@@ -82,6 +87,8 @@ assert_eq!(result.rows.len(), 1);
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+
+Ranking windows require both `PARTITION BY` and `ORDER BY`. They cannot be combined with aggregates or `GROUP BY`, and `ROWS`, `RANGE`, and `GROUPS` frame clauses are rejected explicitly.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
