@@ -30,6 +30,8 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    ResourceLimit(String),
+    ExecutionTimeout,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +75,8 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::ResourceLimit(message) => write!(f, "resource limit exceeded: {message}"),
+            Self::ExecutionTimeout => f.write_str("query execution deadline exceeded"),
         }
     }
 }

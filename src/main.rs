@@ -18,7 +18,7 @@ OPTIONS:
     -h, --help                Print this help
 
 SERVER OPTIONS:
-    --listen <ADDRESS>        TCP address to listen on, for example 127.0.0.1:8080
+    --listen <ADDRESS>        Loopback TCP address, for example 127.0.0.1:8080
 
 With no --execute option, SQL is read to EOF from standard input.
 Command acknowledgements are written to stderr; query data is written to stdout.

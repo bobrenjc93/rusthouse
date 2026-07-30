@@ -1,7 +1,8 @@
 //! Bounded HTTP access to a shared [`Database`](crate::Database).
 //!
-//! `POST /query` accepts raw UTF-8 SQL and negotiates JSON or CSV responses.
-//! `GET /health` reports process availability.
+//! `POST /query` accepts `application/sql` UTF-8 bodies and negotiates JSON or
+//! CSV responses. `GET /health` reports process availability. Listeners are
+//! restricted to loopback because query execution is intentionally unauthenticated.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -11,9 +12,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::format::{OutputFormat, render_results};
+use crate::engine::{ExecutionBudget, ExecutionBudgetLimits};
+use crate::format::{OutputFormat, render};
 use crate::sql::{self, Statement};
-use crate::{Database, QueryResult, StatementResult};
+use crate::{Database, Error, QueryResult, StatementResult, Value};
 
 /// Maximum accepted SQL request body size (1 MiB).
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -21,18 +23,39 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 128;
 /// Fixed request worker count.
 pub const WORKER_COUNT: usize = 8;
-/// Total time allowed to queue and receive one request.
+/// Total time allowed to queue, receive, execute, and answer one request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum statements accepted in one HTTP batch.
+pub const MAX_STATEMENTS_PER_BATCH: usize = 32;
+/// Maximum encoded response size (4 MiB).
+pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const QUEUE_CAPACITY: usize = MAX_CONNECTIONS - WORKER_COUNT;
+const MAX_SCHEMA_COLUMNS: usize = 1024;
+const MAX_QUERY_ITEMS: usize = 256;
+const MAX_GROUP_OR_ORDER_COLUMNS: usize = 64;
+const MAX_INSERT_CELLS: usize = 100_000;
+const MAX_SCANNED_ROWS: usize = 100_000;
+const MAX_WORK_UNITS: usize = 1_000_000;
+const MAX_INTERMEDIATE_GROUPS: usize = 10_000;
+const MAX_RESULT_ROWS: usize = 10_000;
+const MAX_RESULT_CELLS: usize = 100_000;
+const MAX_MATERIALIZED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESULT_COLUMNS: usize = 256;
 
 /// Serve HTTP requests until SIGINT or SIGTERM is received.
 pub fn serve(address: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
-    listener.set_nonblocking(true)?;
     let local_address = listener.local_addr()?;
+    if !local_address.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HTTP service only permits loopback listen addresses",
+        ));
+    }
+    listener.set_nonblocking(true)?;
 
     let shutting_down = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&shutting_down);
@@ -102,6 +125,7 @@ fn accept_connections(
     while !shutting_down.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream.set_nonblocking(false)?;
                 let previous = active_connections.fetch_add(1, Ordering::AcqRel);
                 if previous >= MAX_CONNECTIONS {
                     active_connections.fetch_sub(1, Ordering::AcqRel);
@@ -174,10 +198,16 @@ fn handle_connection(
         )
     } else {
         match read_request(stream, deadline) {
-            Ok(request) => route(request, state),
+            Ok(request) => route(request, state, deadline),
             Err(response) => response,
         }
     };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    stream.set_write_timeout(Some(if remaining.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        remaining
+    }))?;
     write_response(stream, response)
 }
 
@@ -186,6 +216,8 @@ struct Request {
     method: String,
     target: String,
     accept: Option<String>,
+    content_type: Option<String>,
+    origin: Option<String>,
     body: Vec<u8>,
 }
 
@@ -233,6 +265,8 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<Request, Re
 
     let mut content_length = None;
     let mut accept = None;
+    let mut content_type = None;
+    let mut origin = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(Response::error(
@@ -275,6 +309,24 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<Request, Re
             ));
         } else if name.eq_ignore_ascii_case("accept") {
             accept = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.is_some() {
+                return Err(Response::error(
+                    400,
+                    "Bad Request",
+                    "Content-Type may only be supplied once",
+                ));
+            }
+            content_type = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("origin") {
+            if origin.is_some() {
+                return Err(Response::error(
+                    400,
+                    "Bad Request",
+                    "Origin may only be supplied once",
+                ));
+            }
+            origin = Some(value.to_owned());
         }
     }
 
@@ -305,6 +357,8 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<Request, Re
         method,
         target,
         accept,
+        content_type,
+        origin,
         body: received.split_off(body_start),
     })
 }
@@ -398,7 +452,7 @@ fn valid_header_name(name: &str) -> bool {
         })
 }
 
-fn route(request: Request, state: &RwLock<Database>) -> Response {
+fn route(request: Request, state: &RwLock<Database>, deadline: Instant) -> Response {
     match (request.method.as_str(), request.target.as_str()) {
         ("GET", "/health") => Response::new(
             200,
@@ -406,7 +460,7 @@ fn route(request: Request, state: &RwLock<Database>) -> Response {
             "application/json; charset=utf-8",
             b"{\"status\":\"ok\"}\n".to_vec(),
         ),
-        ("POST", "/query") => execute_query(request, state),
+        ("POST", "/query") => execute_query(request, state, deadline),
         (_, "/health") => Response::error(405, "Method Not Allowed", "GET is required")
             .with_header("Allow", "GET"),
         (_, "/query") => Response::error(405, "Method Not Allowed", "POST is required")
@@ -415,7 +469,26 @@ fn route(request: Request, state: &RwLock<Database>) -> Response {
     }
 }
 
-fn execute_query(request: Request, state: &RwLock<Database>) -> Response {
+fn execute_query(request: Request, state: &RwLock<Database>, deadline: Instant) -> Response {
+    if request.origin.is_some() {
+        return Response::error(
+            403,
+            "Forbidden",
+            "browser-originated query requests are not permitted",
+        );
+    }
+    let media_type = request
+        .content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !media_type.is_some_and(|value| value.eq_ignore_ascii_case("application/sql")) {
+        return Response::error(
+            415,
+            "Unsupported Media Type",
+            "Content-Type must be application/sql",
+        );
+    }
     let format = match negotiate_format(request.accept.as_deref()) {
         Some(format) => format,
         None => {
@@ -437,39 +510,216 @@ fn execute_query(request: Request, state: &RwLock<Database>) -> Response {
         Ok(statements) => statements,
         Err(error) => return Response::error(400, "Bad Request", &error.to_string()),
     };
+    if Instant::now() >= deadline {
+        return execution_error_response(Error::ExecutionTimeout);
+    }
+    if let Err(response) = validate_batch_limits(&statements) {
+        return response;
+    }
     let read_only = statements
         .iter()
         .all(|statement| matches!(statement, Statement::Select(_)));
+    let mut budget = ExecutionBudget::new(ExecutionBudgetLimits {
+        deadline,
+        scanned_rows: MAX_SCANNED_ROWS,
+        work_units: MAX_WORK_UNITS,
+        groups: MAX_INTERMEDIATE_GROUPS,
+        result_rows: MAX_RESULT_ROWS,
+        result_cells: MAX_RESULT_CELLS,
+        materialized_bytes: MAX_MATERIALIZED_BYTES,
+        result_columns: MAX_RESULT_COLUMNS,
+    });
 
     let execution = if read_only {
-        match state.read() {
-            Ok(database) => database.execute_read_statements(statements),
-            Err(_) => return Response::internal_error(),
-        }
-    } else {
-        match state.write() {
-            Ok(mut database) => database.execute_statements(statements),
-            Err(_) => return Response::internal_error(),
-        }
-    };
-    let results = match execution {
-        Ok(results) => results,
-        Err(error) => return Response::error(400, "Bad Request", &error.to_string()),
-    };
-    let queries = results
-        .into_iter()
-        .filter_map(|result| match result {
-            StatementResult::Query(query) => Some(query),
-            StatementResult::Command { .. } => None,
+        let database = loop {
+            match state.try_read() {
+                Ok(database) => break database,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if let Err(error) = budget.checkpoint() {
+                        return execution_error_response(error);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return Response::internal_error(),
+            }
+        };
+        execute_batch(statements, format, &mut budget, |statement, budget| {
+            database.execute_bounded_read_statement(statement, budget)
         })
-        .collect::<Vec<QueryResult>>();
-    let body = render_results(&queries, format).into_bytes();
+    } else {
+        let mut database = loop {
+            match state.try_write() {
+                Ok(database) => break database,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if let Err(error) = budget.checkpoint() {
+                        return execution_error_response(error);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return Response::internal_error(),
+            }
+        };
+        execute_batch(statements, format, &mut budget, |statement, budget| {
+            database.execute_bounded_statement(statement, budget)
+        })
+    };
+    let body = match execution {
+        Ok(body) => body,
+        Err(error) => return execution_error_response(error),
+    };
     let content_type = match format {
         OutputFormat::Csv => "text/csv; charset=utf-8",
         OutputFormat::Json => "application/json; charset=utf-8",
         OutputFormat::Table => unreachable!("HTTP only negotiates JSON and CSV"),
     };
     Response::new(200, "OK", content_type, body)
+}
+
+fn validate_batch_limits(statements: &[Statement]) -> Result<(), Response> {
+    if statements.len() > MAX_STATEMENTS_PER_BATCH {
+        return Err(Response::error(
+            422,
+            "Unprocessable Content",
+            "SQL batch contains more than 32 statements",
+        ));
+    }
+    for statement in statements {
+        match statement {
+            Statement::CreateTable { columns, .. } if columns.len() > MAX_SCHEMA_COLUMNS => {
+                return Err(Response::error(
+                    422,
+                    "Unprocessable Content",
+                    "CREATE TABLE contains more than 1024 columns",
+                ));
+            }
+            Statement::Insert { rows, .. } => {
+                let cells = rows
+                    .iter()
+                    .try_fold(0_usize, |total, row| total.checked_add(row.len()).ok_or(()));
+                if !matches!(cells, Ok(cells) if cells <= MAX_INSERT_CELLS) {
+                    return Err(Response::error(
+                        422,
+                        "Unprocessable Content",
+                        "INSERT contains more than 100000 values",
+                    ));
+                }
+            }
+            Statement::Select(select) => {
+                if select.items.len() > MAX_QUERY_ITEMS {
+                    return Err(Response::error(
+                        422,
+                        "Unprocessable Content",
+                        "SELECT contains more than 256 output expressions",
+                    ));
+                }
+                if select.group_by.len() > MAX_GROUP_OR_ORDER_COLUMNS
+                    || select.order_by.len() > MAX_GROUP_OR_ORDER_COLUMNS
+                {
+                    return Err(Response::error(
+                        422,
+                        "Unprocessable Content",
+                        "GROUP BY and ORDER BY are limited to 64 columns each",
+                    ));
+                }
+            }
+            Statement::CreateTable { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn execute_batch(
+    statements: Vec<Statement>,
+    format: OutputFormat,
+    budget: &mut ExecutionBudget,
+    mut execute: impl FnMut(Statement, &mut ExecutionBudget) -> crate::Result<StatementResult>,
+) -> crate::Result<Vec<u8>> {
+    let mut output = match format {
+        OutputFormat::Json => String::from("{\"results\":["),
+        OutputFormat::Csv => String::new(),
+        OutputFormat::Table => unreachable!("HTTP only negotiates JSON and CSV"),
+    };
+    let mut query_count = 0_usize;
+    for statement in statements {
+        budget.checkpoint()?;
+        let result = execute(statement, budget)?;
+        let StatementResult::Query(query) = result else {
+            continue;
+        };
+        let separator = usize::from(query_count > 0);
+        let closing = usize::from(format == OutputFormat::Json) * 3;
+        let estimated = render_size_upper_bound(&query)?;
+        let projected_size = output
+            .len()
+            .checked_add(separator)
+            .and_then(|size| size.checked_add(estimated))
+            .and_then(|size| size.checked_add(closing))
+            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
+        if projected_size > MAX_RESPONSE_BYTES {
+            return Err(Error::ResourceLimit(
+                "encoded response exceeds 4194304 bytes".to_owned(),
+            ));
+        }
+        if query_count > 0 {
+            output.push(if format == OutputFormat::Json {
+                ','
+            } else {
+                '\n'
+            });
+        }
+        let rendered = render(&query, format);
+        if output.len() + rendered.len() + closing > MAX_RESPONSE_BYTES {
+            return Err(Error::ResourceLimit(
+                "encoded response exceeds 4194304 bytes".to_owned(),
+            ));
+        }
+        output.push_str(&rendered);
+        query_count += 1;
+        budget.checkpoint()?;
+    }
+    if format == OutputFormat::Json {
+        output.push_str("]}\n");
+    }
+    Ok(output.into_bytes())
+}
+
+fn render_size_upper_bound(result: &QueryResult) -> crate::Result<usize> {
+    let mut size = 128_usize;
+    for column in &result.columns {
+        size = size
+            .checked_add(64)
+            .and_then(|size| size.checked_add(column.name.len().checked_mul(6)?))
+            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
+    }
+    for row in &result.rows {
+        size = size
+            .checked_add(16)
+            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
+        for value in row {
+            let value_size = match value {
+                Value::String(value) => value
+                    .len()
+                    .checked_mul(6)
+                    .and_then(|size| size.checked_add(8)),
+                Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => Some(40),
+            }
+            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
+            size = size
+                .checked_add(value_size)
+                .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
+        }
+    }
+    Ok(size)
+}
+
+fn execution_error_response(error: Error) -> Response {
+    match error {
+        Error::ExecutionTimeout => Response::error(408, "Request Timeout", &error.to_string()),
+        Error::ResourceLimit(_) => {
+            Response::error(422, "Unprocessable Content", &error.to_string())
+        }
+        _ => Response::error(400, "Bad Request", &error.to_string()),
+    }
 }
 
 fn negotiate_format(accept: Option<&str>) -> Option<OutputFormat> {
@@ -569,7 +819,7 @@ impl Response {
 fn write_response(stream: &mut TcpStream, response: Response) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         response.status,
         response.reason,
         response.content_type,
@@ -625,5 +875,20 @@ mod tests {
     fn escapes_error_messages_as_json() {
         let response = Response::error(400, "Bad Request", "bad \"SQL\"\nnext");
         assert_eq!(response.body, b"{\"error\":\"bad \\\"SQL\\\"\\nnext\"}\n");
+    }
+
+    #[test]
+    fn rejects_execution_after_the_request_deadline() {
+        let request = Request {
+            method: "POST".to_owned(),
+            target: "/query".to_owned(),
+            accept: None,
+            content_type: Some("application/sql".to_owned()),
+            origin: None,
+            body: b"CREATE TABLE late (id Int64)".to_vec(),
+        };
+        let response = execute_query(request, &RwLock::new(Database::new()), Instant::now());
+        assert_eq!(response.status, 408);
+        assert!(response.body.windows(8).any(|value| value == b"deadline"));
     }
 }

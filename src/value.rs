@@ -82,6 +82,10 @@ impl Value {
         }
     }
 
+    pub(crate) fn materialized_size(&self) -> usize {
+        self.as_ref().materialized_size()
+    }
+
     #[cfg(test)]
     pub(crate) fn sql_cmp(&self, other: &Self) -> Option<Ordering> {
         self.as_ref().sql_cmp(other.as_ref())
@@ -109,6 +113,13 @@ impl ValueRef<'_> {
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             _ => None,
+        }
+    }
+
+    pub(crate) fn materialized_size(self) -> usize {
+        match self {
+            Self::String(value) => value.len(),
+            Self::Int64(_) | Self::Float64(_) | Self::Bool(_) => 8,
         }
     }
 

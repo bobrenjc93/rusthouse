@@ -60,7 +60,7 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 ## HTTP service
 
-Start a server on an explicit address:
+Start a server on an explicit loopback address. Non-loopback and wildcard listeners are rejected because the mutable endpoint does not implement authentication:
 
 ~~~bash
 cargo run -- serve --listen 127.0.0.1:8080
@@ -69,18 +69,20 @@ cargo run -- serve --listen 127.0.0.1:8080
 `POST /query` accepts a UTF-8 SQL batch as its request body. It defaults to JSON and negotiates `application/json` or `text/csv` through the `Accept` header. State is retained for the lifetime of the server process:
 
 ~~~bash
-curl --data-binary \
+curl -H 'Content-Type: application/sql' --data-binary \
   "CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2)" \
   http://127.0.0.1:8080/query
 
-curl -H 'Accept: text/csv' --data-binary \
+curl -H 'Content-Type: application/sql' -H 'Accept: text/csv' --data-binary \
   "SELECT * FROM events ORDER BY id" \
   http://127.0.0.1:8080/query
 
 curl http://127.0.0.1:8080/health
 ~~~
 
-The server parses a batch before locking the database. Batches containing only `SELECT` statements share a read lock; any batch containing `CREATE` or `INSERT` holds the exclusive write lock through the complete batch. The service caps bodies at 1 MiB, headers at 16 KiB, accepted connections at 128, and request workers at 8. Queueing plus header and body reads have a 10-second total deadline. SIGINT and SIGTERM stop accepting connections and drain accepted work before exit.
+The query endpoint requires `Content-Type: application/sql` and rejects requests containing an `Origin` header. This non-simple media type plus the absence of CORS preflight support prevents browser cross-origin form and fetch requests from reaching mutable SQL execution.
+
+The server parses a batch before locking the database. Batches containing only `SELECT` statements share a read lock; any batch containing `CREATE` or `INSERT` holds the exclusive write lock through the complete batch. The service caps bodies at 1 MiB, headers at 16 KiB, accepted connections at 128, request workers at 8, statements per batch at 32, scanned rows at 100,000, intermediate groups and result rows at 10,000, result cells at 100,000, materialized result values at 2 MiB, and encoded responses at 4 MiB. Queueing, request reads, lock acquisition, execution, rendering, and successful response writes share a 10-second deadline. SIGINT and SIGTERM stop accepting connections and drain bounded accepted work before exit.
 
 ## Library API
 

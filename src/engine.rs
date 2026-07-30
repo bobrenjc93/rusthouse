@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -37,6 +38,120 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+pub(crate) struct ExecutionBudget {
+    deadline: Instant,
+    remaining_scanned_rows: usize,
+    remaining_work_units: usize,
+    remaining_groups: usize,
+    remaining_result_rows: usize,
+    remaining_result_cells: usize,
+    remaining_materialized_bytes: usize,
+    max_result_columns: usize,
+}
+
+pub(crate) struct ExecutionBudgetLimits {
+    pub deadline: Instant,
+    pub scanned_rows: usize,
+    pub work_units: usize,
+    pub groups: usize,
+    pub result_rows: usize,
+    pub result_cells: usize,
+    pub materialized_bytes: usize,
+    pub result_columns: usize,
+}
+
+impl ExecutionBudget {
+    pub(crate) fn new(limits: ExecutionBudgetLimits) -> Self {
+        Self {
+            deadline: limits.deadline,
+            remaining_scanned_rows: limits.scanned_rows,
+            remaining_work_units: limits.work_units,
+            remaining_groups: limits.groups,
+            remaining_result_rows: limits.result_rows,
+            remaining_result_cells: limits.result_cells,
+            remaining_materialized_bytes: limits.materialized_bytes,
+            max_result_columns: limits.result_columns,
+        }
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            Err(Error::ExecutionTimeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn charge(counter: &mut usize, amount: usize, message: &'static str) -> Result<()> {
+        *counter = counter
+            .checked_sub(amount)
+            .ok_or_else(|| Error::ResourceLimit(message.to_owned()))?;
+        Ok(())
+    }
+
+    fn charge_scan(&mut self, rows: usize, work_units: usize) -> Result<()> {
+        self.checkpoint()?;
+        Self::charge(
+            &mut self.remaining_scanned_rows,
+            rows,
+            "request scans more than 100000 table rows",
+        )?;
+        Self::charge(
+            &mut self.remaining_work_units,
+            work_units,
+            "request exceeds 1000000 execution work units",
+        )
+    }
+
+    fn charge_mutation(&mut self, cells: usize) -> Result<()> {
+        self.checkpoint()?;
+        Self::charge(
+            &mut self.remaining_work_units,
+            cells,
+            "request exceeds 1000000 execution work units",
+        )
+    }
+
+    fn charge_group(&mut self) -> Result<()> {
+        Self::charge(
+            &mut self.remaining_groups,
+            1,
+            "request creates more than 10000 intermediate groups",
+        )
+    }
+
+    fn reserve_result(&mut self, rows: usize, columns: usize) -> Result<()> {
+        self.checkpoint()?;
+        if columns > self.max_result_columns {
+            return Err(Error::ResourceLimit(format!(
+                "a result has {columns} columns; maximum is {}",
+                self.max_result_columns
+            )));
+        }
+        let cells = rows
+            .checked_mul(columns)
+            .ok_or_else(|| Error::ResourceLimit("result cell count overflow".to_owned()))?;
+        Self::charge(
+            &mut self.remaining_result_rows,
+            rows,
+            "request returns more than 10000 result rows",
+        )?;
+        Self::charge(
+            &mut self.remaining_result_cells,
+            cells,
+            "request returns more than 100000 result cells",
+        )
+    }
+
+    fn charge_materialized(&mut self, bytes: usize) -> Result<()> {
+        Self::charge(
+            &mut self.remaining_materialized_bytes,
+            bytes,
+            "request materializes more than 2097152 bytes of result values",
+        )
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -67,23 +182,68 @@ impl Database {
             .collect()
     }
 
-    pub(crate) fn execute_read_statements(
+    pub(crate) fn execute_bounded_statement(
+        &mut self,
+        statement: Statement,
+        budget: &mut ExecutionBudget,
+    ) -> Result<StatementResult> {
+        budget.checkpoint()?;
+        match statement {
+            Statement::CreateTable { name, columns } => {
+                budget.charge_mutation(columns.len())?;
+                self.catalog.create_table(name, columns)?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::Insert { table, rows } => {
+                let affected_rows = rows.len();
+                let cells = rows.iter().try_fold(0_usize, |total, row| {
+                    total.checked_add(row.len()).ok_or_else(|| {
+                        Error::ResourceLimit("INSERT cell count overflow".to_owned())
+                    })
+                })?;
+                budget.charge_mutation(cells)?;
+                {
+                    let target = self.catalog.table(&table)?;
+                    for (index, row) in rows.iter().enumerate() {
+                        if index % 1024 == 0 {
+                            budget.checkpoint()?;
+                        }
+                        target.validate_row(row)?;
+                    }
+                }
+                budget.checkpoint()?;
+                let target = self.catalog.table_mut(&table)?;
+                for row in rows {
+                    target.insert_row(row)?;
+                }
+                Ok(StatementResult::Command {
+                    tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::Select(select) => self
+                .execute_select_with_budget(select, Some(budget))
+                .map(StatementResult::Query),
+        }
+    }
+
+    pub(crate) fn execute_bounded_read_statement(
         &self,
-        statements: Vec<Statement>,
-    ) -> Result<Vec<StatementResult>> {
-        statements
-            .into_iter()
-            .map(|statement| match statement {
-                Statement::Select(select) => {
-                    self.execute_select(select).map(StatementResult::Query)
-                }
-                Statement::CreateTable { .. } | Statement::Insert { .. } => {
-                    Err(Error::InvalidQuery(
-                        "a read batch may only contain SELECT statements".to_owned(),
-                    ))
-                }
-            })
-            .collect()
+        statement: Statement,
+        budget: &mut ExecutionBudget,
+    ) -> Result<StatementResult> {
+        budget.checkpoint()?;
+        match statement {
+            Statement::Select(select) => self
+                .execute_select_with_budget(select, Some(budget))
+                .map(StatementResult::Query),
+            Statement::CreateTable { .. } | Statement::Insert { .. } => Err(Error::InvalidQuery(
+                "a read batch may only contain SELECT statements".to_owned(),
+            )),
+        }
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
@@ -117,30 +277,82 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
+        self.execute_select_with_budget(select, None)
+    }
+
+    fn execute_select_with_budget(
+        &self,
+        select: Select,
+        mut budget: Option<&mut ExecutionBudget>,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
+        let predicate_nodes = select.predicate.as_ref().map_or(0, predicate_node_count);
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
-
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        if let Some(budget) = budget.as_deref_mut() {
+            let operation_width = 1_usize
+                .checked_add(items.len())
+                .and_then(|width| width.checked_add(group_columns.len()))
+                .and_then(|width| width.checked_add(aggregate_specs.len()))
+                .and_then(|width| width.checked_add(ordering.len()))
+                .and_then(|width| width.checked_add(predicate_nodes))
+                .and_then(|width| {
+                    let sort_columns = if grouped {
+                        ordering.len().checked_add(group_columns.len().max(1))?
+                    } else {
+                        ordering.len()
+                    };
+                    width.checked_add(
+                        sort_columns.checked_mul(table.row_count().max(1).ilog2() as usize)?,
+                    )
+                })
+                .ok_or_else(|| Error::ResourceLimit("query work estimate overflow".to_owned()))?;
+            let work_units = table
+                .row_count()
+                .checked_mul(operation_width)
+                .ok_or_else(|| Error::ResourceLimit("query work estimate overflow".to_owned()))?;
+            budget.charge_scan(table.row_count(), work_units)?;
+            budget.reserve_result(0, result_columns.len())?;
+            budget
+                .charge_materialized(result_columns.iter().map(|column| column.name.len()).sum())?;
+        }
+
+        let mut matching_rows = Vec::with_capacity(table.row_count().min(1024));
+        for row in 0..table.row_count() {
+            if row % 1024 == 0
+                && let Some(budget) = budget.as_deref_mut()
+            {
+                budget.checkpoint()?;
+            }
+            if predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate.evaluate(table, row))
+            {
+                matching_rows.push(row);
+            }
+        }
+
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &group_columns,
+                &aggregate_specs,
+                budget.as_deref_mut(),
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.checkpoint()?;
+            }
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -148,16 +360,36 @@ impl Database {
                 &ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.checkpoint()?;
+                budget.reserve_result(selected_groups.len(), items.len())?;
+            }
+            grouped.project(&selected_groups, &items, budget)?
         } else {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.checkpoint()?;
+            }
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.checkpoint()?;
+                budget.reserve_result(matching_rows.len(), items.len())?;
+            }
+            execute_projection(table, &matching_rows, &items, budget)?
         };
 
         Ok(QueryResult {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+fn predicate_node_count(predicate: &Predicate) -> usize {
+    match predicate {
+        Predicate::Comparison { .. } => 1,
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            1 + predicate_node_count(left) + predicate_node_count(right)
+        }
     }
 }
 
@@ -328,21 +560,33 @@ fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
-    matching_rows
-        .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
+    mut budget: Option<&mut ExecutionBudget>,
+) -> Result<Vec<Vec<Value>>> {
+    let mut output = Vec::with_capacity(matching_rows.len());
+    for (index, row) in matching_rows.iter().enumerate() {
+        if index % 1024 == 0
+            && let Some(budget) = budget.as_deref_mut()
+        {
+            budget.checkpoint()?;
+        }
+        let mut projected = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                ResolvedItem::Column { source, .. } => {
+                    let value = table.columns()[*source].value_ref(*row);
+                    if let Some(budget) = budget.as_deref_mut() {
+                        budget.charge_materialized(value.materialized_size())?;
                     }
-                })
-                .collect()
-        })
-        .collect()
+                    projected.push(value.to_owned());
+                }
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("projection does not contain aggregates")
+                }
+            }
+        }
+        output.push(projected);
+    }
+    Ok(output)
 }
 
 fn execute_grouped<'a>(
@@ -350,9 +594,15 @@ fn execute_grouped<'a>(
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    mut budget: Option<&mut ExecutionBudget>,
 ) -> Result<GroupedData<'a>> {
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
+    if group_count == 1
+        && let Some(budget) = budget.as_deref_mut()
+    {
+        budget.charge_group()?;
+    }
     let initial_capacity = matching_rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
@@ -365,9 +615,17 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
+    for (index, row) in matching_rows.iter().enumerate() {
+        if index % 1024 == 0
+            && let Some(budget) = budget.as_deref_mut()
+        {
+            budget.checkpoint()?;
+        }
         let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
         if inserted {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge_group()?;
+            }
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 states.push(AggregateState::new(spec));
@@ -375,7 +633,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, *row, budget.as_deref_mut())?;
         }
     }
 
@@ -522,28 +780,40 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
-            .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+    fn project(
+        &self,
+        selected: &[usize],
+        items: &[ResolvedItem],
+        mut budget: Option<&mut ExecutionBudget>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut output = Vec::with_capacity(selected.len());
+        for (index, group) in selected.iter().enumerate() {
+            if index % 1024 == 0
+                && let Some(budget) = budget.as_deref_mut()
+            {
+                budget.checkpoint()?;
+            }
+            let mut projected = Vec::with_capacity(items.len());
+            for item in items {
+                let value = match item {
+                    ResolvedItem::Column {
+                        group_position: Some(position),
+                        ..
+                    } => self.keys[*group].value(*position).to_owned(),
+                    ResolvedItem::Column {
+                        group_position: None,
+                        ..
+                    } => unreachable!("grouped columns are validated"),
+                    ResolvedItem::Aggregate { state } => self.aggregates[*state][*group].clone(),
+                };
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.charge_materialized(value.materialized_size())?;
+                }
+                projected.push(value);
+            }
+            output.push(projected);
+        }
+        Ok(output)
     }
 }
 
@@ -573,7 +843,13 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+    fn update(
+        &mut self,
+        spec: &AggregateSpec,
+        table: &Table,
+        row: usize,
+        budget: Option<&mut ExecutionBudget>,
+    ) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -607,6 +883,9 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
                 {
+                    if let Some(budget) = budget {
+                        budget.charge_materialized(candidate.materialized_size())?;
+                    }
                     *current = Some(candidate.to_owned());
                 }
             }
@@ -617,6 +896,9 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
                 {
+                    if let Some(budget) = budget {
+                        budget.charge_materialized(candidate.materialized_size())?;
+                    }
                     *current = Some(candidate.to_owned());
                 }
             }

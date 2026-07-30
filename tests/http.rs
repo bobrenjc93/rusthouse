@@ -116,6 +116,9 @@ fn try_request(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     )?;
+    if method == "POST" {
+        stream.write_all(b"Content-Type: application/sql\r\n")?;
+    }
     if let Some(accept) = accept {
         write!(stream, "Accept: {accept}\r\n")?;
     }
@@ -284,6 +287,150 @@ fn malformed_and_oversized_requests_are_bounded_errors() {
     assert!(oversized.body.contains("1048576 bytes"));
 
     assert_eq!(server.request("GET", "/health", None, b"").status, 200);
+}
+
+#[test]
+fn fragmented_requests_and_large_responses_complete() {
+    let server = TestServer::start();
+    let sql = b"CREATE TABLE fragments (value String)";
+    let headers = format!(
+        "POST /query HTTP/1.1\r\nHost: {}\r\nContent-Type: application/sql\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        server.address,
+        sql.len()
+    );
+    let mut stream = TcpStream::connect(server.address).expect("connect fragmented request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set fragmented request timeout");
+    stream
+        .write_all([headers.as_bytes(), &sql[..12]].concat().as_slice())
+        .expect("write first request fragment");
+    thread::sleep(Duration::from_millis(200));
+    stream
+        .write_all(&sql[12..])
+        .expect("write second request fragment");
+    let response = read_response(stream).expect("read fragmented request response");
+    assert_eq!(response.status, 200);
+
+    let value = "x".repeat(512 * 1024);
+    let insert = format!("INSERT INTO fragments VALUES ('{value}')");
+    assert_eq!(
+        server
+            .request("POST", "/query", None, insert.as_bytes())
+            .status,
+        200
+    );
+    let response = server.request(
+        "POST",
+        "/query",
+        Some("application/json"),
+        b"SELECT value FROM fragments",
+    );
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains(&value));
+    let declared_length = response
+        .headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("response content length");
+    assert_eq!(declared_length, response.body.len());
+}
+
+#[test]
+fn execution_and_aggregate_results_are_limited() {
+    let server = TestServer::start();
+    let too_many_statements = vec!["SELECT value FROM blobs"; 33].join(";");
+    let response = server.request("POST", "/query", None, too_many_statements.as_bytes());
+    assert_eq!(response.status, 422);
+    assert!(response.body.contains("more than 32 statements"));
+
+    let value = "z".repeat(600 * 1024);
+    let setup = format!("CREATE TABLE blobs (value String); INSERT INTO blobs VALUES ('{value}')");
+    assert_eq!(
+        server
+            .request("POST", "/query", None, setup.as_bytes())
+            .status,
+        200
+    );
+    let amplified = ["SELECT value FROM blobs"; 4].join(";");
+    let response = server.request("POST", "/query", None, amplified.as_bytes());
+    assert_eq!(response.status, 422);
+    assert!(response.body.contains("resource limit exceeded"));
+
+    let values = std::iter::repeat_n("(1)", 10_001)
+        .collect::<Vec<_>>()
+        .join(",");
+    let setup = format!("CREATE TABLE rows (n Int64); INSERT INTO rows VALUES {values}");
+    assert_eq!(
+        server
+            .request("POST", "/query", None, setup.as_bytes())
+            .status,
+        200
+    );
+    let response = server.request("POST", "/query", None, b"SELECT n FROM rows");
+    assert_eq!(response.status, 422);
+    assert!(response.body.contains("more than 10000 result rows"));
+
+    let more_values = std::iter::repeat_n("(2)", 90_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let insert = format!("INSERT INTO rows VALUES {more_values}");
+    assert_eq!(
+        server
+            .request("POST", "/query", None, insert.as_bytes())
+            .status,
+        200
+    );
+    let response = server.request(
+        "POST",
+        "/query",
+        None,
+        b"SELECT COUNT(*) AS count FROM rows",
+    );
+    assert_eq!(response.status, 422);
+    assert!(response.body.contains("scans more than 100000 table rows"));
+    assert_eq!(server.request("GET", "/health", None, b"").status, 200);
+}
+
+#[test]
+fn query_endpoint_rejects_browser_simple_requests() {
+    let server = TestServer::start();
+    let body = b"CREATE TABLE forbidden (id Int64)";
+    let missing_type = server.raw_request(
+        format!(
+            "POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(missing_type.status, 415);
+
+    let origin = server.raw_request(
+        format!(
+            "POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/sql\r\nOrigin: https://example.com\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(origin.status, 403);
+    assert!(origin.body.contains("browser-originated"));
+}
+
+#[test]
+fn non_loopback_listener_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["serve", "--listen", "0.0.0.0:0"])
+        .output()
+        .expect("run server with wildcard address");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("only permits loopback listen addresses")
+    );
 }
 
 #[cfg(unix)]
