@@ -736,8 +736,8 @@ fn like_supports_wildcards_negation_and_explicit_escaping() {
 
 #[test]
 fn wildcard_matching_handles_long_adversarial_inputs_iteratively() {
-    let value = format!("{}z", "a".repeat(50_000));
-    let pattern = format!("{}z", "%".repeat(4_095));
+    let value = "a".repeat(50_000);
+    let pattern = format!("%{}b", "a".repeat(4_094));
     let mut database = Database::new();
     database
         .execute("CREATE TABLE long_patterns (label String);")
@@ -750,7 +750,7 @@ fn wildcard_matching_handles_long_adversarial_inputs_iteratively() {
         &mut database,
         &format!("SELECT label FROM long_patterns WHERE label LIKE '{pattern}';"),
     );
-    assert_eq!(result.rows.len(), 1);
+    assert!(result.rows.is_empty());
 }
 
 #[test]

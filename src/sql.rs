@@ -5,7 +5,7 @@ use crate::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 const MAX_IN_LIST_ITEMS: usize = 1_024;
-const MAX_LIKE_PATTERN_BYTES: usize = 4_096;
+pub(crate) const MAX_LIKE_PATTERN_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {

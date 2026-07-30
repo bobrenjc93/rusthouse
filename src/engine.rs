@@ -890,12 +890,28 @@ enum LikeToken {
 }
 
 #[derive(Debug)]
+enum LiteralPositions {
+    Sparse(Vec<usize>),
+    Dense(Box<[u64]>),
+}
+
+#[derive(Debug)]
 struct LikePattern {
-    tokens: Vec<LikeToken>,
+    token_count: usize,
+    any_one: Box<[u64]>,
+    any_many: Box<[u64]>,
+    literals: HashMap<char, LiteralPositions>,
 }
 
 impl LikePattern {
     fn compile(pattern: &str, escape: Option<char>) -> Result<Self> {
+        if pattern.len() > sql::MAX_LIKE_PATTERN_BYTES {
+            return Err(Error::InvalidQuery(format!(
+                "LIKE pattern exceeds limit of {} bytes",
+                sql::MAX_LIKE_PATTERN_BYTES
+            )));
+        }
+
         let mut tokens = Vec::with_capacity(pattern.chars().count());
         let mut characters = pattern.chars();
         while let Some(character) = characters.next() {
@@ -916,52 +932,109 @@ impl LikePattern {
                 }
             }
         }
-        Ok(Self { tokens })
-    }
 
-    fn matches(&self, value: &str) -> bool {
-        let mut pattern_index = 0;
-        let mut value_index = 0;
-        let mut last_wildcard = None;
-        let mut wildcard_value_index = 0;
-
-        while value_index < value.len() {
-            let character = value[value_index..]
-                .chars()
-                .next()
-                .expect("value index is at a character boundary");
-            match self.tokens.get(pattern_index) {
-                Some(LikeToken::Literal(expected)) if *expected == character => {
-                    pattern_index += 1;
-                    value_index += character.len_utf8();
+        let token_count = tokens.len();
+        let word_count = Self::word_count(token_count);
+        let mut any_one = vec![0; word_count];
+        let mut any_many = vec![0; word_count];
+        let mut literal_positions: HashMap<char, Vec<usize>> = HashMap::new();
+        for (position, token) in tokens.into_iter().enumerate() {
+            match token {
+                LikeToken::Literal(character) => {
+                    literal_positions
+                        .entry(character)
+                        .or_default()
+                        .push(position);
                 }
-                Some(LikeToken::AnyOne) => {
-                    pattern_index += 1;
-                    value_index += character.len_utf8();
-                }
-                Some(LikeToken::AnyMany) => {
-                    last_wildcard = Some(pattern_index);
-                    pattern_index += 1;
-                    wildcard_value_index = value_index;
-                }
-                _ => {
-                    let Some(wildcard) = last_wildcard else {
-                        return false;
-                    };
-                    let consumed = value[wildcard_value_index..]
-                        .chars()
-                        .next()
-                        .expect("a wildcard retry consumes one character");
-                    wildcard_value_index += consumed.len_utf8();
-                    value_index = wildcard_value_index;
-                    pattern_index = wildcard + 1;
-                }
+                LikeToken::AnyOne => Self::set_bit(&mut any_one, position),
+                LikeToken::AnyMany => Self::set_bit(&mut any_many, position),
             }
         }
 
-        self.tokens[pattern_index..]
-            .iter()
-            .all(|token| *token == LikeToken::AnyMany)
+        let literals = literal_positions
+            .into_iter()
+            .map(|(character, positions)| {
+                let positions = if positions.len() > word_count {
+                    let mut mask = vec![0; word_count];
+                    for position in positions {
+                        Self::set_bit(&mut mask, position);
+                    }
+                    LiteralPositions::Dense(mask.into_boxed_slice())
+                } else {
+                    LiteralPositions::Sparse(positions)
+                };
+                (character, positions)
+            })
+            .collect();
+
+        Ok(Self {
+            token_count,
+            any_one: any_one.into_boxed_slice(),
+            any_many: any_many.into_boxed_slice(),
+            literals,
+        })
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        const MAX_STATE_WORDS: usize =
+            (sql::MAX_LIKE_PATTERN_BYTES + 1).div_ceil(u64::BITS as usize);
+
+        let word_count = self.any_one.len();
+        debug_assert!(word_count <= MAX_STATE_WORDS);
+        let mut active = [0_u64; MAX_STATE_WORDS];
+        let mut next = [0_u64; MAX_STATE_WORDS];
+        active[0] = 1;
+        Self::epsilon_closure(&mut active[..word_count], &self.any_many);
+
+        // The compiled NFA avoids wildcard backtracking. The pattern cap bounds
+        // each input character to two 65-word passes and 65 sparse checks.
+        for character in value.chars() {
+            next[..word_count].fill(0);
+            let literal = self.literals.get(&character);
+            let mut carry = 0;
+            for word in 0..word_count {
+                let literal_mask = match literal {
+                    Some(LiteralPositions::Dense(mask)) => mask[word],
+                    _ => 0,
+                };
+                let matched = active[word] & (self.any_one[word] | literal_mask);
+                next[word] = (matched << 1) | carry | (active[word] & self.any_many[word]);
+                carry = matched >> (u64::BITS - 1);
+            }
+
+            if let Some(LiteralPositions::Sparse(positions)) = literal {
+                for position in positions {
+                    if Self::bit_is_set(&active, *position) {
+                        Self::set_bit(&mut next, position + 1);
+                    }
+                }
+            }
+            Self::epsilon_closure(&mut next[..word_count], &self.any_many);
+            std::mem::swap(&mut active, &mut next);
+        }
+
+        Self::bit_is_set(&active, self.token_count)
+    }
+
+    fn word_count(token_count: usize) -> usize {
+        (token_count + 1).div_ceil(u64::BITS as usize)
+    }
+
+    fn set_bit(words: &mut [u64], position: usize) {
+        words[position / u64::BITS as usize] |= 1 << (position % u64::BITS as usize);
+    }
+
+    fn bit_is_set(words: &[u64], position: usize) -> bool {
+        words[position / u64::BITS as usize] & (1 << (position % u64::BITS as usize)) != 0
+    }
+
+    fn epsilon_closure(states: &mut [u64], any_many: &[u64]) {
+        let mut carry = 0;
+        for (states, many) in states.iter_mut().zip(any_many) {
+            let wildcard_states = *states & many;
+            *states |= (wildcard_states << 1) | carry;
+            carry = wildcard_states >> (u64::BITS - 1);
+        }
     }
 }
 
@@ -1199,17 +1272,65 @@ mod tests {
     #[test]
     fn compiled_like_patterns_collapse_wildcards_and_match_unicode_scalars() {
         let pattern = LikePattern::compile("%%%_!%%", Some('!')).expect("valid pattern");
-        assert_eq!(
-            pattern.tokens,
-            [
-                LikeToken::AnyMany,
-                LikeToken::AnyOne,
-                LikeToken::Literal('%'),
-                LikeToken::AnyMany,
-            ]
-        );
+        assert_eq!(pattern.token_count, 4);
         assert!(pattern.matches("data-%-tail"));
         assert!(pattern.matches("\u{e9}%"));
         assert!(!pattern.matches("%"));
+
+        let boundary_pattern = format!("{}%z", "a".repeat(63));
+        let boundary_pattern =
+            LikePattern::compile(&boundary_pattern, None).expect("valid pattern");
+        assert!(boundary_pattern.matches(&format!("{}tailz", "a".repeat(63))));
+    }
+
+    #[test]
+    fn compiled_like_automaton_matches_reference_semantics() {
+        fn generated(mut encoded: usize, length: u32, alphabet: &[char]) -> String {
+            (0..length)
+                .map(|_| {
+                    let character = alphabet[encoded % alphabet.len()];
+                    encoded /= alphabet.len();
+                    character
+                })
+                .collect()
+        }
+
+        fn reference_matches(pattern: &str, value: &str) -> bool {
+            let value = value.chars().collect::<Vec<_>>();
+            let mut previous = vec![false; value.len() + 1];
+            previous[0] = true;
+            for token in pattern.chars() {
+                let mut current = vec![false; value.len() + 1];
+                current[0] = token == '%' && previous[0];
+                for position in 1..=value.len() {
+                    current[position] = match token {
+                        '%' => previous[position] || current[position - 1],
+                        '_' => previous[position - 1],
+                        literal => previous[position - 1] && literal == value[position - 1],
+                    };
+                }
+                previous = current;
+            }
+            previous[value.len()]
+        }
+
+        let pattern_alphabet = ['a', 'b', '%', '_'];
+        let value_alphabet = ['a', 'b'];
+        for pattern_length in 0..=5 {
+            for encoded_pattern in 0..pattern_alphabet.len().pow(pattern_length) {
+                let source = generated(encoded_pattern, pattern_length, &pattern_alphabet);
+                let compiled = LikePattern::compile(&source, None).expect("valid pattern");
+                for value_length in 0..=5 {
+                    for encoded_value in 0..value_alphabet.len().pow(value_length) {
+                        let value = generated(encoded_value, value_length, &value_alphabet);
+                        assert_eq!(
+                            compiled.matches(&value),
+                            reference_matches(&source, &value),
+                            "pattern {source:?}, value {value:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
