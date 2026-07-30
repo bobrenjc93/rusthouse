@@ -249,7 +249,16 @@ fn resolve_select_items(
                     AggregateArgument::Expression(expression) => {
                         let compiled = CompiledExpression::compile(table, expression)?;
                         let input_type = compiled.data_type();
-                        (Some(compiled), Some(input_type), expression.to_string())
+                        let argument_name = match expression {
+                            Expression::Column(_) => {
+                                let source = compiled
+                                    .source_column()
+                                    .expect("direct column expression stays resolved as a column");
+                                table.schema()[source].name.clone()
+                            }
+                            _ => expression.to_string(),
+                        };
+                        (Some(compiled), Some(input_type), argument_name)
                     }
                 };
                 validate_aggregate(*function, input_type)?;

@@ -274,6 +274,46 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
 }
 
 #[test]
+fn unaliased_aggregates_preserve_schema_column_casing() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE casing (MixedCase Int64);
+             INSERT INTO casing VALUES (2), (4);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT SUM(mixedcase), MIN(MIXEDCASE), COUNT(MiXeDcAsE), SUM(mixedcase + 1)
+         FROM casing;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "SUM(MixedCase)",
+            "MIN(MixedCase)",
+            "COUNT(MixedCase)",
+            "SUM(mixedcase + 1)",
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(6),
+            Value::Int64(2),
+            Value::Int64(2),
+            Value::Int64(8),
+        ]]
+    );
+}
+
+#[test]
 fn global_aggregates_and_empty_count_are_supported() {
     let mut database = Database::new();
     database
