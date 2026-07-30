@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -69,14 +69,16 @@ impl Database {
                     affected_rows: 0,
                 })
             }
-            Statement::Insert { table, rows } => {
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
                 let affected_rows = rows.len();
-                {
+                let rows = {
                     let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
+                    materialize_insert_rows(target, columns.as_deref(), rows)?
+                };
                 let target = self.catalog.table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
@@ -133,6 +135,67 @@ impl Database {
             rows,
         })
     }
+}
+
+fn materialize_insert_rows(
+    table: &Table,
+    requested_columns: Option<&[String]>,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>> {
+    let Some(requested_columns) = requested_columns else {
+        for row in &rows {
+            table.validate_row(row)?;
+        }
+        return Ok(rows);
+    };
+
+    let schema_columns = table
+        .schema()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.name.to_ascii_lowercase(), index))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::with_capacity(requested_columns.len());
+    let mut physical_columns = Vec::with_capacity(requested_columns.len());
+    for column in requested_columns {
+        let normalized = column.to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
+            return Err(Error::DuplicateColumn(column.clone()));
+        }
+        let physical =
+            schema_columns
+                .get(&normalized)
+                .copied()
+                .ok_or_else(|| Error::ColumnNotFound {
+                    table: table.name().to_owned(),
+                    column: column.clone(),
+                })?;
+        physical_columns.push(physical);
+    }
+
+    let mut materialized_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() != physical_columns.len() {
+            return Err(Error::RowLength {
+                table: table.name().to_owned(),
+                expected: physical_columns.len(),
+                actual: row.len(),
+            });
+        }
+
+        let mut materialized = table
+            .schema()
+            .iter()
+            .map(|column| column.data_type.default_value())
+            .collect::<Vec<_>>();
+        for (physical, value) in physical_columns.iter().copied().zip(row) {
+            materialized[physical] = value;
+        }
+        table.validate_row(&materialized)?;
+        materialized_rows.push(materialized);
+    }
+
+    Ok(materialized_rows)
 }
 
 #[derive(Debug)]

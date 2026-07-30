@@ -5,7 +5,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 ## What works
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- positional or named multi-row INSERT INTO ... VALUES with atomic validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -16,6 +16,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+INSERT column lists may be reordered or partial. Omitted Int64, Float64, Bool, and String columns receive ClickHouse-compatible defaults of `0`, `0.0`, `false`, and the empty string.
 
 ## CLI
 

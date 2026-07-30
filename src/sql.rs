@@ -13,6 +13,7 @@ pub enum Statement {
     },
     Insert {
         table: String,
+        columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
@@ -419,6 +420,19 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
+        let columns = if self.eat(&TokenKind::LeftParen) {
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.expect_identifier("column name in INSERT")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after INSERT column list")?;
+            Some(columns)
+        } else {
+            None
+        };
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -438,7 +452,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(Statement::Insert { table, rows })
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -777,11 +795,27 @@ mod tests {
     fn parses_escaped_strings_and_multiple_rows() {
         let statements =
             parse("INSERT INTO notes VALUES (1, 'it''s good'), (2, 'ok')").expect("valid insert");
-        let Statement::Insert { rows, .. } = &statements[0] else {
+        let Statement::Insert { columns, rows, .. } = &statements[0] else {
             panic!("expected insert");
         };
+        assert!(columns.is_none());
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_named_insert_columns() {
+        let statements =
+            parse("INSERT INTO notes (label, id) VALUES ('first', 1)").expect("valid named insert");
+        let Statement::Insert { columns, rows, .. } = &statements[0] else {
+            panic!("expected insert");
+        };
+
+        assert_eq!(columns, &Some(vec!["label".to_owned(), "id".to_owned()]));
+        assert_eq!(
+            rows,
+            &[vec![Value::String("first".to_owned()), Value::Int64(1)]]
+        );
     }
 
     #[test]

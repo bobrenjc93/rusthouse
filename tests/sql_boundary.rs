@@ -346,6 +346,99 @@ fn failed_multi_row_insert_is_atomic_and_actionable() {
 }
 
 #[test]
+fn named_and_partial_inserts_follow_schema_order_and_fill_type_defaults() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String);
+             INSERT INTO events (label, ID) VALUES ('first', 1), ('second', 2);
+             INSERT INTO events (active, score, id) VALUES (true, 3.5, 3);
+             SELECT * FROM events ORDER BY id;",
+        )
+        .expect("named inserts succeed");
+
+    let result = last_query(results);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("first".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Float64(0.0),
+                Value::Bool(false),
+                Value::String("second".to_owned()),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Float64(3.5),
+                Value::Bool(true),
+                Value::String(String::new()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn invalid_named_inserts_are_rejected_without_appending_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String, active Bool);
+             INSERT INTO events VALUES (1, 'existing', true);",
+        )
+        .expect("setup succeeds");
+
+    let duplicate = database
+        .execute("INSERT INTO events (id, ID) VALUES (2, 3);")
+        .expect_err("duplicate columns are rejected case-insensitively");
+    assert!(matches!(duplicate, Error::DuplicateColumn(column) if column == "ID"));
+
+    let unknown = database
+        .execute("INSERT INTO events (missing) VALUES (2);")
+        .expect_err("unknown columns are rejected");
+    assert!(matches!(
+        unknown,
+        Error::ColumnNotFound { table, column }
+            if table == "events" && column == "missing"
+    ));
+
+    let wrong_width = database
+        .execute("INSERT INTO events (id, label) VALUES (2);")
+        .expect_err("row width follows the named column list");
+    assert!(matches!(
+        wrong_width,
+        Error::RowLength {
+            expected: 2,
+            actual: 1,
+            ..
+        }
+    ));
+
+    let wrong_type = database
+        .execute(
+            "INSERT INTO events (label, id)
+             VALUES ('valid', 2), ('invalid', false);",
+        )
+        .expect_err("all materialized rows are checked before appending");
+    assert!(matches!(
+        wrong_type,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "column 'events.id'" && expected == "Int64" && actual == "Bool"
+    ));
+
+    let count = execute_query(&mut database, "SELECT COUNT(*) AS count FROM events;");
+    assert_eq!(count.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
 fn invalid_grouping_and_aggregate_types_are_rejected() {
     let mut database = Database::new();
     database

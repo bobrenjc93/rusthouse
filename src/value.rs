@@ -21,6 +21,15 @@ impl DataType {
             _ => None,
         }
     }
+
+    pub(crate) fn default_value(self) -> Value {
+        match self {
+            Self::Int64 => Value::Int64(0),
+            Self::Float64 => Value::Float64(0.0),
+            Self::Bool => Value::Bool(false),
+            Self::String => Value::String(String::new()),
+        }
+    }
 }
 
 impl fmt::Display for DataType {
