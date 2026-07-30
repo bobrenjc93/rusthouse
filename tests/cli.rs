@@ -95,6 +95,42 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn nulls_are_rendered_by_every_output_format() {
+    let sql = "CREATE TABLE notes (id Int64, note Nullable(String));
+               INSERT INTO notes VALUES (1, NULL), (2, '');
+               SELECT * FROM notes ORDER BY id;";
+
+    let json = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format=json", "--execute", sql])
+        .output()
+        .expect("run JSON CLI");
+    assert!(json.status.success());
+    assert_eq!(
+        String::from_utf8(json.stdout).expect("UTF-8 JSON stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"note\",\"type\":\"Nullable(String)\"}],\"rows\":[[1,null],[2,\"\"]]}]}\n"
+    );
+
+    let csv = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format=csv", "--execute", sql])
+        .output()
+        .expect("run CSV CLI");
+    assert!(csv.status.success());
+    assert_eq!(
+        String::from_utf8(csv.stdout).expect("UTF-8 CSV stdout"),
+        "id,note\n1,\\N\n2,\n"
+    );
+
+    let table = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format=table", "--execute", sql])
+        .output()
+        .expect("run table CLI");
+    assert!(table.status.success());
+    let table = String::from_utf8(table.stdout).expect("UTF-8 table stdout");
+    assert!(table.contains("| 1  | NULL |"));
+    assert!(table.contains("| 2  |      |"));
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

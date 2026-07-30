@@ -123,7 +123,13 @@ fn render_csv(result: &QueryResult) -> String {
         result.columns.iter().map(|column| column.name.as_str()),
     );
     for row in &result.rows {
-        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
+        let values = row
+            .iter()
+            .map(|value| match value {
+                Value::Null => r"\N".to_owned(),
+                value => value.as_display_string(),
+            })
+            .collect::<Vec<_>>();
         write_csv_row(&mut output, values.iter().map(String::as_str));
     }
     output
@@ -184,6 +190,7 @@ fn write_json_value(output: &mut String, value: &Value) {
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
+        Value::Null => output.push_str("null"),
     }
 }
 

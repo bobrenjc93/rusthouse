@@ -244,10 +244,10 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
         vec![
             DataType::String,
             DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Float64,
+            DataType::nullable(DataType::Int64),
+            DataType::nullable(DataType::Int64),
+            DataType::nullable(DataType::Int64),
+            DataType::nullable(DataType::Float64),
         ]
     );
     assert_eq!(
@@ -284,7 +284,7 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -478,14 +478,286 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+fn nullable_columns_store_typed_payloads_with_validity_bitmaps() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE observations (
+                id Int64,
+                reading Nullable(Float64),
+                active Nullable(Bool),
+                note Nullable(String)
+             );
+             INSERT INTO observations VALUES
+                (1, NULL, true, 'present'),
+                (2, 4.5, NULL, NULL);",
+        )
+        .expect("nullable values insert");
+
+    let result = execute_query(&mut database, "SELECT * FROM observations ORDER BY id;");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::nullable(DataType::Float64),
+            DataType::nullable(DataType::Bool),
+            DataType::nullable(DataType::String),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Null,
+                Value::Bool(true),
+                Value::String("present".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Float64(4.5),
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+
+    let table = database
+        .catalog()
+        .table("observations")
+        .expect("table exists");
+    assert!(table.columns()[0].validity().is_none());
+    let reading_validity = table.columns()[1].validity().expect("nullable bitmap");
+    assert_eq!(reading_validity.len(), 2);
+    assert!(!reading_validity.is_valid(0));
+    assert!(reading_validity.is_valid(1));
+
+    let error = database
+        .execute("INSERT INTO observations VALUES (NULL, 1.0, true, 'invalid');")
+        .expect_err("NULL cannot enter a non-nullable column");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch { expected, actual, .. }
+            if expected == "Int64" && actual == "NULL"
+    ));
+}
+
+#[test]
+fn null_predicates_follow_sql_three_valued_logic() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE nullable_predicates (id Int64, value Nullable(Int64));
+             INSERT INTO nullable_predicates VALUES (1, NULL), (2, 2), (3, 3);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE value IS NULL;",
+        )
+        .rows,
+        vec![vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE value IS NOT NULL ORDER BY id;",
+        )
+        .rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+    );
+    assert!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE value = NULL OR id = -1;",
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE value = NULL OR id = 1;",
+        )
+        .rows,
+        vec![vec![Value::Int64(1)]]
+    );
+    assert!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE value = NULL AND id = 1;",
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE value != 2 ORDER BY id;",
+        )
+        .rows,
+        vec![vec![Value::Int64(3)]]
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM nullable_predicates WHERE NOT (value = 2) ORDER BY id;",
+        )
+        .rows,
+        vec![vec![Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn aggregates_ignore_nulls_and_empty_inputs_return_null() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE nullable_facts (
+                id Int64, bucket Nullable(String), amount Nullable(Int64)
+             );
+             INSERT INTO nullable_facts VALUES
+                (1, 'a', 10),
+                (2, 'a', NULL),
+                (3, NULL, 5),
+                (4, NULL, NULL),
+                (5, 'b', NULL);",
+        )
+        .expect("setup succeeds");
+
+    let global = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows,
+                COUNT(amount) AS present,
+                SUM(amount) AS total,
+                MIN(amount) AS low,
+                MAX(amount) AS high,
+                AVG(amount) AS mean
+         FROM nullable_facts;",
+    );
+    assert_eq!(
+        global.rows,
+        vec![vec![
+            Value::Int64(5),
+            Value::Int64(2),
+            Value::Int64(15),
+            Value::Int64(5),
+            Value::Int64(10),
+            Value::Float64(7.5),
+        ]]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT bucket, COUNT(*) AS rows, COUNT(amount) AS present, SUM(amount) AS total
+         FROM nullable_facts GROUP BY bucket ORDER BY bucket;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(10),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Null,
+            ],
+            vec![
+                Value::Null,
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(5),
+            ],
+        ]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows, COUNT(amount) AS present,
+                SUM(amount) AS total, MIN(amount) AS low,
+                MAX(amount) AS high, AVG(amount) AS mean
+         FROM nullable_facts WHERE id < 0;",
+    );
+    assert_eq!(
+        empty.rows,
+        vec![vec![
+            Value::Int64(0),
+            Value::Int64(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+}
+
+#[test]
+fn null_ordering_is_deterministic_in_both_directions() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE null_order (id Int64, rank Nullable(Int64));
+             INSERT INTO null_order VALUES (1, NULL), (2, 4), (3, NULL), (4, 2);",
+        )
+        .expect("setup succeeds");
+
+    let ascending = execute_query(
+        &mut database,
+        "SELECT id, rank FROM null_order ORDER BY rank ASC;",
+    );
+    assert_eq!(
+        ascending
+            .rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Int64(4),
+            Value::Int64(2),
+            Value::Int64(1),
+            Value::Int64(3),
+        ]
+    );
+
+    let descending = execute_query(
+        &mut database,
+        "SELECT id, rank FROM null_order ORDER BY rank DESC;",
+    );
+    assert_eq!(
+        descending
+            .rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Int64(1),
+            Value::Int64(3),
+            Value::Int64(2),
+            Value::Int64(4),
+        ]
+    );
+}
+
+#[test]
+fn sql_literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE", "null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
                 "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
             ))
-            .expect_err("Boolean literal names are reserved");
+            .expect_err("SQL literal names are reserved");
 
         assert!(matches!(
             error,
