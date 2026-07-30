@@ -30,6 +30,11 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    StringColumnTooLarge {
+        table: String,
+        column: String,
+        maximum_bytes: u32,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +78,14 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::StringColumnTooLarge {
+                table,
+                column,
+                maximum_bytes,
+            } => write!(
+                f,
+                "string column '{table}.{column}' exceeds its {maximum_bytes}-byte UTF-8 arena limit"
+            ),
         }
     }
 }

@@ -3,7 +3,7 @@
 RustHouse should evolve through narrow modules with explicit boundaries:
 
 1. A catalog owns schemas and tables.
-2. A columnar storage layer owns typed vectors and validates row shape.
+2. A columnar storage layer owns typed vectors, with strings packed into a UTF-8 byte arena and checked 32-bit end offsets, and validates row shape.
 3. A parser produces a small typed syntax tree without coupling syntax to execution.
 4. A query engine plans scans, filters, projections, grouping, aggregation, sorting, and limits.
 5. Formats render results without changing execution semantics.

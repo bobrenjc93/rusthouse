@@ -1,3 +1,5 @@
+use rusthouse::ResultColumn;
+use rusthouse::format::{OutputFormat, render};
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
@@ -63,6 +65,119 @@ fn typed_projection_filter_order_and_limit_work_end_to_end() {
             ],
         ]
     );
+}
+
+#[test]
+fn string_arena_values_filter_group_order_and_aggregate() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE text_values (label String, category String, amount Int64);
+             INSERT INTO text_values VALUES
+                ('', 'empty', 5),
+                ('éclair', 'food', 3),
+                ('東京', 'city', 7),
+                ('éclair', 'food', 11),
+                ('🦀', 'emoji', 2);",
+        )
+        .expect("Unicode setup succeeds");
+
+    let filtered = execute_query(
+        &mut database,
+        "SELECT label, amount FROM text_values
+         WHERE category = 'food' AND label != ''
+         ORDER BY label, amount DESC LIMIT 2;",
+    );
+    assert_eq!(
+        filtered.rows,
+        vec![
+            vec![Value::String("éclair".to_owned()), Value::Int64(11)],
+            vec![Value::String("éclair".to_owned()), Value::Int64(3)],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT category, COUNT(*) AS rows, MIN(label) AS first, MAX(label) AS last
+         FROM text_values GROUP BY category ORDER BY category;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("city".to_owned()),
+                Value::Int64(1),
+                Value::String("東京".to_owned()),
+                Value::String("東京".to_owned()),
+            ],
+            vec![
+                Value::String("emoji".to_owned()),
+                Value::Int64(1),
+                Value::String("🦀".to_owned()),
+                Value::String("🦀".to_owned()),
+            ],
+            vec![
+                Value::String("empty".to_owned()),
+                Value::Int64(1),
+                Value::String(String::new()),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::String("food".to_owned()),
+                Value::Int64(2),
+                Value::String("éclair".to_owned()),
+                Value::String("éclair".to_owned()),
+            ],
+        ]
+    );
+
+    let extrema = execute_query(
+        &mut database,
+        "SELECT MIN(label) AS first, MAX(label) AS last, COUNT(label) AS rows
+         FROM text_values;",
+    );
+    assert_eq!(
+        extrema.rows,
+        vec![vec![
+            Value::String(String::new()),
+            Value::String("🦀".to_owned()),
+            Value::Int64(5),
+        ]]
+    );
+}
+
+#[test]
+fn arena_backed_strings_render_like_owned_results() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE rendered (id Int64, label String);
+             INSERT INTO rendered VALUES (1, ''), (2, '東京'), (3, 'éclair');",
+        )
+        .expect("setup succeeds");
+    let actual = execute_query(&mut database, "SELECT id, label FROM rendered ORDER BY id;");
+    let expected = QueryResult {
+        columns: vec![
+            ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "label".to_owned(),
+                data_type: DataType::String,
+            },
+        ],
+        rows: vec![
+            vec![Value::Int64(1), Value::String(String::new())],
+            vec![Value::Int64(2), Value::String("東京".to_owned())],
+            vec![Value::Int64(3), Value::String("éclair".to_owned())],
+        ],
+    };
+
+    assert_eq!(actual, expected);
+    for format in [OutputFormat::Table, OutputFormat::Csv, OutputFormat::Json] {
+        assert_eq!(render(&actual, format), render(&expected, format));
+    }
 }
 
 #[test]

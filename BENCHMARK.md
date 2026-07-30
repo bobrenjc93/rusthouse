@@ -62,6 +62,19 @@ On 2026-07-29, the default command above was run on the same Apple Silicon host 
 
 The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
 
+## Contiguous string storage measurement
+
+On 2026-07-30, the default suite was run with seed `20260729` after replacing `Vec<String>` columns with a UTF-8 arena and checked 32-bit end offsets. All 24 correctness gates passed. The sustained score was 98.83 and the startup-inclusive score was 100.00.
+
+| String workload | Rows | RustHouse (ms) | ClickHouse (ms) | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| High-cardinality group by | 10,000 | 0.969 | 1.551 | 1.601 |
+| High-cardinality group by | 50,000 | 4.372 | 3.413 | 0.781 |
+| String order by limit | 10,000 | 0.350 | 1.151 | 3.293 |
+| String order by limit | 50,000 | 1.377 | 2.163 | 1.570 |
+
+The seeded 50,000-row dataset has 150,000 values across its three String columns and 2,006,614 bytes of UTF-8 payload. Initialized arena data plus one `u32` offset per value occupies 2,606,614 bytes. The equivalent `Vec<String>` representation has a 5,606,614-byte lower bound on this 64-bit target (payload plus a 24-byte `String` header per value), so initialized storage falls by 53.51% before counting allocator metadata or spare per-String capacity. `StringColumn::used_bytes` and `StringColumn::allocated_bytes` expose logical and reserved storage for repeatable measurements.
+
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
 Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
