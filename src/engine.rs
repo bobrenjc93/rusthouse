@@ -1,5 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -10,10 +17,32 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+/// Default maximum number of row indices held in one in-memory sort buffer.
+pub const DEFAULT_MAX_IN_MEMORY_SORT_ROWS: usize = 65_536;
+
+/// Execution settings for a [`Database`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseOptions {
+    /// Maximum row indices held in one sort run or bounded top-k heap.
+    pub max_in_memory_sort_rows: usize,
+    /// Parent directory for per-query ORDER BY spill directories.
+    pub temporary_directory: Option<PathBuf>,
+}
+
+impl Default for DatabaseOptions {
+    fn default() -> Self {
+        Self {
+            max_in_memory_sort_rows: DEFAULT_MAX_IN_MEMORY_SORT_ROWS,
+            temporary_directory: None,
+        }
+    }
+}
+
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    options: DatabaseOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +73,19 @@ impl Database {
     }
 
     #[must_use]
+    pub fn with_options(options: DatabaseOptions) -> Self {
+        Self {
+            catalog: Catalog::default(),
+            options,
+        }
+    }
+
+    #[must_use]
+    pub fn options(&self) -> &DatabaseOptions {
+        &self.options
+    }
+
+    #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -54,6 +96,11 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        if self.options.max_in_memory_sort_rows == 0 {
+            return Err(Error::InvalidQuery(
+                "max_in_memory_sort_rows must be at least 1".to_owned(),
+            ));
+        }
         sql::parse(sql)?
             .into_iter()
             .map(|statement| self.execute_statement(statement))
@@ -98,34 +145,52 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let matching_rows = || {
+            (0..table.row_count()).filter(|row| {
+                predicate
+                    .as_ref()
+                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+            })
+        };
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_grouped_rows(
-                &mut selected_groups,
-                &grouped,
-                &items,
-                &ordering,
+            let grouped = execute_grouped(
+                table,
+                matching_rows(),
+                &group_columns,
+                &aggregate_specs,
+                table.row_count(),
+            )?;
+            sort_and_project(
+                (0..grouped.len()).map(Ok),
                 select.limit,
-            );
-            grouped.project(&selected_groups, &items)
+                grouped.len(),
+                &self.options,
+                |left, right| compare_grouped_rows(left, right, &grouped, &items, &ordering),
+                |group| grouped.project_row(group, &items),
+            )?
+            .into_values(self.options.max_in_memory_sort_rows)
+        } else if ordering.is_empty() {
+            execute_projection(
+                table,
+                matching_rows().take(select.limit.unwrap_or(usize::MAX)),
+                &items,
+            )
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            sort_and_project(
+                matching_rows().map(Ok),
+                select.limit,
+                table.row_count(),
+                &self.options,
+                |left, right| compare_source_rows(left, right, table, &items, &ordering),
+                |row| project_source_row(table, row, &items),
+            )?
+            .into_values(self.options.max_in_memory_sort_rows)
         };
 
         Ok(QueryResult {
@@ -300,34 +365,37 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 
 fn execute_projection(
     table: &Table,
-    matching_rows: &[usize],
+    matching_rows: impl IntoIterator<Item = usize>,
     items: &[ResolvedItem],
 ) -> Vec<Vec<Value>> {
     matching_rows
+        .into_iter()
+        .map(|row| project_source_row(table, row, items))
+        .collect()
+}
+
+fn project_source_row(table: &Table, row: usize, items: &[ResolvedItem]) -> Vec<Value> {
+    items
         .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
-                .collect()
+        .map(|item| match item {
+            ResolvedItem::Column { source, .. } => table.columns()[*source].value(row),
+            ResolvedItem::Aggregate { .. } => {
+                unreachable!("projection does not contain aggregates")
+            }
         })
         .collect()
 }
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    matching_rows: impl IntoIterator<Item = usize>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    row_count_hint: usize,
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let mut groups = GroupIndex::new(group_columns.len(), row_count_hint);
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let initial_capacity = row_count_hint.min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -340,7 +408,7 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +417,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -496,26 +564,19 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
+    fn project_row(&self, group: usize, items: &[ResolvedItem]) -> Vec<Value> {
+        items
             .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
+            .map(|item| match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => self.keys[group].value(*position).to_owned(),
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => self.aggregates[*state][group].clone(),
             })
             .collect()
     }
@@ -683,88 +744,595 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
     Ok(ordering)
 }
 
-fn order_source_rows(
-    rows: &mut Vec<usize>,
+fn compare_source_rows(
+    left: usize,
+    right: usize,
     table: &Table,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
-    limit: Option<usize>,
-) {
-    if ordering.is_empty() {
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-        return;
-    }
-
-    sort_and_limit(rows, limit, |left, right| {
-        for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
+) -> Ordering {
+    for order in ordering {
+        let ResolvedItem::Column { source, .. } = items[order.output] else {
+            unreachable!("ungrouped projections cannot contain aggregates")
+        };
+        let comparison = table.columns()[source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
-            if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
-            }
         }
-        left.cmp(&right)
-    });
+    }
+    left.cmp(&right)
 }
 
-fn order_grouped_rows(
-    groups: &mut Vec<usize>,
+fn compare_grouped_rows(
+    left: usize,
+    right: usize,
     data: &GroupedData<'_>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
+) -> Ordering {
+    for order in ordering {
+        let comparison = match items[order.output] {
+            ResolvedItem::Column {
+                group_position: Some(position),
+                ..
+            } => data.keys[left]
+                .value(position)
+                .cmp(&data.keys[right].value(position)),
+            ResolvedItem::Column {
+                group_position: None,
+                ..
+            } => unreachable!("grouped columns are validated"),
+            ResolvedItem::Aggregate { state } => {
+                data.aggregates[state][left].cmp(&data.aggregates[state][right])
+            }
+        };
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    data.keys[left].cmp(&data.keys[right])
+}
+
+const MAX_MERGE_FAN_IN: usize = 32;
+const RUN_READER_BUFFER_RECORDS: usize = 128;
+static NEXT_SORT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct SortedOutput<T> {
+    values: Vec<T>,
+    statistics: SortStatistics,
+}
+
+impl<T> SortedOutput<T> {
+    fn into_values(self, max_in_memory_sort_rows: usize) -> Vec<T> {
+        debug_assert!(self.statistics.peak_run_rows <= max_in_memory_sort_rows);
+        debug_assert!(self.statistics.peak_merge_heads <= MAX_MERGE_FAN_IN);
+        self.values
+    }
+}
+
+#[derive(Debug, Default)]
+struct SortStatistics {
+    peak_run_rows: usize,
+    peak_merge_heads: usize,
+}
+
+fn sort_and_project<T>(
+    indices: impl Iterator<Item = Result<usize>>,
     limit: Option<usize>,
-) {
-    sort_and_limit(groups, limit, |left, right| {
-        for order in ordering {
-            let comparison = match items[order.output] {
-                ResolvedItem::Column {
-                    group_position: Some(position),
-                    ..
-                } => data.keys[left]
-                    .value(position)
-                    .cmp(&data.keys[right].value(position)),
-                ResolvedItem::Column {
-                    group_position: None,
-                    ..
-                } => unreachable!("grouped columns are validated"),
-                ResolvedItem::Aggregate { state } => {
-                    data.aggregates[state][left].cmp(&data.aggregates[state][right])
+    row_limit: usize,
+    options: &DatabaseOptions,
+    compare: impl Fn(usize, usize) -> Ordering,
+    project: impl Fn(usize) -> T,
+) -> Result<SortedOutput<T>> {
+    let mut statistics = SortStatistics::default();
+    if let Some(limit) = limit.filter(|limit| *limit <= options.max_in_memory_sort_rows) {
+        let indices = select_top_k(
+            indices,
+            limit,
+            options.max_in_memory_sort_rows,
+            &compare,
+            &mut statistics,
+        )?;
+        return Ok(SortedOutput {
+            values: indices.into_iter().map(project).collect(),
+            statistics,
+        });
+    }
+
+    let mut buffer = Vec::with_capacity(options.max_in_memory_sort_rows.min(1_024));
+    let mut workspace = None;
+    let mut runs = Vec::new();
+    for index in indices {
+        let index = index?;
+        if buffer.len() == options.max_in_memory_sort_rows {
+            let workspace = match workspace.as_mut() {
+                Some(workspace) => workspace,
+                None => {
+                    workspace.insert(SortWorkspace::new(options.temporary_directory.as_deref())?)
                 }
             };
-            if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
-            }
+            runs.push(write_sorted_run(workspace, &mut buffer, &compare)?);
         }
-        data.keys[left].cmp(&data.keys[right])
-    });
+        buffer.push(index);
+        statistics.peak_run_rows = statistics.peak_run_rows.max(buffer.len());
+    }
+
+    let Some(mut workspace) = workspace else {
+        buffer.sort_unstable_by(|left, right| compare(*left, *right));
+        if let Some(limit) = limit {
+            buffer.truncate(limit);
+        }
+        return Ok(SortedOutput {
+            values: buffer.into_iter().map(project).collect(),
+            statistics,
+        });
+    };
+
+    if !buffer.is_empty() {
+        runs.push(write_sorted_run(&mut workspace, &mut buffer, &compare)?);
+    }
+    runs = collapse_runs(&mut workspace, runs, &compare, &mut statistics, row_limit)?;
+
+    let output_limit = limit.unwrap_or(usize::MAX);
+    let mut values = Vec::with_capacity(output_limit.min(1_024));
+    merge_run_indices(&runs, row_limit, &compare, &mut statistics, |index| {
+        if values.len() == output_limit {
+            return Ok(false);
+        }
+        values.push(project(index));
+        Ok(values.len() < output_limit)
+    })?;
+    workspace.cleanup()?;
+    Ok(SortedOutput { values, statistics })
+}
+
+fn select_top_k(
+    indices: impl Iterator<Item = Result<usize>>,
+    limit: usize,
+    max_in_memory_rows: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
+    statistics: &mut SortStatistics,
+) -> Result<Vec<usize>> {
+    if limit > max_in_memory_rows / 2 {
+        return select_top_k_heap(indices, limit, compare, statistics);
+    }
+
+    let mut selected = Vec::with_capacity(max_in_memory_rows.min(1_024));
+    for index in indices {
+        if selected.len() == max_in_memory_rows {
+            retain_top_k(&mut selected, limit, compare);
+        }
+        selected.push(index?);
+        statistics.peak_run_rows = statistics.peak_run_rows.max(selected.len());
+    }
+    sort_and_limit(&mut selected, limit, compare);
+    Ok(selected)
+}
+
+fn select_top_k_heap(
+    indices: impl Iterator<Item = Result<usize>>,
+    limit: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
+    statistics: &mut SortStatistics,
+) -> Result<Vec<usize>> {
+    let mut heap = Vec::with_capacity(limit.min(1_024));
+    for index in indices {
+        let index = index?;
+        if heap.len() < limit {
+            push_max_heap(&mut heap, index, compare);
+            statistics.peak_run_rows = statistics.peak_run_rows.max(heap.len());
+        } else if compare(index, heap[0]) == Ordering::Less {
+            heap[0] = index;
+            sift_down_max(&mut heap, 0, compare);
+        }
+    }
+    heap.sort_unstable_by(|left, right| compare(*left, *right));
+    Ok(heap)
+}
+
+fn push_max_heap(heap: &mut Vec<usize>, index: usize, compare: &impl Fn(usize, usize) -> Ordering) {
+    heap.push(index);
+    let mut child = heap.len() - 1;
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        if compare(heap[parent], heap[child]) != Ordering::Less {
+            break;
+        }
+        heap.swap(parent, child);
+        child = parent;
+    }
+}
+
+fn sift_down_max(
+    heap: &mut [usize],
+    mut parent: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
+) {
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            return;
+        }
+        let right = left + 1;
+        let largest = if right < heap.len() && compare(heap[left], heap[right]) == Ordering::Less {
+            right
+        } else {
+            left
+        };
+        if compare(heap[parent], heap[largest]) != Ordering::Less {
+            return;
+        }
+        heap.swap(parent, largest);
+        parent = largest;
+    }
+}
+
+fn retain_top_k(
+    indices: &mut Vec<usize>,
+    limit: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
+) {
+    if limit < indices.len() {
+        indices.select_nth_unstable_by(limit, |left, right| compare(*left, *right));
+        indices.truncate(limit);
+    }
 }
 
 fn sort_and_limit(
     indices: &mut Vec<usize>,
-    limit: Option<usize>,
-    compare: impl Fn(usize, usize) -> Ordering,
+    limit: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
 ) {
-    if let Some(0) = limit {
-        indices.clear();
-        return;
-    }
-    if let Some(limit) = limit.filter(|limit| *limit < indices.len()) {
-        indices.select_nth_unstable_by(limit, |left, right| compare(*left, *right));
-        indices.truncate(limit);
-    }
+    retain_top_k(indices, limit, compare);
     indices.sort_unstable_by(|left, right| compare(*left, *right));
+}
+
+fn write_sorted_run(
+    workspace: &mut SortWorkspace,
+    buffer: &mut Vec<usize>,
+    compare: &impl Fn(usize, usize) -> Ordering,
+) -> Result<SortRun> {
+    buffer.sort_unstable_by(|left, right| compare(*left, *right));
+    let (mut run, file) = workspace.create_run()?;
+    let mut writer = BufWriter::new(file);
+    for index in buffer.drain(..) {
+        write_row_index(&mut writer, index, &run.path)?;
+        run.row_count += 1;
+    }
+    writer
+        .flush()
+        .map_err(|error| temporary_storage_error("flush sort run", &run.path, error))?;
+    Ok(run)
+}
+
+fn collapse_runs(
+    workspace: &mut SortWorkspace,
+    mut runs: Vec<SortRun>,
+    compare: &impl Fn(usize, usize) -> Ordering,
+    statistics: &mut SortStatistics,
+    row_limit: usize,
+) -> Result<Vec<SortRun>> {
+    while runs.len() > MAX_MERGE_FAN_IN {
+        let old_runs = std::mem::take(&mut runs);
+        let mut pending = old_runs.into_iter();
+        loop {
+            let mut batch = pending.by_ref().take(MAX_MERGE_FAN_IN).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            if batch.len() == 1 {
+                runs.push(batch.pop().expect("single run"));
+                continue;
+            }
+            let merged = merge_runs_to_file(workspace, &batch, row_limit, compare, statistics)?;
+            for run in batch {
+                remove_sort_run(&run.path)?;
+            }
+            runs.push(merged);
+        }
+    }
+    Ok(runs)
+}
+
+fn merge_runs_to_file(
+    workspace: &mut SortWorkspace,
+    runs: &[SortRun],
+    row_limit: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
+    statistics: &mut SortStatistics,
+) -> Result<SortRun> {
+    let (mut output, file) = workspace.create_run()?;
+    let mut writer = BufWriter::new(file);
+    merge_run_indices(runs, row_limit, compare, statistics, |index| {
+        write_row_index(&mut writer, index, &output.path)?;
+        output.row_count += 1;
+        Ok(true)
+    })?;
+    writer
+        .flush()
+        .map_err(|error| temporary_storage_error("flush merged sort run", &output.path, error))?;
+    Ok(output)
+}
+
+#[derive(Clone, Copy)]
+struct MergeHead {
+    index: usize,
+    run: usize,
+}
+
+fn merge_run_indices(
+    runs: &[SortRun],
+    row_limit: usize,
+    compare: &impl Fn(usize, usize) -> Ordering,
+    statistics: &mut SortStatistics,
+    mut emit: impl FnMut(usize) -> Result<bool>,
+) -> Result<()> {
+    debug_assert!(runs.len() <= MAX_MERGE_FAN_IN);
+    let mut readers = runs
+        .iter()
+        .map(|run| RowIndexReader::open(run, row_limit))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = Vec::with_capacity(readers.len());
+    for (run, reader) in readers.iter_mut().enumerate() {
+        if let Some(index) = reader.next().transpose()? {
+            push_merge_head(&mut heap, MergeHead { index, run }, compare);
+        }
+    }
+    statistics.peak_merge_heads = statistics.peak_merge_heads.max(heap.len());
+
+    while let Some(head) = pop_merge_head(&mut heap, compare) {
+        if !emit(head.index)? {
+            break;
+        }
+        if let Some(index) = readers[head.run].next().transpose()? {
+            push_merge_head(
+                &mut heap,
+                MergeHead {
+                    index,
+                    run: head.run,
+                },
+                compare,
+            );
+        }
+        statistics.peak_merge_heads = statistics.peak_merge_heads.max(heap.len());
+    }
+    Ok(())
+}
+
+fn compare_merge_heads(
+    left: MergeHead,
+    right: MergeHead,
+    compare: &impl Fn(usize, usize) -> Ordering,
+) -> Ordering {
+    compare(left.index, right.index).then_with(|| left.run.cmp(&right.run))
+}
+
+fn push_merge_head(
+    heap: &mut Vec<MergeHead>,
+    head: MergeHead,
+    compare: &impl Fn(usize, usize) -> Ordering,
+) {
+    heap.push(head);
+    let mut child = heap.len() - 1;
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        if compare_merge_heads(heap[parent], heap[child], compare) != Ordering::Greater {
+            break;
+        }
+        heap.swap(parent, child);
+        child = parent;
+    }
+}
+
+fn pop_merge_head(
+    heap: &mut Vec<MergeHead>,
+    compare: &impl Fn(usize, usize) -> Ordering,
+) -> Option<MergeHead> {
+    if heap.is_empty() {
+        return None;
+    }
+    let head = heap.swap_remove(0);
+    let mut parent = 0;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            break;
+        }
+        let right = left + 1;
+        let smallest = if right < heap.len()
+            && compare_merge_heads(heap[right], heap[left], compare) == Ordering::Less
+        {
+            right
+        } else {
+            left
+        };
+        if compare_merge_heads(heap[parent], heap[smallest], compare) != Ordering::Greater {
+            break;
+        }
+        heap.swap(parent, smallest);
+        parent = smallest;
+    }
+    Some(head)
+}
+
+#[derive(Debug)]
+struct SortRun {
+    path: PathBuf,
+    row_count: usize,
+}
+
+struct SortWorkspace {
+    path: PathBuf,
+    next_file: u64,
+    active: bool,
+}
+
+impl SortWorkspace {
+    fn new(configured_parent: Option<&Path>) -> Result<Self> {
+        let parent = configured_parent.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        fs::create_dir_all(&parent).map_err(|error| {
+            temporary_storage_error("create temporary directory", &parent, error)
+        })?;
+
+        loop {
+            let sequence = NEXT_SORT_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = parent.join(format!("rusthouse-sort-{}-{sequence}", std::process::id()));
+            match create_private_directory(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        next_file: 0,
+                        active: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(temporary_storage_error(
+                        "create sort workspace",
+                        &path,
+                        error,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn create_run(&mut self) -> Result<(SortRun, File)> {
+        let path = self.path.join(format!("run-{}.bin", self.next_file));
+        self.next_file += 1;
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&path)
+            .map_err(|error| temporary_storage_error("create sort run", &path, error))?;
+        Ok((SortRun { path, row_count: 0 }, file))
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        fs::remove_dir_all(&self.path)
+            .map_err(|error| temporary_storage_error("remove sort workspace", &self.path, error))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+impl Drop for SortWorkspace {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct RowIndexReader {
+    reader: BufReader<File>,
+    remaining: usize,
+    row_limit: usize,
+    path: PathBuf,
+}
+
+impl RowIndexReader {
+    fn open(run: &SortRun, row_limit: usize) -> Result<Self> {
+        let file = File::open(&run.path)
+            .map_err(|error| temporary_storage_error("open sort run", &run.path, error))?;
+        let byte_len = file
+            .metadata()
+            .map_err(|error| temporary_storage_error("inspect sort run", &run.path, error))?
+            .len();
+        if byte_len % 8 != 0 {
+            return Err(Error::TemporaryStorage(format!(
+                "sort run '{}' has a partial row index",
+                run.path.display()
+            )));
+        }
+        let record_count = usize::try_from(byte_len / 8).map_err(|_| {
+            Error::TemporaryStorage(format!(
+                "sort run '{}' is too large for this platform",
+                run.path.display()
+            ))
+        })?;
+        if record_count != run.row_count {
+            return Err(Error::TemporaryStorage(format!(
+                "sort run '{}' changed length while sorting",
+                run.path.display()
+            )));
+        }
+        Ok(Self {
+            reader: BufReader::with_capacity(RUN_READER_BUFFER_RECORDS * 8, file),
+            remaining: record_count,
+            row_limit,
+            path: run.path.clone(),
+        })
+    }
+}
+
+impl Iterator for RowIndexReader {
+    type Item = Result<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let mut bytes = [0_u8; 8];
+        if let Err(error) = self.reader.read_exact(&mut bytes) {
+            self.remaining = 0;
+            return Some(Err(temporary_storage_error(
+                "read sort run",
+                &self.path,
+                error,
+            )));
+        }
+        self.remaining -= 1;
+        let row = match usize::try_from(u64::from_le_bytes(bytes)) {
+            Ok(row) if row < self.row_limit => row,
+            Ok(_) | Err(_) => {
+                return Some(Err(Error::TemporaryStorage(format!(
+                    "sort run '{}' contains an invalid row index",
+                    self.path.display()
+                ))));
+            }
+        };
+        Some(Ok(row))
+    }
+}
+
+fn write_row_index(writer: &mut impl Write, index: usize, path: &Path) -> Result<()> {
+    let index = u64::try_from(index).map_err(|_| {
+        Error::TemporaryStorage("row index does not fit in a sort run record".to_owned())
+    })?;
+    writer
+        .write_all(&index.to_le_bytes())
+        .map_err(|error| temporary_storage_error("write sort run", path, error))
+}
+
+fn remove_sort_run(path: &Path) -> Result<()> {
+    fs::remove_file(path).map_err(|error| temporary_storage_error("remove sort run", path, error))
+}
+
+fn temporary_storage_error(action: &str, path: &Path, error: io::Error) -> Error {
+    Error::TemporaryStorage(format!("{action} '{}': {error}", path.display()))
 }
 
 #[derive(Debug)]
@@ -886,6 +1454,16 @@ fn comparable(left: DataType, right: DataType) -> bool {
 mod tests {
     use super::*;
 
+    fn test_temporary_directory(label: &str) -> PathBuf {
+        let sequence = NEXT_SORT_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusthouse-engine-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create test temporary directory");
+        path
+    }
+
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
         match results.into_iter().last().expect("one result") {
@@ -945,5 +1523,84 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn external_sort_buffers_remain_bounded_at_million_row_scale() {
+        const ROW_COUNT: usize = 1_000_000;
+        const MAX_IN_MEMORY_ROWS: usize = 4_096;
+        let temporary_directory = test_temporary_directory("million-sort");
+        let options = DatabaseOptions {
+            max_in_memory_sort_rows: MAX_IN_MEMORY_ROWS,
+            temporary_directory: Some(temporary_directory.clone()),
+        };
+
+        let output = sort_and_project(
+            (0..ROW_COUNT).rev().map(Ok),
+            None,
+            ROW_COUNT,
+            &options,
+            |left, right| left.cmp(&right),
+            |index| index,
+        )
+        .expect("external sort succeeds");
+
+        assert_eq!(output.values.len(), ROW_COUNT);
+        assert_eq!(output.values[0], 0);
+        assert_eq!(output.values[ROW_COUNT - 1], ROW_COUNT - 1);
+        assert!(output.statistics.peak_run_rows <= MAX_IN_MEMORY_ROWS);
+        assert!(output.statistics.peak_merge_heads <= MAX_MERGE_FAN_IN);
+
+        let top = sort_and_project(
+            (0..ROW_COUNT).rev().map(Ok),
+            Some(25),
+            ROW_COUNT,
+            &options,
+            |left, right| left.cmp(&right),
+            |index| index,
+        )
+        .expect("bounded top-k succeeds");
+        assert_eq!(top.values, (0..25).collect::<Vec<_>>());
+        assert!(top.statistics.peak_run_rows <= MAX_IN_MEMORY_ROWS);
+        assert_eq!(top.statistics.peak_merge_heads, 0);
+        assert_eq!(
+            fs::read_dir(&temporary_directory)
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
+        fs::remove_dir(temporary_directory).expect("remove test temporary directory");
+    }
+
+    #[test]
+    fn a_stream_error_after_spilling_removes_the_workspace() {
+        let temporary_directory = test_temporary_directory("failed-sort");
+        let options = DatabaseOptions {
+            max_in_memory_sort_rows: 2,
+            temporary_directory: Some(temporary_directory.clone()),
+        };
+        let expected = Error::InvalidQuery("forced scan failure".to_owned());
+        let indices = (0..5).map(Ok).chain(std::iter::once(Err(expected.clone())));
+
+        let error = match sort_and_project(
+            indices,
+            None,
+            5,
+            &options,
+            |left, right| left.cmp(&right),
+            |index| index,
+        ) {
+            Ok(_) => panic!("stream failure should be returned"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, expected);
+        assert_eq!(
+            fs::read_dir(&temporary_directory)
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
+        fs::remove_dir(temporary_directory).expect("remove test temporary directory");
     }
 }

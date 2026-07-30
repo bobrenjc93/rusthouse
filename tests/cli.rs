@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -92,6 +93,38 @@ fn stdin_and_csv_output_work_together() {
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
         "label,active\n\"hello, world\",true\n"
     );
+}
+
+#[test]
+fn order_by_spill_options_work_end_to_end() {
+    let temporary_directory =
+        std::env::temp_dir().join(format!("rusthouse-cli-order-test-{}", std::process::id()));
+    fs::create_dir(&temporary_directory).expect("create temporary directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--max-in-memory-sort-rows=2",
+            &format!("--temporary-directory={}", temporary_directory.display()),
+            "--execute",
+            "CREATE TABLE valueset (value Int64);
+             INSERT INTO valueset VALUES (4), (2), (3), (1);
+             SELECT value FROM valueset ORDER BY value;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"value\",\"type\":\"Int64\"}],\"rows\":[[1],[2],[3],[4]]}]}\n"
+    );
+    assert_eq!(
+        fs::read_dir(&temporary_directory)
+            .expect("read temporary directory")
+            .count(),
+        0
+    );
+    fs::remove_dir(temporary_directory).expect("remove temporary directory");
 }
 
 #[test]

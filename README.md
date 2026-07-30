@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- bounded ORDER BY execution with temporary-file runs and deterministic merging
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -44,6 +45,16 @@ cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
 
+ORDER BY keeps at most 65,536 row indices in one in-memory sort run by default. Lower the cap or choose the parent directory for per-query spill files with `--max-in-memory-sort-rows` and `--temporary-directory`:
+
+~~~bash
+cargo run -- --max-in-memory-sort-rows 10000 \
+  --temporary-directory /var/tmp \
+  --execute "SELECT id, score FROM events ORDER BY score DESC, id LIMIT 50000"
+~~~
+
+Small LIMIT queries use in-memory top-k selection and do not create spill files. Larger sorts write row indices to bounded runs and use a fixed-fan-in merge; spill workspaces are removed after successful and failed queries. Query results themselves remain materialized in memory.
+
 Or pipe a batch through standard input:
 
 ~~~bash
@@ -64,9 +75,13 @@ Database retains an in-memory catalog across calls and returns structured result
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
 ~~~rust
-use rusthouse::{Database, StatementResult};
+use std::path::PathBuf;
+use rusthouse::{Database, DatabaseOptions, StatementResult};
 
-let mut database = Database::new();
+let mut database = Database::with_options(DatabaseOptions {
+    max_in_memory_sort_rows: 10_000,
+    temporary_directory: Some(PathBuf::from("/var/tmp")),
+});
 database.execute("CREATE TABLE events (id Int64, name String)")?;
 database.execute("INSERT INTO events VALUES (1, 'launch')")?;
 

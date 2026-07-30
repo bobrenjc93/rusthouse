@@ -1,9 +1,12 @@
 use std::env;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{
+    DEFAULT_MAX_IN_MEMORY_SORT_ROWS, Database, DatabaseOptions, QueryResult, StatementResult,
+};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,6 +17,10 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+        --max-in-memory-sort-rows <COUNT>
+                              Spill ORDER BY above this many rows (default: 65536)
+        --temporary-directory <PATH>
+                              Parent directory for ORDER BY spill files
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -47,7 +54,10 @@ fn run() -> Result<(), String> {
         sql
     };
 
-    let mut database = Database::new();
+    let mut database = Database::with_options(DatabaseOptions {
+        max_in_memory_sort_rows: config.max_in_memory_sort_rows,
+        temporary_directory: config.temporary_directory,
+    });
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +104,16 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    max_in_memory_sort_rows: usize,
+    temporary_directory: Option<PathBuf>,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut max_in_memory_sort_rows = DEFAULT_MAX_IN_MEMORY_SORT_ROWS;
+    let mut max_in_memory_sort_rows_supplied = false;
+    let mut temporary_directory = None;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +137,26 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "--max-in-memory-sort-rows" => {
+                if max_in_memory_sort_rows_supplied {
+                    return Err("--max-in-memory-sort-rows may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a count"))?;
+                max_in_memory_sort_rows = parse_max_in_memory_sort_rows(&value)?;
+                max_in_memory_sort_rows_supplied = true;
+            }
+            "--temporary-directory" => {
+                if temporary_directory.is_some() {
+                    return Err("--temporary-directory may only be supplied once".to_owned());
+                }
+                temporary_directory = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a path"))?,
+                ));
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +169,41 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--max-in-memory-sort-rows=") => {
+                if max_in_memory_sort_rows_supplied {
+                    return Err("--max-in-memory-sort-rows may only be supplied once".to_owned());
+                }
+                max_in_memory_sort_rows =
+                    parse_max_in_memory_sort_rows(&argument["--max-in-memory-sort-rows=".len()..])?;
+                max_in_memory_sort_rows_supplied = true;
+            }
+            _ if argument.starts_with("--temporary-directory=") => {
+                if temporary_directory.is_some() {
+                    return Err("--temporary-directory may only be supplied once".to_owned());
+                }
+                temporary_directory =
+                    Some(PathBuf::from(&argument["--temporary-directory=".len()..]));
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        max_in_memory_sort_rows,
+        temporary_directory,
+    }))
+}
+
+fn parse_max_in_memory_sort_rows(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("--max-in-memory-sort-rows must be at least 1".to_owned()),
+        Ok(value) => Ok(value),
+        Err(_) => Err(format!(
+            "invalid --max-in-memory-sort-rows value '{value}'; expected a positive integer"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +222,11 @@ mod tests {
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(
+            config.max_in_memory_sort_rows,
+            DEFAULT_MAX_IN_MEMORY_SORT_ROWS
+        );
+        assert_eq!(config.temporary_directory, None);
     }
 
     #[test]
@@ -164,6 +234,29 @@ mod tests {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
         assert!(error.contains("table, csv, or json"));
+    }
+
+    #[test]
+    fn parses_order_by_spill_options() {
+        let config = parse_arguments(
+            [
+                "--max-in-memory-sort-rows=7",
+                "--temporary-directory",
+                "/tmp/rusthouse-test",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("valid arguments")
+        .expect("not help");
+
+        assert_eq!(config.max_in_memory_sort_rows, 7);
+        assert_eq!(
+            config.temporary_directory,
+            Some(PathBuf::from("/tmp/rusthouse-test"))
+        );
+        assert!(parse_max_in_memory_sort_rows("0").is_err());
+        assert!(parse_max_in_memory_sort_rows("many").is_err());
     }
 
     #[test]
