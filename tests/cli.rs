@@ -154,3 +154,66 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         assert!(!stderr.contains("stack overflow"));
     }
 }
+
+#[test]
+fn execution_limit_flags_return_specific_errors() {
+    let cases = [
+        (
+            ["--max-scan-rows", "1"],
+            "execution scan row limit exceeded: maximum 1, attempted 2",
+        ),
+        (
+            ["--max-output-rows", "1"],
+            "execution output row limit exceeded: maximum 1, attempted 2",
+        ),
+        (["--timeout-ms", "0"], "query execution deadline exceeded"),
+    ];
+
+    for (option, expected_error) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .args(option)
+            .args([
+                "--execute",
+                "CREATE TABLE numbers (n Int64); \
+                 INSERT INTO numbers VALUES (1), (2); \
+                 SELECT n FROM numbers;",
+            ])
+            .output()
+            .expect("run CLI with execution limit");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            stderr.contains(expected_error),
+            "unexpected stderr for {option:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn execution_limit_flags_accept_equals_syntax_and_validate_numbers() {
+    let success = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--max-scan-rows=2",
+            "--max-output-rows=1",
+            "--timeout-ms=1000",
+            "--execute",
+            "CREATE TABLE numbers (n Int64); \
+             INSERT INTO numbers VALUES (1), (2); \
+             SELECT n FROM numbers LIMIT 1;",
+        ])
+        .output()
+        .expect("run CLI with equals-style limits");
+    assert!(success.status.success());
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--max-scan-rows", "-1", "--execute", "SELECT * FROM t"])
+        .output()
+        .expect("run CLI with invalid row limit");
+    assert!(!invalid.status.success());
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .expect("UTF-8 stderr")
+            .contains("expected a non-negative integer")
+    );
+}

@@ -14,6 +14,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
+- cooperative scan-row, output-row, deadline, and cancellation controls
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
@@ -43,6 +44,18 @@ Choose table (the default), csv, or json:
 cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
+
+Bound a batch's resource use with row limits and a wall-clock timeout:
+
+~~~bash
+cargo run -- --max-scan-rows 100000 --max-output-rows 1000 --timeout-ms 5000 \
+  --execute "SELECT * FROM events ORDER BY id LIMIT 1000"
+~~~
+
+Limits count cumulatively across all SELECT statements in the input batch. Row
+maximums are inclusive, so a limit of 100 permits exactly 100 rows. Exceeding a
+limit, reaching the deadline, or cancelling execution returns a structured
+error and a nonzero CLI status.
 
 Or pipe a batch through standard input:
 
@@ -78,6 +91,38 @@ assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+Use `execute_with_options` for bounded or externally cancellable work. The
+cancellation token is cloneable and can be signalled from another thread:
+
+~~~rust
+use std::time::{Duration, Instant};
+use rusthouse::{CancellationToken, Database, ExecutionLimits, ExecutionOptions};
+
+let token = CancellationToken::new();
+let canceller = token.clone();
+let options = ExecutionOptions::new(
+    ExecutionLimits {
+        max_scan_rows: Some(1_000_000),
+        max_output_rows: Some(10_000),
+        deadline: Instant::now().checked_add(Duration::from_secs(2)),
+    },
+    token,
+);
+
+// Another thread may call `canceller.cancel()` while execution is in progress.
+let mut database = Database::new();
+let _ = canceller;
+database.execute_with_options("CREATE TABLE events (id Int64)", &options)?;
+
+# Ok::<(), rusthouse::Error>(())
+~~~
+
+`Database::execute` remains the unlimited API, retains the optimized sort path,
+and does not perform row accounting or atomic/deadline checks. An aborted SELECT
+does not poison the database; later calls can reuse it normally. As with
+unlimited batches, commands completed before a later execution error remain
+applied.
 
 ## Current boundaries
 

@@ -1,5 +1,21 @@
 use std::fmt;
 
+/// Identifies a row resource controlled by [`crate::ExecutionLimits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionLimit {
+    ScanRows,
+    OutputRows,
+}
+
+impl fmt::Display for ExecutionLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScanRows => f.write_str("scan row"),
+            Self::OutputRows => f.write_str("output row"),
+        }
+    }
+}
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -30,6 +46,13 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    ExecutionLimitExceeded {
+        limit: ExecutionLimit,
+        maximum: usize,
+        actual: usize,
+    },
+    ExecutionCancelled,
+    DeadlineExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +96,16 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::ExecutionLimitExceeded {
+                limit,
+                maximum,
+                actual,
+            } => write!(
+                f,
+                "execution {limit} limit exceeded: maximum {maximum}, attempted {actual}"
+            ),
+            Self::ExecutionCancelled => f.write_str("query execution was cancelled"),
+            Self::DeadlineExceeded => f.write_str("query execution deadline exceeded"),
         }
     }
 }

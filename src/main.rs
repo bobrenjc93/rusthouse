@@ -1,9 +1,10 @@
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{Database, ExecutionLimits, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,6 +15,9 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+        --max-scan-rows <N>   Abort after scanning N source rows
+        --max-output-rows <N> Abort before emitting more than N result rows
+        --timeout-ms <MS>     Abort after this execution time in milliseconds
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -48,7 +52,25 @@ fn run() -> Result<(), String> {
     };
 
     let mut database = Database::new();
-    let results = database.execute(&sql).map_err(|error| error.to_string())?;
+    let deadline = config
+        .timeout_ms
+        .map(|milliseconds| {
+            Instant::now()
+                .checked_add(Duration::from_millis(milliseconds))
+                .ok_or_else(|| "--timeout-ms is too large for this platform".to_owned())
+        })
+        .transpose()?;
+    let limits = ExecutionLimits {
+        max_scan_rows: config.max_scan_rows,
+        max_output_rows: config.max_output_rows,
+        deadline,
+    };
+    let results = if limits == ExecutionLimits::unlimited() {
+        database.execute(&sql)
+    } else {
+        database.execute_with_options(&sql, limits)
+    }
+    .map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
         match result {
@@ -94,11 +116,17 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    max_scan_rows: Option<usize>,
+    max_output_rows: Option<usize>,
+    timeout_ms: Option<u64>,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut max_scan_rows = None;
+    let mut max_output_rows = None;
+    let mut timeout_ms = None;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +150,33 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "--max-scan-rows" => {
+                if max_scan_rows.is_some() {
+                    return Err("--max-scan-rows may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--max-scan-rows requires a row count".to_owned())?;
+                max_scan_rows = Some(parse_number("--max-scan-rows", &value)?);
+            }
+            "--max-output-rows" => {
+                if max_output_rows.is_some() {
+                    return Err("--max-output-rows may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--max-output-rows requires a row count".to_owned())?;
+                max_output_rows = Some(parse_number("--max-output-rows", &value)?);
+            }
+            "--timeout-ms" => {
+                if timeout_ms.is_some() {
+                    return Err("--timeout-ms may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--timeout-ms requires a millisecond count".to_owned())?;
+                timeout_ms = Some(parse_number("--timeout-ms", &value)?);
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +189,53 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--max-scan-rows=") => {
+                if max_scan_rows.is_some() {
+                    return Err("--max-scan-rows may only be supplied once".to_owned());
+                }
+                max_scan_rows = Some(parse_number(
+                    "--max-scan-rows",
+                    &argument["--max-scan-rows=".len()..],
+                )?);
+            }
+            _ if argument.starts_with("--max-output-rows=") => {
+                if max_output_rows.is_some() {
+                    return Err("--max-output-rows may only be supplied once".to_owned());
+                }
+                max_output_rows = Some(parse_number(
+                    "--max-output-rows",
+                    &argument["--max-output-rows=".len()..],
+                )?);
+            }
+            _ if argument.starts_with("--timeout-ms=") => {
+                if timeout_ms.is_some() {
+                    return Err("--timeout-ms may only be supplied once".to_owned());
+                }
+                timeout_ms = Some(parse_number(
+                    "--timeout-ms",
+                    &argument["--timeout-ms=".len()..],
+                )?);
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        max_scan_rows,
+        max_output_rows,
+        timeout_ms,
+    }))
+}
+
+fn parse_number<T>(option: &str, value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    value.parse().map_err(|_| {
+        format!("invalid value '{value}' for {option}; expected a non-negative integer")
+    })
 }
 
 #[cfg(test)]
@@ -157,6 +254,7 @@ mod tests {
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(config.max_scan_rows, None);
     }
 
     #[test]

@@ -2,7 +2,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::catalog::Catalog;
-use crate::error::{Error, Result};
+use crate::error::{Error, ExecutionLimit, Result};
+use crate::execution::{CancellationToken, ExecutionLimits, ExecutionOptions};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
@@ -37,6 +38,94 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+#[derive(Debug)]
+struct ExecutionControl<'a> {
+    limits: Option<&'a ExecutionLimits>,
+    cancellation_token: Option<&'a CancellationToken>,
+    scanned_rows: usize,
+    output_rows: usize,
+}
+
+impl<'a> ExecutionControl<'a> {
+    fn unlimited() -> Self {
+        Self {
+            limits: None,
+            cancellation_token: None,
+            scanned_rows: 0,
+            output_rows: 0,
+        }
+    }
+
+    fn new(options: &'a ExecutionOptions) -> Self {
+        Self {
+            limits: Some(&options.limits),
+            cancellation_token: Some(&options.cancellation_token),
+            scanned_rows: 0,
+            output_rows: 0,
+        }
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        let Some(limits) = self.limits else {
+            return Ok(());
+        };
+        if self
+            .cancellation_token
+            .expect("controlled execution has a cancellation token")
+            .is_cancelled()
+        {
+            return Err(Error::ExecutionCancelled);
+        }
+        if limits
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(Error::DeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    fn is_unlimited(&self) -> bool {
+        self.limits.is_none() && self.cancellation_token.is_none()
+    }
+
+    fn record_scanned_row(&mut self) -> Result<()> {
+        let Some(limits) = self.limits else {
+            return Ok(());
+        };
+        self.checkpoint()?;
+        self.scanned_rows = self.scanned_rows.saturating_add(1);
+        if let Some(maximum) = limits.max_scan_rows
+            && self.scanned_rows > maximum
+        {
+            return Err(Error::ExecutionLimitExceeded {
+                limit: ExecutionLimit::ScanRows,
+                maximum,
+                actual: self.scanned_rows,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_output_row(&mut self) -> Result<()> {
+        let Some(limits) = self.limits else {
+            return Ok(());
+        };
+        self.checkpoint()?;
+        self.output_rows = self.output_rows.saturating_add(1);
+        if let Some(maximum) = limits.max_output_rows
+            && self.output_rows > maximum
+        {
+            return Err(Error::ExecutionLimitExceeded {
+                limit: ExecutionLimit::OutputRows,
+                maximum,
+                actual: self.output_rows,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -54,13 +143,43 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
+        let statements = sql::parse(sql)?;
+        let mut control = ExecutionControl::unlimited();
+        self.execute_statements(statements, &mut control)
+    }
+
+    /// Execute a batch with resource limits and cooperative cancellation.
+    ///
+    /// Row counters are cumulative across all SELECT statements in the batch.
+    /// Completed commands remain applied if a later statement is aborted.
+    pub fn execute_with_options(
+        &mut self,
+        sql: &str,
+        options: impl Into<ExecutionOptions>,
+    ) -> Result<Vec<StatementResult>> {
+        let options = options.into();
+        let statements = sql::parse(sql)?;
+        let mut control = ExecutionControl::new(&options);
+        self.execute_statements(statements, &mut control)
+    }
+
+    fn execute_statements(
+        &mut self,
+        statements: Vec<Statement>,
+        control: &mut ExecutionControl<'_>,
+    ) -> Result<Vec<StatementResult>> {
+        statements
             .into_iter()
-            .map(|statement| self.execute_statement(statement))
+            .map(|statement| self.execute_statement(statement, control))
             .collect()
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    fn execute_statement(
+        &mut self,
+        statement: Statement,
+        control: &mut ExecutionControl<'_>,
+    ) -> Result<StatementResult> {
+        control.checkpoint()?;
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog.create_table(name, columns)?;
@@ -86,11 +205,17 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self
+                .execute_select(select, control)
+                .map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(
+        &self,
+        select: Select,
+        control: &mut ExecutionControl<'_>,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -98,13 +223,17 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
+        let mut matching_rows = Vec::new();
+        for row in 0..table.row_count() {
+            control.record_scanned_row()?;
+            if predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate.evaluate(table, row))
+            {
+                matching_rows.push(row);
+            }
+        }
+        control.checkpoint()?;
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -113,7 +242,13 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &group_columns,
+                &aggregate_specs,
+                control,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -121,11 +256,19 @@ impl Database {
                 &items,
                 &ordering,
                 select.limit,
-            );
-            grouped.project(&selected_groups, &items)
+                control,
+            )?;
+            grouped.project(&selected_groups, &items, control)?
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &items,
+                &ordering,
+                select.limit,
+                control,
+            )?;
+            execute_projection(table, &matching_rows, &items, control)?
         };
 
         Ok(QueryResult {
@@ -302,21 +445,25 @@ fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
-    matching_rows
-        .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
-                .collect()
-        })
-        .collect()
+    control: &mut ExecutionControl<'_>,
+) -> Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::with_capacity(matching_rows.len());
+    for row in matching_rows {
+        control.record_output_row()?;
+        let mut values = Vec::with_capacity(items.len());
+        for item in items {
+            control.checkpoint()?;
+            values.push(match item {
+                ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("projection does not contain aggregates")
+                }
+            });
+        }
+        rows.push(values);
+    }
+    control.checkpoint()?;
+    Ok(rows)
 }
 
 fn execute_grouped<'a>(
@@ -324,6 +471,7 @@ fn execute_grouped<'a>(
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    control: &ExecutionControl<'_>,
 ) -> Result<GroupedData<'a>> {
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
@@ -340,29 +488,38 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        control.checkpoint()?;
+        let (group, inserted) =
+            groups.find_or_insert(table, group_columns, *row, group_count, control)?;
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
+                control.checkpoint()?;
                 states.push(AggregateState::new(spec));
             }
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
+            control.checkpoint()?;
             debug_assert_eq!(states.len(), group_count);
             states[group].update(spec, table, *row)?;
         }
     }
 
-    let keys = groups.into_keys(group_count);
+    let keys = groups.into_keys(group_count, control)?;
     let aggregates = aggregate_states
         .into_iter()
         .map(|states| {
+            control.checkpoint()?;
             states
                 .into_iter()
-                .map(AggregateState::finish)
+                .map(|state| {
+                    control.checkpoint()?;
+                    state.finish()
+                })
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
+    control.checkpoint()?;
     Ok(GroupedData { keys, aggregates })
 }
 
@@ -389,8 +546,9 @@ impl<'a> GroupIndex<'a> {
         columns: &[usize],
         row: usize,
         next_group: usize,
-    ) -> (usize, bool) {
-        match self {
+        control: &ExecutionControl<'_>,
+    ) -> Result<(usize, bool)> {
+        Ok(match self {
             Self::Global => (0, false),
             Self::One(groups) => {
                 let key = table.columns()[columns[0]].value_ref(row);
@@ -409,16 +567,21 @@ impl<'a> GroupIndex<'a> {
                 find_or_insert_group(groups, &key, next_group)
             }
             Self::Multiple(groups) => {
-                let key = columns
-                    .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
-                    .collect::<Vec<_>>();
+                let mut key = Vec::with_capacity(columns.len());
+                for column in columns {
+                    control.checkpoint()?;
+                    key.push(table.columns()[*column].value_ref(row));
+                }
                 find_or_insert_group(groups, &key, next_group)
             }
-        }
+        })
     }
 
-    fn into_keys(self, group_count: usize) -> Vec<GroupKey<'a>> {
+    fn into_keys(
+        self,
+        group_count: usize,
+        control: &ExecutionControl<'_>,
+    ) -> Result<Vec<GroupKey<'a>>> {
         let mut ordered = std::iter::repeat_with(|| None)
             .take(group_count)
             .collect::<Vec<_>>();
@@ -429,19 +592,24 @@ impl<'a> GroupIndex<'a> {
             }
             Self::One(groups) => {
                 for (key, group) in groups {
+                    control.checkpoint()?;
                     ordered[group] = Some(GroupKey::One(key));
                 }
             }
             Self::Multiple(groups) => {
                 for (key, group) in groups {
+                    control.checkpoint()?;
                     ordered[group] = Some(GroupKey::Multiple(key));
                 }
             }
         }
-        ordered
-            .into_iter()
-            .map(|key| key.expect("every group index has a key"))
-            .collect()
+        let mut keys = Vec::with_capacity(group_count);
+        for key in ordered {
+            control.checkpoint()?;
+            keys.push(key.expect("every group index has a key"));
+        }
+        control.checkpoint()?;
+        Ok(keys)
     }
 }
 
@@ -496,28 +664,34 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
-            .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+    fn project(
+        &self,
+        selected: &[usize],
+        items: &[ResolvedItem],
+        control: &mut ExecutionControl<'_>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::with_capacity(selected.len());
+        for group in selected {
+            control.record_output_row()?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                control.checkpoint()?;
+                values.push(match item {
+                    ResolvedItem::Column {
+                        group_position: Some(position),
+                        ..
+                    } => self.keys[*group].value(*position).to_owned(),
+                    ResolvedItem::Column {
+                        group_position: None,
+                        ..
+                    } => unreachable!("grouped columns are validated"),
+                    ResolvedItem::Aggregate { state } => self.aggregates[*state][*group].clone(),
+                });
+            }
+            rows.push(values);
+        }
+        control.checkpoint()?;
+        Ok(rows)
     }
 }
 
@@ -689,30 +863,32 @@ fn order_source_rows(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
+    control: &ExecutionControl<'_>,
+) -> Result<()> {
     if ordering.is_empty() {
         if let Some(limit) = limit {
             rows.truncate(limit);
         }
-        return;
+        return control.checkpoint();
     }
 
-    sort_and_limit(rows, limit, |left, right| {
+    sort_and_limit(rows, limit, control, |left, right| {
         for order in ordering {
+            control.checkpoint()?;
             let ResolvedItem::Column { source, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
             };
             let comparison = table.columns()[source].cmp_at(left, right);
             if comparison != Ordering::Equal {
-                return if order.descending {
+                return Ok(if order.descending {
                     comparison.reverse()
                 } else {
                     comparison
-                };
+                });
             }
         }
-        left.cmp(&right)
-    });
+        Ok(left.cmp(&right))
+    })
 }
 
 fn order_grouped_rows(
@@ -721,9 +897,11 @@ fn order_grouped_rows(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
-    sort_and_limit(groups, limit, |left, right| {
+    control: &ExecutionControl<'_>,
+) -> Result<()> {
+    sort_and_limit(groups, limit, control, |left, right| {
         for order in ordering {
+            control.checkpoint()?;
             let comparison = match items[order.output] {
                 ResolvedItem::Column {
                     group_position: Some(position),
@@ -740,31 +918,126 @@ fn order_grouped_rows(
                 }
             };
             if comparison != Ordering::Equal {
-                return if order.descending {
+                return Ok(if order.descending {
                     comparison.reverse()
                 } else {
                     comparison
-                };
+                });
             }
         }
-        data.keys[left].cmp(&data.keys[right])
-    });
+        Ok(data.keys[left].cmp(&data.keys[right]))
+    })
 }
 
 fn sort_and_limit(
     indices: &mut Vec<usize>,
     limit: Option<usize>,
-    compare: impl Fn(usize, usize) -> Ordering,
-) {
+    control: &ExecutionControl<'_>,
+    mut compare: impl FnMut(usize, usize) -> Result<Ordering>,
+) -> Result<()> {
+    control.checkpoint()?;
     if let Some(0) = limit {
         indices.clear();
-        return;
+        return Ok(());
     }
+
+    if control.is_unlimited() {
+        if let Some(limit) = limit.filter(|limit| *limit < indices.len()) {
+            indices.select_nth_unstable_by(limit, |left, right| {
+                compare(*left, *right).expect("unlimited comparison cannot be interrupted")
+            });
+            indices.truncate(limit);
+        }
+        indices.sort_unstable_by(|left, right| {
+            compare(*left, *right).expect("unlimited comparison cannot be interrupted")
+        });
+        return Ok(());
+    }
+
     if let Some(limit) = limit.filter(|limit| *limit < indices.len()) {
-        indices.select_nth_unstable_by(limit, |left, right| compare(*left, *right));
-        indices.truncate(limit);
+        retain_top_k(indices, limit, &mut compare)?;
     }
-    indices.sort_unstable_by(|left, right| compare(*left, *right));
+    fallible_sort(indices, &mut compare)?;
+    control.checkpoint()
+}
+
+fn retain_top_k(
+    indices: &mut Vec<usize>,
+    limit: usize,
+    compare: &mut impl FnMut(usize, usize) -> Result<Ordering>,
+) -> Result<()> {
+    debug_assert!(limit > 0 && limit < indices.len());
+    for root in (0..limit / 2).rev() {
+        sift_down_max(&mut indices[..limit], root, compare)?;
+    }
+    for candidate in limit..indices.len() {
+        if compare(indices[candidate], indices[0])? == Ordering::Less {
+            indices[0] = indices[candidate];
+            sift_down_max(&mut indices[..limit], 0, compare)?;
+        }
+    }
+    indices.truncate(limit);
+    Ok(())
+}
+
+fn sift_down_max(
+    heap: &mut [usize],
+    mut root: usize,
+    compare: &mut impl FnMut(usize, usize) -> Result<Ordering>,
+) -> Result<()> {
+    loop {
+        let left = root * 2 + 1;
+        if left >= heap.len() {
+            return Ok(());
+        }
+        let right = left + 1;
+        let largest = if right < heap.len() && compare(heap[left], heap[right])? == Ordering::Less {
+            right
+        } else {
+            left
+        };
+        if compare(heap[root], heap[largest])? != Ordering::Less {
+            return Ok(());
+        }
+        heap.swap(root, largest);
+        root = largest;
+    }
+}
+
+fn fallible_sort(
+    indices: &mut [usize],
+    compare: &mut impl FnMut(usize, usize) -> Result<Ordering>,
+) -> Result<()> {
+    let mut scratch = indices.to_vec();
+    let mut width = 1;
+    while width < indices.len() {
+        let mut start = 0;
+        while start < indices.len() {
+            let middle = start.saturating_add(width).min(indices.len());
+            let end = middle.saturating_add(width).min(indices.len());
+            let (mut left, mut right) = (start, middle);
+            for destination in &mut scratch[start..end] {
+                let take_left = if left == middle {
+                    false
+                } else if right == end {
+                    true
+                } else {
+                    compare(indices[left], indices[right])? != Ordering::Greater
+                };
+                if take_left {
+                    *destination = indices[left];
+                    left += 1;
+                } else {
+                    *destination = indices[right];
+                    right += 1;
+                }
+            }
+            start = end;
+        }
+        indices.copy_from_slice(&scratch);
+        width = width.saturating_mul(2);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
