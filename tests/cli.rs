@@ -95,6 +95,27 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn multiple_csv_results_use_blank_line_separators() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=csv",
+            "--execute",
+            "CREATE TABLE numbers (n Int64);
+             INSERT INTO numbers VALUES (1);
+             SELECT n FROM numbers;
+             SELECT n FROM numbers;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "n\n1\n\nn\n1\n"
+    );
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

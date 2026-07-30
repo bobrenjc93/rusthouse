@@ -127,23 +127,44 @@ fn normalize_repeated(
     let expected_header = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>();
     let mut tables = Vec::new();
     let mut rows = None::<Vec<Vec<String>>>;
+    let mut separator_pending = false;
 
     for record in records {
-        if record
+        let is_header = record
             .iter()
             .map(String::as_str)
-            .eq(expected_header.iter().copied())
-        {
+            .eq(expected_header.iter().copied());
+        let is_blank = record.len() == 1 && record[0].is_empty();
+
+        if is_header {
             if let Some(previous_rows) = rows.replace(Vec::new()) {
                 tables.push(normalize_rows(&previous_rows, columns, engine)?);
             }
+            separator_pending = false;
+        } else if is_blank {
+            if rows.is_none() || separator_pending {
+                return Err(format!(
+                    "{engine} amplified output contained an unexpected blank record"
+                ));
+            }
+            separator_pending = true;
         } else if let Some(rows) = &mut rows {
+            if separator_pending {
+                return Err(format!(
+                    "{engine} amplified output blank separator was not followed by the expected header"
+                ));
+            }
             rows.push(record);
         } else {
             return Err(format!(
                 "{engine} amplified output did not start with the expected header"
             ));
         }
+    }
+    if separator_pending {
+        return Err(format!(
+            "{engine} amplified output ended after a blank separator"
+        ));
     }
     if let Some(rows) = rows {
         tables.push(normalize_rows(&rows, columns, engine)?);
@@ -350,7 +371,7 @@ mod tests {
     #[test]
     fn amplified_output_validates_count_cross_engine_parity_and_repeatability() {
         let columns = [("n", ColumnType::Integer), ("mean", ColumnType::Float)];
-        let rusthouse = "n,mean\n1,0.3333333333333333\nn,mean\n1,0.3333333333333333\n";
+        let rusthouse = "n,mean\n1,0.3333333333333333\n\nn,mean\n1,0.3333333333333333\n";
         let clickhouse = "n,mean\r\n1,0.33333333333333331\r\nn,mean\r\n1,0.33333333333333331\r\n";
         compare_repeated_outputs(rusthouse, clickhouse, &columns, 2)
             .expect("equivalent repeated output");
@@ -365,5 +386,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn amplified_output_accepts_captured_rusthouse_cli_separator() {
+        let columns = [("n", ColumnType::Integer)];
+        let rusthouse_cli = "n\n1\n\nn\n1\n";
+        let clickhouse_cli = "\"n\"\n1\n\"n\"\n1\n";
+
+        compare_repeated_outputs(rusthouse_cli, clickhouse_cli, &columns, 2)
+            .expect("captured CLI outputs should match");
+    }
+
+    #[test]
+    fn amplified_output_rejects_blank_records_outside_result_boundaries() {
+        let columns = [("n", ColumnType::Integer)];
+        let clickhouse = "n\n1\nn\n1\n";
+
+        for malformed in [
+            "\nn\n1\nn\n1\n",
+            "n\n1\n\n2\nn\n1\n",
+            "n\n1\n\n\nn\n1\n",
+            "n\n1\nn\n1\n\n",
+        ] {
+            assert!(compare_repeated_outputs(malformed, clickhouse, &columns, 2).is_err());
+        }
     }
 }
