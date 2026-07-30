@@ -524,3 +524,243 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn ctes_support_typed_multi_stage_aggregation() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cte_sales (
+                region String, channel String, amount Int64, included Bool
+             );
+             INSERT INTO cte_sales VALUES
+                ('west', 'web', 10, true),
+                ('west', 'web', 5, true),
+                ('west', 'store', 7, true),
+                ('east', 'web', 4, true),
+                ('east', 'store', 20, false);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "WITH channel_totals AS (
+            SELECT region, channel, SUM(amount) AS total
+            FROM cte_sales
+            WHERE included = true
+            GROUP BY region, channel
+         ),
+         regional_totals AS (
+            SELECT region, SUM(total) AS revenue
+            FROM channel_totals
+            GROUP BY region
+         )
+         SELECT region, revenue
+         FROM regional_totals
+         WHERE revenue >= 4
+         ORDER BY revenue DESC
+         LIMIT 2;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"region".to_owned(), DataType::String),
+            (&"revenue".to_owned(), DataType::Int64),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::String("west".to_owned()), Value::Int64(22)],
+            vec![Value::String("east".to_owned()), Value::Int64(4)],
+        ]
+    );
+}
+
+#[test]
+fn ctes_preserve_empty_relation_schemas() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cte_metrics (id Int64, amount Float64);
+             INSERT INTO cte_metrics VALUES (1, 2.5), (2, 3.5);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "WITH empty_metrics AS (
+            SELECT id AS metric_id, amount FROM cte_metrics WHERE id < 0
+         ),
+         empty_summary AS (
+            SELECT COUNT(*) AS rows, SUM(amount) AS total FROM empty_metrics
+         )
+         SELECT rows, total FROM empty_summary;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::Int64, DataType::Float64]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(0), Value::Float64(0.0)]]
+    );
+}
+
+#[test]
+fn cte_output_aliases_are_queryable() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cte_items (id Int64, label String);
+             INSERT INTO cte_items VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "WITH renamed AS (
+            SELECT id AS item_key, label AS item_name FROM cte_items
+         )
+         SELECT item_name AS name, item_key AS key
+         FROM renamed
+         WHERE item_key >= 2
+         ORDER BY name
+         LIMIT 1;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::String("three".to_owned()), Value::Int64(3),]]
+    );
+}
+
+#[test]
+fn ordered_ctes_can_chain_filters_ordering_and_limits() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cte_scores (id Int64, score Int64, active Bool);
+             INSERT INTO cte_scores VALUES
+                (1, 10, true), (2, 30, false), (3, 20, true), (4, 40, true);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "WITH all_scores AS (
+            SELECT id, score, active FROM cte_scores
+         ),
+         active_scores AS (
+            SELECT id, score FROM all_scores WHERE active = true
+         ),
+         top_scores AS (
+            SELECT id, score FROM active_scores ORDER BY score DESC LIMIT 2
+         )
+         SELECT id, score FROM top_scores ORDER BY id;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(3), Value::Int64(20)],
+            vec![Value::Int64(4), Value::Int64(40)],
+        ]
+    );
+}
+
+#[test]
+fn cte_scope_is_limited_to_one_statement() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cte_source (id Int64);
+             INSERT INTO cte_source VALUES (1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "WITH statement_only AS (SELECT id FROM cte_source)
+         SELECT id FROM statement_only;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
+
+    let error = database
+        .execute("SELECT id FROM statement_only;")
+        .expect_err("CTE must not enter the catalog");
+    assert!(matches!(error, Error::TableNotFound(name) if name == "statement_only"));
+}
+
+#[test]
+fn invalid_cte_references_and_ambiguous_columns_are_explicit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cte_base (id Int64, label String);
+             CREATE TABLE later (id Int64);
+             CREATE TABLE shadowed (id Int64);
+             INSERT INTO cte_base VALUES (1, 'one');",
+        )
+        .expect("setup succeeds");
+
+    let duplicate = database
+        .execute(
+            "WITH stage AS (SELECT id FROM cte_base),
+                  STAGE AS (SELECT id FROM cte_base)
+             SELECT id FROM stage;",
+        )
+        .expect_err("CTE names are case-insensitively unique");
+    assert!(
+        matches!(duplicate, Error::InvalidQuery(message) if message.contains("duplicate CTE name 'STAGE'"))
+    );
+
+    let forward = database
+        .execute(
+            "WITH first AS (SELECT id FROM later),
+                  later AS (SELECT id FROM cte_base)
+             SELECT id FROM first;",
+        )
+        .expect_err("forward references are unsupported");
+    assert!(
+        matches!(forward, Error::InvalidQuery(message) if message.contains("forward reference to CTE 'later'"))
+    );
+
+    let recursive = database
+        .execute(
+            "WITH shadowed AS (SELECT id FROM shadowed)
+             SELECT id FROM shadowed;",
+        )
+        .expect_err("a CTE shadows a catalog table and cannot recurse");
+    assert!(
+        matches!(recursive, Error::InvalidQuery(message) if message.contains("recursive reference to CTE 'shadowed'"))
+    );
+
+    let wildcard = execute_query(
+        &mut database,
+        "WITH duplicated AS (SELECT id, label AS id FROM cte_base)
+         SELECT * FROM duplicated;",
+    );
+    assert_eq!(wildcard.columns[0].name, "id");
+    assert_eq!(wildcard.columns[1].name, "id");
+
+    let ambiguous = database
+        .execute(
+            "WITH duplicated AS (SELECT id, label AS id FROM cte_base)
+             SELECT id FROM duplicated;",
+        )
+        .expect_err("a named duplicate output is ambiguous");
+    assert!(
+        matches!(ambiguous, Error::InvalidQuery(message) if message.contains("column 'id' is ambiguous in relation 'duplicated'"))
+    );
+}

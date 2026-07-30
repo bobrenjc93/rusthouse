@@ -20,12 +20,19 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub ctes: Vec<CommonTableExpression>,
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommonTableExpression {
+    pub name: String,
+    pub query: Select,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -376,11 +383,38 @@ impl Parser {
             self.parse_create()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
+        } else if self.eat_keyword("WITH") {
+            self.parse_with_select().map(Statement::Select)
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, SELECT, or WITH")
         }
+    }
+
+    fn parse_with_select(&mut self) -> Result<Select> {
+        if self.eat_keyword("RECURSIVE") {
+            return self.error("recursive CTEs are not supported");
+        }
+
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.expect_identifier("CTE name")?;
+            self.expect_keyword("AS")?;
+            self.expect(&TokenKind::LeftParen, "'(' before CTE query")?;
+            self.expect_keyword("SELECT")?;
+            let query = self.parse_select()?;
+            self.expect(&TokenKind::RightParen, "')' after CTE query")?;
+            ctes.push(CommonTableExpression { name, query });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect_keyword("SELECT")?;
+        let mut select = self.parse_select()?;
+        select.ctes = ctes;
+        Ok(select)
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -504,6 +538,7 @@ impl Parser {
         };
 
         Ok(Select {
+            ctes: Vec::new(),
             items,
             table,
             predicate,
@@ -771,6 +806,36 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_ordered_ctes() {
+        let statements = parse(
+            "WITH filtered AS (SELECT region, amount FROM sales WHERE amount > 0), \
+             totals AS (SELECT region, SUM(amount) AS total FROM filtered GROUP BY region) \
+             SELECT region, total FROM totals ORDER BY total DESC LIMIT 2",
+        )
+        .expect("valid CTE query");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(select.ctes.len(), 2);
+        assert_eq!(select.ctes[0].name, "filtered");
+        assert_eq!(select.ctes[0].query.table, "sales");
+        assert_eq!(select.ctes[1].name, "totals");
+        assert_eq!(select.ctes[1].query.table, "filtered");
+        assert_eq!(select.table, "totals");
+    }
+
+    #[test]
+    fn rejects_with_recursive_explicitly() {
+        let error = parse("WITH RECURSIVE ids AS (SELECT id FROM ids) SELECT * FROM ids")
+            .expect_err("recursive syntax is unsupported");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message == "recursive CTEs are not supported"
+        ));
     }
 
     #[test]

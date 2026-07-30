@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- ordered, non-recursive WITH ... AS (SELECT ...) CTEs with typed, statement-local results
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -28,12 +29,14 @@ cargo run -- --execute "
     ('west', 10, true),
     ('east', 4, false),
     ('west', 7, true);
-  SELECT region, COUNT(*) AS orders, SUM(amount) AS total, AVG(amount) AS mean
-  FROM sales
-  WHERE online = true
-  GROUP BY region
-  ORDER BY total DESC
-  LIMIT 10;
+  WITH online_sales AS (
+    SELECT region, amount FROM sales WHERE online = true
+  ),
+  regional AS (
+    SELECT region, COUNT(*) AS orders, SUM(amount) AS total
+    FROM online_sales GROUP BY region
+  )
+  SELECT region, orders, total FROM regional ORDER BY total DESC LIMIT 10;
 "
 ~~~
 
@@ -82,6 +85,8 @@ assert_eq!(result.rows.len(), 1);
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+
+CTEs can reference catalog tables and earlier CTEs in the same WITH list. Their names and typed rows exist only for their SELECT statement; duplicate names, forward references, recursion, and ambiguous named column references are rejected.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

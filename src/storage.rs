@@ -116,16 +116,40 @@ impl Table {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
+        Ok(Self::empty(name, schema))
+    }
+
+    pub(crate) fn from_rows(
+        name: String,
+        schema: Vec<ColumnDef>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<Self> {
+        if schema.is_empty() {
+            return Err(Error::InvalidQuery(
+                "a transient relation must contain at least one column".to_owned(),
+            ));
+        }
+        let mut table = Self::empty(name, schema);
+        for row in &rows {
+            table.validate_row(row)?;
+        }
+        for row in rows {
+            table.append_row(row);
+        }
+        Ok(table)
+    }
+
+    fn empty(name: String, schema: Vec<ColumnDef>) -> Self {
         let columns = schema
             .iter()
             .map(|field| Column::new(field.data_type))
             .collect();
-        Ok(Self {
+        Self {
             name,
             schema,
             columns,
             row_count: 0,
-        })
+        }
     }
 
     #[must_use]
@@ -149,13 +173,25 @@ impl Table {
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
-        self.schema
+        let mut matches = self
+            .schema
             .iter()
-            .position(|field| field.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| Error::ColumnNotFound {
+            .enumerate()
+            .filter(|(_, field)| field.name.eq_ignore_ascii_case(name))
+            .map(|(index, _)| index);
+        let Some(index) = matches.next() else {
+            return Err(Error::ColumnNotFound {
                 table: self.name.clone(),
                 column: name.to_owned(),
-            })
+            });
+        };
+        if matches.next().is_some() {
+            return Err(Error::InvalidQuery(format!(
+                "column '{name}' is ambiguous in relation '{}'",
+                self.name
+            )));
+        }
+        Ok(index)
     }
 
     /// Checks a row without mutating any physical column.
@@ -190,11 +226,15 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.append_row(row);
+        Ok(())
+    }
+
+    fn append_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 }
 

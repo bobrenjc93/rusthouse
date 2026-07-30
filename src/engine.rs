@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, CommonTableExpression, ComparisonOperator, Operand,
+    OrderBy, Predicate, Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -91,7 +91,36 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        if select.ctes.is_empty() {
+            let table = self.catalog.table(&select.table)?;
+            return self.execute_select_from(&select, table);
+        }
+
+        let declared_ctes = validate_cte_names(&select.ctes)?;
+        let mut cte_tables = HashMap::with_capacity(select.ctes.len());
+
+        for (position, cte) in select.ctes.iter().enumerate() {
+            let result = {
+                let source = self.resolve_cte_source(
+                    &cte.query.table,
+                    &cte_tables,
+                    &declared_ctes,
+                    position,
+                    &cte.name,
+                )?;
+                self.execute_select_from(&cte.query, source)?
+            };
+            let table = materialize_cte(&cte.name, result)?;
+            cte_tables.insert(normalize_identifier(&cte.name), table);
+        }
+
+        let table = cte_tables
+            .get(&normalize_identifier(&select.table))
+            .map_or_else(|| self.catalog.table(&select.table), Ok)?;
+        self.execute_select_from(&select, table)
+    }
+
+    fn execute_select_from(&self, select: &Select, table: &Table) -> Result<QueryResult> {
         let predicate = select
             .predicate
             .as_ref()
@@ -133,6 +162,63 @@ impl Database {
             rows,
         })
     }
+
+    fn resolve_cte_source<'a>(
+        &'a self,
+        name: &str,
+        cte_tables: &'a HashMap<String, Table>,
+        declared_ctes: &HashMap<String, usize>,
+        current_position: usize,
+        current_name: &str,
+    ) -> Result<&'a Table> {
+        let key = normalize_identifier(name);
+        if let Some(table) = cte_tables.get(&key) {
+            return Ok(table);
+        }
+        if let Some(referenced_position) = declared_ctes.get(&key) {
+            if *referenced_position == current_position {
+                return Err(Error::InvalidQuery(format!(
+                    "recursive reference to CTE '{current_name}' is not supported"
+                )));
+            }
+            return Err(Error::InvalidQuery(format!(
+                "CTE '{current_name}' has a forward reference to CTE '{name}'"
+            )));
+        }
+        self.catalog.table(name)
+    }
+}
+
+fn validate_cte_names(ctes: &[CommonTableExpression]) -> Result<HashMap<String, usize>> {
+    let mut positions = HashMap::with_capacity(ctes.len());
+    for (position, cte) in ctes.iter().enumerate() {
+        if positions
+            .insert(normalize_identifier(&cte.name), position)
+            .is_some()
+        {
+            return Err(Error::InvalidQuery(format!(
+                "duplicate CTE name '{}'",
+                cte.name
+            )));
+        }
+    }
+    Ok(positions)
+}
+
+fn materialize_cte(name: &str, result: QueryResult) -> Result<Table> {
+    let schema = result
+        .columns
+        .into_iter()
+        .map(|column| ColumnDef {
+            name: column.name,
+            data_type: column.data_type,
+        })
+        .collect();
+    Table::from_rows(name.to_owned(), schema, result.rows)
+}
+
+fn normalize_identifier(identifier: &str) -> String {
+    identifier.to_ascii_lowercase()
 }
 
 #[derive(Debug)]
