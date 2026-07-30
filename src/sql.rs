@@ -13,7 +13,12 @@ pub enum Statement {
     },
     Insert {
         table: String,
+        columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
+    },
+    AlterTableAddColumn {
+        table: String,
+        column: ColumnDef,
     },
     Select(Select),
 }
@@ -376,10 +381,12 @@ impl Parser {
             self.parse_create()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
+        } else if self.eat_keyword("ALTER") {
+            self.parse_alter()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, ALTER, or SELECT")
         }
     }
 
@@ -389,25 +396,7 @@ impl Parser {
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
-            let column_name = self.expect_identifier("column name")?;
-            if is_reserved_column_name(&column_name) {
-                return Err(Error::ReservedIdentifier {
-                    identifier: column_name,
-                    context: "column name".to_owned(),
-                });
-            }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
-            columns.push(ColumnDef {
-                name: column_name,
-                data_type,
-            });
+            columns.push(self.parse_column_definition()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -419,6 +408,19 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
+        let columns = if self.eat(&TokenKind::LeftParen) {
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.expect_identifier("insert column name")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after insert column names")?;
+            Some(columns)
+        } else {
+            None
+        };
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -438,7 +440,51 @@ impl Parser {
                 break;
             }
         }
-        Ok(Statement::Insert { table, rows })
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("ADD")?;
+        self.expect_keyword("COLUMN")?;
+        let column = self.parse_column_definition()?;
+        if column.default.is_none() {
+            return self.error("expected DEFAULT for added column");
+        }
+        Ok(Statement::AlterTableAddColumn { table, column })
+    }
+
+    fn parse_column_definition(&mut self) -> Result<ColumnDef> {
+        let name = self.expect_identifier("column name")?;
+        if is_reserved_column_name(&name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: name,
+                context: "column name".to_owned(),
+            });
+        }
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+            ),
+        })?;
+        let default = if self.eat_keyword("DEFAULT") {
+            Some(self.parse_literal()?)
+        } else {
+            None
+        };
+        Ok(ColumnDef {
+            name,
+            data_type,
+            default,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -782,6 +828,53 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_defaults_named_inserts_and_alter_add_column() {
+        let statements = parse(
+            "CREATE TABLE events (
+                id Int64,
+                score Float64 DEFAULT 1.5,
+                active Bool DEFAULT true,
+                label String DEFAULT 'new'
+             );
+             INSERT INTO events (LABEL, id) VALUES ('ready', 1);
+             ALTER TABLE events ADD COLUMN source String DEFAULT 'api';",
+        )
+        .expect("valid schema evolution SQL");
+
+        let Statement::CreateTable { columns, .. } = &statements[0] else {
+            panic!("expected create table");
+        };
+        assert_eq!(columns[0].default, None);
+        assert_eq!(columns[1].default, Some(Value::Float64(1.5)));
+        assert_eq!(columns[2].default, Some(Value::Bool(true)));
+        assert_eq!(columns[3].default, Some(Value::String("new".to_owned())));
+
+        let Statement::Insert { columns, .. } = &statements[1] else {
+            panic!("expected insert");
+        };
+        assert_eq!(
+            columns.as_deref(),
+            Some(["LABEL".to_owned(), "id".to_owned()].as_slice())
+        );
+
+        let Statement::AlterTableAddColumn { column, .. } = &statements[2] else {
+            panic!("expected alter table");
+        };
+        assert_eq!(column.name, "source");
+        assert_eq!(column.default, Some(Value::String("api".to_owned())));
+    }
+
+    #[test]
+    fn alter_add_column_requires_a_default() {
+        let error = parse("ALTER TABLE events ADD COLUMN source String")
+            .expect_err("added columns require a backfill value");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("expected DEFAULT")
+        ));
     }
 
     #[test]

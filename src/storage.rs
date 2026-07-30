@@ -1,13 +1,14 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::value::{DataType, Value, ValueRef};
 
-/// A named, typed field in a table schema.
+/// A named, typed field in a table schema with an optional insertion default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    pub default: Option<Value>,
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
@@ -86,6 +87,15 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn filled(value: &Value, len: usize) -> Self {
+        match value {
+            Value::Int64(value) => Self::Int64(vec![*value; len]),
+            Value::Float64(value) => Self::Float64(vec![*value; len]),
+            Value::Bool(value) => Self::Bool(vec![*value; len]),
+            Value::String(value) => Self::String(vec![value.clone(); len]),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -93,6 +103,7 @@ impl Column {
 pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
+    column_indices: HashMap<String, usize>,
     columns: Vec<Column>,
     row_count: usize,
 }
@@ -104,16 +115,22 @@ impl Table {
                 "a table must contain at least one column".to_owned(),
             ));
         }
-        let mut column_names = HashSet::with_capacity(schema.len());
-        for field in &schema {
+        let mut column_indices = HashMap::with_capacity(schema.len());
+        for (index, field) in schema.iter().enumerate() {
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
                     context: "column name".to_owned(),
                 });
             }
-            if !column_names.insert(field.name.to_ascii_lowercase()) {
+            if column_indices
+                .insert(field.name.to_ascii_lowercase(), index)
+                .is_some()
+            {
                 return Err(Error::DuplicateColumn(field.name.clone()));
+            }
+            if let Some(default) = &field.default {
+                validate_value(&name, field, default, true)?;
             }
         }
         let columns = schema
@@ -123,6 +140,7 @@ impl Table {
         Ok(Self {
             name,
             schema,
+            column_indices,
             columns,
             row_count: 0,
         })
@@ -149,9 +167,9 @@ impl Table {
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
-        self.schema
-            .iter()
-            .position(|field| field.name.eq_ignore_ascii_case(name))
+        self.column_indices
+            .get(&name.to_ascii_lowercase())
+            .copied()
             .ok_or_else(|| Error::ColumnNotFound {
                 table: self.name.clone(),
                 column: name.to_owned(),
@@ -169,19 +187,7 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
-                return Err(Error::TypeMismatch {
-                    context: format!("column '{}.{}'", self.name, field.name),
-                    expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
-                });
-            }
-            if matches!(value, Value::Float64(number) if !number.is_finite()) {
-                return Err(Error::InvalidQuery(format!(
-                    "column '{}.{}' cannot store a non-finite Float64",
-                    self.name, field.name
-                )));
-            }
+            validate_value(&self.name, field, value, false)?;
         }
 
         Ok(())
@@ -190,12 +196,134 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
-        for (column, value) in self.columns.iter_mut().zip(row) {
-            column.push(value);
-        }
-        self.row_count += 1;
+        self.append_validated_rows(std::iter::once(row));
         Ok(())
     }
+
+    pub(crate) fn prepare_insert_rows(
+        &self,
+        column_names: Option<&[String]>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let Some(column_names) = column_names else {
+            for row in &rows {
+                self.validate_row(row)?;
+            }
+            return Ok(rows);
+        };
+
+        let mut sources = vec![None; self.schema.len()];
+        for (source, name) in column_names.iter().enumerate() {
+            let target = self.column_index(name)?;
+            if sources[target].replace(source).is_some() {
+                return Err(Error::DuplicateColumn(name.clone()));
+            }
+        }
+
+        for (field, source) in self.schema.iter().zip(&sources) {
+            if source.is_none() && field.default.is_none() {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' must be provided because it has no DEFAULT",
+                    self.name, field.name
+                )));
+            }
+        }
+
+        for row in &rows {
+            if row.len() != column_names.len() {
+                return Err(Error::RowLength {
+                    table: self.name.clone(),
+                    expected: column_names.len(),
+                    actual: row.len(),
+                });
+            }
+        }
+
+        let mut materialized = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut input = row.into_iter().map(Some).collect::<Vec<_>>();
+            let full_row = self
+                .schema
+                .iter()
+                .zip(&sources)
+                .map(|(field, source)| match source {
+                    Some(source) => input[*source]
+                        .take()
+                        .expect("each named insert source is unique"),
+                    None => field.default.clone().expect("omitted fields have defaults"),
+                })
+                .collect::<Vec<_>>();
+            self.validate_row(&full_row)?;
+            materialized.push(full_row);
+        }
+        Ok(materialized)
+    }
+
+    pub(crate) fn append_validated_rows(&mut self, rows: impl IntoIterator<Item = Vec<Value>>) {
+        for row in rows {
+            for (column, value) in self.columns.iter_mut().zip(row) {
+                column.push(value);
+            }
+            self.row_count += 1;
+        }
+    }
+
+    pub fn add_column(&mut self, field: ColumnDef) -> Result<()> {
+        if is_reserved_column_name(&field.name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: field.name,
+                context: "column name".to_owned(),
+            });
+        }
+        let key = field.name.to_ascii_lowercase();
+        if self.column_indices.contains_key(&key) {
+            return Err(Error::DuplicateColumn(field.name));
+        }
+        let default = field.default.as_ref().ok_or_else(|| {
+            Error::InvalidQuery(format!(
+                "added column '{}.{}' requires a DEFAULT",
+                self.name, field.name
+            ))
+        })?;
+        validate_value(&self.name, &field, default, true)?;
+
+        // Complete the potentially large allocation before exposing the schema change.
+        let column = Column::filled(default, self.row_count);
+        let index = self.schema.len();
+        self.schema.reserve(1);
+        self.columns.reserve(1);
+        self.column_indices.reserve(1);
+        self.schema.push(field);
+        self.columns.push(column);
+        self.column_indices.insert(key, index);
+        Ok(())
+    }
+}
+
+fn validate_value(
+    table_name: &str,
+    field: &ColumnDef,
+    value: &Value,
+    is_default: bool,
+) -> Result<()> {
+    let context = if is_default {
+        format!("DEFAULT for column '{table_name}.{}'", field.name)
+    } else {
+        format!("column '{table_name}.{}'", field.name)
+    };
+    if field.data_type != value.data_type() {
+        return Err(Error::TypeMismatch {
+            context,
+            expected: field.data_type.to_string(),
+            actual: value.data_type().to_string(),
+        });
+    }
+    if matches!(value, Value::Float64(number) if !number.is_finite()) {
+        return Err(Error::InvalidQuery(format!(
+            "{context} cannot store a non-finite Float64"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -209,10 +337,12 @@ mod tests {
                 ColumnDef {
                     name: "id".to_owned(),
                     data_type: DataType::Int64,
+                    default: None,
                 },
                 ColumnDef {
                     name: "label".to_owned(),
                     data_type: DataType::String,
+                    default: None,
                 },
             ],
         )

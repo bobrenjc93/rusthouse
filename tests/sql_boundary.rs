@@ -346,6 +346,187 @@ fn failed_multi_row_insert_is_atomic_and_actionable() {
 }
 
 #[test]
+fn named_inserts_reorder_fields_and_fill_case_insensitive_defaults() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (
+                id Int64,
+                label String DEFAULT 'untitled',
+                active Bool DEFAULT true,
+                score Float64 DEFAULT 0.0
+             );
+             INSERT INTO EVENTS (ACTIVE, Id) VALUES (false, 2), (true, 1);
+             INSERT INTO events (score, LABEL, ID) VALUES (3.5, 'ranked', 3);",
+        )
+        .expect("named inserts succeed");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id, label, active, score FROM events ORDER BY id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::String("untitled".to_owned()),
+                Value::Bool(true),
+                Value::Float64(0.0),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("untitled".to_owned()),
+                Value::Bool(false),
+                Value::Float64(0.0),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::String("ranked".to_owned()),
+                Value::Bool(true),
+                Value::Float64(3.5),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn named_insert_rejections_are_atomic() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE items (
+                id Int64,
+                label String,
+                active Bool DEFAULT true
+             );
+             INSERT INTO items VALUES (1, 'existing', false);",
+        )
+        .expect("setup succeeds");
+
+    let duplicate = database
+        .execute("INSERT INTO items (id, ID, label) VALUES (2, 3, 'duplicate');")
+        .expect_err("column names are unique case-insensitively");
+    assert!(matches!(duplicate, Error::DuplicateColumn(name) if name == "ID"));
+
+    let missing = database
+        .execute("INSERT INTO items (id) VALUES (2);")
+        .expect_err("label has no default");
+    assert!(matches!(
+        missing,
+        Error::InvalidQuery(message)
+            if message.contains("items.label") && message.contains("no DEFAULT")
+    ));
+
+    let bad_batch = database
+        .execute(
+            "INSERT INTO items (label, id) VALUES
+                ('valid', 2),
+                ('wrong type', false);",
+        )
+        .expect_err("all rows are validated before append");
+    assert!(matches!(bad_batch, Error::TypeMismatch { .. }));
+
+    let result = execute_query(&mut database, "SELECT id, label, active FROM items;");
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(1),
+            Value::String("existing".to_owned()),
+            Value::Bool(false),
+        ]]
+    );
+}
+
+#[test]
+fn alter_add_column_backfills_large_tables_and_supplies_future_defaults() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (id Int64);")
+        .expect("create succeeds");
+
+    let row_count = 50_000;
+    let values = (0..row_count)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    database
+        .execute(&format!("INSERT INTO samples VALUES {values};"))
+        .expect("large insert succeeds");
+
+    let results = database
+        .execute("ALTER TABLE SAMPLES ADD COLUMN enabled Bool DEFAULT true;")
+        .expect("backfill succeeds");
+    assert!(matches!(
+        &results[0],
+        StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows
+        } if *affected_rows == row_count
+    ));
+
+    let table = database.catalog().table("samples").expect("table exists");
+    assert_eq!(table.schema().len(), 2);
+    assert_eq!(table.columns()[1].len(), row_count);
+    assert!(matches!(
+        &table.columns()[1],
+        rusthouse::storage::Column::Bool(values)
+            if values.iter().all(|value| *value)
+    ));
+
+    database
+        .execute("INSERT INTO samples (ID) VALUES (50000);")
+        .expect("new default applies to later partial inserts");
+    let result = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows FROM samples WHERE enabled = true;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(50_001)]]);
+}
+
+#[test]
+fn invalid_defaults_and_failed_alters_do_not_publish_schema_changes() {
+    let mut database = Database::new();
+    let create_error = database
+        .execute("CREATE TABLE invalid (id Int64 DEFAULT 'wrong');")
+        .expect_err("default must match its declared type");
+    assert!(matches!(create_error, Error::TypeMismatch { .. }));
+    assert!(matches!(
+        database.catalog().table("invalid"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    database
+        .execute(
+            "CREATE TABLE stable (id Int64);
+             INSERT INTO stable VALUES (1), (2), (3);",
+        )
+        .expect("setup succeeds");
+    let alter_error = database
+        .execute("ALTER TABLE stable ADD COLUMN label String DEFAULT false;")
+        .expect_err("backfill default has the wrong type");
+    assert!(matches!(alter_error, Error::TypeMismatch { .. }));
+
+    let table = database.catalog().table("stable").expect("table remains");
+    assert_eq!(table.schema().len(), 1);
+    assert_eq!(table.columns().len(), 1);
+    assert_eq!(table.row_count(), 3);
+
+    database
+        .execute("ALTER TABLE stable ADD COLUMN label String DEFAULT 'ok';")
+        .expect("valid alter succeeds after failure");
+    let duplicate = database
+        .execute("ALTER TABLE stable ADD COLUMN LABEL String DEFAULT 'other';")
+        .expect_err("duplicate alter is rejected case-insensitively");
+    assert!(matches!(duplicate, Error::DuplicateColumn(name) if name == "LABEL"));
+
+    let table = database.catalog().table("stable").expect("table remains");
+    assert_eq!(table.schema().len(), 2);
+    assert_eq!(table.columns().len(), 2);
+    assert_eq!(table.columns()[1].len(), 3);
+}
+
+#[test]
 fn invalid_grouping_and_aggregate_types_are_rejected() {
     let mut database = Database::new();
     database

@@ -4,8 +4,9 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- CREATE TABLE with Int64, Float64, Bool, and String columns and typed literal defaults
+- positional or named multi-row INSERT INTO ... VALUES with defaults for omitted named fields
+- ALTER TABLE ... ADD COLUMN ... DEFAULT with atomic backfill
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -16,6 +17,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+Defaults use the same exact typed literals as inserts. A named insert may omit only columns that declare a default, and duplicate target names are rejected case-insensitively.
 
 ## CLI
 
@@ -23,11 +25,12 @@ Run a batch directly:
 
 ~~~bash
 cargo run -- --execute "
-  CREATE TABLE sales (region String, amount Int64, online Bool);
-  INSERT INTO sales VALUES
-    ('west', 10, true),
-    ('east', 4, false),
-    ('west', 7, true);
+  CREATE TABLE sales (region String, amount Int64, online Bool DEFAULT true);
+  INSERT INTO sales (amount, region) VALUES
+    (10, 'west'),
+    (4, 'east');
+  INSERT INTO sales VALUES ('west', 7, true);
+  ALTER TABLE sales ADD COLUMN source String DEFAULT 'import';
   SELECT region, COUNT(*) AS orders, SUM(amount) AS total, AVG(amount) AS mean
   FROM sales
   WHERE online = true
@@ -81,7 +84,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. ALTER TABLE currently supports only adding a column with a literal default. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

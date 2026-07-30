@@ -69,20 +69,29 @@ impl Database {
                     affected_rows: 0,
                 })
             }
-            Statement::Insert { table, rows } => {
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
                 let affected_rows = rows.len();
-                {
+                let rows = {
                     let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
+                    target.prepare_insert_rows(columns.as_deref(), rows)?
+                };
                 let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                target.append_validated_rows(rows);
                 Ok(StatementResult::Command {
                     tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::AlterTableAddColumn { table, column } => {
+                let target = self.catalog.table_mut(&table)?;
+                let affected_rows = target.row_count();
+                target.add_column(column)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
                     affected_rows,
                 })
             }
