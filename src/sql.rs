@@ -23,9 +23,17 @@ pub struct Select {
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
-    pub group_by: Vec<String>,
+    pub group_by: Option<GroupBy>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupBy {
+    Columns(Vec<String>),
+    GroupingSets(Vec<Vec<String>>),
+    Rollup(Vec<String>),
+    Cube(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +46,10 @@ pub enum SelectItem {
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
+        alias: Option<String>,
+    },
+    Grouping {
+        arguments: Vec<String>,
         alias: Option<String>,
     },
 }
@@ -460,16 +472,12 @@ impl Parser {
             None
         };
 
-        let mut group_by = Vec::new();
-        if self.eat_keyword("GROUP") {
+        let group_by = if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
-            loop {
-                group_by.push(self.expect_identifier("GROUP BY column")?);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
+            Some(self.parse_group_by()?)
+        } else {
+            None
+        };
 
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
@@ -521,6 +529,18 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
+            if name.eq_ignore_ascii_case("GROUPING") {
+                let mut arguments = Vec::new();
+                loop {
+                    arguments.push(self.expect_identifier("GROUPING column")?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RightParen, "')' after GROUPING arguments")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Grouping { arguments, alias });
+            }
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -541,6 +561,79 @@ impl Parser {
             let alias = self.parse_alias()?;
             Ok(SelectItem::Column { name, alias })
         }
+    }
+
+    fn parse_group_by(&mut self) -> Result<GroupBy> {
+        if self.at_keyword("GROUPING") && self.keyword_at(1, "SETS") {
+            self.current += 2;
+            self.expect(&TokenKind::LeftParen, "'(' after GROUPING SETS")?;
+            let mut sets = Vec::new();
+            loop {
+                self.expect(&TokenKind::LeftParen, "'(' before grouping set")?;
+                let mut columns = Vec::new();
+                if !self.at(&TokenKind::RightParen) {
+                    loop {
+                        columns.push(self.expect_identifier("grouping set column")?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RightParen, "')' after grouping set")?;
+                sets.push(columns);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after GROUPING SETS")?;
+            return Ok(GroupBy::GroupingSets(sets));
+        }
+
+        if self.at_keyword("ROLLUP") && self.token_at(1) == Some(&TokenKind::LeftParen) {
+            self.current += 1;
+            return self.parse_grouping_columns("ROLLUP").map(GroupBy::Rollup);
+        }
+        if self.at_keyword("CUBE") && self.token_at(1) == Some(&TokenKind::LeftParen) {
+            self.current += 1;
+            return self.parse_grouping_columns("CUBE").map(GroupBy::Cube);
+        }
+
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_identifier("GROUP BY column")?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        if self.eat_keyword("WITH") {
+            if self.eat_keyword("ROLLUP") {
+                Ok(GroupBy::Rollup(columns))
+            } else if self.eat_keyword("CUBE") {
+                Ok(GroupBy::Cube(columns))
+            } else {
+                self.error("expected ROLLUP or CUBE after WITH")
+            }
+        } else {
+            Ok(GroupBy::Columns(columns))
+        }
+    }
+
+    fn parse_grouping_columns(&mut self, construct: &str) -> Result<Vec<String>> {
+        self.expect(&TokenKind::LeftParen, &format!("'(' after {construct}"))?;
+        let mut columns = Vec::new();
+        if !self.at(&TokenKind::RightParen) {
+            loop {
+                columns.push(self.expect_identifier("grouping column")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(
+            &TokenKind::RightParen,
+            &format!("')' after {construct} columns"),
+        )?;
+        Ok(columns)
     }
 
     fn parse_alias(&mut self) -> Result<Option<String>> {
@@ -686,13 +779,29 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.at_keyword(expected) {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        self.keyword_at(0, expected)
+    }
+
+    fn keyword_at(&self, offset: usize, expected: &str) -> bool {
+        matches!(
+            self.token_at(offset),
+            Some(TokenKind::Identifier(value)) if value.eq_ignore_ascii_case(expected)
+        )
+    }
+
+    fn token_at(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| &token.kind)
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
@@ -767,7 +876,10 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(select.items.len(), 2);
-        assert_eq!(select.group_by, ["region"]);
+        assert_eq!(
+            select.group_by,
+            Some(GroupBy::Columns(vec!["region".to_owned()]))
+        );
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
@@ -782,6 +894,35 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_grouping_extensions() {
+        let statements = parse(
+            "SELECT region, product, GROUPING(region, product) AS level, SUM(amount)
+             FROM sales
+             GROUP BY GROUPING SETS ((region, product), (region), ());",
+        )
+        .expect("valid grouping sets query");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(matches!(select.items[2], SelectItem::Grouping { .. }));
+        assert_eq!(
+            select.group_by,
+            Some(GroupBy::GroupingSets(vec![
+                vec!["region".to_owned(), "product".to_owned()],
+                vec!["region".to_owned()],
+                vec![],
+            ]))
+        );
+
+        let statements = parse("SELECT COUNT(*) FROM sales GROUP BY region, product WITH ROLLUP")
+            .expect("ClickHouse suffix syntax is valid");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(matches!(select.group_by, Some(GroupBy::Rollup(_))));
     }
 
     #[test]

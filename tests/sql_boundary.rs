@@ -311,6 +311,273 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn rollup_emits_totals_with_typed_defaults_and_grouping_masks() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE rollup_sales (region String, active Bool, amount Int64);
+             INSERT INTO rollup_sales VALUES
+                ('', false, 2),
+                ('west', true, 3),
+                ('west', false, 5);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region,
+                active,
+                GROUPING(region, active) AS level,
+                GROUPING(active, region) AS reverse_level,
+                COUNT(*) AS rows,
+                SUM(amount) AS total,
+                SUM(amount) AS repeated_total
+         FROM rollup_sales
+         GROUP BY ROLLUP(region, active)
+         ORDER BY level, region, active;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("".to_owned()),
+                Value::Bool(false),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(false),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(1),
+                Value::Int64(5),
+                Value::Int64(5),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(true),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(1),
+                Value::Int64(3),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::String("".to_owned()),
+                Value::Bool(false),
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(false),
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(8),
+                Value::Int64(8),
+            ],
+            vec![
+                Value::String("".to_owned()),
+                Value::Bool(false),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Int64(10),
+                Value::Int64(10),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn grouping_sets_deduplicate_equivalent_sets() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE set_sales (region String, active Bool);
+             INSERT INTO set_sales VALUES ('west', true), ('west', false);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region, active, GROUPING(region, active) AS level, COUNT(*) AS rows
+         FROM set_sales
+         GROUP BY GROUPING SETS (
+            (region, active), (active, region),
+            (region), (region), (), ()
+         )
+         ORDER BY level, region, active;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(false),
+                Value::Int64(0),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(true),
+                Value::Int64(0),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(false),
+                Value::Int64(1),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("".to_owned()),
+                Value::Bool(false),
+                Value::Int64(3),
+                Value::Int64(2),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn grouping_construct_names_remain_valid_column_names() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE grouping_names (rollup Int64, cube Int64, grouping Int64);
+             INSERT INTO grouping_names VALUES (1, 2, 3), (1, 4, 5);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT rollup, COUNT(*) AS rows
+         FROM grouping_names GROUP BY rollup;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(1), Value::Int64(2)]]);
+}
+
+#[test]
+fn cube_ordering_and_limit_apply_to_all_generated_groups() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cube_sales (bucket Int64, ratio Float64, amount Int64);
+             INSERT INTO cube_sales VALUES (1, 1.5, 2), (1, 2.5, 3);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT bucket, ratio, GROUPING(bucket, ratio) AS level, SUM(amount) AS total
+         FROM cube_sales
+         GROUP BY CUBE(bucket, ratio)
+         ORDER BY level, bucket, ratio
+         LIMIT 4;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Float64(1.5),
+                Value::Int64(0),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Float64(2.5),
+                Value::Int64(0),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Float64(0.0),
+                Value::Int64(1),
+                Value::Int64(5),
+            ],
+            vec![
+                Value::Int64(0),
+                Value::Float64(1.5),
+                Value::Int64(2),
+                Value::Int64(2),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn empty_cube_keeps_only_its_grand_total() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE empty_cube (region String, active Bool, amount Int64);")
+        .expect("create succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region, active, GROUPING(region, active) AS level,
+                COUNT(*) AS rows, SUM(amount) AS total
+         FROM empty_cube
+         GROUP BY CUBE(region, active);",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::String("".to_owned()),
+            Value::Bool(false),
+            Value::Int64(3),
+            Value::Int64(0),
+            Value::Int64(0),
+        ]]
+    );
+}
+
+#[test]
+fn cube_generation_and_subtotal_arithmetic_are_bounded() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE wide_cube (
+                c0 Int64, c1 Int64, c2 Int64, c3 Int64,
+                c4 Int64, c5 Int64, c6 Int64, c7 Int64
+             );
+             CREATE TABLE overflow_sales (key String, amount Int64);
+             INSERT INTO overflow_sales VALUES ('a', 9223372036854775807), ('b', 1);",
+        )
+        .expect("setup succeeds");
+
+    let cube_error = database
+        .execute(
+            "SELECT COUNT(*) FROM wide_cube
+             GROUP BY CUBE(c0, c1, c2, c3, c4, c5, c6, c7);",
+        )
+        .expect_err("eight dimensions generate too many sets");
+    assert!(matches!(cube_error, Error::InvalidQuery(message)
+            if message.contains("CUBE exceeds the limit of 128 grouping sets")));
+
+    let overflow = database
+        .execute(
+            "SELECT key, SUM(amount) FROM overflow_sales
+             GROUP BY ROLLUP(key);",
+        )
+        .expect_err("the grand total overflows even though leaf groups do not");
+    assert_eq!(overflow, Error::NumericOverflow("SUM(Int64)".to_owned()));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database

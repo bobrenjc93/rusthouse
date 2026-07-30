@@ -21,6 +21,15 @@ impl DataType {
             _ => None,
         }
     }
+
+    pub(crate) fn default_value_ref(self) -> ValueRef<'static> {
+        match self {
+            Self::Int64 => ValueRef::Int64(0),
+            Self::Float64 => ValueRef::Float64(0.0),
+            Self::Bool => ValueRef::Bool(false),
+            Self::String => ValueRef::String(""),
+        }
+    }
 }
 
 impl fmt::Display for DataType {

@@ -10,7 +10,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
-- GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- GROUP BY with GROUPING SETS, ROLLUP, bounded CUBE, and GROUPING(...) masks
+- output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -56,6 +57,19 @@ printf '%s\n' \
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
+
+## Subtotals
+
+GROUPING SETS, ROLLUP, and CUBE use ClickHouse-style default fillers for columns omitted from a subtotal: `0`, `0.0`, `false`, or the empty string according to the declared type. `GROUPING(a, b)` distinguishes those fillers from stored values; its last argument is the low bit. Equivalent GROUPING SETS entries are evaluated once.
+
+~~~sql
+SELECT region, product, GROUPING(region, product) AS level, SUM(amount) AS total
+FROM sales
+GROUP BY ROLLUP(region, product)
+ORDER BY level, region, product;
+~~~
+
+The functional `ROLLUP(...)` and `CUBE(...)` forms and ClickHouse's `GROUP BY a, b WITH ROLLUP` / `WITH CUBE` forms are accepted. A query may produce at most 128 unique grouping sets, so CUBE supports up to seven dimensions.
 
 ## Library API
 

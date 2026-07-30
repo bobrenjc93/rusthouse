@@ -1,14 +1,17 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, GroupBy, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
+
+const MAX_GROUPING_SETS: usize = 128;
+const MAX_GROUPING_ARGUMENTS: usize = 63;
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
@@ -106,23 +109,25 @@ impl Database {
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let grouping = resolve_grouping(table, select.group_by.as_ref())?;
         let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
+            resolve_select_items(table, &select.items, &grouping)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        let grouped = grouping.explicit || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(table, &matching_rows, &grouping, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
+                table,
+                &grouping,
                 &items,
                 &ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
+            grouped.project(&selected_groups, table, &grouping, &items)
         } else {
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
@@ -144,16 +149,80 @@ enum ResolvedItem {
     Aggregate {
         state: usize,
     },
+    Grouping {
+        group_positions: Box<[usize]>,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
+#[derive(Debug)]
+struct ResolvedGrouping {
+    columns: Vec<usize>,
+    sets: Vec<ResolvedGroupingSet>,
+    explicit: bool,
+}
+
+#[derive(Debug)]
+struct ResolvedGroupingSet {
+    columns: Vec<usize>,
+    positions: Vec<Option<usize>>,
+}
+
+fn resolve_grouping(table: &Table, requested: Option<&GroupBy>) -> Result<ResolvedGrouping> {
+    let Some(requested) = requested else {
+        return Ok(build_grouping(Vec::new(), vec![Vec::new()], false));
+    };
+
+    match requested {
+        GroupBy::Columns(names) => {
+            let columns = resolve_unique_group_columns(table, names)?;
+            let all = (0..columns.len()).collect();
+            Ok(build_grouping(columns, vec![all], true))
+        }
+        GroupBy::Rollup(names) => {
+            let columns = resolve_unique_group_columns(table, names)?;
+            let sets = (0..=columns.len())
+                .rev()
+                .map(|length| (0..length).collect())
+                .collect();
+            Ok(build_grouping(columns, sets, true))
+        }
+        GroupBy::Cube(names) => {
+            let columns = resolve_unique_group_columns(table, names)?;
+            let set_count = if columns.len() >= usize::BITS as usize {
+                None
+            } else {
+                Some(1_usize << columns.len())
+            };
+            let Some(set_count) = set_count.filter(|count| *count <= MAX_GROUPING_SETS) else {
+                return Err(too_many_grouping_sets("CUBE"));
+            };
+            let sets = (0..set_count)
+                .rev()
+                .map(|mask| {
+                    (0..columns.len())
+                        .filter(|position| {
+                            let bit = columns.len() - position - 1;
+                            mask & (1 << bit) != 0
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(build_grouping(columns, sets, true))
+        }
+        GroupBy::GroupingSets(requested_sets) => {
+            resolve_explicit_grouping_sets(table, requested_sets)
+        }
+    }
+}
+
+fn resolve_unique_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
     for name in names {
         let column = table.column_index(name)?;
@@ -167,11 +236,99 @@ fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> 
     Ok(columns)
 }
 
+fn resolve_explicit_grouping_sets(
+    table: &Table,
+    requested_sets: &[Vec<String>],
+) -> Result<ResolvedGrouping> {
+    let mut columns = Vec::new();
+    let mut source_sets = Vec::with_capacity(requested_sets.len());
+    for requested_set in requested_sets {
+        let mut source_set = Vec::with_capacity(requested_set.len());
+        for name in requested_set {
+            let source = table.column_index(name)?;
+            if source_set.contains(&source) {
+                return Err(Error::InvalidQuery(format!(
+                    "GROUP BY column '{name}' is listed more than once within a grouping set"
+                )));
+            }
+            source_set.push(source);
+            if !columns.contains(&source) {
+                columns.push(source);
+            }
+        }
+        source_sets.push(source_set);
+    }
+
+    let position_sets = source_sets
+        .into_iter()
+        .map(|source_set| {
+            let mut positions = source_set
+                .into_iter()
+                .map(|source| {
+                    columns
+                        .iter()
+                        .position(|column| *column == source)
+                        .expect("grouping set columns form the grouping universe")
+                })
+                .collect::<Vec<_>>();
+            positions.sort_unstable();
+            positions
+        })
+        .collect();
+    Ok(build_grouping(columns, position_sets, true))
+}
+
+fn build_grouping(
+    columns: Vec<usize>,
+    position_sets: Vec<Vec<usize>>,
+    explicit: bool,
+) -> ResolvedGrouping {
+    let mut seen = HashSet::with_capacity(position_sets.len());
+    let mut sets = Vec::new();
+    for positions in position_sets {
+        if seen.insert(positions.clone()) {
+            let mut projected_positions = vec![None; columns.len()];
+            let set_columns = positions
+                .iter()
+                .enumerate()
+                .map(|(set_position, group_position)| {
+                    projected_positions[*group_position] = Some(set_position);
+                    columns[*group_position]
+                })
+                .collect();
+            sets.push(ResolvedGroupingSet {
+                columns: set_columns,
+                positions: projected_positions,
+            });
+        }
+    }
+    ResolvedGrouping {
+        columns,
+        sets,
+        explicit,
+    }
+}
+
+fn validate_grouping_set_count(grouping: &ResolvedGrouping) -> Result<()> {
+    if grouping.sets.len() > MAX_GROUPING_SETS {
+        Err(too_many_grouping_sets("GROUPING SETS"))
+    } else {
+        Ok(())
+    }
+}
+
+fn too_many_grouping_sets(construct: &str) -> Error {
+    Error::InvalidQuery(format!(
+        "{construct} exceeds the limit of {MAX_GROUPING_SETS} grouping sets"
+    ))
+}
+
 fn resolve_select_items(
     table: &Table,
     requested: &[SelectItem],
-    group_columns: &[usize],
+    grouping: &ResolvedGrouping,
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+    validate_grouping_set_count(grouping)?;
     let has_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
@@ -193,8 +350,9 @@ fn resolve_select_items(
         match requested_item {
             SelectItem::Wildcard => {
                 for (source, field) in table.schema().iter().enumerate() {
-                    let group_position = group_columns.iter().position(|column| *column == source);
-                    if !group_columns.is_empty() && group_position.is_none() {
+                    let group_position =
+                        grouping.columns.iter().position(|column| *column == source);
+                    if grouping.explicit && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
                             field.name
@@ -212,8 +370,8 @@ fn resolve_select_items(
             }
             SelectItem::Column { name, alias } => {
                 let source = table.column_index(name)?;
-                let group_position = group_columns.iter().position(|column| *column == source);
-                if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
+                let group_position = grouping.columns.iter().position(|column| *column == source);
+                if (has_aggregate || grouping.explicit) && group_position.is_none() {
                     return Err(Error::InvalidQuery(format!(
                         "column '{name}' must appear in GROUP BY"
                     )));
@@ -254,11 +412,18 @@ fn resolve_select_items(
                     }
                 };
                 validate_aggregate(*function, input_type)?;
-                let state = aggregate_specs.len();
-                aggregate_specs.push(AggregateSpec {
+                let spec = AggregateSpec {
                     function: *function,
                     argument: argument_index,
                     input_type,
+                };
+                let state = aggregate_specs
+                    .iter()
+                    .position(|existing| *existing == spec);
+                let state = state.unwrap_or_else(|| {
+                    let state = aggregate_specs.len();
+                    aggregate_specs.push(spec);
+                    state
                 });
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
@@ -266,6 +431,46 @@ fn resolve_select_items(
                         .clone()
                         .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
                     data_type: aggregate_output_type(*function, input_type),
+                });
+            }
+            SelectItem::Grouping { arguments, alias } => {
+                if !grouping.explicit {
+                    return Err(Error::InvalidQuery(
+                        "GROUPING(...) requires a GROUP BY clause".to_owned(),
+                    ));
+                }
+                if arguments.len() > MAX_GROUPING_ARGUMENTS {
+                    return Err(Error::InvalidQuery(format!(
+                        "GROUPING(...) supports at most {MAX_GROUPING_ARGUMENTS} arguments"
+                    )));
+                }
+                let mut group_positions = Vec::with_capacity(arguments.len());
+                let mut argument_names = Vec::with_capacity(arguments.len());
+                for name in arguments {
+                    let source = table.column_index(name)?;
+                    let Some(position) =
+                        grouping.columns.iter().position(|column| *column == source)
+                    else {
+                        return Err(Error::InvalidQuery(format!(
+                            "GROUPING column '{name}' must appear in GROUP BY"
+                        )));
+                    };
+                    if group_positions.contains(&position) {
+                        return Err(Error::InvalidQuery(format!(
+                            "GROUPING column '{name}' is listed more than once"
+                        )));
+                    }
+                    group_positions.push(position);
+                    argument_names.push(table.schema()[source].name.clone());
+                }
+                items.push(ResolvedItem::Grouping {
+                    group_positions: group_positions.into_boxed_slice(),
+                });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("GROUPING({})", argument_names.join(", "))),
+                    data_type: DataType::Int64,
                 });
             }
         }
@@ -310,8 +515,8 @@ fn execute_projection(
                 .iter()
                 .map(|item| match item {
                     ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
+                    ResolvedItem::Aggregate { .. } | ResolvedItem::Grouping { .. } => {
+                        unreachable!("projection does not contain grouped expressions")
                     }
                 })
                 .collect()
@@ -322,9 +527,30 @@ fn execute_projection(
 fn execute_grouped<'a>(
     table: &'a Table,
     matching_rows: &[usize],
-    group_columns: &[usize],
+    grouping: &ResolvedGrouping,
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
+    let mut rows = Vec::new();
+    let mut aggregates = vec![Vec::new(); aggregate_specs.len()];
+    for (set_index, grouping_set) in grouping.sets.iter().enumerate() {
+        let (keys, set_aggregates) =
+            execute_grouping_set(table, matching_rows, &grouping_set.columns, aggregate_specs)?;
+        let group_count = keys.len();
+        rows.extend(keys.into_iter().map(|key| GroupedRow { key, set_index }));
+        for (all_values, set_values) in aggregates.iter_mut().zip(set_aggregates) {
+            debug_assert_eq!(set_values.len(), group_count);
+            all_values.extend(set_values);
+        }
+    }
+    Ok(GroupedData { rows, aggregates })
+}
+
+fn execute_grouping_set<'a>(
+    table: &'a Table,
+    matching_rows: &[usize],
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+) -> Result<(Vec<GroupKey<'a>>, Vec<Vec<Value>>)> {
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
     let initial_capacity = matching_rows.len().min(1_024);
@@ -363,7 +589,7 @@ fn execute_grouped<'a>(
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(GroupedData { keys, aggregates })
+    Ok((keys, aggregates))
 }
 
 #[derive(Debug)]
@@ -486,17 +712,29 @@ impl GroupKey<'_> {
 }
 
 #[derive(Debug)]
+struct GroupedRow<'a> {
+    key: GroupKey<'a>,
+    set_index: usize,
+}
+
+#[derive(Debug)]
 struct GroupedData<'a> {
-    keys: Vec<GroupKey<'a>>,
+    rows: Vec<GroupedRow<'a>>,
     aggregates: Vec<Vec<Value>>,
 }
 
 impl GroupedData<'_> {
     fn len(&self) -> usize {
-        self.keys.len()
+        self.rows.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
+    fn project(
+        &self,
+        selected: &[usize],
+        table: &Table,
+        grouping: &ResolvedGrouping,
+        items: &[ResolvedItem],
+    ) -> Vec<Vec<Value>> {
         selected
             .iter()
             .map(|group| {
@@ -506,7 +744,7 @@ impl GroupedData<'_> {
                         ResolvedItem::Column {
                             group_position: Some(position),
                             ..
-                        } => self.keys[*group].value(*position).to_owned(),
+                        } => self.group_value(*group, *position, table, grouping),
                         ResolvedItem::Column {
                             group_position: None,
                             ..
@@ -514,10 +752,63 @@ impl GroupedData<'_> {
                         ResolvedItem::Aggregate { state } => {
                             self.aggregates[*state][*group].clone()
                         }
+                        ResolvedItem::Grouping { group_positions } => {
+                            Value::Int64(self.grouping_mask(*group, group_positions, grouping))
+                        }
                     })
                     .collect()
             })
             .collect()
+    }
+
+    fn group_value(
+        &self,
+        group: usize,
+        group_position: usize,
+        table: &Table,
+        grouping: &ResolvedGrouping,
+    ) -> Value {
+        self.group_value_ref(group, group_position, table, grouping)
+            .to_owned()
+    }
+
+    fn group_value_ref<'a>(
+        &'a self,
+        group: usize,
+        group_position: usize,
+        table: &'a Table,
+        grouping: &ResolvedGrouping,
+    ) -> ValueRef<'a> {
+        let row = &self.rows[group];
+        let set = &grouping.sets[row.set_index];
+        if let Some(set_position) = set.positions[group_position] {
+            row.key.value(set_position)
+        } else {
+            table.schema()[grouping.columns[group_position]]
+                .data_type
+                .default_value_ref()
+        }
+    }
+
+    fn grouping_mask(
+        &self,
+        group: usize,
+        group_positions: &[usize],
+        grouping: &ResolvedGrouping,
+    ) -> i64 {
+        let set = &grouping.sets[self.rows[group].set_index];
+        group_positions.iter().fold(0_i64, |mask, position| {
+            (mask << 1) | i64::from(set.positions[*position].is_none())
+        })
+    }
+
+    fn fallback_cmp(&self, left: usize, right: usize) -> Ordering {
+        let left_row = &self.rows[left];
+        let right_row = &self.rows[right];
+        left_row
+            .set_index
+            .cmp(&right_row.set_index)
+            .then_with(|| left_row.key.cmp(&right_row.key))
     }
 }
 
@@ -718,6 +1009,8 @@ fn order_source_rows(
 fn order_grouped_rows(
     groups: &mut Vec<usize>,
     data: &GroupedData<'_>,
+    table: &Table,
+    grouping: &ResolvedGrouping,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
@@ -728,9 +1021,9 @@ fn order_grouped_rows(
                 ResolvedItem::Column {
                     group_position: Some(position),
                     ..
-                } => data.keys[left]
-                    .value(position)
-                    .cmp(&data.keys[right].value(position)),
+                } => data
+                    .group_value_ref(left, position, table, grouping)
+                    .cmp(&data.group_value_ref(right, position, table, grouping)),
                 ResolvedItem::Column {
                     group_position: None,
                     ..
@@ -738,6 +1031,11 @@ fn order_grouped_rows(
                 ResolvedItem::Aggregate { state } => {
                     data.aggregates[state][left].cmp(&data.aggregates[state][right])
                 }
+                ResolvedItem::Grouping {
+                    ref group_positions,
+                } => data
+                    .grouping_mask(left, group_positions, grouping)
+                    .cmp(&data.grouping_mask(right, group_positions, grouping)),
             };
             if comparison != Ordering::Equal {
                 return if order.descending {
@@ -747,7 +1045,7 @@ fn order_grouped_rows(
                 };
             }
         }
-        data.keys[left].cmp(&data.keys[right])
+        data.fallback_cmp(left, right)
     });
 }
 
