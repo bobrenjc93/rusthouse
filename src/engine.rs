@@ -722,24 +722,28 @@ fn resolve_ordering(
 ) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let alias_matches = match &order.expression {
-            Expression::Column(name) => columns
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
+        let alias_name = match &order.expression {
+            Expression::Column(name) => Some(name.as_str()),
+            Expression::Literal(Value::Bool(true)) => Some("true"),
+            Expression::Literal(Value::Bool(false)) => Some("false"),
+            _ => None,
         };
+        let alias_matches = alias_name
+            .map(|name| {
+                columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let target = match alias_matches.as_slice() {
             [index] => ResolvedOrderTarget::Output(*index),
             [_, _, ..] => {
-                let Expression::Column(name) = &order.expression else {
-                    unreachable!("only column-shaped ORDER BY expressions resolve aliases")
-                };
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY name '{}' is ambiguous",
-                    name
+                    alias_name.expect("alias matches require an alias-shaped expression")
                 )));
             }
             [] => {

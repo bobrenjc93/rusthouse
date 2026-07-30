@@ -524,8 +524,16 @@ fn round_int(value: i64, precision: i64) -> Result<i64> {
 }
 
 fn round_float(value: f64, precision: i64) -> Result<Value> {
-    let result = if precision > 308 {
+    let result = if precision > 323 {
         value
+    } else if precision > 308 {
+        let quantum = 1e-308 / 10_f64.powi((precision - 308) as i32);
+        let scaled = value / quantum;
+        if scaled.is_finite() {
+            scaled.round() * quantum
+        } else {
+            value
+        }
     } else if precision < -308 {
         0.0_f64.copysign(value)
     } else if precision >= 0 {

@@ -637,9 +637,12 @@ fn casts_unicode_and_substring_boundaries_are_defined() {
         &mut database,
         "SELECT ROUND(12345, -2), ROUND(-125, -1), ROUND(1.235, 2),
                 ROUND(1.25, 309), ROUND(-1.25, -309),
-                ROUND(-9223372036854775808, -20)
+                ROUND(-9223372036854775808, -20),
+                ROUND(1e-310, 309), ROUND(6e-310, 309),
+                ROUND(-6e-310, 309), ROUND(1e-310, 324)
          FROM one;",
     );
+    let quantum_309 = 1e-308 / 10.0;
     assert_eq!(
         rounding.rows,
         vec![vec![
@@ -649,6 +652,10 @@ fn casts_unicode_and_substring_boundaries_are_defined() {
             Value::Float64(1.25),
             Value::Float64(-0.0),
             Value::Int64(0),
+            Value::Float64(0.0),
+            Value::Float64(quantum_309),
+            Value::Float64(-quantum_309),
+            Value::Float64(1e-310),
         ]]
     );
 }
@@ -745,4 +752,41 @@ fn ordering_expressions_need_not_be_projected_and_grouping_is_strict() {
         error,
         Error::InvalidQuery(message) if message.contains("must appear in GROUP BY")
     ));
+}
+
+#[test]
+fn boolean_named_aliases_resolve_in_order_by() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE alias_ordering (n Int64);
+             INSERT INTO alias_ordering VALUES (2), (1), (3);",
+        )
+        .expect("setup succeeds");
+
+    let ascending = execute_query(
+        &mut database,
+        "SELECT n AS true FROM alias_ordering ORDER BY true;",
+    );
+    assert_eq!(
+        ascending.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+
+    let descending = execute_query(
+        &mut database,
+        "SELECT n AS false FROM alias_ordering ORDER BY false DESC;",
+    );
+    assert_eq!(
+        descending.rows,
+        vec![
+            vec![Value::Int64(3)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(1)],
+        ]
+    );
 }
