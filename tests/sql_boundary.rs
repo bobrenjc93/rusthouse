@@ -578,6 +578,64 @@ fn cube_generation_and_subtotal_arithmetic_are_bounded() {
 }
 
 #[test]
+fn grouping_set_limits_are_enforced_before_wide_expansion() {
+    let definitions = (0..128)
+        .map(|index| format!("c{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+    database
+        .execute(&format!("CREATE TABLE rollup_limits ({definitions})"))
+        .expect("wide table is valid");
+
+    let accepted_columns = (0..127)
+        .map(|index| format!("c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let accepted = execute_query(
+        &mut database,
+        &format!(
+            "SELECT COUNT(*) AS rows FROM rollup_limits
+             GROUP BY ROLLUP({accepted_columns})"
+        ),
+    );
+    assert_eq!(accepted.rows, vec![vec![Value::Int64(0)]]);
+
+    let rejected_columns = (0..128)
+        .map(|index| format!("c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rollup_error = database
+        .execute(&format!(
+            "SELECT COUNT(*) FROM rollup_limits
+             GROUP BY ROLLUP({rejected_columns})"
+        ))
+        .expect_err("128 dimensions would generate 129 rollup sets");
+    assert!(matches!(rollup_error, Error::InvalidQuery(message)
+            if message.contains("ROLLUP exceeds the limit of 128 grouping sets")));
+
+    let grouping_sets = (0..129_usize)
+        .map(|mask| {
+            let columns = (0..8)
+                .filter(|bit| mask & (1 << bit) != 0)
+                .map(|bit| format!("c{bit}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({columns})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let explicit_error = database
+        .execute(&format!(
+            "SELECT COUNT(*) FROM rollup_limits
+             GROUP BY GROUPING SETS ({grouping_sets})"
+        ))
+        .expect_err("the 129th unique explicit set is rejected during resolution");
+    assert!(matches!(explicit_error, Error::InvalidQuery(message)
+            if message.contains("GROUPING SETS exceeds the limit of 128 grouping sets")));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database

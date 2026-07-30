@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -186,23 +186,28 @@ fn resolve_grouping(table: &Table, requested: Option<&GroupBy>) -> Result<Resolv
             Ok(build_grouping(columns, vec![all], true))
         }
         GroupBy::Rollup(names) => {
+            let Some(set_count) = names.len().checked_add(1) else {
+                return Err(too_many_grouping_sets("ROLLUP"));
+            };
+            enforce_grouping_set_count("ROLLUP", set_count)?;
             let columns = resolve_unique_group_columns(table, names)?;
-            let sets = (0..=columns.len())
+            let sets = (0..set_count)
                 .rev()
                 .map(|length| (0..length).collect())
                 .collect();
             Ok(build_grouping(columns, sets, true))
         }
         GroupBy::Cube(names) => {
-            let columns = resolve_unique_group_columns(table, names)?;
-            let set_count = if columns.len() >= usize::BITS as usize {
+            let set_count = if names.len() >= usize::BITS as usize {
                 None
             } else {
-                Some(1_usize << columns.len())
+                Some(1_usize << names.len())
             };
-            let Some(set_count) = set_count.filter(|count| *count <= MAX_GROUPING_SETS) else {
+            let Some(set_count) = set_count else {
                 return Err(too_many_grouping_sets("CUBE"));
             };
+            enforce_grouping_set_count("CUBE", set_count)?;
+            let columns = resolve_unique_group_columns(table, names)?;
             let sets = (0..set_count)
                 .rev()
                 .map(|mask| {
@@ -241,7 +246,9 @@ fn resolve_explicit_grouping_sets(
     requested_sets: &[Vec<String>],
 ) -> Result<ResolvedGrouping> {
     let mut columns = Vec::new();
-    let mut source_sets = Vec::with_capacity(requested_sets.len());
+    let mut column_positions = HashMap::new();
+    let mut seen_sets = HashSet::new();
+    let mut source_sets = Vec::with_capacity(requested_sets.len().min(MAX_GROUPING_SETS));
     for requested_set in requested_sets {
         let mut source_set = Vec::with_capacity(requested_set.len());
         for name in requested_set {
@@ -252,11 +259,20 @@ fn resolve_explicit_grouping_sets(
                 )));
             }
             source_set.push(source);
-            if !columns.contains(&source) {
-                columns.push(source);
-            }
         }
-        source_sets.push(source_set);
+
+        let mut canonical_set = source_set.clone();
+        canonical_set.sort_unstable();
+        if seen_sets.insert(canonical_set.clone()) {
+            enforce_grouping_set_count("GROUPING SETS", seen_sets.len())?;
+            for source in source_set {
+                if let Entry::Vacant(entry) = column_positions.entry(source) {
+                    entry.insert(columns.len());
+                    columns.push(source);
+                }
+            }
+            source_sets.push(canonical_set);
+        }
     }
 
     let position_sets = source_sets
@@ -265,9 +281,9 @@ fn resolve_explicit_grouping_sets(
             let mut positions = source_set
                 .into_iter()
                 .map(|source| {
-                    columns
-                        .iter()
-                        .position(|column| *column == source)
+                    column_positions
+                        .get(&source)
+                        .copied()
                         .expect("grouping set columns form the grouping universe")
                 })
                 .collect::<Vec<_>>();
@@ -283,6 +299,7 @@ fn build_grouping(
     position_sets: Vec<Vec<usize>>,
     explicit: bool,
 ) -> ResolvedGrouping {
+    debug_assert!(position_sets.len() <= MAX_GROUPING_SETS);
     let mut seen = HashSet::with_capacity(position_sets.len());
     let mut sets = Vec::new();
     for positions in position_sets {
@@ -309,9 +326,9 @@ fn build_grouping(
     }
 }
 
-fn validate_grouping_set_count(grouping: &ResolvedGrouping) -> Result<()> {
-    if grouping.sets.len() > MAX_GROUPING_SETS {
-        Err(too_many_grouping_sets("GROUPING SETS"))
+fn enforce_grouping_set_count(construct: &str, count: usize) -> Result<()> {
+    if count > MAX_GROUPING_SETS {
+        Err(too_many_grouping_sets(construct))
     } else {
         Ok(())
     }
@@ -328,7 +345,6 @@ fn resolve_select_items(
     requested: &[SelectItem],
     grouping: &ResolvedGrouping,
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
-    validate_grouping_set_count(grouping)?;
     let has_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
