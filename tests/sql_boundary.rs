@@ -524,3 +524,222 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn ordered_parts_merge_interleaved_inserts_and_preserve_duplicate_keys() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (tenant String, ts Int64, id Int64) \
+             ORDER BY (tenant, ts);
+             INSERT INTO events VALUES
+                ('b', 2, 20), ('a', 3, 30), ('a', 1, 10), ('a', 1, 11);
+             INSERT INTO events VALUES
+                ('b', 1, 21), ('a', 2, 12), ('a', 1, 13);",
+        )
+        .expect("ordered setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT tenant, ts, id FROM events ORDER BY tenant, ts LIMIT 20",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(1),
+                Value::Int64(10)
+            ],
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(1),
+                Value::Int64(11)
+            ],
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(1),
+                Value::Int64(13)
+            ],
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Int64(12)
+            ],
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(3),
+                Value::Int64(30)
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(1),
+                Value::Int64(21)
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(2),
+                Value::Int64(20)
+            ],
+        ]
+    );
+    let stats = database.last_query_stats().expect("query stats");
+    assert!(stats.used_ordered_merge);
+    assert_eq!(stats.total_parts, 2);
+
+    let table = database.catalog().table("events").expect("events table");
+    assert_eq!(table.parts().len(), 2);
+    assert_eq!(table.order_key(), &[0, 1]);
+}
+
+#[test]
+fn leading_key_prefixes_prune_scans_without_changing_results() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE facts (tenant Int64, ts Int64, value Int64) ORDER BY (tenant, ts)")
+        .expect("create ordered table");
+    let values = (0..4)
+        .flat_map(|tenant| {
+            (0..128)
+                .rev()
+                .map(move |ts| format!("({tenant}, {ts}, {})", tenant * 1_000 + ts))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    database
+        .execute(&format!("INSERT INTO facts VALUES {values}"))
+        .expect("insert facts");
+
+    let ranged = execute_query(
+        &mut database,
+        "SELECT tenant, ts, value FROM facts
+         WHERE 2 = tenant AND 20 <= ts AND ts < 30
+         ORDER BY tenant, ts LIMIT 100",
+    );
+    assert_eq!(ranged.rows.len(), 10);
+    assert_eq!(ranged.rows[0][1], Value::Int64(20));
+    assert_eq!(ranged.rows[9][1], Value::Int64(29));
+    let stats = database.last_query_stats().expect("range stats");
+    assert!(stats.used_primary_key);
+    assert_eq!(stats.scanned_rows, 10);
+    assert_eq!(stats.total_rows, 512);
+
+    let prefix = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows FROM facts WHERE tenant = 1",
+    );
+    assert_eq!(prefix.rows, vec![vec![Value::Int64(128)]]);
+    assert_eq!(
+        database
+            .last_query_stats()
+            .expect("prefix stats")
+            .scanned_rows,
+        128
+    );
+
+    let full_prefix = execute_query(
+        &mut database,
+        "SELECT value FROM facts WHERE tenant = 3 AND ts = 7",
+    );
+    assert_eq!(full_prefix.rows, vec![vec![Value::Int64(3_007)]]);
+    assert_eq!(
+        database
+            .last_query_stats()
+            .expect("full-prefix stats")
+            .scanned_rows,
+        1
+    );
+
+    execute_query(&mut database, "SELECT ts FROM facts WHERE ts = 7");
+    let nonleading = database.last_query_stats().expect("nonleading stats");
+    assert!(!nonleading.used_primary_key);
+    assert_eq!(nonleading.scanned_rows, 512);
+
+    execute_query(
+        &mut database,
+        "SELECT tenant FROM facts WHERE tenant = 0 OR tenant = 3",
+    );
+    let disjunction = database.last_query_stats().expect("OR stats");
+    assert!(!disjunction.used_primary_key);
+    assert_eq!(disjunction.scanned_rows, 512);
+}
+
+#[test]
+fn ordered_limit_merge_matches_general_sort_results() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ordered (a Int64, b Int64, id Int64) ORDER BY (a, b);
+             CREATE TABLE plain (a Int64, b Int64, id Int64);",
+        )
+        .expect("create tables");
+    for batch in [
+        "(3, 1, 1), (1, 2, 2), (1, 2, 3), (2, 5, 4)",
+        "(1, 1, 5), (3, 0, 6), (2, 5, 7), (2, 1, 8)",
+    ] {
+        database
+            .execute(&format!(
+                "INSERT INTO ordered VALUES {batch}; INSERT INTO plain VALUES {batch};"
+            ))
+            .expect("insert matching batch");
+    }
+
+    let ordered = execute_query(
+        &mut database,
+        "SELECT a, b, id FROM ordered WHERE a >= 1 ORDER BY a, b LIMIT 7",
+    );
+    assert!(
+        database
+            .last_query_stats()
+            .expect("ordered stats")
+            .used_ordered_merge
+    );
+    let plain = execute_query(
+        &mut database,
+        "SELECT a, b, id FROM plain WHERE a >= 1 ORDER BY a, b LIMIT 7",
+    );
+    assert!(
+        !database
+            .last_query_stats()
+            .expect("plain stats")
+            .used_ordered_merge
+    );
+    assert_eq!(ordered, plain);
+}
+
+#[test]
+fn ordered_table_and_part_failures_are_atomic() {
+    let mut database = Database::new();
+    let missing = database
+        .execute("CREATE TABLE bad (id Int64) ORDER BY (missing)")
+        .expect_err("missing key is rejected");
+    assert!(matches!(missing, Error::ColumnNotFound { .. }));
+    assert!(matches!(
+        database.catalog().table("bad"),
+        Err(Error::TableNotFound(_))
+    ));
+    database
+        .execute("CREATE TABLE repeated (id Int64) ORDER BY (id, ID)")
+        .expect_err("duplicate key is rejected");
+    assert!(matches!(
+        database.catalog().table("repeated"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    database
+        .execute("CREATE TABLE events (id Int64, label String) ORDER BY (id)")
+        .expect("create events");
+    database
+        .execute("INSERT INTO events VALUES (2, 'two'), (1, 'one')")
+        .expect("first part");
+    let before = database.catalog().table("events").expect("events");
+    assert_eq!(before.parts().len(), 1);
+    assert_eq!(before.row_count(), 2);
+
+    database
+        .execute("INSERT INTO events VALUES (3, 'three'), (4, false)")
+        .expect_err("invalid part is rejected");
+    let after = database.catalog().table("events").expect("events");
+    assert_eq!(after.parts().len(), 1);
+    assert_eq!(after.row_count(), 2);
+}

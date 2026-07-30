@@ -11,7 +11,7 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{Database, QueryResult, QueryStats, ResultColumn, StatementResult};
 pub use error::{Error, Result};
 pub use value::{DataType, Value};
 

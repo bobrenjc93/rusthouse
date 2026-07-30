@@ -16,11 +16,20 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
+        self.create_ordered_table(name, schema, Vec::new())
+    }
+
+    pub fn create_ordered_table(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        order_by: Vec<String>,
+    ) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
             return Err(Error::TableAlreadyExists(name));
         }
-        let table = Table::new(name, schema)?;
+        let table = Table::new_ordered(name, schema, order_by)?;
         self.tables.insert(key, table);
         Ok(())
     }

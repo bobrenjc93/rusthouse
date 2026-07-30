@@ -10,6 +10,7 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        order_by: Vec<String>,
     },
     Insert {
         table: String,
@@ -413,7 +414,23 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
-        Ok(Statement::CreateTable { name, columns })
+        let mut order_by = Vec::new();
+        if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            self.expect(&TokenKind::LeftParen, "'(' before ORDER BY keys")?;
+            loop {
+                order_by.push(self.expect_identifier("ORDER BY key column")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after ORDER BY keys")?;
+        }
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            order_by,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -771,6 +788,20 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_create_table_order_key() {
+        let statements = parse(
+            "CREATE TABLE events (tenant String, ts Int64, value Float64) \
+             ORDER BY (tenant, ts)",
+        )
+        .expect("valid ordered table");
+
+        let Statement::CreateTable { order_by, .. } = &statements[0] else {
+            panic!("expected create table");
+        };
+        assert_eq!(order_by, &["tenant", "ts"]);
     }
 
     #[test]

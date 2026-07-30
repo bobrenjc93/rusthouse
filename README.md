@@ -1,21 +1,36 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores inserts as immutable parts containing contiguous typed columns (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`).
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, and String columns, plus optional physical `ORDER BY (key, ...)`
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- sparse leading-key equality/range pruning and ordered-part merge for compatible top-k queries
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+## Ordered tables
+
+An ordered table declares an ascending physical key after its columns:
+
+~~~sql
+CREATE TABLE events (
+  tenant String,
+  timestamp Int64,
+  value Float64
+) ORDER BY (tenant, timestamp);
+~~~
+
+Each successful `INSERT` becomes one immutable part, sorted stably by that key. Sparse marks accelerate equality prefixes and an optional range on the next key column. Ascending `ORDER BY` prefixes with `LIMIT` are merged directly across parts; incompatible directions or columns use the general sorter. `Database::last_query_stats()` reports scanned rows and parts and whether either optimization was selected.
 
 ## CLI
 
@@ -81,7 +96,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated and built in full before its immutable part is published.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
