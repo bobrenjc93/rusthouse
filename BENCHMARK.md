@@ -76,7 +76,7 @@ The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 1
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes one schema-version 3 JSON document containing the seed mode and panel, aggregation hierarchy, timing method and limitations, amplification, correctness count, seed-tagged raw batch and per-query samples, medians, both ratios and scores, paths, mode, and ClickHouse identity. Each case records both its panel seed and row-count-derived dataset seed. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one stdout object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes one schema-version 3 JSON document containing the seed mode and panel, aggregation hierarchy, timing method and limitations, amplification, correctness count, seed-tagged raw batch and per-query samples, medians, both ratios and scores, paths, mode, and ClickHouse identity. Each case records both its panel seed and row-count-derived dataset seed. The requested details path is cleared before engine validation; after a successful audit, the complete document is written and synced to a sibling temporary file and atomically renamed into place. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one stdout object with score zero and exit nonzero without exposing stale or partial details at the requested path.
 
 ## Dataset and workloads
 
@@ -112,7 +112,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, shuffled-key cardinality, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, family/scale weighting, outer equal-seed weighting, and the schema-versioned audit artifact.
+Tests cover generator reproducibility, runtime-seed variation, shuffled-key cardinality, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, per-seed score saturation detection, family/scale weighting, outer equal-seed weighting, the schema-versioned audit artifact, and failure-safe artifact publication.
 
 ## Timing and calibration
 
@@ -133,7 +133,7 @@ Aggregation is hierarchical in log space:
 3. Workload families receive equal weight within each seed.
 4. Seeds receive equal weight in the final geometric mean, outside the existing family and scale hierarchy.
 
-The same aggregation produces primary and end-to-end scores. A single-seed run is the one-member form of this hierarchy. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default rejects a result if every primary case across the selected seed set reaches the 100 cap because that indicates no useful optimization headroom was measured. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
+The same aggregation produces primary and end-to-end scores. A single-seed run is the one-member form of this hierarchy. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default checks every seed independently and rejects the entire result if every primary case for any selected seed reaches the 100 cap, because that panel member measured no useful optimization headroom. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
 
 ## Fairness, limitations, and anti-gaming
 

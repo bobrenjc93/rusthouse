@@ -7,8 +7,9 @@ mod workload;
 
 use std::env;
 use std::fmt::Write as _;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(test)]
 use std::time::Duration;
@@ -150,6 +151,9 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 }
 
 fn run(config: Config) -> Result<Report, String> {
+    if let Some(path) = &config.details {
+        clear_details_output(path)?;
+    }
     let settings = config.mode.settings();
     let paths = EnginePaths {
         rusthouse: config.rusthouse.clone(),
@@ -305,7 +309,7 @@ fn run(config: Config) -> Result<Report, String> {
 
     let primary_score = score_cases(&cases, |case| case.primary_ratio)?;
     if config.mode == config::Mode::Default {
-        ensure_primary_headroom(&primary_score, cases.len())?;
+        ensure_primary_headroom_per_seed(&cases, &seeds)?;
     }
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
 
@@ -318,8 +322,7 @@ fn run(config: Config) -> Result<Report, String> {
             end_to_end_score,
             correctness_checks,
         );
-        fs::write(path, details)
-            .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
+        publish_details(path, &details)?;
     }
 
     let mut evidence = vec![
@@ -432,14 +435,76 @@ fn display_seeds(seeds: &[u64]) -> String {
         .join(",")
 }
 
-fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<(), String> {
-    if score.saturated_cases == case_count {
-        return Err(
-            "primary timing saturated: every case reached the parity cap; increase query amplification before accepting this benchmark"
-                .to_owned(),
-        );
+fn ensure_primary_headroom_per_seed(cases: &[CaseResult], seeds: &[u64]) -> Result<(), String> {
+    for seed in seeds {
+        let seed_cases = cases.iter().filter(|case| case.seed == *seed);
+        let case_count = seed_cases.clone().count();
+        if case_count == 0 {
+            return Err(format!("primary timing is missing cases for seed {seed}"));
+        }
+        let saturated_cases = seed_cases.filter(|case| case.primary_ratio >= 1.0).count();
+        if saturated_cases == case_count {
+            return Err(format!(
+                "primary timing saturated for seed {seed}: every case reached the parity cap; increase query amplification before accepting this benchmark"
+            ));
+        }
     }
     Ok(())
+}
+
+fn clear_details_output(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove stale details at '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+fn publish_details(path: &Path, details: &str) -> Result<(), String> {
+    let temporary = temporary_details_path(path)?;
+    let publication = (|| {
+        let mut file = File::create(&temporary).map_err(|error| {
+            format!(
+                "could not create temporary details at '{}': {error}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(details.as_bytes()).map_err(|error| {
+            format!(
+                "could not write temporary details at '{}': {error}",
+                temporary.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "could not sync temporary details at '{}': {error}",
+                temporary.display()
+            )
+        })?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|error| {
+            format!("could not publish details to '{}': {error}", path.display())
+        })?;
+        Ok(())
+    })();
+
+    if publication.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    publication
+}
+
+fn temporary_details_path(path: &Path) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?;
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".{}.tmp", std::process::id()));
+    Ok(path.with_file_name(temporary_name))
 }
 
 fn execute_correctness_pair(
@@ -825,12 +890,34 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_capped_primary_score_is_rejected() {
-        let score = ScoreBreakdown {
-            score: 100.0,
-            saturated_cases: 8,
-        };
-        assert!(ensure_primary_headroom(&score, 8).is_err());
+    fn a_fully_capped_seed_is_rejected() {
+        let mut case = sample_case(8);
+        case.primary_ratio = 1.0;
+
+        let error = ensure_primary_headroom_per_seed(&[case], &[8])
+            .expect_err("a fully capped seed must fail");
+        assert!(error.contains("seed 8"));
+    }
+
+    #[test]
+    fn mixed_panel_rejects_a_saturated_seed() {
+        let mut saturated_a = sample_case(11);
+        saturated_a.primary_ratio = 2.0;
+        let mut saturated_b = sample_case(11);
+        saturated_b.primary_ratio = 1.0;
+        saturated_b.workload = "selective_filter";
+        let mut unsaturated = sample_case(22);
+        unsaturated.primary_ratio = 0.5;
+        let mut capped = sample_case(22);
+        capped.primary_ratio = 1.5;
+        capped.workload = "selective_filter";
+
+        let error = ensure_primary_headroom_per_seed(
+            &[saturated_a, saturated_b, unsaturated, capped],
+            &[11, 22],
+        )
+        .expect_err("one saturated panel member must fail the panel");
+        assert!(error.contains("seed 11"));
     }
 
     #[test]
@@ -886,6 +973,69 @@ mod tests {
         }
         assert_eq!(details.matches("\"rusthouse_batch_samples_ms\"").count(), 3);
         assert_eq!(details.matches("\"clickhouse_samples_ms\"").count(), 3);
+    }
+
+    #[test]
+    fn failed_validation_removes_stale_details() {
+        let directory = test_directory("stale-validation");
+        let details_path = directory.join("details.json");
+        fs::write(&details_path, "stale").expect("stale details");
+        let config = Config {
+            mode: config::Mode::Quick,
+            seed_selection: SeedSelection::AuditPanel,
+            rusthouse: directory.join("missing-rusthouse"),
+            clickhouse: directory.join("missing-clickhouse"),
+            details: Some(details_path.clone()),
+        };
+
+        assert!(run(config).is_err(), "engine validation must fail");
+
+        assert!(!details_path.exists());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn details_are_published_through_a_sibling_temporary_file() {
+        let directory = test_directory("atomic-publication");
+        let details_path = directory.join("details.json");
+        let temporary = temporary_details_path(&details_path).expect("temporary path");
+        fs::write(&details_path, "stale").expect("stale details");
+
+        clear_details_output(&details_path).expect("clear stale details");
+        publish_details(&details_path, "{\"schema_version\":3}\n").expect("publish details");
+
+        assert_eq!(
+            fs::read_to_string(&details_path).expect("published details"),
+            "{\"schema_version\":3}\n"
+        );
+        assert!(!temporary.exists());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn publication_failure_exposes_neither_stale_nor_temporary_details() {
+        let directory = test_directory("failed-publication");
+        let details_path = directory.join("details.json");
+        let temporary = temporary_details_path(&details_path).expect("temporary path");
+        fs::write(&details_path, "stale").expect("stale details");
+        clear_details_output(&details_path).expect("clear stale details");
+        fs::remove_dir_all(&directory).expect("remove publication directory");
+
+        publish_details(&details_path, "complete details")
+            .expect_err("missing parent must prevent publication");
+
+        assert!(!details_path.exists());
+        assert!(!temporary.exists());
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        let directory =
+            env::temp_dir().join(format!("rusthouse-benchmark-{name}-{}", std::process::id()));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("remove previous test directory");
+        }
+        fs::create_dir_all(&directory).expect("create test directory");
+        directory
     }
 
     fn sample_case(seed: u64) -> CaseResult {
