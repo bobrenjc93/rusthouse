@@ -12,3 +12,7 @@ repository = "https://github.com/bobrenjc93/rusthouse"
 [[bin]]
 name = "clickhouse-parity-bench"
 path = "benchmark/main.rs"
+
+[[bench]]
+name = "zone_map"
+harness = false

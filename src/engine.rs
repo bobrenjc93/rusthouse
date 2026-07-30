@@ -7,13 +7,24 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, Table, ZoneMapRef};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    last_scan_stats: ScanStats,
+}
+
+/// Work performed by the most recently completed `SELECT`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanStats {
+    pub row_groups_total: usize,
+    pub row_groups_scanned: usize,
+    pub row_groups_pruned: usize,
+    pub rows_examined: usize,
+    pub rows_matched: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +57,12 @@ impl Database {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Returns scan counters for the most recently completed `SELECT`.
+    #[must_use]
+    pub fn last_scan_stats(&self) -> ScanStats {
+        self.last_scan_stats
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -90,7 +107,7 @@ impl Database {
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(&mut self, select: Select) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -98,13 +115,7 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
+        let (mut matching_rows, scan_stats) = scan_rows(table, predicate.as_ref());
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -128,11 +139,42 @@ impl Database {
             execute_projection(table, &matching_rows, &items)
         };
 
-        Ok(QueryResult {
+        let result = QueryResult {
             columns: result_columns,
             rows,
-        })
+        };
+        self.last_scan_stats = scan_stats;
+        Ok(result)
     }
+}
+
+fn scan_rows(table: &Table, predicate: Option<&CompiledPredicate>) -> (Vec<usize>, ScanStats) {
+    let zone_predicate = predicate.map(ZonePredicate::compile);
+    let mut matching_rows = Vec::new();
+    let mut stats = ScanStats {
+        row_groups_total: table.row_group_count(),
+        ..ScanStats::default()
+    };
+
+    for row_group in 0..table.row_group_count() {
+        if zone_predicate
+            .as_ref()
+            .is_some_and(|predicate| !predicate.can_match(table, row_group))
+        {
+            stats.row_groups_pruned += 1;
+            continue;
+        }
+
+        stats.row_groups_scanned += 1;
+        let rows = table.row_group_range(row_group);
+        stats.rows_examined += rows.len();
+        matching_rows.extend(
+            rows.filter(|row| predicate.is_none_or(|predicate| predicate.evaluate(table, *row))),
+        );
+    }
+
+    stats.rows_matched = matching_rows.len();
+    (matching_rows, stats)
 }
 
 #[derive(Debug)]
@@ -807,6 +849,125 @@ impl CompiledPredicate {
 }
 
 #[derive(Debug)]
+enum ZonePredicate<'a> {
+    Comparison {
+        column: usize,
+        operator: ComparisonOperator,
+        literal: &'a Value,
+    },
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Unknown,
+}
+
+impl<'a> ZonePredicate<'a> {
+    fn compile(predicate: &'a CompiledPredicate) -> Self {
+        match predicate {
+            CompiledPredicate::Comparison {
+                left,
+                operator,
+                right,
+            } => match (left, right) {
+                (CompiledOperand::Column { index, .. }, CompiledOperand::Literal(literal)) => {
+                    Self::Comparison {
+                        column: *index,
+                        operator: *operator,
+                        literal,
+                    }
+                }
+                (CompiledOperand::Literal(literal), CompiledOperand::Column { index, .. }) => {
+                    Self::Comparison {
+                        column: *index,
+                        operator: reverse_operator(*operator),
+                        literal,
+                    }
+                }
+                _ => Self::Unknown,
+            },
+            CompiledPredicate::And(left, right) => Self::And(
+                Box::new(Self::compile(left)),
+                Box::new(Self::compile(right)),
+            ),
+            CompiledPredicate::Or(left, right) => Self::Or(
+                Box::new(Self::compile(left)),
+                Box::new(Self::compile(right)),
+            ),
+        }
+    }
+
+    fn can_match(&self, table: &Table, row_group: usize) -> bool {
+        match self {
+            Self::Comparison {
+                column,
+                operator,
+                literal,
+            } => zone_map_can_match(table.zone_map(*column, row_group), *operator, literal),
+            Self::And(left, right) => {
+                left.can_match(table, row_group) && right.can_match(table, row_group)
+            }
+            Self::Or(left, right) => {
+                left.can_match(table, row_group) || right.can_match(table, row_group)
+            }
+            Self::Unknown => true,
+        }
+    }
+}
+
+fn reverse_operator(operator: ComparisonOperator) -> ComparisonOperator {
+    match operator {
+        ComparisonOperator::Equal => ComparisonOperator::Equal,
+        ComparisonOperator::NotEqual => ComparisonOperator::NotEqual,
+        ComparisonOperator::Less => ComparisonOperator::Greater,
+        ComparisonOperator::LessOrEqual => ComparisonOperator::GreaterOrEqual,
+        ComparisonOperator::Greater => ComparisonOperator::Less,
+        ComparisonOperator::GreaterOrEqual => ComparisonOperator::LessOrEqual,
+    }
+}
+
+fn zone_map_can_match(
+    zone_map: ZoneMapRef<'_>,
+    operator: ComparisonOperator,
+    literal: &Value,
+) -> bool {
+    let (min, max) = zone_map_bounds(zone_map);
+    let literal = literal.as_ref();
+    let min_comparison = min
+        .sql_cmp(literal)
+        .expect("zone map and literal types are validated");
+    let max_comparison = max
+        .sql_cmp(literal)
+        .expect("zone map and literal types are validated");
+
+    match operator {
+        ComparisonOperator::Equal => {
+            min_comparison != Ordering::Greater && max_comparison != Ordering::Less
+        }
+        ComparisonOperator::NotEqual => {
+            min_comparison != Ordering::Equal || max_comparison != Ordering::Equal
+        }
+        ComparisonOperator::Less => min_comparison == Ordering::Less,
+        ComparisonOperator::LessOrEqual => min_comparison != Ordering::Greater,
+        ComparisonOperator::Greater => max_comparison == Ordering::Greater,
+        ComparisonOperator::GreaterOrEqual => max_comparison != Ordering::Less,
+    }
+}
+
+fn zone_map_bounds(zone_map: ZoneMapRef<'_>) -> (ValueRef<'_>, ValueRef<'_>) {
+    match zone_map {
+        ZoneMapRef::Int64 { min, max } => (ValueRef::Int64(min), ValueRef::Int64(max)),
+        ZoneMapRef::Float64 { min, max } => (ValueRef::Float64(min), ValueRef::Float64(max)),
+        ZoneMapRef::Bool {
+            has_false,
+            has_true,
+        } => (
+            ValueRef::Bool(!has_false && has_true),
+            ValueRef::Bool(has_true),
+        ),
+        ZoneMapRef::String { min, max } => (ValueRef::String(min), ValueRef::String(max)),
+    }
+}
+
+#[derive(Debug)]
 enum CompiledOperand {
     Column { index: usize, data_type: DataType },
     Literal(Value),
@@ -885,6 +1046,7 @@ fn comparable(left: DataType, right: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{ColumnDef, ROW_GROUP_SIZE};
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
@@ -945,5 +1107,100 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn zone_checks_never_reject_groups_with_matching_rows() {
+        let mut table = Table::new(
+            "valueset".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "integer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ColumnDef {
+                    name: "float".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ColumnDef {
+                    name: "flag".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ColumnDef {
+                    name: "label".to_owned(),
+                    data_type: DataType::String,
+                },
+                ColumnDef {
+                    name: "peer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+            ],
+        )
+        .expect("valid table");
+
+        for row in 0..ROW_GROUP_SIZE * 2 + 3 {
+            let integer = match row {
+                0 => i64::MIN,
+                ROW_GROUP_SIZE => 9_007_199_254_740_993,
+                row if row == ROW_GROUP_SIZE * 2 => i64::MAX,
+                _ => row as i64 - 500,
+            };
+            table
+                .insert_row(vec![
+                    Value::Int64(integer),
+                    Value::Float64(row as f64 - 500.5),
+                    Value::Bool(row >= ROW_GROUP_SIZE * 2),
+                    Value::String(format!("label-{row:04}")),
+                    Value::Int64(integer),
+                ])
+                .expect("valid row");
+        }
+
+        let expressions = [
+            "integer = 1024",
+            "integer != 1024",
+            "integer < 0",
+            "integer <= 0.5",
+            "integer > 9007199254740992.0",
+            "9007199254740992.0 < integer",
+            "integer >= 9223372036854775808.0",
+            "float = 523.5",
+            "float != 523.5",
+            "float < 0",
+            "float <= 0",
+            "float > 1000",
+            "float >= 1000",
+            "flag = true",
+            "flag != false",
+            "label = 'label-1024'",
+            "label < 'label-0500'",
+            "label >= 'label-2048'",
+            "(integer < 0 AND flag = false) OR (integer > 9007199254740992.0 AND flag = true)",
+            "integer = peer",
+        ];
+
+        for expression in expressions {
+            let mut statements =
+                sql::parse(&format!("SELECT integer FROM valueset WHERE {expression}"))
+                    .expect("valid predicate");
+            let Statement::Select(select) = statements.remove(0) else {
+                panic!("expected select");
+            };
+            let predicate = compile_predicate(
+                &table,
+                select.predicate.as_ref().expect("predicate is present"),
+            )
+            .expect("predicate compiles");
+            let zone_predicate = ZonePredicate::compile(&predicate);
+
+            for row in 0..table.row_count() {
+                if predicate.evaluate(&table, row) {
+                    assert!(
+                        zone_predicate.can_match(&table, row / ROW_GROUP_SIZE),
+                        "{expression:?} rejected matching row {row}"
+                    );
+                }
+            }
+        }
     }
 }

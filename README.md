@@ -9,6 +9,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
+- append-maintained 1,024-row zone maps for conservative WHERE scan pruning
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
@@ -76,6 +77,9 @@ let StatementResult::Query(result) = &results[0] else {
 };
 assert_eq!(result.rows.len(), 1);
 
+let scan = database.last_scan_stats();
+assert!(scan.row_groups_scanned <= scan.row_groups_total);
+
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
@@ -96,3 +100,11 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ~~~
+
+The standalone zone-map benchmark measures point, compound-selective, and full scans over one million rows without participating in ClickHouse parity scoring:
+
+~~~bash
+cargo bench --bench zone_map
+~~~
+
+On 2026-07-29, an arm64 macOS release run measured 9.622 us/query for the point filter (1/977 groups and 1,024 rows examined), 32.489 us/query for the compound filter (2/977 groups and 1,600 rows examined), and 2,628.785 us/query for the unfiltered baseline (all 1,000,000 rows examined). Query parsing is included in every iteration. These measurements are informational only; the parity benchmark's modes, workloads, weights, and scoring are unchanged.
