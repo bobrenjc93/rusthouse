@@ -89,12 +89,30 @@ pub enum ParseResult {
     Help,
 }
 
+#[derive(Debug)]
+pub struct ParseFailure {
+    message: String,
+    details: Option<PathBuf>,
+}
+
+impl ParseFailure {
+    pub fn into_parts(self) -> (String, Option<PathBuf>) {
+        (self.message, self.details)
+    }
+}
+
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 pub fn parse(
     arguments: impl IntoIterator<Item = String>,
     clickhouse_from_env: Option<String>,
     rusthouse_from_env: Option<String>,
     default_rusthouse: PathBuf,
-) -> Result<ParseResult, String> {
+) -> Result<ParseResult, ParseFailure> {
     let mut mode = Mode::Default;
     let mut seed = None;
     let mut audit_seeds = false;
@@ -105,88 +123,93 @@ pub fn parse(
     let mut details = None;
     let mut arguments = arguments.into_iter();
 
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "-h" | "--help" => return Ok(ParseResult::Help),
-            "--quick" => mode = Mode::Quick,
-            "--mode" => {
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| "--mode requires quick or default".to_owned())?;
-                mode = parse_mode(&value)?;
-            }
-            "--seed" => {
-                reject_seed_conflict(audit_seeds)?;
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| "--seed requires an unsigned integer".to_owned())?;
-                seed = Some(parse_seed(&value)?);
-            }
-            "--seeds" => {
-                if seed.is_some() {
-                    return Err("--seed and --seeds are mutually exclusive".to_owned());
+    let result = (|| -> Result<ParseResult, String> {
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "-h" | "--help" => return Ok(ParseResult::Help),
+                "--quick" => mode = Mode::Quick,
+                "--mode" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--mode requires quick or default".to_owned())?;
+                    mode = parse_mode(&value)?;
                 }
-                if audit_seeds {
-                    return Err("--seeds may only be supplied once".to_owned());
+                "--seed" => {
+                    reject_seed_conflict(audit_seeds)?;
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| "--seed requires an unsigned integer".to_owned())?;
+                    seed = Some(parse_seed(&value)?);
                 }
-                audit_seeds = true;
+                "--seeds" => {
+                    if seed.is_some() {
+                        return Err("--seed and --seeds are mutually exclusive".to_owned());
+                    }
+                    if audit_seeds {
+                        return Err("--seeds may only be supplied once".to_owned());
+                    }
+                    audit_seeds = true;
+                }
+                "--clickhouse" => {
+                    clickhouse = Some(PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--clickhouse requires a path".to_owned())?,
+                    ));
+                }
+                "--rusthouse" => {
+                    rusthouse = PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--rusthouse requires a path".to_owned())?,
+                    );
+                }
+                "--details" => {
+                    details = Some(PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| "--details requires a path".to_owned())?,
+                    ));
+                }
+                _ if argument.starts_with("--mode=") => {
+                    mode = parse_mode(&argument["--mode=".len()..])?;
+                }
+                _ if argument.starts_with("--seed=") => {
+                    reject_seed_conflict(audit_seeds)?;
+                    seed = Some(parse_seed(&argument["--seed=".len()..])?);
+                }
+                _ if argument.starts_with("--clickhouse=") => {
+                    clickhouse = Some(PathBuf::from(&argument["--clickhouse=".len()..]));
+                }
+                _ if argument.starts_with("--rusthouse=") => {
+                    rusthouse = PathBuf::from(&argument["--rusthouse=".len()..]);
+                }
+                _ if argument.starts_with("--details=") => {
+                    details = Some(PathBuf::from(&argument["--details=".len()..]));
+                }
+                _ => return Err(format!("unknown argument {argument:?}; try --help")),
             }
-            "--clickhouse" => {
-                clickhouse = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--clickhouse requires a path".to_owned())?,
-                ));
-            }
-            "--rusthouse" => {
-                rusthouse = PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--rusthouse requires a path".to_owned())?,
-                );
-            }
-            "--details" => {
-                details = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--details requires a path".to_owned())?,
-                ));
-            }
-            _ if argument.starts_with("--mode=") => {
-                mode = parse_mode(&argument["--mode=".len()..])?;
-            }
-            _ if argument.starts_with("--seed=") => {
-                reject_seed_conflict(audit_seeds)?;
-                seed = Some(parse_seed(&argument["--seed=".len()..])?);
-            }
-            _ if argument.starts_with("--clickhouse=") => {
-                clickhouse = Some(PathBuf::from(&argument["--clickhouse=".len()..]));
-            }
-            _ if argument.starts_with("--rusthouse=") => {
-                rusthouse = PathBuf::from(&argument["--rusthouse=".len()..]);
-            }
-            _ if argument.starts_with("--details=") => {
-                details = Some(PathBuf::from(&argument["--details=".len()..]));
-            }
-            _ => return Err(format!("unknown argument {argument:?}; try --help")),
         }
-    }
 
-    let clickhouse = clickhouse.ok_or_else(|| {
-        "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN".to_owned()
-    })?;
-    let seed_selection = if audit_seeds {
-        SeedSelection::AuditPanel
-    } else {
-        SeedSelection::Single(seed.unwrap_or(DEFAULT_SEED))
-    };
-    Ok(ParseResult::Run(Config {
-        mode,
-        seed_selection,
-        rusthouse,
-        clickhouse,
-        details,
-    }))
+        let clickhouse = clickhouse.ok_or_else(|| {
+            "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN"
+                .to_owned()
+        })?;
+        let seed_selection = if audit_seeds {
+            SeedSelection::AuditPanel
+        } else {
+            SeedSelection::Single(seed.unwrap_or(DEFAULT_SEED))
+        };
+        Ok(ParseResult::Run(Config {
+            mode,
+            seed_selection,
+            rusthouse,
+            clickhouse,
+            details: details.clone(),
+        }))
+    })();
+
+    result.map_err(|message| ParseFailure { message, details })
 }
 
 fn reject_seed_conflict(audit_seeds: bool) -> Result<(), String> {
@@ -287,7 +310,7 @@ mod tests {
                 Ok(_) => panic!("conflicting seed options should fail"),
                 Err(error) => error,
             };
-            assert!(error.contains("mutually exclusive"));
+            assert!(error.to_string().contains("mutually exclusive"));
         }
     }
 
@@ -297,6 +320,6 @@ mod tests {
             Ok(_) => panic!("missing ClickHouse path should fail"),
             Err(error) => error,
         };
-        assert!(error.contains("RUSTHOUSE_CLICKHOUSE_BIN"));
+        assert!(error.to_string().contains("RUSTHOUSE_CLICKHOUSE_BIN"));
     }
 }

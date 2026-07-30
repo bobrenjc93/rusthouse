@@ -7,8 +7,8 @@ mod workload;
 
 use std::env;
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(test)]
@@ -22,6 +22,7 @@ use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
+const TEMPORARY_FILE_ATTEMPTS: usize = 16;
 
 const HELP: &str = "\
 RustHouse / ClickHouse Local black-box parity benchmark
@@ -115,7 +116,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(ParseResult::Run(config)) => config,
-        Err(error) => return emit_failure(error),
+        Err(failure) => return emit_failure(handle_parse_failure(failure)),
     };
 
     match run(config) {
@@ -139,6 +140,16 @@ fn emit_failure(error: String) -> ExitCode {
     };
     println!("{}", report.to_json());
     ExitCode::FAILURE
+}
+
+fn handle_parse_failure(failure: config::ParseFailure) -> String {
+    let (message, details) = failure.into_parts();
+    if let Some(path) = details
+        && let Err(cleanup_error) = clear_details_output(&path)
+    {
+        return format!("{message}; additionally, {cleanup_error}");
+    }
+    message
 }
 
 fn default_rusthouse_path() -> Result<PathBuf, String> {
@@ -464,14 +475,8 @@ fn clear_details_output(path: &Path) -> Result<(), String> {
 }
 
 fn publish_details(path: &Path, details: &str) -> Result<(), String> {
-    let temporary = temporary_details_path(path)?;
+    let (temporary, mut file) = create_temporary_details(path)?;
     let publication = (|| {
-        let mut file = File::create(&temporary).map_err(|error| {
-            format!(
-                "could not create temporary details at '{}': {error}",
-                temporary.display()
-            )
-        })?;
         file.write_all(details.as_bytes()).map_err(|error| {
             format!(
                 "could not write temporary details at '{}': {error}",
@@ -497,13 +502,48 @@ fn publish_details(path: &Path, details: &str) -> Result<(), String> {
     publication
 }
 
-fn temporary_details_path(path: &Path) -> Result<PathBuf, String> {
+fn create_temporary_details(path: &Path) -> Result<(PathBuf, File), String> {
+    for _ in 0..TEMPORARY_FILE_ATTEMPTS {
+        let mut nonce = [0_u8; 16];
+        File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .map_err(|error| {
+                format!("could not obtain OS randomness for details output: {error}")
+            })?;
+        let temporary = temporary_details_path(path, &nonce)?;
+        match open_exclusive_temporary(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create temporary details at '{}': {error}",
+                    temporary.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "could not allocate a unique temporary details file after {TEMPORARY_FILE_ATTEMPTS} attempts"
+    ))
+}
+
+fn open_exclusive_temporary(path: &Path) -> std::io::Result<File> {
+    // create_new is atomic and rejects an existing symlink instead of following it.
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+fn temporary_details_path(path: &Path, nonce: &[u8; 16]) -> Result<PathBuf, String> {
     let file_name = path
         .file_name()
         .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?;
     let mut temporary_name = std::ffi::OsString::from(".");
     temporary_name.push(file_name);
-    temporary_name.push(format!(".{}.tmp", std::process::id()));
+    let mut suffix = String::from(".");
+    for byte in nonce {
+        write!(suffix, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    suffix.push_str(".tmp");
+    temporary_name.push(suffix);
     Ok(path.with_file_name(temporary_name))
 }
 
@@ -995,10 +1035,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_failure_removes_the_recognized_stale_details() {
+        let directory = test_directory("stale-parse");
+        let details_path = directory.join("details.json");
+        fs::write(&details_path, "stale").expect("stale details");
+        let failure = match config::parse(
+            [
+                format!("--details={}", details_path.display()),
+                "--seeds".to_owned(),
+                "--seed=1".to_owned(),
+                "--clickhouse=/clickhouse".to_owned(),
+            ],
+            None,
+            None,
+            PathBuf::from("/rusthouse"),
+        ) {
+            Ok(_) => panic!("conflicting seed options must fail"),
+            Err(failure) => failure,
+        };
+
+        let message = handle_parse_failure(failure);
+
+        assert!(message.contains("mutually exclusive"));
+        assert!(!details_path.exists());
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn details_are_published_through_a_sibling_temporary_file() {
         let directory = test_directory("atomic-publication");
         let details_path = directory.join("details.json");
-        let temporary = temporary_details_path(&details_path).expect("temporary path");
         fs::write(&details_path, "stale").expect("stale details");
 
         clear_details_output(&details_path).expect("clear stale details");
@@ -1008,7 +1074,7 @@ mod tests {
             fs::read_to_string(&details_path).expect("published details"),
             "{\"schema_version\":3}\n"
         );
-        assert!(!temporary.exists());
+        assert_only_details_entry(&directory);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -1016,16 +1082,38 @@ mod tests {
     fn publication_failure_exposes_neither_stale_nor_temporary_details() {
         let directory = test_directory("failed-publication");
         let details_path = directory.join("details.json");
-        let temporary = temporary_details_path(&details_path).expect("temporary path");
         fs::write(&details_path, "stale").expect("stale details");
         clear_details_output(&details_path).expect("clear stale details");
-        fs::remove_dir_all(&directory).expect("remove publication directory");
+        fs::create_dir(&details_path).expect("block final rename with a directory");
 
         publish_details(&details_path, "complete details")
-            .expect_err("missing parent must prevent publication");
+            .expect_err("a directory at the destination must prevent publication");
 
-        assert!(!details_path.exists());
-        assert!(!temporary.exists());
+        assert!(details_path.is_dir());
+        assert_only_details_entry(&directory);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_temporary_creation_does_not_follow_symlinks() {
+        let directory = test_directory("temporary-symlink");
+        let details_path = directory.join("details.json");
+        let victim = directory.join("victim.txt");
+        fs::write(&victim, "unchanged").expect("victim file");
+        let temporary = temporary_details_path(&details_path, &[0x5a; 16])
+            .expect("deterministic test candidate");
+        std::os::unix::fs::symlink(&victim, &temporary).expect("temporary-path symlink");
+
+        let error = open_exclusive_temporary(&temporary)
+            .expect_err("exclusive creation must reject the existing symlink");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim contents"),
+            "unchanged"
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     fn test_directory(name: &str) -> PathBuf {
@@ -1036,6 +1124,14 @@ mod tests {
         }
         fs::create_dir_all(&directory).expect("create test directory");
         directory
+    }
+
+    fn assert_only_details_entry(directory: &Path) {
+        let entries = fs::read_dir(directory)
+            .expect("read test directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("details.json")]);
     }
 
     fn sample_case(seed: u64) -> CaseResult {
