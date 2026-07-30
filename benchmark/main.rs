@@ -14,13 +14,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use config::{Config, ParseResult};
-use dataset::Dataset;
+use dataset::{Dataset, DatasetParameters};
 use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use process::{ClickHouseIdentity, Engine, EnginePaths, PreparedBatch, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
-use workload::workloads;
+use workload::{WorkloadParameters, WorkloadSuite, workloads};
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
+const DATASET_SCALE_SEED_DOMAIN: u64 = 0xd6e8_feb8_6659_fd93;
+const WORKLOAD_SCALE_SEED_DOMAIN: u64 = 0x94d0_49bb_1331_11eb;
 
 const HELP: &str = "\
 RustHouse / ClickHouse Local black-box parity benchmark
@@ -66,6 +68,22 @@ struct CaseResult {
     rusthouse_end_to_end_median_ms: f64,
     clickhouse_end_to_end_median_ms: f64,
     end_to_end_ratio: f64,
+}
+
+#[derive(Debug)]
+struct ResolvedScale {
+    row_count: usize,
+    dataset_seed: u64,
+    workload_seed: u64,
+    dataset: DatasetParameters,
+    workload: WorkloadParameters,
+    queries: Vec<ResolvedQuery>,
+}
+
+#[derive(Debug)]
+struct ResolvedQuery {
+    workload: &'static str,
+    sql: String,
 }
 
 #[derive(Debug, Default)]
@@ -153,14 +171,24 @@ fn run(config: Config) -> Result<Report, String> {
     };
     let identity = paths.validate()?;
     let mut cases = Vec::new();
+    let mut resolved_parameters = Vec::new();
     let mut correctness_checks = 0_usize;
 
     for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
-        let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+        let dataset_seed = derive_scale_seed(config.seed, row_count, DATASET_SCALE_SEED_DOMAIN);
+        let workload_seed = derive_scale_seed(config.seed, row_count, WORKLOAD_SCALE_SEED_DOMAIN);
         let dataset = Dataset::generate(dataset_seed, row_count);
         let setup_sql = dataset.setup_sql();
+        let suite = workloads(workload_seed, &dataset)?;
+        resolved_parameters.push(resolve_scale(
+            row_count,
+            dataset_seed,
+            workload_seed,
+            &dataset,
+            &suite,
+        ));
 
-        for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
+        for (workload_index, workload) in suite.workloads.into_iter().enumerate() {
             eprintln!(
                 "benchmarking {} at {} rows ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
                 workload.name,
@@ -299,6 +327,7 @@ fn run(config: Config) -> Result<Report, String> {
             &config,
             &identity,
             &cases,
+            &resolved_parameters,
             primary_score,
             end_to_end_score,
             correctness_checks,
@@ -385,6 +414,34 @@ fn run(config: Config) -> Result<Report, String> {
     })
 }
 
+fn derive_scale_seed(runtime_seed: u64, row_count: usize, domain: u64) -> u64 {
+    runtime_seed ^ (row_count as u64).wrapping_mul(domain)
+}
+
+fn resolve_scale(
+    row_count: usize,
+    dataset_seed: u64,
+    workload_seed: u64,
+    dataset: &Dataset,
+    suite: &WorkloadSuite,
+) -> ResolvedScale {
+    ResolvedScale {
+        row_count,
+        dataset_seed,
+        workload_seed,
+        dataset: dataset.parameters,
+        workload: suite.parameters,
+        queries: suite
+            .workloads
+            .iter()
+            .map(|workload| ResolvedQuery {
+                workload: workload.name,
+                sql: workload.sql.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn score_cases(
     cases: &[CaseResult],
     ratio: impl Fn(&CaseResult) -> f64,
@@ -416,13 +473,15 @@ fn execute_correctness_pair(
     query_sql: &str,
     rusthouse_first: bool,
 ) -> Result<(TimedOutput, TimedOutput), String> {
+    let (rusthouse_batch, clickhouse_batch) =
+        PreparedBatch::shared_engine_pair(setup_sql, query_sql, 1)?;
     if rusthouse_first {
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
+        let rusthouse = paths.execute_correctness(Engine::RustHouse, &rusthouse_batch)?;
+        let clickhouse = paths.execute_correctness(Engine::ClickHouse, &clickhouse_batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
+        let clickhouse = paths.execute_correctness(Engine::ClickHouse, &clickhouse_batch)?;
+        let rusthouse = paths.execute_correctness(Engine::RustHouse, &rusthouse_batch)?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -434,17 +493,15 @@ fn execute_timed_pair(
     query_repetitions: usize,
     rusthouse_first: bool,
 ) -> Result<(TimedBatch, TimedBatch), String> {
+    let (rusthouse_batch, clickhouse_batch) =
+        PreparedBatch::shared_engine_pair(setup_sql, query_sql, query_repetitions)?;
     if rusthouse_first {
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse = paths.execute_timed(Engine::RustHouse, &rusthouse_batch)?;
+        let clickhouse = paths.execute_timed(Engine::ClickHouse, &clickhouse_batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_timed(Engine::ClickHouse, &clickhouse_batch)?;
+        let rusthouse = paths.execute_timed(Engine::RustHouse, &rusthouse_batch)?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -532,6 +589,7 @@ fn details_json(
     config: &Config,
     identity: &ClickHouseIdentity,
     cases: &[CaseResult],
+    resolved_parameters: &[ResolvedScale],
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
@@ -540,7 +598,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -559,9 +617,11 @@ fn details_json(
         }
         write!(output, "{row_count}").expect("writing to String cannot fail");
     }
+    output.push_str("],\"resolved_parameters\":");
+    write_resolved_parameters(&mut output, resolved_parameters);
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        ",\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
@@ -612,6 +672,64 @@ fn details_json(
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_resolved_parameters(output: &mut String, scales: &[ResolvedScale]) {
+    output.push('[');
+    for (scale_index, scale) in scales.iter().enumerate() {
+        if scale_index > 0 {
+            output.push(',');
+        }
+        let compound_target_selectivity =
+            scale.workload.compound_target_rows as f64 / scale.row_count as f64;
+        let compound_resolved_selectivity =
+            scale.workload.compound_matched_rows as f64 / scale.row_count as f64;
+        let nonselective_target_selectivity =
+            scale.workload.nonselective_target_rows as f64 / scale.row_count as f64;
+        let nonselective_resolved_selectivity =
+            scale.workload.nonselective_matched_rows as f64 / scale.row_count as f64;
+        write!(
+            output,
+            "{{\"row_count\":{},\"dataset_seed\":{},\"workload_seed\":{},\"id_permutation\":{{\"modulus\":{},\"multiplier\":{},\"offset\":{}}},\"high_key_permutation\":{{\"modulus\":{},\"multiplier\":{},\"offset\":{}}},\"workload_literals\":{{\"selected_id\":{},\"compound_flag\":{},\"compound_uniform_upper_bound\":{},\"compound_skew_lower_bound\":{},\"compound_target_rows\":{},\"compound_matched_rows\":{},\"compound_target_selectivity\":{:.9},\"compound_resolved_selectivity\":{:.9},\"nonselective_uniform_lower_bound\":{},\"nonselective_target_rows\":{},\"nonselective_matched_rows\":{},\"nonselective_target_selectivity\":{:.9},\"nonselective_resolved_selectivity\":{:.9}}},\"queries\":[",
+            scale.row_count,
+            scale.dataset_seed,
+            scale.workload_seed,
+            scale.row_count,
+            scale.dataset.id_permutation.multiplier,
+            scale.dataset.id_permutation.offset,
+            scale.row_count,
+            scale.dataset.high_key_permutation.multiplier,
+            scale.dataset.high_key_permutation.offset,
+            scale.workload.selected_id,
+            scale.workload.compound_flag,
+            scale.workload.compound_uniform_upper_bound,
+            scale.workload.compound_skew_lower_bound,
+            scale.workload.compound_target_rows,
+            scale.workload.compound_matched_rows,
+            compound_target_selectivity,
+            compound_resolved_selectivity,
+            scale.workload.nonselective_uniform_lower_bound,
+            scale.workload.nonselective_target_rows,
+            scale.workload.nonselective_matched_rows,
+            nonselective_target_selectivity,
+            nonselective_resolved_selectivity,
+        )
+        .expect("writing to String cannot fail");
+        for (query_index, query) in scale.queries.iter().enumerate() {
+            if query_index > 0 {
+                output.push(',');
+            }
+            write!(
+                output,
+                "{{\"workload\":{},\"sql\":{}}}",
+                json_string(query.workload),
+                json_string(&query.sql)
+            )
+            .expect("writing to String cannot fail");
+        }
+        output.push_str("]}");
+    }
+    output.push(']');
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -799,5 +917,32 @@ mod tests {
             "{\"score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
         );
         assert!(!report.contains('\n'));
+    }
+
+    #[test]
+    fn resolved_parameters_are_reproducible_and_include_generated_sql() {
+        fn render(runtime_seed: u64) -> String {
+            let row_count = 1_000;
+            let dataset_seed =
+                derive_scale_seed(runtime_seed, row_count, DATASET_SCALE_SEED_DOMAIN);
+            let workload_seed =
+                derive_scale_seed(runtime_seed, row_count, WORKLOAD_SCALE_SEED_DOMAIN);
+            let dataset = Dataset::generate(dataset_seed, row_count);
+            let suite = workloads(workload_seed, &dataset).expect("workloads");
+            let scale = resolve_scale(row_count, dataset_seed, workload_seed, &dataset, &suite);
+            let mut output = String::new();
+            write_resolved_parameters(&mut output, &[scale]);
+            output
+        }
+
+        let first = render(99);
+        assert_eq!(first, render(99));
+        assert_ne!(first, render(100));
+        assert!(first.contains("\"id_permutation\""));
+        assert!(first.contains("\"high_key_permutation\""));
+        assert!(first.contains("\"workload_literals\""));
+        assert!(first.contains("\"compound_resolved_selectivity\""));
+        assert!(first.contains("\"queries\":[{"));
+        assert!(first.contains("SELECT id, payload, large_int, flag"));
     }
 }

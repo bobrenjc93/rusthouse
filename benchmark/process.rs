@@ -1,6 +1,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
@@ -36,6 +37,26 @@ pub struct TimedBatch {
     pub query_repetitions: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedBatch {
+    sql: Arc<str>,
+    query_repetitions: usize,
+}
+
+impl PreparedBatch {
+    pub fn shared_engine_pair(
+        setup_sql: &str,
+        query_sql: &str,
+        query_repetitions: usize,
+    ) -> Result<(Self, Self), String> {
+        let batch = Self {
+            sql: Arc::from(sql_batch(setup_sql, query_sql, query_repetitions)?),
+            query_repetitions,
+        };
+        Ok((batch.clone(), batch))
+    }
+}
+
 impl EnginePaths {
     pub fn validate(&self) -> Result<ClickHouseIdentity, String> {
         validate_rusthouse(&self.rusthouse)?;
@@ -45,11 +66,12 @@ impl EnginePaths {
     pub fn execute_correctness(
         &self,
         engine: Engine,
-        setup_sql: &str,
-        query_sql: &str,
+        batch: &PreparedBatch,
     ) -> Result<TimedOutput, String> {
-        let batch = sql_batch(setup_sql, query_sql, 1)?;
-        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+        if batch.query_repetitions != 1 {
+            return Err("correctness execution requires exactly one query".to_owned());
+        }
+        let (_, stdout) = self.execute_batch(engine, &batch.sql, true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),
         })
@@ -58,16 +80,13 @@ impl EnginePaths {
     pub fn execute_timed(
         &self,
         engine: Engine,
-        setup_sql: &str,
-        query_sql: &str,
-        query_repetitions: usize,
+        batch: &PreparedBatch,
     ) -> Result<TimedBatch, String> {
-        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
-        let (elapsed, stdout) = self.execute_batch(engine, &batch, false)?;
+        let (elapsed, stdout) = self.execute_batch(engine, &batch.sql, false)?;
         debug_assert!(stdout.is_none());
         Ok(TimedBatch {
             elapsed,
-            query_repetitions,
+            query_repetitions: batch.query_repetitions,
         })
     }
 
@@ -277,6 +296,17 @@ mod tests {
             sql_batch("CREATE TABLE t (n Int64);\n", "SELECT n FROM t;", 3).expect("valid batch");
         assert_eq!(batch.matches("CREATE TABLE").count(), 1);
         assert_eq!(batch.matches("SELECT n FROM t;").count(), 3);
+    }
+
+    #[test]
+    fn both_engines_receive_identical_shared_sql_bytes() {
+        let (rusthouse, clickhouse) =
+            PreparedBatch::shared_engine_pair("CREATE TABLE t (n Int64);\n", "SELECT n FROM t;", 3)
+                .expect("valid batch");
+
+        assert_eq!(rusthouse.sql.as_ref(), clickhouse.sql.as_ref());
+        assert!(Arc::ptr_eq(&rusthouse.sql, &clickhouse.sql));
+        assert_eq!(rusthouse.query_repetitions, clickhouse.query_repetitions);
     }
 
     #[test]

@@ -18,12 +18,65 @@ pub struct Row {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dataset {
     pub seed: u64,
+    pub parameters: DatasetParameters,
     pub rows: Vec<Row>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetParameters {
+    pub id_permutation: PermutationParameters,
+    pub high_key_permutation: PermutationParameters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermutationParameters {
+    pub multiplier: usize,
+    pub offset: usize,
+}
+
+impl PermutationParameters {
+    fn derive(seed: u64, row_count: usize, domain: u64) -> Self {
+        if row_count <= 1 {
+            return Self {
+                multiplier: 1,
+                offset: 0,
+            };
+        }
+
+        let mut multiplier = (mix64(seed ^ domain) as usize) % row_count;
+        if multiplier == 0 {
+            multiplier = 1;
+        }
+        while greatest_common_divisor(multiplier, row_count) != 1 {
+            multiplier += 1;
+            if multiplier == row_count {
+                multiplier = 1;
+            }
+        }
+        let offset = (mix64(seed ^ domain.rotate_left(29)) as usize) % row_count;
+        Self { multiplier, offset }
+    }
+
+    fn apply(self, index: usize, row_count: usize) -> usize {
+        if row_count <= 1 {
+            return 0;
+        }
+        ((self.multiplier as u128 * index as u128 + self.offset as u128) % row_count as u128)
+            as usize
+    }
 }
 
 impl Dataset {
     pub fn generate(seed: u64, row_count: usize) -> Self {
         let mut random = SplitMix64::new(seed);
+        let parameters = DatasetParameters {
+            id_permutation: PermutationParameters::derive(seed, row_count, 0xa076_1d64_78bd_642f),
+            high_key_permutation: PermutationParameters::derive(
+                seed,
+                row_count,
+                0xe703_7ed1_a0b4_28db,
+            ),
+        };
         let low_keys = [
             "amber", "blue", "coral", "green", "indigo", "red", "silver", "violet",
         ];
@@ -40,6 +93,8 @@ impl Dataset {
         let mut rows = Vec::with_capacity(row_count);
 
         for index in 0..row_count {
+            let id = parameters.id_permutation.apply(index, row_count);
+            let high_key = parameters.high_key_permutation.apply(index, row_count);
             let uniform_num = if index == 0 {
                 -1_000_000
             } else if index == 1 {
@@ -56,7 +111,7 @@ impl Dataset {
             };
             let score = ((random.next() % 160_001) as i64 - 80_000) as f64 / 8.0;
             let low_key = low_keys[(random.next() as usize) % low_keys.len()].to_owned();
-            let high_key = format!("entity_{index:08}");
+            let high_key = format!("entity_{high_key:08}");
             let word = words[(random.next() as usize) % words.len()];
             let suffix_len = (random.next() % 13) as usize;
             let payload = if index == 0 {
@@ -81,7 +136,7 @@ impl Dataset {
             };
 
             rows.push(Row {
-                id: index as i64,
+                id: id as i64,
                 uniform_num,
                 skewed_num,
                 score,
@@ -93,7 +148,11 @@ impl Dataset {
             });
         }
 
-        Self { seed, rows }
+        Self {
+            seed,
+            parameters,
+            rows,
+        }
     }
 
     pub fn setup_sql(&self) -> String {
@@ -126,6 +185,20 @@ impl Dataset {
         sql.push_str(";\n");
         sql
     }
+}
+
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn escape_sql_string(value: &str) -> String {
@@ -163,6 +236,82 @@ mod tests {
     #[test]
     fn runtime_seed_changes_generated_data() {
         assert_ne!(Dataset::generate(41, 64), Dataset::generate(42, 64));
+    }
+
+    #[test]
+    fn seed_permutations_change_structure_without_changing_key_sets() {
+        let left = Dataset::generate(41, 257);
+        let right = Dataset::generate(42, 257);
+        let ids = |dataset: &Dataset| dataset.rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let high_keys = |dataset: &Dataset| {
+            dataset
+                .rows
+                .iter()
+                .map(|row| row.high_key.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_ne!(left.parameters, right.parameters);
+        assert_ne!(ids(&left), ids(&right));
+        assert_ne!(high_keys(&left), high_keys(&right));
+
+        let mut left_ids = ids(&left);
+        let mut right_ids = ids(&right);
+        left_ids.sort_unstable();
+        right_ids.sort_unstable();
+        assert_eq!(left_ids, (0..257).map(i64::from).collect::<Vec<_>>());
+        assert_eq!(right_ids, left_ids);
+
+        let mut left_high_keys = high_keys(&left);
+        let mut right_high_keys = high_keys(&right);
+        left_high_keys.sort_unstable();
+        right_high_keys.sort_unstable();
+        assert_eq!(left_high_keys, right_high_keys);
+        assert_eq!(left_high_keys.len(), 257);
+        assert_eq!(
+            left_high_keys.first().map(String::as_str),
+            Some("entity_00000000")
+        );
+        assert_eq!(
+            left_high_keys.last().map(String::as_str),
+            Some("entity_00000256")
+        );
+    }
+
+    #[test]
+    fn permutations_are_bijective_at_composite_benchmark_scales() {
+        for seed in [0, 1, 20_260_729, u64::MAX] {
+            for row_count in [256, 1_000, 2_048] {
+                let dataset = Dataset::generate(seed, row_count);
+                let ids = dataset
+                    .rows
+                    .iter()
+                    .map(|row| row.id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let high_keys = dataset
+                    .rows
+                    .iter()
+                    .map(|row| &row.high_key)
+                    .collect::<std::collections::BTreeSet<_>>();
+
+                assert_eq!(ids.len(), row_count);
+                assert_eq!(high_keys.len(), row_count);
+                assert_eq!(
+                    greatest_common_divisor(
+                        dataset.parameters.id_permutation.multiplier,
+                        row_count
+                    ),
+                    1
+                );
+                assert_eq!(
+                    greatest_common_divisor(
+                        dataset.parameters.high_key_permutation.multiplier,
+                        row_count
+                    ),
+                    1
+                );
+            }
+        }
     }
 
     #[test]

@@ -62,9 +62,9 @@ On 2026-07-29, the default command above was run on the same Apple Silicon host 
 
 The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
 
-The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
+The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data, ID/key permutations, selected point ID, Boolean predicate polarity, and calibrated numeric predicate literals.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Schema version 3 also records each scale's derived dataset/workload seeds, affine permutation coefficients, resolved filter literals, target and achieved row counts/selectivities, and exact workload SQL. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -77,21 +77,21 @@ A dependency-free SplitMix64 generator produces deterministic typed rows. Every 
 - negative numbers and signed integers around four quadrillion;
 - exactly representable eighth-step floating-point values.
 
-The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix.
+The first generated rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix. At each scale, independent seed-derived affine permutations assign the complete ID range and complete high-key suffix range to rows. Coprime multipliers make both maps bijective: seeds change row/key associations without changing ID density or high-key cardinality.
 
 Each row count runs eight cases spanning:
 
 | Family | Coverage |
 | --- | --- |
 | Full scan | COUNT, two SUMs, MIN, MAX, and AVG |
-| Selective filter | A single-ID point predicate with mixed projected types |
-| Compound filter | Parenthesized AND/OR, Boolean, uniform, and skewed columns |
-| Nonselective filter | A predicate expected to retain about 97.5% of rows |
+| Selective filter | A seed-selected single-ID point predicate with mixed projected types |
+| Compound filter | Parenthesized AND/OR with seed-selected Boolean polarity and data-calibrated uniform/skewed literals targeting about 31.25% total retention |
+| Nonselective filter | A data-calibrated seeded literal targeting 97.5% retention |
 | Low-cardinality grouping | String plus Boolean grouping with several aggregates |
 | High-cardinality grouping | Unique string-key grouping, deterministic ordering, bounded output |
 | Ordering and limit | Numeric and string sort shapes with deterministic tie breakers |
 
-The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
+The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Each pair receives clones of one shared immutable SQL payload; only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
 
 ## Correctness gate and normalization
 
@@ -99,7 +99,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator and resolved-parameter reproducibility, cross-seed structural/literal variation, permutation bijectivity at composite benchmark scales, key/cardinality and family/selectivity invariants across seeds and scales, byte-identical shared engine SQL, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
 
 ## Timing and calibration
 
@@ -127,4 +127,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, seed-derived bijective key/ID assignments and calibrated literals, recorded resolved SQL and parameters, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, one shared SQL payload and identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
