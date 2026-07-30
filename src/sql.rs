@@ -207,9 +207,19 @@ impl StatementFramer {
             }
         }
 
-        if completed_through > 0 {
-            self.buffer.drain(..completed_through);
-            self.position -= completed_through;
+        let consumed_through = if self.has_sql {
+            completed_through
+        } else {
+            self.position
+        };
+        if consumed_through > 0 {
+            self.buffer.drain(..consumed_through);
+            self.position -= consumed_through;
+        }
+        if !self.has_sql && self.state == FramingState::LineComment {
+            self.buffer.clear();
+            self.buffer.push_str("--");
+            self.position = self.buffer.len();
         }
         completed
     }
@@ -941,11 +951,32 @@ mod tests {
 
         assert!(framer.push_str("-- comment ending in dash-").is_empty());
         assert!(framer.push_str("\nSELECT 'split quote'").is_empty());
-        assert_eq!(
-            framer.push_str(";"),
-            vec!["-- comment ending in dash-\nSELECT 'split quote';"]
-        );
+        assert_eq!(framer.push_str(";"), vec!["--\nSELECT 'split quote';"]);
         assert!(framer.push_str(" ; -- empty;\n").is_empty());
+    }
+
+    #[test]
+    fn statement_framer_compacts_consumed_idle_input() {
+        let mut framer = StatementFramer::new();
+
+        assert!(framer.push_str("  -- ignored ; comment\n").is_empty());
+        let idle_capacity = framer.buffer.capacity();
+        for _ in 0..10_000 {
+            assert!(framer.push_str("  -- ignored ; comment\n").is_empty());
+            assert!(framer.is_idle());
+            assert!(framer.buffer.is_empty());
+            assert_eq!(framer.position, 0);
+            assert_eq!(framer.buffer.capacity(), idle_capacity);
+        }
+
+        assert!(framer.push_str("-- unfinished comment").is_empty());
+        assert_eq!(framer.buffer, "--");
+        assert_eq!(framer.position, 2);
+        assert_eq!(framer.state, FramingState::LineComment);
+        assert_eq!(
+            framer.push_str("; still ignored\nSELECT * FROM notes;"),
+            vec!["--; still ignored\nSELECT * FROM notes;"]
+        );
     }
 
     #[test]
