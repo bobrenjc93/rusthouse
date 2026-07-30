@@ -38,6 +38,10 @@ pub(crate) fn run(
             return Ok(());
         }
 
+        if line.trim() == "\\q" {
+            return Ok(());
+        }
+
         if buffer.is_empty() && line.trim_start().starts_with('\\') {
             if handle_command(
                 line.trim(),

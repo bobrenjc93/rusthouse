@@ -213,6 +213,25 @@ fn interactive_session_keeps_state_and_continues_after_sql_errors() {
 }
 
 #[test]
+fn interactive_quit_discards_buffered_sql() {
+    let output = run_with_stdin(
+        &["--interactive", "--format", "csv"],
+        "CREATE TABLE notes (label String);\n\
+         INSERT INTO notes VALUES ('kept');\n\
+         SELECT label FROM notes\n\
+         \\q\n\
+         SELECT label FROM notes;\n",
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("        -> "));
+    assert!(!stderr.contains("unexpected character"));
+}
+
+#[test]
 fn interactive_commands_change_format_read_files_and_quit() {
     let path = temp_sql_path();
     fs::write(
