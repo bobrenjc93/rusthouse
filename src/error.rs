@@ -48,7 +48,7 @@ impl fmt::Display for Error {
                 context,
             } => write!(
                 f,
-                "{context} {identifier:?} is reserved; TRUE and FALSE are Boolean literals"
+                "{context} {identifier:?} is reserved; TRUE, FALSE, and NULL are predicate literals"
             ),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
@@ -78,3 +78,21 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_identifier_message_lists_every_predicate_literal() {
+        let error = Error::ReservedIdentifier {
+            identifier: "NULL".to_owned(),
+            context: "alias".to_owned(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "alias \"NULL\" is reserved; TRUE, FALSE, and NULL are predicate literals"
+        );
+    }
+}
