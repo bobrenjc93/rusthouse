@@ -526,6 +526,35 @@ fn creates_a_fifty_thousand_column_schema() {
 }
 
 #[test]
+fn creates_a_fifty_thousand_column_order_key() {
+    let column_count = 50_000;
+    let definitions = (0..column_count)
+        .map(|index| format!("c{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_by = (0..column_count)
+        .rev()
+        .map(|index| format!("c{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+
+    database
+        .execute(&format!(
+            "CREATE TABLE wide_ordered ({definitions}) ORDER BY ({order_by})"
+        ))
+        .expect("wide ordered schema should validate in linear time");
+
+    let table = database
+        .catalog()
+        .table("wide_ordered")
+        .expect("wide ordered table exists");
+    assert_eq!(table.order_key().len(), column_count);
+    assert_eq!(table.order_key()[0], column_count - 1);
+    assert_eq!(table.order_key()[column_count - 1], 0);
+}
+
+#[test]
 fn ordered_parts_merge_interleaved_inserts_and_preserve_duplicate_keys() {
     let mut database = Database::new();
     database

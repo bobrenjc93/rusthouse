@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::error::{Error, Result};
@@ -200,6 +200,7 @@ pub(crate) struct KeyRange {
 pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
+    column_indexes: HashMap<String, usize>,
     order_key: Vec<usize>,
     parts: Vec<Part>,
     row_count: usize,
@@ -220,42 +221,45 @@ impl Table {
                 "a table must contain at least one column".to_owned(),
             ));
         }
-        let mut column_names = HashSet::with_capacity(schema.len());
-        for field in &schema {
+        let mut column_indexes = HashMap::with_capacity(schema.len());
+        for (index, field) in schema.iter().enumerate() {
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
                     context: "column name".to_owned(),
                 });
             }
-            if !column_names.insert(field.name.to_ascii_lowercase()) {
+            if column_indexes
+                .insert(field.name.to_ascii_lowercase(), index)
+                .is_some()
+            {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
 
         let mut order_key = Vec::with_capacity(order_by.len());
+        let mut selected = vec![false; schema.len()];
         for key in order_by {
-            let Some(column) = schema
-                .iter()
-                .position(|field| field.name.eq_ignore_ascii_case(&key))
-            else {
+            let Some(&column) = column_indexes.get(&key.to_ascii_lowercase()) else {
                 return Err(Error::ColumnNotFound {
                     table: name,
                     column: key,
                 });
             };
-            if order_key.contains(&column) {
+            if selected[column] {
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY key '{}' is listed more than once",
                     schema[column].name
                 )));
             }
+            selected[column] = true;
             order_key.push(column);
         }
 
         Ok(Self {
             name,
             schema,
+            column_indexes,
             order_key,
             parts: Vec::new(),
             row_count: 0,
@@ -288,9 +292,9 @@ impl Table {
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
-        self.schema
-            .iter()
-            .position(|field| field.name.eq_ignore_ascii_case(name))
+        self.column_indexes
+            .get(&name.to_ascii_lowercase())
+            .copied()
             .ok_or_else(|| Error::ColumnNotFound {
                 table: self.name.clone(),
                 column: name.to_owned(),
