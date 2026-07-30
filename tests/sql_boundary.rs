@@ -478,6 +478,198 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
+fn scalar_expressions_obey_precedence_aliases_and_numeric_promotion() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE arithmetic (id Int64, quantity Int64, price Float64);
+             INSERT INTO arithmetic VALUES (1, 3, 2.5), (2, 4, 10.0);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id + quantity * 2 AS precedence,
+                (id + quantity) * 2 AS parenthesized,
+                -id AS negated,
+                quantity + price AS promoted,
+                20 / quantity AS integer_division
+         FROM arithmetic
+         WHERE (id + quantity) * 2 >= price
+         ORDER BY promoted DESC;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"precedence".to_owned(), DataType::Int64),
+            (&"parenthesized".to_owned(), DataType::Int64),
+            (&"negated".to_owned(), DataType::Int64),
+            (&"promoted".to_owned(), DataType::Float64),
+            (&"integer_division".to_owned(), DataType::Int64),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(10),
+                Value::Int64(12),
+                Value::Int64(-2),
+                Value::Float64(14.0),
+                Value::Int64(5),
+            ],
+            vec![
+                Value::Int64(7),
+                Value::Int64(8),
+                Value::Int64(-1),
+                Value::Float64(5.5),
+                Value::Int64(6),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn expressions_work_in_aggregate_arguments_and_follow_grouping_rules() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE line_items (category Int64, quantity Int64, price Float64);
+             INSERT INTO line_items VALUES (1, 2, 3.5), (1, 3, 2.0), (2, 4, 1.25);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT category * 10 AS bucket,
+                SUM(quantity * price) AS revenue,
+                MIN(price - 1) AS lowest_adjusted,
+                MAX(quantity + 1) AS highest_quantity,
+                AVG(quantity * 2) AS mean_quantity,
+                COUNT(quantity + 1) AS rows
+         FROM line_items
+         GROUP BY category
+         ORDER BY bucket;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(10),
+                Value::Float64(13.0),
+                Value::Float64(1.0),
+                Value::Int64(4),
+                Value::Float64(5.0),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(20),
+                Value::Float64(5.0),
+                Value::Float64(0.25),
+                Value::Int64(5),
+                Value::Float64(8.0),
+                Value::Int64(1),
+            ],
+        ]
+    );
+
+    let error = database
+        .execute(
+            "SELECT category + quantity AS invalid, SUM(price)
+             FROM line_items GROUP BY category;",
+        )
+        .expect_err("every non-aggregate reference must be grouped");
+    assert!(
+        matches!(error, Error::InvalidQuery(message) if message.contains("quantity") && message.contains("GROUP BY"))
+    );
+}
+
+#[test]
+fn int64_expression_boundaries_are_checked() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE boundaries (maximum Int64, minimum Int64, zero Int64);
+             INSERT INTO boundaries VALUES
+                (9223372036854775807, -9223372036854775808, 0);",
+        )
+        .expect("setup succeeds");
+
+    for (sql, operation) in [
+        ("SELECT maximum + 1 FROM boundaries", "'+'"),
+        ("SELECT minimum - 1 FROM boundaries", "'-'"),
+        ("SELECT -minimum FROM boundaries", "unary '-'"),
+        ("SELECT minimum / -1 FROM boundaries", "'/'"),
+        ("SELECT 3037000500 * 3037000500 FROM boundaries", "'*'"),
+    ] {
+        let error = database.execute(sql).expect_err("operation overflows");
+        assert!(
+            matches!(error, Error::NumericOverflow(ref message) if message.contains(operation)),
+            "unexpected error: {error}"
+        );
+    }
+
+    assert!(matches!(
+        database
+            .execute("SELECT 1e308 * 2.0 FROM boundaries")
+            .expect_err("Float64 operation overflows"),
+        Error::NumericOverflow(message) if message.contains("Float64")
+    ));
+
+    for sql in [
+        "SELECT maximum / zero FROM boundaries",
+        "SELECT 1.0 / 0 FROM boundaries",
+        "SELECT SUM(maximum / zero) FROM boundaries",
+    ] {
+        assert_eq!(
+            database.execute(sql).expect_err("division by zero"),
+            Error::DivisionByZero
+        );
+    }
+}
+
+#[test]
+fn literal_expressions_are_folded_and_type_checked_before_scanning() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE empty (id Int64);")
+        .expect("create succeeds");
+
+    assert_eq!(
+        database
+            .execute("SELECT 10 / (3 - 3) FROM empty")
+            .expect_err("constant division fails even without rows"),
+        Error::DivisionByZero
+    );
+    assert!(matches!(
+        database
+            .execute("SELECT 'wrong' + 1 FROM empty")
+            .expect_err("arithmetic must be numeric"),
+        Error::TypeMismatch { expected, actual, .. }
+            if expected == "Int64 or Float64" && actual == "String"
+    ));
+
+    let folded = execute_query(
+        &mut database,
+        "SELECT 1 + 2 * 3 AS folded, 1 + 2.5 AS promoted FROM empty;",
+    );
+    assert_eq!(
+        folded
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::Int64, DataType::Float64]
+    );
+    assert!(folded.rows.is_empty());
+}
+
+#[test]
 fn boolean_literals_cannot_be_ambiguous_column_names() {
     for identifier in ["true", "FALSE"] {
         let mut database = Database::new();

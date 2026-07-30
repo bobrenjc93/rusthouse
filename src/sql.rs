@@ -4,6 +4,8 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_EXPRESSION_DEPTH: usize = 64;
+const MAX_EXPRESSION_NODES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -33,6 +35,10 @@ pub enum SelectItem {
     Wildcard,
     Column {
         name: String,
+        alias: Option<String>,
+    },
+    Expression {
+        expression: ScalarExpression,
         alias: Option<String>,
     },
     Aggregate {
@@ -79,6 +85,7 @@ impl AggregateFunction {
 pub enum AggregateArgument {
     Wildcard,
     Column(String),
+    Expression(ScalarExpression),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,10 +99,63 @@ pub enum Predicate {
     Or(Box<Self>, Box<Self>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Operand {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarExpression {
     Column(String),
     Literal(Value),
+    Parenthesized(Box<Self>),
+    UnaryMinus(Box<Self>),
+    Binary {
+        left: Box<Self>,
+        operator: ArithmeticOperator,
+        right: Box<Self>,
+    },
+}
+
+pub type Operand = ScalarExpression;
+
+impl ScalarExpression {
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Column(name) => name.clone(),
+            Self::Literal(Value::String(value)) => format!("'{}'", value.replace('\'', "''")),
+            Self::Literal(Value::Bool(value)) => value.to_string(),
+            Self::Literal(value) => value.as_display_string(),
+            Self::Parenthesized(expression) => format!("({})", expression.display_name()),
+            Self::UnaryMinus(expression) => format!("-{}", expression.display_name()),
+            Self::Binary {
+                left,
+                operator,
+                right,
+            } => format!(
+                "{} {} {}",
+                left.display_name(),
+                operator.symbol(),
+                right.display_name()
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+impl ArithmeticOperator {
+    #[must_use]
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +196,9 @@ enum TokenKind {
     RightParen,
     Semicolon,
     Star,
+    Plus,
     Minus,
+    Slash,
     Equal,
     NotEqual,
     Less,
@@ -190,9 +252,17 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     TokenKind::Star
                 }
+                '+' => {
+                    self.advance();
+                    TokenKind::Plus
+                }
                 '-' => {
                     self.advance();
                     TokenKind::Minus
+                }
+                '/' => {
+                    self.advance();
+                    TokenKind::Slash
                 }
                 '=' => {
                     self.advance();
@@ -343,6 +413,8 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    expression_depth: usize,
+    expression_nodes: usize,
 }
 
 impl Parser {
@@ -352,6 +424,8 @@ impl Parser {
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            expression_depth: 0,
+            expression_nodes: 0,
         }
     }
 
@@ -518,9 +592,11 @@ impl Parser {
             return Ok(SelectItem::Wildcard);
         }
 
-        let position = self.position();
-        let name = self.expect_identifier("column or aggregate function")?;
-        if self.eat(&TokenKind::LeftParen) {
+        if let TokenKind::Identifier(name) = self.peek().clone()
+            && self.peek_next() == &TokenKind::LeftParen
+        {
+            let position = self.position();
+            self.current += 2;
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -528,18 +604,26 @@ impl Parser {
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                let expression = self.parse_scalar_expression()?;
+                match expression {
+                    ScalarExpression::Column(name) => AggregateArgument::Column(name),
+                    expression => AggregateArgument::Expression(expression),
+                }
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let alias = self.parse_alias()?;
-            Ok(SelectItem::Aggregate {
+            return Ok(SelectItem::Aggregate {
                 function,
                 argument,
                 alias,
-            })
-        } else {
-            let alias = self.parse_alias()?;
-            Ok(SelectItem::Column { name, alias })
+            });
+        }
+
+        let expression = self.parse_scalar_expression()?;
+        let alias = self.parse_alias()?;
+        match expression {
+            ScalarExpression::Column(name) => Ok(SelectItem::Column { name, alias }),
+            expression => Ok(SelectItem::Expression { expression, alias }),
         }
     }
 
@@ -572,12 +656,22 @@ impl Parser {
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
-        if self.eat(&TokenKind::LeftParen) {
+        if self.at(&TokenKind::LeftParen) {
             if self.predicate_depth >= MAX_PREDICATE_DEPTH {
                 return self.error(format!(
                     "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
                 ));
             }
+
+            let start = self.current;
+            let predicate_nodes = self.predicate_nodes;
+            if let Ok(comparison) = self.parse_comparison() {
+                return Ok(comparison);
+            }
+            self.current = start;
+            self.predicate_nodes = predicate_nodes;
+
+            self.current += 1;
             self.predicate_depth += 1;
             let predicate = self.parse_or_predicate();
             self.predicate_depth -= 1;
@@ -586,7 +680,11 @@ impl Parser {
             return Ok(predicate);
         }
 
-        let left = self.parse_operand()?;
+        self.parse_comparison()
+    }
+
+    fn parse_comparison(&mut self) -> Result<Predicate> {
+        let left = self.parse_scalar_expression()?;
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -597,7 +695,7 @@ impl Parser {
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
         self.current += 1;
-        let right = self.parse_operand()?;
+        let right = self.parse_scalar_expression()?;
         self.record_predicate_node()?;
         Ok(Predicate::Comparison {
             left,
@@ -616,21 +714,154 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_operand(&mut self) -> Result<Operand> {
-        match self.peek() {
-            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
-                self.parse_literal().map(Operand::Literal)
-            }
-            TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
-            {
-                self.parse_literal().map(Operand::Literal)
-            }
-            TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
-                .map(Operand::Column),
-            _ => self.error("expected column or literal"),
+    fn parse_scalar_expression(&mut self) -> Result<ScalarExpression> {
+        self.expression_depth = 0;
+        self.expression_nodes = 0;
+        self.parse_additive_expression()
+    }
+
+    fn parse_additive_expression(&mut self) -> Result<ScalarExpression> {
+        let mut expression = self.parse_multiplicative_expression()?;
+        loop {
+            let operator = if self.eat(&TokenKind::Plus) {
+                ArithmeticOperator::Add
+            } else if self.eat(&TokenKind::Minus) {
+                ArithmeticOperator::Subtract
+            } else {
+                break;
+            };
+            let right = self.parse_multiplicative_expression()?;
+            self.record_expression_node()?;
+            expression = ScalarExpression::Binary {
+                left: Box::new(expression),
+                operator,
+                right: Box::new(right),
+            };
         }
+        Ok(expression)
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<ScalarExpression> {
+        let mut expression = self.parse_unary_expression()?;
+        loop {
+            let operator = if self.eat(&TokenKind::Star) {
+                ArithmeticOperator::Multiply
+            } else if self.eat(&TokenKind::Slash) {
+                ArithmeticOperator::Divide
+            } else {
+                break;
+            };
+            let right = self.parse_unary_expression()?;
+            self.record_expression_node()?;
+            expression = ScalarExpression::Binary {
+                left: Box::new(expression),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<ScalarExpression> {
+        if self.eat(&TokenKind::Minus) {
+            let is_minimum = matches!(
+                self.peek(),
+                TokenKind::Number(value)
+                    if !value.contains(['.', 'e', 'E'])
+                        && value.parse::<u64>() == Ok(i64::MAX as u64 + 1)
+            );
+            if is_minimum {
+                self.current += 1;
+                self.record_expression_node()?;
+                return Ok(ScalarExpression::Literal(Value::Int64(i64::MIN)));
+            }
+            self.enter_expression()?;
+            let expression = self.parse_unary_expression();
+            self.expression_depth -= 1;
+            let expression = expression?;
+            self.record_expression_node()?;
+            return Ok(ScalarExpression::UnaryMinus(Box::new(expression)));
+        }
+        self.parse_expression_primary()
+    }
+
+    fn parse_expression_primary(&mut self) -> Result<ScalarExpression> {
+        if self.eat(&TokenKind::LeftParen) {
+            self.enter_expression()?;
+            let expression = self.parse_additive_expression();
+            self.expression_depth -= 1;
+            let expression = expression?;
+            self.expect(&TokenKind::RightParen, "')' after expression")?;
+            self.record_expression_node()?;
+            return Ok(ScalarExpression::Parenthesized(Box::new(expression)));
+        }
+
+        let expression = match self.peek().clone() {
+            TokenKind::String(value) => {
+                self.current += 1;
+                ScalarExpression::Literal(Value::String(value))
+            }
+            TokenKind::Number(number) => {
+                self.current += 1;
+                ScalarExpression::Literal(self.parse_unsigned_number(number)?)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("TRUE") => {
+                self.current += 1;
+                ScalarExpression::Literal(Value::Bool(true))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FALSE") => {
+                self.current += 1;
+                ScalarExpression::Literal(Value::Bool(false))
+            }
+            TokenKind::Identifier(name) => {
+                self.current += 1;
+                ScalarExpression::Column(name)
+            }
+            _ => return self.error("expected a column, literal, or parenthesized expression"),
+        };
+        self.record_expression_node()?;
+        Ok(expression)
+    }
+
+    fn parse_unsigned_number(&self, number: String) -> Result<Value> {
+        if number.contains(['.', 'e', 'E']) {
+            let value = number.parse::<f64>().map_err(|_| Error::Sql {
+                position: self.position(),
+                message: format!("invalid Float64 literal '{number}'"),
+            })?;
+            if !value.is_finite() {
+                return self.error("Float64 literal must be finite");
+            }
+            Ok(Value::Float64(value))
+        } else {
+            number
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|_| Error::Sql {
+                    position: self.position(),
+                    message: format!("invalid Int64 literal '{number}'"),
+                })
+        }
+    }
+
+    fn enter_expression(&mut self) -> Result<()> {
+        if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+            return self.error(format!(
+                "scalar expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+            ));
+        }
+        self.expression_depth += 1;
+        Ok(())
+    }
+
+    fn record_expression_node(&mut self) -> Result<()> {
+        if self.expression_nodes >= MAX_EXPRESSION_NODES {
+            return self.error(format!(
+                "scalar expression is too complex; maximum {MAX_EXPRESSION_NODES} nodes"
+            ));
+        }
+        self.expression_nodes += 1;
+        Ok(())
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
@@ -738,6 +969,10 @@ impl Parser {
         &self.tokens[self.current].kind
     }
 
+    fn peek_next(&self) -> &TokenKind {
+        &self.tokens[self.current + 1].kind
+    }
+
     fn position(&self) -> usize {
         self.tokens[self.current].position
     }
@@ -816,6 +1051,29 @@ mod tests {
             error,
             Error::Sql { message, .. }
                 if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn scalar_expression_ast_is_bounded() {
+        let nested = format!(
+            "SELECT {}id{} FROM things",
+            "(".repeat(1_000),
+            ")".repeat(1_000)
+        );
+        let error = parse(&nested).expect_err("nesting limit should reject expression");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("scalar expression nesting exceeds limit of 64")
+        ));
+
+        let flat = format!("SELECT {} FROM things", vec!["id"; 1_000].join(" + "));
+        let error = parse(&flat).expect_err("node limit should reject expression");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("scalar expression is too complex; maximum 256 nodes")
         ));
     }
 }

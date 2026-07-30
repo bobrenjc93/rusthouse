@@ -95,6 +95,42 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn scalar_expression_results_render_in_every_output_format() {
+    let sql = "CREATE TABLE numbers (n Int64);
+               INSERT INTO numbers VALUES (3);
+               SELECT n * 2 AS doubled, n / 2.0 AS half FROM numbers;";
+
+    let table = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "table", "--execute", sql])
+        .output()
+        .expect("run table CLI");
+    assert!(table.status.success());
+    let table = String::from_utf8(table.stdout).expect("UTF-8 table output");
+    assert!(table.contains("| doubled | half |"));
+    assert!(table.contains("| 6       | 1.5  |"));
+
+    let csv = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "csv", "--execute", sql])
+        .output()
+        .expect("run CSV CLI");
+    assert!(csv.status.success());
+    assert_eq!(
+        String::from_utf8(csv.stdout).expect("UTF-8 CSV output"),
+        "doubled,half\n6,1.5\n"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "json", "--execute", sql])
+        .output()
+        .expect("run JSON CLI");
+    assert!(json.status.success());
+    assert_eq!(
+        String::from_utf8(json.stdout).expect("UTF-8 JSON output"),
+        "{\"results\":[{\"columns\":[{\"name\":\"doubled\",\"type\":\"Int64\"},{\"name\":\"half\",\"type\":\"Float64\"}],\"rows\":[[6,1.5]]}]}\n"
+    );
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
