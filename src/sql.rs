@@ -88,6 +88,10 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    IsNull {
+        operand: Operand,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -398,12 +402,26 @@ impl Parser {
             }
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = if type_name.eq_ignore_ascii_case("NULLABLE") {
+                self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+                let inner_position = self.position();
+                let inner_name = self.expect_identifier("type inside Nullable(...)")?;
+                let inner = DataType::parse(&inner_name).ok_or_else(|| Error::Sql {
+                    position: inner_position,
+                    message: format!(
+                        "unknown nullable type '{inner_name}'; expected Int64, Float64, Bool, or String"
+                    ),
+                })?;
+                self.expect(&TokenKind::RightParen, "')' after nullable column type")?;
+                DataType::nullable(inner).expect("parser only accepts physical inner types")
+            } else {
+                DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+                    position,
+                    message: format!(
+                        "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(type)"
+                    ),
+                })?
+            };
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -587,6 +605,15 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        if self.eat_keyword("IS") {
+            let negated = self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            self.record_predicate_node()?;
+            return Ok(Predicate::IsNull {
+                operand: left,
+                negated,
+            });
+        }
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -622,7 +649,9 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL") =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -672,8 +701,10 @@ impl Parser {
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
+        } else if self.eat_keyword("NULL") {
+            Ok(Value::Null)
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, or NULL literal")
         }
     }
 
@@ -782,6 +813,32 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_nullable_types_null_literals_and_null_checks() {
+        let statements = parse(
+            "CREATE TABLE valueset (n Nullable(Int64), label Nullable(String));
+             INSERT INTO valueset VALUES (NULL, 'x');
+             SELECT n FROM valueset WHERE n IS NULL OR label IS NOT NULL;",
+        )
+        .expect("valid nullable SQL");
+
+        let Statement::CreateTable { columns, .. } = &statements[0] else {
+            panic!("expected create table");
+        };
+        assert_eq!(columns[0].data_type, DataType::NullableInt64);
+        assert_eq!(columns[1].data_type, DataType::NullableString);
+
+        let Statement::Insert { rows, .. } = &statements[1] else {
+            panic!("expected insert");
+        };
+        assert_eq!(rows[0][0], Value::Null);
+
+        let Statement::Select(select) = &statements[2] else {
+            panic!("expected select");
+        };
+        assert!(matches!(&select.predicate, Some(Predicate::Or(_, _))));
     }
 
     #[test]

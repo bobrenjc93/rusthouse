@@ -2,13 +2,17 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+/// The physical column types supported by RustHouse, with optional nullability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Int64,
     Float64,
     Bool,
     String,
+    NullableInt64,
+    NullableFloat64,
+    NullableBool,
+    NullableString,
 }
 
 impl DataType {
@@ -21,6 +25,43 @@ impl DataType {
             _ => None,
         }
     }
+
+    pub(crate) fn nullable(inner: Self) -> Option<Self> {
+        match inner {
+            Self::Int64 => Some(Self::NullableInt64),
+            Self::Float64 => Some(Self::NullableFloat64),
+            Self::Bool => Some(Self::NullableBool),
+            Self::String => Some(Self::NullableString),
+            Self::NullableInt64
+            | Self::NullableFloat64
+            | Self::NullableBool
+            | Self::NullableString => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_nullable(self) -> bool {
+        matches!(
+            self,
+            Self::NullableInt64 | Self::NullableFloat64 | Self::NullableBool | Self::NullableString
+        )
+    }
+
+    #[must_use]
+    pub fn base_type(self) -> Self {
+        match self {
+            Self::NullableInt64 => Self::Int64,
+            Self::NullableFloat64 => Self::Float64,
+            Self::NullableBool => Self::Bool,
+            Self::NullableString => Self::String,
+            value => value,
+        }
+    }
+
+    #[must_use]
+    pub fn into_nullable(self) -> Self {
+        Self::nullable(self.base_type()).expect("base types have nullable variants")
+    }
 }
 
 impl fmt::Display for DataType {
@@ -30,6 +71,10 @@ impl fmt::Display for DataType {
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
+            Self::NullableInt64 => "Nullable(Int64)",
+            Self::NullableFloat64 => "Nullable(Float64)",
+            Self::NullableBool => "Nullable(Bool)",
+            Self::NullableString => "Nullable(String)",
         })
     }
 }
@@ -41,6 +86,7 @@ pub enum Value {
     Float64(f64),
     Bool(bool),
     String(String),
+    Null,
 }
 
 /// A non-owning scalar used while scanning immutable column storage.
@@ -50,16 +96,18 @@ pub(crate) enum ValueRef<'a> {
     Float64(f64),
     Bool(bool),
     String(&'a str),
+    Null,
 }
 
 impl Value {
     #[must_use]
-    pub fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> Option<DataType> {
         match self {
-            Self::Int64(_) => DataType::Int64,
-            Self::Float64(_) => DataType::Float64,
-            Self::Bool(_) => DataType::Bool,
-            Self::String(_) => DataType::String,
+            Self::Int64(_) => Some(DataType::Int64),
+            Self::Float64(_) => Some(DataType::Float64),
+            Self::Bool(_) => Some(DataType::Bool),
+            Self::String(_) => Some(DataType::String),
+            Self::Null => None,
         }
     }
 
@@ -70,6 +118,7 @@ impl Value {
             Self::Float64(value) => format_float(*value),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Null => "NULL".to_owned(),
         }
     }
 
@@ -79,6 +128,7 @@ impl Value {
             Self::Float64(value) => ValueRef::Float64(*value),
             Self::Bool(value) => ValueRef::Bool(*value),
             Self::String(value) => ValueRef::String(value),
+            Self::Null => ValueRef::Null,
         }
     }
 
@@ -95,6 +145,7 @@ impl ValueRef<'_> {
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
             Self::String(value) => Value::String(value.to_owned()),
+            Self::Null => Value::Null,
         }
     }
 
@@ -108,6 +159,7 @@ impl ValueRef<'_> {
             }
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
+            (Self::Null, _) | (_, Self::Null) => None,
             _ => None,
         }
     }
@@ -118,6 +170,7 @@ impl ValueRef<'_> {
             Self::Float64(_) => 1,
             Self::Bool(_) => 2,
             Self::String(_) => 3,
+            Self::Null => 4,
         }
     }
 }
@@ -210,6 +263,7 @@ impl Ord for ValueRef<'_> {
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
             (Self::String(left), Self::String(right)) => left.cmp(right),
+            (Self::Null, Self::Null) => Ordering::Equal,
             _ => self.variant_index().cmp(&other.variant_index()),
         }
     }
@@ -229,6 +283,7 @@ impl Hash for ValueRef<'_> {
             Self::Float64(value) => canonical_float_bits(*value).hash(state),
             Self::Bool(value) => value.hash(state),
             Self::String(value) => value.hash(state),
+            Self::Null => {}
         }
     }
 }

@@ -11,46 +11,73 @@ pub struct ColumnDef {
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
+    name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+        || name.eq_ignore_ascii_case("NULL")
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// A physical column with contiguous typed values and a parallel validity bitmap.
 #[derive(Debug, Clone)]
 pub enum Column {
-    Int64(Vec<i64>),
-    Float64(Vec<f64>),
-    Bool(Vec<bool>),
-    String(Vec<String>),
+    Int64 {
+        values: Vec<i64>,
+        validity: Vec<bool>,
+    },
+    Float64 {
+        values: Vec<f64>,
+        validity: Vec<bool>,
+    },
+    Bool {
+        values: Vec<bool>,
+        validity: Vec<bool>,
+    },
+    String {
+        values: Vec<String>,
+        validity: Vec<bool>,
+    },
 }
 
 impl Column {
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
-        match data_type {
-            DataType::Int64 => Self::Int64(Vec::new()),
-            DataType::Float64 => Self::Float64(Vec::new()),
-            DataType::Bool => Self::Bool(Vec::new()),
-            DataType::String => Self::String(Vec::new()),
+        match data_type.base_type() {
+            DataType::Int64 => Self::Int64 {
+                values: Vec::new(),
+                validity: Vec::new(),
+            },
+            DataType::Float64 => Self::Float64 {
+                values: Vec::new(),
+                validity: Vec::new(),
+            },
+            DataType::Bool => Self::Bool {
+                values: Vec::new(),
+                validity: Vec::new(),
+            },
+            DataType::String => Self::String {
+                values: Vec::new(),
+                validity: Vec::new(),
+            },
+            _ => unreachable!("base_type returns a physical type"),
         }
     }
 
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Int64(_) => DataType::Int64,
-            Self::Float64(_) => DataType::Float64,
-            Self::Bool(_) => DataType::Bool,
-            Self::String(_) => DataType::String,
+            Self::Int64 { .. } => DataType::Int64,
+            Self::Float64 { .. } => DataType::Float64,
+            Self::Bool { .. } => DataType::Bool,
+            Self::String { .. } => DataType::String,
         }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Int64(values) => values.len(),
-            Self::Float64(values) => values.len(),
-            Self::Bool(values) => values.len(),
-            Self::String(values) => values.len(),
+            Self::Int64 { values, .. } => values.len(),
+            Self::Float64 { values, .. } => values.len(),
+            Self::Bool { values, .. } => values.len(),
+            Self::String { values, .. } => values.len(),
         }
     }
 
@@ -64,12 +91,30 @@ impl Column {
         self.value_ref(row).to_owned()
     }
 
-    pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
+    #[must_use]
+    pub fn validity(&self) -> &[bool] {
         match self {
-            Self::Int64(values) => ValueRef::Int64(values[row]),
-            Self::Float64(values) => ValueRef::Float64(values[row]),
-            Self::Bool(values) => ValueRef::Bool(values[row]),
-            Self::String(values) => ValueRef::String(&values[row]),
+            Self::Int64 { validity, .. }
+            | Self::Float64 { validity, .. }
+            | Self::Bool { validity, .. }
+            | Self::String { validity, .. } => validity,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, row: usize) -> bool {
+        self.validity()[row]
+    }
+
+    pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
+        if !self.is_valid(row) {
+            return ValueRef::Null;
+        }
+        match self {
+            Self::Int64 { values, .. } => ValueRef::Int64(values[row]),
+            Self::Float64 { values, .. } => ValueRef::Float64(values[row]),
+            Self::Bool { values, .. } => ValueRef::Bool(values[row]),
+            Self::String { values, .. } => ValueRef::String(&values[row]),
         }
     }
 
@@ -79,10 +124,38 @@ impl Column {
 
     fn push(&mut self, value: Value) {
         match (self, value) {
-            (Self::Int64(values), Value::Int64(value)) => values.push(value),
-            (Self::Float64(values), Value::Float64(value)) => values.push(value),
-            (Self::Bool(values), Value::Bool(value)) => values.push(value),
-            (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Int64 { values, validity }, Value::Int64(value)) => {
+                values.push(value);
+                validity.push(true);
+            }
+            (Self::Float64 { values, validity }, Value::Float64(value)) => {
+                values.push(value);
+                validity.push(true);
+            }
+            (Self::Bool { values, validity }, Value::Bool(value)) => {
+                values.push(value);
+                validity.push(true);
+            }
+            (Self::String { values, validity }, Value::String(value)) => {
+                values.push(value);
+                validity.push(true);
+            }
+            (Self::Int64 { values, validity }, Value::Null) => {
+                values.push(0);
+                validity.push(false);
+            }
+            (Self::Float64 { values, validity }, Value::Null) => {
+                values.push(0.0);
+                validity.push(false);
+            }
+            (Self::Bool { values, validity }, Value::Null) => {
+                values.push(false);
+                validity.push(false);
+            }
+            (Self::String { values, validity }, Value::Null) => {
+                values.push(String::new());
+                validity.push(false);
+            }
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -169,11 +242,17 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            let actual_type = value.data_type();
+            let valid_type = match actual_type {
+                Some(data_type) => field.data_type.base_type() == data_type,
+                None => field.data_type.is_nullable(),
+            };
+            if !valid_type {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: actual_type
+                        .map_or_else(|| "NULL".to_owned(), |value| value.to_string()),
                 });
             }
             if matches!(value, Value::Float64(number) if !number.is_finite()) {
@@ -226,8 +305,14 @@ mod tests {
             .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
             .expect("valid row");
 
-        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
-        assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+        assert!(matches!(
+            &table.columns()[0],
+            Column::Int64 { values, validity } if values == &[7] && validity == &[true]
+        ));
+        assert!(matches!(
+            &table.columns()[1],
+            Column::String { values, validity } if values == &["ok"] && validity == &[true]
+        ));
     }
 
     #[test]
@@ -240,5 +325,30 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn nullable_columns_store_placeholders_with_validity_bitmaps() {
+        let mut table = Table::new(
+            "readings".to_owned(),
+            vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::NullableInt64,
+            }],
+        )
+        .expect("valid schema");
+
+        table.insert_row(vec![Value::Null]).expect("NULL is valid");
+        table
+            .insert_row(vec![Value::Int64(9)])
+            .expect("typed value is valid");
+
+        assert!(matches!(
+            &table.columns()[0],
+            Column::Int64 { values, validity }
+                if values == &[0, 9] && validity == &[false, true]
+        ));
+        assert_eq!(table.columns()[0].value(0), Value::Null);
+        assert_eq!(table.columns()[0].value(1), Value::Int64(9));
     }
 }

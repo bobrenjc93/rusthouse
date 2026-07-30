@@ -102,7 +102,7 @@ impl Database {
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(table, *row) == TruthValue::True)
             })
             .collect::<Vec<_>>();
 
@@ -276,7 +276,10 @@ fn resolve_select_items(
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+        && !matches!(
+            input_type.map(DataType::base_type),
+            Some(DataType::Int64 | DataType::Float64)
+        )
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
@@ -291,10 +294,11 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => DataType::Float64,
-        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
-            input_type.expect("validated column argument")
-        }
+        AggregateFunction::Avg => DataType::NullableFloat64,
+        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => input_type
+            .expect("validated column argument")
+            .base_type()
+            .into_nullable(),
     }
 }
 
@@ -524,8 +528,8 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
+    SumInt(Option<i64>),
+    SumFloat(Option<f64>),
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
@@ -536,11 +540,17 @@ impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum
+                if spec.input_type.map(DataType::base_type) == Some(DataType::Int64) =>
+            {
+                Self::SumInt(None)
+            }
+            AggregateFunction::Sum => Self::SumFloat(None),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+            AggregateFunction::Avg
+                if spec.input_type.map(DataType::base_type) == Some(DataType::Int64) =>
+            {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
@@ -548,6 +558,13 @@ impl AggregateState {
     }
 
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        if spec
+            .argument
+            .is_some_and(|column| !table.columns()[column].is_valid(row))
+        {
+            return Ok(());
+        }
+
         match self {
             Self::Count(count) => {
                 *count = count
@@ -555,24 +572,28 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
-                };
-                *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
-            }
-            Self::SumFloat(sum) => {
-                let Column::Float64(values) =
+                let Column::Int64 { values, .. } =
                     &table.columns()[spec.argument.expect("SUM argument")]
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
-                if !sum.is_finite() {
+                *sum = Some(
+                    sum.unwrap_or(0)
+                        .checked_add(values[row])
+                        .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?,
+                );
+            }
+            Self::SumFloat(sum) => {
+                let Column::Float64 { values, .. } =
+                    &table.columns()[spec.argument.expect("SUM argument")]
+                else {
+                    unreachable!("SUM input type is resolved")
+                };
+                let next = sum.unwrap_or(0.0) + values[row];
+                if !next.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
+                *sum = Some(next);
             }
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
@@ -595,7 +616,8 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let Column::Int64 { values, .. } =
+                    &table.columns()[spec.argument.expect("AVG argument")]
                 else {
                     unreachable!("AVG input type is resolved")
                 };
@@ -607,7 +629,7 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
+                let Column::Float64 { values, .. } =
                     &table.columns()[spec.argument.expect("AVG argument")]
                 else {
                     unreachable!("AVG input type is resolved")
@@ -626,22 +648,20 @@ impl AggregateState {
 
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt(Some(value)) => Ok(Value::Int64(value)),
+            Self::SumFloat(Some(value)) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
-            )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::SumInt(None)
+            | Self::SumFloat(None)
+            | Self::Min(None)
+            | Self::Max(None)
+            | Self::AvgInt { .. }
+            | Self::AvgFloat { .. } => Ok(Value::Null),
         }
     }
 }
@@ -774,12 +794,41 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    IsNull {
+        operand: CompiledOperand,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruthValue {
+    False,
+    True,
+    Unknown,
+}
+
+impl TruthValue {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, table: &Table, row: usize) -> TruthValue {
         match self {
             Self::Comparison {
                 left,
@@ -788,20 +837,33 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
-                match operator {
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return TruthValue::Unknown;
+                };
+                let result = match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
                     ComparisonOperator::Less => comparison == Ordering::Less,
                     ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
                     ComparisonOperator::Greater => comparison == Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
+                };
+                if result {
+                    TruthValue::True
+                } else {
+                    TruthValue::False
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::IsNull { operand, negated } => {
+                let is_null = matches!(operand.value(table, row), ValueRef::Null);
+                if is_null != *negated {
+                    TruthValue::True
+                } else {
+                    TruthValue::False
+                }
+            }
+            Self::And(left, right) => left.evaluate(table, row).and(right.evaluate(table, row)),
+            Self::Or(left, right) => left.evaluate(table, row).or(right.evaluate(table, row)),
         }
     }
 }
@@ -813,9 +875,9 @@ enum CompiledOperand {
 }
 
 impl CompiledOperand {
-    fn data_type(&self) -> DataType {
+    fn data_type(&self) -> Option<DataType> {
         match self {
-            Self::Column { data_type, .. } => *data_type,
+            Self::Column { data_type, .. } => Some(*data_type),
             Self::Literal(value) => value.data_type(),
         }
     }
@@ -840,8 +902,12 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
-                    expected: left.data_type().to_string(),
-                    actual: right.data_type().to_string(),
+                    expected: left
+                        .data_type()
+                        .map_or_else(|| "NULL".to_owned(), |value| value.to_string()),
+                    actual: right
+                        .data_type()
+                        .map_or_else(|| "NULL".to_owned(), |value| value.to_string()),
                 });
             }
             Ok(CompiledPredicate::Comparison {
@@ -850,6 +916,10 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::IsNull { operand, negated } => Ok(CompiledPredicate::IsNull {
+            operand: compile_operand(table, operand)?,
+            negated: *negated,
+        }),
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
@@ -874,7 +944,12 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
     }
 }
 
-fn comparable(left: DataType, right: DataType) -> bool {
+fn comparable(left: Option<DataType>, right: Option<DataType>) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return true;
+    };
+    let left = left.base_type();
+    let right = right.base_type();
     left == right
         || matches!(
             (left, right),
@@ -944,6 +1019,31 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn implements_sql_three_valued_truth_tables() {
+        assert_eq!(
+            TruthValue::Unknown.and(TruthValue::False),
+            TruthValue::False
+        );
+        assert_eq!(
+            TruthValue::Unknown.and(TruthValue::True),
+            TruthValue::Unknown
+        );
+        assert_eq!(TruthValue::Unknown.or(TruthValue::True), TruthValue::True);
+        assert_eq!(
+            TruthValue::Unknown.or(TruthValue::False),
+            TruthValue::Unknown
+        );
+        assert_eq!(
+            TruthValue::Unknown.and(TruthValue::Unknown),
+            TruthValue::Unknown
+        );
+        assert_eq!(
+            TruthValue::Unknown.or(TruthValue::Unknown),
+            TruthValue::Unknown
         );
     }
 }

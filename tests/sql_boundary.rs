@@ -244,10 +244,10 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
         vec![
             DataType::String,
             DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Float64,
+            DataType::NullableInt64,
+            DataType::NullableInt64,
+            DataType::NullableInt64,
+            DataType::NullableFloat64,
         ]
     );
     assert_eq!(
@@ -284,7 +284,7 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -478,14 +478,14 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+fn literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE", "Null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
                 "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
             ))
-            .expect_err("Boolean literal names are reserved");
+            .expect_err("literal names are reserved");
 
         assert!(matches!(
             error,
@@ -522,5 +522,265 @@ fn creates_a_fifty_thousand_column_schema() {
             .schema()
             .len(),
         column_count
+    );
+}
+
+#[test]
+fn nullable_columns_and_three_valued_predicates_work_end_to_end() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (
+                id Int64,
+                integer Nullable(Int64),
+                float Nullable(Float64),
+                flag Nullable(Bool),
+                label Nullable(String)
+             );
+             INSERT INTO samples VALUES
+                (1, NULL, 1.5, NULL, 'one'),
+                (2, 10, NULL, true, NULL),
+                (3, 20, 3.5, false, 'three');",
+        )
+        .expect("nullable setup succeeds");
+
+    let projected = execute_query(
+        &mut database,
+        "SELECT id, integer, float, flag, label FROM samples ORDER BY id;",
+    );
+    assert_eq!(
+        projected
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::NullableInt64,
+            DataType::NullableFloat64,
+            DataType::NullableBool,
+            DataType::NullableString,
+        ]
+    );
+    assert_eq!(
+        projected.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Null,
+                Value::Float64(1.5),
+                Value::Null,
+                Value::String("one".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(10),
+                Value::Null,
+                Value::Bool(true),
+                Value::Null,
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Int64(20),
+                Value::Float64(3.5),
+                Value::Bool(false),
+                Value::String("three".to_owned()),
+            ],
+        ]
+    );
+
+    let null_checks = execute_query(
+        &mut database,
+        "SELECT id FROM samples
+         WHERE integer IS NULL OR label IS NULL
+         ORDER BY id;",
+    );
+    assert_eq!(
+        null_checks.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+
+    let not_null = execute_query(
+        &mut database,
+        "SELECT id FROM samples WHERE float IS NOT NULL ORDER BY id;",
+    );
+    assert_eq!(
+        not_null.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]
+    );
+
+    assert!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM samples WHERE integer = NULL;"
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM samples WHERE integer = NULL OR id = 2;",
+        )
+        .rows,
+        vec![vec![Value::Int64(2)]]
+    );
+    assert!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM samples WHERE integer = NULL AND id = 2;",
+        )
+        .rows
+        .is_empty()
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM samples WHERE integer != 10 ORDER BY id;",
+        )
+        .rows,
+        vec![vec![Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn nullable_aggregates_group_and_order_deterministically() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE nullable_sales (
+                category Nullable(String), amount Nullable(Int64)
+             );
+             INSERT INTO nullable_sales VALUES
+                (NULL, NULL), (NULL, 3), ('books', NULL), ('books', 7);",
+        )
+        .expect("nullable aggregate setup succeeds");
+
+    let global = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows,
+                COUNT(amount) AS present,
+                SUM(amount) AS total,
+                MIN(amount) AS low,
+                MAX(amount) AS high,
+                AVG(amount) AS mean
+         FROM nullable_sales;",
+    );
+    assert_eq!(
+        global.rows,
+        vec![vec![
+            Value::Int64(4),
+            Value::Int64(2),
+            Value::Int64(10),
+            Value::Int64(3),
+            Value::Int64(7),
+            Value::Float64(5.0),
+        ]]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT category, COUNT(*) AS rows, COUNT(amount) AS present, SUM(amount) AS total
+         FROM nullable_sales
+         GROUP BY category
+         ORDER BY category;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("books".to_owned()),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::Null,
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(3),
+            ],
+        ]
+    );
+
+    let descending = execute_query(
+        &mut database,
+        "SELECT category FROM nullable_sales GROUP BY category ORDER BY category DESC;",
+    );
+    assert_eq!(
+        descending.rows,
+        vec![vec![Value::Null], vec![Value::String("books".to_owned())],]
+    );
+
+    let all_null = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows,
+                COUNT(amount) AS present,
+                SUM(amount) AS total,
+                MIN(amount) AS low,
+                MAX(amount) AS high,
+                AVG(amount) AS mean
+         FROM nullable_sales
+         WHERE category = 'books' AND amount IS NULL;",
+    );
+    assert_eq!(
+        all_null.rows,
+        vec![vec![
+            Value::Int64(1),
+            Value::Int64(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT MIN(amount), MAX(amount), AVG(amount)
+         FROM nullable_sales WHERE category = 'missing';",
+    );
+    assert_eq!(
+        empty.rows,
+        vec![vec![Value::Null, Value::Null, Value::Null]]
+    );
+}
+
+#[test]
+fn failed_nullable_multi_row_insert_is_atomic() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE atomic_values (id Int64, note Nullable(String));")
+        .expect("create succeeds");
+
+    let error = database
+        .execute(
+            "INSERT INTO atomic_values VALUES
+                (1, NULL),
+                (2, 'valid'),
+                (NULL, 'invalid'),
+                (4, NULL);",
+        )
+        .expect_err("NULL in a non-nullable column rejects the complete insert");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "column 'atomic_values.id'" && expected == "Int64" && actual == "NULL"
+    ));
+
+    let table = database
+        .catalog()
+        .table("atomic_values")
+        .expect("table exists");
+    assert_eq!(table.row_count(), 0);
+    assert!(table.columns().iter().all(|column| column.is_empty()));
+    assert!(
+        table
+            .columns()
+            .iter()
+            .all(|column| column.validity().is_empty())
     );
 }

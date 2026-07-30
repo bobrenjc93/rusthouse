@@ -1,11 +1,12 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`) with a parallel validity bitmap.
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, String, and `Nullable(type)` columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- NULL literals, `IS NULL`, `IS NOT NULL`, and SQL three-valued WHERE logic
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -15,7 +16,11 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+Identifiers are unquoted and case-insensitive; TRUE, FALSE, and NULL are reserved literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+`Nullable(Int64)`, `Nullable(Float64)`, `Nullable(Bool)`, and `Nullable(String)` accept NULL. Comparisons involving NULL produce UNKNOWN, and WHERE retains only TRUE rows. Aggregates ignore NULL inputs, except `COUNT(*)`, which counts rows; `COUNT(column)` counts non-NULL values. SUM, MIN, MAX, and AVG return NULL for empty or all-NULL input.
+
+NULL grouping and output are deterministic: all NULL keys form one group, ascending order places NULL last, and descending order places it first. Table output renders `NULL`, CSV renders `\N`, and JSON uses the native `null` value.
 
 ## CLI
 
@@ -81,11 +86,11 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+On empty input, COUNT returns numeric zero. SUM, MIN, MAX, and AVG return NULL with nullable result metadata.
 
 ## Development
 

@@ -154,3 +154,30 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         assert!(!stderr.contains("stack overflow"));
     }
 }
+
+#[test]
+fn nullable_values_render_as_csv_and_json_at_the_cli_boundary() {
+    let sql = "CREATE TABLE valueset (id Int64, note Nullable(String));
+               INSERT INTO valueset VALUES (1, NULL), (2, 'present');
+               SELECT id, note FROM valueset ORDER BY id;";
+
+    let csv = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format=csv", "--execute", sql])
+        .output()
+        .expect("run CSV CLI");
+    assert!(csv.status.success());
+    assert_eq!(
+        String::from_utf8(csv.stdout).expect("UTF-8 stdout"),
+        "id,note\n1,\\N\n2,present\n"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format=json", "--execute", sql])
+        .output()
+        .expect("run JSON CLI");
+    assert!(json.status.success());
+    assert_eq!(
+        String::from_utf8(json.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"note\",\"type\":\"Nullable(String)\"}],\"rows\":[[1,null],[2,\"present\"]]}]}\n"
+    );
+}

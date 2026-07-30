@@ -48,7 +48,7 @@ impl fmt::Display for Error {
                 context,
             } => write!(
                 f,
-                "{context} {identifier:?} is reserved; TRUE and FALSE are Boolean literals"
+                "{context} {identifier:?} is reserved; TRUE, FALSE, and NULL are literals"
             ),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
