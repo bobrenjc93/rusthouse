@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
+use normalize::{
+    ColumnType, MAX_STREAM_RECORD_BYTES, ResultOracle, compare_oracles, result_oracle,
+};
 use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
@@ -48,6 +50,10 @@ struct TimingSeries {
     clickhouse_batch_ms: Vec<f64>,
     rusthouse_per_query_ms: Vec<f64>,
     clickhouse_per_query_ms: Vec<f64>,
+    rusthouse_verified_results: Vec<usize>,
+    clickhouse_verified_results: Vec<usize>,
+    rusthouse_canonical_digests: Vec<String>,
+    clickhouse_canonical_digests: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -56,6 +62,8 @@ struct CaseResult {
     family: &'static str,
     row_count: usize,
     query_amplification: usize,
+    rusthouse_oracle_digest: String,
+    clickhouse_oracle_digest: String,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
     clickhouse_primary_batch_median_ms: f64,
@@ -71,6 +79,8 @@ struct CaseResult {
 #[derive(Debug, Default)]
 struct CorrectnessGate {
     passed: bool,
+    rusthouse_oracle: Option<ResultOracle>,
+    clickhouse_oracle: Option<ResultOracle>,
 }
 
 impl CorrectnessGate {
@@ -80,9 +90,27 @@ impl CorrectnessGate {
         rusthouse: &TimedOutput,
         clickhouse: &TimedOutput,
     ) -> Result<(), String> {
-        compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
+        self.passed = false;
+        self.rusthouse_oracle = None;
+        self.clickhouse_oracle = None;
+        let rusthouse_oracle = result_oracle(&rusthouse.stdout, columns, "RustHouse")?;
+        let clickhouse_oracle = result_oracle(&clickhouse.stdout, columns, "ClickHouse")?;
+        compare_oracles(&rusthouse_oracle, &clickhouse_oracle, columns)?;
+        self.rusthouse_oracle = Some(rusthouse_oracle);
+        self.clickhouse_oracle = Some(clickhouse_oracle);
         self.passed = true;
         Ok(())
+    }
+
+    fn oracle(&self, engine: Engine) -> Result<&ResultOracle, String> {
+        if !self.passed {
+            return Err("timed batch was not preceded by a passing correctness run".to_owned());
+        }
+        match engine {
+            Engine::RustHouse => self.rusthouse_oracle.as_ref(),
+            Engine::ClickHouse => self.clickhouse_oracle.as_ref(),
+        }
+        .ok_or_else(|| "passing correctness gate did not retain its result oracle".to_owned())
     }
 }
 
@@ -196,6 +224,8 @@ fn run(config: Config) -> Result<Report, String> {
                     &workload.sql,
                     settings.query_amplification,
                     rusthouse_first,
+                    &correctness_gate,
+                    &workload.columns,
                 )?;
                 accept_timed_pair(
                     &correctness_gate,
@@ -212,8 +242,15 @@ fn run(config: Config) -> Result<Report, String> {
                 let rusthouse_first =
                     (row_count_index + workload_index + iteration + primary_iterations)
                         .is_multiple_of(2);
-                let (rusthouse, clickhouse) =
-                    execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
+                let (rusthouse, clickhouse) = execute_timed_pair(
+                    &paths,
+                    &setup_sql,
+                    &workload.sql,
+                    1,
+                    rusthouse_first,
+                    &correctness_gate,
+                    &workload.columns,
+                )?;
                 accept_timed_pair(
                     &correctness_gate,
                     &rusthouse,
@@ -274,6 +311,14 @@ fn run(config: Config) -> Result<Report, String> {
                 family: workload.family.name(),
                 row_count,
                 query_amplification: settings.query_amplification,
+                rusthouse_oracle_digest: correctness_gate
+                    .oracle(Engine::RustHouse)?
+                    .canonical_digest()
+                    .to_owned(),
+                clickhouse_oracle_digest: correctness_gate
+                    .oracle(Engine::ClickHouse)?
+                    .canonical_digest()
+                    .to_owned(),
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
@@ -319,8 +364,13 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
+            "primary timing uses setup plus {} identical queries per process, validates every streamed result, divides positive batch wall time by {}, and performs no startup subtraction",
             settings.query_amplification, settings.query_amplification
+        ),
+        format!(
+            "{} RustHouse and {} ClickHouse timed result sets were verified against typed correctness oracles",
+            total_verified_results(&cases, Engine::RustHouse),
+            total_verified_results(&cases, Engine::ClickHouse)
         ),
         format!(
             "primary parity caps: {}/{} cases; end-to-end parity caps: {}/{} cases",
@@ -433,18 +483,44 @@ fn execute_timed_pair(
     query_sql: &str,
     query_repetitions: usize,
     rusthouse_first: bool,
+    gate: &CorrectnessGate,
+    columns: &[(&str, ColumnType)],
 ) -> Result<(TimedBatch, TimedBatch), String> {
     if rusthouse_first {
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse = paths.execute_timed(
+            Engine::RustHouse,
+            setup_sql,
+            query_sql,
+            query_repetitions,
+            columns,
+            gate.oracle(Engine::RustHouse)?,
+        )?;
+        let clickhouse = paths.execute_timed(
+            Engine::ClickHouse,
+            setup_sql,
+            query_sql,
+            query_repetitions,
+            columns,
+            gate.oracle(Engine::ClickHouse)?,
+        )?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_timed(
+            Engine::ClickHouse,
+            setup_sql,
+            query_sql,
+            query_repetitions,
+            columns,
+            gate.oracle(Engine::ClickHouse)?,
+        )?;
+        let rusthouse = paths.execute_timed(
+            Engine::RustHouse,
+            setup_sql,
+            query_sql,
+            query_repetitions,
+            columns,
+            gate.oracle(Engine::RustHouse)?,
+        )?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -468,12 +544,33 @@ fn accept_timed_pair(
             rusthouse.query_repetitions, clickhouse.query_repetitions
         ));
     }
+    if rusthouse.verified_results != expected_repetitions
+        || clickhouse.verified_results != expected_repetitions
+    {
+        return Err(format!(
+            "verified result count mismatch: expected {expected_repetitions}, RustHouse verified {}, ClickHouse verified {}",
+            rusthouse.verified_results, clickhouse.verified_results
+        ));
+    }
 
     let rusthouse_batch_ms = rusthouse.elapsed.as_secs_f64() * 1_000.0;
     let clickhouse_batch_ms = clickhouse.elapsed.as_secs_f64() * 1_000.0;
     let rusthouse_per_query_ms = per_query_millis(rusthouse_batch_ms, rusthouse.query_repetitions)?;
     let clickhouse_per_query_ms =
         per_query_millis(clickhouse_batch_ms, clickhouse.query_repetitions)?;
+
+    samples
+        .rusthouse_verified_results
+        .push(rusthouse.verified_results);
+    samples
+        .clickhouse_verified_results
+        .push(clickhouse.verified_results);
+    samples
+        .rusthouse_canonical_digests
+        .push(rusthouse.canonical_digest.clone());
+    samples
+        .clickhouse_canonical_digests
+        .push(clickhouse.canonical_digest.clone());
 
     if record {
         samples.rusthouse_batch_ms.push(rusthouse_batch_ms);
@@ -484,6 +581,25 @@ fn accept_timed_pair(
             .push(clickhouse_per_query_ms);
     }
     Ok(())
+}
+
+fn total_verified_results(cases: &[CaseResult], engine: Engine) -> usize {
+    cases
+        .iter()
+        .map(|case| {
+            let (primary, end_to_end) = match engine {
+                Engine::RustHouse => (
+                    &case.primary.rusthouse_verified_results,
+                    &case.end_to_end.rusthouse_verified_results,
+                ),
+                Engine::ClickHouse => (
+                    &case.primary.clickhouse_verified_results,
+                    &case.end_to_end.clickhouse_verified_results,
+                ),
+            };
+            primary.iter().chain(end_to_end).sum::<usize>()
+        })
+        .sum()
 }
 
 fn per_query_millis(batch_millis: f64, query_repetitions: usize) -> Result<f64, String> {
@@ -540,7 +656,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"rusthouse_verified_timed_results\":{},\"clickhouse_verified_timed_results\":{},\"canonical_digest_algorithm\":\"sha256\",\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -550,7 +666,9 @@ fn details_json(
         config.seed,
         settings.warmups,
         settings.samples,
-        settings.end_to_end_samples
+        settings.end_to_end_samples,
+        total_verified_results(cases, Engine::RustHouse),
+        total_verified_results(cases, Engine::ClickHouse)
     )
     .expect("writing to String cannot fail");
     for (index, row_count) in settings.row_counts.iter().enumerate() {
@@ -561,7 +679,7 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"timed_stdout\":\"bounded_streaming_validation\",\"max_csv_record_bytes\":{MAX_STREAM_RECORD_BYTES},\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
@@ -578,11 +696,13 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"correctness_oracles\":{{\"rusthouse_canonical_digest\":{},\"clickhouse_canonical_digest\":{}}},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
             case.query_amplification,
+            json_string(&case.rusthouse_oracle_digest),
+            json_string(&case.clickhouse_oracle_digest),
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
@@ -597,6 +717,16 @@ fn details_json(
         write_number_array(&mut output, &case.primary.rusthouse_per_query_ms);
         output.push_str(",\"clickhouse_per_query_samples_ms\":");
         write_number_array(&mut output, &case.primary.clickhouse_per_query_ms);
+        output.push_str(",\"validation_including_warmups\":{");
+        output.push_str("\"rusthouse_verified_result_counts\":");
+        write_usize_array(&mut output, &case.primary.rusthouse_verified_results);
+        output.push_str(",\"clickhouse_verified_result_counts\":");
+        write_usize_array(&mut output, &case.primary.clickhouse_verified_results);
+        output.push_str(",\"rusthouse_canonical_digests\":[");
+        write_string_array(&mut output, &case.primary.rusthouse_canonical_digests);
+        output.push_str("],\"clickhouse_canonical_digests\":[");
+        write_string_array(&mut output, &case.primary.clickhouse_canonical_digests);
+        output.push_str("]}");
         write!(
             output,
             "}},\"end_to_end\":{{\"rusthouse_median_ms\":{:.6},\"clickhouse_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_samples_ms\":",
@@ -608,6 +738,16 @@ fn details_json(
         write_number_array(&mut output, &case.end_to_end.rusthouse_batch_ms);
         output.push_str(",\"clickhouse_samples_ms\":");
         write_number_array(&mut output, &case.end_to_end.clickhouse_batch_ms);
+        output.push_str(",\"validation\":{");
+        output.push_str("\"rusthouse_verified_result_counts\":");
+        write_usize_array(&mut output, &case.end_to_end.rusthouse_verified_results);
+        output.push_str(",\"clickhouse_verified_result_counts\":");
+        write_usize_array(&mut output, &case.end_to_end.clickhouse_verified_results);
+        output.push_str(",\"rusthouse_canonical_digests\":[");
+        write_string_array(&mut output, &case.end_to_end.rusthouse_canonical_digests);
+        output.push_str("],\"clickhouse_canonical_digests\":[");
+        write_string_array(&mut output, &case.end_to_end.clickhouse_canonical_digests);
+        output.push_str("]}");
         output.push_str("}}");
     }
     output.push_str("]}\n");
@@ -621,6 +761,17 @@ fn write_number_array(output: &mut String, values: &[f64]) {
             output.push(',');
         }
         write!(output, "{value:.6}").expect("writing to String cannot fail");
+    }
+    output.push(']');
+}
+
+fn write_usize_array(output: &mut String, values: &[usize]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{value}").expect("writing to String cannot fail");
     }
     output.push(']');
 }
@@ -676,6 +827,8 @@ mod tests {
         TimedBatch {
             elapsed: Duration::from_secs_f64(milliseconds / 1_000.0),
             query_repetitions: repetitions,
+            verified_results: repetitions,
+            canonical_digest: "0".repeat(64),
         }
     }
 
@@ -722,7 +875,10 @@ mod tests {
     fn amplification_must_match_for_both_engines() {
         let mut samples = TimingSeries::default();
         let error = accept_timed_pair(
-            &CorrectnessGate { passed: true },
+            &CorrectnessGate {
+                passed: true,
+                ..CorrectnessGate::default()
+            },
             &batch(10.0, 64),
             &batch(10.0, 63),
             64,
@@ -734,6 +890,31 @@ mod tests {
         assert!(error.contains("amplification mismatch"));
         assert!(samples.rusthouse_batch_ms.is_empty());
         assert!(samples.clickhouse_batch_ms.is_empty());
+    }
+
+    #[test]
+    fn accepted_timing_requires_every_result_to_be_verified() {
+        let mut samples = TimingSeries::default();
+        let rusthouse = batch(10.0, 64);
+        let mut clickhouse = batch(10.0, 64);
+        clickhouse.verified_results = 63;
+
+        let error = accept_timed_pair(
+            &CorrectnessGate {
+                passed: true,
+                ..CorrectnessGate::default()
+            },
+            &rusthouse,
+            &clickhouse,
+            64,
+            true,
+            &mut samples,
+        )
+        .expect_err("unverified result must fail");
+
+        assert!(error.contains("verified result count mismatch"));
+        assert!(samples.rusthouse_batch_ms.is_empty());
+        assert!(samples.rusthouse_verified_results.is_empty());
     }
 
     #[test]
@@ -773,6 +954,10 @@ mod tests {
         .expect("gated sample");
         assert_eq!(samples.rusthouse_per_query_ms, [1.0]);
         assert_eq!(samples.clickhouse_per_query_ms, [0.5]);
+        assert_eq!(samples.rusthouse_verified_results, [64]);
+        assert_eq!(samples.clickhouse_verified_results, [64]);
+        assert_eq!(samples.rusthouse_canonical_digests.len(), 1);
+        assert_eq!(samples.clickhouse_canonical_digests.len(), 1);
     }
 
     #[test]
@@ -799,5 +984,68 @@ mod tests {
             "{\"score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
         );
         assert!(!report.contains('\n'));
+    }
+
+    #[test]
+    fn details_record_verified_counts_and_canonical_digests() {
+        let primary = TimingSeries {
+            rusthouse_verified_results: vec![64, 64],
+            clickhouse_verified_results: vec![64, 64],
+            rusthouse_canonical_digests: vec!["a".repeat(64), "a".repeat(64)],
+            clickhouse_canonical_digests: vec!["b".repeat(64), "b".repeat(64)],
+            ..TimingSeries::default()
+        };
+        let end_to_end = TimingSeries {
+            rusthouse_verified_results: vec![1],
+            clickhouse_verified_results: vec![1],
+            rusthouse_canonical_digests: vec!["c".repeat(64)],
+            clickhouse_canonical_digests: vec!["d".repeat(64)],
+            ..TimingSeries::default()
+        };
+        let case = CaseResult {
+            workload: "case",
+            family: "family",
+            row_count: 256,
+            query_amplification: 64,
+            rusthouse_oracle_digest: "e".repeat(64),
+            clickhouse_oracle_digest: "f".repeat(64),
+            primary,
+            rusthouse_primary_batch_median_ms: 1.0,
+            clickhouse_primary_batch_median_ms: 2.0,
+            rusthouse_primary_median_ms: 0.1,
+            clickhouse_primary_median_ms: 0.2,
+            primary_ratio: 2.0,
+            end_to_end,
+            rusthouse_end_to_end_median_ms: 3.0,
+            clickhouse_end_to_end_median_ms: 4.0,
+            end_to_end_ratio: 4.0 / 3.0,
+        };
+        let config = Config {
+            mode: config::Mode::Quick,
+            seed: 1,
+            rusthouse: PathBuf::from("rusthouse"),
+            clickhouse: PathBuf::from("clickhouse"),
+            details: None,
+        };
+        let identity = ClickHouseIdentity {
+            version_output: "version".to_owned(),
+            sha256: "0".repeat(64),
+        };
+        let score = ScoreBreakdown {
+            score: 50.0,
+            saturated_cases: 0,
+        };
+
+        let details = details_json(&config, &identity, &[case], score, score, 1);
+
+        assert!(details.contains("\"schema_version\":3"));
+        assert!(details.contains("\"rusthouse_verified_timed_results\":129"));
+        assert!(details.contains("\"clickhouse_verified_timed_results\":129"));
+        assert!(details.contains("\"canonical_digest_algorithm\":\"sha256\""));
+        assert!(details.contains("\"rusthouse_verified_result_counts\":[64,64]"));
+        assert!(details.contains(&format!(
+            "\"rusthouse_canonical_digest\":\"{}\"",
+            "e".repeat(64)
+        )));
     }
 }
