@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::io::BufRead;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -60,6 +61,55 @@ impl Database {
             .collect()
     }
 
+    /// Execute a batch whose `INSERT ... FORMAT CSV` statement reads from
+    /// `input`. At most one streaming insert can appear in a batch because it
+    /// consumes the reader through EOF.
+    pub fn execute_with_input<R: BufRead>(
+        &mut self,
+        sql: &str,
+        mut input: R,
+    ) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        let streaming_inserts = statements
+            .iter()
+            .filter(|statement| matches!(statement, Statement::InsertCsv { .. }))
+            .count();
+        if streaming_inserts > 1 {
+            return Err(Error::InvalidQuery(
+                "a SQL batch can contain at most one streaming CSV insert".to_owned(),
+            ));
+        }
+
+        statements
+            .into_iter()
+            .map(|statement| match statement {
+                Statement::InsertCsv { table, with_names } => {
+                    let affected_rows = self.insert_csv(&table, &mut input, with_names)?;
+                    Ok(StatementResult::Command {
+                        tag: "INSERT",
+                        affected_rows,
+                    })
+                }
+                statement => self.execute_statement(statement),
+            })
+            .collect()
+    }
+
+    /// Stream RFC 4180 records into a table in fixed-size typed column blocks.
+    ///
+    /// If `with_names` is true, the first record must name every table column
+    /// in schema order. Any read, CSV, shape, or type error restores the table
+    /// to the row count it had before this call.
+    pub fn insert_csv<R: BufRead>(
+        &mut self,
+        table: &str,
+        reader: R,
+        with_names: bool,
+    ) -> Result<usize> {
+        let table = self.catalog.table_mut(table)?;
+        crate::csv::insert(table, reader, with_names)
+    }
+
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
@@ -86,6 +136,10 @@ impl Database {
                     affected_rows,
                 })
             }
+            Statement::InsertCsv { .. } => Err(Error::InvalidQuery(
+                "INSERT ... FORMAT CSV requires a reader; use Database::execute_with_input or Database::insert_csv"
+                    .to_owned(),
+            )),
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
     }

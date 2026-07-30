@@ -15,6 +15,10 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
+    InsertCsv {
+        table: String,
+        with_names: bool,
+    },
     Select(Select),
 }
 
@@ -419,7 +423,27 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
-        self.expect_keyword("VALUES")?;
+        if self.eat_keyword("FORMAT") {
+            let position = self.position();
+            let format = self.expect_identifier("CSV or CSVWithNames after FORMAT")?;
+            let with_names = if format.eq_ignore_ascii_case("CSV") {
+                false
+            } else if format.eq_ignore_ascii_case("CSVWithNames") {
+                true
+            } else {
+                return Err(Error::Sql {
+                    position,
+                    message: format!(
+                        "unsupported INSERT format '{format}'; expected CSV or CSVWithNames"
+                    ),
+                });
+            };
+            return Ok(Statement::InsertCsv { table, with_names });
+        }
+        if !self.eat_keyword("VALUES") {
+            return self.error("expected VALUES or FORMAT after table name");
+        }
+
         let mut rows = Vec::new();
         loop {
             self.expect(&TokenKind::LeftParen, "'(' before row values")?;
@@ -782,6 +806,27 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_csv_insert_formats_case_insensitively() {
+        let statements =
+            parse("INSERT INTO plain FORMAT csv; INSERT INTO named FORMAT CSVWithNames")
+                .expect("valid CSV inserts");
+
+        assert_eq!(
+            statements,
+            vec![
+                Statement::InsertCsv {
+                    table: "plain".to_owned(),
+                    with_names: false,
+                },
+                Statement::InsertCsv {
+                    table: "named".to_owned(),
+                    with_names: true,
+                },
+            ]
+        );
     }
 
     #[test]

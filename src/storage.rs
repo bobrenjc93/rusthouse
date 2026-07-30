@@ -86,6 +86,57 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn append(&mut self, other: &mut Self) {
+        match (self, other) {
+            (Self::Int64(values), Self::Int64(other)) => values.append(other),
+            (Self::Float64(values), Self::Float64(other)) => values.append(other),
+            (Self::Bool(values), Self::Bool(other)) => values.append(other),
+            (Self::String(values), Self::String(other)) => values.append(other),
+            _ => unreachable!("a batch is created from the table schema"),
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Int64(values) => values.truncate(len),
+            Self::Float64(values) => values.truncate(len),
+            Self::Bool(values) => values.truncate(len),
+            Self::String(values) => values.truncate(len),
+        }
+    }
+}
+
+/// A bounded, column-oriented staging area used by streaming imports.
+#[derive(Debug)]
+pub(crate) struct ColumnBatch {
+    columns: Vec<Column>,
+    row_count: usize,
+}
+
+impl ColumnBatch {
+    pub(crate) fn new(schema: &[ColumnDef]) -> Self {
+        Self {
+            columns: schema
+                .iter()
+                .map(|field| Column::new(field.data_type))
+                .collect(),
+            row_count: 0,
+        }
+    }
+
+    pub(crate) fn push_row(&mut self, row: Vec<Value>) {
+        debug_assert_eq!(row.len(), self.columns.len());
+        for (column, value) in self.columns.iter_mut().zip(row) {
+            debug_assert_eq!(column.data_type(), value.data_type());
+            column.push(value);
+        }
+        self.row_count += 1;
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_count
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -195,6 +246,22 @@ impl Table {
         }
         self.row_count += 1;
         Ok(())
+    }
+
+    pub(crate) fn append_batch(&mut self, mut batch: ColumnBatch) {
+        debug_assert_eq!(self.columns.len(), batch.columns.len());
+        for (column, batch_column) in self.columns.iter_mut().zip(&mut batch.columns) {
+            column.append(batch_column);
+        }
+        self.row_count += batch.row_count;
+    }
+
+    pub(crate) fn truncate(&mut self, row_count: usize) {
+        debug_assert!(row_count <= self.row_count);
+        for column in &mut self.columns {
+            column.truncate(row_count);
+        }
+        self.row_count = row_count;
     }
 }
 

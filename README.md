@@ -6,6 +6,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- streaming INSERT INTO ... FORMAT CSV or CSVWithNames in bounded typed blocks
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -57,6 +58,20 @@ printf '%s\n' \
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
+When SQL is supplied with `--execute`, a streaming CSV insert reads records from
+standard input:
+
+~~~bash
+printf 'id,name\n1,Ada\n2,Grace\n' | cargo run -- --execute \
+  "CREATE TABLE people (id Int64, name String);
+   INSERT INTO people FORMAT CSVWithNames;
+   SELECT * FROM people ORDER BY id"
+~~~
+
+Use `--input PATH` to read the CSV records from a file instead. CSV follows RFC
+4180 quoting rules. `CSVWithNames` requires its first record to match the table
+schema in order; names are compared case-insensitively.
+
 ## Library API
 
 Database retains an in-memory catalog across calls and returns structured results:
@@ -76,12 +91,16 @@ let StatementResult::Query(result) = &results[0] else {
 };
 assert_eq!(result.rows.len(), 1);
 
+let csv = std::io::Cursor::new("2,complete\n3,archived\n");
+let inserted = database.insert_csv("events", csv, false)?;
+assert_eq!(inserted, 2);
+
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row literal INSERT is validated in full before any of its rows are appended. A streaming CSV insert appends fixed-size column blocks and restores the table to its original row count if any later record fails to read, parse, or type-check.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

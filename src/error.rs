@@ -28,6 +28,11 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    Csv {
+        record: usize,
+        column: Option<usize>,
+        message: String,
+    },
     InvalidQuery(String),
     NumericOverflow(String),
 }
@@ -69,6 +74,17 @@ impl fmt::Display for Error {
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
             ),
+            Self::Csv {
+                record,
+                column,
+                message,
+            } => {
+                write!(f, "CSV error at record {record}")?;
+                if let Some(column) = column {
+                    write!(f, ", column {column}")?;
+                }
+                write!(f, ": {message}")
+            }
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
