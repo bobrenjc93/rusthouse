@@ -1,5 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -10,10 +15,32 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+/// Default maximum number of groups aggregated in one in-memory partition.
+pub const DEFAULT_MAX_IN_MEMORY_GROUPS: usize = 65_536;
+
+/// Execution settings for a [`Database`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseOptions {
+    /// Maximum aggregate groups held in memory by one grouping partition.
+    pub max_in_memory_groups: usize,
+    /// Parent directory for per-query spill directories.
+    pub temporary_directory: Option<PathBuf>,
+}
+
+impl Default for DatabaseOptions {
+    fn default() -> Self {
+        Self {
+            max_in_memory_groups: DEFAULT_MAX_IN_MEMORY_GROUPS,
+            temporary_directory: None,
+        }
+    }
+}
+
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    options: DatabaseOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +71,19 @@ impl Database {
     }
 
     #[must_use]
+    pub fn with_options(options: DatabaseOptions) -> Self {
+        Self {
+            catalog: Catalog::default(),
+            options,
+        }
+    }
+
+    #[must_use]
+    pub fn options(&self) -> &DatabaseOptions {
+        &self.options
+    }
+
+    #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -54,6 +94,11 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        if self.options.max_in_memory_groups == 0 {
+            return Err(Error::InvalidQuery(
+                "max_in_memory_groups must be at least 1".to_owned(),
+            ));
+        }
         sql::parse(sql)?
             .into_iter()
             .map(|statement| self.execute_statement(statement))
@@ -113,7 +158,13 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &group_columns,
+                &aggregate_specs,
+                &self.options,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -324,10 +375,63 @@ fn execute_grouped<'a>(
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    options: &DatabaseOptions,
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let rows = matching_rows.iter().copied().map(Ok);
+    if group_columns.is_empty()
+        || groups_fit_in_memory(table, group_columns, rows, options.max_in_memory_groups)?
+    {
+        return aggregate_rows(
+            table,
+            group_columns,
+            aggregate_specs,
+            matching_rows.iter().copied().map(Ok),
+            matching_rows.len(),
+            options.max_in_memory_groups,
+        );
+    }
+
+    execute_spilled_grouped(
+        table,
+        matching_rows,
+        group_columns,
+        aggregate_specs,
+        options,
+    )
+}
+
+fn groups_fit_in_memory(
+    table: &Table,
+    group_columns: &[usize],
+    rows: impl Iterator<Item = Result<usize>>,
+    max_groups: usize,
+) -> Result<bool> {
+    let mut groups = GroupIndex::new(group_columns.len(), max_groups.min(1_024));
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+
+    for row in rows {
+        let row = row?;
+        let Some((_, inserted)) =
+            groups.find_or_insert(table, group_columns, row, group_count, max_groups)
+        else {
+            return Ok(false);
+        };
+        group_count += usize::from(inserted);
+    }
+    Ok(true)
+}
+
+fn aggregate_rows<'a>(
+    table: &'a Table,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+    rows: impl Iterator<Item = Result<usize>>,
+    row_count_hint: usize,
+    max_groups: usize,
+) -> Result<GroupedData<'a>> {
+    let initial_capacity = row_count_hint.min(max_groups).min(1_024);
+    let mut groups = GroupIndex::new(group_columns.len(), initial_capacity);
+    let mut group_count = usize::from(group_columns.is_empty());
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -339,8 +443,11 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in rows {
+        let row = row?;
+        let (group, inserted) = groups
+            .find_or_insert(table, group_columns, row, group_count, max_groups)
+            .expect("partition group count is checked before aggregation");
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +456,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -364,6 +471,334 @@ fn execute_grouped<'a>(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(GroupedData { keys, aggregates })
+}
+
+const SPILL_PARTITION_COUNT: usize = 16;
+const MAX_REPARTITION_DEPTH: usize = 64;
+static NEXT_SPILL_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+fn execute_spilled_grouped<'a>(
+    table: &'a Table,
+    matching_rows: &[usize],
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+    options: &DatabaseOptions,
+) -> Result<GroupedData<'a>> {
+    let mut workspace = SpillWorkspace::new(options.temporary_directory.as_deref())?;
+    let root_partitions = partition_rows(
+        &mut workspace,
+        table,
+        group_columns,
+        matching_rows.iter().copied().map(Ok),
+        0,
+    )?;
+    let grouped = {
+        let mut execution = SpillExecution {
+            workspace: &mut workspace,
+            table,
+            group_columns,
+            aggregate_specs,
+            max_groups: options.max_in_memory_groups,
+            grouped: GroupedData::empty(aggregate_specs.len()),
+        };
+        for partition in root_partitions {
+            execution.process_partition(partition, 1)?;
+        }
+        execution.grouped
+    };
+
+    workspace.cleanup()?;
+    Ok(grouped)
+}
+
+struct SpillExecution<'config, 'table> {
+    workspace: &'config mut SpillWorkspace,
+    table: &'table Table,
+    group_columns: &'config [usize],
+    aggregate_specs: &'config [AggregateSpec],
+    max_groups: usize,
+    grouped: GroupedData<'table>,
+}
+
+impl SpillExecution<'_, '_> {
+    fn process_partition(&mut self, partition: SpillFile, depth: usize) -> Result<()> {
+        if partition.row_count == 0 {
+            remove_spill_file(&partition.path)?;
+            return Ok(());
+        }
+
+        let fits = groups_fit_in_memory(
+            self.table,
+            self.group_columns,
+            RowIndexReader::open(&partition.path)?,
+            self.max_groups,
+        )?;
+        if fits {
+            let partition_grouped = aggregate_rows(
+                self.table,
+                self.group_columns,
+                self.aggregate_specs,
+                RowIndexReader::open(&partition.path)?,
+                partition.row_count,
+                self.max_groups,
+            )?;
+            self.grouped.append(partition_grouped);
+            remove_spill_file(&partition.path)?;
+            return Ok(());
+        }
+
+        if depth >= MAX_REPARTITION_DEPTH {
+            return Err(Error::TemporaryStorage(format!(
+                "could not divide a grouping partition below {} groups after {depth} levels",
+                self.max_groups
+            )));
+        }
+
+        let children = partition_rows(
+            self.workspace,
+            self.table,
+            self.group_columns,
+            RowIndexReader::open(&partition.path)?,
+            depth,
+        )?;
+        remove_spill_file(&partition.path)?;
+        for child in children {
+            self.process_partition(child, depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+fn partition_rows(
+    workspace: &mut SpillWorkspace,
+    table: &Table,
+    group_columns: &[usize],
+    rows: impl Iterator<Item = Result<usize>>,
+    depth: usize,
+) -> Result<Vec<SpillFile>> {
+    let mut partitions = (0..SPILL_PARTITION_COUNT)
+        .map(|_| workspace.create_partition())
+        .collect::<Result<Vec<_>>>()?;
+    let mut writers = partitions
+        .iter()
+        .map(|partition| {
+            OpenOptions::new()
+                .write(true)
+                .open(&partition.path)
+                .map(BufWriter::new)
+                .map_err(|error| {
+                    temporary_storage_error("open spill partition", &partition.path, error)
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for row in rows {
+        let row = row?;
+        let partition_index =
+            group_hash(table, group_columns, row, depth) % SPILL_PARTITION_COUNT as u64;
+        let row_index = u64::try_from(row).map_err(|_| {
+            Error::TemporaryStorage("row index does not fit in a spill record".to_owned())
+        })?;
+        writers[partition_index as usize]
+            .write_all(&row_index.to_le_bytes())
+            .map_err(|error| {
+                temporary_storage_error(
+                    "write spill partition",
+                    &partitions[partition_index as usize].path,
+                    error,
+                )
+            })?;
+        partitions[partition_index as usize].row_count += 1;
+    }
+
+    for (writer, partition) in writers.iter_mut().zip(&partitions) {
+        writer.flush().map_err(|error| {
+            temporary_storage_error("flush spill partition", &partition.path, error)
+        })?;
+    }
+    Ok(partitions)
+}
+
+fn group_hash(table: &Table, group_columns: &[usize], row: usize, depth: usize) -> u64 {
+    let seed = (depth as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut hasher = StableHasher::new(seed);
+    group_columns.len().hash(&mut hasher);
+    for column in group_columns {
+        table.columns()[*column].value_ref(row).hash(&mut hasher);
+    }
+    avalanche(hasher.finish() ^ seed.rotate_left(17))
+}
+
+fn avalanche(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+struct StableHasher {
+    state: u64,
+}
+
+impl StableHasher {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: 0xcbf2_9ce4_8422_2325 ^ avalanche(seed),
+        }
+    }
+}
+
+impl Hasher for StableHasher {
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpillFile {
+    path: PathBuf,
+    row_count: usize,
+}
+
+struct SpillWorkspace {
+    path: PathBuf,
+    next_file: u64,
+    active: bool,
+}
+
+impl SpillWorkspace {
+    fn new(configured_parent: Option<&Path>) -> Result<Self> {
+        let parent = configured_parent.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        fs::create_dir_all(&parent).map_err(|error| {
+            temporary_storage_error("create temporary directory", &parent, error)
+        })?;
+
+        loop {
+            let sequence = NEXT_SPILL_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = parent.join(format!("rusthouse-group-{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        next_file: 0,
+                        active: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(temporary_storage_error(
+                        "create spill workspace",
+                        &path,
+                        error,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn create_partition(&mut self) -> Result<SpillFile> {
+        let path = self.path.join(format!("partition-{}.bin", self.next_file));
+        self.next_file += 1;
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| temporary_storage_error("create spill partition", &path, error))?;
+        Ok(SpillFile { path, row_count: 0 })
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        fs::remove_dir_all(&self.path).map_err(|error| {
+            temporary_storage_error("remove spill workspace", &self.path, error)
+        })?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SpillWorkspace {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct RowIndexReader {
+    reader: BufReader<File>,
+    remaining: usize,
+    path: PathBuf,
+}
+
+impl RowIndexReader {
+    fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)
+            .map_err(|error| temporary_storage_error("open spill partition", path, error))?;
+        let byte_len = file
+            .metadata()
+            .map_err(|error| temporary_storage_error("inspect spill partition", path, error))?
+            .len();
+        if byte_len % 8 != 0 {
+            return Err(Error::TemporaryStorage(format!(
+                "spill partition '{}' has a partial row index",
+                path.display()
+            )));
+        }
+        let record_count = usize::try_from(byte_len / 8).map_err(|_| {
+            Error::TemporaryStorage(format!(
+                "spill partition '{}' is too large for this platform",
+                path.display()
+            ))
+        })?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            remaining: record_count,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Iterator for RowIndexReader {
+    type Item = Result<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let mut bytes = [0_u8; 8];
+        if let Err(error) = self.reader.read_exact(&mut bytes) {
+            self.remaining = 0;
+            return Some(Err(temporary_storage_error(
+                "read spill partition",
+                &self.path,
+                error,
+            )));
+        }
+        self.remaining -= 1;
+        Some(usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
+            Error::TemporaryStorage(format!(
+                "spill partition '{}' contains an invalid row index",
+                self.path.display()
+            ))
+        }))
+    }
+}
+
+fn remove_spill_file(path: &Path) -> Result<()> {
+    fs::remove_file(path)
+        .map_err(|error| temporary_storage_error("remove spill partition", path, error))
+}
+
+fn temporary_storage_error(action: &str, path: &Path, error: io::Error) -> Error {
+    Error::TemporaryStorage(format!("{action} '{}': {error}", path.display()))
 }
 
 #[derive(Debug)]
@@ -389,16 +824,19 @@ impl<'a> GroupIndex<'a> {
         columns: &[usize],
         row: usize,
         next_group: usize,
-    ) -> (usize, bool) {
+        max_groups: usize,
+    ) -> Option<(usize, bool)> {
         match self {
-            Self::Global => (0, false),
+            Self::Global => Some((0, false)),
             Self::One(groups) => {
                 let key = table.columns()[columns[0]].value_ref(row);
                 if let Some(group) = groups.get(&key) {
-                    (*group, false)
+                    Some((*group, false))
+                } else if next_group == max_groups {
+                    None
                 } else {
                     groups.insert(key, next_group);
-                    (next_group, true)
+                    Some((next_group, true))
                 }
             }
             Self::Multiple(groups) if columns.len() == 2 => {
@@ -406,14 +844,14 @@ impl<'a> GroupIndex<'a> {
                     table.columns()[columns[0]].value_ref(row),
                     table.columns()[columns[1]].value_ref(row),
                 ];
-                find_or_insert_group(groups, &key, next_group)
+                find_or_insert_group(groups, &key, next_group, max_groups)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
                     .map(|column| table.columns()[*column].value_ref(row))
                     .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
+                find_or_insert_group(groups, &key, next_group, max_groups)
             }
         }
     }
@@ -449,12 +887,15 @@ fn find_or_insert_group<'a>(
     groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
     key: &[ValueRef<'a>],
     next_group: usize,
-) -> (usize, bool) {
+    max_groups: usize,
+) -> Option<(usize, bool)> {
     if let Some(group) = groups.get(key) {
-        (*group, false)
+        Some((*group, false))
+    } else if next_group == max_groups {
+        None
     } else {
         groups.insert(key.into(), next_group);
-        (next_group, true)
+        Some((next_group, true))
     }
 }
 
@@ -491,7 +932,22 @@ struct GroupedData<'a> {
     aggregates: Vec<Vec<Value>>,
 }
 
-impl GroupedData<'_> {
+impl<'a> GroupedData<'a> {
+    fn empty(aggregate_count: usize) -> Self {
+        Self {
+            keys: Vec::new(),
+            aggregates: (0..aggregate_count).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    fn append(&mut self, mut other: GroupedData<'a>) {
+        self.keys.append(&mut other.keys);
+        debug_assert_eq!(self.aggregates.len(), other.aggregates.len());
+        for (target, mut source) in self.aggregates.iter_mut().zip(other.aggregates) {
+            target.append(&mut source);
+        }
+    }
+
     fn len(&self) -> usize {
         self.keys.len()
     }

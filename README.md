@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- bounded GROUP BY state with recursive temporary-file spilling
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -44,6 +45,16 @@ cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
 
+GROUP BY keeps at most 65,536 groups in one in-memory partition by default. Lower the cap or choose the parent directory for per-query spill files with `--max-in-memory-groups` and `--temporary-directory`:
+
+~~~bash
+cargo run -- --max-in-memory-groups 10000 \
+  --temporary-directory /var/tmp \
+  --execute "SELECT region, COUNT(*) FROM events GROUP BY region"
+~~~
+
+Spill workspaces are removed after successful and failed queries.
+
 Or pipe a batch through standard input:
 
 ~~~bash
@@ -64,9 +75,13 @@ Database retains an in-memory catalog across calls and returns structured result
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
 ~~~rust
-use rusthouse::{Database, StatementResult};
+use std::path::PathBuf;
+use rusthouse::{Database, DatabaseOptions, StatementResult};
 
-let mut database = Database::new();
+let mut database = Database::with_options(DatabaseOptions {
+    max_in_memory_groups: 10_000,
+    temporary_directory: Some(PathBuf::from("/var/tmp")),
+});
 database.execute("CREATE TABLE events (id Int64, name String)")?;
 database.execute("INSERT INTO events VALUES (1, 'launch')")?;
 

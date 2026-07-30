@@ -1,5 +1,9 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn execute_argument_emits_clean_json_and_command_statuses() {
@@ -92,6 +96,41 @@ fn stdin_and_csv_output_work_together() {
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
         "label,active\n\"hello, world\",true\n"
     );
+}
+
+#[test]
+fn grouping_spill_options_work_end_to_end_and_clean_up() {
+    let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let temporary_directory = std::env::temp_dir().join(format!(
+        "rusthouse-cli-spill-test-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&temporary_directory).expect("create temporary directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--max-in-memory-groups=1",
+            &format!("--temporary-directory={}", temporary_directory.display()),
+            "--execute",
+            "CREATE TABLE totals (key String, amount Int64);
+             INSERT INTO totals VALUES ('a', 1), ('b', 2), ('a', 3);
+             SELECT key, SUM(amount) AS total FROM totals GROUP BY key ORDER BY key;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"key\",\"type\":\"String\"},{\"name\":\"total\",\"type\":\"Int64\"}],\"rows\":[[\"a\",4],[\"b\",2]]}]}\n"
+    );
+    assert_eq!(
+        fs::read_dir(&temporary_directory)
+            .expect("read temporary directory")
+            .count(),
+        0
+    );
+    fs::remove_dir(temporary_directory).expect("remove temporary directory");
 }
 
 #[test]
