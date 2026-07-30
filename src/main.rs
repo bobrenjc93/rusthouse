@@ -172,6 +172,7 @@ mod tests {
             columns: vec![ResultColumn {
                 name: "n".to_owned(),
                 data_type: DataType::Int64,
+                nullable: false,
             }],
             rows: vec![vec![Value::Int64(1)]],
         };

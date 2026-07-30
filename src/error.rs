@@ -29,6 +29,11 @@ pub enum Error {
         actual: String,
     },
     InvalidQuery(String),
+    JoinLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+        actual: usize,
+    },
     NumericOverflow(String),
 }
 
@@ -48,7 +53,7 @@ impl fmt::Display for Error {
                 context,
             } => write!(
                 f,
-                "{context} {identifier:?} is reserved; TRUE and FALSE are Boolean literals"
+                "{context} {identifier:?} is reserved; TRUE, FALSE, and NULL are literals"
             ),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
@@ -70,6 +75,14 @@ impl fmt::Display for Error {
                 "type mismatch for {context}: expected {expected}, found {actual}"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
+            Self::JoinLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                f,
+                "JOIN {resource} limit exceeded: limit {limit}, requires at least {actual}"
+            ),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }

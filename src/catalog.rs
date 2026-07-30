@@ -56,6 +56,7 @@ mod tests {
                 vec![ColumnDef {
                     name: "id".to_owned(),
                     data_type: DataType::Int64,
+                    nullable: false,
                 }],
             )
             .expect("create table");
