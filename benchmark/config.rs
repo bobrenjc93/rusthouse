@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -149,6 +153,20 @@ pub fn parse(
     if audit_sql.is_some() && !correctness_audit {
         return Err("--audit-sql requires --correctness-audit".to_owned());
     }
+    if correctness_audit {
+        let audit_destination = audit_sql
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("clickhouse-correctness-audit-{seed}.sql")));
+        if let Some(details) = &details
+            && destinations_collide(details, &audit_destination)
+        {
+            return Err(format!(
+                "details output '{}' and correctness-audit replay SQL '{}' must use distinct paths",
+                details.display(),
+                audit_destination.display(),
+            ));
+        }
+    }
     Ok(ParseResult::Run(Config {
         mode,
         seed,
@@ -172,6 +190,89 @@ fn parse_seed(value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("invalid seed {value:?}; expected an unsigned integer"))
+}
+
+fn destinations_collide(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (resolved_destination(left), resolved_destination(right))
+        && left == right
+    {
+        return true;
+    }
+    same_existing_file(left, right)
+}
+
+fn resolved_destination(path: &Path) -> Option<PathBuf> {
+    let mut destination = canonical_parent_destination(path).or_else(|| lexical_absolute(path))?;
+    for _ in 0..40 {
+        let target = match fs::read_link(&destination) {
+            Ok(target) => target,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                return Some(destination);
+            }
+            Err(_) => return None,
+        };
+        let target = if target.is_absolute() {
+            target
+        } else {
+            destination.parent()?.join(target)
+        };
+        destination =
+            canonical_parent_destination(&target).or_else(|| lexical_absolute(&target))?;
+    }
+    None
+}
+
+fn lexical_absolute(path: &Path) -> Option<PathBuf> {
+    let absolute = absolute_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    Some(normalized)
+}
+
+fn canonical_parent_destination(path: &Path) -> Option<PathBuf> {
+    let absolute = absolute_path(path)?;
+    let file_name = absolute.file_name()?.to_owned();
+    let parent = fs::canonicalize(absolute.parent()?).ok()?;
+    Some(parent.join(file_name))
+}
+
+fn absolute_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_owned())
+    } else {
+        Some(std::env::current_dir().ok()?.join(path))
+    }
+}
+
+#[cfg(unix)]
+fn same_existing_file(left: &Path, right: &Path) -> bool {
+    let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_existing_file(_left: &Path, _right: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -245,5 +346,74 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("--correctness-audit"));
+    }
+
+    #[test]
+    fn details_and_audit_sql_destinations_must_be_distinct() {
+        for arguments in [
+            vec![
+                "--clickhouse=/clickhouse",
+                "--correctness-audit",
+                "--audit-sql=artifact",
+                "--details=artifact",
+            ],
+            vec![
+                "--clickhouse=/clickhouse",
+                "--correctness-audit",
+                "--audit-sql=output/../artifact",
+                "--details=artifact",
+            ],
+            vec![
+                "--clickhouse=/clickhouse",
+                "--correctness-audit",
+                "--seed=7",
+                "--details=clickhouse-correctness-audit-7.sql",
+            ],
+        ] {
+            let error = match parse(
+                arguments.into_iter().map(str::to_owned),
+                None,
+                None,
+                PathBuf::from("rusthouse"),
+            ) {
+                Ok(_) => panic!("colliding output destinations should fail"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("distinct paths"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_aliases_include_symlinks_and_hard_links() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "rusthouse-output-aliases-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create alias test directory");
+
+        let first_symlink = directory.join("first-symlink");
+        let second_symlink = directory.join("second-symlink");
+        symlink("future-output", &first_symlink).expect("create first dangling symlink");
+        symlink("future-output", &second_symlink).expect("create second dangling symlink");
+        assert!(destinations_collide(&first_symlink, &second_symlink));
+
+        let file = directory.join("file");
+        let hard_link = directory.join("hard-link");
+        fs::write(&file, "content").expect("write hard-link source");
+        fs::hard_link(&file, &hard_link).expect("create hard link");
+        assert!(destinations_collide(&file, &hard_link));
+
+        fs::remove_dir_all(&directory).expect("remove alias test directory");
     }
 }

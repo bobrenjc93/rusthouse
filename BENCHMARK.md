@@ -47,7 +47,7 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
-Add the deterministic, non-scoring correctness corpus to either mode with `--correctness-audit`. The exact shared SQL batch is written before execution so any failure is replayable. Use `--audit-sql` to choose its location; otherwise the harness writes `clickhouse-correctness-audit-<seed>.sql` in the current directory.
+Add the deterministic, non-scoring correctness corpus to either mode with `--correctness-audit`. The exact shared SQL batch is written before execution so any failure is replayable. Use `--audit-sql` to choose its location; otherwise the harness writes `clickhouse-correctness-audit-<seed>.sql` in the current directory. The replay and `--details` destinations must be distinct; path aliases that resolve to the same file are rejected before benchmarking.
 
 ~~~bash
 RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \

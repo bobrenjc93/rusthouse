@@ -114,15 +114,20 @@ impl EnginePaths {
                 engine.path(self).display()
             )
         })?;
-        child
+        let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("{} stdin was not piped", engine.name()))?
-            .write_all(batch.as_bytes())
-            .map_err(|error| format!("could not write SQL to {}: {error}", engine.name()))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("could not wait for {}: {error}", engine.name()))?;
+            .ok_or_else(|| format!("{} stdin was not piped", engine.name()))?;
+        let (output, write_result) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(batch.as_bytes()));
+            let output = child.wait_with_output();
+            let write_result = writer
+                .join()
+                .map_err(|_| format!("SQL writer thread for {} panicked", engine.name()));
+            (output, write_result)
+        });
+        let output =
+            output.map_err(|error| format!("could not wait for {}: {error}", engine.name()))?;
         let elapsed = started.elapsed();
 
         if !output.status.success() {
@@ -133,6 +138,8 @@ impl EnginePaths {
                 summarize_stderr(&output.stderr)
             ));
         }
+        write_result?
+            .map_err(|error| format!("could not write SQL to {}: {error}", engine.name()))?;
         let stdout =
             if capture_stdout {
                 Some(String::from_utf8(output.stdout).map_err(|error| {
@@ -277,6 +284,13 @@ fn summarize_stderr(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -290,5 +304,45 @@ mod tests {
     #[test]
     fn amplification_must_be_positive() {
         assert!(sql_batch("", "SELECT 1;", 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_streaming_process_drains_output_while_writing_input() {
+        const LINES: usize = 32;
+        const OUTPUT_BYTES_PER_LINE: usize = 65_536;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "rusthouse-streaming-child-{}-{unique}.sh",
+            std::process::id()
+        ));
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  dd if=/dev/zero bs={OUTPUT_BYTES_PER_LINE} count=1 2>/dev/null\n  dd if=/dev/zero bs={OUTPUT_BYTES_PER_LINE} count=1 >&2 2>/dev/null\ndone\n"
+            ),
+        )
+        .expect("write streaming child script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("streaming child metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions).expect("make streaming child executable");
+
+        let paths = EnginePaths {
+            rusthouse: script_path.clone(),
+            clickhouse: script_path.clone(),
+        };
+        let line = format!("{}\n", "x".repeat(8_192));
+        let batch = line.repeat(LINES);
+        let result = paths.execute_correctness_batch(Engine::RustHouse, &batch);
+        fs::remove_file(&script_path).expect("remove streaming child script");
+
+        let output = result.expect("streaming child completes without pipe deadlock");
+        assert_eq!(output.stdout.len(), LINES * OUTPUT_BYTES_PER_LINE);
     }
 }
