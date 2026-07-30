@@ -186,12 +186,7 @@ fn run(config: Config) -> Result<Report, String> {
                 for (workload_index, workload) in
                     workloads(profile, row_count).into_iter().enumerate()
                 {
-                    let query_amplification = partitioned_query_budget(
-                        settings.sustained_query_budget,
-                        profiles.len() * seeds.len(),
-                        seed_index * profiles.len() + profile_index,
-                        row_count_index + workload_index,
-                    )?;
+                    let query_amplification = settings.query_amplification;
                     eprintln!(
                         "benchmarking {} / {} at {} rows with seed {} ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
                         profile.name(),
@@ -378,17 +373,6 @@ fn run(config: Config) -> Result<Report, String> {
         &expected_workloads,
         |case| case.end_to_end_ratio,
     )?;
-    let minimum_amplification = cases
-        .iter()
-        .map(|case| case.query_amplification)
-        .min()
-        .ok_or_else(|| "benchmark produced no cases".to_owned())?;
-    let maximum_amplification = cases
-        .iter()
-        .map(|case| case.query_amplification)
-        .max()
-        .ok_or_else(|| "benchmark produced no cases".to_owned())?;
-
     if let Some(path) = &config.details {
         let details = details_json(
             &config,
@@ -416,10 +400,9 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing holds a fixed {}-query budget per workload/scale/sample across all profile/seed cells; each symmetric engine batch uses {} or {} identical queries, divides positive batch wall time by its exact repetition count, discards stdout, and performs no startup subtraction",
-            settings.sustained_query_budget,
-            minimum_amplification,
-            maximum_amplification
+            "primary timing uses setup plus {} identical queries in every profile/seed/workload/scale process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
+            settings.query_amplification,
+            settings.query_amplification
         ),
         format!(
             "primary parity caps: {}/{} cases; end-to-end parity caps: {}/{} cases",
@@ -512,26 +495,6 @@ fn score_cases(
         expected_scales,
         expected_workloads,
     )
-}
-
-fn partitioned_query_budget(
-    total_budget: usize,
-    partition_count: usize,
-    partition_index: usize,
-    rotation: usize,
-) -> Result<usize, String> {
-    if partition_count == 0 || partition_index >= partition_count {
-        return Err("query budget partitions must be non-empty and in range".to_owned());
-    }
-    if total_budget < partition_count {
-        return Err(format!(
-            "sustained query budget {total_budget} cannot give positive work to {partition_count} profile/seed cells"
-        ));
-    }
-    let base = total_budget / partition_count;
-    let remainder = total_budget % partition_count;
-    let rotated_index = (partition_index + rotation % partition_count) % partition_count;
-    Ok(base + usize::from(rotated_index < remainder))
 }
 
 fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<(), String> {
@@ -674,16 +637,6 @@ fn details_json(
 ) -> String {
     let settings = config.mode.settings();
     let seeds = config.mode.seeds(config.seed);
-    let minimum_amplification = cases
-        .iter()
-        .map(|case| case.query_amplification)
-        .min()
-        .unwrap_or(0);
-    let maximum_amplification = cases
-        .iter()
-        .map(|case| case.query_amplification)
-        .max()
-        .unwrap_or(0);
     let mut output = String::new();
     write!(
         output,
@@ -722,10 +675,8 @@ fn details_json(
     }
     write!(
         output,
-        "],\"aggregation\":{{\"space\":\"log\",\"ratio_floor\":0.01,\"ratio_cap\":1.0,\"hierarchy\":[\"workload\",\"scale\",\"family\",\"seed\",\"profile\"],\"complete_matrix_required\":true}},\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_total_profile_seed_budget\",\"sustained_query_budget\":{},\"case_query_amplification_min\":{},\"case_query_amplification_max\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
-        settings.sustained_query_budget,
-        minimum_amplification,
-        maximum_amplification,
+        "],\"aggregation\":{{\"space\":\"log\",\"ratio_floor\":0.01,\"ratio_cap\":1.0,\"hierarchy\":[\"workload\",\"scale\",\"family\",\"seed\",\"profile\"],\"complete_matrix_required\":true}},\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions_per_cell\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.version_output),
@@ -920,52 +871,21 @@ mod tests {
     }
 
     #[test]
-    fn fixed_query_budget_is_rotated_and_fully_allocated() {
-        for (partitions, expected_min, expected_max) in [(3, 85, 86), (9, 28, 29)] {
-            for rotation in 0..12 {
-                let allocations = (0..partitions)
-                    .map(|index| {
-                        partitioned_query_budget(256, partitions, index, rotation)
-                            .expect("allocation")
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(allocations.iter().sum::<usize>(), 256);
-                assert_eq!(allocations.iter().copied().min(), Some(expected_min));
-                assert_eq!(allocations.iter().copied().max(), Some(expected_max));
-            }
-        }
-        assert!(partitioned_query_budget(2, 3, 0, 0).is_err());
-        assert!(partitioned_query_budget(256, 0, 0, 0).is_err());
-        assert!(partitioned_query_budget(256, 3, 3, 0).is_err());
-    }
-
-    #[test]
-    fn default_matrix_has_every_profile_seed_scale_case_without_more_query_work() {
+    fn default_matrix_preserves_calibrated_amplification_for_every_case() {
         let settings = config::Mode::Default.settings();
         let seeds = config::Mode::Default.seeds(20_260_729);
         let cell_count = SchemaProfile::ALL.len() * seeds.len();
         let workloads_per_cell = workloads(SchemaProfile::NumericHeavy, 1).len();
+        let case_count = cell_count * settings.row_counts.len() * workloads_per_cell;
+        assert_eq!(case_count, 216);
         assert_eq!(
-            cell_count * settings.row_counts.len() * workloads_per_cell,
-            216
+            settings.query_amplification,
+            config::CALIBRATED_QUERY_AMPLIFICATION
         );
-
-        for scale_index in 0..settings.row_counts.len() {
-            for workload_index in 0..workloads_per_cell {
-                let allocated = (0..cell_count)
-                    .map(|cell_index| {
-                        partitioned_query_budget(
-                            settings.sustained_query_budget,
-                            cell_count,
-                            cell_index,
-                            scale_index + workload_index,
-                        )
-                        .expect("allocation")
-                    })
-                    .sum::<usize>();
-                assert_eq!(allocated, settings.sustained_query_budget);
-            }
-        }
+        assert_eq!(
+            case_count * settings.query_amplification,
+            216 * config::CALIBRATED_QUERY_AMPLIFICATION
+        );
     }
 
     #[test]

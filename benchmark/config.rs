@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub const CALIBRATED_QUERY_AMPLIFICATION: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Quick,
@@ -20,14 +22,14 @@ impl Mode {
                 row_counts: vec![256, 2_048],
                 warmups: 1,
                 samples: 3,
-                sustained_query_budget: 256,
+                query_amplification: CALIBRATED_QUERY_AMPLIFICATION,
                 end_to_end_samples: 3,
             },
             Self::Default => BenchmarkSettings {
                 row_counts: vec![1_000, 10_000, 50_000],
                 warmups: 2,
                 samples: 7,
-                sustained_query_budget: 256,
+                query_amplification: CALIBRATED_QUERY_AMPLIFICATION,
                 end_to_end_samples: 3,
             },
         }
@@ -51,9 +53,9 @@ pub struct BenchmarkSettings {
     pub row_counts: Vec<usize>,
     pub warmups: usize,
     pub samples: usize,
-    /// Total repeated queries assigned across all profile/seed cells for one
-    /// workload/scale/sample. Matrix expansion must not increase this budget.
-    pub sustained_query_budget: usize,
+    /// Fixed repetitions for every profile/seed/workload/scale timing cell.
+    /// This is deliberately not divided when the benchmark matrix expands.
+    pub query_amplification: usize,
     pub end_to_end_samples: usize,
 }
 
@@ -206,7 +208,7 @@ mod tests {
             assert!(settings.row_counts.len() >= 2);
             assert!(settings.warmups >= 1);
             assert!(settings.samples >= 3);
-            assert_eq!(settings.sustained_query_budget, 256);
+            assert_eq!(settings.query_amplification, CALIBRATED_QUERY_AMPLIFICATION);
             assert!(settings.end_to_end_samples >= 3);
         }
     }
