@@ -3,6 +3,8 @@ use std::fmt::Write;
 use crate::engine::QueryResult;
 use crate::value::Value;
 
+const CSV_NULL: &str = r"\N";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Table,
@@ -123,14 +125,7 @@ fn render_csv(result: &QueryResult) -> String {
         result.columns.iter().map(|column| column.name.as_str()),
     );
     for row in &result.rows {
-        let values = row
-            .iter()
-            .map(|value| match value {
-                Value::Null => r"\N".to_owned(),
-                value => value.as_display_string(),
-            })
-            .collect::<Vec<_>>();
-        write_csv_row(&mut output, values.iter().map(String::as_str));
+        write_csv_value_row(&mut output, row);
     }
     output
 }
@@ -140,15 +135,36 @@ fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>)
         if index > 0 {
             output.push(',');
         }
-        if value.contains([',', '"', '\n', '\r']) {
-            output.push('"');
-            output.push_str(&value.replace('"', "\"\""));
-            output.push('"');
-        } else {
-            output.push_str(value);
+        write_csv_field(output, value, false);
+    }
+    output.push('\n');
+}
+
+fn write_csv_value_row(output: &mut String, values: &[Value]) {
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        match value {
+            Value::Null => output.push_str(CSV_NULL),
+            value => {
+                let rendered = value.as_display_string();
+                let collides_with_null = matches!(value, Value::String(value) if value == CSV_NULL);
+                write_csv_field(output, &rendered, collides_with_null);
+            }
         }
     }
     output.push('\n');
+}
+
+fn write_csv_field(output: &mut String, value: &str, force_quote: bool) {
+    if force_quote || value.contains([',', '"', '\n', '\r']) {
+        output.push('"');
+        output.push_str(&value.replace('"', "\"\""));
+        output.push('"');
+    } else {
+        output.push_str(value);
+    }
 }
 
 /// Render one result set with explicit column metadata and positional rows.

@@ -615,6 +615,42 @@ fn null_predicates_follow_sql_three_valued_logic() {
 }
 
 #[test]
+fn not_operator_does_not_shadow_a_column_named_not() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE contextual_not (id Int64, not Nullable(Bool));
+             INSERT INTO contextual_not VALUES (1, true), (2, false), (3, NULL);",
+        )
+        .expect("NOT remains a valid column name");
+
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM contextual_not WHERE not = true;",
+        )
+        .rows,
+        vec![vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM contextual_not WHERE NOT not = true;",
+        )
+        .rows,
+        vec![vec![Value::Int64(2)]]
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM contextual_not WHERE not IS NULL;",
+        )
+        .rows,
+        vec![vec![Value::Int64(3)]]
+    );
+}
+
+#[test]
 fn aggregates_ignore_nulls_and_empty_inputs_return_null() {
     let mut database = Database::new();
     database

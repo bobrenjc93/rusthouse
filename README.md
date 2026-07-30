@@ -20,7 +20,7 @@ Identifiers are unquoted and case-insensitive; TRUE, FALSE, and NULL are reserve
 
 Comparisons involving NULL evaluate to unknown and are not selected by WHERE. `COUNT(*)` counts rows, while `COUNT(column)` and the other aggregates ignore NULL inputs. SUM, MIN, MAX, and AVG return NULL when no non-NULL input exists. Their result types are nullable; COUNT remains Int64.
 
-NULL sorts after non-NULL values in ascending order and before them in descending order. Table output renders it as `NULL`, CSV uses `\N`, and JSON uses native `null`.
+NULL sorts after non-NULL values in ascending order and before them in descending order. Table output renders it as `NULL`, CSV uses the unquoted `\N` sentinel (a non-NULL string equal to `\N` is quoted), and JSON uses native `null`.
 
 ## CLI
 

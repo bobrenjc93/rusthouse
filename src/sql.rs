@@ -596,7 +596,8 @@ impl Parser {
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
         let mut negations = 0;
-        while self.eat_keyword("NOT") {
+        while self.at_keyword("NOT") && !self.not_is_column_operand() {
+            self.current += 1;
             self.record_predicate_node()?;
             negations += 1;
         }
@@ -605,6 +606,19 @@ impl Parser {
             predicate = Predicate::Not(Box::new(predicate));
         }
         Ok(predicate)
+    }
+
+    fn not_is_column_operand(&self) -> bool {
+        match &self.tokens[self.current + 1].kind {
+            TokenKind::Equal
+            | TokenKind::NotEqual
+            | TokenKind::Less
+            | TokenKind::LessOrEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterOrEqual => true,
+            TokenKind::Identifier(value) => value.eq_ignore_ascii_case("IS"),
+            _ => false,
+        }
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
@@ -735,13 +749,16 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.at_keyword(expected) {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
