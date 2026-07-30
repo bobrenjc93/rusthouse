@@ -522,17 +522,25 @@ impl Parser {
             return false;
         }
 
-        let distinct_is_column = matches!(self.tokens[self.current + 1].kind, TokenKind::Comma)
-            || matches!(
-                &self.tokens[self.current + 1].kind,
-                TokenKind::Identifier(value)
-                    if value.eq_ignore_ascii_case("FROM") || value.eq_ignore_ascii_case("AS")
-            );
-        if distinct_is_column {
-            false
-        } else {
+        // DISTINCT is also a legal identifier, so only consume it when the
+        // remaining tokens form a complete projection list.
+        let checkpoint = self.current;
+        self.current += 1;
+        let modifier_has_projection = loop {
+            if self.parse_select_item().is_err() {
+                break false;
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FROM"));
+            }
+        };
+        self.current = checkpoint;
+
+        if modifier_has_projection {
             self.current += 1;
             true
+        } else {
+            false
         }
     }
 
@@ -822,6 +830,21 @@ mod tests {
                 &select.items[0],
                 SelectItem::Column { name, .. } if name.eq_ignore_ascii_case("distinct")
             ));
+        }
+    }
+
+    #[test]
+    fn distinct_modifier_accepts_keyword_projection_columns() {
+        for sql in [
+            "SELECT DISTINCT from FROM events",
+            "SELECT DISTINCT as FROM events",
+        ] {
+            let statements = parse(sql).expect("keyword column follows DISTINCT modifier");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            assert!(select.distinct);
+            assert!(matches!(&select.items[0], SelectItem::Column { .. }));
         }
     }
 

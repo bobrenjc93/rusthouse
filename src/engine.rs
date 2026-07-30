@@ -113,15 +113,22 @@ impl Database {
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if select.distinct {
-            let mut rows = if grouped {
-                let grouped =
-                    execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-                grouped.project(&(0..grouped.len()).collect::<Vec<_>>(), &items)
-            } else {
-                execute_projection(table, &matching_rows, &items)
-            };
-            deduplicate_rows(&mut rows);
+        let rows = if select.distinct && grouped {
+            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let all_groups = (0..grouped.len()).collect::<Vec<_>>();
+            let mut projected = grouped.project(&all_groups, &items);
+            let mut selected_groups = retain_distinct_rows(&mut projected);
+            order_grouped_rows(
+                &mut selected_groups,
+                &grouped,
+                &items,
+                &ordering,
+                select.limit,
+            );
+            grouped.project(&selected_groups, &items)
+        } else if select.distinct {
+            let mut rows = execute_projection(table, &matching_rows, &items);
+            let _ = retain_distinct_rows(&mut rows);
             order_projected_rows(&mut rows, &ordering, select.limit);
             rows
         } else if grouped {
@@ -178,9 +185,19 @@ impl Hash for SqlRowKey {
     }
 }
 
-fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
+fn retain_distinct_rows(rows: &mut Vec<Vec<Value>>) -> Vec<usize> {
     let mut seen = HashSet::with_capacity(rows.len());
-    rows.retain(|row| seen.insert(SqlRowKey::from_row(row)));
+    let mut source_index = 0;
+    let mut retained_indices = Vec::with_capacity(rows.len());
+    rows.retain(|row| {
+        let retained = seen.insert(SqlRowKey::from_row(row));
+        if retained {
+            retained_indices.push(source_index);
+        }
+        source_index += 1;
+        retained
+    });
+    retained_indices
 }
 
 fn order_projected_rows(

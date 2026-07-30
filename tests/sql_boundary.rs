@@ -16,8 +16,8 @@ fn distinct_column_name_remains_selectable() {
     let mut database = Database::new();
     database
         .execute(
-            "CREATE TABLE keyword_columns (distinct Int64, id Int64);
-             INSERT INTO keyword_columns VALUES (2, 1), (1, 2);",
+            "CREATE TABLE keyword_columns (distinct Int64, from Int64, as Int64);
+             INSERT INTO keyword_columns VALUES (2, 2, 1), (1, 2, 1), (1, 1, 2);",
         )
         .expect("setup succeeds");
 
@@ -27,8 +27,53 @@ fn distinct_column_name_remains_selectable() {
     );
     assert_eq!(
         result.rows,
-        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+        ]
     );
+
+    for column in ["from", "as"] {
+        let result = execute_query(
+            &mut database,
+            &format!("SELECT DISTINCT {column} FROM keyword_columns ORDER BY {column};"),
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+}
+
+#[test]
+fn grouped_distinct_retains_group_key_ordering_for_ties() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE grouped_order (category String, amount Int64);
+             INSERT INTO grouped_order VALUES
+                ('zeta', 2), ('alpha', 1), ('beta', 2), ('alpha', 1);",
+        )
+        .expect("setup succeeds");
+
+    for order_by in ["", " ORDER BY total"] {
+        let plain = execute_query(
+            &mut database,
+            &format!(
+                "SELECT category, SUM(amount) AS total
+                 FROM grouped_order GROUP BY category{order_by};"
+            ),
+        );
+        let distinct = execute_query(
+            &mut database,
+            &format!(
+                "SELECT DISTINCT category, SUM(amount) AS total
+                 FROM grouped_order GROUP BY category{order_by};"
+            ),
+        );
+        assert_eq!(distinct.rows, plain.rows);
+    }
 }
 
 #[test]
