@@ -752,3 +752,55 @@ fn boolean_words_can_qualify_where_columns_when_used_as_aliases() {
         assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
     }
 }
+
+#[test]
+fn qualified_order_by_accepts_repeated_single_table_projections() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE repeated (id Int64);
+             INSERT INTO repeated VALUES (2), (1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT t.id AS one, t.id AS two
+         FROM repeated t
+         ORDER BY t.id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
+fn qualified_order_by_accepts_repeated_joined_projections() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE owners (id Int64);
+             CREATE TABLE details (owner_id Int64, rank Int64);
+             INSERT INTO owners VALUES (2), (1);
+             INSERT INTO details VALUES (2, 4), (1, 9);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT d.rank AS first_rank, d.rank AS second_rank, o.id
+         FROM owners o INNER JOIN details d ON o.id = d.owner_id
+         ORDER BY d.rank DESC;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(9), Value::Int64(9), Value::Int64(1)],
+            vec![Value::Int64(4), Value::Int64(4), Value::Int64(2)],
+        ]
+    );
+}

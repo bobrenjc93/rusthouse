@@ -977,6 +977,7 @@ fn resolve_ordering(
                     matches!(item, ResolvedItem::Column { source, .. } if *source == requested_column)
                 })
                 .map(|(index, _)| index)
+                .take(1)
                 .collect::<Vec<_>>()
         } else {
             columns
