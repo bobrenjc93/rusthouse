@@ -12,6 +12,120 @@ fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
 }
 
 #[test]
+fn distinct_deduplicates_complete_wildcard_rows_in_first_seen_order() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (category String, amount Int64);
+             INSERT INTO events VALUES
+                ('alpha', 1), ('alpha', 1), ('alpha', 2),
+                ('beta', 1), ('alpha', 2), ('beta', 1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT DISTINCT * FROM events WHERE amount >= 1;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::String("alpha".to_owned()), Value::Int64(1)],
+            vec![Value::String("alpha".to_owned()), Value::Int64(2)],
+            vec![Value::String("beta".to_owned()), Value::Int64(1)],
+        ]
+    );
+}
+
+#[test]
+fn distinct_supports_aliases_grouped_aggregates_and_empty_inputs() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES
+                ('west', 2), ('west', 4), ('east', 3), ('east', 5), ('north', 8);",
+        )
+        .expect("setup succeeds");
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT DISTINCT COUNT(*) AS group_size
+         FROM sales GROUP BY region ORDER BY group_size DESC;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(1)]]
+    );
+    assert_eq!(grouped.columns[0].name, "group_size");
+
+    let aliased = execute_query(
+        &mut database,
+        "SELECT DISTINCT region AS area FROM sales ORDER BY area;",
+    );
+    assert_eq!(
+        aliased.rows,
+        vec![
+            vec![Value::String("east".to_owned())],
+            vec![Value::String("north".to_owned())],
+            vec![Value::String("west".to_owned())],
+        ]
+    );
+    assert_eq!(aliased.columns[0].name, "area");
+
+    let filtered = execute_query(
+        &mut database,
+        "SELECT DISTINCT region AS area FROM sales
+         WHERE amount > 100 ORDER BY area;",
+    );
+    assert!(filtered.rows.is_empty());
+
+    let empty_aggregate = execute_query(
+        &mut database,
+        "SELECT DISTINCT COUNT(*) AS count FROM sales WHERE amount > 100;",
+    );
+    assert_eq!(empty_aggregate.rows, vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn distinct_canonicalizes_float_zero_and_runs_before_order_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE measurements (value Float64);
+             INSERT INTO measurements VALUES
+                (3.0), (3.0), (2.0), (0.0), (-0.0), (1.0), (2.0);",
+        )
+        .expect("setup succeeds");
+
+    let top = execute_query(
+        &mut database,
+        "SELECT DISTINCT value AS reading FROM measurements
+         ORDER BY reading DESC LIMIT 3;",
+    );
+    assert_eq!(
+        top.rows,
+        vec![
+            vec![Value::Float64(3.0)],
+            vec![Value::Float64(2.0)],
+            vec![Value::Float64(1.0)],
+        ]
+    );
+
+    let zeros = execute_query(
+        &mut database,
+        "SELECT DISTINCT value FROM measurements WHERE value = 0.0;",
+    );
+    assert_eq!(zeros.rows, vec![vec![Value::Float64(0.0)]]);
+
+    let no_rows = execute_query(
+        &mut database,
+        "SELECT DISTINCT value FROM measurements ORDER BY value LIMIT 0;",
+    );
+    assert!(no_rows.rows.is_empty());
+}
+
+#[test]
 fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let mut database = Database::new();
     let results = database

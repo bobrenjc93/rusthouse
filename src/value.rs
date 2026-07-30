@@ -112,6 +112,33 @@ impl ValueRef<'_> {
         }
     }
 
+    pub(crate) fn sql_eq(self, other: Self) -> bool {
+        self.sql_cmp(other) == Some(Ordering::Equal)
+    }
+
+    pub(crate) fn sql_hash<H: Hasher>(self, state: &mut H) {
+        match self {
+            Self::Int64(value) => hash_sql_integer(value, state),
+            Self::Float64(value) => {
+                if let Some(integer) = equal_i64(value) {
+                    hash_sql_integer(integer, state);
+                } else {
+                    0_u8.hash(state);
+                    1_u8.hash(state);
+                    canonical_float_bits(value).hash(state);
+                }
+            }
+            Self::Bool(value) => {
+                1_u8.hash(state);
+                value.hash(state);
+            }
+            Self::String(value) => {
+                2_u8.hash(state);
+                value.hash(state);
+            }
+        }
+    }
+
     fn variant_index(&self) -> u8 {
         match self {
             Self::Int64(_) => 0,
@@ -120,6 +147,24 @@ impl ValueRef<'_> {
             Self::String(_) => 3,
         }
     }
+}
+
+fn hash_sql_integer<H: Hasher>(value: i64, state: &mut H) {
+    0_u8.hash(state);
+    0_u8.hash(state);
+    value.hash(state);
+}
+
+fn equal_i64(value: f64) -> Option<i64> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+
+    if !value.is_finite() || value >= I64_UPPER_EXCLUSIVE || value < i64::MIN as f64 {
+        return None;
+    }
+    let integer = value as i64;
+    int_float_cmp(integer, value)
+        .is_some_and(|ordering| ordering == Ordering::Equal)
+        .then_some(integer)
 }
 
 fn int_float_cmp(integer: i64, float: f64) -> Option<Ordering> {

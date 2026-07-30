@@ -20,6 +20,7 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
@@ -442,6 +443,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        let distinct = self.eat_keyword("DISTINCT");
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -504,6 +506,7 @@ impl Parser {
         };
 
         Ok(Select {
+            distinct,
             items,
             table,
             predicate,
@@ -757,7 +760,7 @@ mod tests {
     #[test]
     fn parses_complete_select_shape() {
         let statements = parse(
-            "SELECT region, SUM(amount) AS total FROM sales \
+            "SELECT DISTINCT region, SUM(amount) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
              GROUP BY region ORDER BY total DESC LIMIT 3;",
         )
@@ -766,11 +769,21 @@ mod tests {
         let Statement::Select(select) = &statements[0] else {
             panic!("expected select");
         };
+        assert!(select.distinct);
         assert_eq!(select.items.len(), 2);
         assert_eq!(select.group_by, ["region"]);
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn select_is_not_distinct_unless_requested() {
+        let statements = parse("SELECT id FROM events").expect("valid SQL");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(!select.distinct);
     }
 
     #[test]

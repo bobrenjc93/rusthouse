@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -112,7 +113,18 @@ impl Database {
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
+        let rows = if select.distinct {
+            let mut rows = if grouped {
+                let grouped =
+                    execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+                grouped.project(&(0..grouped.len()).collect::<Vec<_>>(), &items)
+            } else {
+                execute_projection(table, &matching_rows, &items)
+            };
+            deduplicate_rows(&mut rows);
+            order_projected_rows(&mut rows, &ordering, select.limit);
+            rows
+        } else if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
@@ -132,6 +144,67 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+#[derive(Debug)]
+struct SqlRowKey(Box<[Value]>);
+
+impl SqlRowKey {
+    fn from_row(row: &[Value]) -> Self {
+        Self(row.into())
+    }
+}
+
+impl PartialEq for SqlRowKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0.iter())
+                .all(|(left, right)| left.as_ref().sql_eq(right.as_ref()))
+    }
+}
+
+impl Eq for SqlRowKey {}
+
+impl Hash for SqlRowKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for value in &self.0 {
+            value.as_ref().sql_hash(state);
+        }
+    }
+}
+
+fn deduplicate_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen = HashSet::with_capacity(rows.len());
+    rows.retain(|row| seen.insert(SqlRowKey::from_row(row)));
+}
+
+fn order_projected_rows(
+    rows: &mut Vec<Vec<Value>>,
+    ordering: &[ResolvedOrder],
+    limit: Option<usize>,
+) {
+    if !ordering.is_empty() {
+        rows.sort_by(|left, right| {
+            for order in ordering {
+                let comparison = left[order.output].cmp(&right[order.output]);
+                if comparison != Ordering::Equal {
+                    return if order.descending {
+                        comparison.reverse()
+                    } else {
+                        comparison
+                    };
+                }
+            }
+            Ordering::Equal
+        });
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
     }
 }
 
@@ -885,6 +958,7 @@ fn comparable(left: DataType, right: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::DefaultHasher;
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
@@ -945,5 +1019,26 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn distinct_row_keys_use_sql_numeric_equality() {
+        fn row_hash(row: &SqlRowKey) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            row.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let integer = SqlRowKey::from_row(&[Value::Int64(0)]);
+        let positive_zero = SqlRowKey::from_row(&[Value::Float64(0.0)]);
+        let negative_zero = SqlRowKey::from_row(&[Value::Float64(-0.0)]);
+        assert_eq!(integer, positive_zero);
+        assert_eq!(positive_zero, negative_zero);
+        assert_eq!(row_hash(&integer), row_hash(&positive_zero));
+        assert_eq!(row_hash(&positive_zero), row_hash(&negative_zero));
+
+        let precise_integer = SqlRowKey::from_row(&[Value::Int64(9_007_199_254_740_993)]);
+        let rounded_float = SqlRowKey::from_row(&[Value::Float64(9_007_199_254_740_992.0)]);
+        assert_ne!(precise_integer, rounded_float);
     }
 }
