@@ -18,7 +18,7 @@ OPTIONS:
 
 With no --execute option, SQL is read to EOF from standard input.
 Command acknowledgements are written to stderr; query data is written to stdout.
-JSON output is an object containing a results array, one entry per SELECT.
+JSON output is an object containing a results array, one entry per query result.
 ";
 
 fn main() -> ExitCode {
@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
+                if matches!(tag, "INSERT" | "TRUNCATE TABLE") {
                     eprintln!("{tag} {affected_rows}");
                 } else {
                     eprintln!("{tag}");

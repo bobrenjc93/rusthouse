@@ -4,7 +4,9 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE and CREATE TABLE IF NOT EXISTS with Int64, Float64, Bool, and String columns
+- deterministic SHOW TABLES and DESCRIBE table metadata
+- DROP TABLE, DROP TABLE IF EXISTS, and TRUNCATE TABLE lifecycle commands
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -16,6 +18,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+SHOW TABLES returns a single String column named `name`, ordered case-insensitively by table name. DESCRIBE returns String columns named `name` and `type` in schema order, with canonical type names.
 
 ## CLI
 
@@ -55,7 +58,9 @@ printf '%s\n' \
 ~~~
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
-JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
+JSON output is always one document with a top-level results array. Each query result contains explicit column name/type metadata and positional row arrays, so multiple query statements and duplicate aliases preserve every value.
+
+Command results use stable tags such as `CREATE TABLE`, `INSERT`, `DROP TABLE`, and `TRUNCATE TABLE`. CREATE and DROP report zero affected rows through the library API; INSERT reports inserted rows and TRUNCATE reports removed rows. The CLI includes row counts in INSERT and TRUNCATE acknowledgements.
 
 ## Library API
 

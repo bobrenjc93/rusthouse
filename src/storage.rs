@@ -196,6 +196,18 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Remove every row while retaining the table name and schema.
+    pub fn truncate(&mut self) -> usize {
+        let removed_rows = self.row_count;
+        self.columns = self
+            .schema
+            .iter()
+            .map(|field| Column::new(field.data_type))
+            .collect();
+        self.row_count = 0;
+        removed_rows
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +252,20 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn truncate_removes_rows_and_retains_typed_schema() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+
+        assert_eq!(table.truncate(), 1);
+        assert_eq!(table.row_count(), 0);
+        assert!(matches!(&table.columns()[0], Column::Int64(values) if values.is_empty()));
+        assert!(matches!(&table.columns()[1], Column::String(values) if values.is_empty()));
+        assert_eq!(table.name(), "events");
+        assert_eq!(table.schema().len(), 2);
     }
 }

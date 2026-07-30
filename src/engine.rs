@@ -62,11 +62,41 @@ impl Database {
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
-            Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+            Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => {
+                if if_not_exists {
+                    self.catalog.create_table_if_not_exists(name, columns)?;
+                } else {
+                    self.catalog.create_table(name, columns)?;
+                }
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
+                })
+            }
+            Statement::ShowTables => Ok(StatementResult::Query(self.show_tables())),
+            Statement::DescribeTable { name } => {
+                self.describe_table(&name).map(StatementResult::Query)
+            }
+            Statement::DropTable { name, if_exists } => {
+                if if_exists {
+                    self.catalog.drop_table_if_exists(&name);
+                } else {
+                    self.catalog.drop_table(&name)?;
+                }
+                Ok(StatementResult::Command {
+                    tag: "DROP TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::TruncateTable { name } => {
+                let affected_rows = self.catalog.truncate_table(&name)?;
+                Ok(StatementResult::Command {
+                    tag: "TRUNCATE TABLE",
+                    affected_rows,
                 })
             }
             Statement::Insert { table, rows } => {
@@ -88,6 +118,47 @@ impl Database {
             }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
+    }
+
+    fn show_tables(&self) -> QueryResult {
+        QueryResult {
+            columns: vec![ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: self
+                .catalog
+                .tables()
+                .into_iter()
+                .map(|table| vec![Value::String(table.name().to_owned())])
+                .collect(),
+        }
+    }
+
+    fn describe_table(&self, name: &str) -> Result<QueryResult> {
+        let table = self.catalog.table(name)?;
+        Ok(QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "name".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "type".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: table
+                .schema()
+                .iter()
+                .map(|column| {
+                    vec![
+                        Value::String(column.name.clone()),
+                        Value::String(column.data_type.to_string()),
+                    ]
+                })
+                .collect(),
+        })
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {

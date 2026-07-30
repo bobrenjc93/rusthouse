@@ -10,6 +10,18 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        if_not_exists: bool,
+    },
+    ShowTables,
+    DescribeTable {
+        name: String,
+    },
+    DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    TruncateTable {
+        name: String,
     },
     Insert {
         table: String,
@@ -374,17 +386,32 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_keyword("CREATE") {
             self.parse_create()
+        } else if self.eat_keyword("SHOW") {
+            self.parse_show()
+        } else if self.eat_keyword("DESCRIBE") {
+            self.parse_describe()
+        } else if self.eat_keyword("DROP") {
+            self.parse_drop()
+        } else if self.eat_keyword("TRUNCATE") {
+            self.parse_truncate()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, SHOW, DESCRIBE, DROP, TRUNCATE, INSERT, or SELECT")
         }
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
+        let if_not_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
@@ -413,7 +440,39 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+        })
+    }
+
+    fn parse_show(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLES")?;
+        Ok(Statement::ShowTables)
+    }
+
+    fn parse_describe(&mut self) -> Result<Statement> {
+        let name = self.expect_identifier("table name")?;
+        Ok(Statement::DescribeTable { name })
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_identifier("table name")?;
+        Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn parse_truncate(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        Ok(Statement::TruncateTable { name })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -782,6 +841,51 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_catalog_and_table_lifecycle_statements() {
+        let statements = parse(
+            "CREATE TABLE IF NOT EXISTS Events (id Int64); \
+             SHOW TABLES; \
+             DESCRIBE events; \
+             TRUNCATE TABLE EVENTS; \
+             DROP TABLE events; \
+             DROP TABLE IF EXISTS events;",
+        )
+        .expect("valid lifecycle SQL");
+
+        assert!(matches!(
+            &statements[0],
+            Statement::CreateTable {
+                name,
+                if_not_exists: true,
+                ..
+            } if name == "Events"
+        ));
+        assert_eq!(statements[1], Statement::ShowTables);
+        assert!(matches!(
+            &statements[2],
+            Statement::DescribeTable { name } if name == "events"
+        ));
+        assert!(matches!(
+            &statements[3],
+            Statement::TruncateTable { name } if name == "EVENTS"
+        ));
+        assert!(matches!(
+            &statements[4],
+            Statement::DropTable {
+                name,
+                if_exists: false
+            } if name == "events"
+        ));
+        assert!(matches!(
+            &statements[5],
+            Statement::DropTable {
+                name,
+                if_exists: true
+            } if name == "events"
+        ));
     }
 
     #[test]

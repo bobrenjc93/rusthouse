@@ -95,6 +95,69 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn catalog_and_lifecycle_sql_render_in_every_output_format() {
+    let sql = "CREATE TABLE Zebra (id Int64);
+               CREATE TABLE Alpha (Id Int64, Note String);
+               INSERT INTO alpha VALUES (1, 'one'), (2, 'two');
+               SHOW TABLES;
+               DESCRIBE ALPHA;
+               TRUNCATE TABLE alpha;
+               SELECT COUNT(*) AS rows FROM Alpha;
+               DROP TABLE zebra;
+               DROP TABLE IF EXISTS missing;";
+    let cases = [
+        (
+            "table",
+            "+-------+\n\
+             | name  |\n\
+             +-------+\n\
+             | Alpha |\n\
+             | Zebra |\n\
+             +-------+\n\
+             \n\
+             +------+--------+\n\
+             | name | type   |\n\
+             +------+--------+\n\
+             | Id   | Int64  |\n\
+             | Note | String |\n\
+             +------+--------+\n\
+             \n\
+             +------+\n\
+             | rows |\n\
+             +------+\n\
+             | 0    |\n\
+             +------+\n",
+        ),
+        (
+            "csv",
+            "name\nAlpha\nZebra\n\nname,type\nId,Int64\nNote,String\n\nrows\n0\n",
+        ),
+        (
+            "json",
+            "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"String\"}],\"rows\":[[\"Alpha\"],[\"Zebra\"]]},{\"columns\":[{\"name\":\"name\",\"type\":\"String\"},{\"name\":\"type\",\"type\":\"String\"}],\"rows\":[[\"Id\",\"Int64\"],[\"Note\",\"String\"]]},{\"columns\":[{\"name\":\"rows\",\"type\":\"Int64\"}],\"rows\":[[0]]}]}\n",
+        ),
+    ];
+
+    for (format, expected_stdout) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .args(["--format", format, "--execute", sql])
+            .output()
+            .expect("run CLI");
+
+        assert!(output.status.success(), "{format} command failed");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+            expected_stdout,
+            "unexpected {format} output"
+        );
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+            "CREATE TABLE\nCREATE TABLE\nINSERT 2\nTRUNCATE TABLE 2\nDROP TABLE\nDROP TABLE\n"
+        );
+    }
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

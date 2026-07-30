@@ -11,6 +11,156 @@ fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
     last_query(database.execute(sql).expect("SQL succeeds"))
 }
 
+fn only_command(database: &mut Database, sql: &str) -> (&'static str, usize) {
+    let results = database.execute(sql).expect("SQL succeeds");
+    match results.as_slice() {
+        [StatementResult::Command { tag, affected_rows }] => (*tag, *affected_rows),
+        _ => panic!("expected one command result"),
+    }
+}
+
+#[test]
+fn catalog_discovery_and_table_lifecycle_work_end_to_end() {
+    let mut database = Database::new();
+
+    let empty = execute_query(&mut database, "SHOW TABLES;");
+    assert_eq!(
+        empty.columns,
+        vec![rusthouse::ResultColumn {
+            name: "name".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert!(empty.rows.is_empty());
+
+    assert_eq!(
+        only_command(
+            &mut database,
+            "CREATE TABLE Reports (EventId Int64, Score Float64, Active Bool, Label String);"
+        ),
+        ("CREATE TABLE", 0)
+    );
+    assert!(matches!(
+        database.execute("CREATE TABLE reports (replacement Bool);"),
+        Err(Error::TableAlreadyExists(name)) if name == "reports"
+    ));
+    assert_eq!(
+        only_command(
+            &mut database,
+            "CREATE TABLE IF NOT EXISTS reports (replacement Bool);"
+        ),
+        ("CREATE TABLE", 0)
+    );
+    only_command(&mut database, "CREATE TABLE zebra (id Int64);");
+
+    let tables = execute_query(&mut database, "show tables;");
+    assert_eq!(
+        tables.rows,
+        vec![
+            vec![Value::String("Reports".to_owned())],
+            vec![Value::String("zebra".to_owned())],
+        ]
+    );
+
+    let description = execute_query(&mut database, "describe REPORTS;");
+    assert_eq!(
+        description
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"name".to_owned(), DataType::String),
+            (&"type".to_owned(), DataType::String),
+        ]
+    );
+    assert_eq!(
+        description.rows,
+        vec![
+            vec![
+                Value::String("EventId".to_owned()),
+                Value::String("Int64".to_owned()),
+            ],
+            vec![
+                Value::String("Score".to_owned()),
+                Value::String("Float64".to_owned()),
+            ],
+            vec![
+                Value::String("Active".to_owned()),
+                Value::String("Bool".to_owned()),
+            ],
+            vec![
+                Value::String("Label".to_owned()),
+                Value::String("String".to_owned()),
+            ],
+        ]
+    );
+
+    assert_eq!(
+        only_command(
+            &mut database,
+            "INSERT INTO reports VALUES
+                (1, 1.5, true, 'first'), (2, 2.5, false, 'second');"
+        ),
+        ("INSERT", 2)
+    );
+    assert_eq!(
+        only_command(&mut database, "TRUNCATE TABLE REPORTS;"),
+        ("TRUNCATE TABLE", 2)
+    );
+    let after_truncate = execute_query(&mut database, "SELECT COUNT(*) AS rows FROM reports;");
+    assert_eq!(after_truncate.rows, vec![vec![Value::Int64(0)]]);
+
+    only_command(
+        &mut database,
+        "INSERT INTO REPORTS VALUES (3, 3.5, true, 'after truncate');",
+    );
+    assert_eq!(
+        only_command(&mut database, "DROP TABLE reports;"),
+        ("DROP TABLE", 0)
+    );
+    assert!(matches!(
+        database.execute("SELECT * FROM Reports;"),
+        Err(Error::TableNotFound(name)) if name == "Reports"
+    ));
+
+    assert_eq!(
+        only_command(&mut database, "DROP TABLE IF EXISTS REPORTS;"),
+        ("DROP TABLE", 0)
+    );
+    assert_eq!(
+        only_command(
+            &mut database,
+            "CREATE TABLE IF NOT EXISTS reports (replacement Bool);"
+        ),
+        ("CREATE TABLE", 0)
+    );
+    let recreated = execute_query(&mut database, "DESCRIBE Reports;");
+    assert_eq!(
+        recreated.rows,
+        vec![vec![
+            Value::String("replacement".to_owned()),
+            Value::String("Bool".to_owned()),
+        ]]
+    );
+}
+
+#[test]
+fn missing_table_lifecycle_commands_return_consistent_errors() {
+    let mut database = Database::new();
+
+    for sql in [
+        "DESCRIBE missing;",
+        "TRUNCATE TABLE missing;",
+        "DROP TABLE missing;",
+    ] {
+        assert!(matches!(
+            database.execute(sql),
+            Err(Error::TableNotFound(name)) if name == "missing"
+        ));
+    }
+}
+
 #[test]
 fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let mut database = Database::new();
