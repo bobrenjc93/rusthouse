@@ -167,7 +167,11 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = Vec::with_capacity(table.row_count());
+        let mut matching_rows = if predicate.is_none() {
+            Vec::with_capacity(table.row_count())
+        } else {
+            Vec::new()
+        };
         for block in 0..table.block_count() {
             if predicate
                 .as_ref()
@@ -179,10 +183,14 @@ impl Database {
                 continue;
             }
 
+            let block_rows = table.block_rows(block);
+            if predicate.is_some() {
+                matching_rows.reserve(block_rows.len());
+            }
             if let Some(profile) = profile.as_deref_mut() {
                 profile.blocks_read += 1;
             }
-            for row in table.block_rows(block) {
+            for row in block_rows {
                 if let Some(profile) = profile.as_deref_mut() {
                     profile.rows_read += 1;
                 }
