@@ -524,3 +524,171 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn numeric_expressions_work_in_projection_predicates_and_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE calculations (id Int64, units Int64, price Float64);
+             INSERT INTO calculations VALUES
+                (1, 2, 0.5), (2, 5, 1.25), (3, 1, 10.0);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id,
+                units + 2 * 3 AS precedence,
+                (units + 2) * 3 AS parenthesized,
+                -units AS negated,
+                units + price AS promoted
+         FROM calculations
+         WHERE (units + 1) * 2 >= 6
+         ORDER BY promoted DESC;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Float64,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(2),
+                Value::Int64(11),
+                Value::Int64(21),
+                Value::Int64(-5),
+                Value::Float64(6.25),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Int64(8),
+                Value::Int64(12),
+                Value::Int64(-2),
+                Value::Float64(2.5),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn expressions_work_as_grouping_keys_and_aggregate_arguments() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE expression_groups (units Int64, price Float64);
+             INSERT INTO expression_groups VALUES (2, 0.5), (5, 1.25), (4, 2.0);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT units % 2 AS bucket,
+                SUM(units * 2) AS doubled,
+                AVG(units + price) AS mean,
+                COUNT(10 / units) AS rows
+         FROM expression_groups
+         GROUP BY units % 2
+         ORDER BY bucket;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(0),
+                Value::Int64(12),
+                Value::Float64(4.25),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Float64(6.25),
+                Value::Int64(1),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn integer_expression_overflow_and_zero_divisors_are_errors() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE arithmetic_bounds (value Int64);
+             INSERT INTO arithmetic_bounds VALUES
+                (9223372036854775807), (-9223372036854775808), (0);",
+        )
+        .expect("setup succeeds");
+
+    for sql in [
+        "SELECT value + 1 FROM arithmetic_bounds WHERE value = 9223372036854775807",
+        "SELECT -value FROM arithmetic_bounds WHERE value = -9223372036854775808",
+        "SELECT value / -1 FROM arithmetic_bounds WHERE value = -9223372036854775808",
+        "SELECT value % -1 FROM arithmetic_bounds WHERE value = -9223372036854775808",
+    ] {
+        assert!(matches!(
+            database.execute(sql),
+            Err(Error::NumericOverflow(_))
+        ));
+    }
+
+    for sql in [
+        "SELECT 10 / value FROM arithmetic_bounds WHERE value = 0",
+        "SELECT 10 % value FROM arithmetic_bounds WHERE value = 0",
+        "SELECT 1.0 / value FROM arithmetic_bounds WHERE value = 0",
+    ] {
+        assert!(matches!(
+            database.execute(sql),
+            Err(Error::DivisionByZero(_))
+        ));
+    }
+}
+
+#[test]
+fn constant_expressions_fold_and_validate_without_input_rows() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE empty_values (id Int64);")
+        .expect("create succeeds");
+
+    assert!(matches!(
+        database.execute("SELECT 1 / 0 FROM empty_values"),
+        Err(Error::DivisionByZero(_))
+    ));
+    assert!(matches!(
+        database.execute("SELECT 9223372036854775807 + 1 FROM empty_values"),
+        Err(Error::NumericOverflow(_))
+    ));
+    assert!(matches!(
+        database.execute("SELECT 1e308 * 1e308 FROM empty_values"),
+        Err(Error::NumericOverflow(_))
+    ));
+}
+
+#[test]
+fn arithmetic_rejects_non_numeric_operands_during_resolution() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE labels (label String);")
+        .expect("create succeeds");
+
+    assert!(matches!(
+        database.execute("SELECT label + 1 FROM labels"),
+        Err(Error::TypeMismatch { expected, actual, .. })
+            if expected == "Int64 or Float64" && actual == "String"
+    ));
+}

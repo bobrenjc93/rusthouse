@@ -30,6 +30,7 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    DivisionByZero(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +73,9 @@ impl fmt::Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
+            }
+            Self::DivisionByZero(operation) => {
+                write!(f, "division by zero while computing {operation}")
             }
         }
     }
