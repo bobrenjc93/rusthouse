@@ -412,6 +412,153 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
 }
 
 #[test]
+fn scalar_expressions_match_clickhouse_types_precedence_and_filtering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE expression_inputs (id Int64, whole Int64, fraction Float64);
+             INSERT INTO expression_inputs VALUES
+                (1, 10, 1.5), (2, 4, 2.0), (3, -3, 0.5);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id,
+                whole + 2 * 3 AS precedence,
+                (whole + fraction) / 2 AS mixed,
+                -whole AS negated,
+                7 / 2 AS ratio,
+                'fixed' AS label
+         FROM expression_inputs
+         WHERE (whole + 1) * 2 >= 10
+         ORDER BY precedence DESC;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::String,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(16),
+                Value::Float64(5.75),
+                Value::Int64(-10),
+                Value::Float64(3.5),
+                Value::String("fixed".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(10),
+                Value::Float64(3.0),
+                Value::Int64(-4),
+                Value::Float64(3.5),
+                Value::String("fixed".to_owned()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn grouped_expression_aliases_and_aggregate_arguments_match_clickhouse() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE grouped_expressions (bucket Int64, amount Int64);
+             INSERT INTO grouped_expressions VALUES
+                (2, 10), (1, 4), (2, -3), (1, 8);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT bucket * 10 AS scaled_bucket,
+                SUM(amount * 2 + 1) AS adjusted_total,
+                AVG(amount / 2) AS half_mean,
+                COUNT(amount + 1) AS rows
+         FROM grouped_expressions
+         GROUP BY bucket
+         ORDER BY scaled_bucket DESC;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(20),
+                Value::Int64(16),
+                Value::Float64(1.75),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(10),
+                Value::Int64(26),
+                Value::Float64(3.0),
+                Value::Int64(2),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn scalar_expression_failures_are_explicit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE arithmetic_failures (whole Int64, huge Float64, label String);
+             INSERT INTO arithmetic_failures VALUES
+                (9223372036854775807, 1e308, 'not numeric');",
+        )
+        .expect("setup succeeds");
+
+    let overflow = database
+        .execute("SELECT whole + 1 FROM arithmetic_failures;")
+        .expect_err("Int64 addition is checked");
+    assert!(matches!(overflow, Error::NumericOverflow(_)));
+
+    let division = database
+        .execute("SELECT whole / 0 FROM arithmetic_failures;")
+        .expect_err("zero divisors are rejected");
+    assert!(matches!(division, Error::DivisionByZero(_)));
+
+    let non_finite = database
+        .execute("SELECT huge * 2.0 FROM arithmetic_failures;")
+        .expect_err("non-finite Float64 results are rejected");
+    assert!(matches!(non_finite, Error::NonFiniteResult(_)));
+
+    let mismatch = database
+        .execute("SELECT label + 1 FROM arithmetic_failures;")
+        .expect_err("arithmetic types resolve before scanning");
+    assert!(matches!(
+        mismatch,
+        Error::TypeMismatch { expected, actual, .. }
+            if expected == "Int64 or Float64" && actual == "String"
+    ));
+
+    database
+        .execute("CREATE TABLE empty_numbers (value Int64);")
+        .expect("create empty table");
+    let constant_error = database
+        .execute("SELECT 1 / 0 FROM empty_numbers;")
+        .expect_err("constant expressions are validated before an empty scan");
+    assert!(matches!(constant_error, Error::DivisionByZero(_)));
+}
+
+#[test]
 fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
     let mut database = Database::new();
 

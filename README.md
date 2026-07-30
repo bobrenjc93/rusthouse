@@ -6,16 +6,19 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
-- SELECT * and named projections, with optional AS aliases
-- WHERE comparisons using =, !=, <>, <, <=, >, and >=
+- SELECT *, literals, columns, and typed arithmetic projections, with optional AS aliases
+- WHERE comparisons using =, !=, <>, <, <=, >, and >= on scalar expressions
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
+- scalar aggregate arguments such as SUM(price * quantity)
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Scalar expressions support parentheses, unary minus, and `+`, `-`, `*`, and `/`. `Int64` addition, subtraction, and multiplication use checked arithmetic. Mixing `Int64` with `Float64` produces `Float64`, and division always produces `Float64`. Overflow, division by zero, and non-finite floating results are query errors.
 
 ## CLI
 
@@ -81,9 +84,9 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+To keep recursive processing bounded, scalar and WHERE expressions are limited to 64 levels of nesting and 256 AST nodes. Queries over either limit return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

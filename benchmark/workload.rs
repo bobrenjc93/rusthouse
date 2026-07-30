@@ -9,6 +9,7 @@ pub enum Family {
     LowCardinalityGroupBy,
     HighCardinalityGroupBy,
     OrderByLimit,
+    ScalarExpression,
 }
 
 impl Family {
@@ -21,6 +22,7 @@ impl Family {
             Self::LowCardinalityGroupBy => "low_cardinality_group_by",
             Self::HighCardinalityGroupBy => "high_cardinality_group_by",
             Self::OrderByLimit => "order_by_limit",
+            Self::ScalarExpression => "scalar_expression",
         }
     }
 }
@@ -121,6 +123,25 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
                 ("flag", ColumnType::Boolean),
             ],
         },
+        Workload {
+            name: "expression_projection_filter",
+            family: Family::ScalarExpression,
+            sql: "SELECT id, (uniform_num + skewed_num * 2) / 3 AS adjusted FROM parity_data WHERE (uniform_num + skewed_num * 2) >= -1000000 ORDER BY adjusted DESC, id LIMIT 25;".to_owned(),
+            columns: vec![
+                ("id", ColumnType::Integer),
+                ("adjusted", ColumnType::Float),
+            ],
+        },
+        Workload {
+            name: "grouped_expression_aggregate",
+            family: Family::ScalarExpression,
+            sql: "SELECT skewed_num * 2 AS doubled, SUM(uniform_num + skewed_num) AS total, AVG(score / 2) AS mean_half_score FROM parity_data GROUP BY skewed_num ORDER BY doubled LIMIT 100;".to_owned(),
+            columns: vec![
+                ("doubled", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+                ("mean_half_score", ColumnType::Float),
+            ],
+        },
     ]
 }
 
@@ -138,7 +159,7 @@ mod tests {
             .map(|workload| workload.family)
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(families.len(), 7);
+        assert_eq!(families.len(), 8);
         assert!(
             workloads
                 .iter()
@@ -168,6 +189,16 @@ mod tests {
             workloads
                 .iter()
                 .any(|workload| workload.sql.contains("ORDER BY payload"))
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.sql.contains("SUM(uniform_num + skewed_num)"))
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.sql.contains("ORDER BY adjusted"))
         );
         assert!(workloads.iter().all(|workload| workload.sql.ends_with(';')));
     }
