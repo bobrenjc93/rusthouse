@@ -284,7 +284,7 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -308,6 +308,126 @@ fn global_aggregates_and_empty_count_are_supported() {
             Value::Float64(10.0 / 3.0),
         ]]
     );
+}
+
+#[test]
+fn filtered_aggregates_handle_groups_aliases_nulls_having_and_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE cohort_events (
+                cohort String, amount Int64, qualified Bool
+             );
+             INSERT INTO cohort_events VALUES
+                ('alpha', 10, true),
+                ('alpha', NULL, true),
+                ('alpha', 3, false),
+                ('beta', 4, false),
+                ('beta', 8, true),
+                ('beta', 2, true),
+                ('gamma', NULL, true);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT cohort,
+                COUNT(*) FILTER (WHERE qualified = true) AS qualified_rows,
+                COUNT(amount) FILTER (WHERE qualified = true) AS valued_rows,
+                SUM(amount) FILTER (WHERE qualified = true) AS filtered_total,
+                MIN(amount) FILTER (WHERE qualified = true) AS filtered_min,
+                MAX(amount) FILTER (WHERE qualified = true) AS filtered_max,
+                AVG(amount) FILTER (WHERE qualified = true) AS filtered_avg
+         FROM cohort_events
+         GROUP BY cohort
+         HAVING qualified_rows > 0
+            AND SUM(amount) FILTER (WHERE qualified = true) >= 10
+         ORDER BY filtered_total DESC, cohort;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::Float64(10.0),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(10),
+                Value::Int64(2),
+                Value::Int64(8),
+                Value::Float64(5.0),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn filtered_aggregates_return_standard_empty_values() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (kind String, value Float64);
+             INSERT INTO samples VALUES ('present', NULL), ('present', 2.5);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT COUNT(*) FILTER (WHERE kind = 'missing') AS rows,
+                COUNT(value) FILTER (WHERE kind = 'missing') AS values,
+                SUM(value) FILTER (WHERE kind = 'missing') AS total,
+                MIN(value) FILTER (WHERE kind = 'missing') AS low,
+                MAX(value) FILTER (WHERE kind = 'missing') AS high,
+                AVG(value) FILTER (WHERE kind = 'missing') AS mean
+         FROM samples;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(0),
+            Value::Int64(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+}
+
+#[test]
+fn aggregate_filters_exclude_rows_before_overflow_checks() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE large_values (value Int64, selected Bool);
+             INSERT INTO large_values VALUES
+                (9223372036854775807, true), (1, false);",
+        )
+        .expect("setup succeeds");
+
+    let filtered = execute_query(
+        &mut database,
+        "SELECT SUM(value) FILTER (WHERE selected = true) AS total FROM large_values;",
+    );
+    assert_eq!(filtered.rows, vec![vec![Value::Int64(i64::MAX)]]);
+
+    let error = database
+        .execute(
+            "SELECT SUM(value) FILTER (WHERE value >= 0) AS total
+             FROM large_values;",
+        )
+        .expect_err("included values overflow Int64 SUM");
+    assert_eq!(error, Error::NumericOverflow("SUM(Int64)".to_owned()));
 }
 
 #[test]
@@ -478,14 +598,14 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+fn literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE", "Null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
                 "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
             ))
-            .expect_err("Boolean literal names are reserved");
+            .expect_err("literal names are reserved");
 
         assert!(matches!(
             error,

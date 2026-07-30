@@ -9,8 +9,10 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
-- GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- nullable values with SQL NULL comparison and aggregate semantics
+- COUNT, SUM, MIN, MAX, and AVG, including `FILTER (WHERE ...)`
+- GROUP BY and HAVING over selected outputs, aliases, or aggregate expressions
+- output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -28,11 +30,14 @@ cargo run -- --execute "
     ('west', 10, true),
     ('east', 4, false),
     ('west', 7, true);
-  SELECT region, COUNT(*) AS orders, SUM(amount) AS total, AVG(amount) AS mean
+  SELECT region,
+         COUNT(*) AS orders,
+         SUM(amount) FILTER (WHERE online = true) AS online_total,
+         AVG(amount) AS mean
   FROM sales
-  WHERE online = true
   GROUP BY region
-  ORDER BY total DESC
+  HAVING orders > 0
+  ORDER BY online_total DESC
   LIMIT 10;
 "
 ~~~
@@ -81,11 +86,11 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+To keep recursive predicate processing bounded, every WHERE, aggregate FILTER, and HAVING expression is independently limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+COUNT(column), SUM, MIN, MAX, and AVG ignore NULL arguments. On empty input, COUNT returns zero and the other aggregates return NULL. Comparisons involving NULL do not select a row. HAVING accepts aggregate expressions; its identifiers resolve against unambiguous SELECT output columns and aliases.
 
 ## Development
 

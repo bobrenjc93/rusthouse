@@ -15,7 +15,7 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
-    Select(Select),
+    Select(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +24,7 @@ pub struct Select {
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
+    pub having: Option<Predicate>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -38,6 +39,7 @@ pub enum SelectItem {
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
+        filter: Option<Predicate>,
         alias: Option<String>,
     },
 }
@@ -96,6 +98,11 @@ pub enum Predicate {
 pub enum Operand {
     Column(String),
     Literal(Value),
+    Aggregate {
+        function: AggregateFunction,
+        argument: AggregateArgument,
+        filter: Option<Box<Predicate>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +350,7 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    predicate_aggregates_allowed: bool,
 }
 
 impl Parser {
@@ -352,6 +360,7 @@ impl Parser {
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            predicate_aggregates_allowed: false,
         }
     }
 
@@ -377,7 +386,7 @@ impl Parser {
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
-            self.parse_select().map(Statement::Select)
+            self.parse_select().map(Box::new).map(Statement::Select)
         } else {
             self.error("expected CREATE, INSERT, or SELECT")
         }
@@ -453,9 +462,7 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
 
         let predicate = if self.eat_keyword("WHERE") {
-            self.predicate_depth = 0;
-            self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
+            Some(self.parse_bounded_predicate(false)?)
         } else {
             None
         };
@@ -470,6 +477,12 @@ impl Parser {
                 }
             }
         }
+
+        let having = if self.eat_keyword("HAVING") {
+            Some(self.parse_bounded_predicate(true)?)
+        } else {
+            None
+        };
 
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
@@ -508,6 +521,7 @@ impl Parser {
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -521,20 +535,12 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
-            let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!("unknown aggregate function '{name}'"),
-            })?;
-            let argument = if self.eat(&TokenKind::Star) {
-                AggregateArgument::Wildcard
-            } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
-            };
-            self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            let (function, argument, filter) = self.parse_aggregate_call(position, &name)?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
                 argument,
+                filter,
                 alias,
             })
         } else {
@@ -543,12 +549,51 @@ impl Parser {
         }
     }
 
+    fn parse_aggregate_call(
+        &mut self,
+        position: usize,
+        name: &str,
+    ) -> Result<(AggregateFunction, AggregateArgument, Option<Predicate>)> {
+        let function = AggregateFunction::parse(name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!("unknown aggregate function '{name}'"),
+        })?;
+        let argument = if self.eat(&TokenKind::Star) {
+            AggregateArgument::Wildcard
+        } else {
+            AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+        };
+        self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+        let filter = if self.eat_keyword("FILTER") {
+            self.expect(&TokenKind::LeftParen, "'(' after FILTER")?;
+            self.expect_keyword("WHERE")?;
+            let filter = self.parse_bounded_predicate(false)?;
+            self.expect(&TokenKind::RightParen, "')' after aggregate FILTER")?;
+            Some(filter)
+        } else {
+            None
+        };
+        Ok((function, argument, filter))
+    }
+
     fn parse_alias(&mut self) -> Result<Option<String>> {
         if self.eat_keyword("AS") {
             self.expect_identifier("alias").map(Some)
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_bounded_predicate(&mut self, aggregates_allowed: bool) -> Result<Predicate> {
+        let previous_depth = std::mem::replace(&mut self.predicate_depth, 0);
+        let previous_nodes = std::mem::replace(&mut self.predicate_nodes, 0);
+        let previous_aggregates =
+            std::mem::replace(&mut self.predicate_aggregates_allowed, aggregates_allowed);
+        let predicate = self.parse_or_predicate();
+        self.predicate_depth = previous_depth;
+        self.predicate_nodes = previous_nodes;
+        self.predicate_aggregates_allowed = previous_aggregates;
+        predicate
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -622,13 +667,31 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL") =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
-            TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
-                .map(Operand::Column),
+            TokenKind::Identifier(_) => {
+                let position = self.position();
+                let name = self.expect_identifier("column, aggregate, or literal")?;
+                if self.eat(&TokenKind::LeftParen) {
+                    if !self.predicate_aggregates_allowed {
+                        return self
+                            .error("aggregate functions are only allowed in HAVING predicates");
+                    }
+                    let (function, argument, filter) =
+                        self.parse_aggregate_call(position, &name)?;
+                    Ok(Operand::Aggregate {
+                        function,
+                        argument,
+                        filter: filter.map(Box::new),
+                    })
+                } else {
+                    Ok(Operand::Column(name))
+                }
+            }
             _ => self.error("expected column or literal"),
         }
     }
@@ -637,6 +700,10 @@ impl Parser {
         if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
             return Ok(Value::String(value));
+        }
+
+        if self.eat_keyword("NULL") {
+            return Ok(Value::Null);
         }
 
         let negative = self.eat(&TokenKind::Minus);
@@ -757,9 +824,9 @@ mod tests {
     #[test]
     fn parses_complete_select_shape() {
         let statements = parse(
-            "SELECT region, SUM(amount) AS total FROM sales \
+            "SELECT region, SUM(amount) FILTER (WHERE active = true) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region HAVING total > 5 ORDER BY total DESC LIMIT 3;",
         )
         .expect("valid SQL");
 
@@ -768,9 +835,18 @@ mod tests {
         };
         assert_eq!(select.items.len(), 2);
         assert_eq!(select.group_by, ["region"]);
+        assert!(select.having.is_some());
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+        let SelectItem::Aggregate {
+            filter: Some(filter),
+            ..
+        } = &select.items[1]
+        else {
+            panic!("expected filtered aggregate");
+        };
+        assert!(matches!(filter, Predicate::Comparison { .. }));
     }
 
     #[test]
@@ -816,6 +892,59 @@ mod tests {
             error,
             Error::Sql { message, .. }
                 if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn rejects_excessively_nested_aggregate_filter() {
+        let depth = 50_000;
+        let sql = format!(
+            "SELECT COUNT(*) FILTER (WHERE {}id = 1{}) FROM things",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+
+        let error = parse(&sql).expect_err("nesting limit should reject filter");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("predicate nesting exceeds limit of 64")
+        ));
+    }
+
+    #[test]
+    fn rejects_excessively_complex_aggregate_filter() {
+        let predicate = vec!["id = 1"; 50_000].join(" OR ");
+        let sql = format!("SELECT COUNT(*) FILTER (WHERE {predicate}) FROM things");
+
+        let error = parse(&sql).expect_err("node limit should reject filter");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn predicate_budgets_are_independent_between_aggregate_filters() {
+        let predicate = vec!["id = 1"; 100].join(" OR ");
+        let sql = format!(
+            "SELECT COUNT(*) FILTER (WHERE {predicate}), \
+             SUM(id) FILTER (WHERE {predicate}) FROM things"
+        );
+
+        parse(&sql).expect("each filter stays within its own predicate budget");
+    }
+
+    #[test]
+    fn aggregate_operands_are_restricted_to_having() {
+        let error =
+            parse("SELECT COUNT(*) FILTER (WHERE COUNT(*) FILTER (WHERE id = 1) > 0) FROM things")
+                .expect_err("aggregate calls cannot nest through FILTER predicates");
+
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("aggregate functions are only allowed in HAVING predicates")
         ));
     }
 }

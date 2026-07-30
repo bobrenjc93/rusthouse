@@ -11,46 +11,48 @@ pub struct ColumnDef {
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
+    name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+        || name.eq_ignore_ascii_case("NULL")
 }
 
 /// A physical column. Each variant owns a contiguous vector of one Rust type.
 #[derive(Debug, Clone)]
 pub enum Column {
-    Int64(Vec<i64>),
-    Float64(Vec<f64>),
-    Bool(Vec<bool>),
-    String(Vec<String>),
+    Int64(Vec<i64>, Vec<bool>),
+    Float64(Vec<f64>, Vec<bool>),
+    Bool(Vec<bool>, Vec<bool>),
+    String(Vec<String>, Vec<bool>),
 }
 
 impl Column {
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
         match data_type {
-            DataType::Int64 => Self::Int64(Vec::new()),
-            DataType::Float64 => Self::Float64(Vec::new()),
-            DataType::Bool => Self::Bool(Vec::new()),
-            DataType::String => Self::String(Vec::new()),
+            DataType::Int64 => Self::Int64(Vec::new(), Vec::new()),
+            DataType::Float64 => Self::Float64(Vec::new(), Vec::new()),
+            DataType::Bool => Self::Bool(Vec::new(), Vec::new()),
+            DataType::String => Self::String(Vec::new(), Vec::new()),
         }
     }
 
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Int64(_) => DataType::Int64,
-            Self::Float64(_) => DataType::Float64,
-            Self::Bool(_) => DataType::Bool,
-            Self::String(_) => DataType::String,
+            Self::Int64(_, _) => DataType::Int64,
+            Self::Float64(_, _) => DataType::Float64,
+            Self::Bool(_, _) => DataType::Bool,
+            Self::String(_, _) => DataType::String,
         }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Int64(values) => values.len(),
-            Self::Float64(values) => values.len(),
-            Self::Bool(values) => values.len(),
-            Self::String(values) => values.len(),
+            Self::Int64(values, _) => values.len(),
+            Self::Float64(values, _) => values.len(),
+            Self::Bool(values, _) => values.len(),
+            Self::String(values, _) => values.len(),
         }
     }
 
@@ -66,10 +68,27 @@ impl Column {
 
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
-            Self::Int64(values) => ValueRef::Int64(values[row]),
-            Self::Float64(values) => ValueRef::Float64(values[row]),
-            Self::Bool(values) => ValueRef::Bool(values[row]),
-            Self::String(values) => ValueRef::String(&values[row]),
+            Self::Int64(_, valid)
+            | Self::Float64(_, valid)
+            | Self::Bool(_, valid)
+            | Self::String(_, valid)
+                if !valid[row] =>
+            {
+                ValueRef::Null
+            }
+            Self::Int64(values, _) => ValueRef::Int64(values[row]),
+            Self::Float64(values, _) => ValueRef::Float64(values[row]),
+            Self::Bool(values, _) => ValueRef::Bool(values[row]),
+            Self::String(values, _) => ValueRef::String(&values[row]),
+        }
+    }
+
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Int64(_, valid)
+            | Self::Float64(_, valid)
+            | Self::Bool(_, valid)
+            | Self::String(_, valid) => !valid[row],
         }
     }
 
@@ -79,10 +98,38 @@ impl Column {
 
     fn push(&mut self, value: Value) {
         match (self, value) {
-            (Self::Int64(values), Value::Int64(value)) => values.push(value),
-            (Self::Float64(values), Value::Float64(value)) => values.push(value),
-            (Self::Bool(values), Value::Bool(value)) => values.push(value),
-            (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Int64(values, valid), Value::Int64(value)) => {
+                values.push(value);
+                valid.push(true);
+            }
+            (Self::Float64(values, valid), Value::Float64(value)) => {
+                values.push(value);
+                valid.push(true);
+            }
+            (Self::Bool(values, valid), Value::Bool(value)) => {
+                values.push(value);
+                valid.push(true);
+            }
+            (Self::String(values, valid), Value::String(value)) => {
+                values.push(value);
+                valid.push(true);
+            }
+            (Self::Int64(values, valid), Value::Null) => {
+                values.push(0);
+                valid.push(false);
+            }
+            (Self::Float64(values, valid), Value::Null) => {
+                values.push(0.0);
+                valid.push(false);
+            }
+            (Self::Bool(values, valid), Value::Null) => {
+                values.push(false);
+                valid.push(false);
+            }
+            (Self::String(values, valid), Value::Null) => {
+                values.push(String::new());
+                valid.push(false);
+            }
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -169,11 +216,17 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            if value
+                .data_type()
+                .is_some_and(|data_type| field.data_type != data_type)
+            {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: value
+                        .data_type()
+                        .expect("non-NULL type mismatch")
+                        .to_string(),
                 });
             }
             if matches!(value, Value::Float64(number) if !number.is_finite()) {
@@ -226,8 +279,29 @@ mod tests {
             .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
             .expect("valid row");
 
-        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
-        assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+        assert!(
+            matches!(&table.columns()[0], Column::Int64(v, valid) if v == &[7] && valid == &[true])
+        );
+        assert!(
+            matches!(&table.columns()[1], Column::String(v, valid) if v == &["ok"] && valid == &[true])
+        );
+    }
+
+    #[test]
+    fn stores_nulls_in_column_validity_bitmaps() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Null, Value::Null])
+            .expect("NULL is valid for every column type");
+
+        assert!(
+            matches!(&table.columns()[0], Column::Int64(v, valid) if v == &[0] && valid == &[false])
+        );
+        assert!(
+            matches!(&table.columns()[1], Column::String(v, valid) if v == &[""] && valid == &[false])
+        );
+        assert_eq!(table.columns()[0].value(0), Value::Null);
+        assert_eq!(table.columns()[1].value(0), Value::Null);
     }
 
     #[test]

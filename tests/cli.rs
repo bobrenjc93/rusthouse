@@ -46,6 +46,29 @@ fn multiple_selects_emit_one_json_document() {
 }
 
 #[test]
+fn filtered_aggregates_and_nulls_work_through_the_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE samples (n Int64, keep Bool);
+             INSERT INTO samples VALUES (4, true), (NULL, true), (2, false);
+             SELECT COUNT(*) FILTER (WHERE keep = true) AS kept,
+                    COUNT(n) FILTER (WHERE keep = true) AS valued,
+                    SUM(n) FILTER (WHERE keep = false) AS excluded
+             FROM samples;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"kept\",\"type\":\"Int64\"},{\"name\":\"valued\",\"type\":\"Int64\"},{\"name\":\"excluded\",\"type\":\"Int64\"}],\"rows\":[[2,1,2]]}]}\n"
+    );
+}
+
+#[test]
 fn positional_json_preserves_duplicate_alias_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
