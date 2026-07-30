@@ -120,6 +120,130 @@ pub fn parse(input: &str) -> Result<Vec<Statement>> {
     Parser::new(tokens).parse_script()
 }
 
+/// Incrementally separates SQL statements at lexer-visible semicolons.
+///
+/// Semicolons inside string literals and line comments do not terminate a
+/// statement. Incomplete input remains buffered until a later call supplies a
+/// terminator.
+#[derive(Debug, Default)]
+pub struct StatementFramer {
+    buffer: String,
+    position: usize,
+    state: FramingState,
+    has_sql: bool,
+}
+
+impl StatementFramer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an input fragment and return every newly terminated statement.
+    pub fn push_str(&mut self, input: &str) -> Vec<String> {
+        self.buffer.push_str(input);
+        let mut completed = Vec::new();
+        let mut completed_through = 0;
+
+        while let Some(character) = self.current() {
+            match self.state {
+                FramingState::Sql => match character {
+                    '\'' => {
+                        self.has_sql = true;
+                        self.advance();
+                        self.state = FramingState::String;
+                    }
+                    '-' => {
+                        let next = self.next();
+                        if next == Some('-') {
+                            self.advance();
+                            self.advance();
+                            self.state = FramingState::LineComment;
+                        } else if next.is_none() {
+                            break;
+                        } else {
+                            self.has_sql = true;
+                            self.advance();
+                        }
+                    }
+                    ';' => {
+                        self.advance();
+                        if self.has_sql {
+                            completed
+                                .push(self.buffer[completed_through..self.position].to_owned());
+                        }
+                        completed_through = self.position;
+                        self.has_sql = false;
+                    }
+                    value => {
+                        if !value.is_whitespace() {
+                            self.has_sql = true;
+                        }
+                        self.advance();
+                    }
+                },
+                FramingState::String => {
+                    if character == '\'' {
+                        let next = self.next();
+                        if next == Some('\'') {
+                            self.advance();
+                            self.advance();
+                        } else if next.is_none() {
+                            break;
+                        } else {
+                            self.advance();
+                            self.state = FramingState::Sql;
+                        }
+                    } else {
+                        self.advance();
+                    }
+                }
+                FramingState::LineComment => {
+                    self.advance();
+                    if character == '\n' {
+                        self.state = FramingState::Sql;
+                    }
+                }
+            }
+        }
+
+        if completed_through > 0 {
+            self.buffer.drain(..completed_through);
+            self.position -= completed_through;
+        }
+        completed
+    }
+
+    #[must_use]
+    pub fn has_pending_statement(&self) -> bool {
+        self.has_sql
+    }
+
+    fn current(&self) -> Option<char> {
+        self.buffer[self.position..].chars().next()
+    }
+
+    fn next(&self) -> Option<char> {
+        let mut characters = self.buffer[self.position..].chars();
+        characters.next();
+        characters.next()
+    }
+
+    fn advance(&mut self) {
+        if let Some(character) = self.current() {
+            self.position += character.len_utf8();
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum FramingState {
+    #[default]
+    Sql,
+    String,
+    LineComment,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Token {
     kind: TokenKind,
@@ -782,6 +906,40 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn statement_framer_waits_for_lexer_visible_terminators() {
+        let mut framer = StatementFramer::new();
+
+        assert!(framer.push_str("INSERT INTO notes\n").is_empty());
+        assert!(framer.has_pending_statement());
+        assert!(
+            framer
+                .push_str("VALUES ('first; value', 'it''s open")
+                .is_empty()
+        );
+        assert_eq!(
+            framer.push_str("'); -- ignored ;\nSELECT * FROM notes;"),
+            vec![
+                "INSERT INTO notes\nVALUES ('first; value', 'it''s open');".to_owned(),
+                " -- ignored ;\nSELECT * FROM notes;".to_owned(),
+            ]
+        );
+        assert!(!framer.has_pending_statement());
+    }
+
+    #[test]
+    fn statement_framer_handles_token_boundaries_across_fragments() {
+        let mut framer = StatementFramer::new();
+
+        assert!(framer.push_str("-- comment ending in dash-").is_empty());
+        assert!(framer.push_str("\nSELECT 'split quote'").is_empty());
+        assert_eq!(
+            framer.push_str(";"),
+            vec!["-- comment ending in dash-\nSELECT 'split quote';"]
+        );
+        assert!(framer.push_str(" ; -- empty;\n").is_empty());
     }
 
     #[test]
