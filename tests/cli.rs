@@ -154,3 +154,40 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         assert!(!stderr.contains("stack overflow"));
     }
 }
+
+#[test]
+fn catalog_and_lifecycle_commands_emit_queries_and_acknowledgements() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE Events (ID Int64, Label String); \
+             INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
+             SHOW TABLES; \
+             DESCRIBE EVENTS; \
+             TRUNCATE TABLE events; \
+             SELECT COUNT(*) AS count FROM Events; \
+             DROP TABLE EVENTS; \
+             DROP TABLE IF EXISTS events; \
+             SHOW TABLES;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        concat!(
+            "{\"results\":[",
+            "{\"columns\":[{\"name\":\"name\",\"type\":\"String\"}],\"rows\":[[\"Events\"]]},",
+            "{\"columns\":[{\"name\":\"name\",\"type\":\"String\"},{\"name\":\"type\",\"type\":\"String\"}],\"rows\":[[\"ID\",\"Int64\"],[\"Label\",\"String\"]]},",
+            "{\"columns\":[{\"name\":\"count\",\"type\":\"Int64\"}],\"rows\":[[0]]},",
+            "{\"columns\":[{\"name\":\"name\",\"type\":\"String\"}],\"rows\":[]}",
+            "]}\n"
+        )
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "CREATE TABLE\nINSERT 2\nTRUNCATE TABLE\nDROP TABLE\nDROP TABLE\n"
+    );
+}

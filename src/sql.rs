@@ -16,6 +16,17 @@ pub enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
+    ShowTables,
+    DescribeTable {
+        name: String,
+    },
+    DropTable {
+        name: String,
+        if_exists: bool,
+    },
+    TruncateTable {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,9 +389,48 @@ impl Parser {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
+        } else if self.eat_keyword("SHOW") {
+            self.parse_show()
+        } else if self.eat_keyword("DESCRIBE") {
+            self.parse_describe()
+        } else if self.eat_keyword("DROP") {
+            self.parse_drop()
+        } else if self.eat_keyword("TRUNCATE") {
+            self.parse_truncate()
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, SELECT, SHOW, DESCRIBE, DROP, or TRUNCATE")
         }
+    }
+
+    fn parse_show(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLES")?;
+        Ok(Statement::ShowTables)
+    }
+
+    fn parse_describe(&mut self) -> Result<Statement> {
+        let mut name = self.expect_identifier("table name")?;
+        if name.eq_ignore_ascii_case("TABLE") && matches!(self.peek(), TokenKind::Identifier(_)) {
+            name = self.expect_identifier("table name")?;
+        }
+        Ok(Statement::DescribeTable { name })
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_identifier("table name")?;
+        Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn parse_truncate(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        Ok(Statement::TruncateTable { name })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -782,6 +832,35 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_catalog_and_lifecycle_statements_case_insensitively() {
+        let statements = parse(
+            "show tables; describe Events; DeScRiBe TaBlE Events; \
+             drop table if exists EVENTS; truncate table events",
+        )
+        .expect("valid lifecycle SQL");
+
+        assert_eq!(
+            statements,
+            vec![
+                Statement::ShowTables,
+                Statement::DescribeTable {
+                    name: "Events".to_owned(),
+                },
+                Statement::DescribeTable {
+                    name: "Events".to_owned(),
+                },
+                Statement::DropTable {
+                    name: "EVENTS".to_owned(),
+                    if_exists: true,
+                },
+                Statement::TruncateTable {
+                    name: "events".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

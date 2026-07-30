@@ -87,7 +87,66 @@ impl Database {
                 })
             }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::ShowTables => Ok(StatementResult::Query(self.show_tables())),
+            Statement::DescribeTable { name } => {
+                self.describe_table(&name).map(StatementResult::Query)
+            }
+            Statement::DropTable { name, if_exists } => {
+                self.catalog.drop_table(&name, if_exists)?;
+                Ok(StatementResult::Command {
+                    tag: "DROP TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::TruncateTable { name } => {
+                let affected_rows = self.catalog.truncate_table(&name)?;
+                Ok(StatementResult::Command {
+                    tag: "TRUNCATE TABLE",
+                    affected_rows,
+                })
+            }
         }
+    }
+
+    fn show_tables(&self) -> QueryResult {
+        QueryResult {
+            columns: vec![ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: self
+                .catalog
+                .table_names()
+                .into_iter()
+                .map(|name| vec![Value::String(name.to_owned())])
+                .collect(),
+        }
+    }
+
+    fn describe_table(&self, name: &str) -> Result<QueryResult> {
+        let table = self.catalog.table(name)?;
+        Ok(QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "name".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "type".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: table
+                .schema()
+                .iter()
+                .map(|column| {
+                    vec![
+                        Value::String(column.name.clone()),
+                        Value::String(column.data_type.to_string()),
+                    ]
+                })
+                .collect(),
+        })
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {

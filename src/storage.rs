@@ -77,6 +77,15 @@ impl Column {
         self.value_ref(left).cmp(&self.value_ref(right))
     }
 
+    fn clear(&mut self) {
+        match self {
+            Self::Int64(values) => values.clear(),
+            Self::Float64(values) => values.clear(),
+            Self::Bool(values) => values.clear(),
+            Self::String(values) => values.clear(),
+        }
+    }
+
     fn push(&mut self, value: Value) {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(value),
@@ -196,6 +205,16 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Remove every row while retaining the table schema.
+    pub fn truncate(&mut self) -> usize {
+        let removed_rows = self.row_count;
+        for column in &mut self.columns {
+            column.clear();
+        }
+        self.row_count = 0;
+        removed_rows
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +259,18 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn truncate_clears_every_column_and_resets_row_count() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+
+        assert_eq!(table.truncate(), 1);
+        assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+        assert_eq!(table.schema().len(), 2);
     }
 }

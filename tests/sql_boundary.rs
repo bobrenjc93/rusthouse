@@ -524,3 +524,118 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn catalog_discovery_is_deterministic_and_describe_returns_typed_schema_metadata() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Zulu (id Int64); \
+             CREATE TABLE alpha (Metric Float64, Enabled Bool, Label String); \
+             CREATE TABLE Middle (value Int64);",
+        )
+        .expect("setup succeeds");
+
+    let tables = execute_query(&mut database, "sHoW tAbLeS");
+    assert_eq!(
+        tables.columns,
+        vec![rusthouse::ResultColumn {
+            name: "name".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        tables.rows,
+        vec![
+            vec![Value::String("alpha".to_owned())],
+            vec![Value::String("Middle".to_owned())],
+            vec![Value::String("Zulu".to_owned())],
+        ]
+    );
+
+    let schema = execute_query(&mut database, "DeScRiBe ALPHA");
+    assert_eq!(
+        schema
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"name".to_owned(), DataType::String),
+            (&"type".to_owned(), DataType::String),
+        ]
+    );
+    assert_eq!(
+        schema.rows,
+        vec![
+            vec![
+                Value::String("Metric".to_owned()),
+                Value::String("Float64".to_owned()),
+            ],
+            vec![
+                Value::String("Enabled".to_owned()),
+                Value::String("Bool".to_owned()),
+            ],
+            vec![
+                Value::String("Label".to_owned()),
+                Value::String("String".to_owned()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn truncate_and_drop_enforce_missing_table_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Events (id Int64); \
+             INSERT INTO events VALUES (1), (2), (3);",
+        )
+        .expect("setup succeeds");
+
+    let truncate = database
+        .execute("TrUnCaTe TaBlE EVENTS")
+        .expect("case-insensitive truncate succeeds");
+    assert_eq!(
+        truncate,
+        vec![StatementResult::Command {
+            tag: "TRUNCATE TABLE",
+            affected_rows: 3,
+        }]
+    );
+    let count = execute_query(&mut database, "SELECT COUNT(*) AS count FROM events");
+    assert_eq!(count.rows, vec![vec![Value::Int64(0)]]);
+
+    let drop = database
+        .execute("DROP TABLE eVeNtS")
+        .expect("case-insensitive drop succeeds");
+    assert_eq!(
+        drop,
+        vec![StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }]
+    );
+    assert!(matches!(
+        database.execute("DESCRIBE events"),
+        Err(Error::TableNotFound(name)) if name == "events"
+    ));
+    assert!(matches!(
+        database.execute("TRUNCATE TABLE events"),
+        Err(Error::TableNotFound(name)) if name == "events"
+    ));
+    assert!(matches!(
+        database.execute("DROP TABLE events"),
+        Err(Error::TableNotFound(name)) if name == "events"
+    ));
+    assert_eq!(
+        database
+            .execute("DROP TABLE IF EXISTS EVENTS")
+            .expect("optional drop succeeds"),
+        vec![StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }]
+    );
+}
