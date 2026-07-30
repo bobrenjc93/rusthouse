@@ -679,46 +679,132 @@ fn execute_window_float(
     output: &mut [Value],
 ) -> Result<()> {
     let argument = aggregate.argument.expect("numeric aggregate argument");
-    let counts = prefix_counts(table, rows, Some(argument))?;
-    let mut sums = Vec::with_capacity(rows.len() + 1);
-    sums.push(0.0_f64);
-    for row in rows {
-        let value = match table.columns()[argument].value_ref(*row) {
-            ValueRef::Float64(value) => value,
-            ValueRef::Null => 0.0,
-            _ => unreachable!("Float64 window input is resolved"),
-        };
-        let next = sums.last().copied().expect("prefix has an initial state") + value;
-        if !next.is_finite() {
-            return Err(Error::NumericOverflow(
-                "window Float64 prefix sum".to_owned(),
-            ));
+    match frame {
+        WindowFrame::UnboundedPreceding => {
+            let mut state = FloatFrameAggregate::default();
+            for row in rows.iter().copied() {
+                state = state.combine(float_frame_value(table, argument, row))?;
+                output[row] = state.finish(aggregate.function);
+            }
         }
-        sums.push(next);
-    }
-
-    for (position, row) in rows.iter().copied().enumerate() {
-        let start = frame_start(frame, position);
-        let count = counts[position + 1] - counts[start];
-        if count == 0 {
-            output[row] = Value::Null;
-            continue;
+        WindowFrame::Preceding(preceding) => {
+            let frame_len = preceding
+                .checked_add(1)
+                .ok_or_else(|| Error::NumericOverflow("Float64 window frame size".to_owned()))?;
+            let mut state = FloatWindowQueue::default();
+            for row in rows.iter().copied() {
+                // Expire first so neither partial state can include a row outside this frame.
+                if state.len() == frame_len {
+                    state.pop_front()?;
+                }
+                state.push(float_frame_value(table, argument, row))?;
+                output[row] = state.aggregate()?.finish(aggregate.function);
+            }
         }
-        let sum = sums[position + 1] - sums[start];
-        let value = match aggregate.function {
-            AggregateFunction::Sum => sum,
-            AggregateFunction::Avg => sum / count as f64,
-            _ => unreachable!("numeric prefix is only used for SUM and AVG"),
-        };
-        if !value.is_finite() {
-            return Err(Error::NumericOverflow(format!(
-                "{}(Float64) window",
-                aggregate.function.name()
-            )));
-        }
-        output[row] = Value::Float64(value);
     }
     Ok(())
+}
+
+fn float_frame_value(table: &Table, argument: usize, row: usize) -> FloatFrameAggregate {
+    match table.columns()[argument].value_ref(row) {
+        ValueRef::Float64(value) => FloatFrameAggregate {
+            sum: value,
+            count: 1,
+        },
+        ValueRef::Null => FloatFrameAggregate::default(),
+        _ => unreachable!("Float64 window input is resolved"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FloatFrameAggregate {
+    sum: f64,
+    count: u64,
+}
+
+impl FloatFrameAggregate {
+    fn combine(self, right: Self) -> Result<Self> {
+        let sum = self.sum + right.sum;
+        if !sum.is_finite() {
+            return Err(Error::NumericOverflow(
+                "Float64 window frame sum".to_owned(),
+            ));
+        }
+        Ok(Self {
+            sum,
+            count: self
+                .count
+                .checked_add(right.count)
+                .ok_or_else(|| Error::NumericOverflow("Float64 window count".to_owned()))?,
+        })
+    }
+
+    fn finish(self, function: AggregateFunction) -> Value {
+        if self.count == 0 {
+            return Value::Null;
+        }
+        match function {
+            AggregateFunction::Sum => Value::Float64(self.sum),
+            AggregateFunction::Avg => Value::Float64(self.sum / self.count as f64),
+            _ => unreachable!("Float64 frame state is only used for SUM and AVG"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FloatWindowEntry {
+    value: FloatFrameAggregate,
+    aggregate: FloatFrameAggregate,
+}
+
+#[derive(Debug, Default)]
+struct FloatWindowQueue {
+    incoming: Vec<FloatWindowEntry>,
+    outgoing: Vec<FloatWindowEntry>,
+}
+
+impl FloatWindowQueue {
+    fn len(&self) -> usize {
+        self.incoming.len() + self.outgoing.len()
+    }
+
+    fn push(&mut self, value: FloatFrameAggregate) -> Result<()> {
+        let aggregate = if let Some(previous) = self.incoming.last() {
+            previous.aggregate.combine(value)?
+        } else {
+            value
+        };
+        self.incoming.push(FloatWindowEntry { value, aggregate });
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Result<()> {
+        if self.outgoing.is_empty() {
+            while let Some(entry) = self.incoming.pop() {
+                let aggregate = if let Some(previous) = self.outgoing.last() {
+                    entry.value.combine(previous.aggregate)?
+                } else {
+                    entry.value
+                };
+                self.outgoing.push(FloatWindowEntry {
+                    value: entry.value,
+                    aggregate,
+                });
+            }
+        }
+        self.outgoing
+            .pop()
+            .expect("a full Float64 frame contains a row");
+        Ok(())
+    }
+
+    fn aggregate(&self) -> Result<FloatFrameAggregate> {
+        match (self.outgoing.last(), self.incoming.last()) {
+            (Some(left), Some(right)) => left.aggregate.combine(right.aggregate),
+            (Some(value), None) | (None, Some(value)) => Ok(value.aggregate),
+            (None, None) => unreachable!("the current row is always in its frame"),
+        }
+    }
 }
 
 fn execute_window_extreme(

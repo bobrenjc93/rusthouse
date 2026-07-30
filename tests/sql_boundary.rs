@@ -318,6 +318,67 @@ fn fixed_preceding_windows_use_sliding_prefixes_and_extreme_queues() {
 }
 
 #[test]
+fn fixed_float_windows_exclude_expired_values_from_sum_and_overflow() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE float_samples (
+                cohort Int64, id Int64, amount Nullable(Float64)
+             );
+             INSERT INTO float_samples VALUES
+                (1, 1, 1e16), (1, 2, 1.0),
+                (2, 1, 1e308), (2, 2, 1e308),
+                (3, 1, NULL);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT cohort, id,
+                SUM(amount) OVER (
+                    PARTITION BY cohort ORDER BY id
+                    ROWS BETWEEN 0 PRECEDING AND CURRENT ROW
+                ) AS current_sum,
+                AVG(amount) OVER (
+                    PARTITION BY cohort ORDER BY id
+                    ROWS BETWEEN 0 PRECEDING AND CURRENT ROW
+                ) AS current_avg
+         FROM float_samples ORDER BY cohort, id;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Float64(1e16),
+                Value::Float64(1e16),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Float64(1.0),
+                Value::Float64(1.0),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Float64(1e308),
+                Value::Float64(1e308),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Float64(1e308),
+                Value::Float64(1e308),
+            ],
+            vec![Value::Int64(3), Value::Int64(1), Value::Null, Value::Null,],
+        ]
+    );
+}
+
+#[test]
 fn ranking_and_aggregate_windows_share_deterministic_partition_ordering() {
     let mut database = Database::new();
     database
@@ -429,7 +490,7 @@ fn aggregate_windows_bound_frames_report_overflow_and_accept_empty_input() {
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
              ) FROM valueset;",
         )
-        .expect_err("running Float64 prefix overflows");
+        .expect_err("running Float64 sum overflows");
     assert!(matches!(float_overflow, Error::NumericOverflow(_)));
 
     for sql in [
