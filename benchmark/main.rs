@@ -13,11 +13,11 @@ use std::process::ExitCode;
 #[cfg(test)]
 use std::time::Duration;
 
-use config::{Config, ParseResult};
+use config::{Config, ParseResult, derive_seeds};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs};
 use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
-use score::{RatioObservation, ScoreBreakdown, median, parity_score};
+use score::{RatioObservation, ScoreBreakdown, WorkloadDimension, median, parity_score};
 use workload::workloads;
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
@@ -32,6 +32,7 @@ OPTIONS:
     --mode <quick|default>  Benchmark size (default: default)
     --quick                 Alias for --mode quick
     --seed <U64>            Deterministic runtime seed (default: 20260729)
+    --seed-count <N>        Derived seeds (default: 3 default, 1 quick)
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
     --details <PATH>        Write detailed JSON without changing stdout
@@ -54,6 +55,8 @@ struct TimingSeries {
 struct CaseResult {
     workload: &'static str,
     family: &'static str,
+    seed: u64,
+    dataset_seed: u64,
     row_count: usize,
     query_amplification: usize,
     primary: TimingSeries,
@@ -147,6 +150,7 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 
 fn run(config: Config) -> Result<Report, String> {
     let settings = config.mode.settings();
+    let derived_seeds = derive_seeds(config.seed, config.seed_count)?;
     let paths = EnginePaths {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
@@ -155,150 +159,173 @@ fn run(config: Config) -> Result<Report, String> {
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
 
-    for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
-        let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
-        let dataset = Dataset::generate(dataset_seed, row_count);
-        let setup_sql = dataset.setup_sql();
+    for (seed_index, seed) in derived_seeds.iter().copied().enumerate() {
+        for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
+            let dataset_seed = seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+            let dataset = Dataset::generate(dataset_seed, row_count);
+            let setup_sql = dataset.setup_sql();
 
-        for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
-            eprintln!(
-                "benchmarking {} at {} rows ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
-                workload.name,
-                row_count,
-                settings.query_amplification,
-                settings.warmups,
-                settings.samples,
-                settings.end_to_end_samples
-            );
-
-            let correctness_order = (row_count_index + workload_index).is_multiple_of(2);
-            let (rusthouse_output, clickhouse_output) =
-                execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
-            let mut correctness_gate = CorrectnessGate::default();
-            correctness_gate
-                .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
-                .map_err(|error| {
-                    format!(
-                        "correctness gate failed for '{}' at {row_count} rows: {error}",
-                        workload.name
-                    )
-                })?;
-            correctness_checks += 1;
-
-            let mut primary = TimingSeries::default();
-            let primary_iterations = settings.warmups + settings.samples;
-            for iteration in 0..primary_iterations {
-                let rusthouse_first =
-                    (row_count_index + workload_index + iteration + 1).is_multiple_of(2);
-                let (rusthouse, clickhouse) = execute_timed_pair(
-                    &paths,
-                    &setup_sql,
-                    &workload.sql,
+            for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
+                eprintln!(
+                    "benchmarking {} at {} rows with seed {} ({}/{}, {}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
+                    workload.name,
+                    row_count,
+                    seed,
+                    seed_index + 1,
+                    derived_seeds.len(),
                     settings.query_amplification,
-                    rusthouse_first,
-                )?;
-                accept_timed_pair(
-                    &correctness_gate,
-                    &rusthouse,
-                    &clickhouse,
-                    settings.query_amplification,
-                    iteration >= settings.warmups,
-                    &mut primary,
-                )?;
-            }
+                    settings.warmups,
+                    settings.samples,
+                    settings.end_to_end_samples
+                );
 
-            let mut end_to_end = TimingSeries::default();
-            for iteration in 0..settings.end_to_end_samples {
-                let rusthouse_first =
-                    (row_count_index + workload_index + iteration + primary_iterations)
+                let correctness_order =
+                    (seed_index + row_count_index + workload_index).is_multiple_of(2);
+                let (rusthouse_output, clickhouse_output) =
+                    execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
+                let mut correctness_gate = CorrectnessGate::default();
+                correctness_gate
+                    .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
+                    .map_err(|error| {
+                        format!(
+                            "correctness gate failed for '{}' at {row_count} rows with seed {seed}: {error}",
+                            workload.name
+                        )
+                    })?;
+                correctness_checks += 1;
+
+                let mut primary = TimingSeries::default();
+                let primary_iterations = settings.warmups + settings.samples;
+                for iteration in 0..primary_iterations {
+                    let rusthouse_first =
+                        (seed_index + row_count_index + workload_index + iteration + 1)
+                            .is_multiple_of(2);
+                    let (rusthouse, clickhouse) = execute_timed_pair(
+                        &paths,
+                        &setup_sql,
+                        &workload.sql,
+                        settings.query_amplification,
+                        rusthouse_first,
+                    )?;
+                    accept_timed_pair(
+                        &correctness_gate,
+                        &rusthouse,
+                        &clickhouse,
+                        settings.query_amplification,
+                        iteration >= settings.warmups,
+                        &mut primary,
+                    )?;
+                }
+
+                let mut end_to_end = TimingSeries::default();
+                for iteration in 0..settings.end_to_end_samples {
+                    let rusthouse_first = (seed_index
+                        + row_count_index
+                        + workload_index
+                        + iteration
+                        + primary_iterations)
                         .is_multiple_of(2);
-                let (rusthouse, clickhouse) =
-                    execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
-                accept_timed_pair(
-                    &correctness_gate,
-                    &rusthouse,
-                    &clickhouse,
-                    1,
-                    true,
-                    &mut end_to_end,
-                )?;
-            }
+                    let (rusthouse, clickhouse) =
+                        execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
+                    accept_timed_pair(
+                        &correctness_gate,
+                        &rusthouse,
+                        &clickhouse,
+                        1,
+                        true,
+                        &mut end_to_end,
+                    )?;
+                }
 
-            let rusthouse_primary_batch_median = stable_median(
-                &primary.rusthouse_batch_ms,
-                "RustHouse amplified batch",
-                workload.name,
-                row_count,
-            )?;
-            let clickhouse_primary_batch_median = stable_median(
-                &primary.clickhouse_batch_ms,
-                "ClickHouse amplified batch",
-                workload.name,
-                row_count,
-            )?;
-            let rusthouse_primary_median = stable_median(
-                &primary.rusthouse_per_query_ms,
-                "RustHouse amortized query",
-                workload.name,
-                row_count,
-            )?;
-            let clickhouse_primary_median = stable_median(
-                &primary.clickhouse_per_query_ms,
-                "ClickHouse amortized query",
-                workload.name,
-                row_count,
-            )?;
-            let rusthouse_end_to_end_median = stable_median(
-                &end_to_end.rusthouse_batch_ms,
-                "RustHouse end-to-end",
-                workload.name,
-                row_count,
-            )?;
-            let clickhouse_end_to_end_median = stable_median(
-                &end_to_end.clickhouse_batch_ms,
-                "ClickHouse end-to-end",
-                workload.name,
-                row_count,
-            )?;
-            let primary_ratio = clickhouse_primary_median / rusthouse_primary_median;
-            let end_to_end_ratio = clickhouse_end_to_end_median / rusthouse_end_to_end_median;
-            eprintln!(
-                "  primary/query: RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end ratio {:.3}",
-                rusthouse_primary_median,
-                clickhouse_primary_median,
-                primary_ratio,
-                end_to_end_ratio
-            );
-            cases.push(CaseResult {
-                workload: workload.name,
-                family: workload.family.name(),
-                row_count,
-                query_amplification: settings.query_amplification,
-                primary,
-                rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
-                clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
-                rusthouse_primary_median_ms: rusthouse_primary_median,
-                clickhouse_primary_median_ms: clickhouse_primary_median,
-                primary_ratio,
-                end_to_end,
-                rusthouse_end_to_end_median_ms: rusthouse_end_to_end_median,
-                clickhouse_end_to_end_median_ms: clickhouse_end_to_end_median,
-                end_to_end_ratio,
-            });
+                let rusthouse_primary_batch_median = stable_median(
+                    &primary.rusthouse_batch_ms,
+                    "RustHouse amplified batch",
+                    workload.name,
+                    row_count,
+                    seed,
+                )?;
+                let clickhouse_primary_batch_median = stable_median(
+                    &primary.clickhouse_batch_ms,
+                    "ClickHouse amplified batch",
+                    workload.name,
+                    row_count,
+                    seed,
+                )?;
+                let rusthouse_primary_median = stable_median(
+                    &primary.rusthouse_per_query_ms,
+                    "RustHouse amortized query",
+                    workload.name,
+                    row_count,
+                    seed,
+                )?;
+                let clickhouse_primary_median = stable_median(
+                    &primary.clickhouse_per_query_ms,
+                    "ClickHouse amortized query",
+                    workload.name,
+                    row_count,
+                    seed,
+                )?;
+                let rusthouse_end_to_end_median = stable_median(
+                    &end_to_end.rusthouse_batch_ms,
+                    "RustHouse end-to-end",
+                    workload.name,
+                    row_count,
+                    seed,
+                )?;
+                let clickhouse_end_to_end_median = stable_median(
+                    &end_to_end.clickhouse_batch_ms,
+                    "ClickHouse end-to-end",
+                    workload.name,
+                    row_count,
+                    seed,
+                )?;
+                let primary_ratio = clickhouse_primary_median / rusthouse_primary_median;
+                let end_to_end_ratio = clickhouse_end_to_end_median / rusthouse_end_to_end_median;
+                eprintln!(
+                    "  primary/query: RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end ratio {:.3}",
+                    rusthouse_primary_median,
+                    clickhouse_primary_median,
+                    primary_ratio,
+                    end_to_end_ratio
+                );
+                cases.push(CaseResult {
+                    workload: workload.name,
+                    family: workload.family.name(),
+                    seed,
+                    dataset_seed,
+                    row_count,
+                    query_amplification: settings.query_amplification,
+                    primary,
+                    rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
+                    clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
+                    rusthouse_primary_median_ms: rusthouse_primary_median,
+                    clickhouse_primary_median_ms: clickhouse_primary_median,
+                    primary_ratio,
+                    end_to_end,
+                    rusthouse_end_to_end_median_ms: rusthouse_end_to_end_median,
+                    clickhouse_end_to_end_median_ms: clickhouse_end_to_end_median,
+                    end_to_end_ratio,
+                });
+            }
         }
     }
 
-    let primary_score = score_cases(&cases, |case| case.primary_ratio)?;
+    let primary_score = score_cases(&cases, &derived_seeds, &settings.row_counts, |case| {
+        case.primary_ratio
+    })?;
     if config.mode == config::Mode::Default {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
-    let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
+    let end_to_end_score = score_cases(&cases, &derived_seeds, &settings.row_counts, |case| {
+        case.end_to_end_ratio
+    })?;
 
     if let Some(path) = &config.details {
         let details = details_json(
             &config,
             &identity,
             &cases,
+            &derived_seeds,
             primary_score,
             end_to_end_score,
             correctness_checks,
@@ -309,9 +336,10 @@ fn run(config: Config) -> Result<Report, String> {
 
     let mut evidence = vec![
         format!(
-            "{} separate correctness pairs passed across {} cases and {} row counts",
+            "{} separate correctness pairs passed across {} cases, {} derived seeds, and {} row counts",
             correctness_checks,
             cases.len(),
+            derived_seeds.len(),
             settings.row_counts.len()
         ),
         format!(
@@ -330,9 +358,10 @@ fn run(config: Config) -> Result<Report, String> {
             cases.len()
         ),
         format!(
-            "mode={}, seed={}, warmups={}, primary_samples={}, end_to_end_samples={}; ClickHouse SHA-256={}",
+            "mode={}, root_seed={}, derived_seeds={:?}, warmups={}, primary_samples={}, end_to_end_samples={}; ClickHouse SHA-256={}",
             config.mode.name(),
             config.seed,
+            derived_seeds,
             settings.warmups,
             settings.samples,
             settings.end_to_end_samples,
@@ -346,9 +375,10 @@ fn run(config: Config) -> Result<Report, String> {
     ];
     evidence.extend(cases.iter().map(|case| {
         format!(
-            "{} / {} rows: primary/query RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}",
+            "{} / {} rows / seed {}: primary/query RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}",
             case.workload,
             case.row_count,
+            case.seed,
             case.rusthouse_primary_median_ms,
             case.clickhouse_primary_median_ms,
             case.primary_ratio,
@@ -359,13 +389,12 @@ fn run(config: Config) -> Result<Report, String> {
     }));
     let suggestions = if config.mode == config::Mode::Quick {
         vec![
-            "Use --mode default for the decision-grade 1k/10k/50k-row suite.".to_owned(),
-            "Rerun with several explicit --seed values before drawing optimization conclusions."
-                .to_owned(),
+            "Use --mode default for the decision-grade multi-seed 1k/10k/50k-row suite.".to_owned(),
+            "Use --seed-count to add seed coverage to a quick diagnostic run.".to_owned(),
         ]
     } else {
         vec![
-            "Repeat the default suite with several explicit seeds and compare detailed case medians."
+            "Repeat with a different root --seed to assess host noise independently of this deterministic seed set."
                 .to_owned(),
             "Treat regressions in correctness as score zero, regardless of timing improvements."
                 .to_owned(),
@@ -375,10 +404,11 @@ fn run(config: Config) -> Result<Report, String> {
     Ok(Report {
         score: primary_score.score,
         summary: format!(
-            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
+            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases from {} derived seeds.",
             primary_score.score,
             end_to_end_score.score,
-            cases.len()
+            cases.len(),
+            derived_seeds.len()
         ),
         evidence,
         suggestions,
@@ -387,17 +417,37 @@ fn run(config: Config) -> Result<Report, String> {
 
 fn score_cases(
     cases: &[CaseResult],
+    expected_seeds: &[u64],
+    expected_scales: &[usize],
     ratio: impl Fn(&CaseResult) -> f64,
 ) -> Result<ScoreBreakdown, String> {
+    let expected_workloads = workloads(
+        *expected_scales
+            .first()
+            .ok_or_else(|| "expected scale list must not be empty".to_owned())?,
+    )
+    .into_iter()
+    .map(|workload| WorkloadDimension {
+        family: workload.family.name(),
+        workload: workload.name,
+    })
+    .collect::<Vec<_>>();
     let observations = cases
         .iter()
         .map(|case| RatioObservation {
             family: case.family,
+            workload: case.workload,
             scale: case.row_count,
+            seed: case.seed,
             ratio: ratio(case),
         })
         .collect::<Vec<_>>();
-    parity_score(&observations)
+    parity_score(
+        &observations,
+        expected_seeds,
+        expected_scales,
+        &expected_workloads,
+    )
 }
 
 fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<(), String> {
@@ -509,18 +559,19 @@ fn stable_median(
     engine_metric: &str,
     workload: &str,
     row_count: usize,
+    seed: u64,
 ) -> Result<f64, String> {
     let value = median(samples)?;
     if value <= 0.0 {
         return Err(format!(
-            "timer resolution was insufficient for {engine_metric}, '{workload}' at {row_count} rows"
+            "timer resolution was insufficient for {engine_metric}, '{workload}' at {row_count} rows with seed {seed}"
         ));
     }
     let minimum = samples.iter().copied().fold(f64::INFINITY, f64::min);
     let maximum = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if maximum / minimum > MAX_SAMPLE_SPREAD {
         return Err(format!(
-            "unstable timing for {engine_metric}, '{workload}' at {row_count} rows: max/min spread {:.2} exceeds {:.2}",
+            "unstable timing for {engine_metric}, '{workload}' at {row_count} rows with seed {seed}: max/min spread {:.2} exceeds {:.2}",
             maximum / minimum,
             MAX_SAMPLE_SPREAD
         ));
@@ -532,6 +583,7 @@ fn details_json(
     config: &Config,
     identity: &ClickHouseIdentity,
     cases: &[CaseResult],
+    derived_seeds: &[u64],
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
@@ -540,7 +592,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"seed_count\":{},\"derived_seeds\":",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -548,9 +600,14 @@ fn details_json(
         end_to_end_score.saturated_cases,
         json_string(config.mode.name()),
         config.seed,
-        settings.warmups,
-        settings.samples,
-        settings.end_to_end_samples
+        config.seed_count,
+    )
+    .expect("writing to String cannot fail");
+    write_u64_array(&mut output, derived_seeds);
+    write!(
+        output,
+        ",\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        settings.warmups, settings.samples, settings.end_to_end_samples
     )
     .expect("writing to String cannot fail");
     for (index, row_count) in settings.row_counts.iter().enumerate() {
@@ -578,9 +635,11 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"seed\":{},\"dataset_seed\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             json_string(case.workload),
             json_string(case.family),
+            case.seed,
+            case.dataset_seed,
             case.row_count,
             case.query_amplification,
             case.rusthouse_primary_batch_median_ms,
@@ -621,6 +680,17 @@ fn write_number_array(output: &mut String, values: &[f64]) {
             output.push(',');
         }
         write!(output, "{value:.6}").expect("writing to String cannot fail");
+    }
+    output.push(']');
+}
+
+fn write_u64_array(output: &mut String, values: &[u64]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{value}").expect("writing to String cannot fail");
     }
     output.push(']');
 }
@@ -746,9 +816,10 @@ mod tests {
 
     #[test]
     fn unstable_samples_are_rejected() {
-        let error = stable_median(&[1.0, 1.1, 20.0], "engine", "workload", 10)
+        let error = stable_median(&[1.0, 1.1, 20.0], "engine", "workload", 10, 42)
             .expect_err("large spread must fail");
         assert!(error.contains("unstable timing"));
+        assert!(error.contains("seed 42"));
     }
 
     #[test]
@@ -782,6 +853,70 @@ mod tests {
             saturated_cases: 8,
         };
         assert!(ensure_primary_headroom(&score, 8).is_err());
+    }
+
+    #[test]
+    fn details_record_derived_seeds_case_seed_and_every_raw_sample() {
+        let config = Config {
+            mode: config::Mode::Quick,
+            seed: 11,
+            seed_count: 2,
+            rusthouse: PathBuf::from("/rusthouse"),
+            clickhouse: PathBuf::from("/clickhouse"),
+            details: None,
+        };
+        let case = CaseResult {
+            workload: "case",
+            family: "family",
+            seed: 22,
+            dataset_seed: 33,
+            row_count: 256,
+            query_amplification: 2,
+            primary: TimingSeries {
+                rusthouse_batch_ms: vec![1.0, 2.0],
+                clickhouse_batch_ms: vec![3.0, 4.0],
+                rusthouse_per_query_ms: vec![0.5, 1.0],
+                clickhouse_per_query_ms: vec![1.5, 2.0],
+            },
+            rusthouse_primary_batch_median_ms: 1.5,
+            clickhouse_primary_batch_median_ms: 3.5,
+            rusthouse_primary_median_ms: 0.75,
+            clickhouse_primary_median_ms: 1.75,
+            primary_ratio: 1.75 / 0.75,
+            end_to_end: TimingSeries {
+                rusthouse_batch_ms: vec![5.0, 6.0],
+                clickhouse_batch_ms: vec![7.0, 8.0],
+                rusthouse_per_query_ms: vec![5.0, 6.0],
+                clickhouse_per_query_ms: vec![7.0, 8.0],
+            },
+            rusthouse_end_to_end_median_ms: 5.5,
+            clickhouse_end_to_end_median_ms: 7.5,
+            end_to_end_ratio: 7.5 / 5.5,
+        };
+        let score = ScoreBreakdown {
+            score: 50.0,
+            saturated_cases: 0,
+        };
+        let details = details_json(
+            &config,
+            &ClickHouseIdentity {
+                version_output: "ClickHouse 26.7.1".to_owned(),
+                sha256: "checksum".to_owned(),
+            },
+            &[case],
+            &[11, 22],
+            score,
+            score,
+            1,
+        );
+
+        assert!(details.contains("\"schema_version\":3"));
+        assert!(details.contains("\"seed_count\":2,\"derived_seeds\":[11,22]"));
+        assert!(details.contains("\"seed\":22,\"dataset_seed\":33"));
+        assert!(details.contains("\"rusthouse_batch_samples_ms\":[1.000000,2.000000]"));
+        assert!(details.contains("\"clickhouse_batch_samples_ms\":[3.000000,4.000000]"));
+        assert!(details.contains("\"rusthouse_samples_ms\":[5.000000,6.000000]"));
+        assert!(details.contains("\"clickhouse_samples_ms\":[7.000000,8.000000]"));
     }
 
     #[test]
