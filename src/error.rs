@@ -9,6 +9,8 @@ pub enum Error {
     },
     TableAlreadyExists(String),
     TableNotFound(String),
+    ViewAlreadyExists(String),
+    ViewNotFound(String),
     DuplicateColumn(String),
     ReservedIdentifier {
         identifier: String,
@@ -42,6 +44,8 @@ impl fmt::Display for Error {
             }
             Self::TableAlreadyExists(table) => write!(f, "table '{table}' already exists"),
             Self::TableNotFound(table) => write!(f, "table '{table}' does not exist"),
+            Self::ViewAlreadyExists(view) => write!(f, "view '{view}' already exists"),
+            Self::ViewNotFound(view) => write!(f, "view '{view}' does not exist"),
             Self::DuplicateColumn(column) => write!(f, "duplicate column '{column}'"),
             Self::ReservedIdentifier {
                 identifier,

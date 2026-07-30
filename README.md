@@ -5,6 +5,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 ## What works
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
+- dependency-checked CREATE VIEW ... AS SELECT and DROP VIEW [IF EXISTS]
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -28,9 +29,10 @@ cargo run -- --execute "
     ('west', 10, true),
     ('east', 4, false),
     ('west', 7, true);
+  CREATE VIEW online_sales AS
+    SELECT region, amount FROM sales WHERE online = true;
   SELECT region, COUNT(*) AS orders, SUM(amount) AS total, AVG(amount) AS mean
-  FROM sales
-  WHERE online = true
+  FROM online_sales
   GROUP BY region
   ORDER BY total DESC
   LIMIT 10;
@@ -63,6 +65,8 @@ Database retains an in-memory catalog across calls and returns structured result
 
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
+Logical views store their parsed SELECT rather than result rows. Creation validates the complete dependency chain, and each reference expands and revalidates that chain against the current catalog. Tables and views share one case-insensitive namespace; catalog callers can inspect them with `Catalog::tables`, `Catalog::views`, and `Catalog::relation_kind`.
+
 ~~~rust
 use rusthouse::{Database, StatementResult};
 
@@ -83,7 +87,7 @@ assert_eq!(result.rows.len(), 1);
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+To keep recursive processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes, and a view chain is limited to 64 expansions. Queries over these limits return an error before execution. Cyclic view definitions are rejected.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

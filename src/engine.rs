@@ -1,14 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, RelationKind};
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
 use crate::value::{DataType, Value, ValueRef};
+
+/// Maximum number of logical views that may be expanded for one relation.
+pub const MAX_VIEW_EXPANSION_DEPTH: usize = 64;
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
@@ -69,7 +72,30 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateView { name, query } => {
+                self.catalog.create_view(name.clone(), query)?;
+                if let Err(error) = self.validate_view(&name) {
+                    self.catalog.remove_view(&name);
+                    return Err(error);
+                }
+                Ok(StatementResult::Command {
+                    tag: "CREATE VIEW",
+                    affected_rows: 0,
+                })
+            }
+            Statement::DropView { name, if_exists } => {
+                self.catalog.drop_view(&name, if_exists)?;
+                Ok(StatementResult::Command {
+                    tag: "DROP VIEW",
+                    affected_rows: 0,
+                })
+            }
             Statement::Insert { table, rows } => {
+                if self.catalog.relation_kind(&table) == Some(RelationKind::View) {
+                    return Err(Error::InvalidQuery(format!(
+                        "cannot INSERT into view '{table}'"
+                    )));
+                }
                 let affected_rows = rows.len();
                 {
                     let target = self.catalog.table(&table)?;
@@ -91,48 +117,164 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
-        let predicate = select
-            .predicate
-            .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
-            .transpose()?;
-
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
-
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_grouped_rows(
-                &mut selected_groups,
-                &grouped,
-                &items,
-                &ordering,
-                select.limit,
-            );
-            grouped.project(&selected_groups, &items)
-        } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
-        };
-
-        Ok(QueryResult {
-            columns: result_columns,
-            rows,
-        })
+        self.select_schema_expanded(&select, &mut ViewExpansion::default())?;
+        self.execute_select_expanded(&select, &mut ViewExpansion::default())
     }
+
+    fn validate_view(&self, name: &str) -> Result<()> {
+        self.relation_schema(name, &mut ViewExpansion::default())?;
+        Ok(())
+    }
+
+    fn relation_schema(&self, name: &str, expansion: &mut ViewExpansion) -> Result<Vec<ColumnDef>> {
+        match self.catalog.relation_kind(name) {
+            Some(RelationKind::Table) => Ok(self.catalog.table(name)?.schema().to_vec()),
+            Some(RelationKind::View) => {
+                let view = self.catalog.view(name)?;
+                expansion.enter(view.name())?;
+                let columns = self.select_schema_expanded(view.query(), expansion);
+                expansion.exit();
+                validate_view_columns(view.name(), columns?)
+            }
+            None => Err(Error::TableNotFound(name.to_owned())),
+        }
+    }
+
+    fn select_schema_expanded(
+        &self,
+        select: &Select,
+        expansion: &mut ViewExpansion,
+    ) -> Result<Vec<ResultColumn>> {
+        let source_schema = self.relation_schema(&select.table, expansion)?;
+        let source = Table::new(select.table.clone(), source_schema)?;
+        Ok(resolve_select(&source, select)?.result_columns)
+    }
+
+    fn execute_select_expanded(
+        &self,
+        select: &Select,
+        expansion: &mut ViewExpansion,
+    ) -> Result<QueryResult> {
+        match self.catalog.relation_kind(&select.table) {
+            Some(RelationKind::Table) => {
+                execute_select_on_table(self.catalog.table(&select.table)?, select)
+            }
+            Some(RelationKind::View) => {
+                let view = self.catalog.view(&select.table)?;
+                expansion.enter(view.name())?;
+                let result = self.execute_select_expanded(view.query(), expansion);
+                expansion.exit();
+                let source = materialize_view_result(view.name(), result?)?;
+                execute_select_on_table(&source, select)
+            }
+            None => Err(Error::TableNotFound(select.table.clone())),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ViewExpansion {
+    stack: Vec<String>,
+}
+
+impl ViewExpansion {
+    fn enter(&mut self, name: &str) -> Result<()> {
+        if let Some(cycle_start) = self
+            .stack
+            .iter()
+            .position(|entry| entry.eq_ignore_ascii_case(name))
+        {
+            let mut cycle = self.stack[cycle_start..].to_vec();
+            cycle.push(name.to_owned());
+            return Err(Error::InvalidQuery(format!(
+                "view dependency cycle detected: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        if self.stack.len() >= MAX_VIEW_EXPANSION_DEPTH {
+            return Err(Error::InvalidQuery(format!(
+                "view expansion exceeds maximum depth of {MAX_VIEW_EXPANSION_DEPTH}"
+            )));
+        }
+        self.stack.push(name.to_owned());
+        Ok(())
+    }
+
+    fn exit(&mut self) {
+        self.stack.pop().expect("a view expansion is active");
+    }
+}
+
+fn validate_view_columns(name: &str, columns: Vec<ResultColumn>) -> Result<Vec<ColumnDef>> {
+    let schema = columns
+        .into_iter()
+        .map(|column| ColumnDef {
+            name: column.name,
+            data_type: column.data_type,
+        })
+        .collect::<Vec<_>>();
+    Ok(Table::new(name.to_owned(), schema)?.schema().to_vec())
+}
+
+fn materialize_view_result(name: &str, result: QueryResult) -> Result<Table> {
+    let QueryResult { columns, rows } = result;
+    let schema = validate_view_columns(name, columns)?;
+    let mut table = Table::new(name.to_owned(), schema)?;
+    for row in rows {
+        table.insert_row(row)?;
+    }
+    Ok(table)
+}
+
+fn execute_select_on_table(table: &Table, select: &Select) -> Result<QueryResult> {
+    let ResolvedSelect {
+        predicate,
+        group_columns,
+        items,
+        result_columns,
+        aggregate_specs,
+        ordering,
+    } = resolve_select(table, select)?;
+
+    let mut matching_rows = (0..table.row_count())
+        .filter(|row| {
+            predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate.evaluate(table, *row))
+        })
+        .collect::<Vec<_>>();
+
+    let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+    let rows = if grouped {
+        let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+        let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+        order_grouped_rows(
+            &mut selected_groups,
+            &grouped,
+            &items,
+            &ordering,
+            select.limit,
+        );
+        grouped.project(&selected_groups, &items)
+    } else {
+        order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+        execute_projection(table, &matching_rows, &items)
+    };
+
+    Ok(QueryResult {
+        columns: result_columns,
+        rows,
+    })
+}
+
+#[derive(Debug)]
+struct ResolvedSelect {
+    predicate: Option<CompiledPredicate>,
+    group_columns: Vec<usize>,
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    ordering: Vec<ResolvedOrder>,
 }
 
 #[derive(Debug)]
@@ -151,6 +293,26 @@ struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+}
+
+fn resolve_select(table: &Table, select: &Select) -> Result<ResolvedSelect> {
+    let predicate = select
+        .predicate
+        .as_ref()
+        .map(|predicate| compile_predicate(table, predicate))
+        .transpose()?;
+    let group_columns = resolve_group_columns(table, &select.group_by)?;
+    let (items, result_columns, aggregate_specs) =
+        resolve_select_items(table, &select.items, &group_columns)?;
+    let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+    Ok(ResolvedSelect {
+        predicate,
+        group_columns,
+        items,
+        result_columns,
+        aggregate_specs,
+        ordering,
+    })
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {

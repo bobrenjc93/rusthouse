@@ -95,6 +95,33 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn one_cli_session_can_create_query_and_drop_views() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE events (kind String, amount Int64);
+             INSERT INTO events VALUES ('a', 2), ('a', 3), ('b', 7);
+             CREATE VIEW totals AS
+                SELECT kind, SUM(amount) AS total FROM events GROUP BY kind;
+             SELECT kind, total FROM totals ORDER BY total DESC;
+             DROP VIEW totals;
+             DROP VIEW IF EXISTS totals;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"kind\",\"type\":\"String\"},{\"name\":\"total\",\"type\":\"Int64\"}],\"rows\":[[\"b\",7],[\"a\",5]]}]}\n"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("CREATE VIEW"));
+    assert_eq!(stderr.matches("DROP VIEW").count(), 2);
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
