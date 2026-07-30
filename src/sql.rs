@@ -37,6 +37,7 @@ pub enum SelectItem {
     },
     Aggregate {
         function: AggregateFunction,
+        parameter: Option<f64>,
         argument: AggregateArgument,
         alias: Option<String>,
     },
@@ -49,6 +50,7 @@ pub enum AggregateFunction {
     Min,
     Max,
     Avg,
+    QuantileTDigest,
 }
 
 impl AggregateFunction {
@@ -60,6 +62,7 @@ impl AggregateFunction {
             Self::Min => "MIN",
             Self::Max => "MAX",
             Self::Avg => "AVG",
+            Self::QuantileTDigest => "quantileTDigest",
         }
     }
 
@@ -70,6 +73,7 @@ impl AggregateFunction {
             "MIN" => Some(Self::Min),
             "MAX" => Some(Self::Max),
             "AVG" => Some(Self::Avg),
+            "QUANTILETDIGEST" => Some(Self::QuantileTDigest),
             _ => None,
         }
     }
@@ -525,6 +529,17 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
+            let parameter = if function == AggregateFunction::QuantileTDigest {
+                let level = self.parse_aggregate_parameter("quantileTDigest level")?;
+                self.expect(&TokenKind::RightParen, "')' after quantileTDigest level")?;
+                self.expect(
+                    &TokenKind::LeftParen,
+                    "'(' before quantileTDigest column argument",
+                )?;
+                Some(level)
+            } else {
+                None
+            };
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
@@ -534,6 +549,7 @@ impl Parser {
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
+                parameter,
                 argument,
                 alias,
             })
@@ -549,6 +565,31 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_aggregate_parameter(&mut self, description: &str) -> Result<f64> {
+        let position = self.position();
+        let negative = self.eat(&TokenKind::Minus);
+        let number = self.take_number().ok_or_else(|| Error::Sql {
+            position,
+            message: format!("expected numeric {description}"),
+        })?;
+        let signed = if negative {
+            format!("-{number}")
+        } else {
+            number
+        };
+        let value = signed.parse::<f64>().map_err(|_| Error::Sql {
+            position,
+            message: format!("invalid {description} '{signed}'"),
+        })?;
+        if !value.is_finite() {
+            return Err(Error::Sql {
+                position,
+                message: format!("{description} must be finite"),
+            });
+        }
+        Ok(value)
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -771,6 +812,29 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_clickhouse_style_quantile_parameter_and_argument() {
+        let statements = parse("SELECT quantileTDigest(0.99)(latency) AS p99 FROM requests")
+            .expect("valid quantile SQL");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let SelectItem::Aggregate {
+            function,
+            parameter,
+            argument,
+            alias,
+        } = &select.items[0]
+        else {
+            panic!("expected aggregate");
+        };
+
+        assert_eq!(*function, AggregateFunction::QuantileTDigest);
+        assert_eq!(*parameter, Some(0.99));
+        assert_eq!(argument, &AggregateArgument::Column("latency".to_owned()));
+        assert_eq!(alias.as_deref(), Some("p99"));
     }
 
     #[test]

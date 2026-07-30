@@ -9,7 +9,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- COUNT, SUM, MIN, MAX, AVG, and bounded `quantileTDigest(level)(numeric_column)`
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
@@ -85,7 +85,9 @@ RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted i
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+`quantileTDigest` accepts a level from 0 through 1 and returns a deterministic approximate `Float64` quantile from `Int64` or `Float64` input. Its mergeable state is capped at 256 centroids per group, independent of row count.
+
+On empty input, COUNT and SUM return numeric zero. MIN, MAX, AVG, and `quantileTDigest` return an actionable error because the current type system has no nullable result.
 
 ## Development
 

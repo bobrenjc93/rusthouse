@@ -311,6 +311,148 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn quantile_tdigest_handles_skew_outliers_grouping_and_accuracy() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE distributions (bucket String, value Float64);")
+        .expect("create succeeds");
+
+    let mut rows = Vec::new();
+    for _ in 0..990 {
+        rows.push("('skew', 1.0)".to_owned());
+    }
+    for value in 2..=10 {
+        rows.push(format!("('skew', {value}.0)"));
+    }
+    rows.push("('skew', 1000000.0)".to_owned());
+    for value in 0..1_000 {
+        rows.push(format!("('uniform', {value}.0)"));
+    }
+    database
+        .execute(&format!(
+            "INSERT INTO distributions VALUES {}",
+            rows.join(", ")
+        ))
+        .expect("distribution insert succeeds");
+
+    let sql = "SELECT bucket,
+                      quantileTDigest(0.5)(value) AS median,
+                      quantileTDigest(0.99)(value) AS p99,
+                      quantileTDigest(1)(value) AS maximum
+               FROM distributions
+               GROUP BY bucket
+               ORDER BY bucket";
+    let first = execute_query(&mut database, sql);
+    let repeated = execute_query(&mut database, sql);
+    assert_eq!(first, repeated);
+    assert_eq!(
+        first
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::String,
+            DataType::Float64,
+            DataType::Float64,
+            DataType::Float64,
+        ]
+    );
+
+    assert_eq!(first.rows[0][0], Value::String("skew".to_owned()));
+    assert_eq!(first.rows[0][1], Value::Float64(1.0));
+    let Value::Float64(skew_p99) = first.rows[0][2] else {
+        panic!("p99 is Float64");
+    };
+    assert!(skew_p99 <= 2.0, "skew p99 was {skew_p99}");
+    assert_eq!(first.rows[0][3], Value::Float64(1_000_000.0));
+
+    assert_eq!(first.rows[1][0], Value::String("uniform".to_owned()));
+    for (column, expected) in [(1, 499.5), (2, 989.01), (3, 999.0)] {
+        let Value::Float64(actual) = first.rows[1][column] else {
+            panic!("quantile is Float64");
+        };
+        assert!(
+            (actual - expected).abs() <= 10.0,
+            "column {column}: expected {expected}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn quantile_tdigest_validates_level_type_wildcard_and_empty_input() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE quantiles (value Int64, label String);")
+        .expect("create succeeds");
+
+    let empty = database
+        .execute("SELECT quantileTDigest(0.5)(value) FROM quantiles;")
+        .expect_err("an empty quantile has no nullable result");
+    assert!(matches!(
+        empty,
+        Error::InvalidQuery(message)
+            if message == "quantileTDigest is undefined for an empty input"
+    ));
+
+    database
+        .execute("INSERT INTO quantiles VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+        .expect("insert succeeds");
+    let endpoints = execute_query(
+        &mut database,
+        "SELECT quantileTDigest(0)(value) AS low,
+                quantileTDigest(1)(value) AS high
+         FROM quantiles;",
+    );
+    assert_eq!(
+        endpoints.rows,
+        vec![vec![Value::Float64(1.0), Value::Float64(3.0)]]
+    );
+
+    for level in ["-0.01", "1.01"] {
+        let error = database
+            .execute(&format!(
+                "SELECT quantileTDigest({level})(value) FROM quantiles"
+            ))
+            .expect_err("out-of-range level is rejected");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message)
+                if message.contains("level must be between 0 and 1 inclusive")
+        ));
+    }
+
+    let non_finite = database
+        .execute("SELECT quantileTDigest(1e999)(value) FROM quantiles")
+        .expect_err("non-finite level is rejected");
+    assert!(matches!(
+        non_finite,
+        Error::Sql { message, .. } if message.contains("level must be finite")
+    ));
+
+    let wrong_type = database
+        .execute("SELECT quantileTDigest(0.5)(label) FROM quantiles")
+        .expect_err("String quantiles are rejected");
+    assert!(matches!(
+        wrong_type,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "Int64 or Float64" && actual == "String"
+    ));
+
+    let wildcard = database
+        .execute("SELECT quantileTDigest(0.5)(*) FROM quantiles")
+        .expect_err("wildcard quantiles are rejected");
+    assert!(matches!(
+        wildcard,
+        Error::InvalidQuery(message)
+            if message.contains("quantileTDigest(*) is not supported")
+    ));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database

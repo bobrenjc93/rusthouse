@@ -8,6 +8,7 @@ use crate::sql::{
     Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
+use crate::tdigest::TDigest;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -149,6 +150,7 @@ enum ResolvedItem {
 #[derive(Debug, Clone)]
 struct AggregateSpec {
     function: AggregateFunction,
+    parameter: Option<f64>,
     argument: Option<usize>,
     input_type: Option<DataType>,
 }
@@ -231,6 +233,7 @@ fn resolve_select_items(
             }
             SelectItem::Aggregate {
                 function,
+                parameter,
                 argument,
                 alias,
             } => {
@@ -253,18 +256,23 @@ fn resolve_select_items(
                         )
                     }
                 };
-                validate_aggregate(*function, input_type)?;
+                validate_aggregate(*function, *parameter, input_type)?;
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
                     function: *function,
+                    parameter: *parameter,
                     argument: argument_index,
                     input_type,
                 });
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                    name: alias.clone().unwrap_or_else(|| {
+                        if let Some(parameter) = parameter {
+                            format!("{}({parameter})({argument_name})", function.name())
+                        } else {
+                            format!("{}({argument_name})", function.name())
+                        }
+                    }),
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
@@ -274,9 +282,24 @@ fn resolve_select_items(
     Ok((items, result_columns, aggregate_specs))
 }
 
-fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
-    if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+fn validate_aggregate(
+    function: AggregateFunction,
+    parameter: Option<f64>,
+    input_type: Option<DataType>,
+) -> Result<()> {
+    if function == AggregateFunction::QuantileTDigest {
+        let level = parameter.expect("quantileTDigest parameter is parsed");
+        if !(0.0..=1.0).contains(&level) {
+            return Err(Error::InvalidQuery(format!(
+                "quantileTDigest level must be between 0 and 1 inclusive; found {level}"
+            )));
+        }
+    }
+
+    if matches!(
+        function,
+        AggregateFunction::Sum | AggregateFunction::Avg | AggregateFunction::QuantileTDigest
+    ) && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
@@ -291,7 +314,7 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => DataType::Float64,
+        AggregateFunction::Avg | AggregateFunction::QuantileTDigest => DataType::Float64,
         AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
             input_type.expect("validated column argument")
         }
@@ -530,6 +553,7 @@ enum AggregateState {
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
     AvgFloat { sum: f64, count: u64 },
+    QuantileTDigest { digest: Box<TDigest>, level: f64 },
 }
 
 impl AggregateState {
@@ -544,6 +568,12 @@ impl AggregateState {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::QuantileTDigest => Self::QuantileTDigest {
+                digest: Box::default(),
+                level: spec
+                    .parameter
+                    .expect("quantileTDigest parameter is resolved"),
+            },
         }
     }
 
@@ -620,6 +650,22 @@ impl AggregateState {
                     return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
                 }
             }
+            Self::QuantileTDigest { digest, .. } => {
+                let column =
+                    &table.columns()[spec.argument.expect("quantileTDigest argument is resolved")];
+                let value = match column {
+                    Column::Int64(values) => values[row] as f64,
+                    Column::Float64(values) => values[row],
+                    Column::Bool(_) | Column::String(_) => {
+                        unreachable!("quantileTDigest input type is resolved")
+                    }
+                };
+                if !digest.add(value) {
+                    return Err(Error::NumericOverflow(
+                        "quantileTDigest sample count".to_owned(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -633,6 +679,14 @@ impl AggregateState {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
+            Self::QuantileTDigest { digest, level } => digest.quantile(level).map_or_else(
+                || {
+                    Err(Error::InvalidQuery(
+                        "quantileTDigest is undefined for an empty input".to_owned(),
+                    ))
+                },
+                |value| Ok(Value::Float64(value)),
+            ),
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),

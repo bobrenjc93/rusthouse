@@ -9,6 +9,7 @@ pub mod error;
 pub mod format;
 pub mod sql;
 pub mod storage;
+mod tdigest;
 pub mod value;
 
 pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
