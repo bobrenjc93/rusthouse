@@ -27,7 +27,7 @@ Build both shipped binaries first so compilation is never included:
 cargo build --release --bins
 ~~~
 
-A quick local check uses two row counts, one amplified warmup, three amplified samples, and three end-to-end samples:
+A quick local check uses the supplied seed directly with two row counts, one amplified warmup, three amplified samples, and three end-to-end samples:
 
 ~~~bash
 RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
@@ -37,7 +37,7 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-quick.json
 ~~~
 
-The decision-grade default uses 1,000, 10,000, and 50,000 rows, two amplified warmups, seven amplified samples, and three end-to-end samples:
+The decision-grade default uses 1,000, 10,000, 50,000, and 250,000 rows for each of three derived seeds, two amplified warmups, seven amplified samples, and three end-to-end samples. This produces 96 required correctness-gated cases (three seeds times four scales times eight workloads):
 
 ~~~bash
 RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
@@ -47,9 +47,11 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
+In default mode, `--seed` is a root seed. The three-seed panel is `[root, root XOR 0xa0761d6478bd642f, root XOR 0xe7037ed1a0b428db]`. The fixed nonzero, distinct masks guarantee three distinct `u64` seeds without aligning the panels to SplitMix64's stepping constant. For root `20260729`, the panel is `[20260729, 11562461410693235542, 16646288086514339746]`. Quick mode uses only the root seed and is not an acceptance run.
+
 ## Grouping and top-k optimization measurement
 
-On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
+On 2026-07-29, the earlier single-seed, three-scale default was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. These historical results predate the required three-seed, four-scale panel and are not acceptance results under the current default. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
 
 | Case | Rows | Before (ms) | After (ms) | Speedup | After ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -62,9 +64,9 @@ On 2026-07-29, the default command above was run on the same Apple Silicon host 
 
 The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
 
-The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
+The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes the complete default seed panel and every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, root seed, derived seed panel, per-case dataset seed, mode, aggregation order, saturation limit, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, incomplete-panel, or excessive-saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -77,7 +79,7 @@ A dependency-free SplitMix64 generator produces deterministic typed rows. Every 
 - negative numbers and signed integers around four quadrillion;
 - exactly representable eighth-step floating-point values.
 
-The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix.
+The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Each panel seed is combined with the row count before generation, preventing the larger sizes from merely timing the same prefix.
 
 Each row count runs eight cases spanning:
 
@@ -99,7 +101,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, the exact default seed and scale panel, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, seed/scale/family weighting, and exhaustive removal of every required seed/scale/workload case. Duplicate observations cannot substitute for a missing case.
 
 ## Timing and calibration
 
@@ -115,11 +117,12 @@ Each case ratio is ClickHouse median divided by RustHouse median. Ratios below 0
 
 Aggregation is hierarchical in log space:
 
-1. Workloads receive equal weight within each family and row count.
-2. Row counts receive equal weight within each family.
-3. Workload families receive equal weight in the final geometric mean.
+1. Workloads receive equal weight within each family, seed, and row count.
+2. Seeds receive equal weight within each family and row count.
+3. Row counts receive equal weight within each family.
+4. Workload families receive equal weight in the final geometric mean.
 
-The same aggregation produces primary and end-to-end scores. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default rejects a result if every primary case reaches the 100 cap because that indicates no useful optimization headroom was measured. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
+Before either score is calculated, the scorer requires exactly one observation for every configured seed, row count, and workload, with the workload in its declared family. Missing, duplicate, unexpected, or family-mismatched observations reject the entire score. The same aggregation produces primary and end-to-end scores. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default rejects a result when one quarter or more of its primary cases reach the 100 cap because that indicates substantial loss of optimization headroom. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
 
 ## Fairness, limitations, and anti-gaming
 
@@ -127,4 +130,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, a configurable three-seed default panel, scales through 250,000 rows, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, exact panel completeness, identical per-engine amplification, retained raw samples, conservative per-case caps, a one-quarter saturation rejection threshold, and equal seed/scale/family weighting. No single special-case query, favorable seed, omitted case, or duplicated workload can legitimately stand in for the suite.

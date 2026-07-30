@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub const SEED_PANEL_MASKS: [u64; 3] = [0, 0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Quick,
@@ -24,12 +26,22 @@ impl Mode {
                 end_to_end_samples: 3,
             },
             Self::Default => BenchmarkSettings {
-                row_counts: vec![1_000, 10_000, 50_000],
+                row_counts: vec![1_000, 10_000, 50_000, 250_000],
                 warmups: 2,
                 samples: 7,
                 query_amplification: 256,
                 end_to_end_samples: 3,
             },
+        }
+    }
+
+    pub fn benchmark_seeds(self, root_seed: u64) -> Vec<u64> {
+        match self {
+            Self::Quick => vec![root_seed],
+            Self::Default => SEED_PANEL_MASKS
+                .iter()
+                .map(|mask| root_seed ^ mask)
+                .collect(),
         }
     }
 }
@@ -195,6 +207,33 @@ mod tests {
             assert!(settings.query_amplification > 1);
             assert!(settings.end_to_end_samples >= 3);
         }
+    }
+
+    #[test]
+    fn default_uses_documented_three_seed_large_scale_panel() {
+        let root = 20_260_729;
+        assert_eq!(
+            Mode::Default.benchmark_seeds(root),
+            SEED_PANEL_MASKS.map(|mask| root ^ mask)
+        );
+        assert_eq!(
+            Mode::Default.settings().row_counts,
+            [1_000, 10_000, 50_000, 250_000]
+        );
+        assert_eq!(Mode::Quick.benchmark_seeds(root), [root]);
+    }
+
+    #[test]
+    fn default_seed_panel_remains_distinct_for_large_roots() {
+        let seeds = Mode::Default.benchmark_seeds(u64::MAX);
+        assert_eq!(
+            seeds
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            seeds.len()
+        );
     }
 
     #[test]
