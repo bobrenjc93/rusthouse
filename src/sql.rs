@@ -116,8 +116,27 @@ pub struct OrderBy {
 
 /// Parse one or more semicolon-separated SQL statements.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens).parse_script()
+    parse_with_limits(input, None)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParseLimits {
+    pub tokens: usize,
+    pub statements: usize,
+    pub create_columns: usize,
+    pub insert_cells: usize,
+    pub select_items: usize,
+    pub group_columns: usize,
+    pub order_columns: usize,
+}
+
+pub(crate) fn parse_bounded(input: &str, limits: ParseLimits) -> Result<Vec<Statement>> {
+    parse_with_limits(input, Some(limits))
+}
+
+fn parse_with_limits(input: &str, limits: Option<ParseLimits>) -> Result<Vec<Statement>> {
+    let tokens = Lexer::new(input, limits.map(|limits| limits.tokens)).tokenize()?;
+    Parser::new(tokens, limits).parse_script()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,11 +168,16 @@ enum TokenKind {
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
+    max_tokens: Option<usize>,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+    fn new(input: &'a str, max_tokens: Option<usize>) -> Self {
+        Self {
+            input,
+            position: 0,
+            max_tokens,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
@@ -168,6 +192,12 @@ impl<'a> Lexer<'a> {
                 });
                 return Ok(tokens);
             };
+            if self.max_tokens.is_some_and(|limit| tokens.len() >= limit) {
+                return Err(Error::ResourceLimit(format!(
+                    "SQL contains more than {} tokens",
+                    self.max_tokens.expect("checked token limit")
+                )));
+            }
 
             let kind = match character {
                 ',' => {
@@ -343,15 +373,19 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    limits: Option<ParseLimits>,
+    insert_cells: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, limits: Option<ParseLimits>) -> Self {
         Self {
             tokens,
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            limits,
+            insert_cells: 0,
         }
     }
 
@@ -359,6 +393,15 @@ impl Parser {
         let mut statements = Vec::new();
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
+            if self
+                .limits
+                .is_some_and(|limits| statements.len() >= limits.statements)
+            {
+                return Err(Error::ResourceLimit(format!(
+                    "SQL batch contains more than {} statements",
+                    self.limits.expect("checked parse limits").statements
+                )));
+            }
             statements.push(self.parse_statement()?);
             if !self.eat(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("expected ';' between statements");
@@ -389,6 +432,15 @@ impl Parser {
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
+            if self
+                .limits
+                .is_some_and(|limits| columns.len() >= limits.create_columns)
+            {
+                return Err(Error::ResourceLimit(format!(
+                    "CREATE TABLE contains more than {} columns",
+                    self.limits.expect("checked parse limits").create_columns
+                )));
+            }
             let column_name = self.expect_identifier("column name")?;
             if is_reserved_column_name(&column_name) {
                 return Err(Error::ReservedIdentifier {
@@ -426,7 +478,17 @@ impl Parser {
             let mut row = Vec::new();
             if !self.at(&TokenKind::RightParen) {
                 loop {
+                    if self
+                        .limits
+                        .is_some_and(|limits| self.insert_cells >= limits.insert_cells)
+                    {
+                        return Err(Error::ResourceLimit(format!(
+                            "INSERT contains more than {} values",
+                            self.limits.expect("checked parse limits").insert_cells
+                        )));
+                    }
                     row.push(self.parse_literal()?);
+                    self.insert_cells += 1;
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -444,6 +506,15 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
+            if self
+                .limits
+                .is_some_and(|limits| items.len() >= limits.select_items)
+            {
+                return Err(Error::ResourceLimit(format!(
+                    "SELECT contains more than {} output expressions",
+                    self.limits.expect("checked parse limits").select_items
+                )));
+            }
             items.push(self.parse_select_item()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -464,6 +535,15 @@ impl Parser {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
+                if self
+                    .limits
+                    .is_some_and(|limits| group_by.len() >= limits.group_columns)
+                {
+                    return Err(Error::ResourceLimit(format!(
+                        "GROUP BY contains more than {} columns",
+                        self.limits.expect("checked parse limits").group_columns
+                    )));
+                }
                 group_by.push(self.expect_identifier("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -475,6 +555,15 @@ impl Parser {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
+                if self
+                    .limits
+                    .is_some_and(|limits| order_by.len() >= limits.order_columns)
+                {
+                    return Err(Error::ResourceLimit(format!(
+                        "ORDER BY contains more than {} columns",
+                        self.limits.expect("checked parse limits").order_columns
+                    )));
+                }
                 let name = self.expect_identifier("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true

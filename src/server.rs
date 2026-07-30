@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::engine::{ExecutionBudget, ExecutionBudgetLimits};
+use crate::engine::{ExecutionBudget, ExecutionBudgetLimits, RetainedStateLimits};
 use crate::format::{OutputFormat, render};
 use crate::sql::{self, Statement};
 use crate::{Database, Error, QueryResult, StatementResult, Value};
@@ -31,6 +31,7 @@ pub const MAX_STATEMENTS_PER_BATCH: usize = 32;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_SQL_TOKENS: usize = 65_536;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const QUEUE_CAPACITY: usize = MAX_CONNECTIONS - WORKER_COUNT;
 const MAX_SCHEMA_COLUMNS: usize = 1024;
@@ -44,6 +45,11 @@ const MAX_RESULT_ROWS: usize = 10_000;
 const MAX_RESULT_CELLS: usize = 100_000;
 const MAX_MATERIALIZED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESULT_COLUMNS: usize = 256;
+const MAX_RETAINED_TABLES: usize = 64;
+const MAX_RETAINED_ROWS: usize = 100_000;
+const MAX_RETAINED_CELLS: usize = 1_000_000;
+const MAX_RETAINED_VALUE_BYTES: usize = 32 * 1024 * 1024;
+const ERROR_WRITE_GRACE: Duration = Duration::from_millis(250);
 
 /// Serve HTTP requests until SIGINT or SIGTERM is received.
 pub fn serve(address: &str) -> io::Result<()> {
@@ -159,7 +165,7 @@ fn accept_connections(
 }
 
 fn reject_busy(stream: &mut TcpStream) {
-    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(ERROR_WRITE_GRACE));
     let _ = write_response(
         stream,
         Response::error(
@@ -167,6 +173,7 @@ fn reject_busy(stream: &mut TcpStream) {
             "Service Unavailable",
             "server connection limit reached",
         ),
+        Instant::now() + ERROR_WRITE_GRACE,
     );
 }
 
@@ -190,7 +197,7 @@ fn handle_connection(
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
 
-    let response = if Instant::now() >= deadline {
+    let mut response = if Instant::now() >= deadline {
         Response::error(
             408,
             "Request Timeout",
@@ -202,13 +209,18 @@ fn handle_connection(
             Err(response) => response,
         }
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    stream.set_write_timeout(Some(if remaining.is_zero() {
-        Duration::from_secs(1)
+    let now = Instant::now();
+    let write_deadline = if now >= deadline {
+        response = Response::error(
+            408,
+            "Request Timeout",
+            "request did not complete within 10 seconds",
+        );
+        now + ERROR_WRITE_GRACE
     } else {
-        remaining
-    }))?;
-    write_response(stream, response)
+        deadline
+    };
+    write_response(stream, response, write_deadline)
 }
 
 #[derive(Debug)]
@@ -506,8 +518,22 @@ fn execute_query(request: Request, state: &RwLock<Database>, deadline: Instant) 
             return Response::error(400, "Bad Request", "SQL request body must be valid UTF-8");
         }
     };
-    let statements = match sql::parse(&sql) {
+    let statements = match sql::parse_bounded(
+        &sql,
+        sql::ParseLimits {
+            tokens: MAX_SQL_TOKENS,
+            statements: MAX_STATEMENTS_PER_BATCH,
+            create_columns: MAX_SCHEMA_COLUMNS,
+            insert_cells: MAX_INSERT_CELLS,
+            select_items: MAX_QUERY_ITEMS,
+            group_columns: MAX_GROUP_OR_ORDER_COLUMNS,
+            order_columns: MAX_GROUP_OR_ORDER_COLUMNS,
+        },
+    ) {
         Ok(statements) => statements,
+        Err(error @ (Error::ResourceLimit(_) | Error::ExecutionTimeout)) => {
+            return execution_error_response(error);
+        }
         Err(error) => return Response::error(400, "Bad Request", &error.to_string()),
     };
     if Instant::now() >= deadline {
@@ -529,6 +555,12 @@ fn execute_query(request: Request, state: &RwLock<Database>, deadline: Instant) 
         materialized_bytes: MAX_MATERIALIZED_BYTES,
         result_columns: MAX_RESULT_COLUMNS,
     });
+    let retained_limits = RetainedStateLimits {
+        tables: MAX_RETAINED_TABLES,
+        rows: MAX_RETAINED_ROWS,
+        cells: MAX_RETAINED_CELLS,
+        value_bytes: MAX_RETAINED_VALUE_BYTES,
+    };
 
     let execution = if read_only {
         let database = loop {
@@ -560,7 +592,7 @@ fn execute_query(request: Request, state: &RwLock<Database>, deadline: Instant) 
             }
         };
         execute_batch(statements, format, &mut budget, |statement, budget| {
-            database.execute_bounded_statement(statement, budget)
+            database.execute_bounded_statement(statement, budget, &retained_limits)
         })
     };
     let body = match execution {
@@ -816,20 +848,61 @@ impl Response {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) -> io::Result<()> {
+fn write_response(stream: &mut TcpStream, response: Response, deadline: Instant) -> io::Result<()> {
+    use std::fmt::Write as _;
+
+    let mut head = String::new();
     write!(
-        stream,
+        head,
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         response.status,
         response.reason,
         response.content_type,
         response.body.len()
-    )?;
+    )
+    .expect("writing to String cannot fail");
     for (name, value) in response.headers {
-        write!(stream, "{name}: {value}\r\n")?;
+        write!(head, "{name}: {value}\r\n").expect("writing to String cannot fail");
     }
-    stream.write_all(b"\r\n")?;
-    stream.write_all(&response.body)
+    head.push_str("\r\n");
+    write_all_until(stream, head.as_bytes(), deadline)?;
+    write_all_until(stream, &response.body, deadline)
+}
+
+fn write_all_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP response write deadline exceeded",
+            ));
+        }
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "could not write complete HTTP response",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HTTP response write deadline exceeded",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn write_json_string(output: &mut String, value: &str) {
@@ -890,5 +963,19 @@ mod tests {
         let response = execute_query(request, &RwLock::new(Database::new()), Instant::now());
         assert_eq!(response.status, 408);
         assert!(response.body.windows(8).any(|value| value == b"deadline"));
+    }
+
+    #[test]
+    fn stalled_reader_cannot_extend_an_absolute_write_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let _client = TcpStream::connect(address).expect("connect stalled reader");
+        let (mut server, _) = listener.accept().expect("accept stalled reader");
+        let payload = vec![0_u8; 16 * 1024 * 1024];
+        let started = Instant::now();
+        let error = write_all_until(&mut server, &payload, started + Duration::from_millis(100))
+            .expect_err("stalled reader must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

@@ -276,6 +276,11 @@ fn malformed_and_oversized_requests_are_bounded_errors() {
     let unacceptable = server.request("POST", "/query", Some("text/html"), b"SELECT 1");
     assert_eq!(unacceptable.status, 406);
 
+    let dense_tokens = ";".repeat(70_000);
+    let dense = server.request("POST", "/query", None, dense_tokens.as_bytes());
+    assert_eq!(dense.status, 422);
+    assert!(dense.body.contains("more than 65536 tokens"));
+
     let declared_size = MAX_REQUEST_BODY_BYTES + 1;
     let oversized = server.raw_request(
         format!(
@@ -358,6 +363,8 @@ fn execution_and_aggregate_results_are_limited() {
     assert_eq!(response.status, 422);
     assert!(response.body.contains("resource limit exceeded"));
 
+    drop(server);
+    let server = TestServer::start();
     let values = std::iter::repeat_n("(1)", 10_001)
         .collect::<Vec<_>>()
         .join(",");
@@ -372,24 +379,41 @@ fn execution_and_aggregate_results_are_limited() {
     assert_eq!(response.status, 422);
     assert!(response.body.contains("more than 10000 result rows"));
 
-    let more_values = std::iter::repeat_n("(2)", 90_000)
+    let more_values = std::iter::repeat_n("(2)", 9_999)
         .collect::<Vec<_>>()
         .join(",");
     let insert = format!("INSERT INTO rows VALUES {more_values}");
+    for _ in 0..9 {
+        assert_eq!(
+            server
+                .request("POST", "/query", None, insert.as_bytes())
+                .status,
+            200
+        );
+    }
     assert_eq!(
         server
-            .request("POST", "/query", None, insert.as_bytes())
+            .request(
+                "POST",
+                "/query",
+                None,
+                b"INSERT INTO rows VALUES (2),(2),(2),(2),(2),(2),(2),(2)",
+            )
             .status,
         200
     );
+    let rejected = server.request("POST", "/query", None, b"INSERT INTO rows VALUES (3)");
+    assert_eq!(rejected.status, 422);
+    assert!(rejected.body.contains("retains more than 100000 rows"));
+
     let response = server.request(
         "POST",
         "/query",
         None,
         b"SELECT COUNT(*) AS count FROM rows",
     );
-    assert_eq!(response.status, 422);
-    assert!(response.body.contains("scans more than 100000 table rows"));
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("\"rows\":[[100000]]"));
     assert_eq!(server.request("GET", "/health", None, b"").status, 200);
 }
 

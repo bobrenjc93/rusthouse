@@ -15,6 +15,7 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    retained: RetainedState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,110 @@ pub(crate) struct ExecutionBudgetLimits {
     pub result_cells: usize,
     pub materialized_bytes: usize,
     pub result_columns: usize,
+}
+
+#[derive(Debug, Default)]
+struct RetainedState {
+    tables: usize,
+    rows: usize,
+    cells: usize,
+    value_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetainedGrowth {
+    tables: usize,
+    rows: usize,
+    cells: usize,
+    value_bytes: usize,
+}
+
+pub(crate) struct RetainedStateLimits {
+    pub tables: usize,
+    pub rows: usize,
+    pub cells: usize,
+    pub value_bytes: usize,
+}
+
+impl RetainedState {
+    fn check_growth(&self, growth: RetainedGrowth, limits: &RetainedStateLimits) -> Result<()> {
+        Self::check(
+            self.tables,
+            growth.tables,
+            limits.tables,
+            "database retains more than 64 tables",
+        )?;
+        Self::check(
+            self.rows,
+            growth.rows,
+            limits.rows,
+            "database retains more than 100000 rows",
+        )?;
+        Self::check(
+            self.cells,
+            growth.cells,
+            limits.cells,
+            "database retains more than 1000000 cells",
+        )?;
+        Self::check(
+            self.value_bytes,
+            growth.value_bytes,
+            limits.value_bytes,
+            "database retains more than 33554432 value bytes",
+        )
+    }
+
+    fn check(current: usize, added: usize, maximum: usize, message: &'static str) -> Result<()> {
+        if current
+            .checked_add(added)
+            .is_none_or(|total| total > maximum)
+        {
+            Err(Error::ResourceLimit(message.to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn apply(&mut self, growth: RetainedGrowth) {
+        self.tables = self.tables.saturating_add(growth.tables);
+        self.rows = self.rows.saturating_add(growth.rows);
+        self.cells = self.cells.saturating_add(growth.cells);
+        self.value_bytes = self.value_bytes.saturating_add(growth.value_bytes);
+    }
+}
+
+fn create_growth(name: &str, columns: &[crate::storage::ColumnDef]) -> RetainedGrowth {
+    RetainedGrowth {
+        tables: 1,
+        rows: 0,
+        cells: 0,
+        value_bytes: name.len()
+            + columns
+                .iter()
+                .map(|column| column.name.len())
+                .sum::<usize>(),
+    }
+}
+
+fn insert_growth(rows: &[Vec<Value>]) -> Result<RetainedGrowth> {
+    let mut cells = 0_usize;
+    let mut value_bytes = 0_usize;
+    for row in rows {
+        cells = cells
+            .checked_add(row.len())
+            .ok_or_else(|| Error::ResourceLimit("INSERT cell count overflow".to_owned()))?;
+        for value in row {
+            value_bytes = value_bytes
+                .checked_add(value.materialized_size())
+                .ok_or_else(|| Error::ResourceLimit("INSERT value size overflow".to_owned()))?;
+        }
+    }
+    Ok(RetainedGrowth {
+        tables: 0,
+        rows: rows.len(),
+        cells,
+        value_bytes,
+    })
 }
 
 impl ExecutionBudget {
@@ -186,12 +291,16 @@ impl Database {
         &mut self,
         statement: Statement,
         budget: &mut ExecutionBudget,
+        retained_limits: &RetainedStateLimits,
     ) -> Result<StatementResult> {
         budget.checkpoint()?;
         match statement {
             Statement::CreateTable { name, columns } => {
                 budget.charge_mutation(columns.len())?;
+                let growth = create_growth(&name, &columns);
+                self.retained.check_growth(growth, retained_limits)?;
                 self.catalog.create_table(name, columns)?;
+                self.retained.apply(growth);
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -199,12 +308,8 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                let cells = rows.iter().try_fold(0_usize, |total, row| {
-                    total.checked_add(row.len()).ok_or_else(|| {
-                        Error::ResourceLimit("INSERT cell count overflow".to_owned())
-                    })
-                })?;
-                budget.charge_mutation(cells)?;
+                let growth = insert_growth(&rows)?;
+                budget.charge_mutation(growth.cells)?;
                 {
                     let target = self.catalog.table(&table)?;
                     for (index, row) in rows.iter().enumerate() {
@@ -215,10 +320,12 @@ impl Database {
                     }
                 }
                 budget.checkpoint()?;
+                self.retained.check_growth(growth, retained_limits)?;
                 let target = self.catalog.table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
                 }
+                self.retained.apply(growth);
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
@@ -249,7 +356,9 @@ impl Database {
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
+                let growth = create_growth(&name, &columns);
                 self.catalog.create_table(name, columns)?;
+                self.retained.apply(growth);
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -257,6 +366,7 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
+                let growth = insert_growth(&rows)?;
                 {
                     let target = self.catalog.table(&table)?;
                     for row in &rows {
@@ -267,6 +377,7 @@ impl Database {
                 for row in rows {
                     target.insert_row(row)?;
                 }
+                self.retained.apply(growth);
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
@@ -306,8 +417,10 @@ impl Database {
                 .and_then(|width| width.checked_add(ordering.len()))
                 .and_then(|width| width.checked_add(predicate_nodes))
                 .and_then(|width| {
-                    let sort_columns = if grouped {
+                    let sort_columns = if !group_columns.is_empty() {
                         ordering.len().checked_add(group_columns.len().max(1))?
+                    } else if grouped {
+                        0
                     } else {
                         ordering.len()
                     };
@@ -359,7 +472,8 @@ impl Database {
                 &items,
                 &ordering,
                 select.limit,
-            );
+                budget.as_deref_mut(),
+            )?;
             if let Some(budget) = budget.as_deref_mut() {
                 budget.checkpoint()?;
                 budget.reserve_result(selected_groups.len(), items.len())?;
@@ -369,7 +483,14 @@ impl Database {
             if let Some(budget) = budget.as_deref_mut() {
                 budget.checkpoint()?;
             }
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &items,
+                &ordering,
+                select.limit,
+                budget.as_deref_mut(),
+            )?;
             if let Some(budget) = budget.as_deref_mut() {
                 budget.checkpoint()?;
                 budget.reserve_result(matching_rows.len(), items.len())?;
@@ -997,15 +1118,16 @@ fn order_source_rows(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
+    budget: Option<&mut ExecutionBudget>,
+) -> Result<()> {
     if ordering.is_empty() {
         if let Some(limit) = limit {
             rows.truncate(limit);
         }
-        return;
+        return Ok(());
     }
 
-    sort_and_limit(rows, limit, |left, right| {
+    let compare = |left: usize, right: usize| {
         for order in ordering {
             let ResolvedItem::Column { source, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
@@ -1020,7 +1142,13 @@ fn order_source_rows(
             }
         }
         left.cmp(&right)
-    });
+    };
+    if let Some(budget) = budget {
+        sort_and_limit_bounded(rows, limit, compare, budget)
+    } else {
+        sort_and_limit(rows, limit, compare);
+        Ok(())
+    }
 }
 
 fn order_grouped_rows(
@@ -1029,8 +1157,9 @@ fn order_grouped_rows(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
-    sort_and_limit(groups, limit, |left, right| {
+    budget: Option<&mut ExecutionBudget>,
+) -> Result<()> {
+    let compare = |left: usize, right: usize| {
         for order in ordering {
             let comparison = match items[order.output] {
                 ResolvedItem::Column {
@@ -1056,7 +1185,13 @@ fn order_grouped_rows(
             }
         }
         data.keys[left].cmp(&data.keys[right])
-    });
+    };
+    if let Some(budget) = budget {
+        sort_and_limit_bounded(groups, limit, compare, budget)
+    } else {
+        sort_and_limit(groups, limit, compare);
+        Ok(())
+    }
 }
 
 fn sort_and_limit(
@@ -1073,6 +1208,66 @@ fn sort_and_limit(
         indices.truncate(limit);
     }
     indices.sort_unstable_by(|left, right| compare(*left, *right));
+}
+
+fn sort_and_limit_bounded(
+    indices: &mut Vec<usize>,
+    limit: Option<usize>,
+    compare: impl Fn(usize, usize) -> Ordering,
+    budget: &ExecutionBudget,
+) -> Result<()> {
+    if let Some(0) = limit {
+        indices.clear();
+        return Ok(());
+    }
+    budget.checkpoint()?;
+    if indices.len() < 2 {
+        return Ok(());
+    }
+
+    let mut source = std::mem::take(indices);
+    let mut target = vec![0; source.len()];
+    let mut width = 1_usize;
+    while width < source.len() {
+        let mut start = 0_usize;
+        while start < source.len() {
+            budget.checkpoint()?;
+            let middle = start.saturating_add(width).min(source.len());
+            let end = start
+                .saturating_add(width.saturating_mul(2))
+                .min(source.len());
+            let (mut left, mut right, mut output) = (start, middle, start);
+            while left < middle && right < end {
+                budget.checkpoint()?;
+                if compare(source[left], source[right]) != Ordering::Greater {
+                    target[output] = source[left];
+                    left += 1;
+                } else {
+                    target[output] = source[right];
+                    right += 1;
+                }
+                output += 1;
+            }
+            while left < middle {
+                target[output] = source[left];
+                left += 1;
+                output += 1;
+            }
+            while right < end {
+                target[output] = source[right];
+                right += 1;
+                output += 1;
+            }
+            start = end;
+        }
+        std::mem::swap(&mut source, &mut target);
+        width = width.saturating_mul(2);
+    }
+    if let Some(limit) = limit {
+        source.truncate(limit);
+    }
+    *indices = source;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1193,6 +1388,8 @@ fn comparable(left: DataType, right: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
@@ -1200,6 +1397,35 @@ mod tests {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
         }
+    }
+
+    #[test]
+    fn bounded_sort_stops_when_its_deadline_expires() {
+        let mut indices = (0..256).rev().collect::<Vec<_>>();
+        let budget = ExecutionBudget::new(ExecutionBudgetLimits {
+            deadline: Instant::now() + Duration::from_millis(10),
+            scanned_rows: usize::MAX,
+            work_units: usize::MAX,
+            groups: usize::MAX,
+            result_rows: usize::MAX,
+            result_cells: usize::MAX,
+            materialized_bytes: usize::MAX,
+            result_columns: usize::MAX,
+        });
+        let comparisons = Cell::new(0_usize);
+        let error = sort_and_limit_bounded(
+            &mut indices,
+            None,
+            |left, right| {
+                comparisons.set(comparisons.get() + 1);
+                std::thread::sleep(Duration::from_millis(2));
+                left.cmp(&right)
+            },
+            &budget,
+        )
+        .expect_err("sort must observe its deadline");
+        assert_eq!(error, Error::ExecutionTimeout);
+        assert!(comparisons.get() < 20);
     }
 
     #[test]

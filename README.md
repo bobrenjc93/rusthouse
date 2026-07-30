@@ -82,7 +82,9 @@ curl http://127.0.0.1:8080/health
 
 The query endpoint requires `Content-Type: application/sql` and rejects requests containing an `Origin` header. This non-simple media type plus the absence of CORS preflight support prevents browser cross-origin form and fetch requests from reaching mutable SQL execution.
 
-The server parses a batch before locking the database. Batches containing only `SELECT` statements share a read lock; any batch containing `CREATE` or `INSERT` holds the exclusive write lock through the complete batch. The service caps bodies at 1 MiB, headers at 16 KiB, accepted connections at 128, request workers at 8, statements per batch at 32, scanned rows at 100,000, intermediate groups and result rows at 10,000, result cells at 100,000, materialized result values at 2 MiB, and encoded responses at 4 MiB. Queueing, request reads, lock acquisition, execution, rendering, and successful response writes share a 10-second deadline. SIGINT and SIGTERM stop accepting connections and drain bounded accepted work before exit.
+The server parses a batch before locking the database. Batches containing only `SELECT` statements share a read lock; any batch containing `CREATE` or `INSERT` holds the exclusive write lock through the complete batch. The service caps bodies at 1 MiB, headers at 16 KiB, SQL tokens at 65,536, accepted connections at 128, request workers at 8, statements per batch at 32, scanned rows at 100,000, intermediate groups and result rows at 10,000, result cells at 100,000, materialized result values at 2 MiB, and encoded responses at 4 MiB.
+
+Retained state is capped across requests at 64 tables, 100,000 total rows, 1,000,000 cells, and 32 MiB of stored value data. CREATE and INSERT check retained growth before mutation, so a limit error does not partially change state. Queueing, request reads, lock acquisition, execution (including sorting), rendering, and successful response writes share an absolute 10-second deadline; timeout errors have a bounded 250 ms write grace. SIGINT and SIGTERM stop accepting connections and drain bounded accepted work before exit.
 
 ## Library API
 
