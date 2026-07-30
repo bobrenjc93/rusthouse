@@ -111,6 +111,26 @@ fn sql_errors_are_reported_with_nonzero_status() {
 }
 
 #[test]
+fn compact_integers_render_with_exact_json_types_and_numbers() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE compact (signed Int8, unsigned UInt32);
+             INSERT INTO compact VALUES (-128, 4294967295);
+             SELECT signed, unsigned, SUM(unsigned) AS total FROM compact GROUP BY signed, unsigned;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"signed\",\"type\":\"Int8\"},{\"name\":\"unsigned\",\"type\":\"UInt32\"},{\"name\":\"total\",\"type\":\"UInt64\"}],\"rows\":[[-128,4294967295,4294967295]]}]}\n"
+    );
+}
+
+#[test]
 fn excessive_predicates_return_cli_errors_without_aborting() {
     let cases = [
         (

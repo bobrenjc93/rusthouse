@@ -1,15 +1,15 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column, including width-specific vectors for signed and unsigned integers.
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- CREATE TABLE with Int8/16/32/64, UInt8/16/32/64, Float64, Bool, and String columns
+- multi-row INSERT INTO ... VALUES with row-width validation and checked integer-literal coercion
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- COUNT, SUM, MIN, MAX, and AVG, with signed SUM widening to Int64 and unsigned SUM widening to UInt64
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
@@ -86,6 +86,8 @@ RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted i
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+
+Integral SQL literals are coerced to an integer column's declared width only when the value is in range. A failed value rejects the complete multi-row INSERT before any physical column is changed. Numeric predicates compare signed integers, unsigned integers, and Float64 values without first converting integers to floating point.
 
 ## Development
 

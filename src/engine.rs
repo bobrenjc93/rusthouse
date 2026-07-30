@@ -7,7 +7,7 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -71,12 +71,12 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
+                let rows = {
                     let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
+                    rows.into_iter()
+                        .map(|row| target.prepare_row(row))
+                        .collect::<Result<Vec<_>>>()?
+                };
                 let target = self.catalog.table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
@@ -276,12 +276,12 @@ fn resolve_select_items(
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+        && !input_type.is_some_and(DataType::is_numeric)
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
             context: format!("{} argument", function.name()),
-            expected: "Int64 or Float64".to_owned(),
+            expected: "an integer type or Float64".to_owned(),
             actual,
         });
     }
@@ -292,6 +292,16 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     match function {
         AggregateFunction::Count => DataType::Int64,
         AggregateFunction::Avg => DataType::Float64,
+        AggregateFunction::Sum
+            if input_type
+                .expect("validated column argument")
+                .is_signed_integer() =>
+        {
+            DataType::Int64
+        }
+        AggregateFunction::Sum if input_type.expect("validated column argument").is_integer() => {
+            DataType::UInt64
+        }
         AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
             input_type.expect("validated column argument")
         }
@@ -524,7 +534,8 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
+    SumSigned(i64),
+    SumUnsigned(u64),
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
@@ -536,11 +547,16 @@ impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
+            AggregateFunction::Sum if spec.input_type.is_some_and(DataType::is_signed_integer) => {
+                Self::SumSigned(0)
+            }
+            AggregateFunction::Sum if spec.input_type.is_some_and(DataType::is_integer) => {
+                Self::SumUnsigned(0)
+            }
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+            AggregateFunction::Avg if spec.input_type.is_some_and(DataType::is_integer) => {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
@@ -554,22 +570,33 @@ impl AggregateState {
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
-            Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
-                };
+            Self::SumSigned(sum) => {
+                let value = table.columns()[spec.argument.expect("SUM argument")]
+                    .value_ref(row)
+                    .integer()
+                    .expect("SUM input type is resolved");
+                let value = i64::try_from(value).expect("signed input fits Int64");
                 *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                    .checked_add(value)
+                    .ok_or_else(|| Error::NumericOverflow("SUM(signed integer)".to_owned()))?;
+            }
+            Self::SumUnsigned(sum) => {
+                let value = table.columns()[spec.argument.expect("SUM argument")]
+                    .value_ref(row)
+                    .integer()
+                    .expect("SUM input type is resolved");
+                let value = u64::try_from(value).expect("unsigned input fits UInt64");
+                *sum = sum
+                    .checked_add(value)
+                    .ok_or_else(|| Error::NumericOverflow("SUM(unsigned integer)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Float64(value) =
+                    table.columns()[spec.argument.expect("SUM argument")].value_ref(row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
@@ -595,24 +622,24 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
-                else {
-                    unreachable!("AVG input type is resolved")
-                };
+                let value = table.columns()[spec.argument.expect("AVG argument")]
+                    .value_ref(row)
+                    .integer()
+                    .expect("AVG input type is resolved");
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
-                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+                    .checked_add(value)
+                    .ok_or_else(|| Error::NumericOverflow("AVG(integer) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Float64(value) =
+                    table.columns()[spec.argument.expect("AVG argument")].value_ref(row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -626,7 +653,8 @@ impl AggregateState {
 
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
+            Self::Count(value) | Self::SumSigned(value) => Ok(Value::Int64(value)),
+            Self::SumUnsigned(value) => Ok(Value::UInt64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
@@ -875,11 +903,7 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
 }
 
 fn comparable(left: DataType, right: DataType) -> bool {
-    left == right
-        || matches!(
-            (left, right),
-            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
-        )
+    left == right || (left.is_numeric() && right.is_numeric())
 }
 
 #[cfg(test)]

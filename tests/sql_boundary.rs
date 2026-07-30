@@ -371,8 +371,215 @@ fn invalid_grouping_and_aggregate_types_are_rejected() {
             expected,
             actual,
             ..
-        } if expected == "Int64 or Float64" && actual == "String"
+        } if expected == "an integer type or Float64" && actual == "String"
     ));
+}
+
+#[test]
+fn compact_integer_boundaries_round_trip_with_physical_types() {
+    let mut database = Database::new();
+    let result = execute_query(
+        &mut database,
+        "CREATE TABLE compact (
+            i8 Int8, i16 Int16, i32 Int32,
+            u8 UInt8, u16 UInt16, u32 UInt32
+         );
+         INSERT INTO compact VALUES
+            (-128, -32768, -2147483648, 0, 0, 0),
+            (127, 32767, 2147483647, 255, 65535, 4294967295);
+         SELECT * FROM compact ORDER BY i8;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int8(i8::MIN),
+                Value::Int16(i16::MIN),
+                Value::Int32(i32::MIN),
+                Value::UInt8(u8::MIN),
+                Value::UInt16(u16::MIN),
+                Value::UInt32(u32::MIN),
+            ],
+            vec![
+                Value::Int8(i8::MAX),
+                Value::Int16(i16::MAX),
+                Value::Int32(i32::MAX),
+                Value::UInt8(u8::MAX),
+                Value::UInt16(u16::MAX),
+                Value::UInt32(u32::MAX),
+            ],
+        ]
+    );
+
+    use rusthouse::storage::Column;
+    let columns = database
+        .catalog()
+        .table("compact")
+        .expect("table exists")
+        .columns();
+    assert!(matches!(columns[0], Column::Int8(_)));
+    assert!(matches!(columns[1], Column::Int16(_)));
+    assert!(matches!(columns[2], Column::Int32(_)));
+    assert!(matches!(columns[3], Column::UInt8(_)));
+    assert!(matches!(columns[4], Column::UInt16(_)));
+    assert!(matches!(columns[5], Column::UInt32(_)));
+}
+
+#[test]
+fn compact_integer_literal_overflow_is_typed_and_atomic() {
+    let invalid_literals = [
+        ("Int8", "-129"),
+        ("Int8", "128"),
+        ("Int16", "-32769"),
+        ("Int16", "32768"),
+        ("Int32", "-2147483649"),
+        ("Int32", "2147483648"),
+        ("UInt8", "-1"),
+        ("UInt8", "256"),
+        ("UInt16", "-1"),
+        ("UInt16", "65536"),
+        ("UInt32", "-1"),
+        ("UInt32", "4294967296"),
+    ];
+
+    for (data_type, literal) in invalid_literals {
+        let mut database = Database::new();
+        database
+            .execute(&format!("CREATE TABLE bounds (value {data_type})"))
+            .expect("table creation succeeds");
+        let error = database
+            .execute(&format!("INSERT INTO bounds VALUES (0), ({literal})"))
+            .expect_err("out-of-range literal is rejected");
+        assert!(matches!(
+            error,
+            Error::IntegerOutOfRange { target, .. } if target.to_string() == data_type
+        ));
+        assert_eq!(
+            database
+                .catalog()
+                .table("bounds")
+                .expect("table remains")
+                .row_count(),
+            0,
+            "failed batch mutated {data_type}"
+        );
+    }
+}
+
+#[test]
+fn mixed_integer_and_float_predicates_compare_exactly() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numeric_mix (small Int8, unsigned UInt32, wide UInt64, rounded Float64);
+             INSERT INTO numeric_mix VALUES
+                (-1, 0, 9007199254740993, 9007199254740992.0),
+                (1, 1, 9007199254740992, 9007199254740992.0);",
+        )
+        .expect("setup succeeds");
+
+    let exact = execute_query(
+        &mut database,
+        "SELECT small, wide FROM numeric_mix
+         WHERE small = unsigned AND wide = rounded;",
+    );
+    assert_eq!(
+        exact.rows,
+        vec![vec![Value::Int8(1), Value::UInt64(9_007_199_254_740_992),]]
+    );
+
+    let beyond_float_precision = execute_query(
+        &mut database,
+        "SELECT wide FROM numeric_mix WHERE wide > rounded;",
+    );
+    assert_eq!(
+        beyond_float_precision.rows,
+        vec![vec![Value::UInt64(9_007_199_254_740_993)]]
+    );
+}
+
+#[test]
+fn compact_integer_aggregates_use_clickhouse_widening() {
+    let mut database = Database::new();
+    let result = execute_query(
+        &mut database,
+        "CREATE TABLE integer_aggregates (
+            i8 Int8, i16 Int16, i32 Int32,
+            u8 UInt8, u16 UInt16, u32 UInt32
+         );
+         INSERT INTO integer_aggregates VALUES
+            (-5, -500, -50000, 5, 500, 50000),
+            (7, 700, 70000, 7, 700, 70000);
+         SELECT
+            SUM(i8) AS si8, SUM(i16) AS si16, SUM(i32) AS si32,
+            SUM(u8) AS su8, SUM(u16) AS su16, SUM(u32) AS su32,
+            MIN(i8) AS low, MAX(u32) AS high, AVG(u16) AS mean
+         FROM integer_aggregates;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::UInt64,
+            DataType::UInt64,
+            DataType::UInt64,
+            DataType::Int8,
+            DataType::UInt32,
+            DataType::Float64,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(2),
+            Value::Int64(200),
+            Value::Int64(20_000),
+            Value::UInt64(12),
+            Value::UInt64(1_200),
+            Value::UInt64(120_000),
+            Value::Int8(-5),
+            Value::UInt32(70_000),
+            Value::Float64(600.0),
+        ]]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "CREATE TABLE empty_integers (signed Int8, unsigned UInt8);
+         SELECT SUM(signed) AS signed, SUM(unsigned) AS unsigned FROM empty_integers;",
+    );
+    assert_eq!(
+        empty
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::Int64, DataType::UInt64]
+    );
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::UInt64(0)]]);
 }
 
 #[test]

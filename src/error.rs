@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::value::DataType;
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -27,6 +29,11 @@ pub enum Error {
         context: String,
         expected: String,
         actual: String,
+    },
+    IntegerOutOfRange {
+        value: String,
+        target: DataType,
+        context: String,
     },
     InvalidQuery(String),
     NumericOverflow(String),
@@ -68,6 +75,14 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
+            ),
+            Self::IntegerOutOfRange {
+                value,
+                target,
+                context,
+            } => write!(
+                f,
+                "integer literal {value} is out of range for {target} in {context}"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {

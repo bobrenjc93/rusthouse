@@ -401,7 +401,7 @@ impl Parser {
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected an integer type, Float64, Bool, or String"
                 ),
             })?;
             columns.push(ColumnDef {
@@ -656,12 +656,22 @@ impl Parser {
                 }
                 return Ok(Value::Float64(value));
             }
+            if negative {
+                return signed
+                    .parse::<i64>()
+                    .map(Value::Int64)
+                    .map_err(|_| Error::Sql {
+                        position: self.position(),
+                        message: format!("invalid integer literal '{signed}'"),
+                    });
+            }
             return signed
                 .parse::<i64>()
                 .map(Value::Int64)
+                .or_else(|_| signed.parse::<u64>().map(Value::UInt64))
                 .map_err(|_| Error::Sql {
                     position: self.position(),
-                    message: format!("invalid Int64 literal '{signed}'"),
+                    message: format!("invalid integer literal '{signed}'"),
                 });
         }
         if negative {
@@ -673,7 +683,7 @@ impl Parser {
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an integer, Float64, Bool, or String literal")
         }
     }
 
