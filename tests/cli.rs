@@ -1,5 +1,33 @@
+use std::fs;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn run_with_stdin(arguments: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn CLI");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(input.as_bytes())
+        .expect("write CLI input");
+    child.wait_with_output().expect("wait for CLI")
+}
+
+fn temp_sql_path() -> PathBuf {
+    let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("rusthouse-cli-{}-{id}.sql", std::process::id()))
+}
 
 #[test]
 fn execute_argument_emits_clean_json_and_command_statuses() {
@@ -153,4 +181,73 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         );
         assert!(!stderr.contains("stack overflow"));
     }
+}
+
+#[test]
+fn interactive_session_keeps_state_and_continues_after_sql_errors() {
+    let output = run_with_stdin(
+        &["--interactive", "--format", "csv"],
+        "CREATE TABLE notes (\n\
+             label String,\n\
+             n Int64\n\
+         );\n\
+         INSERT INTO notes VALUES ('semi;colon', 1); -- not a boundary ;\n\
+         SELECT missing FROM notes;\n\
+         INSERT INTO notes VALUES ('after error', 2);\n\
+         SELECT label, n FROM notes ORDER BY n;\n\
+         \\q\n\
+         SELECT label FROM notes;\n",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    assert_eq!(stdout, "label,n\nsemi;colon,1\nafter error,2\n");
+    assert!(!stdout.contains("rusthouse>"));
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("rusthouse> "));
+    assert!(stderr.contains("        -> "));
+    assert!(stderr.contains("column 'missing' does not exist"));
+    assert!(stderr.contains("INSERT 1"));
+}
+
+#[test]
+fn interactive_commands_change_format_read_files_and_quit() {
+    let path = temp_sql_path();
+    fs::write(
+        &path,
+        "CREATE TABLE loaded (id Int64, label String);\n\
+         INSERT INTO loaded VALUES (2, 'from;file'), (1, 'first')",
+    )
+    .expect("write SQL file");
+
+    let input = format!(
+        "\\read {}\n\
+         \\format json\n\
+         SELECT id FROM loaded ORDER BY id;\n\
+         \\format invalid\n\
+         \\format csv\n\
+         SELECT label FROM loaded ORDER BY label;\n\
+         \\q\n\
+         SELECT id FROM loaded;\n",
+        path.display()
+    );
+    let output = run_with_stdin(&["--interactive"], &input);
+    fs::remove_file(&path).expect("remove SQL file");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    assert_eq!(
+        stdout,
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1],[2]]}]}\n\
+         label\n\
+         first\n\
+         from;file\n"
+    );
+    assert!(!stdout.contains("rusthouse>"));
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("CREATE TABLE"));
+    assert!(stderr.contains("INSERT 2"));
+    assert!(stderr.contains("unknown output format 'invalid'"));
 }

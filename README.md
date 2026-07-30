@@ -13,7 +13,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
-- SQL input from --execute or standard input
+- SQL input from --execute, piped standard input, or an interactive shell
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
@@ -55,7 +55,17 @@ printf '%s\n' \
 ~~~
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
-JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
+In batch mode, JSON output is one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value. The interactive shell emits one JSON document for each completed statement that returns query data.
+
+With terminal input, RustHouse starts a stateful interactive shell automatically. Use
+`--interactive` to force shell behavior for non-terminal input. Statements may span
+multiple lines and run when a semicolon outside a string literal or line comment is
+read. SQL errors do not end the session.
+
+The shell supports `\q` to quit, `\format [table|csv|json]` to show or change the
+output format, and `\read <path>` to execute a SQL file in the current session.
+Prompts, command acknowledgements, and errors go to stderr; query results stay on
+stdout.
 
 ## Library API
 
