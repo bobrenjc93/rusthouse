@@ -11,7 +11,9 @@ pub struct ColumnDef {
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
+    ["TRUE", "FALSE", "NULL", "DISTINCT"]
+        .iter()
+        .any(|keyword| name.eq_ignore_ascii_case(keyword))
 }
 
 /// A physical column. Each variant owns a contiguous vector of one Rust type.
@@ -73,10 +75,6 @@ impl Column {
         }
     }
 
-    pub(crate) fn cmp_at(&self, left: usize, right: usize) -> std::cmp::Ordering {
-        self.value_ref(left).cmp(&self.value_ref(right))
-    }
-
     fn push(&mut self, value: Value) {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(value),
@@ -84,6 +82,15 @@ impl Column {
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
             _ => unreachable!("values are validated before insertion"),
+        }
+    }
+
+    fn push_null_placeholder(&mut self) {
+        match self {
+            Self::Int64(values) => values.push(0),
+            Self::Float64(values) => values.push(0.0),
+            Self::Bool(values) => values.push(false),
+            Self::String(values) => values.push(String::new()),
         }
     }
 }
@@ -94,6 +101,7 @@ pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
+    nulls: Vec<Vec<bool>>,
     row_count: usize,
 }
 
@@ -119,11 +127,13 @@ impl Table {
         let columns = schema
             .iter()
             .map(|field| Column::new(field.data_type))
-            .collect();
+            .collect::<Vec<_>>();
+        let nulls = (0..columns.len()).map(|_| Vec::new()).collect();
         Ok(Self {
             name,
             schema,
             columns,
+            nulls,
             row_count: 0,
         })
     }
@@ -148,6 +158,24 @@ impl Table {
         self.row_count
     }
 
+    #[must_use]
+    pub fn value(&self, column: usize, row: usize) -> Value {
+        self.value_ref(column, row).to_owned()
+    }
+
+    pub(crate) fn value_ref(&self, column: usize, row: usize) -> ValueRef<'_> {
+        if self.nulls[column][row] {
+            ValueRef::Null
+        } else {
+            self.columns[column].value_ref(row)
+        }
+    }
+
+    pub(crate) fn cmp_at(&self, column: usize, left: usize, right: usize) -> std::cmp::Ordering {
+        self.value_ref(column, left)
+            .cmp(&self.value_ref(column, right))
+    }
+
     pub fn column_index(&self, name: &str) -> Result<usize> {
         self.schema
             .iter()
@@ -169,11 +197,16 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            if value
+                .data_type()
+                .is_some_and(|data_type| field.data_type != data_type)
+            {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: value
+                        .data_type()
+                        .map_or_else(|| "NULL".to_owned(), |data_type| data_type.to_string()),
                 });
             }
             if matches!(value, Value::Float64(number) if !number.is_finite()) {
@@ -190,8 +223,14 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
-        for (column, value) in self.columns.iter_mut().zip(row) {
-            column.push(value);
+        for (index, (column, value)) in self.columns.iter_mut().zip(row).enumerate() {
+            if value == Value::Null {
+                column.push_null_placeholder();
+                self.nulls[index].push(true);
+            } else {
+                column.push(value);
+                self.nulls[index].push(false);
+            }
         }
         self.row_count += 1;
         Ok(())
@@ -240,5 +279,18 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn stores_nulls_in_validity_bits_without_erasing_column_types() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Null, Value::Null])
+            .expect("NULL is valid for every column type");
+
+        assert_eq!(table.value(0, 0), Value::Null);
+        assert_eq!(table.value(1, 0), Value::Null);
+        assert!(matches!(&table.columns()[0], Column::Int64(values) if values == &[0]));
+        assert!(matches!(&table.columns()[1], Column::String(values) if values == &[""]));
     }
 }

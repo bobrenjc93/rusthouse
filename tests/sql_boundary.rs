@@ -284,7 +284,7 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -522,5 +522,158 @@ fn creates_a_fifty_thousand_column_schema() {
             .schema()
             .len(),
         column_count
+    );
+}
+
+#[test]
+fn row_distinct_deduplicates_before_order_and_limit_with_aliases_and_nulls() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE labels (name String, rank Int64);
+             INSERT INTO labels VALUES
+                ('z', NULL), ('z', NULL), ('a', 1), ('b', 2), ('a', 1);",
+        )
+        .expect("setup succeeds");
+
+    let names = execute_query(
+        &mut database,
+        "SELECT DISTINCT name AS label FROM labels ORDER BY label LIMIT 2;",
+    );
+    assert_eq!(
+        names.rows,
+        vec![
+            vec![Value::String("a".to_owned())],
+            vec![Value::String("b".to_owned())],
+        ]
+    );
+
+    let ranks = execute_query(
+        &mut database,
+        "SELECT DISTINCT rank AS value FROM labels ORDER BY value;",
+    );
+    assert_eq!(
+        ranks.rows,
+        vec![
+            vec![Value::Null],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
+fn distinct_aggregates_ignore_nulls_and_are_isolated_per_group() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (site String, value Int64);
+             INSERT INTO readings VALUES
+                ('a', 1), ('a', 1), ('a', 2), ('a', NULL),
+                ('b', 2), ('b', 2), ('b', 3), ('b', NULL),
+                ('empty', NULL), ('empty', NULL);",
+        )
+        .expect("setup succeeds");
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT site,
+                COUNT(DISTINCT value) AS unique_count,
+                SUM(DISTINCT value) AS unique_sum,
+                AVG(DISTINCT value) AS unique_mean
+         FROM readings GROUP BY site ORDER BY site;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Int64(3),
+                Value::Float64(1.5),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(2),
+                Value::Int64(5),
+                Value::Float64(2.5),
+            ],
+            vec![
+                Value::String("empty".to_owned()),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT COUNT(DISTINCT value) AS n,
+                MIN(DISTINCT value) AS low,
+                MAX(DISTINCT value) AS high
+         FROM readings WHERE site = 'missing';",
+    );
+    assert_eq!(
+        empty.rows,
+        vec![vec![Value::Int64(0), Value::Null, Value::Null]]
+    );
+}
+
+#[test]
+fn row_distinct_uses_typed_tuple_keys_without_delimiter_collisions() {
+    let mut database = Database::new();
+    let mut rows = Vec::new();
+    for index in 0..2_000 {
+        rows.push(format!("('left|{index}', '{index}|right')"));
+        rows.push(format!("('left|{index}', '{index}|right')"));
+    }
+    rows.extend([
+        "('a|b', 'c')".to_owned(),
+        "('a', 'b|c')".to_owned(),
+        "('|', '')".to_owned(),
+        "('', '|')".to_owned(),
+    ]);
+    database
+        .execute(&format!(
+            "CREATE TABLE pairs (left_value String, right_value String); \
+             INSERT INTO pairs VALUES {};",
+            rows.join(",")
+        ))
+        .expect("collision-heavy setup succeeds");
+
+    let distinct = execute_query(
+        &mut database,
+        "SELECT DISTINCT left_value AS value, right_value AS value FROM pairs;",
+    );
+    assert_eq!(distinct.rows.len(), 2_004);
+    assert!(distinct.rows.contains(&vec![
+        Value::String("a|b".to_owned()),
+        Value::String("c".to_owned()),
+    ]));
+    assert!(distinct.rows.contains(&vec![
+        Value::String("a".to_owned()),
+        Value::String("b|c".to_owned()),
+    ]));
+}
+
+#[test]
+fn distinct_applies_to_final_grouped_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE group_sizes (group_name String, value Int64);
+             INSERT INTO group_sizes VALUES ('a', 1), ('b', 2), ('c', 3), ('c', 4);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT DISTINCT COUNT(*) AS size
+         FROM group_sizes GROUP BY group_name ORDER BY size DESC LIMIT 2;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(1)]]
     );
 }

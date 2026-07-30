@@ -46,10 +46,7 @@ impl fmt::Display for Error {
             Self::ReservedIdentifier {
                 identifier,
                 context,
-            } => write!(
-                f,
-                "{context} {identifier:?} is reserved; TRUE and FALSE are Boolean literals"
-            ),
+            } => write!(f, "{context} {identifier:?} is reserved by the SQL grammar"),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
             }

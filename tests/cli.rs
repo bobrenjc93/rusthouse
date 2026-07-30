@@ -66,6 +66,27 @@ fn positional_json_preserves_duplicate_alias_values() {
 }
 
 #[test]
+fn distinct_and_nulls_work_through_the_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE valueset (n Int64);
+             INSERT INTO valueset VALUES (2), (2), (NULL), (1);
+             SELECT DISTINCT n AS value FROM valueset ORDER BY value;
+             SELECT COUNT(DISTINCT n) AS unique_values FROM valueset;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"value\",\"type\":\"Int64\"}],\"rows\":[[null],[1],[2]]},{\"columns\":[{\"name\":\"unique_values\",\"type\":\"Int64\"}],\"rows\":[[2]]}]}\n"
+    );
+}
+
+#[test]
 fn stdin_and_csv_output_work_together() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(["--format", "csv"])

@@ -180,6 +180,7 @@ fn render_json(result: &QueryResult) -> String {
 
 fn write_json_value(output: &mut String, value: &Value) {
     match value {
+        Value::Null => output.push_str("null"),
         Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
@@ -268,6 +269,24 @@ mod tests {
             render(&result, OutputFormat::Json),
             r#"{"columns":[{"name":"id","type":"Int64"},{"name":"id","type":"String"}],"rows":[[1,"x"]]}"#
         );
+    }
+
+    #[test]
+    fn renders_null_in_every_output_format() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: vec![vec![Value::Null]],
+        };
+
+        assert_eq!(render(&result, OutputFormat::Csv), "value\nNULL\n");
+        assert_eq!(
+            render(&result, OutputFormat::Json),
+            r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[null]]}"#
+        );
+        assert!(render(&result, OutputFormat::Table).contains("| NULL  |"));
     }
 
     #[test]

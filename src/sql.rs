@@ -20,6 +20,7 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
@@ -79,6 +80,7 @@ impl AggregateFunction {
 pub enum AggregateArgument {
     Wildcard,
     Column(String),
+    DistinctColumn(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -442,6 +444,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        let distinct = self.eat_keyword("DISTINCT");
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -504,6 +507,7 @@ impl Parser {
         };
 
         Ok(Select {
+            distinct,
             items,
             table,
             predicate,
@@ -525,7 +529,14 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
-            let argument = if self.eat(&TokenKind::Star) {
+            let argument = if self.eat_keyword("DISTINCT") {
+                if self.eat(&TokenKind::Star) {
+                    return self.error("DISTINCT aggregate arguments must name a column");
+                }
+                AggregateArgument::DistinctColumn(
+                    self.expect_identifier("DISTINCT aggregate column")?,
+                )
+            } else if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
@@ -622,7 +633,9 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL") =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -672,8 +685,10 @@ impl Parser {
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
+        } else if self.eat_keyword("NULL") {
+            Ok(Value::Null)
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, or NULL literal")
         }
     }
 
@@ -767,6 +782,7 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(select.items.len(), 2);
+        assert!(!select.distinct);
         assert_eq!(select.group_by, ["region"]);
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
@@ -782,6 +798,37 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_row_and_aggregate_distinct() {
+        let statements =
+            parse("SELECT DISTINCT region AS area, COUNT(DISTINCT amount) AS amounts FROM sales")
+                .expect("valid DISTINCT query");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+
+        assert!(select.distinct);
+        assert!(matches!(
+            &select.items[1],
+            SelectItem::Aggregate {
+                argument: AggregateArgument::DistinctColumn(column),
+                alias: Some(alias),
+                ..
+            } if column == "amount" && alias == "amounts"
+        ));
+    }
+
+    #[test]
+    fn rejects_distinct_wildcard_aggregate_argument() {
+        let error = parse("SELECT COUNT(DISTINCT *) FROM sales")
+            .expect_err("DISTINCT * is not a scalar aggregate argument");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("DISTINCT aggregate arguments must name a column")
+        ));
     }
 
     #[test]

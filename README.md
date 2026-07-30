@@ -6,16 +6,16 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
-- SELECT * and named projections, with optional AS aliases
+- SELECT *, named projections, optional AS aliases, and row-level DISTINCT
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- COUNT, SUM, MIN, MAX, and AVG, including DISTINCT column arguments
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+Identifiers are unquoted and case-insensitive. Columns are nullable; NULL values form one DISTINCT or GROUP BY key, and column aggregates ignore them. String literals use single quotes; write a quote inside one as ''.
 
 ## CLI
 
@@ -81,11 +81,11 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no joins, arithmetic expressions, `IS NULL`, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+On empty or all-NULL input, COUNT returns numeric zero; SUM, MIN, MAX, and AVG return NULL.
 
 ## Development
 

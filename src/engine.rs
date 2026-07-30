@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -8,7 +8,7 @@ use crate::sql::{
     Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
-use crate::value::{DataType, Value, ValueRef};
+use crate::value::{DataType, SqlKeyRef, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
@@ -115,6 +115,9 @@ impl Database {
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            if select.distinct {
+                retain_distinct_grouped_rows(&mut selected_groups, &grouped, &items);
+            }
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -124,6 +127,9 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
+            if select.distinct {
+                retain_distinct_source_rows(&mut matching_rows, table, &items);
+            }
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
         };
@@ -151,6 +157,7 @@ struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+    distinct: bool,
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -234,7 +241,7 @@ fn resolve_select_items(
                 argument,
                 alias,
             } => {
-                let (argument_index, input_type, argument_name) = match argument {
+                let (argument_index, input_type, argument_name, distinct) = match argument {
                     AggregateArgument::Wildcard => {
                         if *function != AggregateFunction::Count {
                             return Err(Error::InvalidQuery(format!(
@@ -242,7 +249,7 @@ fn resolve_select_items(
                                 function.name()
                             )));
                         }
-                        (None, None, "*".to_owned())
+                        (None, None, "*".to_owned(), false)
                     }
                     AggregateArgument::Column(name) => {
                         let index = table.column_index(name)?;
@@ -250,6 +257,16 @@ fn resolve_select_items(
                             Some(index),
                             Some(table.schema()[index].data_type),
                             table.schema()[index].name.clone(),
+                            false,
+                        )
+                    }
+                    AggregateArgument::DistinctColumn(name) => {
+                        let index = table.column_index(name)?;
+                        (
+                            Some(index),
+                            Some(table.schema()[index].data_type),
+                            format!("DISTINCT {}", table.schema()[index].name),
+                            true,
                         )
                     }
                 };
@@ -259,6 +276,7 @@ fn resolve_select_items(
                     function: *function,
                     argument: argument_index,
                     input_type,
+                    distinct,
                 });
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
@@ -309,7 +327,7 @@ fn execute_projection(
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::Column { source, .. } => table.value(*source, *row),
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
@@ -317,6 +335,51 @@ fn execute_projection(
                 .collect()
         })
         .collect()
+}
+
+fn retain_distinct_source_rows(rows: &mut Vec<usize>, table: &Table, items: &[ResolvedItem]) {
+    let mut seen = HashSet::<Box<[SqlKeyRef<'_>]>>::with_capacity(rows.len().min(1_024));
+    rows.retain(|row| {
+        let key = items
+            .iter()
+            .map(|item| match item {
+                ResolvedItem::Column { source, .. } => {
+                    SqlKeyRef::new(table.value_ref(*source, *row))
+                }
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                }
+            })
+            .collect::<Box<[_]>>();
+        seen.insert(key)
+    });
+}
+
+fn retain_distinct_grouped_rows(
+    groups: &mut Vec<usize>,
+    data: &GroupedData<'_>,
+    items: &[ResolvedItem],
+) {
+    let mut seen = HashSet::<Box<[SqlKeyRef<'_>]>>::with_capacity(groups.len().min(1_024));
+    groups.retain(|group| {
+        let key = items
+            .iter()
+            .map(|item| match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => SqlKeyRef::new(data.keys[*group].value(*position)),
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => {
+                    SqlKeyRef::new(data.aggregates[*state][*group].as_ref())
+                }
+            })
+            .collect::<Box<[_]>>();
+        seen.insert(key)
+    });
 }
 
 fn execute_grouped<'a>(
@@ -369,8 +432,8 @@ fn execute_grouped<'a>(
 #[derive(Debug)]
 enum GroupIndex<'a> {
     Global,
-    One(HashMap<ValueRef<'a>, usize>),
-    Multiple(HashMap<Box<[ValueRef<'a>]>, usize>),
+    One(HashMap<SqlKeyRef<'a>, usize>),
+    Multiple(HashMap<Box<[SqlKeyRef<'a>]>, usize>),
 }
 
 impl<'a> GroupIndex<'a> {
@@ -393,7 +456,7 @@ impl<'a> GroupIndex<'a> {
         match self {
             Self::Global => (0, false),
             Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
+                let key = SqlKeyRef::new(table.value_ref(columns[0], row));
                 if let Some(group) = groups.get(&key) {
                     (*group, false)
                 } else {
@@ -403,15 +466,15 @@ impl<'a> GroupIndex<'a> {
             }
             Self::Multiple(groups) if columns.len() == 2 => {
                 let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
+                    SqlKeyRef::new(table.value_ref(columns[0], row)),
+                    SqlKeyRef::new(table.value_ref(columns[1], row)),
                 ];
                 find_or_insert_group(groups, &key, next_group)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
+                    .map(|column| SqlKeyRef::new(table.value_ref(*column, row)))
                     .collect::<Vec<_>>();
                 find_or_insert_group(groups, &key, next_group)
             }
@@ -429,12 +492,14 @@ impl<'a> GroupIndex<'a> {
             }
             Self::One(groups) => {
                 for (key, group) in groups {
-                    ordered[group] = Some(GroupKey::One(key));
+                    ordered[group] = Some(GroupKey::One(key.value()));
                 }
             }
             Self::Multiple(groups) => {
                 for (key, group) in groups {
-                    ordered[group] = Some(GroupKey::Multiple(key));
+                    ordered[group] = Some(GroupKey::Multiple(
+                        key.iter().map(|value| value.value()).collect::<Box<[_]>>(),
+                    ));
                 }
             }
         }
@@ -446,8 +511,8 @@ impl<'a> GroupIndex<'a> {
 }
 
 fn find_or_insert_group<'a>(
-    groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
-    key: &[ValueRef<'a>],
+    groups: &mut HashMap<Box<[SqlKeyRef<'a>]>, usize>,
+    key: &[SqlKeyRef<'a>],
     next_group: usize,
 ) -> (usize, bool) {
     if let Some(group) = groups.get(key) {
@@ -522,31 +587,68 @@ impl GroupedData<'_> {
 }
 
 #[derive(Debug)]
-enum AggregateState {
+struct AggregateState<'a> {
+    accumulator: AggregateAccumulator,
+    distinct_values: Option<HashSet<SqlKeyRef<'a>>>,
+}
+
+#[derive(Debug)]
+enum AggregateAccumulator {
     Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
+    SumInt(Option<i64>),
+    SumFloat(Option<f64>),
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
     AvgFloat { sum: f64, count: u64 },
 }
 
-impl AggregateState {
+impl AggregateState<'_> {
     fn new(spec: &AggregateSpec) -> Self {
-        match spec.function {
-            AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
-            AggregateFunction::Min => Self::Min(None),
-            AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
-                Self::AvgInt { sum: 0, count: 0 }
+        let accumulator = match spec.function {
+            AggregateFunction::Count => AggregateAccumulator::Count(0),
+            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => {
+                AggregateAccumulator::SumInt(None)
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Sum => AggregateAccumulator::SumFloat(None),
+            AggregateFunction::Min => AggregateAccumulator::Min(None),
+            AggregateFunction::Max => AggregateAccumulator::Max(None),
+            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+                AggregateAccumulator::AvgInt { sum: 0, count: 0 }
+            }
+            AggregateFunction::Avg => AggregateAccumulator::AvgFloat { sum: 0.0, count: 0 },
+        };
+        Self {
+            accumulator,
+            distinct_values: spec.distinct.then(HashSet::new),
         }
     }
 
+    fn finish(self) -> Result<Value> {
+        self.accumulator.finish()
+    }
+}
+
+impl<'a> AggregateState<'a> {
+    fn update(&mut self, spec: &AggregateSpec, table: &'a Table, row: usize) -> Result<()> {
+        if let Some(argument) = spec.argument {
+            let value = table.value_ref(argument, row);
+            if matches!(value, ValueRef::Null) {
+                return Ok(());
+            }
+            if self
+                .distinct_values
+                .as_mut()
+                .is_some_and(|seen| !seen.insert(SqlKeyRef::new(value)))
+            {
+                return Ok(());
+            }
+        }
+        self.accumulator.update(spec, table, row)
+    }
+}
+
+impl AggregateAccumulator {
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
@@ -559,9 +661,12 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                *sum = Some(match *sum {
+                    Some(current) => current
+                        .checked_add(values[row])
+                        .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?,
+                    None => values[row],
+                });
             }
             Self::SumFloat(sum) => {
                 let Column::Float64(values) =
@@ -569,14 +674,14 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
-                if !sum.is_finite() {
+                let next = sum.unwrap_or(0.0) + values[row];
+                if !next.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
+                *sum = Some(next);
             }
             Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
+                let candidate = table.value_ref(spec.argument.expect("MIN argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -585,8 +690,7 @@ impl AggregateState {
                 }
             }
             Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
+                let candidate = table.value_ref(spec.argument.expect("MAX argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -626,22 +730,20 @@ impl AggregateState {
 
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt(Some(value)) => Ok(Value::Int64(value)),
+            Self::SumFloat(Some(value)) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
-            )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::SumInt(None)
+            | Self::SumFloat(None)
+            | Self::Min(None)
+            | Self::Max(None)
+            | Self::AvgInt { .. }
+            | Self::AvgFloat { .. } => Ok(Value::Null),
         }
     }
 }
@@ -702,7 +804,7 @@ fn order_source_rows(
             let ResolvedItem::Column { source, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
+            let comparison = table.cmp_at(source, left, right);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -788,9 +890,9 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return false;
+                };
                 match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
@@ -813,16 +915,16 @@ enum CompiledOperand {
 }
 
 impl CompiledOperand {
-    fn data_type(&self) -> DataType {
+    fn data_type(&self) -> Option<DataType> {
         match self {
-            Self::Column { data_type, .. } => *data_type,
+            Self::Column { data_type, .. } => Some(*data_type),
             Self::Literal(value) => value.data_type(),
         }
     }
 
     fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
         match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
+            Self::Column { index, .. } => table.value_ref(*index, row),
             Self::Literal(value) => value.as_ref(),
         }
     }
@@ -840,8 +942,12 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
-                    expected: left.data_type().to_string(),
-                    actual: right.data_type().to_string(),
+                    expected: left
+                        .data_type()
+                        .map_or_else(|| "NULL".to_owned(), |value| value.to_string()),
+                    actual: right
+                        .data_type()
+                        .map_or_else(|| "NULL".to_owned(), |value| value.to_string()),
                 });
             }
             Ok(CompiledPredicate::Comparison {
@@ -874,11 +980,14 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
     }
 }
 
-fn comparable(left: DataType, right: DataType) -> bool {
-    left == right
+fn comparable(left: Option<DataType>, right: Option<DataType>) -> bool {
+    left.is_none()
+        || right.is_none()
+        || left == right
         || matches!(
             (left, right),
-            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+            (Some(DataType::Int64), Some(DataType::Float64))
+                | (Some(DataType::Float64), Some(DataType::Int64))
         )
 }
 
