@@ -120,6 +120,16 @@ pub fn parse(input: &str) -> Result<Vec<Statement>> {
     Parser::new(tokens).parse_script()
 }
 
+pub(crate) fn parse_with_checkpoint(
+    input: &str,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<Statement>> {
+    checkpoint()?;
+    let tokens = Lexer::with_checkpoint(input, &mut *checkpoint).tokenize()?;
+    checkpoint()?;
+    Parser::with_checkpoint(tokens, checkpoint).parse_script()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Token {
     kind: TokenKind,
@@ -146,20 +156,39 @@ enum TokenKind {
     End,
 }
 
-struct Lexer<'a> {
+struct Lexer<'a, 'c> {
     input: &'a str,
     position: usize,
+    checkpoint: Option<&'c mut dyn FnMut() -> Result<()>>,
+    characters_since_checkpoint: usize,
 }
 
-impl<'a> Lexer<'a> {
+impl<'a> Lexer<'a, '_> {
     fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+        Self {
+            input,
+            position: 0,
+            checkpoint: None,
+            characters_since_checkpoint: 0,
+        }
+    }
+}
+
+impl<'a, 'c> Lexer<'a, 'c> {
+    fn with_checkpoint(input: &'a str, checkpoint: &'c mut dyn FnMut() -> Result<()>) -> Self {
+        Self {
+            input,
+            position: 0,
+            checkpoint: Some(checkpoint),
+            characters_since_checkpoint: 0,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
-            self.skip_ignored();
+            self.run_checkpoint()?;
+            self.skip_ignored()?;
             let position = self.position;
             let Some(character) = self.current() else {
                 tokens.push(Token {
@@ -171,68 +200,68 @@ impl<'a> Lexer<'a> {
 
             let kind = match character {
                 ',' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::Comma
                 }
                 '(' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::LeftParen
                 }
                 ')' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::RightParen
                 }
                 ';' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::Semicolon
                 }
                 '*' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::Star
                 }
                 '-' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::Minus
                 }
                 '=' => {
-                    self.advance();
+                    self.advance()?;
                     TokenKind::Equal
                 }
                 '!' => {
-                    self.advance();
+                    self.advance()?;
                     if self.current() != Some('=') {
                         return self.error(position, "expected '=' after '!'");
                     }
-                    self.advance();
+                    self.advance()?;
                     TokenKind::NotEqual
                 }
                 '<' => {
-                    self.advance();
+                    self.advance()?;
                     match self.current() {
                         Some('=') => {
-                            self.advance();
+                            self.advance()?;
                             TokenKind::LessOrEqual
                         }
                         Some('>') => {
-                            self.advance();
+                            self.advance()?;
                             TokenKind::NotEqual
                         }
                         _ => TokenKind::Less,
                     }
                 }
                 '>' => {
-                    self.advance();
+                    self.advance()?;
                     if self.current() == Some('=') {
-                        self.advance();
+                        self.advance()?;
                         TokenKind::GreaterOrEqual
                     } else {
                         TokenKind::Greater
                     }
                 }
                 '\'' => TokenKind::String(self.scan_string(position)?),
-                value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()),
+                value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()?),
                 value if value.is_ascii_alphabetic() || value == '_' => {
-                    TokenKind::Identifier(self.scan_identifier())
+                    TokenKind::Identifier(self.scan_identifier()?)
                 }
                 _ => {
                     return self.error(position, format!("unexpected character '{character}'"));
@@ -246,85 +275,99 @@ impl<'a> Lexer<'a> {
         self.input[self.position..].chars().next()
     }
 
-    fn advance(&mut self) {
+    fn advance(&mut self) -> Result<()> {
         if let Some(character) = self.current() {
             self.position += character.len_utf8();
+            self.characters_since_checkpoint += 1;
+            if self.characters_since_checkpoint >= 256 {
+                self.run_checkpoint()?;
+            }
         }
+        Ok(())
     }
 
-    fn skip_ignored(&mut self) {
+    fn run_checkpoint(&mut self) -> Result<()> {
+        self.characters_since_checkpoint = 0;
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint()?;
+        }
+        Ok(())
+    }
+
+    fn skip_ignored(&mut self) -> Result<()> {
         loop {
             while self.current().is_some_and(char::is_whitespace) {
-                self.advance();
+                self.advance()?;
             }
             if self.input[self.position..].starts_with("--") {
                 while self.current().is_some_and(|character| character != '\n') {
-                    self.advance();
+                    self.advance()?;
                 }
             } else {
                 break;
             }
         }
+        Ok(())
     }
 
-    fn scan_identifier(&mut self) -> String {
+    fn scan_identifier(&mut self) -> Result<String> {
         let start = self.position;
         while self
             .current()
             .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_')
         {
-            self.advance();
+            self.advance()?;
         }
-        self.input[start..self.position].to_owned()
+        Ok(self.input[start..self.position].to_owned())
     }
 
-    fn scan_number(&mut self) -> String {
+    fn scan_number(&mut self) -> Result<String> {
         let start = self.position;
         while self.current().is_some_and(|value| value.is_ascii_digit()) {
-            self.advance();
+            self.advance()?;
         }
         if self.current() == Some('.') {
-            self.advance();
+            self.advance()?;
             while self.current().is_some_and(|value| value.is_ascii_digit()) {
-                self.advance();
+                self.advance()?;
             }
         }
         if self
             .current()
             .is_some_and(|value| matches!(value, 'e' | 'E'))
         {
-            self.advance();
+            self.advance()?;
             if self
                 .current()
                 .is_some_and(|value| matches!(value, '+' | '-'))
             {
-                self.advance();
+                self.advance()?;
             }
             while self.current().is_some_and(|value| value.is_ascii_digit()) {
-                self.advance();
+                self.advance()?;
             }
         }
-        self.input[start..self.position].to_owned()
+        Ok(self.input[start..self.position].to_owned())
     }
 
     fn scan_string(&mut self, start: usize) -> Result<String> {
-        self.advance();
+        self.advance()?;
         let mut value = String::new();
         loop {
             match self.current() {
                 None => return self.error(start, "unterminated string literal"),
                 Some('\'') => {
-                    self.advance();
+                    self.advance()?;
                     if self.current() == Some('\'') {
                         value.push('\'');
-                        self.advance();
+                        self.advance()?;
                     } else {
                         return Ok(value);
                     }
                 }
                 Some(character) => {
                     value.push(character);
-                    self.advance();
+                    self.advance()?;
                 }
             }
         }
@@ -338,32 +381,59 @@ impl<'a> Lexer<'a> {
     }
 }
 
-struct Parser {
+struct Parser<'c> {
     tokens: Vec<Token>,
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    checkpoint: Option<&'c mut dyn FnMut() -> Result<()>>,
 }
 
-impl Parser {
+impl Parser<'_> {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
             tokens,
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            checkpoint: None,
+        }
+    }
+}
+
+impl<'c> Parser<'c> {
+    fn with_checkpoint(tokens: Vec<Token>, checkpoint: &'c mut dyn FnMut() -> Result<()>) -> Self {
+        Self {
+            tokens,
+            current: 0,
+            predicate_depth: 0,
+            predicate_nodes: 0,
+            checkpoint: Some(checkpoint),
         }
     }
 
+    fn checkpoint(&mut self) -> Result<()> {
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint()?;
+        }
+        Ok(())
+    }
+
     fn parse_script(mut self) -> Result<Vec<Statement>> {
+        self.checkpoint()?;
         let mut statements = Vec::new();
-        while self.eat(&TokenKind::Semicolon) {}
+        while self.eat(&TokenKind::Semicolon) {
+            self.checkpoint()?;
+        }
         while !self.at(&TokenKind::End) {
+            self.checkpoint()?;
             statements.push(self.parse_statement()?);
             if !self.eat(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("expected ';' between statements");
             }
-            while self.eat(&TokenKind::Semicolon) {}
+            while self.eat(&TokenKind::Semicolon) {
+                self.checkpoint()?;
+            }
         }
         if statements.is_empty() {
             return self.error("expected a SQL statement");
@@ -389,6 +459,7 @@ impl Parser {
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
+            self.checkpoint()?;
             let column_name = self.expect_identifier("column name")?;
             if is_reserved_column_name(&column_name) {
                 return Err(Error::ReservedIdentifier {
@@ -422,10 +493,12 @@ impl Parser {
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
+            self.checkpoint()?;
             self.expect(&TokenKind::LeftParen, "'(' before row values")?;
             let mut row = Vec::new();
             if !self.at(&TokenKind::RightParen) {
                 loop {
+                    self.checkpoint()?;
                     row.push(self.parse_literal()?);
                     if !self.eat(&TokenKind::Comma) {
                         break;
@@ -444,6 +517,7 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
+            self.checkpoint()?;
             items.push(self.parse_select_item()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -464,6 +538,7 @@ impl Parser {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
+                self.checkpoint()?;
                 group_by.push(self.expect_identifier("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -475,6 +550,7 @@ impl Parser {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
+                self.checkpoint()?;
                 let name = self.expect_identifier("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true
@@ -554,6 +630,7 @@ impl Parser {
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
         let mut predicate = self.parse_and_predicate()?;
         while self.eat_keyword("OR") {
+            self.checkpoint()?;
             let right = self.parse_and_predicate()?;
             self.record_predicate_node()?;
             predicate = Predicate::Or(Box::new(predicate), Box::new(right));
@@ -564,6 +641,7 @@ impl Parser {
     fn parse_and_predicate(&mut self) -> Result<Predicate> {
         let mut predicate = self.parse_predicate_atom()?;
         while self.eat_keyword("AND") {
+            self.checkpoint()?;
             let right = self.parse_predicate_atom()?;
             self.record_predicate_node()?;
             predicate = Predicate::And(Box::new(predicate), Box::new(right));
@@ -607,6 +685,7 @@ impl Parser {
     }
 
     fn record_predicate_node(&mut self) -> Result<()> {
+        self.checkpoint()?;
         if self.predicate_nodes >= MAX_PREDICATE_NODES {
             return self.error(format!(
                 "predicate is too complex; maximum {MAX_PREDICATE_NODES} expression nodes"
@@ -817,5 +896,51 @@ mod tests {
             Error::Sql { message, .. }
                 if message.contains("predicate is too complex; maximum 256 expression nodes")
         ));
+    }
+
+    #[test]
+    fn controlled_lexer_propagates_checkpoints() {
+        let columns = (0..10_000)
+            .map(|index| format!("column_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {columns} FROM wide");
+        let mut checkpoints = 0;
+        let error = parse_with_checkpoint(&sql, &mut || {
+            checkpoints += 1;
+            if checkpoints == 100 {
+                Err(Error::ExecutionCancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("controlled parsing should propagate cancellation");
+
+        assert_eq!(error, Error::ExecutionCancelled);
+        assert_eq!(checkpoints, 100);
+    }
+
+    #[test]
+    fn controlled_parser_propagates_checkpoints() {
+        let columns = (0..10_000)
+            .map(|index| format!("column_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {columns} FROM wide");
+        let tokens = Lexer::new(&sql).tokenize().expect("lexing succeeds");
+        let mut checkpoints = 0;
+        let error = Parser::with_checkpoint(tokens, &mut || {
+            checkpoints += 1;
+            if checkpoints == 100 {
+                Err(Error::ExecutionCancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .parse_script()
+        .expect_err("controlled parser should propagate cancellation");
+
+        assert_eq!(error, Error::ExecutionCancelled);
+        assert_eq!(checkpoints, 100);
     }
 }

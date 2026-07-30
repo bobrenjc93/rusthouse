@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, ExecutionLimit, Result};
@@ -124,6 +124,15 @@ impl<'a> ExecutionControl<'a> {
         }
         Ok(())
     }
+
+    fn output_capacity(&self, requested: usize) -> usize {
+        let Some(limits) = self.limits else {
+            return requested;
+        };
+        limits.max_output_rows.map_or(requested, |maximum| {
+            requested.min(maximum.saturating_sub(self.output_rows))
+        })
+    }
 }
 
 impl Database {
@@ -143,8 +152,8 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        let statements = sql::parse(sql)?;
         let mut control = ExecutionControl::unlimited();
+        let statements = sql::parse(sql)?;
         self.execute_statements(statements, &mut control)
     }
 
@@ -158,8 +167,11 @@ impl Database {
         options: impl Into<ExecutionOptions>,
     ) -> Result<Vec<StatementResult>> {
         let options = options.into();
-        let statements = sql::parse(sql)?;
         let mut control = ExecutionControl::new(&options);
+        let statements = {
+            let mut checkpoint = || control.checkpoint();
+            sql::parse_with_checkpoint(sql, &mut checkpoint)?
+        };
         self.execute_statements(statements, &mut control)
     }
 
@@ -217,11 +229,23 @@ impl Database {
         control: &mut ExecutionControl<'_>,
     ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
+        let column_lookup = build_column_lookup(table, control)?;
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| compile_predicate(table, &column_lookup, predicate, control))
             .transpose()?;
+
+        let group_columns =
+            resolve_group_columns(table, &column_lookup, &select.group_by, control)?;
+        let (items, result_columns, aggregate_specs) = resolve_select_items(
+            table,
+            &column_lookup,
+            &select.items,
+            &group_columns,
+            control,
+        )?;
+        let ordering = resolve_ordering(&result_columns, &select.order_by, control)?;
 
         let mut matching_rows = Vec::new();
         for row in 0..table.row_count() {
@@ -234,11 +258,6 @@ impl Database {
             }
         }
         control.checkpoint()?;
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -296,36 +315,79 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
+fn build_column_lookup(
+    table: &Table,
+    control: &ExecutionControl<'_>,
+) -> Result<HashMap<String, usize>> {
+    let mut lookup = HashMap::with_capacity(table.schema().len());
+    for (index, field) in table.schema().iter().enumerate() {
+        control.checkpoint()?;
+        lookup.insert(field.name.to_ascii_lowercase(), index);
+    }
+    control.checkpoint()?;
+    Ok(lookup)
+}
+
+fn resolve_column(
+    table: &Table,
+    column_lookup: &HashMap<String, usize>,
+    name: &str,
+) -> Result<usize> {
+    column_lookup
+        .get(&name.to_ascii_lowercase())
+        .copied()
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table.name().to_owned(),
+            column: name.to_owned(),
+        })
+}
+
+fn resolve_group_columns(
+    table: &Table,
+    column_lookup: &HashMap<String, usize>,
+    names: &[String],
+    control: &ExecutionControl<'_>,
+) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
+    let mut seen = HashSet::with_capacity(names.len());
     for name in names {
-        let column = table.column_index(name)?;
-        if columns.contains(&column) {
+        control.checkpoint()?;
+        let column = resolve_column(table, column_lookup, name)?;
+        if !seen.insert(column) {
             return Err(Error::InvalidQuery(format!(
                 "GROUP BY column '{name}' is listed more than once"
             )));
         }
         columns.push(column);
     }
+    control.checkpoint()?;
     Ok(columns)
 }
 
 fn resolve_select_items(
     table: &Table,
+    column_lookup: &HashMap<String, usize>,
     requested: &[SelectItem],
     group_columns: &[usize],
+    control: &ExecutionControl<'_>,
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
-    let has_aggregate = requested
-        .iter()
-        .any(|item| matches!(item, SelectItem::Aggregate { .. }));
-    if has_aggregate
-        && requested
-            .iter()
-            .any(|item| matches!(item, SelectItem::Wildcard))
-    {
+    let mut has_aggregate = false;
+    let mut has_wildcard = false;
+    for item in requested {
+        control.checkpoint()?;
+        has_aggregate |= matches!(item, SelectItem::Aggregate { .. });
+        has_wildcard |= matches!(item, SelectItem::Wildcard);
+    }
+    if has_aggregate && has_wildcard {
         return Err(Error::InvalidQuery(
             "'*' projection cannot be combined with aggregates".to_owned(),
         ));
+    }
+
+    let mut group_positions = HashMap::with_capacity(group_columns.len());
+    for (position, column) in group_columns.iter().copied().enumerate() {
+        control.checkpoint()?;
+        group_positions.insert(column, position);
     }
 
     let mut items = Vec::new();
@@ -333,10 +395,12 @@ fn resolve_select_items(
     let mut aggregate_specs = Vec::new();
 
     for requested_item in requested {
+        control.checkpoint()?;
         match requested_item {
             SelectItem::Wildcard => {
                 for (source, field) in table.schema().iter().enumerate() {
-                    let group_position = group_columns.iter().position(|column| *column == source);
+                    control.checkpoint()?;
+                    let group_position = group_positions.get(&source).copied();
                     if !group_columns.is_empty() && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
@@ -354,8 +418,8 @@ fn resolve_select_items(
                 }
             }
             SelectItem::Column { name, alias } => {
-                let source = table.column_index(name)?;
-                let group_position = group_columns.iter().position(|column| *column == source);
+                let source = resolve_column(table, column_lookup, name)?;
+                let group_position = group_positions.get(&source).copied();
                 if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
                     return Err(Error::InvalidQuery(format!(
                         "column '{name}' must appear in GROUP BY"
@@ -388,7 +452,7 @@ fn resolve_select_items(
                         (None, None, "*".to_owned())
                     }
                     AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
+                        let index = resolve_column(table, column_lookup, name)?;
                         (
                             Some(index),
                             Some(table.schema()[index].data_type),
@@ -414,6 +478,7 @@ fn resolve_select_items(
         }
     }
 
+    control.checkpoint()?;
     Ok((items, result_columns, aggregate_specs))
 }
 
@@ -447,7 +512,7 @@ fn execute_projection(
     items: &[ResolvedItem],
     control: &mut ExecutionControl<'_>,
 ) -> Result<Vec<Vec<Value>>> {
-    let mut rows = Vec::with_capacity(matching_rows.len());
+    let mut rows = Vec::with_capacity(control.output_capacity(matching_rows.len()));
     for row in matching_rows {
         control.record_output_row()?;
         let mut values = Vec::with_capacity(items.len());
@@ -670,7 +735,7 @@ impl GroupedData<'_> {
         items: &[ResolvedItem],
         control: &mut ExecutionControl<'_>,
     ) -> Result<Vec<Vec<Value>>> {
-        let mut rows = Vec::with_capacity(selected.len());
+        let mut rows = Vec::with_capacity(control.output_capacity(selected.len()));
         for group in selected {
             control.record_output_row()?;
             let mut values = Vec::with_capacity(items.len());
@@ -826,27 +891,35 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
+fn resolve_ordering(
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+    control: &ExecutionControl<'_>,
+) -> Result<Vec<ResolvedOrder>> {
+    let mut outputs = HashMap::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        control.checkpoint()?;
+        outputs
+            .entry(column.name.to_ascii_lowercase())
+            .and_modify(|output| *output = None)
+            .or_insert(Some(index));
+    }
+
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [index] => ordering.push(ResolvedOrder {
+        control.checkpoint()?;
+        match outputs.get(&order.name.to_ascii_lowercase()) {
+            Some(Some(index)) => ordering.push(ResolvedOrder {
                 output: *index,
                 descending: order.descending,
             }),
-            [] => {
+            None => {
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY column or alias '{}' is not in the SELECT output",
                     order.name
                 )));
             }
-            _ => {
+            Some(None) => {
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY name '{}' is ambiguous",
                     order.name
@@ -854,6 +927,7 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
             }
         }
     }
+    control.checkpoint()?;
     Ok(ordering)
 }
 
@@ -1101,15 +1175,21 @@ impl CompiledOperand {
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn compile_predicate(
+    table: &Table,
+    column_lookup: &HashMap<String, usize>,
+    predicate: &Predicate,
+    control: &ExecutionControl<'_>,
+) -> Result<CompiledPredicate> {
+    control.checkpoint()?;
     match predicate {
         Predicate::Comparison {
             left,
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let left = compile_operand(table, column_lookup, left, control)?;
+            let right = compile_operand(table, column_lookup, right, control)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -1124,20 +1204,26 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             })
         }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(table, column_lookup, left, control)?),
+            Box::new(compile_predicate(table, column_lookup, right, control)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(table, column_lookup, left, control)?),
+            Box::new(compile_predicate(table, column_lookup, right, control)?),
         )),
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_operand(
+    table: &Table,
+    column_lookup: &HashMap<String, usize>,
+    operand: &Operand,
+    control: &ExecutionControl<'_>,
+) -> Result<CompiledOperand> {
+    control.checkpoint()?;
     match operand {
         Operand::Column(name) => {
-            let index = table.column_index(name)?;
+            let index = resolve_column(table, column_lookup, name)?;
             Ok(CompiledOperand::Column {
                 index,
                 data_type: table.schema()[index].data_type,

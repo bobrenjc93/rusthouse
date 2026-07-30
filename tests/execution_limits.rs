@@ -36,6 +36,13 @@ fn query_row_count(results: Vec<StatementResult>) -> usize {
     }
 }
 
+fn query_rows(results: Vec<StatementResult>) -> Vec<Vec<rusthouse::Value>> {
+    match results.into_iter().last().expect("query result") {
+        StatementResult::Query(result) => result.rows,
+        StatementResult::Command { .. } => panic!("expected query result"),
+    }
+}
+
 #[test]
 fn row_limit_boundaries_are_inclusive_and_report_the_attempted_count() {
     let mut database = database_with_rows();
@@ -150,6 +157,97 @@ fn sql_limit_can_keep_results_within_the_output_maximum() {
         .execute_with_options("SELECT id FROM events LIMIT 0", limits(4, 0))
         .expect("zero SQL and execution limits agree");
     assert_eq!(query_row_count(results), 0);
+}
+
+#[test]
+fn output_limit_caps_projection_capacity() {
+    let values = (0..1_000)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE many (id Int64); INSERT INTO many VALUES {values}"
+        ))
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database
+            .execute_with_options("SELECT id FROM many", limits(1_000, 0))
+            .expect_err("zero output budget aborts before allocating result slots"),
+        Error::ExecutionLimitExceeded {
+            limit: ExecutionLimit::OutputRows,
+            maximum: 0,
+            actual: 1,
+        }
+    );
+}
+
+#[test]
+fn controlled_sorting_preserves_values_ties_and_top_k_boundaries() {
+    use rusthouse::Value::{Int64, String as Text};
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ranked (id Int64, score Int64, label String);
+             INSERT INTO ranked VALUES
+                (5, 9, 'b'), (2, 9, 'a'), (3, 9, 'a'),
+                (1, 5, 'z'), (4, 1, 'x');
+             CREATE TABLE grouped (name String, amount Int64);
+             INSERT INTO grouped VALUES ('b', 10), ('a', 10), ('c', 5);",
+        )
+        .expect("setup succeeds");
+
+    let full = database
+        .execute_with_options(
+            "SELECT id, score, label FROM ranked \
+             ORDER BY score DESC, label",
+            limits(5, 5),
+        )
+        .expect("controlled full sort succeeds");
+    assert_eq!(
+        query_rows(full),
+        vec![
+            vec![Int64(2), Int64(9), Text("a".to_owned())],
+            vec![Int64(3), Int64(9), Text("a".to_owned())],
+            vec![Int64(5), Int64(9), Text("b".to_owned())],
+            vec![Int64(1), Int64(5), Text("z".to_owned())],
+            vec![Int64(4), Int64(1), Text("x".to_owned())],
+        ]
+    );
+
+    let top = database
+        .execute_with_options(
+            "SELECT id, score, label FROM ranked \
+             ORDER BY score DESC, label, id DESC LIMIT 3",
+            limits(5, 3),
+        )
+        .expect("controlled top-k succeeds");
+    assert_eq!(
+        query_rows(top),
+        vec![
+            vec![Int64(3), Int64(9), Text("a".to_owned())],
+            vec![Int64(2), Int64(9), Text("a".to_owned())],
+            vec![Int64(5), Int64(9), Text("b".to_owned())],
+        ]
+    );
+
+    let grouped = database
+        .execute_with_options(
+            "SELECT name, SUM(amount) AS total FROM grouped \
+             GROUP BY name ORDER BY total DESC LIMIT 2",
+            limits(3, 2),
+        )
+        .expect("controlled grouped top-k succeeds");
+    assert_eq!(
+        query_rows(grouped),
+        vec![
+            vec![Text("a".to_owned()), Int64(10)],
+            vec![Text("b".to_owned()), Int64(10)],
+        ]
+    );
 }
 
 #[test]
