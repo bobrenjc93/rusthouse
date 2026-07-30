@@ -100,9 +100,22 @@ impl Column {
 
         match (self, target) {
             (Self::Int64(values), DataType::Int64) => Ok(Self::Int64(values.clone())),
-            (Self::Int64(values), DataType::Float64) => Ok(Self::Float64(
-                values.iter().map(|value| *value as f64).collect(),
-            )),
+            (Self::Int64(values), DataType::Float64) => {
+                let mut converted = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().copied().enumerate() {
+                    let float = value as f64;
+                    if ValueRef::Int64(value).sql_cmp(ValueRef::Float64(float))
+                        != Some(std::cmp::Ordering::Equal)
+                    {
+                        return Err(failure(
+                            Some(index + 1),
+                            format!("Int64 value {value} cannot be represented exactly as Float64"),
+                        ));
+                    }
+                    converted.push(float);
+                }
+                Ok(Self::Float64(converted))
+            }
             (Self::Int64(values), DataType::String) => {
                 Ok(Self::String(values.iter().map(i64::to_string).collect()))
             }

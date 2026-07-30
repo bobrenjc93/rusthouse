@@ -18,7 +18,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
-`ALTER TABLE name MODIFY COLUMN column Type` supports identity conversions, conversions between Int64 and Float64, conversions from Int64/Float64/Bool to String, and parsing String as Int64/Float64/Bool. Float64-to-Int64 requires a finite, in-range integer, and numeric-to-Bool conversions are rejected. A failed conversion reports its row and leaves the original schema and column unchanged.
+`ALTER TABLE name MODIFY COLUMN column Type` supports identity conversions, conversions between Int64 and Float64, conversions from Int64/Float64/Bool to String, and parsing String as Int64/Float64/Bool. Int64-to-Float64 requires an exact representation, Float64-to-Int64 requires a finite, in-range integer, and numeric-to-Bool conversions are rejected. A failed conversion reports its row and leaves the original schema and column unchanged.
 
 ## CLI
 

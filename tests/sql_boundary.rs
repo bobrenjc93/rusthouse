@@ -116,6 +116,70 @@ fn alter_modify_column_supports_the_complete_conversion_matrix() {
 }
 
 #[test]
+fn int64_to_float64_requires_an_exact_representation() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE exact_integers (value Int64);
+             INSERT INTO exact_integers VALUES
+                (-9223372036854775808),
+                (-9007199254740992),
+                (9007199254740992),
+                (9007199254740994);
+             ALTER TABLE exact_integers MODIFY COLUMN value Float64;",
+        )
+        .expect("exactly representable boundaries convert");
+    assert_eq!(
+        execute_query(&mut database, "SELECT value FROM exact_integers").rows,
+        vec![
+            vec![Value::Float64(-9_223_372_036_854_775_808.0)],
+            vec![Value::Float64(-9_007_199_254_740_992.0)],
+            vec![Value::Float64(9_007_199_254_740_992.0)],
+            vec![Value::Float64(9_007_199_254_740_994.0)],
+        ]
+    );
+
+    for (literal, value) in [
+        ("-9007199254740993", -9_007_199_254_740_993_i64),
+        ("9007199254740993", 9_007_199_254_740_993_i64),
+        ("9223372036854775807", i64::MAX),
+    ] {
+        let mut database = Database::new();
+        database
+            .execute(&format!(
+                "CREATE TABLE inexact_integers (id Int64, value Int64);
+                 INSERT INTO inexact_integers VALUES (1, 0), (2, {literal}), (3, 2)"
+            ))
+            .expect("setup succeeds");
+
+        let error = database
+            .execute("ALTER TABLE inexact_integers MODIFY COLUMN value Float64")
+            .expect_err("inexact conversion fails");
+        assert!(matches!(
+            error,
+            Error::ColumnConversion {
+                from: DataType::Int64,
+                to: DataType::Float64,
+                row: Some(2),
+                reason,
+                ..
+            } if reason.contains("cannot be represented exactly")
+        ));
+
+        database
+            .execute("INSERT INTO inexact_integers VALUES (4, 9007199254740993)")
+            .expect("rollback preserves the Int64 schema");
+        let result = execute_query(
+            &mut database,
+            "SELECT id, value FROM inexact_integers ORDER BY id",
+        );
+        assert_eq!(result.columns[1].data_type, DataType::Int64);
+        assert_eq!(result.rows[1][1], Value::Int64(value));
+        assert_eq!(result.rows[3][1], Value::Int64(9_007_199_254_740_993));
+    }
+}
+
+#[test]
 fn alter_modify_column_handles_empty_and_large_tables() {
     let mut database = Database::new();
     database
