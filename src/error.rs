@@ -40,6 +40,10 @@ pub enum Error {
         context: String,
         message: String,
     },
+    ExecutionAndCleanup {
+        execution: Box<Self>,
+        cleanup: Box<Self>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -85,13 +89,17 @@ impl fmt::Display for Error {
             }
             Self::TemporaryStorageLimit { limit_bytes } => write!(
                 f,
-                "temporary storage limit of {limit_bytes} bytes exceeded while spilling groups"
+                "temporary row-index payload limit of {limit_bytes} bytes exceeded while spilling groups"
             ),
             Self::TemporaryPartitionLimit { limit } => write!(
                 f,
                 "temporary partition limit of {limit} files exceeded while spilling groups"
             ),
             Self::Io { context, message } => write!(f, "{context}: {message}"),
+            Self::ExecutionAndCleanup { execution, cleanup } => write!(
+                f,
+                "{execution}; additionally failed to clean temporary files: {cleanup}"
+            ),
         }
     }
 }

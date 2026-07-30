@@ -1,4 +1,6 @@
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
@@ -15,20 +17,17 @@ const MAX_PARTITION_DEPTH: usize = 64;
 pub(crate) const MAX_LIVE_PARTITIONS: usize =
     1 + PARTITION_FANOUT + (PARTITION_FANOUT - 1) * MAX_PARTITION_DEPTH;
 pub(crate) const ROW_INDEX_BYTES: u64 = mem::size_of::<u64>() as u64;
-// Reserve complete blocks for directory roots/indexes, file inodes/extent
-// metadata, and a worst-case directory leaf plus index split per live name.
-const WORKSPACE_METADATA_UNITS: u64 = 4;
-const FILE_METADATA_UNITS: u64 = 2;
-const DIRECTORY_ENTRY_UNITS: u64 = 2;
-#[cfg(not(any(unix, windows)))]
-const FALLBACK_ALLOCATION_UNIT_BYTES: u64 = 1024 * 1024;
 const WORKSPACE_CREATION_ATTEMPTS: usize = 128;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug)]
 pub(crate) struct Partition {
     pub(crate) path: PathBuf,
     pub(crate) bytes: u64,
-    allocated_bytes: u64,
     file_slot: u64,
     depth: usize,
 }
@@ -38,9 +37,6 @@ pub(crate) struct TempWorkspace {
     path: Option<PathBuf>,
     limit_bytes: u64,
     used_bytes: u64,
-    allocation_unit_bytes: u64,
-    live_files: usize,
-    directory_slots: usize,
     next_file: u64,
     free_file_slots: Vec<u64>,
 }
@@ -53,20 +49,6 @@ impl TempWorkspace {
                 error,
             )
         })?;
-        let allocation_unit_bytes = filesystem_allocation_unit(root)?;
-        Self::new_with_allocation_unit(root, limit_bytes, allocation_unit_bytes)
-    }
-
-    fn new_with_allocation_unit(
-        root: &Path,
-        limit_bytes: u64,
-        allocation_unit_bytes: u64,
-    ) -> Result<Self> {
-        let allocation_unit_bytes = allocation_unit_bytes.max(1);
-        let workspace_bytes = allocation_unit_bytes
-            .checked_mul(WORKSPACE_METADATA_UNITS)
-            .filter(|bytes| *bytes <= limit_bytes)
-            .ok_or(Error::TemporaryStorageLimit { limit_bytes })?;
         for _ in 0..WORKSPACE_CREATION_ATTEMPTS {
             let path = root.join(format!("rusthouse-group-{}", random_token()?));
             match create_private_directory(&path) {
@@ -74,10 +56,7 @@ impl TempWorkspace {
                     let workspace = Self {
                         path: Some(path),
                         limit_bytes,
-                        used_bytes: workspace_bytes,
-                        allocation_unit_bytes,
-                        live_files: 0,
-                        directory_slots: 0,
+                        used_bytes: 0,
                         next_file: 0,
                         free_file_slots: Vec::new(),
                     };
@@ -136,52 +115,6 @@ impl TempWorkspace {
         Ok(())
     }
 
-    fn allocation_bytes(&self, units: u64) -> Result<u64> {
-        self.allocation_unit_bytes
-            .checked_mul(units)
-            .ok_or(Error::TemporaryStorageLimit {
-                limit_bytes: self.limit_bytes,
-            })
-    }
-
-    fn reserve_file(&mut self) -> Result<FileReservation> {
-        let file_bytes = self.allocation_bytes(1 + FILE_METADATA_UNITS)?;
-        let added_directory_slot = self.live_files == self.directory_slots;
-        let directory_bytes = if added_directory_slot {
-            self.allocation_bytes(DIRECTORY_ENTRY_UNITS)?
-        } else {
-            0
-        };
-        let reservation_bytes =
-            file_bytes
-                .checked_add(directory_bytes)
-                .ok_or(Error::TemporaryStorageLimit {
-                    limit_bytes: self.limit_bytes,
-                })?;
-        self.reserve(reservation_bytes)?;
-        self.live_files += 1;
-        if added_directory_slot {
-            self.directory_slots += 1;
-        }
-        Ok(FileReservation {
-            file_bytes,
-            directory_bytes,
-        })
-    }
-
-    fn rollback_file(&mut self, reservation: FileReservation) {
-        self.live_files -= 1;
-        if reservation.directory_bytes > 0 {
-            self.directory_slots -= 1;
-        }
-        self.release(reservation.file_bytes + reservation.directory_bytes);
-    }
-
-    fn release_file(&mut self, bytes: u64) {
-        self.live_files -= 1;
-        self.release(bytes);
-    }
-
     fn release(&mut self, bytes: u64) {
         self.used_bytes = self
             .used_bytes
@@ -197,7 +130,7 @@ impl TempWorkspace {
             )
         })?;
         self.recycle_file_slot(partition.file_slot);
-        self.release_file(partition.allocated_bytes);
+        self.release(partition.bytes);
         Ok(())
     }
 
@@ -205,6 +138,13 @@ impl TempWorkspace {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
+        #[cfg(test)]
+        if FAIL_NEXT_CLEANUP.with(|failure| failure.replace(false)) {
+            return Err(Error::Io {
+                context: format!("could not clean spill workspace '{}'", path.display()),
+                message: "forced cleanup failure".to_owned(),
+            });
+        }
         match fs::remove_dir_all(path) {
             Ok(()) => {
                 self.path = None;
@@ -224,122 +164,9 @@ impl TempWorkspace {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FileReservation {
-    file_bytes: u64,
-    directory_bytes: u64,
-}
-
-#[cfg(unix)]
-fn filesystem_allocation_unit(path: &Path) -> Result<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::Io {
-        context: format!(
-            "could not inspect temporary filesystem for '{}'",
-            path.display()
-        ),
-        message: "path contains an interior NUL byte".to_owned(),
-    })?;
-    let mut statistics = mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: path is NUL-terminated and statistics points to writable storage.
-    let status = unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) };
-    if status != 0 {
-        return Err(io_error(
-            "could not inspect temporary filesystem allocation size".to_owned(),
-            io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: a successful statvfs call initialized the output structure.
-    let statistics = unsafe { statistics.assume_init() };
-    let unit = if statistics.f_frsize > 0 {
-        statvfs_value_to_u64(statistics.f_frsize)
-    } else {
-        statvfs_value_to_u64(statistics.f_bsize)
-    };
-    Ok(unit.max(512))
-}
-
-#[cfg(all(unix, target_pointer_width = "64"))]
-fn statvfs_value_to_u64(value: libc::c_ulong) -> u64 {
-    value
-}
-
-#[cfg(all(unix, target_pointer_width = "32"))]
-fn statvfs_value_to_u64(value: libc::c_ulong) -> u64 {
-    u64::from(value)
-}
-
-#[cfg(windows)]
-fn filesystem_allocation_unit(path: &Path) -> Result<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
-
-    let absolute = fs::canonicalize(path).map_err(|error| {
-        io_error(
-            format!(
-                "could not inspect temporary filesystem for '{}'",
-                path.display()
-            ),
-            error,
-        )
-    })?;
-    let path = absolute
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut volume_path = vec![0_u16; 32_768];
-    // SAFETY: both UTF-16 buffers are NUL-terminated/writable for the supplied lengths.
-    let status = unsafe {
-        GetVolumePathNameW(
-            path.as_ptr(),
-            volume_path.as_mut_ptr(),
-            volume_path.len() as u32,
-        )
-    };
-    if status == 0 {
-        return Err(io_error(
-            "could not resolve the temporary filesystem volume".to_owned(),
-            io::Error::last_os_error(),
-        ));
-    }
-
-    let mut sectors_per_cluster = 0_u32;
-    let mut bytes_per_sector = 0_u32;
-    let mut free_clusters = 0_u32;
-    let mut total_clusters = 0_u32;
-    // SAFETY: volume_path contains the NUL-terminated path returned above, and all outputs
-    // point to initialized writable integers.
-    let status = unsafe {
-        GetDiskFreeSpaceW(
-            volume_path.as_ptr(),
-            &mut sectors_per_cluster,
-            &mut bytes_per_sector,
-            &mut free_clusters,
-            &mut total_clusters,
-        )
-    };
-    if status == 0 {
-        return Err(io_error(
-            "could not inspect temporary filesystem allocation size".to_owned(),
-            io::Error::last_os_error(),
-        ));
-    }
-    u64::from(sectors_per_cluster)
-        .checked_mul(u64::from(bytes_per_sector))
-        .filter(|unit| *unit > 0)
-        .ok_or_else(|| Error::Io {
-            context: "could not inspect temporary filesystem allocation size".to_owned(),
-            message: "the volume reported an invalid allocation unit".to_owned(),
-        })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn filesystem_allocation_unit(_path: &Path) -> Result<u64> {
-    // Deliberately over-reserve where the standard library has no allocation query.
-    Ok(FALLBACK_ALLOCATION_UNIT_BYTES)
+#[cfg(test)]
+pub(crate) fn fail_next_cleanup() {
+    FAIL_NEXT_CLEANUP.with(|failure| failure.set(true));
 }
 
 fn random_token() -> Result<String> {
@@ -363,9 +190,26 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     builder.mode(0o700).create(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn create_private_directory(path: &Path) -> io::Result<()> {
-    fs::create_dir(path)
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let path = windows_path(path);
+    let security = WindowsSecurityDescriptor::new("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)")?;
+    let attributes = security.attributes();
+    // SAFETY: path and the security descriptor remain valid for this synchronous call.
+    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private spill permissions are not implemented on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -377,9 +221,101 @@ fn create_private_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn create_private_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
+
+    let path = windows_path(path);
+    let security = WindowsSecurityDescriptor::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
+    let attributes = security.attributes();
+    // SAFETY: path and the security descriptor remain valid for this synchronous call.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a new owned handle, transferred to File exactly once.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_file(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private spill permissions are not implemented on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn windows_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+struct WindowsSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl WindowsSecurityDescriptor {
+    fn new(sddl: &str) -> io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        let sddl = std::ffi::OsStr::new(sddl)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: sddl is NUL-terminated and descriptor is a valid writable output pointer.
+        let status = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if status == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(descriptor))
+    }
+
+    fn attributes(&self) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: self.0,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSecurityDescriptor {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::LocalFree;
+
+        // SAFETY: the descriptor was allocated by LocalAlloc through the conversion API.
+        let _ = unsafe { LocalFree(self.0) };
+    }
 }
 
 impl Drop for TempWorkspace {
@@ -401,7 +337,6 @@ struct PartitionOutput {
     path: PathBuf,
     writer: BufWriter<File>,
     bytes: u64,
-    allocated_bytes: u64,
     file_slot: u64,
 }
 
@@ -427,13 +362,11 @@ impl PartitionWriters {
         row: usize,
     ) -> Result<()> {
         if self.outputs[bucket].is_none() {
-            let reservation = workspace.reserve_file()?;
             let (file_slot, path) = workspace.allocate_path();
             let file = match create_private_file(&path) {
                 Ok(file) => file,
                 Err(error) => {
                     workspace.recycle_file_slot(file_slot);
-                    workspace.rollback_file(reservation);
                     return Err(io_error(
                         format!("could not create spill file '{}'", path.display()),
                         error,
@@ -444,30 +377,15 @@ impl PartitionWriters {
                 path,
                 writer: BufWriter::new(file),
                 bytes: 0,
-                allocated_bytes: reservation.file_bytes,
                 file_slot,
             });
         }
+        workspace.reserve(ROW_INDEX_BYTES)?;
         let output = self.outputs[bucket].as_mut().expect("output was created");
         let new_bytes = output
             .bytes
             .checked_add(ROW_INDEX_BYTES)
             .expect("one partition cannot exceed the u64 storage counter");
-        let payload_bytes = new_bytes
-            .div_ceil(workspace.allocation_unit_bytes)
-            .checked_mul(workspace.allocation_unit_bytes)
-            .expect("rounded partition allocation fits in u64");
-        let required_bytes = workspace
-            .allocation_bytes(FILE_METADATA_UNITS)?
-            .checked_add(payload_bytes)
-            .ok_or(Error::TemporaryStorageLimit {
-                limit_bytes: workspace.limit_bytes,
-            })?;
-        if required_bytes > output.allocated_bytes {
-            let additional_bytes = required_bytes - output.allocated_bytes;
-            workspace.reserve(additional_bytes)?;
-            output.allocated_bytes = required_bytes;
-        }
         let encoded = u64::try_from(row)
             .expect("RustHouse row indices fit in the on-disk u64 representation")
             .to_le_bytes();
@@ -488,7 +406,6 @@ impl PartitionWriters {
                 path,
                 mut writer,
                 bytes,
-                allocated_bytes,
                 file_slot,
             } = output;
             writer.flush().map_err(|error| {
@@ -500,7 +417,6 @@ impl PartitionWriters {
             partitions.push(Partition {
                 path,
                 bytes,
-                allocated_bytes,
                 file_slot,
                 depth: self.depth,
             });
@@ -512,11 +428,12 @@ impl PartitionWriters {
 pub(crate) struct PartitionRows {
     reader: BufReader<File>,
     path: PathBuf,
+    row_count: usize,
     finished: bool,
 }
 
 impl PartitionRows {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path, row_count: usize) -> Result<Self> {
         let file = File::open(path).map_err(|error| {
             io_error(
                 format!("could not read spill file '{}'", path.display()),
@@ -526,6 +443,7 @@ impl PartitionRows {
         Ok(Self {
             reader: BufReader::new(file),
             path: path.to_owned(),
+            row_count,
             finished: false,
         })
     }
@@ -553,10 +471,26 @@ impl Iterator for PartitionRows {
                     )));
                 }
                 Some(
-                    usize::try_from(u64::from_le_bytes(encoded)).map_err(|_| Error::Io {
-                        context: format!("could not read spill file '{}'", self.path.display()),
-                        message: "row index does not fit this platform".to_owned(),
-                    }),
+                    usize::try_from(u64::from_le_bytes(encoded))
+                        .map_err(|_| Error::Io {
+                            context: format!("could not read spill file '{}'", self.path.display()),
+                            message: "row index does not fit this platform".to_owned(),
+                        })
+                        .and_then(|row| {
+                            if row < self.row_count {
+                                Ok(row)
+                            } else {
+                                Err(Error::Io {
+                                    context: format!(
+                                        "could not read spill file '{}'",
+                                        self.path.display()
+                                    ),
+                                    message: format!(
+                                        "spill file contains out-of-range row index {row}"
+                                    ),
+                                })
+                            }
+                        }),
                 )
             }
             Err(error) => {
@@ -645,7 +579,7 @@ pub(crate) fn repartition(
     let depth = partition.depth + 1;
     let mut writers = PartitionWriters::new(depth);
     {
-        let rows = PartitionRows::open(&partition.path)?;
+        let rows = PartitionRows::open(&partition.path, table.row_count())?;
         for row in rows {
             let row = row?;
             let bucket = group_hash(table, group_columns, row, depth) as usize % PARTITION_FANOUT;
@@ -670,19 +604,64 @@ mod tests {
         root
     }
 
-    #[test]
-    fn non_4k_allocation_accounting_bounds_files_and_uses_private_creation() {
-        const TEST_ALLOCATION_UNIT: u64 = 64 * 1024;
-        const ONE_FILE_LIMIT: u64 = TEST_ALLOCATION_UNIT
-            * (WORKSPACE_METADATA_UNITS + 1 + FILE_METADATA_UNITS + DIRECTORY_ENTRY_UNITS);
-        let root = test_root("allocation");
-        let mut workspace =
-            TempWorkspace::new_with_allocation_unit(&root, ONE_FILE_LIMIT, TEST_ALLOCATION_UNIT)
-                .expect("create 64 KiB allocation workspace");
+    #[cfg(windows)]
+    fn windows_dacl_sddl(path: &Path) -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+        let path = windows_path(path);
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: path is NUL-terminated; unused outputs are null; descriptor is writable.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
         assert_eq!(
-            workspace.used_bytes,
-            TEST_ALLOCATION_UNIT * WORKSPACE_METADATA_UNITS
+            status,
+            0,
+            "read DACL: {}",
+            io::Error::from_raw_os_error(status as i32)
         );
+        let descriptor = WindowsSecurityDescriptor(descriptor);
+        let mut sddl = std::ptr::null_mut();
+        let mut length = 0_u32;
+        // SAFETY: descriptor is valid and both string outputs are writable.
+        let status = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl,
+                &mut length,
+            )
+        };
+        assert_ne!(status, 0, "render DACL: {}", io::Error::last_os_error());
+        // SAFETY: the conversion API returned length initialized UTF-16 code units.
+        let rendered =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sddl, length as usize) });
+        // SAFETY: the conversion API allocated sddl with LocalAlloc.
+        let _ = unsafe { LocalFree(sddl.cast()) };
+        rendered
+    }
+
+    #[test]
+    fn logical_payload_limit_is_independent_of_file_allocation() {
+        const TWO_ROWS: u64 = ROW_INDEX_BYTES * 2;
+        let root = test_root("allocation");
+        let mut workspace = TempWorkspace::new(&root, TWO_ROWS).expect("create workspace");
+        assert_eq!(workspace.used_bytes, 0);
 
         #[cfg(unix)]
         {
@@ -701,8 +680,11 @@ mod tests {
         let mut writers = PartitionWriters::new(0);
         writers
             .write_row(&mut workspace, 0, 7)
-            .expect("one file reservation remains");
-        assert_eq!(workspace.used_bytes, ONE_FILE_LIMIT);
+            .expect("first logical row fits");
+        writers
+            .write_row(&mut workspace, 0, 8)
+            .expect("second logical row fits");
+        assert_eq!(workspace.used_bytes, TWO_ROWS);
         let file_path = writers.outputs[0]
             .as_ref()
             .expect("first partition exists")
@@ -730,33 +712,36 @@ mod tests {
         );
         assert_eq!(
             writers
-                .write_row(&mut workspace, 1, 8)
-                .expect_err("a second file exceeds the physical allocation budget"),
+                .write_row(&mut workspace, 0, 9)
+                .expect_err("a third row exceeds the logical payload budget"),
             Error::TemporaryStorageLimit {
-                limit_bytes: ONE_FILE_LIMIT
+                limit_bytes: TWO_ROWS
             }
         );
 
         let partition = writers.finish().expect("flush partition").pop().unwrap();
+        let corrupt = PartitionRows::open(&partition.path, 7)
+            .expect("open partition")
+            .next()
+            .expect("one encoded row")
+            .expect_err("row seven is out of range for a seven-row table");
+        assert!(matches!(corrupt, Error::Io { message, .. } if message.contains("out-of-range")));
         workspace
             .remove_partition(&partition)
             .expect("remove first partition");
-        assert_eq!(
-            workspace.used_bytes,
-            TEST_ALLOCATION_UNIT * (WORKSPACE_METADATA_UNITS + DIRECTORY_ENTRY_UNITS)
-        );
+        assert_eq!(workspace.used_bytes, 0);
 
         let mut replacement = PartitionWriters::new(1);
         replacement
             .write_row(&mut workspace, 0, 9)
-            .expect("released file allocation is reusable");
+            .expect("released logical payload is reusable");
         assert_eq!(
             replacement.outputs[0]
                 .as_ref()
                 .expect("replacement partition")
                 .path,
             file_path,
-            "reusing the same name bounds retained directory metadata"
+            "partition slots are reused under the independent file-count bound"
         );
         let partition = replacement
             .finish()
@@ -766,6 +751,43 @@ mod tests {
         workspace
             .remove_partition(&partition)
             .expect("remove replacement partition");
+        workspace.cleanup().expect("clean workspace");
+        fs::remove_dir(&root).expect("remove test root");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_and_files_have_protected_owner_only_dacls() {
+        let root = test_root("windows-dacl");
+        let mut workspace = TempWorkspace::new(&root, ROW_INDEX_BYTES).expect("create workspace");
+        let workspace_path = workspace.path().to_owned();
+        let mut writers = PartitionWriters::new(0);
+        writers
+            .write_row(&mut workspace, 0, 1)
+            .expect("write partition");
+        let file_path = writers.outputs[0]
+            .as_ref()
+            .expect("partition file")
+            .path
+            .clone();
+
+        for (kind, path) in [("workspace", &workspace_path), ("partition", &file_path)] {
+            let dacl = windows_dacl_sddl(path);
+            assert!(
+                dacl.starts_with("D:P"),
+                "{kind} DACL is not protected: {dacl}"
+            );
+            assert!(dacl.contains(";;;OW)"), "{kind} owner ACE missing: {dacl}");
+            assert!(dacl.contains(";;;SY)"), "{kind} system ACE missing: {dacl}");
+            for forbidden in [";;;WD)", ";;;AU)", ";;;BU)"] {
+                assert!(
+                    !dacl.contains(forbidden),
+                    "{kind} DACL exposes {forbidden}: {dacl}"
+                );
+            }
+        }
+
+        drop(writers);
         workspace.cleanup().expect("clean workspace");
         fs::remove_dir(&root).expect("remove test root");
     }

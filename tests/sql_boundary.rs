@@ -652,26 +652,26 @@ fn spilled_limit_without_order_keeps_only_the_smallest_group_keys() {
 }
 
 #[test]
-fn physical_partition_allocations_respect_the_temporary_limit() {
+fn logical_partition_payload_respects_the_temporary_limit() {
     let rows = (0..2_000)
         .map(|key| format!("({key})"))
         .collect::<Vec<_>>()
         .join(",");
-    let directory = TestDirectory::new("physical-quota");
-    let mut database = spilling_database(&directory, 32 * 1024);
+    let directory = TestDirectory::new("logical-quota");
+    let mut database = spilling_database(&directory, 8 * 1024);
     database
         .execute(&format!(
-            "CREATE TABLE physical_quota (key Int64);
-             INSERT INTO physical_quota VALUES {rows};"
+            "CREATE TABLE logical_quota (key Int64);
+             INSERT INTO logical_quota VALUES {rows};"
         ))
         .expect("setup succeeds");
 
     assert_eq!(
         database
-            .execute("SELECT key FROM physical_quota GROUP BY key;")
-            .expect_err("partition allocation units exceed 32 KiB"),
+            .execute("SELECT key FROM logical_quota GROUP BY key;")
+            .expect_err("serialized row indices exceed 8 KiB"),
         Error::TemporaryStorageLimit {
-            limit_bytes: 32 * 1024
+            limit_bytes: 8 * 1024
         }
     );
     directory.assert_empty();

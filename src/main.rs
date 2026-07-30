@@ -20,7 +20,7 @@ OPTIONS:
         --temporary-directory <PATH>
                               Root directory for group spill files
         --temporary-directory-limit <BYTES>
-                              Per-query spill budget (supports KiB, MiB, GiB)
+                              Live row-index payload budget (supports KiB, MiB, GiB)
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.

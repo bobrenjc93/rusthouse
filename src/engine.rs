@@ -26,7 +26,7 @@ pub struct DatabaseOptions {
     pub group_memory_limit_bytes: usize,
     /// Root under which query-owned spill directories are created.
     pub temporary_directory: PathBuf,
-    /// Maximum bytes written by one query's spill workspace.
+    /// Maximum live serialized row-index payload in one query's spill workspace.
     pub temporary_directory_limit_bytes: u64,
 }
 
@@ -998,7 +998,7 @@ fn execute_spilled_grouped(
         while let Some(partition) = pending.pop() {
             let row_count =
                 usize::try_from(partition.bytes / ROW_INDEX_BYTES).unwrap_or(usize::MAX);
-            let rows = PartitionRows::open(&partition.path)?;
+            let rows = PartitionRows::open(&partition.path, table.row_count())?;
             match aggregate_rows(
                 table,
                 rows,
@@ -1046,9 +1046,13 @@ fn execute_spilled_grouped(
         }
     })();
     let cleanup = workspace.cleanup();
-    match result {
-        Err(error) => Err(error),
-        Ok(rows) => cleanup.map(|()| rows),
+    match (result, cleanup) {
+        (Err(execution), Err(cleanup)) => Err(Error::ExecutionAndCleanup {
+            execution: Box::new(execution),
+            cleanup: Box::new(cleanup),
+        }),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Ok(rows), Ok(())) => Ok(rows),
     }
 }
 
@@ -1170,6 +1174,7 @@ fn comparable(left: DataType, right: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::group_spill::fail_next_cleanup;
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
@@ -1230,5 +1235,47 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn query_and_cleanup_failures_are_both_reported() {
+        let temporary_directory = std::env::temp_dir().join(format!(
+            "rusthouse-combined-error-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temporary_directory);
+        std::fs::create_dir(&temporary_directory).expect("create temporary root");
+        let mut database = Database::with_options(DatabaseOptions {
+            group_memory_limit_bytes: 1,
+            temporary_directory: temporary_directory.clone(),
+            temporary_directory_limit_bytes: 1024 * 1024,
+        });
+        database
+            .execute(
+                "CREATE TABLE overflowing (key Int64, amount Int64);
+                 INSERT INTO overflowing VALUES
+                    (0, 9223372036854775807), (1, 0), (0, 1);",
+            )
+            .expect("setup");
+
+        fail_next_cleanup();
+        let error = database
+            .execute("SELECT key, SUM(amount) FROM overflowing GROUP BY key")
+            .expect_err("execution and cleanup both fail");
+        let Error::ExecutionAndCleanup { execution, cleanup } = error else {
+            panic!("expected combined error, found {error:?}");
+        };
+        assert_eq!(*execution, Error::NumericOverflow("SUM(Int64)".to_owned()));
+        assert!(matches!(*cleanup, Error::Io { context, message }
+                if context.contains("clean spill workspace")
+                    && message == "forced cleanup failure"));
+        assert_eq!(
+            std::fs::read_dir(&temporary_directory)
+                .expect("read temporary root")
+                .count(),
+            0,
+            "drop retry should remove the failed workspace"
+        );
+        std::fs::remove_dir(&temporary_directory).expect("remove temporary root");
     }
 }

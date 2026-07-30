@@ -61,11 +61,9 @@ cargo run -- \
 
 The library exposes the same controls through DatabaseOptions. The defaults
 are 64 MiB of group state, the operating system temporary directory, and
-1 GiB of spill files per query. The temporary-directory limit counts only the
-active query workspace, not unrelated files under the configured root.
-RustHouse queries the filesystem allocation unit and reserves whole units for
-payload, inode, workspace, and retained directory-growth overhead. Platforms
-without an allocation-size query use a conservative 1 MiB unit.
+1 GiB of live serialized row-index payload per query. This logical payload
+limit is independent of filesystem allocation and metadata overhead; a fixed
+live-partition ceiling separately bounds the number of files and queued paths.
 
 Or pipe a batch through standard input:
 
