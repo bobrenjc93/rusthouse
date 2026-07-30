@@ -865,10 +865,12 @@ impl Parser {
             cursor += 1;
         }
 
-        if !matches!(
+        let is_i64_min_magnitude = matches!(
             self.tokens.get(cursor).map(|token| &token.kind),
-            Some(TokenKind::Number(number)) if number == "9223372036854775808"
-        ) {
+            Some(TokenKind::Number(number))
+                if number.parse::<u64>() == Ok((i64::MAX as u64) + 1)
+        );
+        if !is_i64_min_magnitude {
             return Ok(false);
         }
         cursor += 1;
@@ -1215,7 +1217,9 @@ mod tests {
     fn parentheses_do_not_change_i64_min_literal_validity() {
         for expression in [
             "-9223372036854775808",
+            "-09223372036854775808",
             "-(9223372036854775808)",
+            "-(09223372036854775808)",
             "-((9223372036854775808))",
         ] {
             let statements = parse(&format!("SELECT {expression} FROM numbers"))

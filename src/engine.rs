@@ -127,15 +127,17 @@ impl Database {
                 select.limit,
             );
             grouped.project(&selected_groups, &items)
+        } else if select.limit == Some(0) {
+            Vec::new()
         } else {
-            if ordering.is_empty()
-                && let Some(limit) = select.limit
-            {
-                matching_rows.truncate(limit);
+            if ordering.is_empty() {
+                if let Some(limit) = select.limit {
+                    matching_rows.truncate(limit);
+                }
+            } else {
+                order_source_rows(table, &mut matching_rows, &items, &ordering, select.limit)?;
             }
-            let mut projected = execute_projection(table, &matching_rows, &items)?;
-            order_projected_rows(&mut projected, &ordering, select.limit);
-            projected.into_iter().map(|row| row.values).collect()
+            execute_projection(table, &matching_rows, &items)?
         };
 
         Ok(QueryResult {
@@ -145,7 +147,7 @@ impl Database {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum ResolvedExpression {
     Column {
         index: usize,
@@ -182,6 +184,58 @@ impl ResolvedExpression {
         }
     }
 
+    fn identical_to(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Column {
+                    index: left,
+                    data_type: left_type,
+                },
+                Self::Column {
+                    index: right,
+                    data_type: right_type,
+                },
+            ) => left == right && left_type == right_type,
+            (Self::Literal(left), Self::Literal(right)) => values_are_identical(left, right),
+            (
+                Self::Unary {
+                    operator: left_operator,
+                    expression: left_expression,
+                    data_type: left_type,
+                },
+                Self::Unary {
+                    operator: right_operator,
+                    expression: right_expression,
+                    data_type: right_type,
+                },
+            ) => {
+                left_operator == right_operator
+                    && left_type == right_type
+                    && left_expression.identical_to(right_expression)
+            }
+            (
+                Self::Binary {
+                    left: left_left,
+                    operator: left_operator,
+                    right: left_right,
+                    data_type: left_type,
+                },
+                Self::Binary {
+                    left: right_left,
+                    operator: right_operator,
+                    right: right_right,
+                    data_type: right_type,
+                },
+            ) => {
+                left_operator == right_operator
+                    && left_type == right_type
+                    && left_left.identical_to(right_left)
+                    && left_right.identical_to(right_right)
+            }
+            _ => false,
+        }
+    }
+
     fn evaluate<'a>(&'a self, table: &'a Table, row: usize) -> Result<EvaluatedValue<'a>> {
         match self {
             Self::Column { index, .. } => Ok(EvaluatedValue::Borrowed(
@@ -206,6 +260,16 @@ impl ResolvedExpression {
             )
             .map(EvaluatedValue::Owned),
         }
+    }
+}
+
+fn values_are_identical(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int64(left), Value::Int64(right)) => left == right,
+        (Value::Float64(left), Value::Float64(right)) => left.to_bits() == right.to_bits(),
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -279,10 +343,13 @@ fn resolve_group_expressions(
     table: &Table,
     expressions: &[ScalarExpression],
 ) -> Result<Vec<ResolvedExpression>> {
-    let mut resolved = Vec::with_capacity(expressions.len());
+    let mut resolved: Vec<ResolvedExpression> = Vec::with_capacity(expressions.len());
     for expression in expressions {
         let expression = resolve_expression(table, expression)?;
-        if resolved.contains(&expression) {
+        if resolved
+            .iter()
+            .any(|existing| existing.identical_to(&expression))
+        {
             return Err(Error::InvalidQuery(
                 "GROUP BY expression is listed more than once".to_owned(),
             ));
@@ -324,7 +391,7 @@ fn resolve_select_items(
                     };
                     let group_position = group_expressions
                         .iter()
-                        .position(|group| group == &expression);
+                        .position(|group| group.identical_to(&expression));
                     if !group_expressions.is_empty() && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
@@ -345,7 +412,7 @@ fn resolve_select_items(
                 let resolved = resolve_expression(table, expression)?;
                 let group_position = group_expressions
                     .iter()
-                    .position(|group| group == &resolved);
+                    .position(|group| group.identical_to(&resolved));
                 if (has_aggregate || !group_expressions.is_empty())
                     && group_position.is_none()
                     && resolved.constant().is_none()
@@ -570,21 +637,15 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-#[derive(Debug)]
-struct ProjectedRow {
-    source: usize,
-    values: Vec<Value>,
-}
-
 fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
-) -> Result<Vec<ProjectedRow>> {
+) -> Result<Vec<Vec<Value>>> {
     matching_rows
         .iter()
         .map(|row| {
-            let values = items
+            items
                 .iter()
                 .map(|item| match item {
                     ResolvedItem::Expression { expression, .. } => expression
@@ -594,11 +655,7 @@ fn execute_projection(
                         unreachable!("projection does not contain aggregates")
                     }
                 })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(ProjectedRow {
-                source: *row,
-                values,
-            })
+                .collect()
         })
         .collect()
 }
@@ -972,35 +1029,58 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
     Ok(ordering)
 }
 
-fn order_projected_rows(
-    rows: &mut Vec<ProjectedRow>,
-    ordering: &[ResolvedOrder],
-    limit: Option<usize>,
-) {
-    if ordering.is_empty() {
-        return;
-    }
-
-    if let Some(0) = limit {
-        rows.clear();
-        return;
-    }
-    if let Some(limit) = limit.filter(|limit| *limit < rows.len()) {
-        rows.select_nth_unstable_by(limit, |left, right| {
-            compare_projected_rows(left, right, ordering)
-        });
-        rows.truncate(limit);
-    }
-    rows.sort_unstable_by(|left, right| compare_projected_rows(left, right, ordering));
+#[derive(Debug)]
+struct SourceOrderKey {
+    source: usize,
+    values: Vec<Value>,
 }
 
-fn compare_projected_rows(
-    left: &ProjectedRow,
-    right: &ProjectedRow,
+fn order_source_rows(
+    table: &Table,
+    rows: &mut Vec<usize>,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+    limit: Option<usize>,
+) -> Result<()> {
+    let mut keyed_rows = rows
+        .iter()
+        .map(|row| {
+            let values = ordering
+                .iter()
+                .map(|order| match &items[order.output] {
+                    ResolvedItem::Expression { expression, .. } => expression
+                        .evaluate(table, *row)
+                        .map(EvaluatedValue::into_owned),
+                    ResolvedItem::Aggregate { .. } => {
+                        unreachable!("ungrouped projections cannot contain aggregates")
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SourceOrderKey {
+                source: *row,
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if let Some(limit) = limit.filter(|limit| *limit < rows.len()) {
+        keyed_rows.select_nth_unstable_by(limit, |left, right| {
+            compare_source_order_keys(left, right, ordering)
+        });
+        keyed_rows.truncate(limit);
+    }
+    keyed_rows.sort_unstable_by(|left, right| compare_source_order_keys(left, right, ordering));
+    *rows = keyed_rows.into_iter().map(|row| row.source).collect();
+    Ok(())
+}
+
+fn compare_source_order_keys(
+    left: &SourceOrderKey,
+    right: &SourceOrderKey,
     ordering: &[ResolvedOrder],
 ) -> Ordering {
-    for order in ordering {
-        let comparison = left.values[order.output].cmp(&right.values[order.output]);
+    for (position, order) in ordering.iter().enumerate() {
+        let comparison = left.values[position].cmp(&right.values[position]);
         if comparison != Ordering::Equal {
             return if order.descending {
                 comparison.reverse()

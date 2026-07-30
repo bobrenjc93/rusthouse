@@ -656,6 +656,16 @@ fn integer_expression_overflow_and_zero_divisors_are_errors() {
             Err(Error::DivisionByZero(_))
         ));
     }
+
+    let leading_zero_minimum = execute_query(
+        &mut database,
+        "SELECT value FROM arithmetic_bounds
+         WHERE value = -09223372036854775808;",
+    );
+    assert_eq!(
+        leading_zero_minimum.rows,
+        vec![vec![Value::Int64(i64::MIN)]]
+    );
 }
 
 #[test]
@@ -720,4 +730,50 @@ fn contextual_keyword_columns_and_parenthesized_i64_min_work_end_to_end() {
             Value::Int64(i64::MIN),
         ]]
     );
+}
+
+#[test]
+fn order_by_limit_projects_only_selected_source_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE limited_projection (id Int64, value Int64);
+             INSERT INTO limited_projection VALUES (1, 0), (2, 9223372036854775807);",
+        )
+        .expect("setup succeeds");
+
+    let first = execute_query(
+        &mut database,
+        "SELECT value + 1 AS incremented, id
+         FROM limited_projection ORDER BY id LIMIT 1;",
+    );
+    assert_eq!(first.rows, vec![vec![Value::Int64(1), Value::Int64(1)]]);
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT value + 1 AS incremented, id
+         FROM limited_projection ORDER BY incremented LIMIT 0;",
+    );
+    assert!(empty.rows.is_empty());
+}
+
+#[test]
+fn grouping_expression_matching_preserves_float_signed_zero() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE signed_zero_source (id Int64);
+             INSERT INTO signed_zero_source VALUES (1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT 0.0 AS selected FROM signed_zero_source GROUP BY -0.0;",
+    );
+    let Value::Float64(selected) = result.rows[0][0] else {
+        panic!("expected Float64 result");
+    };
+    assert_eq!(selected.to_bits(), 0.0_f64.to_bits());
+    assert_ne!(selected.to_bits(), (-0.0_f64).to_bits());
 }
