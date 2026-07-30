@@ -224,7 +224,7 @@ impl Table {
             })
     }
 
-    /// Validates a row and inserts it through the columnar batch path.
+    /// Validates a complete row before appending directly to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         if row.len() != self.schema.len() {
             return Err(Error::RowLength {
@@ -233,16 +233,34 @@ impl Table {
                 actual: row.len(),
             });
         }
-        let columns = row
-            .into_iter()
-            .map(|value| match value {
-                Value::Int64(value) => Column::Int64(vec![value]),
-                Value::Float64(value) => Column::Float64(vec![value]),
-                Value::Bool(value) => Column::Bool(vec![value]),
-                Value::String(value) => Column::String(vec![value]),
-            })
-            .collect();
-        self.insert_batch(ColumnBatch::new(columns)).map(|_| ())
+
+        for (field, value) in self.schema.iter().zip(&row) {
+            if field.data_type != value.data_type() {
+                return Err(Error::TypeMismatch {
+                    context: format!("column '{}.{}'", self.name, field.name),
+                    expected: field.data_type.to_string(),
+                    actual: value.data_type().to_string(),
+                });
+            }
+            if matches!(value, Value::Float64(number) if !number.is_finite()) {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' cannot store a non-finite Float64",
+                    self.name, field.name
+                )));
+            }
+        }
+
+        let new_row_count = self.row_count.checked_add(1).ok_or_else(|| {
+            Error::NumericOverflow(format!("row count for table '{}'", self.name))
+        })?;
+        for column in &mut self.columns {
+            column.reserve(1);
+        }
+        for (column, value) in self.columns.iter_mut().zip(row) {
+            column.push(value);
+        }
+        self.row_count = new_row_count;
+        Ok(())
     }
 
     /// Validates and atomically appends an owned set of typed columns.
@@ -375,6 +393,42 @@ mod tests {
 
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejected_non_finite_single_rows_do_not_mutate_columns() {
+        let mut table = Table::new(
+            "measurements".to_owned(),
+            vec![ColumnDef {
+                name: "reading".to_owned(),
+                data_type: DataType::Float64,
+            }],
+        )
+        .expect("valid schema");
+
+        let error = table
+            .insert_row(vec![Value::Float64(f64::NAN)])
+            .expect_err("non-finite float");
+
+        assert!(matches!(error, Error::InvalidQuery(message) if message.contains("non-finite")));
+        assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn single_row_count_overflow_is_rejected_before_columns_change() {
+        let mut table = test_table();
+        table.row_count = usize::MAX;
+
+        let error = table
+            .insert_row(vec![Value::Int64(1), Value::String("one".to_owned())])
+            .expect_err("row count overflows");
+
+        assert!(
+            matches!(error, Error::NumericOverflow(operation) if operation.contains("row count"))
+        );
+        assert_eq!(table.row_count(), usize::MAX);
         assert!(table.columns().iter().all(Column::is_empty));
     }
 
