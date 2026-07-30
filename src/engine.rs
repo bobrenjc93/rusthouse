@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -99,7 +99,14 @@ impl Database {
         let source = if let Some(join) = &select.join {
             let right_table = self.catalog.table(&join.table)?;
             let right_binding = join.alias.as_deref().unwrap_or_else(|| right_table.name());
-            RowSource::joined(left_table, left_binding, right_table, right_binding, join)?
+            RowSource::joined(
+                left_table,
+                left_binding,
+                right_table,
+                right_binding,
+                join,
+                select.limit != Some(0),
+            )?
         } else {
             RowSource::single(left_table, left_binding)
         };
@@ -108,24 +115,26 @@ impl Database {
             .as_ref()
             .map(|predicate| compile_predicate(&source, predicate))
             .transpose()?;
-
-        let mut matching_rows = (0..source.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(&source, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(&source, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(&source, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&source, &items, &result_columns, &select.order_by)?;
 
+        if select.limit == Some(0) {
+            return Ok(QueryResult {
+                columns: result_columns,
+                rows: Vec::new(),
+            });
+        }
+
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped =
-                execute_grouped(&source, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                &source,
+                predicate.as_ref(),
+                &group_columns,
+                &aggregate_specs,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -136,7 +145,8 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, &source, &items, &ordering, select.limit);
+            let matching_rows =
+                collect_source_rows(&source, predicate.as_ref(), &items, &ordering, select.limit)?;
             execute_projection(&source, &matching_rows, &items)
         };
 
@@ -160,11 +170,26 @@ struct SourceColumn {
     data_type: DataType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SourceRow {
+    Single(usize),
+    Joined([usize; 2]),
+}
+
+#[derive(Debug)]
+enum SourceRows<'a> {
+    Single,
+    Joined {
+        left_key: usize,
+        build: HashMap<ValueRef<'a>, Vec<usize>>,
+    },
+}
+
 #[derive(Debug)]
 struct RowSource<'a> {
     relations: Vec<Relation<'a>>,
     columns: Vec<SourceColumn>,
-    joined_rows: Option<Vec<[usize; 2]>>,
+    rows: SourceRows<'a>,
 }
 
 impl<'a> RowSource<'a> {
@@ -181,6 +206,7 @@ impl<'a> RowSource<'a> {
         right: &'a Table,
         right_binding: &str,
         join: &InnerJoin,
+        build_hash: bool,
     ) -> Result<Self> {
         if left_binding.eq_ignore_ascii_case(right_binding) {
             return Err(Error::InvalidQuery(format!(
@@ -222,20 +248,16 @@ impl<'a> RowSource<'a> {
             });
         }
 
-        let mut build = HashMap::<ValueRef<'a>, Vec<usize>>::with_capacity(right.row_count());
-        for right_row in 0..right.row_count() {
-            let key = source.value_ref_physical(right_key, right_row);
-            build.entry(key).or_default().push(right_row);
-        }
-
-        let mut joined_rows = Vec::new();
-        for left_row in 0..left.row_count() {
-            let key = source.value_ref_physical(left_key, left_row);
-            if let Some(matches) = build.get(&key) {
-                joined_rows.extend(matches.iter().map(|right_row| [left_row, *right_row]));
+        let mut build = HashMap::<ValueRef<'a>, Vec<usize>>::new();
+        if build_hash {
+            build.reserve(right.row_count());
+            for right_row in 0..right.row_count() {
+                let key = source.value_ref_physical(right_key, right_row);
+                build.entry(key).or_default().push(right_row);
             }
         }
-        source.joined_rows = Some(joined_rows);
+
+        source.rows = SourceRows::Joined { left_key, build };
         Ok(source)
     }
 
@@ -259,23 +281,42 @@ impl<'a> RowSource<'a> {
         Self {
             relations,
             columns,
-            joined_rows: None,
+            rows: SourceRows::Single,
         }
     }
 
-    fn row_count(&self) -> usize {
-        self.joined_rows
-            .as_ref()
-            .map_or_else(|| self.relations[0].table.row_count(), Vec::len)
+    fn value_ref(&self, column: usize, row: SourceRow) -> ValueRef<'a> {
+        let source_column = self.columns[column];
+        let physical_row = match row {
+            SourceRow::Single(row) => row,
+            SourceRow::Joined(rows) => rows[source_column.relation],
+        };
+        self.value_ref_physical(column, physical_row)
     }
 
-    fn value_ref(&self, column: usize, row: usize) -> ValueRef<'a> {
-        let source_column = self.columns[column];
-        let physical_row = self
-            .joined_rows
-            .as_ref()
-            .map_or(row, |rows| rows[row][source_column.relation]);
-        self.value_ref_physical(column, physical_row)
+    fn try_for_each_row(&self, mut visit: impl FnMut(SourceRow) -> Result<bool>) -> Result<()> {
+        match &self.rows {
+            SourceRows::Single => {
+                for row in 0..self.relations[0].table.row_count() {
+                    if !visit(SourceRow::Single(row))? {
+                        break;
+                    }
+                }
+            }
+            SourceRows::Joined { left_key, build } => {
+                for left_row in 0..self.relations[0].table.row_count() {
+                    let key = self.value_ref_physical(*left_key, left_row);
+                    if let Some(matches) = build.get(&key) {
+                        for right_row in matches {
+                            if !visit(SourceRow::Joined([left_row, *right_row]))? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn value_ref_physical(&self, column: usize, physical_row: usize) -> ValueRef<'a> {
@@ -558,7 +599,7 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 
 fn execute_projection(
     source: &RowSource<'_>,
-    matching_rows: &[usize],
+    matching_rows: &[SourceRow],
     items: &[ResolvedItem],
 ) -> Vec<Vec<Value>> {
     matching_rows
@@ -581,17 +622,16 @@ fn execute_projection(
 
 fn execute_grouped<'a>(
     source: &RowSource<'a>,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let mut groups = GroupIndex::new(group_columns.len());
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
-            let mut states = Vec::with_capacity(initial_capacity);
+            let mut states = Vec::with_capacity(1_024);
             if group_columns.is_empty() {
                 states.push(AggregateState::new(spec));
             }
@@ -599,8 +639,11 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(source, group_columns, *row, group_count);
+    source.try_for_each_row(|row| {
+        if predicate.is_some_and(|predicate| !predicate.evaluate(source, row)) {
+            return Ok(true);
+        }
+        let (group, inserted) = groups.find_or_insert(source, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -609,9 +652,10 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, source, *row)?;
+            states[group].update(spec, source, row)?;
         }
-    }
+        Ok(true)
+    })?;
 
     let keys = groups.into_keys(group_count);
     let aggregates = aggregate_states
@@ -634,12 +678,11 @@ enum GroupIndex<'a> {
 }
 
 impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize, row_count: usize) -> Self {
-        let initial_capacity = row_count.min(1_024);
+    fn new(column_count: usize) -> Self {
         match column_count {
             0 => Self::Global,
-            1 => Self::One(HashMap::with_capacity(initial_capacity)),
-            _ => Self::Multiple(HashMap::with_capacity(initial_capacity)),
+            1 => Self::One(HashMap::with_capacity(1_024)),
+            _ => Self::Multiple(HashMap::with_capacity(1_024)),
         }
     }
 
@@ -647,7 +690,7 @@ impl<'a> GroupIndex<'a> {
         &mut self,
         source: &RowSource<'a>,
         columns: &[usize],
-        row: usize,
+        row: SourceRow,
         next_group: usize,
     ) -> (usize, bool) {
         match self {
@@ -807,7 +850,12 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, source: &RowSource<'_>, row: usize) -> Result<()> {
+    fn update(
+        &mut self,
+        spec: &AggregateSpec,
+        source: &RowSource<'_>,
+        row: SourceRow,
+    ) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -960,38 +1008,155 @@ fn resolve_ordering(
     Ok(ordering)
 }
 
-fn order_source_rows(
-    rows: &mut Vec<usize>,
+fn collect_source_rows(
     source: &RowSource<'_>,
+    predicate: Option<&CompiledPredicate>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
-    if ordering.is_empty() {
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-        return;
+) -> Result<Vec<SourceRow>> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
     }
 
-    sort_and_limit(rows, limit, |left, right| {
-        for order in ordering {
-            let ResolvedItem::Column { source: column, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
-            };
-            let comparison = source
-                .value_ref(column, left)
-                .cmp(&source.value_ref(column, right));
-            if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
+    if ordering.is_empty() {
+        let mut rows = Vec::with_capacity(limit.unwrap_or(0).min(1_024));
+        source.try_for_each_row(|row| {
+            if predicate.is_none_or(|predicate| predicate.evaluate(source, row)) {
+                rows.push(row);
             }
+            Ok(limit.is_none_or(|limit| rows.len() < limit))
+        })?;
+        return Ok(rows);
+    }
+
+    if let Some(limit) = limit {
+        let mut top = BinaryHeap::with_capacity(limit.min(1_024));
+        source.try_for_each_row(|row| {
+            if predicate.is_none_or(|predicate| predicate.evaluate(source, row)) {
+                let candidate = OrderedSourceRow::new(source, row, items, ordering);
+                if top.len() < limit {
+                    top.push(candidate);
+                } else if top
+                    .peek()
+                    .is_some_and(|worst| candidate.cmp(worst) == Ordering::Less)
+                {
+                    top.pop();
+                    top.push(candidate);
+                }
+            }
+            Ok(true)
+        })?;
+        return Ok(top
+            .into_sorted_vec()
+            .into_iter()
+            .map(|entry| entry.row)
+            .collect());
+    }
+
+    let mut rows = Vec::new();
+    source.try_for_each_row(|row| {
+        if predicate.is_none_or(|predicate| predicate.evaluate(source, row)) {
+            rows.push(row);
         }
-        left.cmp(&right)
+        Ok(true)
+    })?;
+    rows.sort_unstable_by(|left, right| {
+        compare_source_rows(source, *left, *right, items, ordering)
     });
+    Ok(rows)
+}
+
+fn compare_source_rows(
+    source: &RowSource<'_>,
+    left: SourceRow,
+    right: SourceRow,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+) -> Ordering {
+    for order in ordering {
+        let ResolvedItem::Column { source: column, .. } = items[order.output] else {
+            unreachable!("ungrouped projections cannot contain aggregates")
+        };
+        let comparison = source
+            .value_ref(column, left)
+            .cmp(&source.value_ref(column, right));
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    left.cmp(&right)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OrderedSourceRow {
+    keys: Vec<OrderedValue>,
+    row: SourceRow,
+}
+
+impl OrderedSourceRow {
+    fn new(
+        source: &RowSource<'_>,
+        row: SourceRow,
+        items: &[ResolvedItem],
+        ordering: &[ResolvedOrder],
+    ) -> Self {
+        let keys = ordering
+            .iter()
+            .map(|order| {
+                let ResolvedItem::Column { source: column, .. } = items[order.output] else {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                };
+                OrderedValue {
+                    value: source.value_ref(column, row).to_owned(),
+                    descending: order.descending,
+                }
+            })
+            .collect();
+        Self { keys, row }
+    }
+}
+
+impl PartialOrd for OrderedSourceRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedSourceRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.keys
+            .cmp(&other.keys)
+            .then_with(|| self.row.cmp(&other.row))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OrderedValue {
+    value: Value,
+    descending: bool,
+}
+
+impl PartialOrd for OrderedValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        debug_assert_eq!(self.descending, other.descending);
+        let comparison = self.value.cmp(&other.value);
+        if self.descending {
+            comparison.reverse()
+        } else {
+            comparison
+        }
+    }
 }
 
 fn order_grouped_rows(
@@ -1058,7 +1223,7 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, source: &RowSource<'_>, row: usize) -> bool {
+    fn evaluate(&self, source: &RowSource<'_>, row: SourceRow) -> bool {
         match self {
             Self::Comparison {
                 left,
@@ -1099,7 +1264,7 @@ impl CompiledOperand {
         }
     }
 
-    fn value<'a>(&'a self, source: &'a RowSource<'_>, row: usize) -> ValueRef<'a> {
+    fn value<'a>(&'a self, source: &'a RowSource<'_>, row: SourceRow) -> ValueRef<'a> {
         match self {
             Self::Column { index, .. } => source.value_ref(*index, row),
             Self::Literal(value) => value.as_ref(),

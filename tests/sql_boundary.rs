@@ -692,3 +692,63 @@ fn invalid_inner_joins_return_actionable_errors() {
         assert!(matches!(database.execute(sql), Err(Error::Sql { .. })));
     }
 }
+
+#[test]
+fn duplicate_key_join_applies_limits_without_materializing_the_cross_product() {
+    let row_count = 2_000;
+    let left_rows = (0..row_count)
+        .map(|sequence| format!("(1, {sequence})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right_rows = (0..row_count)
+        .map(|sequence| format!("(1, {sequence})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE join_left (key Int64, sequence Int64);
+             CREATE TABLE join_right (key Int64, sequence Int64);
+             INSERT INTO join_left VALUES {left_rows};
+             INSERT INTO join_right VALUES {right_rows};"
+        ))
+        .expect("duplicate-key setup succeeds");
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS matches
+         FROM join_left l INNER JOIN join_right r ON l.key = r.key
+         LIMIT 0;",
+    );
+    assert!(empty.rows.is_empty());
+
+    let first = execute_query(
+        &mut database,
+        "SELECT l.sequence AS left_sequence, r.sequence AS right_sequence
+         FROM join_left l INNER JOIN join_right r ON l.key = r.key
+         LIMIT 1;",
+    );
+    assert_eq!(first.rows, vec![vec![Value::Int64(0), Value::Int64(0)]]);
+}
+
+#[test]
+fn boolean_words_can_qualify_where_columns_when_used_as_aliases() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE flags (id Int64, enabled Bool);
+             INSERT INTO flags VALUES (1, true), (2, false);",
+        )
+        .expect("setup succeeds");
+
+    for alias in ["true", "FALSE"] {
+        let result = execute_query(
+            &mut database,
+            &format!(
+                "SELECT {alias}.id FROM flags AS {alias}
+                 WHERE {alias}.id = 1 AND {alias}.enabled = true;"
+            ),
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
+    }
+}

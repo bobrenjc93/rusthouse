@@ -737,7 +737,12 @@ impl Parser {
             TokenKind::Identifier(value)
                 if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
             {
-                self.parse_literal().map(Operand::Literal)
+                if self.next_at(&TokenKind::Dot) {
+                    self.parse_column_reference("qualified column")
+                        .map(Operand::Column)
+                } else {
+                    self.parse_literal().map(Operand::Literal)
+                }
             }
             TokenKind::Identifier(_) => self
                 .parse_column_reference("column or literal")
@@ -850,6 +855,12 @@ impl Parser {
         self.peek() == expected
     }
 
+    fn next_at(&self, expected: &TokenKind) -> bool {
+        self.tokens
+            .get(self.current + 1)
+            .is_some_and(|token| &token.kind == expected)
+    }
+
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.current].kind
     }
@@ -924,6 +935,34 @@ mod tests {
         assert!(
             matches!(multiple, Error::Sql { message, .. } if message.contains("only one INNER JOIN"))
         );
+    }
+
+    #[test]
+    fn parses_boolean_words_as_qualifiers_before_literals() {
+        let statements =
+            parse("SELECT true.id FROM things true WHERE true.id = 1 OR false = false")
+                .expect("qualified TRUE is a column and unqualified FALSE is a literal");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let Predicate::Or(left, right) = select.predicate.as_ref().expect("predicate") else {
+            panic!("expected OR");
+        };
+        assert!(matches!(
+            left.as_ref(),
+            Predicate::Comparison {
+                left: Operand::Column(ColumnReference { qualifier: Some(qualifier), name }),
+                ..
+            } if qualifier == "true" && name == "id"
+        ));
+        assert!(matches!(
+            right.as_ref(),
+            Predicate::Comparison {
+                left: Operand::Literal(Value::Bool(false)),
+                right: Operand::Literal(Value::Bool(false)),
+                ..
+            }
+        ));
     }
 
     #[test]
