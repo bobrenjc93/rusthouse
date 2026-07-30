@@ -6,10 +6,11 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
-- SELECT * and named projections, with optional AS aliases
-- WHERE comparisons using =, !=, <>, <, <=, >, and >=
+- SELECT *, columns, and typed scalar expressions, with optional AS aliases
+- Int64/Float64 arithmetic with parentheses, unary negation, and +, -, *, and /
+- WHERE comparisons using =, !=, <>, <, <=, >, and >=, with expressions on either side
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- COUNT, SUM, MIN, MAX, and AVG over columns or scalar expressions
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
@@ -28,7 +29,7 @@ cargo run -- --execute "
     ('west', 10, true),
     ('east', 4, false),
     ('west', 7, true);
-  SELECT region, COUNT(*) AS orders, SUM(amount) AS total, AVG(amount) AS mean
+  SELECT region, COUNT(*) AS orders, SUM(amount * 2) AS total, AVG(amount / 2.0) AS mean
   FROM sales
   WHERE online = true
   GROUP BY region
@@ -81,9 +82,11 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+
+Each scalar expression is independently limited to a depth of 64 and 256 AST nodes. Arithmetic over two Int64 operands returns Int64 (including truncating division); a Float64 operand promotes the result to Float64. Int64 arithmetic is checked for overflow, division by zero is rejected, and Float64 expressions must produce finite results.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

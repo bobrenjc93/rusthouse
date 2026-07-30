@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ArithmeticOperator, ComparisonOperator, Expression,
+    OrderBy, Predicate, Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -98,13 +98,16 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
+        let mut matching_rows = Vec::new();
+        for row in 0..table.row_count() {
+            let matches = match &predicate {
+                Some(predicate) => predicate.evaluate(table, row)?,
+                None => true,
+            };
+            if matches {
+                matching_rows.push(row);
+            }
+        }
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -115,17 +118,42 @@ impl Database {
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_grouped_rows(
-                &mut selected_groups,
-                &grouped,
-                &items,
+            if ordering.is_empty() {
+                order_group_keys(&mut selected_groups, &grouped, select.limit);
+                grouped.project(&selected_groups, &items, &group_columns)?
+            } else {
+                let projected = grouped.project(&selected_groups, &items, &group_columns)?;
+                order_grouped_rows(
+                    &mut selected_groups,
+                    &grouped,
+                    &projected,
+                    &ordering,
+                    select.limit,
+                );
+                selected_groups
+                    .into_iter()
+                    .map(|group| projected[group].clone())
+                    .collect()
+            }
+        } else if ordering.is_empty() {
+            if let Some(limit) = select.limit {
+                matching_rows.truncate(limit);
+            }
+            execute_projection(table, &matching_rows, &items)?
+        } else {
+            let projected = execute_projection(table, &matching_rows, &items)?;
+            let mut selected_rows = (0..matching_rows.len()).collect::<Vec<_>>();
+            order_source_rows(
+                &mut selected_rows,
+                &matching_rows,
+                &projected,
                 &ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
-        } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            selected_rows
+                .into_iter()
+                .map(|row| projected[row].clone())
+                .collect()
         };
 
         Ok(QueryResult {
@@ -137,19 +165,14 @@ impl Database {
 
 #[derive(Debug)]
 enum ResolvedItem {
-    Column {
-        source: usize,
-        group_position: Option<usize>,
-    },
-    Aggregate {
-        state: usize,
-    },
+    Expression(CompiledExpression),
+    Aggregate { state: usize },
 }
 
 #[derive(Debug, Clone)]
 struct AggregateSpec {
     function: AggregateFunction,
-    argument: Option<usize>,
+    argument: Option<CompiledExpression>,
     input_type: Option<DataType>,
 }
 
@@ -193,40 +216,46 @@ fn resolve_select_items(
         match requested_item {
             SelectItem::Wildcard => {
                 for (source, field) in table.schema().iter().enumerate() {
-                    let group_position = group_columns.iter().position(|column| *column == source);
-                    if !group_columns.is_empty() && group_position.is_none() {
+                    if !group_columns.is_empty() && !group_columns.contains(&source) {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
                             field.name
                         )));
                     }
-                    items.push(ResolvedItem::Column {
+                    items.push(ResolvedItem::Expression(CompiledExpression::Column {
                         source,
-                        group_position,
-                    });
+                        data_type: field.data_type,
+                    }));
                     result_columns.push(ResultColumn {
                         name: field.name.clone(),
                         data_type: field.data_type,
                     });
                 }
             }
-            SelectItem::Column { name, alias } => {
-                let source = table.column_index(name)?;
-                let group_position = group_columns.iter().position(|column| *column == source);
-                if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
-                    return Err(Error::InvalidQuery(format!(
-                        "column '{name}' must appear in GROUP BY"
-                    )));
+            SelectItem::Expression { expression, alias } => {
+                let compiled = compile_expression(table, expression)?;
+                if has_aggregate || !group_columns.is_empty() {
+                    for source in compiled.column_sources() {
+                        if !group_columns.contains(&source) {
+                            return Err(Error::InvalidQuery(format!(
+                                "column '{}' must appear in GROUP BY",
+                                table.schema()[source].name
+                            )));
+                        }
+                    }
                 }
-                items.push(ResolvedItem::Column {
-                    source,
-                    group_position,
-                });
+                let data_type = compiled.data_type();
+                let default_name = match expression {
+                    Expression::Column(name) => {
+                        let source = table.column_index(name)?;
+                        table.schema()[source].name.clone()
+                    }
+                    _ => expression.to_string(),
+                };
+                items.push(ResolvedItem::Expression(compiled));
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| table.schema()[source].name.clone()),
-                    data_type: table.schema()[source].data_type,
+                    name: alias.clone().unwrap_or(default_name),
+                    data_type,
                 });
             }
             SelectItem::Aggregate {
@@ -234,7 +263,7 @@ fn resolve_select_items(
                 argument,
                 alias,
             } => {
-                let (argument_index, input_type, argument_name) = match argument {
+                let (compiled_argument, input_type, argument_name) = match argument {
                     AggregateArgument::Wildcard => {
                         if *function != AggregateFunction::Count {
                             return Err(Error::InvalidQuery(format!(
@@ -244,20 +273,24 @@ fn resolve_select_items(
                         }
                         (None, None, "*".to_owned())
                     }
-                    AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
-                        (
-                            Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
-                        )
+                    AggregateArgument::Expression(expression) => {
+                        let compiled = compile_expression(table, expression)?;
+                        let input_type = compiled.data_type();
+                        let argument_name = match expression {
+                            Expression::Column(name) => {
+                                let source = table.column_index(name)?;
+                                table.schema()[source].name.clone()
+                            }
+                            _ => expression.to_string(),
+                        };
+                        (Some(compiled), Some(input_type), argument_name)
                     }
                 };
                 validate_aggregate(*function, input_type)?;
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
                     function: *function,
-                    argument: argument_index,
+                    argument: compiled_argument,
                     input_type,
                 });
                 items.push(ResolvedItem::Aggregate { state });
@@ -302,19 +335,19 @@ fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>> {
     matching_rows
         .iter()
         .map(|row| {
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::Expression(expression) => expression.evaluate_row(table, *row),
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()
         })
         .collect()
 }
@@ -496,26 +529,32 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
+    fn project(
+        &self,
+        selected: &[usize],
+        items: &[ResolvedItem],
+        group_columns: &[usize],
+    ) -> Result<Vec<Vec<Value>>> {
         selected
             .iter()
             .map(|group| {
                 items
                     .iter()
                     .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
+                        ResolvedItem::Expression(expression) => {
+                            expression.evaluate_with(&|source| {
+                                let position = group_columns
+                                    .iter()
+                                    .position(|column| *column == source)
+                                    .expect("expression columns are validated as grouped");
+                                self.keys[*group].value(position).to_owned()
+                            })
+                        }
                         ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
+                            Ok(self.aggregates[*state][*group].clone())
                         }
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
             .collect()
     }
@@ -550,69 +589,92 @@ impl AggregateState {
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
+                if let Some(argument) = &spec.argument {
+                    argument.evaluate_row(table, row)?;
+                }
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+                let Value::Int64(value) = spec
+                    .argument
+                    .as_ref()
+                    .expect("SUM argument")
+                    .evaluate_row(table, row)?
                 else {
-                    unreachable!("SUM input type is resolved")
+                    unreachable!("SUM expression type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(value)
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
+                let Value::Float64(value) = spec
+                    .argument
+                    .as_ref()
+                    .expect("SUM argument")
+                    .evaluate_row(table, row)?
                 else {
-                    unreachable!("SUM input type is resolved")
+                    unreachable!("SUM expression type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
             }
             Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
+                let candidate = spec
+                    .argument
+                    .as_ref()
+                    .expect("MIN argument")
+                    .evaluate_row(table, row)?;
                 if current
                     .as_ref()
-                    .is_none_or(|existing| candidate < existing.as_ref())
+                    .is_none_or(|existing| candidate < *existing)
                 {
-                    *current = Some(candidate.to_owned());
+                    *current = Some(candidate);
                 }
             }
             Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
+                let candidate = spec
+                    .argument
+                    .as_ref()
+                    .expect("MAX argument")
+                    .evaluate_row(table, row)?;
                 if current
                     .as_ref()
-                    .is_none_or(|existing| candidate > existing.as_ref())
+                    .is_none_or(|existing| candidate > *existing)
                 {
-                    *current = Some(candidate.to_owned());
+                    *current = Some(candidate);
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let Value::Int64(value) = spec
+                    .argument
+                    .as_ref()
+                    .expect("AVG argument")
+                    .evaluate_row(table, row)?
                 else {
-                    unreachable!("AVG input type is resolved")
+                    unreachable!("AVG expression type is resolved")
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
+                let Value::Float64(value) = spec
+                    .argument
+                    .as_ref()
+                    .expect("AVG argument")
+                    .evaluate_row(table, row)?
                 else {
-                    unreachable!("AVG input type is resolved")
+                    unreachable!("AVG expression type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -685,8 +747,8 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
 
 fn order_source_rows(
     rows: &mut Vec<usize>,
-    table: &Table,
-    items: &[ResolvedItem],
+    source_rows: &[usize],
+    projected: &[Vec<Value>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) {
@@ -699,10 +761,7 @@ fn order_source_rows(
 
     sort_and_limit(rows, limit, |left, right| {
         for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
-            };
-            let comparison = table.columns()[source].cmp_at(left, right);
+            let comparison = projected[left][order.output].cmp(&projected[right][order.output]);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -711,34 +770,20 @@ fn order_source_rows(
                 };
             }
         }
-        left.cmp(&right)
+        source_rows[left].cmp(&source_rows[right])
     });
 }
 
 fn order_grouped_rows(
     groups: &mut Vec<usize>,
     data: &GroupedData<'_>,
-    items: &[ResolvedItem],
+    projected: &[Vec<Value>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) {
     sort_and_limit(groups, limit, |left, right| {
         for order in ordering {
-            let comparison = match items[order.output] {
-                ResolvedItem::Column {
-                    group_position: Some(position),
-                    ..
-                } => data.keys[left]
-                    .value(position)
-                    .cmp(&data.keys[right].value(position)),
-                ResolvedItem::Column {
-                    group_position: None,
-                    ..
-                } => unreachable!("grouped columns are validated"),
-                ResolvedItem::Aggregate { state } => {
-                    data.aggregates[state][left].cmp(&data.aggregates[state][right])
-                }
-            };
+            let comparison = projected[left][order.output].cmp(&projected[right][order.output]);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -747,6 +792,12 @@ fn order_grouped_rows(
                 };
             }
         }
+        data.keys[left].cmp(&data.keys[right])
+    });
+}
+
+fn order_group_keys(groups: &mut Vec<usize>, data: &GroupedData<'_>, limit: Option<usize>) {
+    sort_and_limit(groups, limit, |left, right| {
         data.keys[left].cmp(&data.keys[right])
     });
 }
@@ -770,60 +821,136 @@ fn sort_and_limit(
 #[derive(Debug)]
 enum CompiledPredicate {
     Comparison {
-        left: CompiledOperand,
+        left: CompiledExpression,
         operator: ComparisonOperator,
-        right: CompiledOperand,
+        right: CompiledExpression,
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, table: &Table, row: usize) -> Result<bool> {
         match self {
             Self::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
+                let left = left.evaluate_row(table, row)?;
+                let right = right.evaluate_row(table, row)?;
                 let comparison = left
-                    .sql_cmp(right)
+                    .as_ref()
+                    .sql_cmp(right.as_ref())
                     .expect("predicate operand types are validated");
-                match operator {
+                Ok(match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
                     ComparisonOperator::Less => comparison == Ordering::Less,
                     ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
                     ComparisonOperator::Greater => comparison == Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
+                })
+            }
+            Self::And(left, right) => {
+                if left.evaluate(table, row)? {
+                    right.evaluate(table, row)
+                } else {
+                    Ok(false)
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::Or(left, right) => {
+                if left.evaluate(table, row)? {
+                    Ok(true)
+                } else {
+                    right.evaluate(table, row)
+                }
+            }
         }
     }
 }
 
-#[derive(Debug)]
-enum CompiledOperand {
-    Column { index: usize, data_type: DataType },
+#[derive(Debug, Clone)]
+enum CompiledExpression {
+    Column {
+        source: usize,
+        data_type: DataType,
+    },
     Literal(Value),
+    Negate {
+        expression: Box<Self>,
+        data_type: DataType,
+    },
+    Binary {
+        left: Box<Self>,
+        operator: ArithmeticOperator,
+        right: Box<Self>,
+        data_type: DataType,
+    },
 }
 
-impl CompiledOperand {
+impl CompiledExpression {
     fn data_type(&self) -> DataType {
         match self {
-            Self::Column { data_type, .. } => *data_type,
+            Self::Column { data_type, .. }
+            | Self::Negate { data_type, .. }
+            | Self::Binary { data_type, .. } => *data_type,
             Self::Literal(value) => value.data_type(),
         }
     }
 
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
+    fn column_sources(&self) -> Vec<usize> {
+        let mut sources = Vec::new();
+        self.collect_column_sources(&mut sources);
+        sources
+    }
+
+    fn collect_column_sources(&self, sources: &mut Vec<usize>) {
         match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
-            Self::Literal(value) => value.as_ref(),
+            Self::Column { source, .. } => sources.push(*source),
+            Self::Literal(_) => {}
+            Self::Negate { expression, .. } => expression.collect_column_sources(sources),
+            Self::Binary { left, right, .. } => {
+                left.collect_column_sources(sources);
+                right.collect_column_sources(sources);
+            }
+        }
+    }
+
+    fn evaluate_row(&self, table: &Table, row: usize) -> Result<Value> {
+        self.evaluate_with(&|source| table.columns()[source].value(row))
+    }
+
+    fn evaluate_with(&self, column_value: &impl Fn(usize) -> Value) -> Result<Value> {
+        match self {
+            Self::Column { source, .. } => Ok(column_value(*source)),
+            Self::Literal(value) => Ok(value.clone()),
+            Self::Negate {
+                expression,
+                data_type,
+            } => {
+                let value = expression.evaluate_with(column_value)?;
+                match (data_type, value) {
+                    (DataType::Int64, Value::Int64(value)) => value
+                        .checked_neg()
+                        .map(Value::Int64)
+                        .ok_or_else(|| Error::NumericOverflow("Int64 unary negation".to_owned())),
+                    (DataType::Float64, Value::Float64(value)) => {
+                        finite_float(-value, "Float64 unary negation")
+                    }
+                    _ => unreachable!("negation operand type is compiled"),
+                }
+            }
+            Self::Binary {
+                left,
+                operator,
+                right,
+                data_type,
+            } => {
+                let left = left.evaluate_with(column_value)?;
+                let right = right.evaluate_with(column_value)?;
+                evaluate_arithmetic(left, *operator, right, *data_type)
+            }
         }
     }
 }
@@ -835,8 +962,8 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let left = compile_expression(table, left)?;
+            let right = compile_expression(table, right)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -861,16 +988,143 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
-    match operand {
-        Operand::Column(name) => {
-            let index = table.column_index(name)?;
-            Ok(CompiledOperand::Column {
-                index,
-                data_type: table.schema()[index].data_type,
+fn compile_expression(table: &Table, expression: &Expression) -> Result<CompiledExpression> {
+    match expression {
+        Expression::Column(name) => {
+            let source = table.column_index(name)?;
+            Ok(CompiledExpression::Column {
+                source,
+                data_type: table.schema()[source].data_type,
             })
         }
-        Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+        Expression::Literal(value) => Ok(CompiledExpression::Literal(value.clone())),
+        Expression::Parenthesized(expression) => compile_expression(table, expression),
+        Expression::Negate(expression) => {
+            let expression = compile_expression(table, expression)?;
+            require_numeric(expression.data_type(), "unary '-' operand")?;
+            let data_type = expression.data_type();
+            Ok(CompiledExpression::Negate {
+                expression: Box::new(expression),
+                data_type,
+            })
+        }
+        Expression::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            let left = compile_expression(table, left)?;
+            let right = compile_expression(table, right)?;
+            require_numeric(
+                left.data_type(),
+                &format!("left operand of '{}'", operator.symbol()),
+            )?;
+            require_numeric(
+                right.data_type(),
+                &format!("right operand of '{}'", operator.symbol()),
+            )?;
+            let data_type = if left.data_type() == DataType::Float64
+                || right.data_type() == DataType::Float64
+            {
+                DataType::Float64
+            } else {
+                DataType::Int64
+            };
+            Ok(CompiledExpression::Binary {
+                left: Box::new(left),
+                operator: *operator,
+                right: Box::new(right),
+                data_type,
+            })
+        }
+    }
+}
+
+fn require_numeric(data_type: DataType, context: &str) -> Result<()> {
+    if matches!(data_type, DataType::Int64 | DataType::Float64) {
+        Ok(())
+    } else {
+        Err(Error::TypeMismatch {
+            context: context.to_owned(),
+            expected: "Int64 or Float64".to_owned(),
+            actual: data_type.to_string(),
+        })
+    }
+}
+
+fn evaluate_arithmetic(
+    left: Value,
+    operator: ArithmeticOperator,
+    right: Value,
+    data_type: DataType,
+) -> Result<Value> {
+    match data_type {
+        DataType::Int64 => {
+            let (Value::Int64(left), Value::Int64(right)) = (left, right) else {
+                unreachable!("Int64 expression operands are compiled")
+            };
+            if operator == ArithmeticOperator::Divide && right == 0 {
+                return division_by_zero();
+            }
+            let value = match operator {
+                ArithmeticOperator::Add => left.checked_add(right),
+                ArithmeticOperator::Subtract => left.checked_sub(right),
+                ArithmeticOperator::Multiply => left.checked_mul(right),
+                ArithmeticOperator::Divide => left.checked_div(right),
+            }
+            .ok_or_else(|| {
+                Error::NumericOverflow(format!("Int64 {}", arithmetic_name(operator)))
+            })?;
+            Ok(Value::Int64(value))
+        }
+        DataType::Float64 => {
+            let left = numeric_as_f64(left);
+            let right = numeric_as_f64(right);
+            if operator == ArithmeticOperator::Divide && right == 0.0 {
+                return division_by_zero();
+            }
+            let value = match operator {
+                ArithmeticOperator::Add => left + right,
+                ArithmeticOperator::Subtract => left - right,
+                ArithmeticOperator::Multiply => left * right,
+                ArithmeticOperator::Divide => left / right,
+            };
+            finite_float(value, &format!("Float64 {}", arithmetic_name(operator)))
+        }
+        DataType::Bool | DataType::String => unreachable!("arithmetic result type is numeric"),
+    }
+}
+
+fn numeric_as_f64(value: Value) -> f64 {
+    match value {
+        Value::Int64(value) => value as f64,
+        Value::Float64(value) => value,
+        Value::Bool(_) | Value::String(_) => unreachable!("arithmetic operands are numeric"),
+    }
+}
+
+fn finite_float(value: f64, operation: &str) -> Result<Value> {
+    if value.is_finite() {
+        Ok(Value::Float64(value))
+    } else {
+        Err(Error::InvalidQuery(format!(
+            "non-finite result while computing {operation}"
+        )))
+    }
+}
+
+fn division_by_zero<T>() -> Result<T> {
+    Err(Error::InvalidQuery(
+        "division by zero in scalar expression".to_owned(),
+    ))
+}
+
+fn arithmetic_name(operator: ArithmeticOperator) -> &'static str {
+    match operator {
+        ArithmeticOperator::Add => "addition",
+        ArithmeticOperator::Subtract => "subtraction",
+        ArithmeticOperator::Multiply => "multiplication",
+        ArithmeticOperator::Divide => "division",
     }
 }
 
