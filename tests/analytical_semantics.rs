@@ -102,6 +102,107 @@ fn global_having_handles_empty_aggregate_inputs() {
 }
 
 #[test]
+fn having_aliases_bind_to_explicit_items_after_wildcard_expansion() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE wildcard_aliases (a Int64, b Int64);
+             INSERT INTO wildcard_aliases VALUES (1, 2), (2, 9);",
+        )
+        .expect("setup succeeds");
+
+    let result = query(
+        &mut database,
+        "SELECT *, a AS ax FROM wildcard_aliases
+         GROUP BY a, b
+         HAVING ax = 2;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(2), Value::Int64(9), Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn distinct_remains_a_queryable_column_name() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_columns (distinct Int64);
+             INSERT INTO keyword_columns VALUES (2), (1), (2);",
+        )
+        .expect("setup succeeds");
+
+    let projection = query(
+        &mut database,
+        "SELECT distinct FROM keyword_columns ORDER BY distinct;",
+    );
+    assert_eq!(
+        projection.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(2)],
+        ]
+    );
+
+    let aggregates = query(
+        &mut database,
+        "SELECT COUNT(distinct) AS rows,
+                COUNT(DISTINCT distinct) AS unique_values
+         FROM keyword_columns;",
+    );
+    assert_eq!(
+        aggregates.rows,
+        vec![vec![Value::Int64(3), Value::Int64(2)]]
+    );
+
+    let distinct_projection = query(
+        &mut database,
+        "SELECT DISTINCT distinct FROM keyword_columns ORDER BY distinct;",
+    );
+    assert_eq!(
+        distinct_projection.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn boolean_named_having_aliases_override_literals_only_when_present() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE boolean_aliases (enabled Bool);
+             INSERT INTO boolean_aliases VALUES (true), (false), (true);",
+        )
+        .expect("setup succeeds");
+
+    let aliased = query(
+        &mut database,
+        "SELECT enabled, COUNT(*) AS true
+         FROM boolean_aliases
+         GROUP BY enabled
+         HAVING true >= 1
+         ORDER BY enabled;",
+    );
+    assert_eq!(
+        aliased.rows,
+        vec![
+            vec![Value::Bool(false), Value::Int64(1)],
+            vec![Value::Bool(true), Value::Int64(2)],
+        ]
+    );
+
+    let literal = query(
+        &mut database,
+        "SELECT enabled FROM boolean_aliases
+         GROUP BY enabled
+         HAVING enabled = true;",
+    );
+    assert_eq!(literal.rows, vec![vec![Value::Bool(true)]]);
+}
+
+#[test]
 fn select_distinct_deduplicates_typed_tuples_before_order_and_limit() {
     let mut database = Database::new();
     database

@@ -115,8 +115,12 @@ impl Database {
                 .having
                 .as_ref()
                 .is_some_and(|predicate| predicate_contains_aggregate(predicate));
-        let (items, result_columns, mut aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns, has_query_aggregate)?;
+        let ResolvedSelect {
+            items,
+            result_columns,
+            mut aggregate_specs,
+            aliases,
+        } = resolve_select_items(table, &select.items, &group_columns, has_query_aggregate)?;
         let having = select
             .having
             .as_ref()
@@ -125,7 +129,7 @@ impl Database {
                     table,
                     predicate,
                     &group_columns,
-                    &select.items,
+                    &aliases,
                     &items,
                     &mut aggregate_specs,
                 )
@@ -183,6 +187,20 @@ enum ResolvedItem {
     },
 }
 
+#[derive(Debug)]
+struct ResolvedAlias {
+    name: String,
+    output: usize,
+}
+
+#[derive(Debug)]
+struct ResolvedSelect {
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    aliases: Vec<ResolvedAlias>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AggregateSpec {
     function: AggregateFunction,
@@ -210,7 +228,7 @@ fn resolve_select_items(
     requested: &[SelectItem],
     group_columns: &[usize],
     has_query_aggregate: bool,
-) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+) -> Result<ResolvedSelect> {
     let has_selected_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
@@ -227,6 +245,7 @@ fn resolve_select_items(
     let mut items = Vec::new();
     let mut result_columns = Vec::new();
     let mut aggregate_specs = Vec::new();
+    let mut aliases = Vec::new();
 
     for requested_item in requested {
         match requested_item {
@@ -263,6 +282,12 @@ fn resolve_select_items(
                     source,
                     group_position,
                 });
+                if let Some(alias) = alias {
+                    aliases.push(ResolvedAlias {
+                        name: alias.clone(),
+                        output: items.len() - 1,
+                    });
+                }
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
@@ -279,6 +304,12 @@ fn resolve_select_items(
                 let output_type = aggregate_output_type(spec.function, spec.input_type);
                 let state = intern_aggregate(&mut aggregate_specs, spec);
                 items.push(ResolvedItem::Aggregate { state });
+                if let Some(alias) = alias {
+                    aliases.push(ResolvedAlias {
+                        name: alias.clone(),
+                        output: items.len() - 1,
+                    });
+                }
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
@@ -289,7 +320,12 @@ fn resolve_select_items(
         }
     }
 
-    Ok((items, result_columns, aggregate_specs))
+    Ok(ResolvedSelect {
+        items,
+        result_columns,
+        aggregate_specs,
+        aliases,
+    })
 }
 
 fn resolve_aggregate(
@@ -468,7 +504,7 @@ fn compile_having(
     table: &Table,
     predicate: &Predicate,
     group_columns: &[usize],
-    requested_items: &[SelectItem],
+    aliases: &[ResolvedAlias],
     resolved_items: &[ResolvedItem],
     aggregate_specs: &mut Vec<AggregateSpec>,
 ) -> Result<CompiledHavingPredicate> {
@@ -482,7 +518,7 @@ fn compile_having(
                 table,
                 left,
                 group_columns,
-                requested_items,
+                aliases,
                 resolved_items,
                 aggregate_specs,
             )?;
@@ -490,7 +526,7 @@ fn compile_having(
                 table,
                 right,
                 group_columns,
-                requested_items,
+                aliases,
                 resolved_items,
                 aggregate_specs,
             )?;
@@ -512,7 +548,7 @@ fn compile_having(
                 table,
                 left,
                 group_columns,
-                requested_items,
+                aliases,
                 resolved_items,
                 aggregate_specs,
             )?),
@@ -520,7 +556,7 @@ fn compile_having(
                 table,
                 right,
                 group_columns,
-                requested_items,
+                aliases,
                 resolved_items,
                 aggregate_specs,
             )?),
@@ -530,7 +566,7 @@ fn compile_having(
                 table,
                 left,
                 group_columns,
-                requested_items,
+                aliases,
                 resolved_items,
                 aggregate_specs,
             )?),
@@ -538,7 +574,7 @@ fn compile_having(
                 table,
                 right,
                 group_columns,
-                requested_items,
+                aliases,
                 resolved_items,
                 aggregate_specs,
             )?),
@@ -550,12 +586,30 @@ fn compile_having_operand(
     table: &Table,
     operand: &Operand,
     group_columns: &[usize],
-    requested_items: &[SelectItem],
+    aliases: &[ResolvedAlias],
     resolved_items: &[ResolvedItem],
     aggregate_specs: &mut Vec<AggregateSpec>,
 ) -> Result<CompiledHavingOperand> {
     match operand {
         Operand::Literal(value) => Ok(CompiledHavingOperand::Literal(value.clone())),
+        Operand::Boolean(value) => {
+            let name = if *value { "true" } else { "false" };
+            if aliases
+                .iter()
+                .any(|alias| alias.name.eq_ignore_ascii_case(name))
+            {
+                resolve_having_name(
+                    table,
+                    name,
+                    group_columns,
+                    aliases,
+                    resolved_items,
+                    aggregate_specs,
+                )
+            } else {
+                Ok(CompiledHavingOperand::Literal(Value::Bool(*value)))
+            }
+        }
         Operand::Aggregate { function, argument } => {
             let (spec, _) = resolve_aggregate(table, *function, argument)?;
             let data_type = aggregate_output_type(spec.function, spec.input_type);
@@ -566,7 +620,7 @@ fn compile_having_operand(
             table,
             name,
             group_columns,
-            requested_items,
+            aliases,
             resolved_items,
             aggregate_specs,
         ),
@@ -577,26 +631,28 @@ fn resolve_having_name(
     table: &Table,
     name: &str,
     group_columns: &[usize],
-    requested_items: &[SelectItem],
+    aliases: &[ResolvedAlias],
     resolved_items: &[ResolvedItem],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<CompiledHavingOperand> {
-    let aliases = requested_items
+    let matching_aliases = aliases
         .iter()
-        .zip(resolved_items)
-        .filter(|(requested, _)| {
-            select_item_alias(requested).is_some_and(|alias| alias.eq_ignore_ascii_case(name))
-        })
+        .filter(|alias| alias.name.eq_ignore_ascii_case(name))
         .collect::<Vec<_>>();
-    if aliases.len() > 1 {
+    if matching_aliases.len() > 1 {
         return Err(Error::InvalidQuery(format!(
             "HAVING name '{name}' is ambiguous"
         )));
     }
 
     let mut resolved = Vec::with_capacity(2);
-    if let Some((_, item)) = aliases.first() {
-        resolved.push(having_operand_for_item(table, item, aggregate_specs, name)?);
+    if let Some(alias) = matching_aliases.first() {
+        resolved.push(having_operand_for_item(
+            table,
+            &resolved_items[alias.output],
+            aggregate_specs,
+            name,
+        )?);
     }
 
     let source = table
@@ -633,13 +689,6 @@ fn resolve_having_name(
             table: table.name().to_owned(),
             column: name.to_owned(),
         }),
-    }
-}
-
-fn select_item_alias(item: &SelectItem) -> Option<&str> {
-    match item {
-        SelectItem::Column { alias, .. } | SelectItem::Aggregate { alias, .. } => alias.as_deref(),
-        SelectItem::Wildcard => None,
     }
 }
 
@@ -1278,6 +1327,7 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
             "aggregate expression {}(...) is not allowed in WHERE",
             function.name()
         ))),
+        Operand::Boolean(value) => Ok(CompiledOperand::Literal(Value::Bool(*value))),
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
     }
 }

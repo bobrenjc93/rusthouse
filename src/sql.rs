@@ -98,6 +98,7 @@ pub enum Predicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Column(String),
+    Boolean(bool),
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
@@ -449,7 +450,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        let distinct = self.eat_keyword("DISTINCT");
+        let distinct = self.eat_select_distinct_modifier();
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -565,7 +566,7 @@ impl Parser {
             position,
             message: format!("unknown aggregate function '{name}'"),
         })?;
-        let argument = if self.eat_keyword("DISTINCT") {
+        let argument = if self.eat_aggregate_distinct_modifier() {
             AggregateArgument::DistinctColumn(
                 self.expect_identifier("column after DISTINCT in aggregate")?,
             )
@@ -657,7 +658,9 @@ impl Parser {
             TokenKind::Identifier(value)
                 if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
             {
-                self.parse_literal().map(Operand::Literal)
+                let value = value.eq_ignore_ascii_case("TRUE");
+                self.current += 1;
+                Ok(Operand::Boolean(value))
             }
             TokenKind::Identifier(_) => {
                 let position = self.position();
@@ -725,14 +728,42 @@ impl Parser {
         }
     }
 
-    fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+    fn eat_select_distinct_modifier(&mut self) -> bool {
+        if !self.at_keyword("DISTINCT") {
+            return false;
+        }
+        let next = &self.tokens[self.current + 1].kind;
+        let starts_select_item = matches!(next, TokenKind::Star)
+            || matches!(next, TokenKind::Identifier(value)
+                if !value.eq_ignore_ascii_case("AS") && !value.eq_ignore_ascii_case("FROM"));
+        if starts_select_item {
+            self.current += 1;
+        }
+        starts_select_item
+    }
+
+    fn eat_aggregate_distinct_modifier(&mut self) -> bool {
+        if self.at_keyword("DISTINCT")
+            && matches!(self.tokens[self.current + 1].kind, TokenKind::Identifier(_))
         {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn eat_keyword(&mut self, expected: &str) -> bool {
+        if self.at_keyword(expected) {
+            self.current += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
@@ -844,6 +875,52 @@ mod tests {
                 },
                 ..
             }) if column == "reading"
+        ));
+    }
+
+    #[test]
+    fn disambiguates_distinct_modifiers_from_distinct_columns() {
+        let statements = parse(
+            "SELECT distinct FROM values;
+             SELECT DISTINCT distinct FROM values;
+             SELECT COUNT(distinct), COUNT(DISTINCT distinct) FROM values;",
+        )
+        .expect("all contextual DISTINCT uses parse");
+
+        let Statement::Select(column) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(!column.distinct);
+        assert!(matches!(
+            &column.items[0],
+            SelectItem::Column { name, .. } if name == "distinct"
+        ));
+
+        let Statement::Select(distinct_column) = &statements[1] else {
+            panic!("expected select");
+        };
+        assert!(distinct_column.distinct);
+        assert!(matches!(
+            &distinct_column.items[0],
+            SelectItem::Column { name, .. } if name == "distinct"
+        ));
+
+        let Statement::Select(aggregates) = &statements[2] else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            &aggregates.items[0],
+            SelectItem::Aggregate {
+                argument: AggregateArgument::Column(name),
+                ..
+            } if name == "distinct"
+        ));
+        assert!(matches!(
+            &aggregates.items[1],
+            SelectItem::Aggregate {
+                argument: AggregateArgument::DistinctColumn(name),
+                ..
+            } if name == "distinct"
         ));
     }
 
