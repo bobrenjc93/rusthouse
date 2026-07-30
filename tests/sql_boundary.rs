@@ -17,7 +17,9 @@ fn distinct_column_name_remains_selectable() {
     database
         .execute(
             "CREATE TABLE keyword_columns (distinct Int64, from Int64, as Int64);
-             INSERT INTO keyword_columns VALUES (2, 2, 1), (1, 2, 1), (1, 1, 2);",
+             INSERT INTO keyword_columns VALUES (2, 2, 1), (1, 2, 1), (1, 1, 2);
+             CREATE TABLE from (distinct Int64);
+             INSERT INTO from VALUES (2), (1);",
         )
         .expect("setup succeeds");
 
@@ -44,6 +46,26 @@ fn distinct_column_name_remains_selectable() {
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
     }
+
+    let keyword_table = execute_query(&mut database, "SELECT distinct FROM from;");
+    assert_eq!(
+        keyword_table.rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(1)]]
+    );
+
+    let keyword_alias = execute_query(
+        &mut database,
+        "SELECT distinct AS from FROM keyword_columns;",
+    );
+    assert_eq!(keyword_alias.columns[0].name, "from");
+    assert_eq!(
+        keyword_alias.rows,
+        vec![
+            vec![Value::Int64(2)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(1)],
+        ]
+    );
 }
 
 #[test]

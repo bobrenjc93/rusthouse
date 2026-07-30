@@ -443,7 +443,22 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        let distinct = self.eat_distinct_modifier();
+        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("DISTINCT"))
+        {
+            let checkpoint = (self.current, self.predicate_depth, self.predicate_nodes);
+            self.current += 1;
+            if let Ok(select) = self.parse_select_body(true)
+                && matches!(self.peek(), TokenKind::Semicolon | TokenKind::End)
+            {
+                return Ok(select);
+            }
+            (self.current, self.predicate_depth, self.predicate_nodes) = checkpoint;
+        }
+
+        self.parse_select_body(false)
+    }
+
+    fn parse_select_body(&mut self, distinct: bool) -> Result<Select> {
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -514,34 +529,6 @@ impl Parser {
             order_by,
             limit,
         })
-    }
-
-    fn eat_distinct_modifier(&mut self) -> bool {
-        if !matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("DISTINCT"))
-        {
-            return false;
-        }
-
-        // DISTINCT is also a legal identifier, so only consume it when the
-        // remaining tokens form a complete projection list.
-        let checkpoint = self.current;
-        self.current += 1;
-        let modifier_has_projection = loop {
-            if self.parse_select_item().is_err() {
-                break false;
-            }
-            if !self.eat(&TokenKind::Comma) {
-                break matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FROM"));
-            }
-        };
-        self.current = checkpoint;
-
-        if modifier_has_projection {
-            self.current += 1;
-            true
-        } else {
-            false
-        }
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -820,6 +807,8 @@ mod tests {
             "SELECT distinct FROM events",
             "SELECT distinct AS marker FROM events",
             "SELECT distinct, id FROM events",
+            "SELECT distinct FROM from",
+            "SELECT distinct AS from FROM events",
         ] {
             let statements = parse(sql).expect("DISTINCT column is unambiguous");
             let Statement::Select(select) = &statements[0] else {
