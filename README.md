@@ -60,7 +60,7 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 ## Subtotals
 
-GROUPING SETS, ROLLUP, and CUBE use ClickHouse-style default fillers for columns omitted from a subtotal: `0`, `0.0`, `false`, or the empty string according to the declared type. `GROUPING(a, b)` distinguishes those fillers from stored values; its last argument is the low bit. Equivalent GROUPING SETS entries are evaluated once.
+GROUPING SETS, ROLLUP, and CUBE use ClickHouse-style default fillers for columns omitted from a subtotal: `0`, `0.0`, `false`, or the empty string according to the declared type. `GROUPING(a, b)` distinguishes those fillers from stored values; its last argument is the low bit. Repeated GROUPING SETS entries are evaluated separately, as listed.
 
 ~~~sql
 SELECT region, product, GROUPING(region, product) AS level, SUM(amount) AS total
@@ -69,7 +69,7 @@ GROUP BY ROLLUP(region, product)
 ORDER BY level, region, product;
 ~~~
 
-The functional `ROLLUP(...)` and `CUBE(...)` forms and ClickHouse's `GROUP BY a, b WITH ROLLUP` / `WITH CUBE` forms are accepted. A query may produce at most 128 unique grouping sets, so CUBE supports up to seven dimensions.
+The functional `ROLLUP(...)` and `CUBE(...)` forms and ClickHouse's `GROUP BY a, b WITH ROLLUP` / `WITH CUBE` forms are accepted. A query may list or generate at most 128 grouping sets, so CUBE supports up to seven dimensions.
 
 ## Library API
 

@@ -569,17 +569,21 @@ impl Parser {
             self.expect(&TokenKind::LeftParen, "'(' after GROUPING SETS")?;
             let mut sets = Vec::new();
             loop {
-                self.expect(&TokenKind::LeftParen, "'(' before grouping set")?;
-                let mut columns = Vec::new();
-                if !self.at(&TokenKind::RightParen) {
-                    loop {
-                        columns.push(self.expect_identifier("grouping set column")?);
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
+                let columns = if self.eat(&TokenKind::LeftParen) {
+                    let mut columns = Vec::new();
+                    if !self.at(&TokenKind::RightParen) {
+                        loop {
+                            columns.push(self.expect_identifier("grouping set column")?);
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
                         }
                     }
-                }
-                self.expect(&TokenKind::RightParen, "')' after grouping set")?;
+                    self.expect(&TokenKind::RightParen, "')' after grouping set")?;
+                    columns
+                } else {
+                    vec![self.expect_identifier("grouping set column")?]
+                };
                 sets.push(columns);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -901,7 +905,7 @@ mod tests {
         let statements = parse(
             "SELECT region, product, GROUPING(region, product) AS level, SUM(amount)
              FROM sales
-             GROUP BY GROUPING SETS ((region, product), (region), ());",
+             GROUP BY GROUPING SETS ((region, product), region, ());",
         )
         .expect("valid grouping sets query");
         let Statement::Select(select) = &statements[0] else {

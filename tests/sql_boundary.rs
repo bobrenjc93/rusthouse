@@ -399,7 +399,7 @@ fn rollup_emits_totals_with_typed_defaults_and_grouping_masks() {
 }
 
 #[test]
-fn grouping_sets_deduplicate_equivalent_sets() {
+fn grouping_sets_preserve_repetitions_and_accept_bare_singletons() {
     let mut database = Database::new();
     database
         .execute(
@@ -414,7 +414,7 @@ fn grouping_sets_deduplicate_equivalent_sets() {
          FROM set_sales
          GROUP BY GROUPING SETS (
             (region, active), (active, region),
-            (region), (region), (), ()
+            region, region, (), ()
          )
          ORDER BY level, region, active;",
     );
@@ -430,6 +430,18 @@ fn grouping_sets_deduplicate_equivalent_sets() {
             ],
             vec![
                 Value::String("west".to_owned()),
+                Value::Bool(false),
+                Value::Int64(0),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(true),
+                Value::Int64(0),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("west".to_owned()),
                 Value::Bool(true),
                 Value::Int64(0),
                 Value::Int64(1),
@@ -438,6 +450,18 @@ fn grouping_sets_deduplicate_equivalent_sets() {
                 Value::String("west".to_owned()),
                 Value::Bool(false),
                 Value::Int64(1),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Bool(false),
+                Value::Int64(1),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("".to_owned()),
+                Value::Bool(false),
+                Value::Int64(3),
                 Value::Int64(2),
             ],
             vec![
@@ -614,23 +638,13 @@ fn grouping_set_limits_are_enforced_before_wide_expansion() {
     assert!(matches!(rollup_error, Error::InvalidQuery(message)
             if message.contains("ROLLUP exceeds the limit of 128 grouping sets")));
 
-    let grouping_sets = (0..129_usize)
-        .map(|mask| {
-            let columns = (0..8)
-                .filter(|bit| mask & (1 << bit) != 0)
-                .map(|bit| format!("c{bit}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({columns})")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let grouping_sets = vec!["()"; 129].join(", ");
     let explicit_error = database
         .execute(&format!(
             "SELECT COUNT(*) FROM rollup_limits
              GROUP BY GROUPING SETS ({grouping_sets})"
         ))
-        .expect_err("the 129th unique explicit set is rejected during resolution");
+        .expect_err("the 129th listed set is rejected even when all sets repeat");
     assert!(matches!(explicit_error, Error::InvalidQuery(message)
             if message.contains("GROUPING SETS exceeds the limit of 128 grouping sets")));
 }

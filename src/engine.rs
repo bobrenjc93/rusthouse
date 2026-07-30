@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -245,10 +245,10 @@ fn resolve_explicit_grouping_sets(
     table: &Table,
     requested_sets: &[Vec<String>],
 ) -> Result<ResolvedGrouping> {
+    enforce_grouping_set_count("GROUPING SETS", requested_sets.len())?;
     let mut columns = Vec::new();
     let mut column_positions = HashMap::new();
-    let mut seen_sets = HashSet::new();
-    let mut source_sets = Vec::with_capacity(requested_sets.len().min(MAX_GROUPING_SETS));
+    let mut source_sets = Vec::with_capacity(requested_sets.len());
     for requested_set in requested_sets {
         let mut source_set = Vec::with_capacity(requested_set.len());
         for name in requested_set {
@@ -259,20 +259,12 @@ fn resolve_explicit_grouping_sets(
                 )));
             }
             source_set.push(source);
-        }
-
-        let mut canonical_set = source_set.clone();
-        canonical_set.sort_unstable();
-        if seen_sets.insert(canonical_set.clone()) {
-            enforce_grouping_set_count("GROUPING SETS", seen_sets.len())?;
-            for source in source_set {
-                if let Entry::Vacant(entry) = column_positions.entry(source) {
-                    entry.insert(columns.len());
-                    columns.push(source);
-                }
+            if let Entry::Vacant(entry) = column_positions.entry(source) {
+                entry.insert(columns.len());
+                columns.push(source);
             }
-            source_sets.push(canonical_set);
         }
+        source_sets.push(source_set);
     }
 
     let position_sets = source_sets
@@ -300,10 +292,9 @@ fn build_grouping(
     explicit: bool,
 ) -> ResolvedGrouping {
     debug_assert!(position_sets.len() <= MAX_GROUPING_SETS);
-    let mut seen = HashSet::with_capacity(position_sets.len());
-    let mut sets = Vec::new();
-    for positions in position_sets {
-        if seen.insert(positions.clone()) {
+    let sets = position_sets
+        .into_iter()
+        .map(|positions| {
             let mut projected_positions = vec![None; columns.len()];
             let set_columns = positions
                 .iter()
@@ -313,12 +304,12 @@ fn build_grouping(
                     columns[*group_position]
                 })
                 .collect();
-            sets.push(ResolvedGroupingSet {
+            ResolvedGroupingSet {
                 columns: set_columns,
                 positions: projected_positions,
-            });
-        }
-    }
+            }
+        })
+        .collect();
     ResolvedGrouping {
         columns,
         sets,
