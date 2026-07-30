@@ -20,17 +20,29 @@ impl Mode {
                 row_counts: vec![256, 2_048],
                 warmups: 1,
                 samples: 3,
-                query_amplification: 256,
+                sustained_query_budget: 256,
                 end_to_end_samples: 3,
             },
             Self::Default => BenchmarkSettings {
                 row_counts: vec![1_000, 10_000, 50_000],
                 warmups: 2,
                 samples: 7,
-                query_amplification: 256,
+                sustained_query_budget: 256,
                 end_to_end_samples: 3,
             },
         }
+    }
+
+    pub fn seeds(self, root_seed: u64) -> Vec<u64> {
+        let count = match self {
+            Self::Quick => 1,
+            Self::Default => 3,
+        };
+        (0..count)
+            .map(|index| {
+                root_seed.wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(index as u64))
+            })
+            .collect()
     }
 }
 
@@ -39,7 +51,9 @@ pub struct BenchmarkSettings {
     pub row_counts: Vec<usize>,
     pub warmups: usize,
     pub samples: usize,
-    pub query_amplification: usize,
+    /// Total repeated queries assigned across all profile/seed cells for one
+    /// workload/scale/sample. Matrix expansion must not increase this budget.
+    pub sustained_query_budget: usize,
     pub end_to_end_samples: usize,
 }
 
@@ -192,9 +206,26 @@ mod tests {
             assert!(settings.row_counts.len() >= 2);
             assert!(settings.warmups >= 1);
             assert!(settings.samples >= 3);
-            assert!(settings.query_amplification > 1);
+            assert_eq!(settings.sustained_query_budget, 256);
             assert!(settings.end_to_end_samples >= 3);
         }
+    }
+
+    #[test]
+    fn default_derives_a_deterministic_seed_panel_from_the_runtime_seed() {
+        assert_eq!(Mode::Quick.seeds(99), [99]);
+        let seeds = Mode::Default.seeds(99);
+        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds, Mode::Default.seeds(99));
+        assert_ne!(seeds, Mode::Default.seeds(100));
+        assert_eq!(
+            seeds
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
     }
 
     #[test]

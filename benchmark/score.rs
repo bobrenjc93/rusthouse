@@ -1,10 +1,20 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy)]
 pub struct RatioObservation<'a> {
+    pub profile: &'a str,
+    pub seed: u64,
     pub family: &'a str,
+    pub workload: &'a str,
     pub scale: usize,
     pub ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkloadDimension<'a> {
+    pub profile: &'a str,
+    pub family: &'a str,
+    pub workload: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,13 +44,19 @@ pub fn median(samples: &[f64]) -> Result<f64, String> {
     }
 }
 
-/// Aggregate ClickHouse/RustHouse ratios without allowing fast cases to
-/// compensate for slow families.
+/// Aggregate capped ClickHouse/RustHouse ratios in log space.
 ///
-/// Case ratios are capped at parity and floored at 0.01. Workloads within a
-/// family/scale, scales within a family, and finally families receive equal
-/// log-space weight at each level.
-pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakdown, String> {
+/// Workloads are equal within each family/scale cell, followed by equal scale,
+/// family, seed, and profile weight. The complete expected matrix is validated
+/// before aggregation so missing or duplicated cases cannot silently reweight
+/// the score.
+pub fn parity_score(
+    observations: &[RatioObservation<'_>],
+    expected_profiles: &[&str],
+    expected_seeds: &[u64],
+    expected_scales: &[usize],
+    expected_workloads: &[WorkloadDimension<'_>],
+) -> Result<ScoreBreakdown, String> {
     if observations.is_empty() {
         return Err("cannot score an empty benchmark".to_owned());
     }
@@ -51,27 +67,117 @@ pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakd
         return Err("benchmark ratios must be finite and positive".to_owned());
     }
 
-    let mut grouped = BTreeMap::<&str, BTreeMap<usize, Vec<f64>>>::new();
+    let expected_profiles = unique_expected(expected_profiles, "profile")?;
+    let expected_seeds = unique_expected(expected_seeds, "seed")?;
+    let expected_scales = unique_expected(expected_scales, "scale")?;
+    let expected_workloads = expected_workload_matrix(expected_workloads, &expected_profiles)?;
+
+    type WorkloadLogs<'a> = BTreeMap<&'a str, f64>;
+    type ScaleLogs<'a> = BTreeMap<usize, WorkloadLogs<'a>>;
+    type FamilyLogs<'a> = BTreeMap<&'a str, ScaleLogs<'a>>;
+    type SeedLogs<'a> = BTreeMap<u64, FamilyLogs<'a>>;
+    let mut grouped = BTreeMap::<&str, SeedLogs<'_>>::new();
+
     for observation in observations {
-        grouped
+        if !expected_profiles.contains(observation.profile) {
+            return Err(format!(
+                "unexpected profile {:?} in benchmark observations",
+                observation.profile
+            ));
+        }
+        if !expected_seeds.contains(&observation.seed) {
+            return Err(format!(
+                "unexpected seed {} in benchmark observations",
+                observation.seed
+            ));
+        }
+        if !expected_scales.contains(&observation.scale) {
+            return Err(format!(
+                "unexpected scale {} in benchmark observations",
+                observation.scale
+            ));
+        }
+
+        let previous = grouped
+            .entry(observation.profile)
+            .or_default()
+            .entry(observation.seed)
+            .or_default()
             .entry(observation.family)
             .or_default()
             .entry(observation.scale)
             .or_default()
-            .push(observation.ratio.clamp(0.01, 1.0).ln());
+            .insert(
+                observation.workload,
+                observation.ratio.clamp(0.01, 1.0).ln(),
+            );
+        if previous.is_some() {
+            return Err(format!(
+                "duplicate benchmark observation for profile {:?}, seed {}, family {:?}, workload {:?}, scale {}",
+                observation.profile,
+                observation.seed,
+                observation.family,
+                observation.workload,
+                observation.scale
+            ));
+        }
     }
 
-    let family_logs = grouped
-        .values()
-        .map(|scales| {
-            let scale_logs = scales
-                .values()
-                .map(|case_logs| mean(case_logs))
-                .collect::<Vec<_>>();
-            mean(&scale_logs)
-        })
-        .collect::<Vec<_>>();
-    let score = (100.0 * mean(&family_logs).exp()).clamp(0.0, 100.0);
+    let actual_profiles = grouped.keys().copied().collect::<BTreeSet<_>>();
+    if actual_profiles != expected_profiles {
+        return Err(format!(
+            "incomplete profile coverage: expected {expected_profiles:?}, got {actual_profiles:?}"
+        ));
+    }
+
+    let mut profile_logs = Vec::with_capacity(grouped.len());
+    for (profile, seeds) in &grouped {
+        let actual_seeds = seeds.keys().copied().collect::<BTreeSet<_>>();
+        if actual_seeds != expected_seeds {
+            return Err(format!(
+                "incomplete seed coverage for profile {profile:?}: expected {expected_seeds:?}, got {actual_seeds:?}"
+            ));
+        }
+
+        let profile_workloads = &expected_workloads[profile];
+        let expected_families = profile_workloads.keys().copied().collect::<BTreeSet<_>>();
+        let mut seed_logs = Vec::with_capacity(seeds.len());
+        for (seed, families) in seeds {
+            let actual_families = families.keys().copied().collect::<BTreeSet<_>>();
+            if actual_families != expected_families {
+                return Err(format!(
+                    "incomplete family coverage for profile {profile:?}, seed {seed}: expected {expected_families:?}, got {actual_families:?}"
+                ));
+            }
+
+            let mut family_logs = Vec::with_capacity(families.len());
+            for (family, scales) in families {
+                let actual_scales = scales.keys().copied().collect::<BTreeSet<_>>();
+                if actual_scales != expected_scales {
+                    return Err(format!(
+                        "incomplete scale coverage for profile {profile:?}, seed {seed}, family {family:?}: expected {expected_scales:?}, got {actual_scales:?}"
+                    ));
+                }
+
+                let expected_cases = &profile_workloads[family];
+                let mut scale_logs = Vec::with_capacity(scales.len());
+                for (scale, workloads) in scales {
+                    let actual_cases = workloads.keys().copied().collect::<BTreeSet<_>>();
+                    if actual_cases != *expected_cases {
+                        return Err(format!(
+                            "incomplete workload coverage for profile {profile:?}, seed {seed}, family {family:?}, scale {scale}: expected {expected_cases:?}, got {actual_cases:?}"
+                        ));
+                    }
+                    scale_logs.push(mean(workloads.values().copied()));
+                }
+                family_logs.push(mean(scale_logs));
+            }
+            seed_logs.push(mean(family_logs));
+        }
+        profile_logs.push(mean(seed_logs));
+    }
+
+    let score = (100.0 * mean(profile_logs).exp()).clamp(0.0, 100.0);
     let saturated_cases = observations
         .iter()
         .filter(|observation| observation.ratio >= 1.0)
@@ -82,41 +188,174 @@ pub fn parity_score(observations: &[RatioObservation<'_>]) -> Result<ScoreBreakd
     })
 }
 
-fn mean(values: &[f64]) -> f64 {
-    values.iter().sum::<f64>() / values.len() as f64
+fn expected_workload_matrix<'a>(
+    dimensions: &[WorkloadDimension<'a>],
+    expected_profiles: &BTreeSet<&'a str>,
+) -> Result<BTreeMap<&'a str, BTreeMap<&'a str, BTreeSet<&'a str>>>, String> {
+    if dimensions.is_empty() {
+        return Err("expected workload list must not be empty".to_owned());
+    }
+    let mut matrix = BTreeMap::<&str, BTreeMap<&str, BTreeSet<&str>>>::new();
+    for dimension in dimensions {
+        if !expected_profiles.contains(dimension.profile) {
+            return Err(format!(
+                "expected workload {:?} names unexpected profile {:?}",
+                dimension.workload, dimension.profile
+            ));
+        }
+        if !matrix
+            .entry(dimension.profile)
+            .or_default()
+            .entry(dimension.family)
+            .or_default()
+            .insert(dimension.workload)
+        {
+            return Err(format!(
+                "duplicate expected workload {:?} for profile {:?}, family {:?}",
+                dimension.workload, dimension.profile, dimension.family
+            ));
+        }
+    }
+
+    let actual_profiles = matrix.keys().copied().collect::<BTreeSet<_>>();
+    if actual_profiles != *expected_profiles {
+        return Err(format!(
+            "expected workload matrix has incomplete profiles: expected {expected_profiles:?}, got {actual_profiles:?}"
+        ));
+    }
+    let mut family_sets = matrix
+        .values()
+        .map(|families| families.keys().copied().collect::<BTreeSet<_>>());
+    let first = family_sets
+        .next()
+        .ok_or_else(|| "expected profile list must not be empty".to_owned())?;
+    if family_sets.any(|families| families != first) {
+        return Err(
+            "expected workload matrix must use the same families for every profile".to_owned(),
+        );
+    }
+    Ok(matrix)
+}
+
+fn unique_expected<T>(values: &[T], name: &str) -> Result<BTreeSet<T>, String>
+where
+    T: Copy + Ord,
+{
+    if values.is_empty() {
+        return Err(format!("expected {name} list must not be empty"));
+    }
+    let unique = values.iter().copied().collect::<BTreeSet<_>>();
+    if unique.len() != values.len() {
+        return Err(format!("expected {name} list contains duplicates"));
+    }
+    Ok(unique)
+}
+
+fn mean(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut count = 0_usize;
+    let sum = values.into_iter().inspect(|_| count += 1).sum::<f64>();
+    debug_assert!(count > 0);
+    sum / count as f64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const PROFILES: [&str; 2] = ["numeric", "strings"];
+    const SEEDS: [u64; 2] = [7, 8];
+    const SCALES: [usize; 2] = [100, 1_000];
+    const WORKLOADS: [WorkloadDimension<'static>; 4] = [
+        WorkloadDimension {
+            profile: "numeric",
+            family: "scan",
+            workload: "scan",
+        },
+        WorkloadDimension {
+            profile: "numeric",
+            family: "order",
+            workload: "order",
+        },
+        WorkloadDimension {
+            profile: "strings",
+            family: "scan",
+            workload: "scan",
+        },
+        WorkloadDimension {
+            profile: "strings",
+            family: "order",
+            workload: "order",
+        },
+    ];
+
     #[test]
     fn score_math_has_documented_anchor_points() {
-        assert!((score(&[("family", 1, 1.0)]) - 100.0).abs() < 1e-12);
-        assert!((score(&[("family", 1, 0.1)]) - 10.0).abs() < 1e-12);
-        assert!((score(&[("slow", 1, 0.1), ("fast", 1, 10.0)]) - 31.622_776).abs() < 1e-5);
+        assert!((single_score(1.0) - 100.0).abs() < 1e-12);
+        assert!((single_score(0.1) - 10.0).abs() < 1e-12);
+        assert!((single_score(100.0) - 100.0).abs() < 1e-12);
     }
 
     #[test]
-    fn repeated_favorable_workloads_cannot_dominate_other_families() {
-        let baseline = score(&[("slow", 1, 0.1), ("fast", 1, 1.0)]);
-        let mut duplicated = vec![("slow", 1, 0.1)];
-        duplicated.extend(std::iter::repeat_n(("fast", 1, 100.0), 100));
-        assert!((score(&duplicated) - baseline).abs() < 1e-12);
+    fn profiles_seeds_families_and_scales_receive_equal_weight() {
+        let mut observations = complete_matrix(1.0);
+        for observation in &mut observations {
+            if observation.profile == "numeric"
+                && observation.seed == 7
+                && observation.family == "scan"
+                && observation.scale == 100
+            {
+                observation.ratio = 0.01;
+            }
+        }
+
+        let score = parity_score(&observations, &PROFILES, &SEEDS, &SCALES, &WORKLOADS)
+            .expect("complete score")
+            .score;
+        assert!((score - 74.989_420_933).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duplicated_favorable_workload_is_rejected_instead_of_reweighting() {
+        let mut observations = complete_matrix(1.0);
+        observations.push(observations[0]);
+        assert!(
+            parity_score(&observations, &PROFILES, &SEEDS, &SCALES, &WORKLOADS)
+                .expect_err("duplicate must fail")
+                .contains("duplicate benchmark observation")
+        );
+    }
+
+    #[test]
+    fn missing_case_at_each_dimension_fails_closed() {
+        let complete = complete_matrix(1.0);
+        for needle in [("numeric", 7, "scan", 100), ("strings", 8, "order", 1_000)] {
+            let observations = complete
+                .iter()
+                .copied()
+                .filter(|observation| {
+                    (
+                        observation.profile,
+                        observation.seed,
+                        observation.family,
+                        observation.scale,
+                    ) != needle
+                })
+                .collect::<Vec<_>>();
+            assert!(parity_score(&observations, &PROFILES, &SEEDS, &SCALES, &WORKLOADS).is_err());
+        }
+
+        assert!(parity_score(&complete, &["numeric"], &SEEDS, &SCALES, &WORKLOADS).is_err());
+        assert!(parity_score(&complete, &PROFILES, &[7], &SCALES, &WORKLOADS).is_err());
+        assert!(parity_score(&complete, &PROFILES, &SEEDS, &[100], &WORKLOADS).is_err());
     }
 
     #[test]
     fn all_capped_cases_are_reported_as_saturated() {
-        let observations = observations(&[("a", 1, 2.0), ("b", 1, 50.0)]);
-        let breakdown = parity_score(&observations).expect("score");
+        let observations = complete_matrix(2.0);
+        let breakdown =
+            parity_score(&observations, &PROFILES, &SEEDS, &SCALES, &WORKLOADS).expect("score");
         assert_eq!(breakdown.saturated_cases, observations.len());
         assert_eq!(breakdown.score, 100.0);
-    }
-
-    #[test]
-    fn equal_weighting_applies_to_scales_and_families() {
-        let value = score(&[("a", 1, 0.01), ("a", 2, 1.0), ("b", 1, 1.0), ("b", 2, 1.0)]);
-        assert!((value - 31.622_776).abs() < 1e-5);
     }
 
     #[test]
@@ -126,24 +365,59 @@ mod tests {
     }
 
     #[test]
-    fn score_rejects_invalid_inputs() {
-        assert!(parity_score(&[]).is_err());
-        assert!(parity_score(&observations(&[("a", 1, 0.0)])).is_err());
-        assert!(parity_score(&observations(&[("a", 1, f64::NAN)])).is_err());
+    fn score_rejects_invalid_inputs_and_expected_dimensions() {
+        assert!(parity_score(&[], &PROFILES, &SEEDS, &SCALES, &WORKLOADS).is_err());
+        assert!(parity_score(&complete_matrix(1.0), &[], &SEEDS, &SCALES, &WORKLOADS).is_err());
+        assert!(parity_score(&complete_matrix(1.0), &PROFILES, &[], &SCALES, &WORKLOADS).is_err());
+        assert!(parity_score(&complete_matrix(1.0), &PROFILES, &SEEDS, &[], &WORKLOADS).is_err());
+        assert!(single_score_result(0.0).is_err());
+        assert!(single_score_result(f64::NAN).is_err());
     }
 
-    fn score(values: &[(&'static str, usize, f64)]) -> f64 {
-        parity_score(&observations(values)).expect("score").score
+    fn single_score(ratio: f64) -> f64 {
+        single_score_result(ratio).expect("score").score
     }
 
-    fn observations(values: &[(&'static str, usize, f64)]) -> Vec<RatioObservation<'static>> {
-        values
-            .iter()
-            .map(|(family, scale, ratio)| RatioObservation {
-                family,
-                scale: *scale,
-                ratio: *ratio,
-            })
-            .collect()
+    fn single_score_result(ratio: f64) -> Result<ScoreBreakdown, String> {
+        let observations = [RatioObservation {
+            profile: "profile",
+            seed: 1,
+            family: "family",
+            workload: "case",
+            scale: 1,
+            ratio,
+        }];
+        parity_score(
+            &observations,
+            &["profile"],
+            &[1],
+            &[1],
+            &[WorkloadDimension {
+                profile: "profile",
+                family: "family",
+                workload: "case",
+            }],
+        )
+    }
+
+    fn complete_matrix(ratio: f64) -> Vec<RatioObservation<'static>> {
+        let mut observations = Vec::new();
+        for profile in PROFILES {
+            for seed in SEEDS {
+                for family in ["scan", "order"] {
+                    for scale in SCALES {
+                        observations.push(RatioObservation {
+                            profile,
+                            seed,
+                            family,
+                            workload: family,
+                            scale,
+                            ratio,
+                        });
+                    }
+                }
+            }
+        }
+        observations
     }
 }
