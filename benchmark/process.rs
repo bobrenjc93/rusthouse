@@ -49,7 +49,15 @@ impl EnginePaths {
         query_sql: &str,
     ) -> Result<TimedOutput, String> {
         let batch = sql_batch(setup_sql, query_sql, 1)?;
-        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+        self.execute_correctness_batch(engine, &batch)
+    }
+
+    pub fn execute_correctness_batch(
+        &self,
+        engine: Engine,
+        batch: &str,
+    ) -> Result<TimedOutput, String> {
+        let (_, stdout) = self.execute_batch(engine, batch, true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),
         })

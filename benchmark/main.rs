@@ -1,5 +1,7 @@
+mod audit;
 mod config;
 mod dataset;
+mod digest;
 mod normalize;
 mod process;
 mod score;
@@ -13,9 +15,10 @@ use std::process::ExitCode;
 #[cfg(test)]
 use std::time::Duration;
 
+use audit::AuditCorpus;
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
+use normalize::{ColumnType, CorpusResult, compare_corpus_outputs, compare_outputs};
 use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
@@ -35,6 +38,8 @@ OPTIONS:
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
     --details <PATH>        Write detailed JSON without changing stdout
+    --correctness-audit     Run the 336-query non-scoring correctness corpus
+    --audit-sql <PATH>      Write replay SQL here (requires correctness audit)
     -h, --help              Print this help
 
 RUSTHOUSE_CLICKHOUSE_BIN supplies --clickhouse when the flag is absent.
@@ -66,6 +71,17 @@ struct CaseResult {
     rusthouse_end_to_end_median_ms: f64,
     clickhouse_end_to_end_median_ms: f64,
     end_to_end_ratio: f64,
+}
+
+#[derive(Debug)]
+struct CorrectnessAuditResult {
+    query_count: usize,
+    row_count: usize,
+    replay_sql_path: PathBuf,
+    setup_sha256: String,
+    queries_sha256: String,
+    corpus_sha256: String,
+    family_counts: Vec<(&'static str, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +309,11 @@ fn run(config: Config) -> Result<Report, String> {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
+    let correctness_audit = if config.correctness_audit {
+        Some(run_correctness_audit(&config, &paths)?)
+    } else {
+        None
+    };
 
     if let Some(path) = &config.details {
         let details = details_json(
@@ -302,6 +323,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            correctness_audit.as_ref(),
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
@@ -344,6 +366,19 @@ fn run(config: Config) -> Result<Report, String> {
             settings.query_amplification
         ),
     ];
+    if let Some(audit) = &correctness_audit {
+        evidence.push(format!(
+            "non-scoring correctness audit passed {}/{} bounded queries over {} rows; replay SQL={}",
+            audit.query_count,
+            audit.query_count,
+            audit.row_count,
+            audit.replay_sql_path.display()
+        ));
+        evidence.push(format!(
+            "audit SHA-256: setup={}, queries={}, full_corpus={}",
+            audit.setup_sha256, audit.queries_sha256, audit.corpus_sha256
+        ));
+    }
     evidence.extend(cases.iter().map(|case| {
         format!(
             "{} / {} rows: primary/query RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}; end-to-end RustHouse {:.3} ms, ClickHouse {:.3} ms, ratio {:.3}",
@@ -372,13 +407,23 @@ fn run(config: Config) -> Result<Report, String> {
         ]
     };
 
+    let audit_summary = correctness_audit
+        .as_ref()
+        .map(|audit| {
+            format!(
+                "; non-scoring correctness audit passed {} queries",
+                audit.query_count
+            )
+        })
+        .unwrap_or_default();
     Ok(Report {
         score: primary_score.score,
         summary: format!(
-            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
+            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases{}.",
             primary_score.score,
             end_to_end_score.score,
-            cases.len()
+            cases.len(),
+            audit_summary
         ),
         evidence,
         suggestions,
@@ -423,6 +468,89 @@ fn execute_correctness_pair(
     } else {
         let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
         let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
+        Ok((rusthouse, clickhouse))
+    }
+}
+
+fn run_correctness_audit(
+    config: &Config,
+    paths: &EnginePaths,
+) -> Result<CorrectnessAuditResult, String> {
+    let corpus = AuditCorpus::generate(config.seed);
+    let digest_summary = format!(
+        "setup SHA-256={}, queries SHA-256={}, full corpus SHA-256={}",
+        corpus.setup_sha256, corpus.queries_sha256, corpus.corpus_sha256
+    );
+    let replay_sql_path = config.audit_sql.clone().unwrap_or_else(|| {
+        PathBuf::from(format!("clickhouse-correctness-audit-{}.sql", config.seed))
+    });
+    fs::write(&replay_sql_path, &corpus.replay_sql).map_err(|error| {
+        format!(
+            "could not write correctness audit replay SQL to '{}'; {digest_summary}: {error}",
+            replay_sql_path.display(),
+        )
+    })?;
+
+    eprintln!(
+        "running non-scoring correctness audit: {} queries over {} rows; replay SQL {}",
+        corpus.cases.len(),
+        corpus.row_count,
+        replay_sql_path.display()
+    );
+    let (rusthouse, clickhouse) =
+        execute_audit_pair(paths, &corpus.replay_sql, config.seed.is_multiple_of(2)).map_err(
+            |error| {
+                format!(
+                    "correctness audit process failed; replay SQL '{}'; {digest_summary}: {error}",
+                    replay_sql_path.display(),
+                )
+            },
+        )?;
+    let schemas = corpus
+        .cases
+        .iter()
+        .map(|case| CorpusResult {
+            name: &case.id,
+            columns: &case.columns,
+            max_rows: case.max_rows,
+        })
+        .collect::<Vec<_>>();
+    compare_corpus_outputs(&rusthouse.stdout, &clickhouse.stdout, &schemas).map_err(|error| {
+        format!(
+            "correctness audit failed; replay SQL '{}'; {digest_summary}: {error}",
+            replay_sql_path.display(),
+        )
+    })?;
+    eprintln!(
+        "  audit passed {} queries; corpus SHA-256 {}",
+        corpus.cases.len(),
+        corpus.corpus_sha256
+    );
+    let family_counts = corpus.family_counts().into_iter().collect();
+
+    Ok(CorrectnessAuditResult {
+        query_count: corpus.cases.len(),
+        row_count: corpus.row_count,
+        replay_sql_path,
+        setup_sha256: corpus.setup_sha256,
+        queries_sha256: corpus.queries_sha256,
+        corpus_sha256: corpus.corpus_sha256,
+        family_counts,
+    })
+}
+
+fn execute_audit_pair(
+    paths: &EnginePaths,
+    replay_sql: &str,
+    rusthouse_first: bool,
+) -> Result<(TimedOutput, TimedOutput), String> {
+    if rusthouse_first {
+        let rusthouse = paths.execute_correctness_batch(Engine::RustHouse, replay_sql)?;
+        let clickhouse = paths.execute_correctness_batch(Engine::ClickHouse, replay_sql)?;
+        Ok((rusthouse, clickhouse))
+    } else {
+        let clickhouse = paths.execute_correctness_batch(Engine::ClickHouse, replay_sql)?;
+        let rusthouse = paths.execute_correctness_batch(Engine::RustHouse, replay_sql)?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -535,12 +663,13 @@ fn details_json(
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    correctness_audit: Option<&CorrectnessAuditResult>,
 ) -> String {
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,7 +690,7 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"correctness_audit\":",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
@@ -571,6 +700,8 @@ fn details_json(
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
+    write_correctness_audit_json(&mut output, correctness_audit);
+    output.push_str(",\"cases\":[");
 
     for (index, case) in cases.iter().enumerate() {
         if index > 0 {
@@ -612,6 +743,34 @@ fn details_json(
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_correctness_audit_json(
+    output: &mut String,
+    correctness_audit: Option<&CorrectnessAuditResult>,
+) {
+    let Some(audit) = correctness_audit else {
+        output.push_str("null");
+        return;
+    };
+    write!(
+        output,
+        "{{\"query_count\":{},\"row_count\":{},\"replay_sql_path\":{},\"setup_sha256\":{},\"queries_sha256\":{},\"corpus_sha256\":{},\"family_counts\":{{",
+        audit.query_count,
+        audit.row_count,
+        json_string(&audit.replay_sql_path.display().to_string()),
+        json_string(&audit.setup_sha256),
+        json_string(&audit.queries_sha256),
+        json_string(&audit.corpus_sha256)
+    )
+    .expect("writing to String cannot fail");
+    for (index, (family, count)) in audit.family_counts.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{}:{count}", json_string(family)).expect("writing to String cannot fail");
+    }
+    output.push_str("}}");
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {

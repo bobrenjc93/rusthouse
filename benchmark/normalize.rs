@@ -19,6 +19,12 @@ struct NormalizedTable {
     rows: Vec<Vec<NormalizedValue>>,
 }
 
+pub struct CorpusResult<'a> {
+    pub name: &'a str,
+    pub columns: &'a [(String, ColumnType)],
+    pub max_rows: usize,
+}
+
 pub fn compare_outputs(
     rusthouse_csv: &str,
     clickhouse_csv: &str,
@@ -27,9 +33,49 @@ pub fn compare_outputs(
     let rusthouse = normalize(rusthouse_csv, columns, "RustHouse")?;
     let clickhouse = normalize(clickhouse_csv, columns, "ClickHouse")?;
 
+    compare_tables(&rusthouse, &clickhouse, columns, None)
+}
+
+pub fn compare_corpus_outputs(
+    rusthouse_csv: &str,
+    clickhouse_csv: &str,
+    results: &[CorpusResult<'_>],
+) -> Result<(), String> {
+    if results.is_empty() {
+        return Err("correctness corpus has no expected results".to_owned());
+    }
+    let rusthouse = normalize_corpus(rusthouse_csv, results, "RustHouse")?;
+    let clickhouse = normalize_corpus(clickhouse_csv, results, "ClickHouse")?;
+
+    for (index, result) in results.iter().enumerate() {
+        let columns = result
+            .columns
+            .iter()
+            .map(|(name, column_type)| (name.as_str(), *column_type))
+            .collect::<Vec<_>>();
+        compare_tables(
+            &rusthouse[index],
+            &clickhouse[index],
+            &columns,
+            Some(result.name),
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_tables(
+    rusthouse: &NormalizedTable,
+    clickhouse: &NormalizedTable,
+    columns: &[(&str, ColumnType)],
+    result_name: Option<&str>,
+) -> Result<(), String> {
+    let context = result_name
+        .map(|name| format!(" in audit query '{name}'"))
+        .unwrap_or_default();
+
     if rusthouse.rows.len() != clickhouse.rows.len() {
         return Err(format!(
-            "row count mismatch: RustHouse returned {}, ClickHouse returned {}",
+            "row count mismatch{context}: RustHouse returned {}, ClickHouse returned {}",
             rusthouse.rows.len(),
             clickhouse.rows.len()
         ));
@@ -39,7 +85,7 @@ pub fn compare_outputs(
         for (column_index, (left, right)) in left.iter().zip(right).enumerate() {
             if !values_equal(left, right) {
                 return Err(format!(
-                    "result mismatch at row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
+                    "result mismatch{context} at row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
                     row_index + 1,
                     columns[column_index].0
                 ));
@@ -49,17 +95,105 @@ pub fn compare_outputs(
     Ok(())
 }
 
+fn normalize_corpus(
+    csv: &str,
+    results: &[CorpusResult<'_>],
+    engine: &str,
+) -> Result<Vec<NormalizedTable>, String> {
+    let records = parse_csv(csv).map_err(|error| format!("{engine} CSV: {error}"))?;
+    let mut cursor = 0;
+    let mut tables = Vec::with_capacity(results.len());
+
+    for (index, result) in results.iter().enumerate() {
+        let columns = result
+            .columns
+            .iter()
+            .map(|(name, column_type)| (name.as_str(), *column_type))
+            .collect::<Vec<_>>();
+        let header = records.get(cursor).ok_or_else(|| {
+            format!(
+                "{engine} returned only {index} of {} audit results; missing '{}'",
+                results.len(),
+                result.name
+            )
+        })?;
+        if !header_matches(header, &columns) {
+            let expected = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+            return Err(format!(
+                "{engine} audit header mismatch for '{}': expected {expected:?}, got {header:?}",
+                result.name
+            ));
+        }
+
+        let (end, next_cursor) = if let Some(next) = results.get(index + 1) {
+            let next_columns = next
+                .columns
+                .iter()
+                .map(|(name, column_type)| (name.as_str(), *column_type))
+                .collect::<Vec<_>>();
+            let next_header = records[cursor + 1..]
+                .iter()
+                .position(|record| header_matches(record, &next_columns))
+                .map(|offset| cursor + 1 + offset)
+                .ok_or_else(|| {
+                    format!(
+                        "{engine} output has no header for audit query '{}' after '{}'",
+                        next.name, result.name
+                    )
+                })?;
+            let result_end =
+                if next_header > cursor + 1 && is_multiquery_separator(&records[next_header - 1]) {
+                    next_header - 1
+                } else {
+                    next_header
+                };
+            (result_end, next_header)
+        } else {
+            (records.len(), records.len())
+        };
+        let row_count = end - cursor - 1;
+        if row_count > result.max_rows {
+            return Err(format!(
+                "{engine} audit query '{}' returned {row_count} rows; bounded maximum is {}",
+                result.name, result.max_rows
+            ));
+        }
+        tables.push(normalize_records(
+            &records[cursor..end],
+            &columns,
+            &format!("{engine} audit query '{}'", result.name),
+        )?);
+        cursor = next_cursor;
+    }
+
+    if cursor != records.len() {
+        return Err(format!(
+            "{engine} emitted {} unexpected CSV records after the audit corpus",
+            records.len() - cursor
+        ));
+    }
+    Ok(tables)
+}
+
 fn normalize(
     csv: &str,
     columns: &[(&str, ColumnType)],
     engine: &str,
 ) -> Result<NormalizedTable, String> {
     let records = parse_csv(csv).map_err(|error| format!("{engine} CSV: {error}"))?;
+    normalize_records(&records, columns, engine)
+}
+
+fn normalize_records(
+    records: &[Vec<String>],
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+) -> Result<NormalizedTable, String> {
     let (header, rows) = records
         .split_first()
         .ok_or_else(|| format!("{engine} returned no CSV header"))?;
     let expected_header = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-    if header.iter().map(String::as_str).collect::<Vec<_>>() != expected_header {
+    if !header_matches(header, columns) {
         return Err(format!(
             "{engine} header mismatch: expected {expected_header:?}, got {header:?}"
         ));
@@ -95,6 +229,17 @@ fn normalize(
     Ok(NormalizedTable {
         rows: normalized_rows,
     })
+}
+
+fn header_matches(header: &[String], columns: &[(&str, ColumnType)]) -> bool {
+    header
+        .iter()
+        .map(String::as_str)
+        .eq(columns.iter().map(|(name, _)| *name))
+}
+
+fn is_multiquery_separator(record: &[String]) -> bool {
+    record.len() == 1 && record[0].is_empty()
 }
 
 fn normalize_value(value: &str, column_type: ColumnType) -> Result<NormalizedValue, String> {
@@ -232,5 +377,41 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn compares_each_bounded_result_in_a_multiquery_stream() {
+        let first_columns = vec![("q0000_n".to_owned(), ColumnType::Integer)];
+        let second_columns = vec![("q0001_flag".to_owned(), ColumnType::Boolean)];
+        let results = [
+            CorpusResult {
+                name: "q0000",
+                columns: &first_columns,
+                max_rows: 2,
+            },
+            CorpusResult {
+                name: "q0001",
+                columns: &second_columns,
+                max_rows: 1,
+            },
+        ];
+        let rusthouse = "q0000_n\n1\n2\n\nq0001_flag\ntrue\n";
+        let clickhouse = "q0000_n\r\n1\r\n2\r\nq0001_flag\r\n1\r\n";
+
+        compare_corpus_outputs(rusthouse, clickhouse, &results).expect("matching corpus");
+    }
+
+    #[test]
+    fn corpus_comparison_fails_on_missing_unbounded_or_mismatched_results() {
+        let columns = vec![("q0000_n".to_owned(), ColumnType::Integer)];
+        let results = [CorpusResult {
+            name: "q0000",
+            columns: &columns,
+            max_rows: 1,
+        }];
+
+        assert!(compare_corpus_outputs("", "", &results).is_err());
+        assert!(compare_corpus_outputs("q0000_n\n1\n2\n", "q0000_n\n1\n", &results).is_err());
+        assert!(compare_corpus_outputs("q0000_n\n1\n", "q0000_n\n2\n", &results).is_err());
     }
 }

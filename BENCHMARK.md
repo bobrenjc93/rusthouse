@@ -47,6 +47,26 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
+Add the deterministic, non-scoring correctness corpus to either mode with `--correctness-audit`. The exact shared SQL batch is written before execution so any failure is replayable. Use `--audit-sql` to choose its location; otherwise the harness writes `clickhouse-correctness-audit-<seed>.sql` in the current directory.
+
+~~~bash
+RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
+  target/release/clickhouse-parity-bench \
+  --quick \
+  --seed 20260729 \
+  --correctness-audit \
+  --audit-sql /tmp/rusthouse-correctness-audit.sql \
+  --details /tmp/rusthouse-parity-audited.json
+~~~
+
+Replay the emitted bytes through either public CLI:
+
+~~~bash
+target/release/rusthouse --format csv < /tmp/rusthouse-correctness-audit.sql
+/path/to/clickhouse local --multiquery --output-format CSVWithNames \
+  < /tmp/rusthouse-correctness-audit.sql
+~~~
+
 ## Grouping and top-k optimization measurement
 
 On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
@@ -64,7 +84,7 @@ The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 1
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. An enabled audit also records its replay path, family counts, query and row counts, and SHA-256 digests for setup SQL, query SQL, and the complete replay corpus. Setup, execution, version, checksum, parse, correctness, audit-artifact, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
@@ -93,13 +113,31 @@ Each row count runs eight cases spanning:
 
 The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
 
+## Non-scoring correctness audit
+
+`--correctness-audit` deterministically generates a separate 257-row boundary-heavy table and 336 queries from the runtime seed. Its seven families contain 48 queries each:
+
+| Family | Coverage |
+| --- | --- |
+| Scalar boundaries | `Int64` minimum/maximum, values around exact `Float64` integer representation, finite floating-point magnitudes, empty/quoted/comma strings, and both Booleans |
+| Predicates | Every comparison operator, numeric/string/Boolean literals, and parenthesized `AND`/`OR` combinations |
+| Projections | Reordered subsets of every supported scalar type with query-unique aliases |
+| Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` over deterministic nonempty ranges |
+| Grouping | Boolean, low-cardinality, compound, and unique string keys with aggregates |
+| Ordering | Ascending and descending numeric, floating-point, string, and Boolean keys with deterministic ID tie breakers |
+| Limits | Limits from zero through 32 over ordered, filtered projections |
+
+Every query is intrinsically single-row or has an explicit limit no greater than 32. Query-unique CSV headers delimit all 336 result sets without sorting or discarding output. Missing, additional, malformed, oversized, or unequal results reject the run. The harness sends one byte-identical replay batch to each public CLI and compares every typed value under the same strict normalizer as the timing gates.
+
+The audit runs only after all timing samples and scores have been computed. Its queries never enter score aggregation and cannot warm the measured processes, but any audit failure discards the already-computed score and exits nonzero. The SQL artifact is written before either engine runs, and the compact report identifies it even on a comparison failure.
+
 ## Correctness gate and normalization
 
 Correctness and timing use separate processes. Before any timing for a case, the harness runs setup plus one unamplified query on each engine, captures both outputs, and opens that case's timing gate only after normalization succeeds. Amplified and end-to-end sample acceptance both require the open gate. Any process or comparison failure rejects the entire run; failed or absent gates cannot contribute timings.
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, audit family balance and result bounds, standard SHA-256 vectors, single- and multi-result CSV normalization, missing/oversized/mismatched audit results, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
 
 ## Timing and calibration
 
@@ -127,4 +165,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, an optional 336-query boundary corpus with replayable bytes and SHA-256 provenance, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.

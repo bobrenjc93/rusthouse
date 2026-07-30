@@ -50,6 +50,8 @@ pub struct Config {
     pub rusthouse: PathBuf,
     pub clickhouse: PathBuf,
     pub details: Option<PathBuf>,
+    pub correctness_audit: bool,
+    pub audit_sql: Option<PathBuf>,
 }
 
 pub enum ParseResult {
@@ -70,12 +72,15 @@ pub fn parse(
         .map(PathBuf::from)
         .unwrap_or(default_rusthouse);
     let mut details = None;
+    let mut correctness_audit = false;
+    let mut audit_sql = None;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(ParseResult::Help),
             "--quick" => mode = Mode::Quick,
+            "--correctness-audit" => correctness_audit = true,
             "--mode" => {
                 let value = arguments
                     .next()
@@ -109,6 +114,13 @@ pub fn parse(
                         .ok_or_else(|| "--details requires a path".to_owned())?,
                 ));
             }
+            "--audit-sql" => {
+                audit_sql = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--audit-sql requires a path".to_owned())?,
+                ));
+            }
             _ if argument.starts_with("--mode=") => {
                 mode = parse_mode(&argument["--mode=".len()..])?;
             }
@@ -124,6 +136,9 @@ pub fn parse(
             _ if argument.starts_with("--details=") => {
                 details = Some(PathBuf::from(&argument["--details=".len()..]));
             }
+            _ if argument.starts_with("--audit-sql=") => {
+                audit_sql = Some(PathBuf::from(&argument["--audit-sql=".len()..]));
+            }
             _ => return Err(format!("unknown argument {argument:?}; try --help")),
         }
     }
@@ -131,12 +146,17 @@ pub fn parse(
     let clickhouse = clickhouse.ok_or_else(|| {
         "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN".to_owned()
     })?;
+    if audit_sql.is_some() && !correctness_audit {
+        return Err("--audit-sql requires --correctness-audit".to_owned());
+    }
     Ok(ParseResult::Run(Config {
         mode,
         seed,
         rusthouse,
         clickhouse,
         details,
+        correctness_audit,
+        audit_sql,
     }))
 }
 
@@ -167,6 +187,8 @@ mod tests {
                 "--clickhouse=/command/clickhouse",
                 "--rusthouse=/command/rusthouse",
                 "--details=details.json",
+                "--correctness-audit",
+                "--audit-sql=audit.sql",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -183,6 +205,8 @@ mod tests {
         assert_eq!(config.clickhouse, PathBuf::from("/command/clickhouse"));
         assert_eq!(config.rusthouse, PathBuf::from("/command/rusthouse"));
         assert_eq!(config.details, Some(PathBuf::from("details.json")));
+        assert!(config.correctness_audit);
+        assert_eq!(config.audit_sql, Some(PathBuf::from("audit.sql")));
     }
 
     #[test]
@@ -204,5 +228,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("RUSTHOUSE_CLICKHOUSE_BIN"));
+    }
+
+    #[test]
+    fn audit_sql_requires_the_correctness_audit() {
+        let error = match parse(
+            [
+                "--clickhouse=/clickhouse".to_owned(),
+                "--audit-sql=audit.sql".to_owned(),
+            ],
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        ) {
+            Ok(_) => panic!("orphaned audit output should fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("--correctness-audit"));
     }
 }
