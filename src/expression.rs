@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+
 use crate::error::{Error, Result};
 use crate::sql::{ArithmeticOperator, Expression, ScalarFunction};
 use crate::storage::Table;
@@ -31,9 +34,36 @@ pub(crate) enum CompiledExpression {
     },
 }
 
+#[derive(Debug)]
 pub(crate) enum Evaluated<'a> {
     Borrowed(ValueRef<'a>),
     Owned(Value),
+}
+
+impl PartialEq for Evaluated<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for Evaluated<'_> {}
+
+impl PartialOrd for Evaluated<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Evaluated<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_ref().cmp(&other.as_ref())
+    }
+}
+
+impl Hash for Evaluated<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
 }
 
 impl Evaluated<'_> {

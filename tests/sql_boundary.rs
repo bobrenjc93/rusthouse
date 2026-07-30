@@ -790,3 +790,28 @@ fn boolean_named_aliases_resolve_in_order_by() {
         ]
     );
 }
+
+#[test]
+fn direct_column_aggregate_names_use_schema_casing() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE case_names (MixedCase Int64);
+             INSERT INTO case_names VALUES (2), (3);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT SUM(mixedcase), MIN(MIXEDCASE), COUNT(MiXeDcAsE)
+         FROM case_names;",
+    );
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["SUM(MixedCase)", "MIN(MixedCase)", "COUNT(MixedCase)"]
+    );
+}

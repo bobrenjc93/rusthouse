@@ -261,7 +261,13 @@ fn resolve_select_items(
                     AggregateArgument::Expression(expression) => {
                         let compiled = CompiledExpression::compile(table, expression)?;
                         let input_type = compiled.data_type();
-                        (Some(compiled), Some(input_type), expression.to_string())
+                        let argument_name = match &compiled {
+                            CompiledExpression::Column { index, .. } => {
+                                table.schema()[*index].name.clone()
+                            }
+                            _ => expression.to_string(),
+                        };
+                        (Some(compiled), Some(input_type), argument_name)
                     }
                 };
                 validate_aggregate(*function, input_type)?;
@@ -358,12 +364,12 @@ fn execute_projection(
         .collect()
 }
 
-fn execute_grouped(
-    table: &Table,
+fn execute_grouped<'a>(
+    table: &'a Table,
     matching_rows: &[usize],
-    group_expressions: &[CompiledExpression],
+    group_expressions: &'a [CompiledExpression],
     aggregate_specs: &[AggregateSpec],
-) -> Result<GroupedData> {
+) -> Result<GroupedData<'a>> {
     let mut groups = GroupIndex::new(group_expressions.len(), matching_rows.len());
     let mut group_count = usize::from(group_expressions.is_empty());
     let initial_capacity = matching_rows.len().min(1_024);
@@ -386,11 +392,7 @@ fn execute_grouped(
     for row in matching_rows {
         let key = group_expressions
             .iter()
-            .map(|expression| {
-                expression
-                    .evaluate(table, Some(*row))
-                    .map(Evaluated::into_owned)
-            })
+            .map(|expression| expression.evaluate(table, Some(*row)))
             .collect::<Result<Vec<_>>>()?;
         let (group, inserted) = groups.find_or_insert(key, group_count);
         if inserted {
@@ -426,13 +428,13 @@ fn execute_grouped(
 }
 
 #[derive(Debug)]
-enum GroupIndex {
+enum GroupIndex<'a> {
     Global,
-    One(HashMap<Value, usize>),
-    Multiple(HashMap<Box<[Value]>, usize>),
+    One(HashMap<Evaluated<'a>, usize>),
+    Multiple(HashMap<Box<[Evaluated<'a>]>, usize>),
 }
 
-impl GroupIndex {
+impl<'a> GroupIndex<'a> {
     fn new(column_count: usize, row_count: usize) -> Self {
         let initial_capacity = row_count.min(1_024);
         match column_count {
@@ -442,7 +444,7 @@ impl GroupIndex {
         }
     }
 
-    fn find_or_insert(&mut self, mut key: Vec<Value>, next_group: usize) -> (usize, bool) {
+    fn find_or_insert(&mut self, mut key: Vec<Evaluated<'a>>, next_group: usize) -> (usize, bool) {
         match self {
             Self::Global => (0, false),
             Self::One(groups) => {
@@ -458,7 +460,7 @@ impl GroupIndex {
         }
     }
 
-    fn into_keys(self, group_count: usize) -> Vec<GroupKey> {
+    fn into_keys(self, group_count: usize) -> Vec<GroupKey<'a>> {
         let mut ordered = std::iter::repeat_with(|| None)
             .take(group_count)
             .collect::<Vec<_>>();
@@ -485,9 +487,9 @@ impl GroupIndex {
     }
 }
 
-fn find_or_insert_group(
-    groups: &mut HashMap<Box<[Value]>, usize>,
-    key: Vec<Value>,
+fn find_or_insert_group<'a>(
+    groups: &mut HashMap<Box<[Evaluated<'a>]>, usize>,
+    key: Vec<Evaluated<'a>>,
     next_group: usize,
 ) -> (usize, bool) {
     if let Some(group) = groups.get(key.as_slice()) {
@@ -499,13 +501,13 @@ fn find_or_insert_group(
 }
 
 #[derive(Debug)]
-enum GroupKey {
+enum GroupKey<'a> {
     Empty,
-    One(Value),
-    Multiple(Box<[Value]>),
+    One(Evaluated<'a>),
+    Multiple(Box<[Evaluated<'a>]>),
 }
 
-impl GroupKey {
+impl GroupKey<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::Empty, Self::Empty) => Ordering::Equal,
@@ -517,13 +519,13 @@ impl GroupKey {
 }
 
 #[derive(Debug)]
-struct GroupedData {
-    keys: Vec<GroupKey>,
+struct GroupedData<'a> {
+    keys: Vec<GroupKey<'a>>,
     aggregates: Vec<Vec<Value>>,
     source_rows: Vec<Option<usize>>,
 }
 
-impl GroupedData {
+impl GroupedData<'_> {
     fn len(&self) -> usize {
         self.keys.len()
     }
@@ -783,16 +785,16 @@ fn order_source_rows(
                 .iter()
                 .map(|order| match &order.target {
                     ResolvedOrderTarget::Output(output) => match &items[*output] {
-                        ResolvedItem::Expression { expression } => expression
-                            .evaluate(table, Some(*row))
-                            .map(Evaluated::into_owned),
+                        ResolvedItem::Expression { expression } => {
+                            expression.evaluate(table, Some(*row))
+                        }
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("ungrouped projections cannot contain aggregates")
                         }
                     },
-                    ResolvedOrderTarget::Expression(expression) => expression
-                        .evaluate(table, Some(*row))
-                        .map(Evaluated::into_owned),
+                    ResolvedOrderTarget::Expression(expression) => {
+                        expression.evaluate(table, Some(*row))
+                    }
                 })
                 .collect::<Result<Vec<_>>>()
         })
@@ -811,7 +813,7 @@ fn order_source_rows(
 fn order_grouped_rows(
     groups: &mut Vec<usize>,
     table: &Table,
-    data: &GroupedData,
+    data: &GroupedData<'_>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
@@ -823,16 +825,16 @@ fn order_grouped_rows(
                 .iter()
                 .map(|order| match &order.target {
                     ResolvedOrderTarget::Output(output) => match &items[*output] {
-                        ResolvedItem::Expression { expression } => expression
-                            .evaluate(table, data.source_rows[*group])
-                            .map(Evaluated::into_owned),
-                        ResolvedItem::Aggregate { state } => {
-                            Ok(data.aggregates[*state][*group].clone())
+                        ResolvedItem::Expression { expression } => {
+                            expression.evaluate(table, data.source_rows[*group])
                         }
+                        ResolvedItem::Aggregate { state } => Ok(Evaluated::Borrowed(
+                            data.aggregates[*state][*group].as_ref(),
+                        )),
                     },
-                    ResolvedOrderTarget::Expression(expression) => expression
-                        .evaluate(table, data.source_rows[*group])
-                        .map(Evaluated::into_owned),
+                    ResolvedOrderTarget::Expression(expression) => {
+                        expression.evaluate(table, data.source_rows[*group])
+                    }
                 })
                 .collect::<Result<Vec<_>>>()
         })
@@ -850,13 +852,13 @@ fn order_grouped_rows(
 }
 
 fn compare_order_keys(
-    keys: &[Vec<Value>],
+    keys: &[Vec<Evaluated<'_>>],
     ordering: &[ResolvedOrder],
     left: usize,
     right: usize,
 ) -> Ordering {
     for (key, order) in ordering.iter().enumerate() {
-        let comparison = keys[left][key].cmp(&keys[right][key]);
+        let comparison = keys[left][key].as_ref().cmp(&keys[right][key].as_ref());
         if comparison != Ordering::Equal {
             return if order.descending {
                 comparison.reverse()
@@ -1039,6 +1041,43 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn string_group_keys_borrow_columns_and_own_computed_values() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE labels (label String); \
+                 INSERT INTO labels VALUES ('A'), ('a');",
+            )
+            .expect("setup");
+        let table = database.catalog().table("labels").expect("table");
+
+        let raw = resolve_group_expressions(table, &[Expression::Column("label".to_owned())])
+            .expect("resolve raw column");
+        let raw_data = execute_grouped(table, &[0, 1], &raw, &[]).expect("group raw column");
+        assert!(
+            raw_data
+                .keys
+                .iter()
+                .all(|key| matches!(key, GroupKey::One(Evaluated::Borrowed(ValueRef::String(_)))))
+        );
+
+        let computed_ast = Expression::Function {
+            function: crate::sql::ScalarFunction::Lower,
+            arguments: vec![Expression::Column("label".to_owned())],
+        };
+        let computed =
+            resolve_group_expressions(table, &[computed_ast]).expect("resolve computed expression");
+        let computed_data =
+            execute_grouped(table, &[0, 1], &computed, &[]).expect("group computed values");
+        assert!(
+            computed_data
+                .keys
+                .iter()
+                .all(|key| matches!(key, GroupKey::One(Evaluated::Owned(Value::String(_)))))
         );
     }
 }
