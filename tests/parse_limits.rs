@@ -135,6 +135,44 @@ fn select_item_limit_accepts_the_boundary_and_rejects_the_next_item() {
 }
 
 #[test]
+fn group_by_item_limit_accepts_the_boundary_and_rejects_the_next_item() {
+    let limits = ParseLimits {
+        max_group_by_items: 2,
+        ..ParseLimits::default()
+    };
+    parse_with_limits("SELECT a, b FROM t GROUP BY a, b", &limits)
+        .expect("two grouping keys succeed");
+    assert_sql_limit(
+        parse_with_limits("SELECT a, b FROM t GROUP BY a, b, a", &limits)
+            .expect_err("third grouping key fails"),
+        "GROUP BY clause exceeds limit of 2 items",
+    );
+}
+
+#[test]
+fn group_by_limit_failure_leaves_the_entire_batch_unapplied() {
+    let limits = ParseLimits {
+        max_group_by_items: 1,
+        ..ParseLimits::default()
+    };
+    let mut database = Database::with_parse_limits(limits);
+
+    assert_sql_limit(
+        database
+            .execute(
+                "CREATE TABLE group_not_applied (a Int64); \
+                 SELECT a FROM group_not_applied GROUP BY a, a",
+            )
+            .expect_err("grouping limit rejects the parsed batch"),
+        "GROUP BY clause exceeds limit of 1 items",
+    );
+    assert!(matches!(
+        database.catalog().table("group_not_applied"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
 fn order_by_item_limit_accepts_the_boundary_and_rejects_the_next_item() {
     let limits = ParseLimits {
         max_order_by_items: 2,

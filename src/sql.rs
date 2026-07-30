@@ -19,6 +19,7 @@ pub struct ParseLimits {
     pub max_literal_bytes: usize,
     pub max_schema_columns: usize,
     pub max_select_items: usize,
+    pub max_group_by_items: usize,
     pub max_order_by_items: usize,
     pub max_values_cells: usize,
 }
@@ -33,6 +34,7 @@ impl Default for ParseLimits {
             max_literal_bytes: 1024 * 1024,
             max_schema_columns: 1_024,
             max_select_items: 1_024,
+            max_group_by_items: 64,
             max_order_by_items: 64,
             max_values_cells: 1_000_000,
         }
@@ -590,6 +592,12 @@ impl<'input, 'limits> Parser<'input, 'limits> {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
+                if group_by.len() >= self.limits.max_group_by_items {
+                    return self.error(format!(
+                        "GROUP BY clause exceeds limit of {} items",
+                        self.limits.max_group_by_items
+                    ));
+                }
                 group_by.push(self.expect_identifier("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;

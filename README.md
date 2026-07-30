@@ -59,9 +59,10 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 Parser budgets can be tightened or raised with `--max-sql-bytes`, `--max-tokens`,
 `--max-statements`, `--max-identifier-bytes`, `--max-literal-bytes`,
-`--max-schema-columns`, `--max-select-items`, `--max-order-by-items`, and
-`--max-values-cells`. Both `--option N` and `--option=N` forms are accepted.
-Standard input is read only through the configured SQL byte limit.
+`--max-schema-columns`, `--max-select-items`, `--max-group-by-items`,
+`--max-order-by-items`, and `--max-values-cells`. Both `--option N` and
+`--option=N` forms are accepted. Standard input is read only through the
+configured SQL byte limit.
 
 ## Library API
 
@@ -95,13 +96,13 @@ To keep recursive predicate processing bounded, each WHERE expression is limited
 
 Default parser budgets are 64 MiB of SQL, 2,000,000 lexical tokens, 1,024
 statements, 128 bytes per identifier, 1 MiB per literal, 1,024 schema columns,
-1,024 SELECT items, 64 ORDER BY items, and 1,000,000 cells per VALUES clause.
-The identifier budget applies to user-defined table, column, and alias names,
-not SQL keywords or built-in names. Literal length is the decoded UTF-8 length
-for strings and includes a numeric sign. Applications can override every parser
-budget with `ParseLimits`; `sql::parse_with_limits` offers the same control
-without a `Database`. The defaults accept the shipped 50,000-row benchmark
-import.
+1,024 SELECT items, 64 GROUP BY items, 64 ORDER BY items, and 1,000,000 cells
+per VALUES clause. The identifier budget applies to user-defined table, column,
+and alias names, not SQL keywords or built-in names. Literal length is the
+decoded UTF-8 length for strings and includes a numeric sign. Applications can
+override every parser budget with `ParseLimits`; `sql::parse_with_limits` offers
+the same control without a `Database`. The defaults accept the shipped
+50,000-row benchmark import.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

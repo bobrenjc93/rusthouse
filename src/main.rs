@@ -21,6 +21,7 @@ OPTIONS:
     --max-literal-bytes <N>   Maximum literal length
     --max-schema-columns <N>  Maximum columns per CREATE TABLE
     --max-select-items <N>    Maximum items per SELECT list
+    --max-group-by-items <N>  Maximum items per GROUP BY clause
     --max-order-by-items <N>  Maximum items per ORDER BY clause
     --max-values-cells <N>    Maximum cells per VALUES clause
     -h, --help                Print this help
@@ -175,6 +176,7 @@ fn is_parse_limit_option(option: &str) -> bool {
             | "--max-literal-bytes"
             | "--max-schema-columns"
             | "--max-select-items"
+            | "--max-group-by-items"
             | "--max-order-by-items"
             | "--max-values-cells"
     )
@@ -189,6 +191,7 @@ fn set_parse_limit(limits: &mut ParseLimits, option: &str, value: &str) -> Resul
         "--max-literal-bytes" => &mut limits.max_literal_bytes,
         "--max-schema-columns" => &mut limits.max_schema_columns,
         "--max-select-items" => &mut limits.max_select_items,
+        "--max-group-by-items" => &mut limits.max_group_by_items,
         "--max-order-by-items" => &mut limits.max_order_by_items,
         "--max-values-cells" => &mut limits.max_values_cells,
         _ => return Ok(false),
@@ -249,8 +252,9 @@ mod tests {
                 "--max-literal-bytes=5",
                 "--max-schema-columns=6",
                 "--max-select-items=7",
-                "--max-order-by-items=8",
-                "--max-values-cells=9",
+                "--max-group-by-items=8",
+                "--max-order-by-items=9",
+                "--max-values-cells=10",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -268,8 +272,9 @@ mod tests {
                 max_literal_bytes: 5,
                 max_schema_columns: 6,
                 max_select_items: 7,
-                max_order_by_items: 8,
-                max_values_cells: 9,
+                max_group_by_items: 8,
+                max_order_by_items: 9,
+                max_values_cells: 10,
             }
         );
     }
