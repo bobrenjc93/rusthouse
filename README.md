@@ -79,6 +79,27 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+For concurrent embedded use, `SharedDatabase` is a cloneable handle. Pure
+`SELECT` batches share read access; mutating and mixed batches hold exclusive
+access across the whole batch so their statements cannot interleave.
+
+~~~rust
+use rusthouse::SharedDatabase;
+
+let database = SharedDatabase::new();
+database.execute("CREATE TABLE events (id Int64)")?;
+
+let reader = database.clone();
+let result = std::thread::spawn(move || {
+    reader.execute("SELECT COUNT(*) FROM events")
+})
+.join()
+.expect("reader thread")?;
+assert_eq!(result.len(), 1);
+
+# Ok::<(), rusthouse::Error>(())
+~~~
+
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.

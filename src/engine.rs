@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -14,6 +15,16 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+}
+
+/// A cloneable, thread-safe handle to an in-memory SQL database.
+///
+/// SELECT-only batches may execute concurrently. Batches containing CREATE or
+/// INSERT statements hold exclusive access for the complete batch, including
+/// any SELECT statements in that batch.
+#[derive(Debug, Clone, Default)]
+pub struct SharedDatabase {
+    database: Arc<RwLock<Database>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +65,31 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
+        let statements = sql::parse(sql)?;
+        self.execute_statements(statements)
+    }
+
+    fn execute_statements(&mut self, statements: Vec<Statement>) -> Result<Vec<StatementResult>> {
+        statements
             .into_iter()
             .map(|statement| self.execute_statement(statement))
+            .collect()
+    }
+
+    fn execute_select_statements(
+        &self,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<StatementResult>> {
+        statements
+            .into_iter()
+            .map(|statement| match statement {
+                Statement::Select(select) => {
+                    self.execute_select(select).map(StatementResult::Query)
+                }
+                Statement::CreateTable { .. } | Statement::Insert { .. } => {
+                    unreachable!("read-only batches contain only SELECT statements")
+                }
+            })
             .collect()
     }
 
@@ -132,6 +165,59 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+impl SharedDatabase {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Execute one or more semicolon-separated statements in order.
+    ///
+    /// The complete batch is parsed and classified before a lock is acquired.
+    /// SELECT-only batches share read access. A mutating or mixed batch holds
+    /// exclusive access until every statement succeeds or one statement fails.
+    /// As with [`Database::execute`], parsing is all-or-nothing, while changes
+    /// from successful statements remain applied after a later execution error.
+    pub fn execute(&self, sql: &str) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        self.execute_parsed(statements, || {})
+    }
+
+    fn execute_parsed(
+        &self,
+        statements: Vec<Statement>,
+        after_lock: impl FnOnce(),
+    ) -> Result<Vec<StatementResult>> {
+        let read_only = statements
+            .iter()
+            .all(|statement| matches!(statement, Statement::Select(_)));
+
+        if read_only {
+            let database = self
+                .database
+                .read()
+                .map_err(|_| Error::LockPoisoned { access: "read" })?;
+            after_lock();
+            database.execute_select_statements(statements)
+        } else {
+            let mut database = self
+                .database
+                .write()
+                .map_err(|_| Error::LockPoisoned { access: "write" })?;
+            after_lock();
+            database.execute_statements(statements)
+        }
+    }
+}
+
+impl From<Database> for SharedDatabase {
+    fn from(database: Database) -> Self {
+        Self {
+            database: Arc::new(RwLock::new(database)),
+        }
     }
 }
 
@@ -884,10 +970,23 @@ fn comparable(left: DataType, right: DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Barrier, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
+        last_query(results)
+    }
+
+    fn shared_query(database: &SharedDatabase, sql: &str) -> QueryResult {
+        let results = database.execute(sql).expect("query succeeds");
+        last_query(results)
+    }
+
+    fn last_query(results: Vec<StatementResult>) -> QueryResult {
         match results.into_iter().last().expect("one result") {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
@@ -944,6 +1043,179 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn select_batches_share_read_access() {
+        let database = SharedDatabase::new();
+        database
+            .execute(
+                "CREATE TABLE samples (id Int64); \
+                 INSERT INTO samples VALUES (1), (2);",
+            )
+            .expect("setup succeeds");
+
+        let statements = sql::parse("SELECT COUNT(*) FROM samples").expect("valid SQL");
+        let first = database.clone();
+        let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let first_reader = thread::spawn(move || {
+            first.execute_parsed(statements, || {
+                locked_tx.send(()).expect("announce read lock");
+                release_rx.recv().expect("release first reader");
+            })
+        });
+        locked_rx.recv().expect("first reader acquired its lock");
+
+        let second = database.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let second_reader = thread::spawn(move || {
+            result_tx
+                .send(second.execute("SELECT COUNT(*) FROM samples"))
+                .expect("return second result");
+        });
+
+        let second_result = result_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).expect("release first reader");
+        first_reader
+            .join()
+            .expect("first reader did not panic")
+            .expect("first reader succeeds");
+        second_reader.join().expect("second reader did not panic");
+
+        let result = last_query(
+            second_result
+                .expect("second reader must finish while the first holds read access")
+                .expect("second reader succeeds"),
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int64(2)]]);
+    }
+
+    #[test]
+    fn mutating_batches_are_serialized_without_statement_interleaving() {
+        let database = SharedDatabase::new();
+        database
+            .execute("CREATE TABLE sequence (id Int64)")
+            .expect("create table");
+
+        let statements = sql::parse(
+            "INSERT INTO sequence VALUES (1); \
+             SELECT COUNT(*) AS count FROM sequence;",
+        )
+        .expect("valid SQL");
+        let first = database.clone();
+        let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let first_writer = thread::spawn(move || {
+            first.execute_parsed(statements, || {
+                locked_tx.send(()).expect("announce write lock");
+                release_rx.recv().expect("release first writer");
+            })
+        });
+        locked_rx.recv().expect("first writer acquired its lock");
+
+        let second = database.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let second_writer = thread::spawn(move || {
+            started_tx.send(()).expect("announce second writer");
+            second.execute(
+                "INSERT INTO sequence VALUES (2); \
+                 SELECT COUNT(*) AS count FROM sequence;",
+            )
+        });
+        started_rx.recv().expect("second writer started");
+        release_tx.send(()).expect("release first writer");
+
+        let first_result = first_writer
+            .join()
+            .expect("first writer did not panic")
+            .expect("first batch succeeds");
+        let second_result = second_writer
+            .join()
+            .expect("second writer did not panic")
+            .expect("second batch succeeds");
+        assert_eq!(last_query(first_result).rows, vec![vec![Value::Int64(1)]]);
+        assert_eq!(last_query(second_result).rows, vec![vec![Value::Int64(2)]]);
+    }
+
+    #[test]
+    fn concurrent_sessions_do_not_lose_inserts() {
+        const WRITERS: usize = 8;
+        const INSERTS_PER_WRITER: usize = 40;
+
+        let database = SharedDatabase::new();
+        database
+            .execute("CREATE TABLE counters (id Int64)")
+            .expect("create table");
+        let start = Arc::new(Barrier::new(WRITERS));
+
+        let writers = (0..WRITERS)
+            .map(|writer| {
+                let database = database.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    for offset in 0..INSERTS_PER_WRITER {
+                        let id = writer * INSERTS_PER_WRITER + offset;
+                        database
+                            .execute(&format!("INSERT INTO counters VALUES ({id})"))
+                            .expect("insert succeeds");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().expect("writer did not panic");
+        }
+
+        let result = shared_query(&database, "SELECT id FROM counters ORDER BY id");
+        assert_eq!(result.rows.len(), WRITERS * INSERTS_PER_WRITER);
+        assert_eq!(
+            result.rows,
+            (0..WRITERS * INSERTS_PER_WRITER)
+                .map(|id| vec![Value::Int64(id as i64)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shared_batches_preserve_partial_failure_semantics() {
+        let database = SharedDatabase::new();
+        let error = database
+            .execute(
+                "CREATE TABLE applied (id Int64); \
+                 INSERT INTO applied VALUES (false);",
+            )
+            .expect_err("later statement fails");
+        assert!(matches!(error, Error::TypeMismatch { .. }));
+
+        let result = shared_query(&database, "SELECT COUNT(*) FROM applied");
+        assert_eq!(result.rows, vec![vec![Value::Int64(0)]]);
+    }
+
+    #[test]
+    fn poisoned_shared_database_returns_structured_errors() {
+        let database = SharedDatabase::new();
+        let poisoner = database.clone();
+        let panic = thread::spawn(move || {
+            let _guard = poisoner.database.write().expect("acquire write lock");
+            panic!("poison database lock");
+        })
+        .join();
+        assert!(panic.is_err());
+
+        assert!(matches!(
+            database.execute("SELECT FROM"),
+            Err(Error::Sql { .. })
+        ));
+        assert_eq!(
+            database.execute("SELECT * FROM missing"),
+            Err(Error::LockPoisoned { access: "read" })
+        );
+        assert_eq!(
+            database.execute("CREATE TABLE blocked (id Int64)"),
+            Err(Error::LockPoisoned { access: "write" })
         );
     }
 }
