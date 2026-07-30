@@ -405,13 +405,7 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
-        let if_not_exists = if self.eat_keyword("IF") {
-            self.expect_keyword("NOT")?;
-            self.expect_keyword("EXISTS")?;
-            true
-        } else {
-            false
-        };
+        let if_not_exists = self.eat_keyword_sequence(&["IF", "NOT", "EXISTS"]);
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
@@ -459,12 +453,7 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
-        let if_exists = if self.eat_keyword("IF") {
-            self.expect_keyword("EXISTS")?;
-            true
-        } else {
-            false
-        };
+        let if_exists = self.eat_keyword_sequence(&["IF", "EXISTS"]);
         let name = self.expect_identifier("table name")?;
         Ok(Statement::DropTable { name, if_exists })
     }
@@ -754,6 +743,19 @@ impl Parser {
         }
     }
 
+    fn eat_keyword_sequence(&mut self, expected: &[&str]) -> bool {
+        let matches = expected.iter().enumerate().all(|(offset, expected)| {
+            matches!(
+                self.tokens.get(self.current + offset).map(|token| &token.kind),
+                Some(TokenKind::Identifier(value)) if value.eq_ignore_ascii_case(expected)
+            )
+        });
+        if matches {
+            self.current += expected.len();
+        }
+        matches
+    }
+
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
         if let TokenKind::Identifier(value) = self.peek().clone() {
             self.current += 1;
@@ -885,6 +887,28 @@ mod tests {
                 name,
                 if_exists: true
             } if name == "events"
+        ));
+    }
+
+    #[test]
+    fn optional_clauses_do_not_consume_a_table_named_if() {
+        let statements = parse("CREATE TABLE IF (id Int64); DROP TABLE IF;")
+            .expect("IF remains a valid table name");
+
+        assert!(matches!(
+            &statements[0],
+            Statement::CreateTable {
+                name,
+                if_not_exists: false,
+                ..
+            } if name == "IF"
+        ));
+        assert!(matches!(
+            &statements[1],
+            Statement::DropTable {
+                name,
+                if_exists: false
+            } if name == "IF"
         ));
     }
 

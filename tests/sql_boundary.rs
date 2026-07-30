@@ -162,6 +162,29 @@ fn missing_table_lifecycle_commands_return_consistent_errors() {
 }
 
 #[test]
+fn if_remains_a_valid_table_name_across_create_and_drop() {
+    let mut database = Database::new();
+
+    assert_eq!(
+        only_command(&mut database, "CREATE TABLE IF (id Int64);"),
+        ("CREATE TABLE", 0)
+    );
+    only_command(&mut database, "INSERT INTO IF VALUES (1);");
+    assert_eq!(
+        execute_query(&mut database, "SELECT id FROM IF;").rows,
+        vec![vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        only_command(&mut database, "DROP TABLE IF;"),
+        ("DROP TABLE", 0)
+    );
+    assert!(matches!(
+        database.catalog().table("if"),
+        Err(Error::TableNotFound(name)) if name == "if"
+    ));
+}
+
+#[test]
 fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let mut database = Database::new();
     let results = database
