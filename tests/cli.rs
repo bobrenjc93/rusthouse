@@ -194,7 +194,7 @@ fn interactive_session_keeps_state_and_continues_after_sql_errors() {
          INSERT INTO notes VALUES ('semi;colon', 1); -- not a boundary ;\n\
          SELECT missing FROM notes;\n\
          INSERT INTO notes VALUES ('after error', 2);\n\
-         SELECT label, n FROM notes ORDER BY n;\n\
+         SELECT label, n FROM notes ORDER BY n; -- trailing comment ;\n\
          \\q\n\
          SELECT label FROM notes;\n",
     );
@@ -209,6 +209,7 @@ fn interactive_session_keeps_state_and_continues_after_sql_errors() {
     assert!(stderr.contains("        -> "));
     assert!(stderr.contains("column 'missing' does not exist"));
     assert!(stderr.contains("INSERT 1"));
+    assert!(!stderr.contains("unexpected character"));
 }
 
 #[test]
@@ -217,14 +218,15 @@ fn interactive_commands_change_format_read_files_and_quit() {
     fs::write(
         &path,
         "CREATE TABLE loaded (id Int64, label String);\n\
-         INSERT INTO loaded VALUES (2, 'from;file'), (1, 'first')",
+         INSERT INTO loaded VALUES (2, 'from;file'), (1, 'first');\n\
+         ;;; -- trailing file comment ;",
     )
     .expect("write SQL file");
 
     let input = format!(
         "\\read {}\n\
          \\format json\n\
-         SELECT id FROM loaded ORDER BY id;\n\
+         SELECT id FROM loaded ORDER BY id; -- switch format next ;\n\
          \\format invalid\n\
          \\format csv\n\
          SELECT label FROM loaded ORDER BY label;\n\
@@ -250,4 +252,5 @@ fn interactive_commands_change_format_read_files_and_quit() {
     assert!(stderr.contains("CREATE TABLE"));
     assert!(stderr.contains("INSERT 2"));
     assert!(stderr.contains("unknown output format 'invalid'"));
+    assert!(!stderr.contains("unexpected character"));
 }

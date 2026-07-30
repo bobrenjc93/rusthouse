@@ -17,7 +17,10 @@ pub(crate) fn run(
     let mut buffer = String::new();
 
     loop {
-        let prompt = if buffer.trim().is_empty() {
+        if is_ignorable_sql(&buffer) {
+            buffer.clear();
+        }
+        let prompt = if buffer.is_empty() {
             "rusthouse> "
         } else {
             "        -> "
@@ -35,20 +38,17 @@ pub(crate) fn run(
             return Ok(());
         }
 
-        if buffer.trim().is_empty() {
-            buffer.clear();
-            if line.trim_start().starts_with('\\') {
-                if handle_command(
-                    line.trim(),
-                    &mut database,
-                    &mut format,
-                    &mut stdout,
-                    &mut stderr,
-                )? {
-                    return Ok(());
-                }
-                continue;
+        if buffer.is_empty() && line.trim_start().starts_with('\\') {
+            if handle_command(
+                line.trim(),
+                &mut database,
+                &mut format,
+                &mut stdout,
+                &mut stderr,
+            )? {
+                return Ok(());
             }
+            continue;
         }
 
         buffer.push_str(&line);
@@ -124,7 +124,7 @@ fn execute_trailing_sql(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<(), String> {
-    if !sql.trim().is_empty() {
+    if !is_ignorable_sql(sql) {
         execute_sql(database, sql, format, stdout, stderr)?;
     }
     Ok(())
@@ -137,6 +137,10 @@ fn execute_sql(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<(), String> {
+    if is_ignorable_sql(sql) {
+        return Ok(());
+    }
+
     match database.execute(sql) {
         Ok(results) => emit_results(results, format, false, stdout, stderr)
             .map_err(|error| format!("could not write output: {error}")),
@@ -165,6 +169,25 @@ fn unquote_path(path: &str) -> &str {
     } else {
         path
     }
+}
+
+fn is_ignorable_sql(sql: &str) -> bool {
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            value if value.is_whitespace() || value == ';' => {}
+            '-' if characters.peek() == Some(&'-') => {
+                characters.next();
+                for comment_character in characters.by_ref() {
+                    if comment_character == '\n' {
+                        break;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn take_complete_statements(buffer: &mut String) -> Vec<String> {
@@ -237,5 +260,14 @@ mod tests {
             vec![" -- ignored ;\nSELECT * FROM t;"]
         );
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_whitespace_comments_and_separators_as_ignorable() {
+        assert!(is_ignorable_sql(" \t;\n;; -- comment ;\n -- final"));
+        assert!(is_ignorable_sql("\u{2003}-- Unicode whitespace"));
+        assert!(!is_ignorable_sql("-"));
+        assert!(!is_ignorable_sql("SELECT"));
+        assert!(!is_ignorable_sql("'-- not a comment'"));
     }
 }
