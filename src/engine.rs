@@ -48,7 +48,8 @@ impl Database {
 
     /// Open a snapshot-backed database, or create an empty catalog if the path
     /// does not exist. Every successful mutation is checkpointed before it is
-    /// returned to the caller.
+    /// returned to the caller. Snapshot persistence currently requires Unix so
+    /// the replacement's parent directory can be durably synced.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
         if path.file_name().is_none_or(|name| name.is_empty()) {
@@ -58,6 +59,7 @@ impl Database {
                 message: "the database path must name a file".to_owned(),
             });
         }
+        persistence::ensure_supported(&path)?;
         let catalog = persistence::load(&path)?;
         Ok(Self {
             catalog,
@@ -74,7 +76,8 @@ impl Database {
     /// path. In-memory databases have no checkpoint destination and do nothing.
     pub fn checkpoint(&self) -> Result<()> {
         match &self.path {
-            Some(path) => persistence::checkpoint(&self.catalog, path),
+            Some(path) => persistence::checkpoint(&self.catalog, path)
+                .map_err(persistence::CheckpointError::into_error),
             None => Ok(()),
         }
     }
@@ -85,7 +88,8 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs. A database
     /// opened from a path checkpoints each successful mutation before moving to
-    /// the next statement.
+    /// the next statement. Failures before rename roll back the current
+    /// mutation; rename commits it, even if the following directory sync fails.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         let statements = sql::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
@@ -96,10 +100,15 @@ impl Database {
             );
             let previous_catalog = (mutation && self.path.is_some()).then(|| self.catalog.clone());
             let result = self.execute_statement(statement)?;
-            if mutation && let Err(error) = self.checkpoint() {
-                self.catalog =
-                    previous_catalog.expect("persistent mutations save a rollback catalog");
-                return Err(error);
+            if mutation
+                && let Some(path) = &self.path
+                && let Err(checkpoint_error) = persistence::checkpoint(&self.catalog, path)
+            {
+                if !checkpoint_error.committed() {
+                    self.catalog =
+                        previous_catalog.expect("persistent mutations save a rollback catalog");
+                }
+                return Err(checkpoint_error.into_error());
             }
             results.push(result);
         }
@@ -938,6 +947,51 @@ mod tests {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_rename_sync_failure_keeps_the_committed_snapshot_in_memory() {
+        use std::fs;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "rusthouse-post-rename-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&directory).expect("create temporary directory");
+        let _cleanup = Cleanup(directory.clone());
+        let path = directory.join("catalog.rsh");
+        let mut database = Database::open(&path).expect("open database");
+        database
+            .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1)")
+            .expect("create initial snapshot");
+
+        crate::persistence::fail_next_directory_sync();
+        let error = database
+            .execute("INSERT INTO events VALUES (2)")
+            .expect_err("directory sync failure is reported");
+        assert!(error.to_string().contains("remains committed"));
+        assert_eq!(
+            query(&mut database, "SELECT id FROM events ORDER BY id").rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+
+        let mut reopened = Database::open(path).expect("reopen committed snapshot");
+        assert_eq!(
+            query(&mut reopened, "SELECT id FROM events ORDER BY id").rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
     }
 
     #[test]

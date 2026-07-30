@@ -4,6 +4,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(all(test, unix))]
+use std::cell::Cell;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::storage::{Column, ColumnDef, Table};
@@ -14,7 +19,58 @@ const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8 + 4;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static FAIL_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) struct CheckpointError {
+    error: Error,
+    committed: bool,
+}
+
+impl CheckpointError {
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        self.error
+    }
+
+    fn after_commit(error: Error) -> Self {
+        Self {
+            error,
+            committed: true,
+        }
+    }
+}
+
+impl From<Error> for CheckpointError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            committed: false,
+        }
+    }
+}
+
+type CheckpointResult<T> = std::result::Result<T, CheckpointError>;
+
+pub(crate) fn ensure_supported(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(unsupported_platform(path))
+    }
+}
+
 pub(crate) fn load(path: &Path) -> Result<Catalog> {
+    ensure_supported(path)?;
     match fs::read(path) {
         Ok(bytes) => decode(&bytes, path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Catalog::new()),
@@ -22,7 +78,9 @@ pub(crate) fn load(path: &Path) -> Result<Catalog> {
     }
 }
 
-pub(crate) fn checkpoint(catalog: &Catalog, path: &Path) -> Result<()> {
+pub(crate) fn checkpoint(catalog: &Catalog, path: &Path) -> CheckpointResult<()> {
+    ensure_supported(path)?;
+    let security_metadata = existing_security_metadata(path)?;
     let snapshot = encode(catalog)?;
     let parent = usable_parent(path);
     let file_name = path
@@ -40,6 +98,7 @@ pub(crate) fn checkpoint(catalog: &Catalog, path: &Path) -> Result<()> {
         .expect("temporary file is open")
         .write_all(&snapshot)
         .map_err(|error| io_error("write", path, error))?;
+    temporary.preserve_security_metadata(security_metadata, path)?;
     temporary
         .file
         .as_ref()
@@ -50,7 +109,7 @@ pub(crate) fn checkpoint(catalog: &Catalog, path: &Path) -> Result<()> {
 
     fs::rename(&temporary.path, path).map_err(|error| io_error("replace", path, error))?;
     temporary.renamed = true;
-    sync_directory(parent, path)?;
+    sync_directory(parent, path).map_err(CheckpointError::after_commit)?;
     Ok(())
 }
 
@@ -337,11 +396,11 @@ impl TemporaryFile {
                 TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             let temporary_path = parent.join(temporary_name);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)
-            {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&temporary_path) {
                 Ok(file) => {
                     return Ok(Self {
                         file: Some(file),
@@ -359,6 +418,36 @@ impl TemporaryFile {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn preserve_security_metadata(
+        &self,
+        metadata: Option<SecurityMetadata>,
+        database_path: &Path,
+    ) -> Result<()> {
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+        let file = self.file.as_ref().expect("temporary file is open");
+        let temporary_metadata = file
+            .metadata()
+            .map_err(|error| io_error("inspect temporary snapshot for", database_path, error))?;
+        if temporary_metadata.uid() != metadata.uid || temporary_metadata.gid() != metadata.gid {
+            fchown(file, Some(metadata.uid), Some(metadata.gid))
+                .map_err(|error| io_error("preserve owner and group for", database_path, error))?;
+        }
+        file.set_permissions(fs::Permissions::from_mode(metadata.mode))
+            .map_err(|error| io_error("preserve permissions for", database_path, error))
+    }
+
+    #[cfg(not(unix))]
+    fn preserve_security_metadata(
+        &self,
+        _metadata: Option<SecurityMetadata>,
+        database_path: &Path,
+    ) -> Result<()> {
+        Err(unsupported_platform(database_path))
     }
 }
 
@@ -409,15 +498,56 @@ fn usable_parent(path: &Path) -> &Path {
 }
 
 #[cfg(unix)]
-fn sync_directory(parent: &Path, database_path: &Path) -> Result<()> {
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error("sync parent directory for", database_path, error))
+#[derive(Clone, Copy)]
+struct SecurityMetadata {
+    mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_parent: &Path, _database_path: &Path) -> Result<()> {
-    Ok(())
+struct SecurityMetadata;
+
+#[cfg(unix)]
+fn existing_security_metadata(path: &Path) -> Result<Option<SecurityMetadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(SecurityMetadata {
+            mode: metadata.mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error("inspect security metadata for", path, error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn existing_security_metadata(path: &Path) -> Result<Option<SecurityMetadata>> {
+    Err(unsupported_platform(path))
+}
+
+#[cfg(unix)]
+fn sync_directory(parent: &Path, database_path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(committed_sync_error(
+            database_path,
+            io::Error::other("injected directory sync failure"),
+        ));
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| committed_sync_error(database_path, error))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_parent: &Path, database_path: &Path) -> Result<()> {
+    Err(unsupported_platform(database_path))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_directory_sync() {
+    FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
 }
 
 fn io_error(operation: &str, path: &Path, error: io::Error) -> Error {
@@ -425,6 +555,27 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> Error {
         operation: operation.to_owned(),
         path: path.to_owned(),
         message: error.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn committed_sync_error(path: &Path, error: io::Error) -> Error {
+    Error::Persistence {
+        operation: "durably sync committed".to_owned(),
+        path: path.to_owned(),
+        message: format!(
+            "{error}; the new snapshot is live and remains committed, but crash durability is uncertain"
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn unsupported_platform(path: &Path) -> Error {
+    Error::Persistence {
+        operation: "open persistent".to_owned(),
+        path: path.to_owned(),
+        message: "crash-safe database snapshots are currently supported only on Unix platforms"
+            .to_owned(),
     }
 }
 

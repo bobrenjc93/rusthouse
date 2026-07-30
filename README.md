@@ -55,7 +55,7 @@ printf '%s\n' \
   cargo run -- --format csv
 ~~~
 
-Persist data across invocations with `--database` (or `-d`):
+On Unix, persist data across invocations with `--database` (or `-d`):
 
 ~~~bash
 cargo run -- --database rusthouse.db --execute \
@@ -64,7 +64,7 @@ cargo run -- --database rusthouse.db --execute \
   "SELECT * FROM events ORDER BY id"
 ~~~
 
-The database file is loaded before SQL execution. Each successful `CREATE` or `INSERT` is written to a same-directory temporary file, synced, atomically renamed over the previous snapshot, and followed by a parent-directory sync. Snapshots include a format version, declared length, and CRC-32 checksum; truncated, corrupt, and unsupported snapshots are rejected rather than partially loaded.
+The database file is loaded before SQL execution. Each successful `CREATE` or `INSERT` is written to a private same-directory temporary file, synced, atomically renamed over the previous snapshot, and followed by a parent-directory sync. Existing Unix mode, owner, and group metadata are preserved. Snapshots include a format version, declared length, and CRC-32 checksum; truncated, corrupt, and unsupported snapshots are rejected rather than partially loaded. Persistent databases are rejected on non-Unix platforms until an equivalent durable replacement protocol is available.
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
@@ -91,7 +91,7 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
-Use `Database::open("rusthouse.db")` for the same automatically checkpointed behavior as the CLI. A syntax error still applies nothing. If execution fails after earlier statements succeeded, their checkpoints remain; if writing a mutation fails, that mutation is rolled back in memory and is not reported as successful.
+Use `Database::open("rusthouse.db")` for the same automatically checkpointed behavior as the CLI. A syntax error still applies nothing. If execution fails after earlier statements succeeded, their checkpoints remain. A checkpoint failure before rename rolls back that mutation in memory. Rename is the commit boundary: if the subsequent parent-directory sync fails, the error states that crash durability is uncertain, while the live snapshot and in-memory catalog both retain the committed mutation.
 
 ## Current boundaries
 

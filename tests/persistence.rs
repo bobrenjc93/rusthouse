@@ -245,3 +245,28 @@ fn logically_identical_catalogs_have_deterministic_snapshot_bytes() {
         first_bytes
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn checkpoints_create_private_files_and_preserve_existing_unix_metadata() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let directory = TempDirectory::new("permissions");
+    let path = directory.database("catalog.rsh");
+    create_snapshot(&path);
+    let private_metadata = fs::metadata(&path).expect("read new snapshot metadata");
+    assert_eq!(private_metadata.mode() & 0o077, 0);
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+        .expect("set database permissions");
+    let before = fs::metadata(&path).expect("read metadata before checkpoint");
+    let mut database = Database::open(&path).expect("open existing database");
+    database
+        .execute("INSERT INTO samples VALUES (8, 3.5, false, 'saved securely')")
+        .expect("checkpoint database");
+    let after = fs::metadata(path).expect("read metadata after checkpoint");
+
+    assert_eq!(after.mode() & 0o7777, 0o640);
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
+}
