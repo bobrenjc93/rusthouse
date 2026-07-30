@@ -21,6 +21,8 @@ pub enum Column {
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
+    Date(Vec<i32>),
+    DateTime64(Vec<i64>),
 }
 
 impl Column {
@@ -31,6 +33,8 @@ impl Column {
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
+            DataType::Date => Self::Date(Vec::new()),
+            DataType::DateTime64 => Self::DateTime64(Vec::new()),
         }
     }
 
@@ -41,6 +45,8 @@ impl Column {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Date(_) => DataType::Date,
+            Self::DateTime64(_) => DataType::DateTime64,
         }
     }
 
@@ -51,6 +57,8 @@ impl Column {
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
+            Self::Date(values) => values.len(),
+            Self::DateTime64(values) => values.len(),
         }
     }
 
@@ -70,6 +78,8 @@ impl Column {
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
+            Self::Date(values) => ValueRef::Date(values[row]),
+            Self::DateTime64(values) => ValueRef::DateTime64(values[row]),
         }
     }
 
@@ -83,6 +93,8 @@ impl Column {
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Date(values), Value::Date(value)) => values.push(value),
+            (Self::DateTime64(values), Value::DateTime64(value)) => values.push(value),
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -182,6 +194,19 @@ impl Table {
                     self.name, field.name
                 )));
             }
+            if matches!(value, Value::Date(days) if !crate::temporal::is_valid_date_days(*days)) {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' Date value is outside 0001-01-01 through 9999-12-31",
+                    self.name, field.name
+                )));
+            }
+            if matches!(value, Value::DateTime64(milliseconds) if !crate::temporal::is_valid_datetime_millis(*milliseconds))
+            {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' DateTime64(3) value is outside 0001-01-01T00:00:00.000Z through 9999-12-31T23:59:59.999Z",
+                    self.name, field.name
+                )));
+            }
         }
 
         Ok(())
@@ -240,5 +265,62 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejects_programmatic_temporal_values_outside_supported_range() {
+        let mut date_table = Table::new(
+            "dates".to_owned(),
+            vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::Date,
+            }],
+        )
+        .expect("valid schema");
+        let error = date_table
+            .insert_row(vec![Value::Date(crate::temporal::MIN_DATE_DAYS - 1)])
+            .expect_err("out-of-range Date");
+        assert!(matches!(error, Error::InvalidQuery(message) if message.contains("Date value")));
+
+        let mut datetime_table = Table::new(
+            "timestamps".to_owned(),
+            vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::DateTime64,
+            }],
+        )
+        .expect("valid schema");
+        let error = datetime_table
+            .insert_row(vec![Value::DateTime64(
+                crate::temporal::MAX_DATETIME_MILLIS + 1,
+            )])
+            .expect_err("out-of-range DateTime64");
+        assert!(
+            matches!(error, Error::InvalidQuery(message) if message.contains("DateTime64(3) value"))
+        );
+    }
+
+    #[test]
+    fn stores_temporal_values_in_physical_integer_columns() {
+        let mut table = Table::new(
+            "temporal".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "day".to_owned(),
+                    data_type: DataType::Date,
+                },
+                ColumnDef {
+                    name: "at".to_owned(),
+                    data_type: DataType::DateTime64,
+                },
+            ],
+        )
+        .expect("valid schema");
+        table
+            .insert_row(vec![Value::Date(-1), Value::DateTime64(-1)])
+            .expect("valid temporal row");
+
+        assert!(matches!(&table.columns()[0], Column::Date(values) if values == &[-1]));
+        assert!(matches!(&table.columns()[1], Column::DateTime64(values) if values == &[-1]));
     }
 }

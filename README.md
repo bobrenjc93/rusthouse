@@ -1,10 +1,10 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column, including signed epoch-day `Vec<i32>` dates and checked epoch-millisecond `Vec<i64>` timestamps.
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, String, Date, and DateTime64(3) columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -16,6 +16,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Date values use the standard `DATE 'YYYY-MM-DD'` literal. DateTime64(3) values use `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.fff]'`, are interpreted as UTC, and render as `YYYY-MM-DDTHH:MM:SS.mmmZ`. Both types support years 0001 through 9999, including values before the Unix epoch. Temporal arithmetic and precision finer than milliseconds are rejected explicitly.
 
 ## CLI
 

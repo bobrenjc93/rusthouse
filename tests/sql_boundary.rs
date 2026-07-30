@@ -524,3 +524,225 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn temporal_columns_filter_group_order_and_aggregate_end_to_end() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (
+                event_date Date, occurred_at DateTime64(3), category String
+             );
+             INSERT INTO events VALUES
+                (DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00', 'epoch'),
+                (DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59.999', 'before'),
+                (DATE '2000-02-29', TIMESTAMP '2000-02-29 12:30:00.1', 'leap'),
+                (DATE '2000-02-29', TIMESTAMP '2000-02-29 12:30:00.120', 'leap');",
+        )
+        .expect("temporal setup succeeds");
+
+    let filtered = execute_query(
+        &mut database,
+        "SELECT event_date, occurred_at, category
+         FROM events
+         WHERE occurred_at < TIMESTAMP '1970-01-01 00:00:00.000'
+            OR event_date >= DATE '2000-02-29'
+         ORDER BY occurred_at DESC
+         LIMIT 3;",
+    );
+    assert_eq!(
+        filtered
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::Date, DataType::DateTime64, DataType::String]
+    );
+    assert_eq!(
+        filtered.rows,
+        vec![
+            vec![
+                Value::Date(11_016),
+                Value::DateTime64(951_827_400_120),
+                Value::String("leap".to_owned()),
+            ],
+            vec![
+                Value::Date(11_016),
+                Value::DateTime64(951_827_400_100),
+                Value::String("leap".to_owned()),
+            ],
+            vec![
+                Value::Date(-1),
+                Value::DateTime64(-1),
+                Value::String("before".to_owned()),
+            ],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT event_date,
+                COUNT(occurred_at) AS events,
+                MIN(occurred_at) AS first_seen,
+                MAX(occurred_at) AS last_seen
+         FROM events
+         GROUP BY event_date
+         ORDER BY event_date;",
+    );
+    assert_eq!(
+        grouped
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Date,
+            DataType::Int64,
+            DataType::DateTime64,
+            DataType::DateTime64,
+        ]
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::Date(-1),
+                Value::Int64(1),
+                Value::DateTime64(-1),
+                Value::DateTime64(-1),
+            ],
+            vec![
+                Value::Date(0),
+                Value::Int64(1),
+                Value::DateTime64(0),
+                Value::DateTime64(0),
+            ],
+            vec![
+                Value::Date(11_016),
+                Value::Int64(2),
+                Value::DateTime64(951_827_400_100),
+                Value::DateTime64(951_827_400_120),
+            ],
+        ]
+    );
+
+    let date_bounds = execute_query(
+        &mut database,
+        "SELECT MIN(event_date) AS first_date, MAX(event_date) AS last_date
+         FROM events;",
+    );
+    assert_eq!(
+        date_bounds.rows,
+        vec![vec![Value::Date(-1), Value::Date(11_016)]]
+    );
+}
+
+#[test]
+fn temporal_literals_check_leap_years_precision_and_ranges() {
+    let valid = [
+        "DATE '0001-01-01'",
+        "DATE '9999-12-31'",
+        "DATE '2024-02-29'",
+        "TIMESTAMP '0001-01-01 00:00:00'",
+        "TIMESTAMP '9999-12-31 23:59:59.999'",
+        "TIMESTAMP '1970-01-01 00:00:00.1'",
+        "TIMESTAMP '1970-01-01 00:00:00.12'",
+    ];
+    for (index, literal) in valid.iter().enumerate() {
+        let column_type = if literal.starts_with("DATE ") {
+            "Date"
+        } else {
+            "DateTime64(3)"
+        };
+        let mut database = Database::new();
+        database
+            .execute(&format!(
+                "CREATE TABLE valid_{index} (value {column_type});
+                 INSERT INTO valid_{index} VALUES ({literal});"
+            ))
+            .unwrap_or_else(|error| panic!("{literal} should be valid: {error}"));
+    }
+
+    let invalid = [
+        "DATE '0000-01-01'",
+        "DATE '1900-02-29'",
+        "DATE '2023-02-29'",
+        "DATE '2024-13-01'",
+        "DATE '2024-01-1'",
+        "TIMESTAMP '2024-02-29T12:00:00'",
+        "TIMESTAMP '2024-02-29 24:00:00'",
+        "TIMESTAMP '2024-02-29 23:60:00'",
+        "TIMESTAMP '2024-02-29 23:59:60'",
+        "TIMESTAMP '2024-02-29 23:59:59.'",
+        "TIMESTAMP '2024-02-29 23:59:59.0001'",
+        "TIMESTAMP '2024-02-é9 23:59:59.000'",
+    ];
+    for literal in invalid {
+        let mut database = Database::new();
+        let error = database
+            .execute(&format!(
+                "CREATE TABLE invalid_value (value DateTime64(3));
+                 INSERT INTO invalid_value VALUES ({literal});"
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Sql { ref message, .. } if message.contains("invalid") || message.contains("precision") || message.contains("out of range")),
+            "unexpected error for {literal}: {error}"
+        );
+        assert!(matches!(
+            database.catalog().table("invalid_value"),
+            Err(Error::TableNotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn temporal_precision_types_and_arithmetic_are_rejected_explicitly() {
+    for definition in [
+        "DateTime64",
+        "DateTime64(0)",
+        "DateTime64(6)",
+        "DateTime64(3.0)",
+    ] {
+        let mut database = Database::new();
+        let error = database
+            .execute(&format!(
+                "CREATE TABLE invalid_precision (value {definition});"
+            ))
+            .expect_err("unsupported precision must fail");
+        assert!(
+            matches!(error, Error::Sql { message, .. } if message.contains("DateTime64") && (message.contains("precision") || message.contains("'('") ))
+        );
+    }
+
+    for sql in [
+        "INSERT INTO temporal VALUES (DATE '2024-01-01' + 1, TIMESTAMP '2024-01-01 00:00:00');",
+        "SELECT event_date - 1 FROM temporal;",
+        "SELECT event_date FROM temporal WHERE occurred_at < TIMESTAMP '2024-01-01 00:00:00' + 1;",
+    ] {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE temporal (event_date Date, occurred_at DateTime64(3));")
+            .expect("create succeeds");
+        let error = database.execute(sql).expect_err("arithmetic must fail");
+        assert!(
+            matches!(error, Error::Sql { message, .. } if message == "arithmetic expressions are not supported")
+        );
+    }
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE temporal (event_date Date);
+             INSERT INTO temporal VALUES (DATE '2024-01-01');",
+        )
+        .expect("setup succeeds");
+    let error = database
+        .execute("SELECT SUM(event_date) FROM temporal;")
+        .expect_err("temporal SUM is unsupported");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch { expected, actual, .. }
+            if expected == "Int64 or Float64" && actual == "Date"
+    ));
+}

@@ -136,7 +136,10 @@ enum TokenKind {
     RightParen,
     Semicolon,
     Star,
+    Plus,
     Minus,
+    Slash,
+    Percent,
     Equal,
     NotEqual,
     Less,
@@ -190,9 +193,21 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     TokenKind::Star
                 }
+                '+' => {
+                    self.advance();
+                    TokenKind::Plus
+                }
                 '-' => {
                     self.advance();
                     TokenKind::Minus
+                }
+                '/' => {
+                    self.advance();
+                    TokenKind::Slash
+                }
+                '%' => {
+                    self.advance();
+                    TokenKind::Percent
                 }
                 '=' => {
                     self.advance();
@@ -401,9 +416,26 @@ impl Parser {
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected Int64, Float64, Bool, String, Date, or DateTime64(3)"
                 ),
             })?;
+            if data_type == DataType::DateTime64 {
+                self.expect(&TokenKind::LeftParen, "'(' after DateTime64")?;
+                let precision_position = self.position();
+                let precision = self.take_number().ok_or_else(|| Error::Sql {
+                    position: precision_position,
+                    message: "expected precision 3 in DateTime64(3)".to_owned(),
+                })?;
+                if precision != "3" {
+                    return Err(Error::Sql {
+                        position: precision_position,
+                        message: format!(
+                            "unsupported DateTime64 precision '{precision}'; only DateTime64(3) is supported"
+                        ),
+                    });
+                }
+                self.expect(&TokenKind::RightParen, "')' after DateTime64 precision")?;
+            }
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -427,6 +459,7 @@ impl Parser {
             if !self.at(&TokenKind::RightParen) {
                 loop {
                     row.push(self.parse_literal()?);
+                    self.reject_arithmetic()?;
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -445,6 +478,7 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
+            self.reject_arithmetic()?;
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -587,6 +621,7 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        self.reject_arithmetic()?;
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -598,6 +633,7 @@ impl Parser {
         };
         self.current += 1;
         let right = self.parse_operand()?;
+        self.reject_arithmetic()?;
         self.record_predicate_node()?;
         Ok(Predicate::Comparison {
             left,
@@ -626,6 +662,13 @@ impl Parser {
             {
                 self.parse_literal().map(Operand::Literal)
             }
+            TokenKind::Identifier(value)
+                if (value.eq_ignore_ascii_case("DATE")
+                    || value.eq_ignore_ascii_case("TIMESTAMP"))
+                    && matches!(self.peek_n(1), Some(TokenKind::String(_))) =>
+            {
+                self.parse_literal().map(Operand::Literal)
+            }
             TokenKind::Identifier(_) => self
                 .expect_identifier("column or literal")
                 .map(Operand::Column),
@@ -634,6 +677,26 @@ impl Parser {
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
+        let position = self.position();
+        if self.eat_keyword("DATE") {
+            let value = self.take_string().ok_or_else(|| Error::Sql {
+                position: self.position(),
+                message: "expected a string literal after DATE".to_owned(),
+            })?;
+            return crate::temporal::parse_date(&value)
+                .map(Value::Date)
+                .map_err(|message| Error::Sql { position, message });
+        }
+        if self.eat_keyword("TIMESTAMP") {
+            let value = self.take_string().ok_or_else(|| Error::Sql {
+                position: self.position(),
+                message: "expected a string literal after TIMESTAMP".to_owned(),
+            })?;
+            return crate::temporal::parse_datetime64(&value)
+                .map(Value::DateTime64)
+                .map_err(|message| Error::Sql { position, message });
+        }
+
         if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
             return Ok(Value::String(value));
@@ -673,7 +736,22 @@ impl Parser {
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, DATE, or TIMESTAMP literal")
+        }
+    }
+
+    fn reject_arithmetic(&self) -> Result<()> {
+        if matches!(
+            self.peek(),
+            TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Percent
+        ) {
+            self.error("arithmetic expressions are not supported")
+        } else {
+            Ok(())
         }
     }
 
@@ -713,6 +791,15 @@ impl Parser {
         }
     }
 
+    fn take_string(&mut self) -> Option<String> {
+        if let TokenKind::String(value) = self.peek().clone() {
+            self.current += 1;
+            Some(value)
+        } else {
+            None
+        }
+    }
+
     fn expect(&mut self, expected: &TokenKind, description: &str) -> Result<()> {
         if self.eat(expected) {
             Ok(())
@@ -736,6 +823,12 @@ impl Parser {
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.current].kind
+    }
+
+    fn peek_n(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| &token.kind)
     }
 
     fn position(&self) -> usize {

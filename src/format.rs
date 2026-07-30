@@ -184,6 +184,9 @@ fn write_json_value(output: &mut String, value: &Value) {
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
+        Value::Date(_) | Value::DateTime64(_) => {
+            write_json_string(output, &value.as_display_string());
+        }
     }
 }
 
@@ -295,5 +298,33 @@ mod tests {
         assert!(!rendered.contains('\u{07}'));
         assert!(!rendered.contains('\u{00}'));
         assert!(!rendered.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn renders_temporal_values_canonically_in_every_format() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "day".to_owned(),
+                    data_type: DataType::Date,
+                },
+                ResultColumn {
+                    name: "at".to_owned(),
+                    data_type: DataType::DateTime64,
+                },
+            ],
+            rows: vec![vec![Value::Date(-1), Value::DateTime64(-1)]],
+        };
+
+        assert_eq!(
+            render(&result, OutputFormat::Csv),
+            "day,at\n1969-12-31,1969-12-31T23:59:59.999Z\n"
+        );
+        assert_eq!(
+            render(&result, OutputFormat::Json),
+            r#"{"columns":[{"name":"day","type":"Date"},{"name":"at","type":"DateTime64(3)"}],"rows":[["1969-12-31","1969-12-31T23:59:59.999Z"]]}"#
+        );
+        let table = render(&result, OutputFormat::Table);
+        assert!(table.contains("| 1969-12-31 | 1969-12-31T23:59:59.999Z |"));
     }
 }
