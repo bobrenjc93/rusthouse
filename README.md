@@ -79,6 +79,25 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+For ungrouped queries without `ORDER BY`, `execute_with_sink` scans, filters, and projects borrowed values directly into a `RowSink`. It stops scanning as soon as an unordered `LIMIT` is satisfied. Grouped and ordered queries transparently use the materialized path before feeding the same sink contract. `CsvSink` and `JsonSink` provide incremental `std::io::Write` adapters; call `JsonSink::finish` after the batch to close its top-level document.
+
+~~~rust
+use rusthouse::Database;
+use rusthouse::format::CsvSink;
+
+let mut database = Database::new();
+let mut csv = CsvSink::new(Vec::new());
+database.execute_with_sink(
+    "CREATE TABLE events (id Int64, name String);
+     INSERT INTO events VALUES (1, 'launch'), (2, 'finish');
+     SELECT * FROM events LIMIT 1",
+    &mut csv,
+)?;
+assert_eq!(csv.into_inner(), b"id,name\n1,launch\n");
+
+# Ok::<(), rusthouse::ExecutionError<std::io::Error>>(())
+~~~
+
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.

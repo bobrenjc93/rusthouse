@@ -95,6 +95,47 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn multiple_selects_preserve_csv_result_boundaries() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=csv",
+            "--execute",
+            "CREATE TABLE numbers (n Int64); \
+             INSERT INTO numbers VALUES (2), (1); \
+             SELECT n FROM numbers WHERE n = 1; \
+             SELECT n FROM numbers ORDER BY n DESC;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"n\n1\n\nn\n2\n1\n");
+}
+
+#[test]
+fn closed_stdout_pipe_is_a_successful_early_termination() {
+    let values = (0..3_000)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "CREATE TABLE numbers (n Int64); \
+         INSERT INTO numbers VALUES {values}; \
+         SELECT n FROM numbers;"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format=csv", "--execute", &sql])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn CLI");
+
+    drop(child.stdout.take().expect("stdout pipe"));
+    let status = child.wait().expect("wait for CLI");
+    assert!(status.success(), "closed pipe status was {status}");
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

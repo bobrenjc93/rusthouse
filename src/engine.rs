@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::fmt;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -37,6 +39,62 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// Receives statement results as execution produces them.
+///
+/// Rows are iterators of borrowed column values, so a sink can consume a
+/// projection without the engine allocating or retaining output rows.
+pub trait RowSink {
+    type Error;
+
+    /// Receive a successfully executed non-query statement.
+    fn command(
+        &mut self,
+        _tag: &'static str,
+        _affected_rows: usize,
+    ) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Start a SELECT result set.
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error>;
+
+    /// Consume one projected row.
+    fn row<'a, I>(&mut self, values: I) -> std::result::Result<(), Self::Error>
+    where
+        I: ExactSizeIterator<Item = ValueRef<'a>>;
+
+    /// Finish the current SELECT result set.
+    fn end_query(&mut self) -> std::result::Result<(), Self::Error>;
+}
+
+/// A failure produced either by SQL execution or by a [`RowSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionError<E> {
+    Database(Error),
+    Sink(E),
+}
+
+impl<E: fmt::Display> fmt::Display for ExecutionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(error) => error.fmt(formatter),
+            Self::Sink(error) => write!(formatter, "row sink failed: {error}"),
+        }
+    }
+}
+
+impl<E> std::error::Error for ExecutionError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -54,49 +112,136 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let mut sink = CollectingSink::default();
+        match self.execute_with_sink(sql, &mut sink) {
+            Ok(()) => Ok(sink.results),
+            Err(ExecutionError::Database(error)) => Err(error),
+            Err(ExecutionError::Sink(error)) => match error {},
+        }
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    /// Execute a SQL batch and stream every result into `sink`.
+    ///
+    /// Ungrouped SELECTs without ORDER BY are scanned, filtered, and projected
+    /// directly into the sink. Ordered and grouped SELECTs use the materialized
+    /// execution path required by those operations. The complete batch is
+    /// parsed before any callback or catalog mutation occurs.
+    pub fn execute_with_sink<S>(
+        &mut self,
+        sql: &str,
+        sink: &mut S,
+    ) -> std::result::Result<(), ExecutionError<S::Error>>
+    where
+        S: RowSink,
+    {
+        let statements = sql::parse(sql).map_err(ExecutionError::Database)?;
+        for statement in statements {
+            self.execute_statement_with_sink(statement, sink)?;
+        }
+        Ok(())
+    }
+
+    fn execute_statement_with_sink<S>(
+        &mut self,
+        statement: Statement,
+        sink: &mut S,
+    ) -> std::result::Result<(), ExecutionError<S::Error>>
+    where
+        S: RowSink,
+    {
         match statement {
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
-                Ok(StatementResult::Command {
-                    tag: "CREATE TABLE",
-                    affected_rows: 0,
-                })
+                self.catalog
+                    .create_table(name, columns)
+                    .map_err(ExecutionError::Database)?;
+                sink.command("CREATE TABLE", 0)
+                    .map_err(ExecutionError::Sink)
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
                 {
-                    let target = self.catalog.table(&table)?;
+                    let target = self
+                        .catalog
+                        .table(&table)
+                        .map_err(ExecutionError::Database)?;
                     for row in &rows {
-                        target.validate_row(row)?;
+                        target.validate_row(row).map_err(ExecutionError::Database)?;
                     }
                 }
-                let target = self.catalog.table_mut(&table)?;
+                let target = self
+                    .catalog
+                    .table_mut(&table)
+                    .map_err(ExecutionError::Database)?;
                 for row in rows {
-                    target.insert_row(row)?;
+                    target.insert_row(row).map_err(ExecutionError::Database)?;
                 }
-                Ok(StatementResult::Command {
-                    tag: "INSERT",
-                    affected_rows,
-                })
+                sink.command("INSERT", affected_rows)
+                    .map_err(ExecutionError::Sink)
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select_with_sink(select, sink).map(|_| ()),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+    fn execute_select_with_sink<S>(
+        &self,
+        select: Select,
+        sink: &mut S,
+    ) -> std::result::Result<usize, ExecutionError<S::Error>>
+    where
+        S: RowSink,
+    {
+        let table = self
+            .catalog
+            .table(&select.table)
+            .map_err(ExecutionError::Database)?;
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
-            .transpose()?;
+            .transpose()
+            .map_err(ExecutionError::Database)?;
+
+        let group_columns =
+            resolve_group_columns(table, &select.group_by).map_err(ExecutionError::Database)?;
+        let (items, result_columns, aggregate_specs) =
+            resolve_select_items(table, &select.items, &group_columns)
+                .map_err(ExecutionError::Database)?;
+        let ordering = resolve_ordering(&result_columns, &select.order_by)
+            .map_err(ExecutionError::Database)?;
+
+        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        if !grouped && ordering.is_empty() {
+            sink.begin_query(&result_columns)
+                .map_err(ExecutionError::Sink)?;
+            let mut examined = 0;
+            let mut emitted = 0;
+            if select.limit != Some(0) {
+                for row in 0..table.row_count() {
+                    examined += 1;
+                    if predicate
+                        .as_ref()
+                        .is_some_and(|predicate| !predicate.evaluate(table, row))
+                    {
+                        continue;
+                    }
+                    sink.row(items.iter().map(|item| match item {
+                        ResolvedItem::Column { source, .. } => {
+                            table.columns()[*source].value_ref(row)
+                        }
+                        ResolvedItem::Aggregate { .. } => {
+                            unreachable!("projection does not contain aggregates")
+                        }
+                    }))
+                    .map_err(ExecutionError::Sink)?;
+                    emitted += 1;
+                    if select.limit == Some(emitted) {
+                        break;
+                    }
+                }
+            }
+            sink.end_query().map_err(ExecutionError::Sink)?;
+            return Ok(examined);
+        }
 
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
@@ -106,14 +251,9 @@ impl Database {
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
-
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)
+                .map_err(ExecutionError::Database)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -128,10 +268,77 @@ impl Database {
             execute_projection(table, &matching_rows, &items)
         };
 
-        Ok(QueryResult {
-            columns: result_columns,
-            rows,
-        })
+        emit_materialized(
+            sink,
+            &QueryResult {
+                columns: result_columns,
+                rows,
+            },
+        )?;
+        Ok(table.row_count())
+    }
+}
+
+fn emit_materialized<S>(
+    sink: &mut S,
+    result: &QueryResult,
+) -> std::result::Result<(), ExecutionError<S::Error>>
+where
+    S: RowSink,
+{
+    sink.begin_query(&result.columns)
+        .map_err(ExecutionError::Sink)?;
+    for row in &result.rows {
+        sink.row(row.iter().map(Value::as_ref))
+            .map_err(ExecutionError::Sink)?;
+    }
+    sink.end_query().map_err(ExecutionError::Sink)
+}
+
+#[derive(Debug, Default)]
+struct CollectingSink {
+    results: Vec<StatementResult>,
+    current: Option<QueryResult>,
+}
+
+impl RowSink for CollectingSink {
+    type Error = Infallible;
+
+    fn command(
+        &mut self,
+        tag: &'static str,
+        affected_rows: usize,
+    ) -> std::result::Result<(), Self::Error> {
+        self.results
+            .push(StatementResult::Command { tag, affected_rows });
+        Ok(())
+    }
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
+        debug_assert!(self.current.is_none());
+        self.current = Some(QueryResult {
+            columns: columns.to_vec(),
+            rows: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn row<'a, I>(&mut self, values: I) -> std::result::Result<(), Self::Error>
+    where
+        I: ExactSizeIterator<Item = ValueRef<'a>>,
+    {
+        self.current
+            .as_mut()
+            .expect("a query starts before its rows")
+            .rows
+            .push(values.map(ValueRef::into_owned).collect());
+        Ok(())
+    }
+
+    fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+        let result = self.current.take().expect("a query is active");
+        self.results.push(StatementResult::Query(result));
+        Ok(())
     }
 }
 
@@ -506,7 +713,7 @@ impl GroupedData<'_> {
                         ResolvedItem::Column {
                             group_position: Some(position),
                             ..
-                        } => self.keys[*group].value(*position).to_owned(),
+                        } => self.keys[*group].value(*position).into_owned(),
                         ResolvedItem::Column {
                             group_position: None,
                             ..
@@ -581,7 +788,7 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
                 {
-                    *current = Some(candidate.to_owned());
+                    *current = Some(candidate.into_owned());
                 }
             }
             Self::Max(current) => {
@@ -591,7 +798,7 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
                 {
-                    *current = Some(candidate.to_owned());
+                    *current = Some(candidate.into_owned());
                 }
             }
             Self::AvgInt { sum, count } => {
@@ -886,6 +1093,57 @@ fn comparable(left: DataType, right: DataType) -> bool {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        events: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        max_row_width: usize,
+    }
+
+    impl RowSink for RecordingSink {
+        type Error = Infallible;
+
+        fn command(
+            &mut self,
+            tag: &'static str,
+            affected_rows: usize,
+        ) -> std::result::Result<(), Self::Error> {
+            self.events.push(format!("{tag}:{affected_rows}"));
+            Ok(())
+        }
+
+        fn begin_query(
+            &mut self,
+            columns: &[ResultColumn],
+        ) -> std::result::Result<(), Self::Error> {
+            self.events.push(format!(
+                "begin:{}",
+                columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            Ok(())
+        }
+
+        fn row<'a, I>(&mut self, values: I) -> std::result::Result<(), Self::Error>
+        where
+            I: ExactSizeIterator<Item = ValueRef<'a>>,
+        {
+            self.max_row_width = self.max_row_width.max(values.len());
+            let row = values.map(ValueRef::into_owned).collect::<Vec<_>>();
+            self.events.push(format!("row:{}", row.len()));
+            self.rows.push(row);
+            Ok(())
+        }
+
+        fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+            self.events.push("end".to_owned());
+            Ok(())
+        }
+    }
+
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
         match results.into_iter().last().expect("one result") {
@@ -945,5 +1203,231 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn streams_multiple_statements_in_execution_order() {
+        let mut database = Database::new();
+        let mut sink = RecordingSink::default();
+        database
+            .execute_with_sink(
+                "CREATE TABLE valueset (id Int64, label String); \
+                 INSERT INTO valueset VALUES (1, 'one'), (2, 'two'); \
+                 SELECT label FROM valueset WHERE id = 1; \
+                 SELECT id, label FROM valueset WHERE id = 2;",
+                &mut sink,
+            )
+            .expect("batch streams");
+
+        assert_eq!(
+            sink.events,
+            [
+                "CREATE TABLE:0",
+                "INSERT:2",
+                "begin:label",
+                "row:1",
+                "end",
+                "begin:id,label",
+                "row:2",
+                "end",
+            ]
+        );
+        assert_eq!(
+            sink.rows,
+            vec![
+                vec![Value::String("one".to_owned())],
+                vec![Value::Int64(2), Value::String("two".to_owned())],
+            ]
+        );
+    }
+
+    #[test]
+    fn unordered_limit_stops_scanning_after_the_last_match() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE valueset (id Int64); \
+                 INSERT INTO valueset VALUES (1), (2), (3), (4), (5), (6);",
+            )
+            .expect("setup");
+
+        let Statement::Select(select) = sql::parse("SELECT id FROM valueset WHERE id >= 3 LIMIT 2")
+            .expect("parse")
+            .pop()
+            .expect("statement")
+        else {
+            panic!("expected SELECT");
+        };
+        let mut sink = RecordingSink::default();
+        let examined = database
+            .execute_select_with_sink(select, &mut sink)
+            .expect("query streams");
+        assert_eq!(examined, 4);
+        assert_eq!(
+            sink.rows,
+            vec![vec![Value::Int64(3)], vec![Value::Int64(4)]]
+        );
+
+        let Statement::Select(select) = sql::parse("SELECT id FROM valueset LIMIT 0")
+            .expect("parse")
+            .pop()
+            .expect("statement")
+        else {
+            panic!("expected SELECT");
+        };
+        let examined = database
+            .execute_select_with_sink(select, &mut RecordingSink::default())
+            .expect("zero limit streams");
+        assert_eq!(examined, 0);
+    }
+
+    #[test]
+    fn streaming_keeps_only_the_current_borrowed_row_at_the_sink_boundary() {
+        let mut database = Database::new();
+        let values = (0..2_000)
+            .map(|value| format!("({value}, 'label-{value}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        database
+            .execute(&format!(
+                "CREATE TABLE valueset (id Int64, label String); \
+                 INSERT INTO valueset VALUES {values};"
+            ))
+            .expect("setup");
+
+        struct CountingSink {
+            rows: usize,
+            max_width: usize,
+        }
+        impl RowSink for CountingSink {
+            type Error = Infallible;
+
+            fn begin_query(
+                &mut self,
+                _columns: &[ResultColumn],
+            ) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn row<'a, I>(&mut self, values: I) -> std::result::Result<(), Self::Error>
+            where
+                I: ExactSizeIterator<Item = ValueRef<'a>>,
+            {
+                self.max_width = self.max_width.max(values.len());
+                self.rows += 1;
+                for value in values {
+                    std::hint::black_box(value);
+                }
+                Ok(())
+            }
+
+            fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let mut sink = CountingSink {
+            rows: 0,
+            max_width: 0,
+        };
+        database
+            .execute_with_sink("SELECT id, label FROM valueset", &mut sink)
+            .expect("query streams");
+        assert_eq!(sink.rows, 2_000);
+        assert_eq!(sink.max_width, 2);
+    }
+
+    #[test]
+    fn sink_errors_stop_execution_and_remain_distinct() {
+        struct FailingSink {
+            rows_seen: usize,
+            ended: bool,
+        }
+        impl RowSink for FailingSink {
+            type Error = &'static str;
+
+            fn begin_query(
+                &mut self,
+                _columns: &[ResultColumn],
+            ) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn row<'a, I>(&mut self, _values: I) -> std::result::Result<(), Self::Error>
+            where
+                I: ExactSizeIterator<Item = ValueRef<'a>>,
+            {
+                self.rows_seen += 1;
+                if self.rows_seen == 2 {
+                    Err("output closed")
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+                self.ended = true;
+                Ok(())
+            }
+        }
+
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE valueset (id Int64); \
+                 INSERT INTO valueset VALUES (1), (2), (3);",
+            )
+            .expect("setup");
+        let mut sink = FailingSink {
+            rows_seen: 0,
+            ended: false,
+        };
+        let error = database
+            .execute_with_sink(
+                "SELECT id FROM valueset; SELECT id FROM valueset;",
+                &mut sink,
+            )
+            .expect_err("sink rejects the second row");
+
+        assert_eq!(error, ExecutionError::Sink("output closed"));
+        assert_eq!(sink.rows_seen, 2);
+        assert!(!sink.ended);
+    }
+
+    #[test]
+    fn ordered_and_grouped_queries_feed_the_same_sink_contract() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE valueset (label String, amount Int64); \
+                 INSERT INTO valueset VALUES ('b', 2), ('a', 1), ('b', 3);",
+            )
+            .expect("setup");
+
+        let expected_ordered = query(
+            &mut database,
+            "SELECT label, amount FROM valueset ORDER BY amount DESC LIMIT 2",
+        );
+        let mut ordered = RecordingSink::default();
+        database
+            .execute_with_sink(
+                "SELECT label, amount FROM valueset ORDER BY amount DESC LIMIT 2",
+                &mut ordered,
+            )
+            .expect("ordered query streams materialized rows");
+        assert_eq!(ordered.rows, expected_ordered.rows);
+
+        let expected_grouped = query(
+            &mut database,
+            "SELECT label, SUM(amount) AS total FROM valueset GROUP BY label ORDER BY total",
+        );
+        let mut grouped = RecordingSink::default();
+        database
+            .execute_with_sink(
+                "SELECT label, SUM(amount) AS total FROM valueset GROUP BY label ORDER BY total",
+                &mut grouped,
+            )
+            .expect("grouped query streams materialized rows");
+        assert_eq!(grouped.rows, expected_grouped.rows);
     }
 }

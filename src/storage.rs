@@ -61,7 +61,7 @@ impl Column {
 
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
-        self.value_ref(row).to_owned()
+        self.value_ref(row).into_owned()
     }
 
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {

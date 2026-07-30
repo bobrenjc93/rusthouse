@@ -1,7 +1,8 @@
-use std::fmt::Write;
+use std::fmt::Write as _;
+use std::io::{self, Write};
 
-use crate::engine::QueryResult;
-use crate::value::Value;
+use crate::engine::{QueryResult, ResultColumn, RowSink};
+use crate::value::{Value, ValueRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -29,6 +30,280 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
         OutputFormat::Csv => render_csv(result),
         OutputFormat::Json => render_json(result),
     }
+}
+
+/// Streams CSV result sets to an I/O writer.
+///
+/// Multiple queries are separated by one blank line, matching [`render`].
+#[derive(Debug)]
+pub struct CsvSink<W> {
+    output: W,
+    query_count: usize,
+    expected_columns: Option<usize>,
+}
+
+impl<W> CsvSink<W> {
+    #[must_use]
+    pub fn new(output: W) -> Self {
+        Self {
+            output,
+            query_count: 0,
+            expected_columns: None,
+        }
+    }
+
+    #[must_use]
+    pub fn get_ref(&self) -> &W {
+        &self.output
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> W {
+        self.output
+    }
+}
+
+impl<W: Write> RowSink for CsvSink<W> {
+    type Error = io::Error;
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> io::Result<()> {
+        if self.expected_columns.is_some() {
+            return Err(invalid_sink_state("a CSV query is already active"));
+        }
+        if self.query_count > 0 {
+            self.output.write_all(b"\n")?;
+        }
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                self.output.write_all(b",")?;
+            }
+            write_csv_field_io(&mut self.output, &column.name)?;
+        }
+        self.output.write_all(b"\n")?;
+        self.expected_columns = Some(columns.len());
+        self.query_count += 1;
+        Ok(())
+    }
+
+    fn row<'a, I>(&mut self, values: I) -> io::Result<()>
+    where
+        I: ExactSizeIterator<Item = ValueRef<'a>>,
+    {
+        let Some(expected) = self.expected_columns else {
+            return Err(invalid_sink_state("no CSV query is active"));
+        };
+        if values.len() != expected {
+            return Err(invalid_row_width(expected, values.len()));
+        }
+        for (index, value) in values.enumerate() {
+            if index > 0 {
+                self.output.write_all(b",")?;
+            }
+            match value {
+                ValueRef::String(value) => write_csv_field_io(&mut self.output, value)?,
+                value => {
+                    write_csv_field_io(&mut self.output, &value.as_display_string())?;
+                }
+            }
+        }
+        self.output.write_all(b"\n")
+    }
+
+    fn end_query(&mut self) -> io::Result<()> {
+        if self.expected_columns.take().is_none() {
+            return Err(invalid_sink_state("no CSV query is active"));
+        }
+        Ok(())
+    }
+}
+
+/// Streams all JSON result sets into one top-level `results` document.
+#[derive(Debug)]
+pub struct JsonSink<W> {
+    output: W,
+    started: bool,
+    finished: bool,
+    query_count: usize,
+    row_count: usize,
+    expected_columns: Option<usize>,
+}
+
+impl<W> JsonSink<W> {
+    #[must_use]
+    pub fn new(output: W) -> Self {
+        Self {
+            output,
+            started: false,
+            finished: false,
+            query_count: 0,
+            row_count: 0,
+            expected_columns: None,
+        }
+    }
+
+    #[must_use]
+    pub fn get_ref(&self) -> &W {
+        &self.output
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> W {
+        self.output
+    }
+}
+
+impl<W: Write> JsonSink<W> {
+    /// Close the top-level JSON document. An empty execution produces an empty
+    /// `results` array. Calling this method more than once is harmless.
+    pub fn finish(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        if self.expected_columns.is_some() {
+            return Err(invalid_sink_state("cannot finish an active JSON query"));
+        }
+        self.ensure_started()?;
+        self.output.write_all(b"]}\n")?;
+        self.finished = true;
+        Ok(())
+    }
+
+    fn ensure_started(&mut self) -> io::Result<()> {
+        if !self.started {
+            self.output.write_all(b"{\"results\":[")?;
+            self.started = true;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> RowSink for JsonSink<W> {
+    type Error = io::Error;
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> io::Result<()> {
+        if self.finished {
+            return Err(invalid_sink_state("the JSON document is finished"));
+        }
+        if self.expected_columns.is_some() {
+            return Err(invalid_sink_state("a JSON query is already active"));
+        }
+        self.ensure_started()?;
+        if self.query_count > 0 {
+            self.output.write_all(b",")?;
+        }
+        self.output.write_all(b"{\"columns\":[")?;
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                self.output.write_all(b",")?;
+            }
+            self.output.write_all(b"{\"name\":")?;
+            write_json_string_io(&mut self.output, &column.name)?;
+            self.output.write_all(b",\"type\":")?;
+            write_json_string_io(&mut self.output, &column.data_type.to_string())?;
+            self.output.write_all(b"}")?;
+        }
+        self.output.write_all(b"],\"rows\":[")?;
+        self.expected_columns = Some(columns.len());
+        self.query_count += 1;
+        self.row_count = 0;
+        Ok(())
+    }
+
+    fn row<'a, I>(&mut self, values: I) -> io::Result<()>
+    where
+        I: ExactSizeIterator<Item = ValueRef<'a>>,
+    {
+        let Some(expected) = self.expected_columns else {
+            return Err(invalid_sink_state("no JSON query is active"));
+        };
+        if values.len() != expected {
+            return Err(invalid_row_width(expected, values.len()));
+        }
+        if self.row_count > 0 {
+            self.output.write_all(b",")?;
+        }
+        self.output.write_all(b"[")?;
+        for (index, value) in values.enumerate() {
+            if index > 0 {
+                self.output.write_all(b",")?;
+            }
+            write_json_value_io(&mut self.output, value)?;
+        }
+        self.output.write_all(b"]")?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    fn end_query(&mut self) -> io::Result<()> {
+        if self.expected_columns.take().is_none() {
+            return Err(invalid_sink_state("no JSON query is active"));
+        }
+        self.output.write_all(b"]}")
+    }
+}
+
+fn invalid_sink_state(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn invalid_row_width(expected: usize, actual: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("row has {actual} values; expected {expected}"),
+    )
+}
+
+fn write_csv_field_io(output: &mut impl Write, value: &str) -> io::Result<()> {
+    if value.contains([',', '"', '\n', '\r']) {
+        output.write_all(b"\"")?;
+        for (index, part) in value.split('"').enumerate() {
+            if index > 0 {
+                output.write_all(b"\"\"")?;
+            }
+            output.write_all(part.as_bytes())?;
+        }
+        output.write_all(b"\"")
+    } else {
+        output.write_all(value.as_bytes())
+    }
+}
+
+fn write_json_value_io(output: &mut impl Write, value: ValueRef<'_>) -> io::Result<()> {
+    match value {
+        ValueRef::Int64(value) => write!(output, "{value}"),
+        ValueRef::Float64(value) => {
+            output.write_all(ValueRef::Float64(value).as_display_string().as_bytes())
+        }
+        ValueRef::Bool(value) => write!(output, "{value}"),
+        ValueRef::String(value) => write_json_string_io(output, value),
+    }
+}
+
+fn write_json_string_io(output: &mut impl Write, value: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
+    let mut encoded = [0; 4];
+    for character in value.chars() {
+        match character {
+            '"' => output.write_all(b"\\\"")?,
+            '\\' => output.write_all(b"\\\\")?,
+            '\u{08}' => output.write_all(b"\\b")?,
+            '\u{0c}' => output.write_all(b"\\f")?,
+            '\n' => output.write_all(b"\\n")?,
+            '\r' => output.write_all(b"\\r")?,
+            '\t' => output.write_all(b"\\t")?,
+            value if value.is_control() => write!(output, "\\u{:04x}", value as u32)?,
+            value => output.write_all(value.encode_utf8(&mut encoded).as_bytes())?,
+        }
+    }
+    output.write_all(b"\"")
 }
 
 fn render_table(result: &QueryResult) -> String {
@@ -213,6 +488,17 @@ mod tests {
     use crate::engine::ResultColumn;
     use crate::value::DataType;
 
+    fn feed_result<S: RowSink>(sink: &mut S, result: &QueryResult)
+    where
+        S::Error: std::fmt::Debug,
+    {
+        sink.begin_query(&result.columns).expect("begin query");
+        for row in &result.rows {
+            sink.row(row.iter().map(Value::as_ref)).expect("write row");
+        }
+        sink.end_query().expect("end query");
+    }
+
     fn result() -> QueryResult {
         QueryResult {
             columns: vec![
@@ -295,5 +581,116 @@ mod tests {
         assert!(!rendered.contains('\u{07}'));
         assert!(!rendered.contains('\u{00}'));
         assert!(!rendered.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn streaming_csv_is_byte_equivalent_to_collected_rendering() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "integer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "float".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ResultColumn {
+                    name: "enabled".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ResultColumn {
+                    name: "note".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: vec![vec![
+                Value::Int64(-7),
+                Value::Float64(2.0),
+                Value::Bool(true),
+                Value::String("quote: \"; comma, newline\nend".to_owned()),
+            ]],
+        };
+        let expected = render(&result, OutputFormat::Csv);
+        let mut sink = CsvSink::new(Vec::new());
+        feed_result(&mut sink, &result);
+
+        assert_eq!(sink.into_inner(), expected.as_bytes());
+    }
+
+    #[test]
+    fn streaming_json_is_byte_equivalent_to_collected_rendering() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "value".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "value".to_owned(),
+                    data_type: DataType::Float64,
+                },
+            ],
+            rows: vec![vec![
+                Value::String("snowman: \u{2603}; controls: \u{0008}\u{000c}\n".to_owned()),
+                Value::Float64(3.0),
+            ]],
+        };
+        let expected = format!(
+            "{{\"results\":[{}]}}\n",
+            render(&result, OutputFormat::Json)
+        );
+        let mut sink = JsonSink::new(Vec::new());
+        feed_result(&mut sink, &result);
+        sink.finish().expect("finish document");
+
+        assert_eq!(sink.into_inner(), expected.as_bytes());
+    }
+
+    #[test]
+    fn streaming_formats_preserve_multiple_query_framing() {
+        let first = result();
+        let second = QueryResult {
+            columns: vec![ResultColumn {
+                name: "empty".to_owned(),
+                data_type: DataType::Bool,
+            }],
+            rows: Vec::new(),
+        };
+
+        let mut csv = CsvSink::new(Vec::new());
+        feed_result(&mut csv, &first);
+        feed_result(&mut csv, &second);
+        assert_eq!(
+            csv.into_inner(),
+            format!(
+                "{}\n{}",
+                render(&first, OutputFormat::Csv),
+                render(&second, OutputFormat::Csv)
+            )
+            .as_bytes()
+        );
+
+        let mut json = JsonSink::new(Vec::new());
+        feed_result(&mut json, &first);
+        feed_result(&mut json, &second);
+        json.finish().expect("finish document");
+        assert_eq!(
+            json.into_inner(),
+            format!(
+                "{{\"results\":[{},{}]}}\n",
+                render(&first, OutputFormat::Json),
+                render(&second, OutputFormat::Json)
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn empty_json_execution_is_a_complete_document() {
+        let mut sink = JsonSink::new(Vec::new());
+        sink.finish().expect("finish empty document");
+        sink.finish().expect("finish is idempotent");
+        assert_eq!(sink.into_inner(), b"{\"results\":[]}\n");
     }
 }

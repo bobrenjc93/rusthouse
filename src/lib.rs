@@ -11,9 +11,9 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{Database, ExecutionError, QueryResult, ResultColumn, RowSink, StatementResult};
 pub use error::{Error, Result};
-pub use value::{DataType, Value};
+pub use value::{DataType, Value, ValueRef};
 
 /// Returns the product name.
 pub fn product_name() -> &'static str {

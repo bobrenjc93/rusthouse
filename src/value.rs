@@ -45,7 +45,7 @@ pub enum Value {
 
 /// A non-owning scalar used while scanning immutable column storage.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ValueRef<'a> {
+pub enum ValueRef<'a> {
     Int64(i64),
     Float64(f64),
     Bool(bool),
@@ -73,7 +73,9 @@ impl Value {
         }
     }
 
-    pub(crate) fn as_ref(&self) -> ValueRef<'_> {
+    /// Borrow this value without cloning string storage.
+    #[must_use]
+    pub fn as_ref(&self) -> ValueRef<'_> {
         match self {
             Self::Int64(value) => ValueRef::Int64(*value),
             Self::Float64(value) => ValueRef::Float64(*value),
@@ -89,12 +91,25 @@ impl Value {
 }
 
 impl ValueRef<'_> {
-    pub(crate) fn to_owned(self) -> Value {
+    /// Convert this borrowed scalar into an owned value.
+    #[must_use]
+    pub fn into_owned(self) -> Value {
         match self {
             Self::Int64(value) => Value::Int64(value),
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
             Self::String(value) => Value::String(value.to_owned()),
+        }
+    }
+
+    /// Render the scalar using RustHouse's stable display representation.
+    #[must_use]
+    pub fn as_display_string(self) -> String {
+        match self {
+            Self::Int64(value) => value.to_string(),
+            Self::Float64(value) => format_float(value),
+            Self::Bool(value) => value.to_string(),
+            Self::String(value) => value.to_owned(),
         }
     }
 
