@@ -502,7 +502,7 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
-fn creates_a_fifty_thousand_column_schema() {
+fn creates_and_queries_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)
         .map(|index| format!("c{index} Int64"))
@@ -523,4 +523,9 @@ fn creates_a_fifty_thousand_column_schema() {
             .len(),
         column_count
     );
+
+    let projection = execute_query(&mut database, "SELECT c0 FROM wide");
+    assert_eq!(projection.columns.len(), 1);
+    assert_eq!(projection.columns[0].name, "c0");
+    assert!(projection.rows.is_empty());
 }

@@ -117,8 +117,16 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        self.select_schema_expanded(&select, &mut ViewExpansion::default())?;
-        self.execute_select_expanded(&select, &mut ViewExpansion::default())
+        match self.catalog.relation_kind(&select.table) {
+            Some(RelationKind::Table) => {
+                execute_select_on_table(self.catalog.table(&select.table)?, &select)
+            }
+            Some(RelationKind::View) => {
+                self.select_schema_expanded(&select, &mut ViewExpansion::default())?;
+                self.execute_select_expanded(&select, &mut ViewExpansion::default())
+            }
+            None => Err(Error::TableNotFound(select.table)),
+        }
     }
 
     fn validate_view(&self, name: &str) -> Result<()> {
