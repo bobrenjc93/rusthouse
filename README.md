@@ -5,6 +5,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 ## What works
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
+- ALTER TABLE column rename and removal, and RENAME TABLE
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=

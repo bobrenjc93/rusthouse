@@ -11,11 +11,25 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    AlterTable {
+        name: String,
+        action: AlterTableAction,
+    },
+    RenameTable {
+        name: String,
+        new_name: String,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTableAction {
+    RenameColumn { name: String, new_name: String },
+    DropColumn { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -374,12 +388,16 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_keyword("CREATE") {
             self.parse_create()
+        } else if self.eat_keyword("ALTER") {
+            self.parse_alter()
+        } else if self.eat_keyword("RENAME") {
+            self.parse_rename()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, ALTER, RENAME, INSERT, or SELECT")
         }
     }
 
@@ -414,6 +432,43 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        let action = if self.eat_keyword("RENAME") {
+            self.expect_keyword("COLUMN")?;
+            let column_name = self.expect_identifier("column name")?;
+            self.expect_keyword("TO")?;
+            let new_name = self.expect_identifier("new column name")?;
+            if is_reserved_column_name(&new_name) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: new_name,
+                    context: "column name".to_owned(),
+                });
+            }
+            AlterTableAction::RenameColumn {
+                name: column_name,
+                new_name,
+            }
+        } else if self.eat_keyword("DROP") {
+            self.expect_keyword("COLUMN")?;
+            AlterTableAction::DropColumn {
+                name: self.expect_identifier("column name")?,
+            }
+        } else {
+            return self.error("expected RENAME COLUMN or DROP COLUMN after table name");
+        };
+        Ok(Statement::AlterTable { name, action })
+    }
+
+    fn parse_rename(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        self.expect_keyword("TO")?;
+        let new_name = self.expect_identifier("new table name")?;
+        Ok(Statement::RenameTable { name, new_name })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -782,6 +837,39 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_schema_rename_and_drop_statements() {
+        let statements = parse(
+            "ALTER TABLE events RENAME COLUMN label TO category;\
+             ALTER TABLE events DROP COLUMN obsolete;\
+             RENAME TABLE events TO archive",
+        )
+        .expect("valid schema changes");
+
+        assert_eq!(
+            statements,
+            vec![
+                Statement::AlterTable {
+                    name: "events".to_owned(),
+                    action: AlterTableAction::RenameColumn {
+                        name: "label".to_owned(),
+                        new_name: "category".to_owned(),
+                    },
+                },
+                Statement::AlterTable {
+                    name: "events".to_owned(),
+                    action: AlterTableAction::DropColumn {
+                        name: "obsolete".to_owned(),
+                    },
+                },
+                Statement::RenameTable {
+                    name: "events".to_owned(),
+                    new_name: "archive".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

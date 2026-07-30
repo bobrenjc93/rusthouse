@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, AlterTableAction, ComparisonOperator, Operand,
+    OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -66,6 +66,26 @@ impl Database {
                 self.catalog.create_table(name, columns)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::AlterTable { name, action } => {
+                let table = self.catalog.table_mut(&name)?;
+                match action {
+                    AlterTableAction::RenameColumn { name, new_name } => {
+                        table.rename_column(&name, new_name)?;
+                    }
+                    AlterTableAction::DropColumn { name } => table.drop_column(&name)?,
+                }
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::RenameTable { name, new_name } => {
+                self.catalog.rename_table(&name, new_name)?;
+                Ok(StatementResult::Command {
+                    tag: "RENAME TABLE",
                     affected_rows: 0,
                 })
             }

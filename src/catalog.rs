@@ -36,6 +36,34 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    /// Changes a table's catalog key and displayed name as one operation.
+    pub fn rename_table(&mut self, name: &str, new_name: String) -> Result<()> {
+        let key = normalize(name);
+        if !self.tables.contains_key(&key) {
+            return Err(Error::TableNotFound(name.to_owned()));
+        }
+
+        let new_key = normalize(&new_name);
+        if new_key != key && self.tables.contains_key(&new_key) {
+            return Err(Error::TableAlreadyExists(new_name));
+        }
+
+        if new_key == key {
+            self.tables
+                .get_mut(&key)
+                .expect("table existence checked above")
+                .rename(new_name);
+        } else {
+            let mut table = self
+                .tables
+                .remove(&key)
+                .expect("table existence checked above");
+            table.rename(new_name);
+            self.tables.insert(new_key, table);
+        }
+        Ok(())
+    }
 }
 
 fn normalize(identifier: &str) -> String {
@@ -61,5 +89,34 @@ mod tests {
             .expect("create table");
 
         assert_eq!(catalog.table("EVENTS").expect("lookup").name(), "Events");
+    }
+
+    #[test]
+    fn rename_validates_collisions_before_changing_catalog() {
+        let mut catalog = Catalog::new();
+        for name in ["Events", "Archive"] {
+            catalog
+                .create_table(
+                    name.to_owned(),
+                    vec![ColumnDef {
+                        name: "id".to_owned(),
+                        data_type: DataType::Int64,
+                    }],
+                )
+                .expect("create table");
+        }
+
+        assert!(matches!(
+            catalog.rename_table("events", "ARCHIVE".to_owned()),
+            Err(Error::TableAlreadyExists(name)) if name == "ARCHIVE"
+        ));
+        assert_eq!(
+            catalog.table("EVENTS").expect("source remains").name(),
+            "Events"
+        );
+        assert_eq!(
+            catalog.table("archive").expect("target remains").name(),
+            "Archive"
+        );
     }
 }

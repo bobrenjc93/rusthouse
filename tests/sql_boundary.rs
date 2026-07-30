@@ -502,6 +502,139 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
+fn column_and_table_renames_and_column_drop_work_end_to_end() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE Events (id Int64, obsolete String, label String);
+             INSERT INTO events VALUES (1, 'retire', 'first');
+             ALTER TABLE EVENTS RENAME COLUMN Label TO Category;
+             ALTER TABLE events DROP COLUMN OBSOLETE;
+             RENAME TABLE events TO Archive;
+             INSERT INTO ARCHIVE VALUES (2, 'second');
+             SELECT ID, category FROM aRcHiVe ORDER BY id;",
+        )
+        .expect("schema changes and subsequent statements succeed");
+
+    assert!(matches!(
+        &results[2],
+        StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0
+        }
+    ));
+    assert!(matches!(
+        &results[3],
+        StatementResult::Command {
+            tag: "ALTER TABLE",
+            affected_rows: 0
+        }
+    ));
+    assert!(matches!(
+        &results[4],
+        StatementResult::Command {
+            tag: "RENAME TABLE",
+            affected_rows: 0
+        }
+    ));
+
+    let result = last_query(results);
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "Category"]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(1), Value::String("first".to_owned())],
+            vec![Value::Int64(2), Value::String("second".to_owned())],
+        ]
+    );
+
+    let renamed = database
+        .catalog()
+        .table("ArChIvE")
+        .expect("renamed table has case-insensitive lookup");
+    assert_eq!(renamed.name(), "Archive");
+    assert_eq!(renamed.schema().len(), 2);
+    assert!(matches!(
+        database.catalog().table("events"),
+        Err(Error::TableNotFound(_))
+    ));
+    assert!(matches!(
+        database.execute("SELECT obsolete FROM archive"),
+        Err(Error::ColumnNotFound { column, .. }) if column == "obsolete"
+    ));
+    assert!(matches!(
+        database.execute("SELECT label FROM archive"),
+        Err(Error::ColumnNotFound { column, .. }) if column == "label"
+    ));
+}
+
+#[test]
+fn failed_schema_changes_are_atomic() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE current (id Int64, label String);
+             INSERT INTO current VALUES (1, 'kept');
+             CREATE TABLE occupied (id Int64);
+             INSERT INTO occupied VALUES (9);",
+        )
+        .expect("setup succeeds");
+
+    assert!(matches!(
+        database.execute("ALTER TABLE current RENAME COLUMN id TO LABEL"),
+        Err(Error::DuplicateColumn(name)) if name == "LABEL"
+    ));
+    assert!(matches!(
+        database.execute("ALTER TABLE current RENAME COLUMN id TO false"),
+        Err(Error::ReservedIdentifier { identifier, context })
+            if identifier == "false" && context == "column name"
+    ));
+    assert!(matches!(
+        database.execute("ALTER TABLE current DROP COLUMN missing"),
+        Err(Error::ColumnNotFound { column, .. }) if column == "missing"
+    ));
+    assert!(matches!(
+        database.execute("RENAME TABLE current TO OCCUPIED"),
+        Err(Error::TableAlreadyExists(name)) if name == "OCCUPIED"
+    ));
+
+    let current = execute_query(&mut database, "SELECT id, label FROM CURRENT ORDER BY id");
+    assert_eq!(
+        current.rows,
+        vec![vec![Value::Int64(1), Value::String("kept".to_owned())]]
+    );
+    let occupied = execute_query(&mut database, "SELECT id FROM occupied");
+    assert_eq!(occupied.rows, vec![vec![Value::Int64(9)]]);
+
+    database
+        .execute("CREATE TABLE single (only Int64); INSERT INTO single VALUES (1)")
+        .expect("single-column setup succeeds");
+    let error = database
+        .execute("ALTER TABLE single DROP COLUMN only")
+        .expect_err("final column cannot be removed");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message) if message.contains("cannot drop the final column")
+    ));
+
+    database
+        .execute("INSERT INTO SINGLE VALUES (2)")
+        .expect("failed drop leaves table insertable");
+    let single = execute_query(&mut database, "SELECT only FROM single ORDER BY only");
+    assert_eq!(
+        single.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
 fn creates_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)

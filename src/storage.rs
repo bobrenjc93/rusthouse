@@ -158,6 +158,45 @@ impl Table {
             })
     }
 
+    /// Renames a schema field without touching its physical column.
+    pub fn rename_column(&mut self, name: &str, new_name: String) -> Result<()> {
+        let index = self.column_index(name)?;
+        if is_reserved_column_name(&new_name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: new_name,
+                context: "column name".to_owned(),
+            });
+        }
+        if self.schema.iter().enumerate().any(|(candidate, field)| {
+            candidate != index && field.name.eq_ignore_ascii_case(&new_name)
+        }) {
+            return Err(Error::DuplicateColumn(new_name));
+        }
+
+        self.schema[index].name = new_name;
+        Ok(())
+    }
+
+    /// Removes a schema field and its physical column while retaining all
+    /// surviving column allocations.
+    pub fn drop_column(&mut self, name: &str) -> Result<()> {
+        let index = self.column_index(name)?;
+        if self.schema.len() == 1 {
+            return Err(Error::InvalidQuery(format!(
+                "cannot drop the final column from table '{}'",
+                self.name
+            )));
+        }
+
+        self.schema.remove(index);
+        self.columns.remove(index);
+        Ok(())
+    }
+
+    pub(crate) fn rename(&mut self, new_name: String) {
+        self.name = new_name;
+    }
+
     /// Checks a row without mutating any physical column.
     pub(crate) fn validate_row(&self, row: &[Value]) -> Result<()> {
         if row.len() != self.schema.len() {
@@ -240,5 +279,42 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn dropping_a_column_retains_surviving_vector_allocations() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+        let label_allocation = match &table.columns()[1] {
+            Column::String(values) => values.as_ptr(),
+            _ => panic!("expected string column"),
+        };
+
+        table.drop_column("id").expect("drop first column");
+
+        assert_eq!(table.schema()[0].name, "label");
+        assert!(matches!(&table.columns()[0], Column::String(values)
+            if values.as_ptr() == label_allocation && values == &["ok"]));
+    }
+
+    #[test]
+    fn failed_column_changes_leave_schema_and_data_unchanged() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+
+        assert!(matches!(
+            table.rename_column("id", "LABEL".to_owned()),
+            Err(Error::DuplicateColumn(name)) if name == "LABEL"
+        ));
+        assert!(matches!(
+            table.rename_column("id", "true".to_owned()),
+            Err(Error::ReservedIdentifier { .. })
+        ));
+        assert_eq!(table.schema()[0].name, "id");
+        assert!(matches!(&table.columns()[0], Column::Int64(values) if values == &[7]));
     }
 }
