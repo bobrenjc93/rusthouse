@@ -136,61 +136,71 @@ impl Database {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceSide {
-    Left,
-    Right,
-}
-
 #[derive(Debug)]
 struct SourceColumn<'a> {
-    qualifier: String,
     name: &'a str,
     data_type: DataType,
     column: &'a Column,
-    side: SourceSide,
+    relation: usize,
+}
+
+#[derive(Debug)]
+struct SourceRelation<'a> {
+    qualifier: String,
+    table_name: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SourceRow {
     left: usize,
-    right: Option<usize>,
+    right: usize,
+}
+
+#[derive(Debug)]
+enum SourceRows {
+    Identity { len: usize },
+    Joined(Vec<SourceRow>),
 }
 
 #[derive(Debug)]
 struct QuerySource<'a> {
     columns: Vec<SourceColumn<'a>>,
-    rows: Vec<SourceRow>,
-    table_names: Vec<&'a str>,
+    relations: Vec<SourceRelation<'a>>,
+    rows: SourceRows,
 }
 
 impl<'a> QuerySource<'a> {
     fn row_count(&self) -> usize {
-        self.rows.len()
+        match &self.rows {
+            SourceRows::Identity { len } => *len,
+            SourceRows::Joined(rows) => rows.len(),
+        }
     }
 
     fn column_index(&self, reference: &ColumnReference) -> Result<usize> {
-        let matches =
-            self.columns
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| {
-                    column.name.eq_ignore_ascii_case(&reference.name)
-                        && reference.qualifier.as_ref().is_none_or(|qualifier| {
-                            column.qualifier.eq_ignore_ascii_case(qualifier)
-                        })
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
+        let matches = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                column.name.eq_ignore_ascii_case(&reference.name)
+                    && reference.qualifier.as_ref().is_none_or(|qualifier| {
+                        self.relations[column.relation]
+                            .qualifier
+                            .eq_ignore_ascii_case(qualifier)
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
 
         match matches.as_slice() {
             [index] => Ok(*index),
             [] => {
                 if let Some(qualifier) = &reference.qualifier {
                     if !self
-                        .columns
+                        .relations
                         .iter()
-                        .any(|column| column.qualifier.eq_ignore_ascii_case(qualifier))
+                        .any(|relation| relation.qualifier.eq_ignore_ascii_case(qualifier))
                     {
                         return Err(Error::InvalidQuery(format!(
                             "unknown table or alias '{qualifier}'"
@@ -200,9 +210,9 @@ impl<'a> QuerySource<'a> {
                         table: qualifier.clone(),
                         column: reference.name.clone(),
                     })
-                } else if let [table_name] = self.table_names.as_slice() {
+                } else if let [relation] = self.relations.as_slice() {
                     Err(Error::ColumnNotFound {
-                        table: (*table_name).to_owned(),
+                        table: relation.table_name.to_owned(),
                         column: reference.name.clone(),
                     })
                 } else {
@@ -221,10 +231,13 @@ impl<'a> QuerySource<'a> {
 
     fn value_ref(&self, column: usize, row: usize) -> ValueRef<'_> {
         let field = &self.columns[column];
-        let source_row = self.rows[row];
-        let physical_row = match field.side {
-            SourceSide::Left => source_row.left,
-            SourceSide::Right => source_row.right.expect("joined row has a right index"),
+        let physical_row = match &self.rows {
+            SourceRows::Identity { .. } => {
+                debug_assert_eq!(field.relation, 0);
+                row
+            }
+            SourceRows::Joined(rows) if field.relation == 0 => rows[row].left,
+            SourceRows::Joined(rows) => rows[row].right,
         };
         field.column.value_ref(physical_row)
     }
@@ -246,14 +259,15 @@ fn build_query_source<'a>(
 ) -> Result<QuerySource<'a>> {
     let left = catalog.table(&from.name)?;
     let Some(join) = join else {
-        let columns = source_columns(left, from.qualifier(), SourceSide::Left);
-        let rows = (0..left.row_count())
-            .map(|left| SourceRow { left, right: None })
-            .collect();
         return Ok(QuerySource {
-            columns,
-            rows,
-            table_names: vec![left.name()],
+            columns: source_columns(left, 0),
+            relations: vec![SourceRelation {
+                qualifier: from.qualifier().to_owned(),
+                table_name: left.name(),
+            }],
+            rows: SourceRows::Identity {
+                len: left.row_count(),
+            },
         });
     };
 
@@ -268,23 +282,31 @@ fn build_query_source<'a>(
     }
 
     let right = catalog.table(&join.table.name)?;
-    let mut columns = source_columns(left, from.qualifier(), SourceSide::Left);
-    columns.extend(source_columns(
-        right,
-        join.table.qualifier(),
-        SourceSide::Right,
-    ));
+    let mut columns = source_columns(left, 0);
+    columns.extend(source_columns(right, 1));
     let mut source = QuerySource {
         columns,
-        rows: Vec::new(),
-        table_names: vec![left.name(), right.name()],
+        relations: vec![
+            SourceRelation {
+                qualifier: from.qualifier().to_owned(),
+                table_name: left.name(),
+            },
+            SourceRelation {
+                qualifier: join.table.qualifier().to_owned(),
+                table_name: right.name(),
+            },
+        ],
+        rows: SourceRows::Joined(Vec::new()),
     };
 
     let first = source.column_index(&join.left)?;
     let second = source.column_index(&join.right)?;
-    let (left_key, right_key) = match (source.columns[first].side, source.columns[second].side) {
-        (SourceSide::Left, SourceSide::Right) => (first, second),
-        (SourceSide::Right, SourceSide::Left) => (second, first),
+    let (left_key, right_key) = match (
+        source.columns[first].relation,
+        source.columns[second].relation,
+    ) {
+        (0, 1) => (first, second),
+        (1, 0) => (second, first),
         _ => {
             return Err(Error::InvalidQuery(
                 "INNER JOIN condition must compare one column from each relation".to_owned(),
@@ -310,30 +332,28 @@ fn build_query_source<'a>(
     for left_row in 0..left.row_count() {
         let key = JoinKey::from(source.columns[left_key].column.value_ref(left_row));
         if let Some(matches) = right_rows.get(&key) {
-            source.rows.extend(matches.iter().map(|right| SourceRow {
+            let SourceRows::Joined(rows) = &mut source.rows else {
+                unreachable!("join source uses joined row storage")
+            };
+            rows.extend(matches.iter().map(|right| SourceRow {
                 left: left_row,
-                right: Some(*right),
+                right: *right,
             }));
         }
     }
     Ok(source)
 }
 
-fn source_columns<'a>(
-    table: &'a Table,
-    qualifier: &str,
-    side: SourceSide,
-) -> Vec<SourceColumn<'a>> {
+fn source_columns(table: &Table, relation: usize) -> Vec<SourceColumn<'_>> {
     table
         .schema()
         .iter()
         .zip(table.columns())
         .map(|(field, column)| SourceColumn {
-            qualifier: qualifier.to_owned(),
             name: &field.name,
             data_type: field.data_type,
             column,
-            side,
+            relation,
         })
         .collect()
 }
@@ -1206,5 +1226,24 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn single_table_source_uses_identity_rows() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE samples (id Int64); \
+                 INSERT INTO samples VALUES (1), (2), (3);",
+            )
+            .expect("setup");
+
+        let table = TableReference {
+            name: "samples".to_owned(),
+            alias: Some("s".to_owned()),
+        };
+        let source = build_query_source(database.catalog(), &table, None).expect("query source");
+
+        assert!(matches!(source.rows, SourceRows::Identity { len: 3 }));
     }
 }
