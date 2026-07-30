@@ -12,6 +12,26 @@ fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
 }
 
 #[test]
+fn distinct_column_name_remains_selectable() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_columns (distinct Int64, id Int64);
+             INSERT INTO keyword_columns VALUES (2, 1), (1, 2);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT distinct FROM keyword_columns ORDER BY distinct;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
 fn distinct_deduplicates_complete_wildcard_rows_in_first_seen_order() {
     let mut database = Database::new();
     database

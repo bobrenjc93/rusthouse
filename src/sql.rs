@@ -443,7 +443,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        let distinct = self.eat_keyword("DISTINCT");
+        let distinct = self.eat_distinct_modifier();
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -514,6 +514,26 @@ impl Parser {
             order_by,
             limit,
         })
+    }
+
+    fn eat_distinct_modifier(&mut self) -> bool {
+        if !matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("DISTINCT"))
+        {
+            return false;
+        }
+
+        let distinct_is_column = matches!(self.tokens[self.current + 1].kind, TokenKind::Comma)
+            || matches!(
+                &self.tokens[self.current + 1].kind,
+                TokenKind::Identifier(value)
+                    if value.eq_ignore_ascii_case("FROM") || value.eq_ignore_ascii_case("AS")
+            );
+        if distinct_is_column {
+            false
+        } else {
+            self.current += 1;
+            true
+        }
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -784,6 +804,25 @@ mod tests {
             panic!("expected select");
         };
         assert!(!select.distinct);
+    }
+
+    #[test]
+    fn distinct_remains_available_as_a_projection_column() {
+        for sql in [
+            "SELECT distinct FROM events",
+            "SELECT distinct AS marker FROM events",
+            "SELECT distinct, id FROM events",
+        ] {
+            let statements = parse(sql).expect("DISTINCT column is unambiguous");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            assert!(!select.distinct);
+            assert!(matches!(
+                &select.items[0],
+                SelectItem::Column { name, .. } if name.eq_ignore_ascii_case("distinct")
+            ));
+        }
     }
 
     #[test]
