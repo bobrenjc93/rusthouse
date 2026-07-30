@@ -4,6 +4,7 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+pub(crate) const MAX_ASOF_JOIN_CONDITIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -15,13 +16,15 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
-    Select(Select),
+    Select(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub items: Vec<SelectItem>,
     pub table: String,
+    pub table_alias: Option<String>,
+    pub join: Option<AsofJoin>,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
@@ -31,6 +34,9 @@ pub struct Select {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
+    QualifiedWildcard {
+        qualifier: String,
+    },
     Column {
         name: String,
         alias: Option<String>,
@@ -40,6 +46,20 @@ pub enum SelectItem {
         argument: AggregateArgument,
         alias: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsofJoin {
+    pub table: String,
+    pub alias: Option<String>,
+    pub conditions: Vec<AsofJoinCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsofJoinCondition {
+    pub left: Operand,
+    pub operator: ComparisonOperator,
+    pub right: Operand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +152,7 @@ enum TokenKind {
     Number(String),
     String(String),
     Comma,
+    Dot,
     LeftParen,
     RightParen,
     Semicolon,
@@ -173,6 +194,10 @@ impl<'a> Lexer<'a> {
                 ',' => {
                     self.advance();
                     TokenKind::Comma
+                }
+                '.' => {
+                    self.advance();
+                    TokenKind::Dot
                 }
                 '(' => {
                     self.advance();
@@ -377,7 +402,7 @@ impl Parser {
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
-            self.parse_select().map(Statement::Select)
+            self.parse_select().map(Box::new).map(Statement::Select)
         } else {
             self.error("expected CREATE, INSERT, or SELECT")
         }
@@ -396,14 +421,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_column_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -441,6 +459,37 @@ impl Parser {
         Ok(Statement::Insert { table, rows })
     }
 
+    fn parse_column_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("DATETIME64") {
+            self.expect(
+                &TokenKind::LeftParen,
+                "'(' and millisecond precision in DateTime64(3)",
+            )?;
+            let precision = self.take_number().ok_or_else(|| Error::Sql {
+                position: self.position(),
+                message: "expected precision 3 in DateTime64(3)".to_owned(),
+            })?;
+            if precision != "3" {
+                return Err(Error::Sql {
+                    position,
+                    message: format!(
+                        "unsupported DateTime64 precision '{precision}'; only DateTime64(3) is supported"
+                    ),
+                });
+            }
+            self.expect(&TokenKind::RightParen, "')' after DateTime64 precision")?;
+            return Ok(DataType::DateTime64);
+        }
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, String, Date, or DateTime64(3)"
+            ),
+        })
+    }
+
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
@@ -451,6 +500,44 @@ impl Parser {
         }
         self.expect_keyword("FROM")?;
         let table = self.expect_identifier("table name")?;
+        let table_alias = self.parse_table_alias(&["ASOF", "WHERE", "GROUP", "ORDER", "LIMIT"])?;
+
+        let join = if self.eat_keyword("ASOF") {
+            self.expect_keyword("LEFT")?;
+            self.expect_keyword("JOIN")?;
+            let join_table = self.expect_identifier("joined table name")?;
+            let alias = self.parse_table_alias(&["ON"])?;
+            self.expect_keyword("ON")?;
+            let mut conditions = Vec::new();
+            loop {
+                if conditions.len() >= MAX_ASOF_JOIN_CONDITIONS {
+                    return self.error(format!(
+                        "ASOF LEFT JOIN has too many conditions; maximum {MAX_ASOF_JOIN_CONDITIONS}"
+                    ));
+                }
+                let left = self.parse_operand()?;
+                let operator = self.parse_comparison_operator()?;
+                let right = self.parse_operand()?;
+                conditions.push(AsofJoinCondition {
+                    left,
+                    operator,
+                    right,
+                });
+                if !self.eat_keyword("AND") {
+                    break;
+                }
+            }
+            if self.at_keyword("ASOF") || self.at_keyword("LEFT") || self.at_keyword("JOIN") {
+                return self.error("only one ASOF LEFT JOIN is supported per SELECT");
+            }
+            Some(AsofJoin {
+                table: join_table,
+                alias,
+                conditions,
+            })
+        } else {
+            None
+        };
 
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
@@ -464,7 +551,7 @@ impl Parser {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
-                group_by.push(self.expect_identifier("GROUP BY column")?);
+                group_by.push(self.parse_column_name("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -475,7 +562,7 @@ impl Parser {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
+                let name = self.parse_column_name("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true
                 } else {
@@ -506,6 +593,8 @@ impl Parser {
         Ok(Select {
             items,
             table,
+            table_alias,
+            join,
             predicate,
             group_by,
             order_by,
@@ -520,6 +609,17 @@ impl Parser {
 
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
+        if self.eat(&TokenKind::Dot) {
+            if self.eat(&TokenKind::Star) {
+                return Ok(SelectItem::QualifiedWildcard { qualifier: name });
+            }
+            let column = self.expect_identifier("column name after '.'")?;
+            let alias = self.parse_alias()?;
+            return Ok(SelectItem::Column {
+                name: format!("{name}.{column}"),
+                alias,
+            });
+        }
         if self.eat(&TokenKind::LeftParen) {
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
@@ -528,7 +628,7 @@ impl Parser {
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                AggregateArgument::Column(self.parse_column_name("aggregate column")?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let alias = self.parse_alias()?;
@@ -548,6 +648,28 @@ impl Parser {
             self.expect_identifier("alias").map(Some)
         } else {
             Ok(None)
+        }
+    }
+
+    fn parse_table_alias(&mut self, terminators: &[&str]) -> Result<Option<String>> {
+        if self.eat_keyword("AS") {
+            return self.expect_identifier("table alias").map(Some);
+        }
+        if matches!(self.peek(), TokenKind::Identifier(value)
+            if !terminators.iter().any(|keyword| value.eq_ignore_ascii_case(keyword)))
+        {
+            return self.expect_identifier("table alias").map(Some);
+        }
+        Ok(None)
+    }
+
+    fn parse_column_name(&mut self, description: &str) -> Result<String> {
+        let qualifier_or_name = self.expect_identifier(description)?;
+        if self.eat(&TokenKind::Dot) {
+            let name = self.expect_identifier("column name after '.'")?;
+            Ok(format!("{qualifier_or_name}.{name}"))
+        } else {
+            Ok(qualifier_or_name)
         }
     }
 
@@ -587,6 +709,17 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        let operator = self.parse_comparison_operator()?;
+        let right = self.parse_operand()?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Comparison {
+            left,
+            operator,
+            right,
+        })
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator> {
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -597,13 +730,7 @@ impl Parser {
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
         self.current += 1;
-        let right = self.parse_operand()?;
-        self.record_predicate_node()?;
-        Ok(Predicate::Comparison {
-            left,
-            operator,
-            right,
-        })
+        Ok(operator)
     }
 
     fn record_predicate_node(&mut self) -> Result<()> {
@@ -617,6 +744,9 @@ impl Parser {
     }
 
     fn parse_operand(&mut self) -> Result<Operand> {
+        if self.is_typed_temporal_literal() {
+            return self.parse_temporal_literal().map(Operand::Literal);
+        }
         match self.peek() {
             TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
                 self.parse_literal().map(Operand::Literal)
@@ -627,13 +757,16 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
+                .parse_column_name("column or literal")
                 .map(Operand::Column),
             _ => self.error("expected column or literal"),
         }
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
+        if self.is_typed_temporal_literal() {
+            return self.parse_temporal_literal();
+        }
         if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
             return Ok(Value::String(value));
@@ -673,8 +806,53 @@ impl Parser {
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, Date, or DateTime64(3) literal")
         }
+    }
+
+    fn is_typed_temporal_literal(&self) -> bool {
+        match (self.peek(), self.peek_offset(1)) {
+            (TokenKind::Identifier(name), Some(TokenKind::String(_))) => {
+                name.eq_ignore_ascii_case("DATE") || name.eq_ignore_ascii_case("DATETIME64")
+            }
+            (TokenKind::Identifier(name), Some(TokenKind::LeftParen)) => {
+                name.eq_ignore_ascii_case("DATETIME64")
+            }
+            _ => false,
+        }
+    }
+
+    fn parse_temporal_literal(&mut self) -> Result<Value> {
+        let position = self.position();
+        let type_name = self.expect_identifier("temporal literal type")?;
+        let data_type = if type_name.eq_ignore_ascii_case("DATE") {
+            DataType::Date
+        } else {
+            if self.eat(&TokenKind::LeftParen) {
+                let precision = self.take_number().ok_or_else(|| Error::Sql {
+                    position: self.position(),
+                    message: "expected precision 3 in DateTime64(3) literal".to_owned(),
+                })?;
+                if precision != "3" {
+                    return Err(Error::Sql {
+                        position,
+                        message: format!(
+                            "unsupported DateTime64 literal precision '{precision}'; only precision 3 is supported"
+                        ),
+                    });
+                }
+                self.expect(
+                    &TokenKind::RightParen,
+                    "')' after DateTime64 literal precision",
+                )?;
+            }
+            DataType::DateTime64
+        };
+        let input = self.take_string().ok_or_else(|| Error::Sql {
+            position: self.position(),
+            message: format!("expected an ISO-8601 string after {type_name}"),
+        })?;
+        Value::parse_temporal(data_type, &input).map_err(|message| Error::Sql { position, message })
     }
 
     fn expect_keyword(&mut self, expected: &str) -> Result<()> {
@@ -695,6 +873,10 @@ impl Parser {
         }
     }
 
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+    }
+
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
         if let TokenKind::Identifier(value) = self.peek().clone() {
             self.current += 1;
@@ -706,6 +888,15 @@ impl Parser {
 
     fn take_number(&mut self) -> Option<String> {
         if let TokenKind::Number(value) = self.peek().clone() {
+            self.current += 1;
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn take_string(&mut self) -> Option<String> {
+        if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
             Some(value)
         } else {
@@ -736,6 +927,12 @@ impl Parser {
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.current].kind
+    }
+
+    fn peek_offset(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| &token.kind)
     }
 
     fn position(&self) -> usize {
@@ -782,6 +979,32 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_asof_left_join_with_qualified_columns() {
+        let statements = parse(
+            "SELECT t.*, q.price FROM trades AS t
+             ASOF LEFT JOIN quotes q
+               ON t.symbol = q.symbol AND t.ts >= q.ts
+             WHERE q.price > 0",
+        )
+        .expect("valid ASOF query");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.table_alias.as_deref(), Some("t"));
+        let join = select.join.as_ref().expect("ASOF join");
+        assert_eq!(join.alias.as_deref(), Some("q"));
+        assert_eq!(join.conditions.len(), 2);
+        assert!(matches!(
+            join.conditions[1].operator,
+            ComparisonOperator::GreaterOrEqual
+        ));
+        assert!(matches!(
+            select.items[0],
+            SelectItem::QualifiedWildcard { ref qualifier } if qualifier == "t"
+        ));
     }
 
     #[test]

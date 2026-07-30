@@ -30,6 +30,11 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    AsofJoinLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+        actual: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +78,14 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::AsofJoinLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                f,
+                "ASOF LEFT JOIN {resource} limit exceeded: limit {limit}, required {actual}"
+            ),
         }
     }
 }

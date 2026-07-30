@@ -1,21 +1,33 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column.
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, String, Date, and DateTime64(3) columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- one ASOF LEFT JOIN with optional equality keys and one Int64, Date, or DateTime64(3) inequality
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+ASOF joins use qualified table names or aliases. `left.time >= right.time` selects the nearest right key at or before the left key; `<=` searches forward, and `<`/`>` exclude equal keys. Equal right-side ordered keys deterministically select the last inserted row. Unmatched right values are `NULL`.
+
+~~~sql
+SELECT t.symbol, t.time, q.price
+FROM trades t
+ASOF LEFT JOIN quotes q
+  ON t.symbol = q.symbol AND t.time >= q.time;
+~~~
+
+Date accepts ISO-8601 `YYYY-MM-DD` values. DateTime64(3) accepts ISO-8601 timestamps with millisecond precision and normalizes offsets to UTC.
 
 ## CLI
 
@@ -81,7 +93,9 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no user-declared nullable columns, ordinary equi-joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. `NULL` is currently produced only for the unmatched side of an ASOF LEFT JOIN. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+
+ASOF operators have configurable row, estimated-memory, and binary-search candidate-comparison limits through `AsofJoinLimits`. The defaults are one million rows, 64 MiB, and 20 million comparisons. These bounds apply before the final SQL `LIMIT`, so a small output limit cannot hide an oversized join.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

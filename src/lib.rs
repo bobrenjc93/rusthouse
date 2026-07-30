@@ -9,9 +9,13 @@ pub mod error;
 pub mod format;
 pub mod sql;
 pub mod storage;
+mod temporal;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{
+    AsofJoinLimits, DEFAULT_ASOF_MAX_BYTES, DEFAULT_ASOF_MAX_CANDIDATE_COMPARISONS,
+    DEFAULT_ASOF_MAX_ROWS, Database, QueryResult, ResultColumn, StatementResult,
+};
 pub use error::{Error, Result};
 pub use value::{DataType, Value};
 
