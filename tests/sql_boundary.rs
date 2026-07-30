@@ -524,3 +524,225 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn update_and_delete_report_zero_and_all_matches() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE lifecycle (id Int64, enabled Bool);
+             INSERT INTO lifecycle VALUES
+                (1, false), (2, false), (3, false), (4, false);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database
+            .execute("UPDATE lifecycle SET enabled = true WHERE id < 0;")
+            .expect("zero-row update succeeds"),
+        vec![StatementResult::Command {
+            tag: "UPDATE",
+            affected_rows: 0,
+        }]
+    );
+    assert_eq!(
+        database
+            .execute("DELETE FROM lifecycle WHERE id < 0;")
+            .expect("zero-row delete succeeds"),
+        vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 0,
+        }]
+    );
+    assert_eq!(
+        database
+            .execute("UPDATE lifecycle SET enabled = true WHERE id >= 1;")
+            .expect("all-row update succeeds"),
+        vec![StatementResult::Command {
+            tag: "UPDATE",
+            affected_rows: 4,
+        }]
+    );
+    assert_eq!(
+        database
+            .execute("DELETE FROM lifecycle WHERE enabled = true;")
+            .expect("all-row delete succeeds"),
+        vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 4,
+        }]
+    );
+
+    let table = database.catalog().table("lifecycle").expect("table exists");
+    assert_eq!(table.row_count(), 0);
+    assert!(table.columns().iter().all(|column| column.is_empty()));
+}
+
+#[test]
+fn multi_column_update_assignments_read_the_old_row() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE swaps (id Int64, left_value Int64, right_value Int64, total Int64);
+             INSERT INTO swaps VALUES (1, 10, 20, 0), (2, 30, 40, 70);",
+        )
+        .expect("setup succeeds");
+
+    let result = database
+        .execute(
+            "UPDATE swaps
+             SET left_value = right_value,
+                 right_value = left_value,
+                 total = left_value + right_value * 2
+             WHERE id = 1;",
+        )
+        .expect("update succeeds");
+    assert_eq!(
+        result,
+        vec![StatementResult::Command {
+            tag: "UPDATE",
+            affected_rows: 1,
+        }]
+    );
+
+    let rows = execute_query(
+        &mut database,
+        "SELECT id, left_value, right_value, total FROM swaps ORDER BY id;",
+    );
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(20),
+                Value::Int64(10),
+                Value::Int64(50),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(30),
+                Value::Int64(40),
+                Value::Int64(70),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn failed_updates_leave_every_row_and_column_unchanged() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ledger (id Int64, amount Int64, divisor Int64, label String);
+             INSERT INTO ledger VALUES
+                (1, 10, 2, 'first'),
+                (2, 9223372036854775807, 0, 'second');",
+        )
+        .expect("setup succeeds");
+
+    let type_error = database
+        .execute("UPDATE ledger SET amount = label WHERE id = 1;")
+        .expect_err("wrong assignment type is rejected");
+    assert!(matches!(type_error, Error::TypeMismatch { .. }));
+
+    let overflow = database
+        .execute("UPDATE ledger SET amount = amount + 1 WHERE id >= 1;")
+        .expect_err("later row overflows");
+    assert!(matches!(overflow, Error::NumericOverflow(_)));
+
+    let evaluation = database
+        .execute("UPDATE ledger SET amount = amount / divisor WHERE id >= 1;")
+        .expect_err("later row divides by zero");
+    assert!(
+        matches!(evaluation, Error::InvalidQuery(message) if message.contains("division by zero"))
+    );
+
+    let delete_type_error = database
+        .execute("DELETE FROM ledger WHERE amount = label;")
+        .expect_err("invalid delete predicate is rejected");
+    assert!(matches!(delete_type_error, Error::TypeMismatch { .. }));
+
+    let rows = execute_query(
+        &mut database,
+        "SELECT id, amount, divisor, label FROM ledger ORDER BY id;",
+    );
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Int64(2),
+                Value::String("first".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(i64::MAX),
+                Value::Int64(0),
+                Value::String("second".to_owned()),
+            ],
+        ]
+    );
+    let table = database.catalog().table("ledger").expect("table exists");
+    assert!(
+        table
+            .columns()
+            .iter()
+            .all(|column| column.len() == table.row_count())
+    );
+}
+
+#[test]
+fn grouped_queries_remain_correct_after_updates_and_ordered_deletes() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales_after_mutation (id Int64, region String, amount Int64);
+             INSERT INTO sales_after_mutation VALUES
+                (1, 'west', 5),
+                (2, 'east', 10),
+                (3, 'east', 7),
+                (4, 'north', 3),
+                (5, 'west', 2);
+             UPDATE sales_after_mutation
+             SET region = 'west', amount = amount * 2
+             WHERE id = 2;
+             DELETE FROM sales_after_mutation
+             WHERE region = 'east' AND amount < 10;",
+        )
+        .expect("mutations succeed");
+
+    let source = execute_query(&mut database, "SELECT id FROM sales_after_mutation;");
+    assert_eq!(
+        source.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(4)],
+            vec![Value::Int64(5)],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT region, COUNT(*) AS rows, SUM(amount) AS total
+         FROM sales_after_mutation
+         GROUP BY region
+         ORDER BY total DESC;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(3),
+                Value::Int64(27),
+            ],
+            vec![
+                Value::String("north".to_owned()),
+                Value::Int64(1),
+                Value::Int64(3),
+            ],
+        ]
+    );
+}

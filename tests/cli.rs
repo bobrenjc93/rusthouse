@@ -9,6 +9,8 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
             "--execute",
             "CREATE TABLE items (name String, n Int64);
              INSERT INTO items VALUES ('b', 2), ('a', 1);
+             UPDATE items SET n = n + 1 WHERE name = 'a';
+             DELETE FROM items WHERE name = 'b';
              SELECT name, n FROM items ORDER BY n;",
         ])
         .output()
@@ -17,11 +19,13 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
-        "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"String\"},{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[\"a\",1],[\"b\",2]]}]}\n"
+        "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"String\"},{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[\"a\",2]]}]}\n"
     );
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stderr.contains("CREATE TABLE"));
     assert!(stderr.contains("INSERT 2"));
+    assert!(stderr.contains("UPDATE 1"));
+    assert!(stderr.contains("DELETE 1"));
 }
 
 #[test]

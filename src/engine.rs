@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ArithmeticOperator, Assignment, ComparisonOperator,
+    Delete, Expression, Operand, OrderBy, Predicate, Select, SelectItem, Statement, Update,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -86,8 +86,68 @@ impl Database {
                     affected_rows,
                 })
             }
+            Statement::Update(update) => {
+                let affected_rows = self.execute_update(update)?;
+                Ok(StatementResult::Command {
+                    tag: "UPDATE",
+                    affected_rows,
+                })
+            }
+            Statement::Delete(delete) => {
+                let affected_rows = self.execute_delete(delete)?;
+                Ok(StatementResult::Command {
+                    tag: "DELETE",
+                    affected_rows,
+                })
+            }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
+    }
+
+    fn execute_update(&mut self, update: Update) -> Result<usize> {
+        let (rows, replacements) = {
+            let table = self.catalog.table(&update.table)?;
+            let predicate = compile_predicate(table, &update.predicate)?;
+            let assignments = compile_assignments(table, &update.assignments)?;
+            let mut rows = Vec::new();
+            let mut replacements = assignments
+                .iter()
+                .map(|assignment| (assignment.column, Vec::new()))
+                .collect::<Vec<_>>();
+
+            for row in 0..table.row_count() {
+                if predicate.evaluate(table, row) {
+                    rows.push(row);
+                    for ((_, values), assignment) in replacements.iter_mut().zip(&assignments) {
+                        values.push(assignment.expression.evaluate(table, row)?);
+                    }
+                }
+            }
+            (rows, replacements)
+        };
+
+        let affected_rows = rows.len();
+        self.catalog
+            .table_mut(&update.table)?
+            .apply_updates(&rows, replacements)?;
+        Ok(affected_rows)
+    }
+
+    fn execute_delete(&mut self, delete: Delete) -> Result<usize> {
+        let (retained_rows, affected_rows) = {
+            let table = self.catalog.table(&delete.table)?;
+            let predicate = compile_predicate(table, &delete.predicate)?;
+            let retained_rows = (0..table.row_count())
+                .filter(|row| !predicate.evaluate(table, *row))
+                .collect::<Vec<_>>();
+            let affected_rows = table.row_count() - retained_rows.len();
+            (retained_rows, affected_rows)
+        };
+
+        self.catalog
+            .table_mut(&delete.table)?
+            .retain_rows(&retained_rows)?;
+        Ok(affected_rows)
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
@@ -765,6 +825,209 @@ fn sort_and_limit(
         indices.truncate(limit);
     }
     indices.sort_unstable_by(|left, right| compare(*left, *right));
+}
+
+#[derive(Debug)]
+struct CompiledAssignment {
+    column: usize,
+    expression: CompiledExpression,
+}
+
+fn compile_assignments(
+    table: &Table,
+    assignments: &[Assignment],
+) -> Result<Vec<CompiledAssignment>> {
+    let mut columns = HashSet::with_capacity(assignments.len());
+    assignments
+        .iter()
+        .map(|assignment| {
+            let column = table.column_index(&assignment.column)?;
+            if !columns.insert(column) {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}' is assigned more than once",
+                    table.schema()[column].name
+                )));
+            }
+            let expression = compile_expression(table, &assignment.expression)?;
+            let expected = table.schema()[column].data_type;
+            if expression.data_type != expected {
+                return Err(Error::TypeMismatch {
+                    context: format!(
+                        "UPDATE assignment to column '{}.{}'",
+                        table.name(),
+                        table.schema()[column].name
+                    ),
+                    expected: expected.to_string(),
+                    actual: expression.data_type.to_string(),
+                });
+            }
+            Ok(CompiledAssignment { column, expression })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct CompiledExpression {
+    kind: CompiledExpressionKind,
+    data_type: DataType,
+}
+
+#[derive(Debug)]
+enum CompiledExpressionKind {
+    Column(usize),
+    Literal(Value),
+    Negate(Box<CompiledExpression>),
+    Arithmetic {
+        left: Box<CompiledExpression>,
+        operator: ArithmeticOperator,
+        right: Box<CompiledExpression>,
+    },
+}
+
+impl CompiledExpression {
+    fn evaluate(&self, table: &Table, row: usize) -> Result<Value> {
+        match &self.kind {
+            CompiledExpressionKind::Column(column) => Ok(table.columns()[*column].value(row)),
+            CompiledExpressionKind::Literal(value) => Ok(value.clone()),
+            CompiledExpressionKind::Negate(expression) => match expression.evaluate(table, row)? {
+                Value::Int64(value) => value
+                    .checked_neg()
+                    .map(Value::Int64)
+                    .ok_or_else(|| Error::NumericOverflow("UPDATE negation".to_owned())),
+                Value::Float64(value) => finite_float(-value, "UPDATE negation"),
+                _ => unreachable!("negation types are validated during compilation"),
+            },
+            CompiledExpressionKind::Arithmetic {
+                left,
+                operator,
+                right,
+            } => {
+                let left = left.evaluate(table, row)?;
+                let right = right.evaluate(table, row)?;
+                evaluate_arithmetic(left, *operator, right, self.data_type)
+            }
+        }
+    }
+}
+
+fn compile_expression(table: &Table, expression: &Expression) -> Result<CompiledExpression> {
+    let (kind, data_type) = match expression {
+        Expression::Column(name) => {
+            let column = table.column_index(name)?;
+            (
+                CompiledExpressionKind::Column(column),
+                table.schema()[column].data_type,
+            )
+        }
+        Expression::Literal(value) => (
+            CompiledExpressionKind::Literal(value.clone()),
+            value.data_type(),
+        ),
+        Expression::Negate(expression) => {
+            let expression = compile_expression(table, expression)?;
+            validate_numeric_expression(expression.data_type)?;
+            let data_type = expression.data_type;
+            (
+                CompiledExpressionKind::Negate(Box::new(expression)),
+                data_type,
+            )
+        }
+        Expression::Arithmetic {
+            left,
+            operator,
+            right,
+        } => {
+            let left = compile_expression(table, left)?;
+            let right = compile_expression(table, right)?;
+            validate_numeric_expression(left.data_type)?;
+            validate_numeric_expression(right.data_type)?;
+            let data_type =
+                if left.data_type == DataType::Float64 || right.data_type == DataType::Float64 {
+                    DataType::Float64
+                } else {
+                    DataType::Int64
+                };
+            (
+                CompiledExpressionKind::Arithmetic {
+                    left: Box::new(left),
+                    operator: *operator,
+                    right: Box::new(right),
+                },
+                data_type,
+            )
+        }
+    };
+    Ok(CompiledExpression { kind, data_type })
+}
+
+fn validate_numeric_expression(data_type: DataType) -> Result<()> {
+    if matches!(data_type, DataType::Int64 | DataType::Float64) {
+        Ok(())
+    } else {
+        Err(Error::TypeMismatch {
+            context: "UPDATE arithmetic expression".to_owned(),
+            expected: "Int64 or Float64".to_owned(),
+            actual: data_type.to_string(),
+        })
+    }
+}
+
+fn evaluate_arithmetic(
+    left: Value,
+    operator: ArithmeticOperator,
+    right: Value,
+    data_type: DataType,
+) -> Result<Value> {
+    if data_type == DataType::Float64 {
+        let left = numeric_as_f64(left);
+        let right = numeric_as_f64(right);
+        if operator == ArithmeticOperator::Divide && right == 0.0 {
+            return Err(Error::InvalidQuery(
+                "division by zero while evaluating UPDATE assignment".to_owned(),
+            ));
+        }
+        let result = match operator {
+            ArithmeticOperator::Add => left + right,
+            ArithmeticOperator::Subtract => left - right,
+            ArithmeticOperator::Multiply => left * right,
+            ArithmeticOperator::Divide => left / right,
+        };
+        return finite_float(result, "UPDATE arithmetic expression");
+    }
+
+    let (Value::Int64(left), Value::Int64(right)) = (left, right) else {
+        unreachable!("Int64 expression operands are validated during compilation")
+    };
+    if operator == ArithmeticOperator::Divide && right == 0 {
+        return Err(Error::InvalidQuery(
+            "division by zero while evaluating UPDATE assignment".to_owned(),
+        ));
+    }
+    let result = match operator {
+        ArithmeticOperator::Add => left.checked_add(right),
+        ArithmeticOperator::Subtract => left.checked_sub(right),
+        ArithmeticOperator::Multiply => left.checked_mul(right),
+        ArithmeticOperator::Divide => left.checked_div(right),
+    };
+    result
+        .map(Value::Int64)
+        .ok_or_else(|| Error::NumericOverflow("UPDATE arithmetic expression".to_owned()))
+}
+
+fn numeric_as_f64(value: Value) -> f64 {
+    match value {
+        Value::Int64(value) => value as f64,
+        Value::Float64(value) => value,
+        _ => unreachable!("numeric expression operands are validated during compilation"),
+    }
+}
+
+fn finite_float(value: f64, operation: &str) -> Result<Value> {
+    if value.is_finite() {
+        Ok(Value::Float64(value))
+    } else {
+        Err(Error::NumericOverflow(operation.to_owned()))
+    }
 }
 
 #[derive(Debug)]

@@ -4,6 +4,8 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_EXPRESSION_DEPTH: usize = 64;
+const MAX_EXPRESSION_NODES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -15,7 +17,48 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
+    Update(Update),
+    Delete(Delete),
     Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    pub table: String,
+    pub assignments: Vec<Assignment>,
+    pub predicate: Predicate,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    pub table: String,
+    pub predicate: Predicate,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: String,
+    pub expression: Expression,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expression {
+    Column(String),
+    Literal(Value),
+    Negate(Box<Self>),
+    Arithmetic {
+        left: Box<Self>,
+        operator: ArithmeticOperator,
+        right: Box<Self>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,7 +179,9 @@ enum TokenKind {
     RightParen,
     Semicolon,
     Star,
+    Plus,
     Minus,
+    Slash,
     Equal,
     NotEqual,
     Less,
@@ -190,9 +235,17 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     TokenKind::Star
                 }
+                '+' => {
+                    self.advance();
+                    TokenKind::Plus
+                }
                 '-' => {
                     self.advance();
                     TokenKind::Minus
+                }
+                '/' => {
+                    self.advance();
+                    TokenKind::Slash
                 }
                 '=' => {
                     self.advance();
@@ -343,6 +396,8 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    expression_depth: usize,
+    expression_nodes: usize,
 }
 
 impl Parser {
@@ -352,6 +407,8 @@ impl Parser {
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            expression_depth: 0,
+            expression_nodes: 0,
         }
     }
 
@@ -376,10 +433,14 @@ impl Parser {
             self.parse_create()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
+        } else if self.eat_keyword("UPDATE") {
+            self.parse_update().map(Statement::Update)
+        } else if self.eat_keyword("DELETE") {
+            self.parse_delete().map(Statement::Delete)
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, UPDATE, DELETE, or SELECT")
         }
     }
 
@@ -441,6 +502,38 @@ impl Parser {
         Ok(Statement::Insert { table, rows })
     }
 
+    fn parse_update(&mut self) -> Result<Update> {
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("SET")?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.expect_identifier("column name in SET")?;
+            self.expect(&TokenKind::Equal, "'=' after column name in SET")?;
+            assignments.push(Assignment {
+                column,
+                expression: self.parse_assignment_expression()?,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect_keyword("WHERE")?;
+        let predicate = self.parse_where_predicate()?;
+        Ok(Update {
+            table,
+            assignments,
+            predicate,
+        })
+    }
+
+    fn parse_delete(&mut self) -> Result<Delete> {
+        self.expect_keyword("FROM")?;
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("WHERE")?;
+        let predicate = self.parse_where_predicate()?;
+        Ok(Delete { table, predicate })
+    }
+
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
@@ -453,9 +546,7 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
 
         let predicate = if self.eat_keyword("WHERE") {
-            self.predicate_depth = 0;
-            self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
+            Some(self.parse_where_predicate()?)
         } else {
             None
         };
@@ -549,6 +640,126 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_where_predicate(&mut self) -> Result<Predicate> {
+        self.predicate_depth = 0;
+        self.predicate_nodes = 0;
+        self.parse_or_predicate()
+    }
+
+    fn parse_assignment_expression(&mut self) -> Result<Expression> {
+        self.expression_depth = 0;
+        self.expression_nodes = 0;
+        self.parse_expression()
+    }
+
+    fn parse_expression(&mut self) -> Result<Expression> {
+        self.parse_additive_expression()
+    }
+
+    fn parse_additive_expression(&mut self) -> Result<Expression> {
+        let mut expression = self.parse_multiplicative_expression()?;
+        loop {
+            let operator = if self.eat(&TokenKind::Plus) {
+                ArithmeticOperator::Add
+            } else if self.eat(&TokenKind::Minus) {
+                ArithmeticOperator::Subtract
+            } else {
+                break;
+            };
+            let right = self.parse_multiplicative_expression()?;
+            self.record_expression_node()?;
+            expression = Expression::Arithmetic {
+                left: Box::new(expression),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
+        let mut expression = self.parse_unary_expression()?;
+        loop {
+            let operator = if self.eat(&TokenKind::Star) {
+                ArithmeticOperator::Multiply
+            } else if self.eat(&TokenKind::Slash) {
+                ArithmeticOperator::Divide
+            } else {
+                break;
+            };
+            let right = self.parse_unary_expression()?;
+            self.record_expression_node()?;
+            expression = Expression::Arithmetic {
+                left: Box::new(expression),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<Expression> {
+        if self.at(&TokenKind::Minus)
+            && !matches!(self.tokens[self.current + 1].kind, TokenKind::Number(_))
+        {
+            if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+                return self.error(format!(
+                    "expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+                ));
+            }
+            self.current += 1;
+            self.expression_depth += 1;
+            let expression = self.parse_unary_expression();
+            self.expression_depth -= 1;
+            let expression = expression?;
+            self.record_expression_node()?;
+            return Ok(Expression::Negate(Box::new(expression)));
+        }
+        self.parse_primary_expression()
+    }
+
+    fn parse_primary_expression(&mut self) -> Result<Expression> {
+        if self.eat(&TokenKind::LeftParen) {
+            if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+                return self.error(format!(
+                    "expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+                ));
+            }
+            self.expression_depth += 1;
+            let expression = self.parse_expression();
+            self.expression_depth -= 1;
+            let expression = expression?;
+            self.expect(&TokenKind::RightParen, "')' after expression")?;
+            return Ok(expression);
+        }
+        let expression = match self.peek() {
+            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
+                self.parse_literal().map(Expression::Literal)
+            }
+            TokenKind::Identifier(value)
+                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+            {
+                self.parse_literal().map(Expression::Literal)
+            }
+            TokenKind::Identifier(_) => self
+                .expect_identifier("column or literal in expression")
+                .map(Expression::Column),
+            _ => self.error("expected column, literal, or parenthesized expression"),
+        }?;
+        self.record_expression_node()?;
+        Ok(expression)
+    }
+
+    fn record_expression_node(&mut self) -> Result<()> {
+        if self.expression_nodes >= MAX_EXPRESSION_NODES {
+            return self.error(format!(
+                "expression is too complex; maximum {MAX_EXPRESSION_NODES} expression nodes"
+            ));
+        }
+        self.expression_nodes += 1;
+        Ok(())
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -816,6 +1027,47 @@ mod tests {
             error,
             Error::Sql { message, .. }
                 if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn parses_update_arithmetic_and_delete_predicates() {
+        let statements = parse(
+            "UPDATE totals SET current = previous, doubled = (current + 1) * 2 WHERE id = 7;
+             DELETE FROM totals WHERE current < 0;",
+        )
+        .expect("valid mutations");
+
+        let Statement::Update(update) = &statements[0] else {
+            panic!("expected update");
+        };
+        assert_eq!(update.assignments.len(), 2);
+        assert_eq!(update.assignments[0].column, "current");
+        assert!(matches!(statements[1], Statement::Delete(_)));
+    }
+
+    #[test]
+    fn rejects_excessively_nested_or_flat_assignment_expressions() {
+        let nested = format!(
+            "UPDATE things SET value = {}value{} WHERE id = 1",
+            "(".repeat(50_000),
+            ")".repeat(50_000)
+        );
+        let error = parse(&nested).expect_err("nesting limit should reject expression");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("expression nesting exceeds limit of 64")
+        ));
+
+        let flat = format!(
+            "UPDATE things SET value = {} WHERE id = 1",
+            vec!["value"; 50_000].join(" + ")
+        );
+        let error = parse(&flat).expect_err("node limit should reject expression");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("expression is too complex; maximum 256 expression nodes")
         ));
     }
 }

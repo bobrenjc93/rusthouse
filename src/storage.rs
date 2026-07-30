@@ -86,6 +86,36 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn set(&mut self, row: usize, value: Value) {
+        match (self, value) {
+            (Self::Int64(values), Value::Int64(value)) => values[row] = value,
+            (Self::Float64(values), Value::Float64(value)) => values[row] = value,
+            (Self::Bool(values), Value::Bool(value)) => values[row] = value,
+            (Self::String(values), Value::String(value)) => values[row] = value,
+            _ => unreachable!("replacement values are validated before mutation"),
+        }
+    }
+
+    fn retain_rows(&mut self, retained_rows: &[usize]) {
+        fn retain_indices<T>(values: &mut Vec<T>, retained_rows: &[usize]) {
+            let mut source = 0;
+            let mut retained = 0;
+            values.retain(|_| {
+                let keep = retained_rows.get(retained) == Some(&source);
+                source += 1;
+                retained += usize::from(keep);
+                keep
+            });
+        }
+
+        match self {
+            Self::Int64(values) => retain_indices(values, retained_rows),
+            Self::Float64(values) => retain_indices(values, retained_rows),
+            Self::Bool(values) => retain_indices(values, retained_rows),
+            Self::String(values) => retain_indices(values, retained_rows),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -194,6 +224,72 @@ impl Table {
             column.push(value);
         }
         self.row_count += 1;
+        Ok(())
+    }
+
+    /// Validates every staged value before replacing values in physical columns.
+    pub(crate) fn apply_updates(
+        &mut self,
+        rows: &[usize],
+        updates: Vec<(usize, Vec<Value>)>,
+    ) -> Result<()> {
+        for (column, values) in &updates {
+            let field = self.schema.get(*column).ok_or_else(|| {
+                Error::InvalidQuery("staged update references an invalid column".to_owned())
+            })?;
+            if values.len() != rows.len() {
+                return Err(Error::InvalidQuery(
+                    "staged update has inconsistent row and value counts".to_owned(),
+                ));
+            }
+            for value in values {
+                if value.data_type() != field.data_type {
+                    return Err(Error::TypeMismatch {
+                        context: format!("column '{}.{}'", self.name, field.name),
+                        expected: field.data_type.to_string(),
+                        actual: value.data_type().to_string(),
+                    });
+                }
+                if matches!(value, Value::Float64(number) if !number.is_finite()) {
+                    return Err(Error::InvalidQuery(format!(
+                        "column '{}.{}' cannot store a non-finite Float64",
+                        self.name, field.name
+                    )));
+                }
+            }
+        }
+        if rows.iter().any(|row| *row >= self.row_count) {
+            return Err(Error::InvalidQuery(
+                "staged update references an invalid row".to_owned(),
+            ));
+        }
+
+        for (column, values) in updates {
+            for (row, value) in rows.iter().copied().zip(values) {
+                self.columns[column].set(row, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Compacts every physical column to the same staged, ordered row set.
+    pub(crate) fn retain_rows(&mut self, retained_rows: &[usize]) -> Result<()> {
+        if retained_rows.iter().any(|row| *row >= self.row_count)
+            || retained_rows.windows(2).any(|rows| rows[0] >= rows[1])
+        {
+            return Err(Error::InvalidQuery(
+                "retained row indices must be unique, ordered, and in bounds".to_owned(),
+            ));
+        }
+        for column in &mut self.columns {
+            column.retain_rows(retained_rows);
+        }
+        self.row_count = retained_rows.len();
+        debug_assert!(
+            self.columns
+                .iter()
+                .all(|column| column.len() == self.row_count)
+        );
         Ok(())
     }
 }

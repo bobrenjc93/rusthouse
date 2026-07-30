@@ -6,6 +6,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- typed UPDATE ... SET ... WHERE ... with arithmetic assignment expressions
+- DELETE FROM ... WHERE ... with stable row compaction
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -81,7 +83,9 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions in SELECT, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. Multi-row INSERT, UPDATE, and DELETE statements stage and validate all changes before mutating a table.
+
+UPDATE assignments accept literals, columns, parentheses, unary negation, and `+`, `-`, `*`, and `/`. Every assignment in a row reads that row's original values. UPDATE and DELETE require a WHERE clause; use a predicate that matches every row when that is intentional.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
