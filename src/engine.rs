@@ -6,8 +6,8 @@ use std::hash::{Hash, Hasher};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Join, JoinKind, Operand,
-    OrderBy, Predicate, Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, Join, JoinKind, MAX_JOIN_KEYS,
+    Operand, OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
@@ -360,45 +360,56 @@ impl<'a> QueryInput<'a> {
         let join_name = join.kind.name();
 
         let mut keys = Vec::with_capacity(join.conditions.len());
+        let mut predicates = Vec::new();
         for condition in &join.conditions {
             let left = self.column_index(&condition.left)?;
             let right = self.column_index(&condition.right)?;
             let left_relation = self.columns[left].relation;
             let right_side_relation = self.columns[right].relation;
-            let (left_column, right_column) = match (
+            let key = match (
                 left_relation == right_relation,
                 right_side_relation == right_relation,
             ) {
-                (false, true) => (left, right),
-                (true, false) => (right, left),
-                _ => {
+                (false, true) => Some((left, right)),
+                (true, false) => Some((right, left)),
+                _ => None,
+            };
+            if let Some((left_column, right_column)) = key {
+                if keys.len() >= MAX_JOIN_KEYS {
                     return Err(Error::InvalidQuery(format!(
-                        "{join_name} condition '{} = {}' must connect '{}' to an earlier input",
-                        condition.left, condition.right, self.relations[right_relation].qualifier,
+                        "{join_name} has too many equality keys; maximum is {MAX_JOIN_KEYS}"
                     )));
                 }
-            };
-            let left_type = self.columns[left_column].data_type;
-            let right_type = self.columns[right_column].data_type;
-            if !comparable(left_type, right_type) {
-                return Err(Error::TypeMismatch {
-                    context: format!("{join_name} equality"),
-                    expected: left_type.to_string(),
-                    actual: right_type.to_string(),
-                });
+                let left_type = self.columns[left_column].data_type;
+                let right_type = self.columns[right_column].data_type;
+                if !comparable(left_type, right_type) {
+                    return Err(Error::TypeMismatch {
+                        context: format!("{join_name} equality"),
+                        expected: left_type.to_string(),
+                        actual: right_type.to_string(),
+                    });
+                }
+                keys.push((left_column, right_column));
+            } else {
+                let predicate = Predicate::Comparison {
+                    left: Operand::Column(condition.left.clone()),
+                    operator: ComparisonOperator::Equal,
+                    right: Operand::Column(condition.right.clone()),
+                };
+                predicates.push(compile_predicate_for(self, &predicate, join_name)?);
             }
-            keys.push((left_column, right_column));
         }
         if keys.is_empty() {
             return Err(Error::InvalidQuery(format!(
                 "{join_name} requires at least one equality connecting the input tables"
             )));
         }
-        let predicate = join
-            .predicate
-            .as_ref()
-            .map(|predicate| compile_predicate_for(self, predicate, join_name))
-            .transpose()?;
+        if let Some(predicate) = &join.predicate {
+            predicates.push(compile_predicate_for(self, predicate, join_name)?);
+        }
+        let predicate = predicates
+            .into_iter()
+            .reduce(|left, right| CompiledPredicate::And(Box::new(left), Box::new(right)));
 
         let right_row_count = table.row_count();
         let build_left = old_row_count <= right_row_count;
@@ -565,7 +576,7 @@ impl<'a> QueryInput<'a> {
             }
             let mut output_count = 0usize;
             for left_row in 0..old_row_count {
-                let mut qualifying = 0usize;
+                let mut matched = false;
                 if self.old_join_key(
                     old_rows.as_deref(),
                     old_width,
@@ -584,20 +595,15 @@ impl<'a> QueryInput<'a> {
                             right_relation,
                             right_row,
                         ) {
-                            qualifying = checked_join_match_count(qualifying, 1, limits)?;
+                            output_count = checked_join_match_count(output_count, 1, limits)?;
+                            matched = true;
                         }
                         right_row = hash.next_row(right_row);
                     }
                 }
-                output_count = checked_join_match_count(
-                    output_count,
-                    if qualifying == 0 && join.kind == JoinKind::Left {
-                        1
-                    } else {
-                        qualifying
-                    },
-                    limits,
-                )?;
+                if !matched && join.kind == JoinKind::Left {
+                    output_count = checked_join_match_count(output_count, 1, limits)?;
+                }
             }
             let joined_indices = checked_join_output_layout(
                 output_count,
@@ -787,13 +793,22 @@ fn checked_join_match_count(
     additional: usize,
     limits: JoinLimits,
 ) -> Result<usize> {
-    current
+    let actual = current
         .checked_add(additional)
         .ok_or(Error::JoinLimitExceeded {
             resource: "output rows",
             limit: limits.max_rows,
             actual: usize::MAX,
+        })?;
+    if actual > limits.max_rows {
+        Err(Error::JoinLimitExceeded {
+            resource: "output rows",
+            limit: limits.max_rows,
+            actual,
         })
+    } else {
+        Ok(actual)
+    }
 }
 
 fn checked_join_output_layout(

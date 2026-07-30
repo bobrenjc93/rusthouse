@@ -235,10 +235,11 @@ fn join_keys_must_connect_the_tables_and_have_comparable_types() {
             "SELECT l.id FROM typed_left l
              INNER JOIN typed_right r ON l.id = l.id;",
         )
-        .expect_err("a key must connect both tables");
+        .expect_err("the join still requires a cross-table equality key");
     assert!(matches!(
         same_side,
-        Error::InvalidQuery(message) if message.contains("must connect 'r' to an earlier input")
+        Error::InvalidQuery(message)
+            if message.contains("requires at least one equality connecting the input tables")
     ));
 
     let mismatched = database
@@ -255,6 +256,44 @@ fn join_keys_must_connect_the_tables_and_have_comparable_types() {
             actual,
         } if context == "INNER JOIN equality" && expected == "String" && actual == "Int64"
     ));
+}
+
+#[test]
+fn same_side_equalities_are_residual_on_predicates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE residual_left (id Int64, a Int64, b Int64, label String);
+             INSERT INTO residual_left VALUES
+                (1, 5, 5, 'matched'),
+                (1, 5, 6, 'left rejected'),
+                (2, 7, 7, 'right rejected');
+             CREATE TABLE residual_right (id Int64, a Int64, b Int64, label String);
+             INSERT INTO residual_right VALUES
+                (1, 9, 9, 'kept'),
+                (1, 9, 8, 'right rejected'),
+                (2, 3, 4, 'also rejected');",
+        )
+        .expect("setup succeeds");
+
+    let result = query(
+        &mut database,
+        "SELECT l.label AS left_label, r.label AS right_label
+         FROM residual_left l LEFT JOIN residual_right r
+           ON l.id = r.id AND l.a = l.b AND r.a = r.b;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("matched".into()),
+                Value::String("kept".into())
+            ],
+            vec![Value::String("left rejected".into()), Value::Null],
+            vec![Value::String("right rejected".into()), Value::Null],
+        ]
+    );
 }
 
 #[test]
@@ -386,9 +425,44 @@ fn duplicate_key_fanout_is_bounded_before_output_allocation() {
         Error::JoinLimitExceeded {
             resource: "output rows",
             limit: 100,
-            actual: 144,
+            actual: 101,
         }
     ));
+}
+
+#[test]
+fn fanout_row_limit_stops_at_first_excess_for_both_hash_sides() {
+    for (left_count, right_count) in [(2, 3), (3, 2)] {
+        let mut database = Database::with_join_limits(JoinLimits {
+            max_rows: 4,
+            max_bytes: usize::MAX,
+        });
+        let left_values = vec!["(1)"; left_count].join(",");
+        let right_values = vec!["(1)"; right_count].join(",");
+        database
+            .execute(&format!(
+                "CREATE TABLE early_left (key Int64);
+                 INSERT INTO early_left VALUES {left_values};
+                 CREATE TABLE early_right (key Int64);
+                 INSERT INTO early_right VALUES {right_values};"
+            ))
+            .expect("setup succeeds");
+
+        let error = database
+            .execute(
+                "SELECT l.key FROM early_left l
+                 INNER JOIN early_right r ON l.key = r.key;",
+            )
+            .expect_err("six-row fanout must stop at the fifth row");
+        assert!(matches!(
+            error,
+            Error::JoinLimitExceeded {
+                resource: "output rows",
+                limit: 4,
+                actual: 5,
+            }
+        ));
+    }
 }
 
 #[test]

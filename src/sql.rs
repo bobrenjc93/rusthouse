@@ -4,7 +4,7 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
-const MAX_JOIN_KEYS: usize = 64;
+pub(crate) const MAX_JOIN_KEYS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -540,12 +540,6 @@ impl Parser {
                 }
                 if !self.eat_keyword("AND") {
                     break;
-                }
-                if conditions.len() >= MAX_JOIN_KEYS {
-                    return self.error(format!(
-                        "{} has too many equality keys; maximum is {MAX_JOIN_KEYS}",
-                        kind.name()
-                    ));
                 }
                 if conditions.len() + residual.len() >= MAX_PREDICATE_NODES {
                     return self.error(format!("{} condition is too complex", kind.name()));

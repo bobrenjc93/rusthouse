@@ -62,11 +62,6 @@ impl Column {
         self.len() == 0
     }
 
-    #[must_use]
-    pub fn value(&self, row: usize) -> Value {
-        self.value_ref(row).to_owned()
-    }
-
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
             Self::Int64(values) => ValueRef::Int64(values[row]),
@@ -140,9 +135,19 @@ impl Table {
         &self.schema
     }
 
+    /// Returns the physical typed columns.
+    ///
+    /// Nullable slots contain type-specific placeholders in these vectors;
+    /// use `value()` when reading logical table values.
     #[must_use]
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    /// Returns the logical value at a column and row, including stored NULLs.
+    #[must_use]
+    pub fn value(&self, column: usize, row: usize) -> Value {
+        self.value_ref(column, row).to_owned()
     }
 
     #[must_use]
