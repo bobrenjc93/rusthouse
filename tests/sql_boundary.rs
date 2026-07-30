@@ -1,3 +1,4 @@
+use rusthouse::storage::INT64_CHUNK_SIZE;
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
@@ -9,6 +10,50 @@ fn last_query(results: Vec<StatementResult>) -> QueryResult {
 
 fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
     last_query(database.execute(sql).expect("SQL succeeds"))
+}
+
+#[test]
+fn int64_queries_are_exact_across_sealed_chunk_boundaries() {
+    let row_count = INT64_CHUNK_SIZE * 2 + 3;
+    let values = (0..row_count)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE chunked (value Int64); INSERT INTO chunked VALUES {values};"
+        ))
+        .expect("chunked setup succeeds");
+
+    let boundary = execute_query(
+        &mut database,
+        &format!(
+            "SELECT value FROM chunked WHERE value >= {} AND value <= {} ORDER BY value;",
+            INT64_CHUNK_SIZE - 2,
+            INT64_CHUNK_SIZE + 2
+        ),
+    );
+    assert_eq!(
+        boundary.rows,
+        (INT64_CHUNK_SIZE - 2..=INT64_CHUNK_SIZE + 2)
+            .map(|value| vec![Value::Int64(value as i64)])
+            .collect::<Vec<_>>()
+    );
+
+    let aggregates = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows, SUM(value) AS total, MIN(value) AS low, MAX(value) AS high FROM chunked;",
+    );
+    assert_eq!(
+        aggregates.rows,
+        vec![vec![
+            Value::Int64(row_count as i64),
+            Value::Int64((row_count as i64 - 1) * row_count as i64 / 2),
+            Value::Int64(0),
+            Value::Int64(row_count as i64 - 1),
+        ]]
+    );
 }
 
 #[test]

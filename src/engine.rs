@@ -560,7 +560,7 @@ impl AggregateState {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(values.value(row))
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
@@ -600,7 +600,7 @@ impl AggregateState {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(values.value(row)))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)

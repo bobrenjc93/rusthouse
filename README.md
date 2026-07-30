@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a typed column. Int64 columns adaptively compress sealed chunks while Float64, Bool, and String columns use native vectors.
 
 ## What works
 

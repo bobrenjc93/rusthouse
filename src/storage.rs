@@ -3,6 +3,10 @@ use std::collections::HashSet;
 use crate::error::{Error, Result};
 use crate::value::{DataType, Value, ValueRef};
 
+mod int64;
+
+pub use int64::{INT64_CHUNK_SIZE, Int64Column, Int64Iter, Int64StorageStats};
+
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -14,10 +18,10 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// A physical typed column. Int64 uses compressed sealed chunks and a mutable tail.
 #[derive(Debug, Clone)]
 pub enum Column {
-    Int64(Vec<i64>),
+    Int64(Int64Column),
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
@@ -27,7 +31,7 @@ impl Column {
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
         match data_type {
-            DataType::Int64 => Self::Int64(Vec::new()),
+            DataType::Int64 => Self::Int64(Int64Column::new()),
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
@@ -66,7 +70,7 @@ impl Column {
 
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
-            Self::Int64(values) => ValueRef::Int64(values[row]),
+            Self::Int64(values) => ValueRef::Int64(values.value(row)),
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
@@ -226,7 +230,7 @@ mod tests {
             .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
             .expect("valid row");
 
-        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v.iter().eq([7])));
         assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
     }
 

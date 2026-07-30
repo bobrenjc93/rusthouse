@@ -2,6 +2,8 @@
 
 This repository ships a neutral, black-box benchmark in the benchmark directory. It compares the prebuilt rusthouse CLI with ClickHouse Local through child processes and does not call RustHouse engine modules. The benchmark is a measuring instrument, not an engine optimization.
 
+The repository also includes a deterministic Int64 storage scan benchmark. Run `cargo bench --bench int64_scan` to compare constant, delta-bit-packed, and raw sealed chunks with a contiguous raw-vector baseline. Every case checks filtered-count, sum, minimum, and maximum parity before timing, then reports logical bytes, encoded bytes, nanoseconds per value, and the chunked/raw scan ratio. This isolates codec overhead; the black-box benchmark below remains the decision-grade end-to-end comparison.
+
 ## Pinned reference
 
 The accepted reference is the supplied ClickHouse Local build:
