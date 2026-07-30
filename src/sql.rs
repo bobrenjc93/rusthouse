@@ -37,7 +37,7 @@ pub enum SelectItem {
     },
     Aggregate {
         function: AggregateFunction,
-        argument: AggregateArgument,
+        arguments: Vec<AggregateArgument>,
         alias: Option<String>,
     },
 }
@@ -49,6 +49,8 @@ pub enum AggregateFunction {
     Min,
     Max,
     Avg,
+    ArgMin,
+    ArgMax,
 }
 
 impl AggregateFunction {
@@ -60,6 +62,8 @@ impl AggregateFunction {
             Self::Min => "MIN",
             Self::Max => "MAX",
             Self::Avg => "AVG",
+            Self::ArgMin => "ARGMIN",
+            Self::ArgMax => "ARGMAX",
         }
     }
 
@@ -70,6 +74,8 @@ impl AggregateFunction {
             "MIN" => Some(Self::Min),
             "MAX" => Some(Self::Max),
             "AVG" => Some(Self::Avg),
+            "ARGMIN" | "ARG_MIN" => Some(Self::ArgMin),
+            "ARGMAX" | "ARG_MAX" => Some(Self::ArgMax),
             _ => None,
         }
     }
@@ -525,16 +531,24 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
-            let argument = if self.eat(&TokenKind::Star) {
-                AggregateArgument::Wildcard
-            } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
-            };
-            self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            let mut arguments = Vec::new();
+            if !self.at(&TokenKind::RightParen) {
+                loop {
+                    arguments.push(if self.eat(&TokenKind::Star) {
+                        AggregateArgument::Wildcard
+                    } else {
+                        AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                    });
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after aggregate arguments")?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
-                argument,
+                arguments,
                 alias,
             })
         } else {

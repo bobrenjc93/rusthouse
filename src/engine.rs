@@ -150,6 +150,7 @@ enum ResolvedItem {
 struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
+    order: Option<usize>,
     input_type: Option<DataType>,
 }
 
@@ -231,40 +232,49 @@ fn resolve_select_items(
             }
             SelectItem::Aggregate {
                 function,
-                argument,
+                arguments,
                 alias,
             } => {
-                let (argument_index, input_type, argument_name) = match argument {
-                    AggregateArgument::Wildcard => {
-                        if *function != AggregateFunction::Count {
+                validate_aggregate_arity(*function, arguments.len())?;
+                let mut argument_indices = Vec::with_capacity(arguments.len());
+                let mut input_types = Vec::with_capacity(arguments.len());
+                let mut argument_names = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    match argument {
+                        AggregateArgument::Wildcard if *function == AggregateFunction::Count => {
+                            argument_indices.push(None);
+                            input_types.push(None);
+                            argument_names.push("*".to_owned());
+                        }
+                        AggregateArgument::Wildcard => {
                             return Err(Error::InvalidQuery(format!(
                                 "{}(*) is not supported; use a column argument",
                                 function.name()
                             )));
                         }
-                        (None, None, "*".to_owned())
+                        AggregateArgument::Column(name) => {
+                            let index = table.column_index(name)?;
+                            argument_indices.push(Some(index));
+                            input_types.push(Some(table.schema()[index].data_type));
+                            argument_names.push(table.schema()[index].name.clone());
+                        }
                     }
-                    AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
-                        (
-                            Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
-                        )
-                    }
-                };
+                }
+                let argument_index = argument_indices[0];
+                let input_type = input_types[0];
                 validate_aggregate(*function, input_type)?;
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
                     function: *function,
                     argument: argument_index,
+                    order: argument_indices.get(1).copied().flatten(),
                     input_type,
                 });
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                    name: alias.clone().unwrap_or_else(|| {
+                        format!("{}({})", function.name(), argument_names.join(", "))
+                    }),
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
@@ -272,6 +282,25 @@ fn resolve_select_items(
     }
 
     Ok((items, result_columns, aggregate_specs))
+}
+
+fn validate_aggregate_arity(function: AggregateFunction, actual: usize) -> Result<()> {
+    let expected = if matches!(
+        function,
+        AggregateFunction::ArgMin | AggregateFunction::ArgMax
+    ) {
+        2
+    } else {
+        1
+    };
+    if actual != expected {
+        return Err(Error::InvalidQuery(format!(
+            "{} expects {expected} argument{}, got {actual}",
+            function.name(),
+            if expected == 1 { "" } else { "s" }
+        )));
+    }
+    Ok(())
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -292,9 +321,11 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     match function {
         AggregateFunction::Count => DataType::Int64,
         AggregateFunction::Avg => DataType::Float64,
-        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
-            input_type.expect("validated column argument")
-        }
+        AggregateFunction::Sum
+        | AggregateFunction::Min
+        | AggregateFunction::Max
+        | AggregateFunction::ArgMin
+        | AggregateFunction::ArgMax => input_type.expect("validated column argument"),
     }
 }
 
@@ -528,6 +559,8 @@ enum AggregateState {
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
+    ArgMin(Option<(Value, Value)>),
+    ArgMax(Option<(Value, Value)>),
     AvgInt { sum: i128, count: u64 },
     AvgFloat { sum: f64, count: u64 },
 }
@@ -540,6 +573,8 @@ impl AggregateState {
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
+            AggregateFunction::ArgMin => Self::ArgMin(None),
+            AggregateFunction::ArgMax => Self::ArgMax(None),
             AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
                 Self::AvgInt { sum: 0, count: 0 }
             }
@@ -594,6 +629,26 @@ impl AggregateState {
                     *current = Some(candidate.to_owned());
                 }
             }
+            Self::ArgMin(current) => {
+                let order = table.columns()[spec.order.expect("ARGMIN order")].value_ref(row);
+                if current
+                    .as_ref()
+                    .is_none_or(|(_, existing)| order < existing.as_ref())
+                {
+                    let value = table.columns()[spec.argument.expect("ARGMIN value")].value(row);
+                    *current = Some((value, order.to_owned()));
+                }
+            }
+            Self::ArgMax(current) => {
+                let order = table.columns()[spec.order.expect("ARGMAX order")].value_ref(row);
+                if current
+                    .as_ref()
+                    .is_none_or(|(_, existing)| order > existing.as_ref())
+                {
+                    let value = table.columns()[spec.argument.expect("ARGMAX value")].value(row);
+                    *current = Some((value, order.to_owned()));
+                }
+            }
             Self::AvgInt { sum, count } => {
                 let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
                 else {
@@ -629,6 +684,7 @@ impl AggregateState {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
+            Self::ArgMin(Some((value, _))) | Self::ArgMax(Some((value, _))) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
@@ -638,6 +694,12 @@ impl AggregateState {
             )),
             Self::Max(None) => Err(Error::InvalidQuery(
                 "MAX is undefined for an empty input".to_owned(),
+            )),
+            Self::ArgMin(None) => Err(Error::InvalidQuery(
+                "ARGMIN is undefined for an empty input".to_owned(),
+            )),
+            Self::ArgMax(None) => Err(Error::InvalidQuery(
+                "ARGMAX is undefined for an empty input".to_owned(),
             )),
             Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
                 "AVG is undefined for an empty input".to_owned(),

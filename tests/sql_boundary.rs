@@ -274,6 +274,197 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
 }
 
 #[test]
+fn arg_extrema_support_every_scalar_value_and_order_type() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE candidates (
+                id Int64, score Float64, active Bool, label String
+             );
+             INSERT INTO candidates VALUES
+                (1, 9.5, false, 'delta'),
+                (2, -3.25, true, 'alpha'),
+                (3, 7.0, true, 'omega'),
+                (4, 7.0, false, 'beta');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT
+            argMin(id, label) AS int_by_string,
+            ARGMAX(score, id) AS float_by_int,
+            arg_min(active, score) AS bool_by_float,
+            ARG_MAX(label, active) AS string_by_bool
+         FROM candidates;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"int_by_string".to_owned(), DataType::Int64),
+            (&"float_by_int".to_owned(), DataType::Float64),
+            (&"bool_by_float".to_owned(), DataType::Bool),
+            (&"string_by_bool".to_owned(), DataType::String),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(2),
+            Value::Float64(7.0),
+            Value::Bool(true),
+            Value::String("alpha".to_owned()),
+        ]]
+    );
+}
+
+#[test]
+fn arg_extrema_preserve_the_first_value_when_order_values_tie() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ranked (label String, rank Int64);
+             INSERT INTO ranked VALUES
+                ('first low', -10),
+                ('second low', -10),
+                ('first high', 20),
+                ('second high', 20);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT argMin(label, rank) AS low, argMax(label, rank) AS high FROM ranked;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::String("first low".to_owned()),
+            Value::String("first high".to_owned()),
+        ]]
+    );
+}
+
+#[test]
+fn grouped_arg_extrema_mix_with_other_aggregates_and_order_by_alias() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (category String, label String, score Int64);
+             INSERT INTO events VALUES
+                ('a', 'a-low-first', 1),
+                ('a', 'a-low-second', 1),
+                ('b', 'b-high', 8),
+                ('a', 'a-high', 9),
+                ('b', 'b-low', -2);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT category,
+                argMin(label, score) AS lowest,
+                argMax(label, score) AS highest,
+                MIN(score) AS low_score,
+                MAX(score) AS high_score,
+                COUNT(*) AS rows
+         FROM events
+         GROUP BY category
+         ORDER BY high_score DESC;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::String("a-low-first".to_owned()),
+                Value::String("a-high".to_owned()),
+                Value::Int64(1),
+                Value::Int64(9),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::String("b-low".to_owned()),
+                Value::String("b-high".to_owned()),
+                Value::Int64(-2),
+                Value::Int64(8),
+                Value::Int64(2),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn arg_extrema_reject_invalid_arity_wildcards_and_empty_inputs() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (value String, ordering Int64);")
+        .expect("create succeeds");
+
+    for (sql, expected) in [
+        (
+            "SELECT argMin() FROM samples;",
+            "ARGMIN expects 2 arguments, got 0",
+        ),
+        (
+            "SELECT argMin(value) FROM samples;",
+            "ARGMIN expects 2 arguments, got 1",
+        ),
+        (
+            "SELECT argMax(value, ordering, value) FROM samples;",
+            "ARGMAX expects 2 arguments, got 3",
+        ),
+        (
+            "SELECT COUNT(*, value) FROM samples;",
+            "COUNT expects 1 argument, got 2",
+        ),
+    ] {
+        let error = database.execute(sql).expect_err("arity must be exact");
+        assert!(matches!(error, Error::InvalidQuery(message) if message == expected));
+    }
+
+    for sql in [
+        "SELECT argMin(*, ordering) FROM samples;",
+        "SELECT argMax(value, *) FROM samples;",
+    ] {
+        let error = database
+            .execute(sql)
+            .expect_err("wildcards are not value or order columns");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message) if message.contains("is not supported")
+        ));
+    }
+
+    for (sql, function) in [
+        ("SELECT argMin(value, ordering) FROM samples;", "ARGMIN"),
+        ("SELECT argMax(value, ordering) FROM samples;", "ARGMAX"),
+    ] {
+        let error = database
+            .execute(sql)
+            .expect_err("arg extrema are undefined for empty global input");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message)
+                if message == format!("{function} is undefined for an empty input")
+        ));
+    }
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT ordering, argMin(value, ordering) FROM samples GROUP BY ordering;",
+    );
+    assert!(grouped.rows.is_empty());
+}
+
+#[test]
 fn global_aggregates_and_empty_count_are_supported() {
     let mut database = Database::new();
     database
