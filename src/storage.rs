@@ -128,6 +128,19 @@ impl Table {
         })
     }
 
+    pub(crate) fn from_int64_values(name: String, column_name: String, values: Vec<i64>) -> Self {
+        let row_count = values.len();
+        Self {
+            name,
+            schema: vec![ColumnDef {
+                name: column_name,
+                data_type: DataType::Int64,
+            }],
+            columns: vec![Column::Int64(values)],
+            row_count,
+        }
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

@@ -21,11 +21,17 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub items: Vec<SelectItem>,
-    pub table: String,
+    pub source: TableSource,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableSource {
+    Table(String),
+    GenerateSeries { start: i64, stop: i64, step: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -450,7 +456,7 @@ impl Parser {
             }
         }
         self.expect_keyword("FROM")?;
-        let table = self.expect_identifier("table name")?;
+        let source = self.parse_table_source()?;
 
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
@@ -505,12 +511,47 @@ impl Parser {
 
         Ok(Select {
             items,
-            table,
+            source,
             predicate,
             group_by,
             order_by,
             limit,
         })
+    }
+
+    fn parse_table_source(&mut self) -> Result<TableSource> {
+        let name = self.expect_identifier("table name or generate_series")?;
+        if !name.eq_ignore_ascii_case("generate_series") || !self.eat(&TokenKind::LeftParen) {
+            return Ok(TableSource::Table(name));
+        }
+
+        let start = self.parse_generate_series_argument("start")?;
+        self.expect(&TokenKind::Comma, "',' after generate_series start")?;
+        let stop = self.parse_generate_series_argument("stop")?;
+        let step = if self.eat(&TokenKind::Comma) {
+            self.parse_generate_series_argument("step")?
+        } else {
+            1
+        };
+        self.expect(
+            &TokenKind::RightParen,
+            "')' after generate_series arguments",
+        )?;
+        Ok(TableSource::GenerateSeries { start, stop, step })
+    }
+
+    fn parse_generate_series_argument(&mut self, name: &str) -> Result<i64> {
+        let position = self.position();
+        match self.parse_literal()? {
+            Value::Int64(value) => Ok(value),
+            value => Err(Error::Sql {
+                position,
+                message: format!(
+                    "generate_series {name} must be an Int64 literal, found {}",
+                    value.data_type()
+                ),
+            }),
+        }
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -771,6 +812,50 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_generate_series_table_sources() {
+        let statements = parse(
+            "SELECT generate_series FROM generate_series(5, -1, -2); \
+             SELECT * FROM generate_series(1, 3)",
+        )
+        .expect("valid generated sources");
+
+        let Statement::Select(descending) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            descending.source,
+            TableSource::GenerateSeries {
+                start: 5,
+                stop: -1,
+                step: -2,
+            }
+        );
+
+        let Statement::Select(default_step) = &statements[1] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            default_step.source,
+            TableSource::GenerateSeries {
+                start: 1,
+                stop: 3,
+                step: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_series_requires_int64_literal_arguments() {
+        let error =
+            parse("SELECT * FROM generate_series(1, 2.5)").expect_err("Float64 stop is invalid");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("generate_series stop must be an Int64 literal")
+        ));
     }
 
     #[test]

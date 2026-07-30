@@ -5,15 +5,27 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    Select, SelectItem, Statement, TableSource,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+pub const DEFAULT_GENERATE_SERIES_LIMIT: usize = 1_000_000;
+
 /// A reusable in-memory SQL database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    generate_series_limit: usize,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            catalog: Catalog::default(),
+            generate_series_limit: DEFAULT_GENERATE_SERIES_LIMIT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +53,24 @@ impl Database {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty database with a custom maximum generated row count.
+    #[must_use]
+    pub fn with_generate_series_limit(limit: usize) -> Self {
+        Self {
+            generate_series_limit: limit,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn generate_series_limit(&self) -> usize {
+        self.generate_series_limit
+    }
+
+    pub fn set_generate_series_limit(&mut self, limit: usize) {
+        self.generate_series_limit = limit;
     }
 
     #[must_use]
@@ -91,7 +121,15 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        let generated_table;
+        let table = match &select.source {
+            TableSource::Table(name) => self.catalog.table(name)?,
+            TableSource::GenerateSeries { start, stop, step } => {
+                generated_table =
+                    generate_series_table(*start, *stop, *step, self.generate_series_limit)?;
+                &generated_table
+            }
+        };
         let predicate = select
             .predicate
             .as_ref()
@@ -133,6 +171,55 @@ impl Database {
             rows,
         })
     }
+}
+
+fn generate_series_table(start: i64, stop: i64, step: i64, limit: usize) -> Result<Table> {
+    if step == 0 {
+        return Err(Error::InvalidQuery(
+            "generate_series step cannot be zero".to_owned(),
+        ));
+    }
+
+    let has_rows = if step > 0 {
+        start <= stop
+    } else {
+        start >= stop
+    };
+    let mut values = Vec::new();
+    if has_rows {
+        let intervals = start.abs_diff(stop) / step.unsigned_abs();
+        let row_count = intervals
+            .checked_add(1)
+            .ok_or_else(|| Error::NumericOverflow("generate_series cardinality".to_owned()))?;
+        let row_count = usize::try_from(row_count)
+            .map_err(|_| Error::NumericOverflow("generate_series cardinality".to_owned()))?;
+        if row_count > limit {
+            return Err(Error::InvalidQuery(format!(
+                "generate_series would produce {row_count} rows, exceeding the configured limit of {limit}"
+            )));
+        }
+
+        values.try_reserve_exact(row_count).map_err(|_| {
+            Error::InvalidQuery(format!(
+                "could not allocate {row_count} rows for generate_series"
+            ))
+        })?;
+        let mut value = start;
+        for index in 0..row_count {
+            values.push(value);
+            if index + 1 < row_count {
+                value = value
+                    .checked_add(step)
+                    .ok_or_else(|| Error::NumericOverflow("generate_series step".to_owned()))?;
+            }
+        }
+    }
+
+    Ok(Table::from_int64_values(
+        "generate_series".to_owned(),
+        "generate_series".to_owned(),
+        values,
+    ))
 }
 
 #[derive(Debug)]

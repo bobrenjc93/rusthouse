@@ -11,7 +11,9 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{
+    DEFAULT_GENERATE_SERIES_LIMIT, Database, QueryResult, ResultColumn, StatementResult,
+};
 pub use error::{Error, Result};
 pub use value::{DataType, Value};
 

@@ -12,6 +12,110 @@ fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
 }
 
 #[test]
+fn generate_series_uses_the_normal_analytical_pipeline() {
+    let mut database = Database::new();
+    let result = execute_query(
+        &mut database,
+        "SELECT generate_series AS n,
+                COUNT(*) AS occurrences,
+                SUM(generate_series) AS total
+         FROM generate_series(8, -4, -2)
+         WHERE generate_series >= 0
+         GROUP BY generate_series
+         ORDER BY n
+         LIMIT 3;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"n".to_owned(), DataType::Int64),
+            (&"occurrences".to_owned(), DataType::Int64),
+            (&"total".to_owned(), DataType::Int64),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(0), Value::Int64(1), Value::Int64(0)],
+            vec![Value::Int64(2), Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(4), Value::Int64(1), Value::Int64(4)],
+        ]
+    );
+}
+
+#[test]
+fn generate_series_handles_empty_ranges_and_overflow_boundaries() {
+    let mut database = Database::new();
+
+    let empty = execute_query(&mut database, "SELECT * FROM generate_series(3, 1);");
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.columns[0].name, "generate_series");
+
+    let empty_count = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS count FROM generate_series(1, 3, -1);",
+    );
+    assert_eq!(empty_count.rows, vec![vec![Value::Int64(0)]]);
+
+    let upper_edge = execute_query(
+        &mut database,
+        "SELECT generate_series FROM generate_series(9223372036854775806, 9223372036854775807, 2);",
+    );
+    assert_eq!(upper_edge.rows, vec![vec![Value::Int64(i64::MAX - 1)]]);
+
+    let lower_edge = execute_query(
+        &mut database,
+        "SELECT generate_series FROM generate_series(-9223372036854775808, -9223372036854775808, -1);",
+    );
+    assert_eq!(lower_edge.rows, vec![vec![Value::Int64(i64::MIN)]]);
+
+    let overflow = database
+        .execute("SELECT * FROM generate_series(-9223372036854775808, 9223372036854775807);")
+        .expect_err("cardinality cannot wrap");
+    assert!(
+        matches!(overflow, Error::NumericOverflow(operation) if operation == "generate_series cardinality")
+    );
+}
+
+#[test]
+fn generate_series_enforces_a_configurable_source_limit() {
+    let mut database = Database::with_generate_series_limit(3);
+    let bounded = execute_query(&mut database, "SELECT * FROM generate_series(1, 3);");
+    assert_eq!(bounded.rows.len(), 3);
+
+    let error = database
+        .execute("SELECT * FROM generate_series(1, 4) LIMIT 1;")
+        .expect_err("a query LIMIT does not bypass the source bound");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message.contains("4 rows") && message.contains("configured limit of 3")
+    ));
+
+    database.set_generate_series_limit(4);
+    assert_eq!(database.generate_series_limit(), 4);
+    assert_eq!(
+        execute_query(&mut database, "SELECT * FROM generate_series(1, 4);")
+            .rows
+            .len(),
+        4
+    );
+
+    let zero_step = database
+        .execute("SELECT * FROM generate_series(1, 4, 0);")
+        .expect_err("zero step cannot make progress");
+    assert!(matches!(
+        zero_step,
+        Error::InvalidQuery(message) if message.contains("step cannot be zero")
+    ));
+}
+
+#[test]
 fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let mut database = Database::new();
     let results = database

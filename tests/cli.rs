@@ -2,6 +2,26 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+fn generate_series_emits_cli_output_without_table_setup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=csv",
+            "--generate-series-limit=3",
+            "--execute",
+            "SELECT generate_series AS n FROM generate_series(3, -1, -2) ORDER BY n;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "n\n-1\n1\n3\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn execute_argument_emits_clean_json_and_command_statuses() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

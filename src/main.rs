@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{DEFAULT_GENERATE_SERIES_LIMIT, Database, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,6 +14,8 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+    --generate-series-limit <ROWS>
+                              Maximum rows from generate_series (default: 1000000)
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -47,7 +49,7 @@ fn run() -> Result<(), String> {
         sql
     };
 
-    let mut database = Database::new();
+    let mut database = Database::with_generate_series_limit(config.generate_series_limit);
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +96,13 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    generate_series_limit: usize,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut generate_series_limit = None;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +126,15 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "--generate-series-limit" => {
+                if generate_series_limit.is_some() {
+                    return Err("--generate-series-limit may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a row count"))?;
+                generate_series_limit = Some(parse_generate_series_limit(&value)?);
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +147,28 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--generate-series-limit=") => {
+                if generate_series_limit.is_some() {
+                    return Err("--generate-series-limit may only be supplied once".to_owned());
+                }
+                let value = &argument["--generate-series-limit=".len()..];
+                generate_series_limit = Some(parse_generate_series_limit(value)?);
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        generate_series_limit: generate_series_limit.unwrap_or(DEFAULT_GENERATE_SERIES_LIMIT),
+    }))
+}
+
+fn parse_generate_series_limit(value: &str) -> Result<usize, String> {
+    value.parse().map_err(|_| {
+        format!("invalid generate_series row limit '{value}'; expected a non-negative integer")
+    })
 }
 
 #[cfg(test)]
@@ -149,14 +179,19 @@ mod tests {
     #[test]
     fn parses_equals_style_options() {
         let config = parse_arguments(
-            ["--format=json", "--execute=SELECT * FROM t"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "--format=json",
+                "--generate-series-limit=12",
+                "--execute=SELECT * FROM t",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         )
         .expect("valid arguments")
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(config.generate_series_limit, 12);
     }
 
     #[test]
@@ -164,6 +199,17 @@ mod tests {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
         assert!(error.contains("table, csv, or json"));
+    }
+
+    #[test]
+    fn rejects_invalid_generate_series_limits() {
+        let error = parse_arguments(
+            ["--generate-series-limit", "many"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("row limit must be numeric");
+        assert!(error.contains("expected a non-negative integer"));
     }
 
     #[test]
