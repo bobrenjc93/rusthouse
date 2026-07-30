@@ -1,6 +1,10 @@
+use std::fs::{self, Permissions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use parquet::basic::{LogicalType, Repetition, Type as PhysicalType};
 use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int64Type};
@@ -17,11 +21,12 @@ use crate::{DataType, QueryResult, Value};
 /// RustHouse does not support nulls, all fields are required.
 pub fn write_parquet(result: &QueryResult, path: &Path) -> Result<(), String> {
     let schema = parquet_schema(result)?;
+    let existing_permissions = existing_file_permissions(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+    let mut temporary = create_temporary_file(parent).map_err(|error| {
         format!(
             "could not create temporary Parquet file in '{}': {error}",
             parent.display()
@@ -29,6 +34,17 @@ pub fn write_parquet(result: &QueryResult, path: &Path) -> Result<(), String> {
     })?;
 
     write_parquet_data(temporary.as_file_mut(), schema, result)?;
+    if let Some(permissions) = existing_permissions {
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| {
+                format!(
+                    "could not preserve permissions for Parquet output '{}': {error}",
+                    path.display()
+                )
+            })?;
+    }
     temporary.as_file_mut().sync_all().map_err(|error| {
         format!(
             "could not sync temporary Parquet file for '{}': {error}",
@@ -43,6 +59,30 @@ pub fn write_parquet(result: &QueryResult, path: &Path) -> Result<(), String> {
         )
     })?;
     Ok(())
+}
+
+fn existing_file_permissions(path: &Path) -> Result<Option<Permissions>, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions())),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not inspect Parquet output '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn create_temporary_file(parent: &Path) -> std::io::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .permissions(Permissions::from_mode(0o666))
+        .tempfile_in(parent)
+}
+
+#[cfg(not(unix))]
+fn create_temporary_file(parent: &Path) -> std::io::Result<NamedTempFile> {
+    NamedTempFile::new_in(parent)
 }
 
 fn parquet_schema(result: &QueryResult) -> Result<Arc<Type>, String> {

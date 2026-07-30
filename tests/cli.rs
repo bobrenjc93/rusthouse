@@ -3,6 +3,9 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use parquet::basic::{LogicalType, Type as PhysicalType};
 use parquet::column::reader::get_typed_column_reader;
 use parquet::data_type::{BoolType, ByteArrayType, DoubleType, Int64Type};
@@ -201,6 +204,43 @@ fn parquet_round_trip_preserves_all_physical_types() {
     assert_eq!(read_float64_column(&path, 1), vec![-0.25, 3.5]);
     assert_eq!(read_bool_column(&path, 2), vec![false, true]);
     assert_eq!(read_string_column(&path, 3), vec!["", "sample"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn parquet_output_uses_umask_and_preserves_existing_permissions() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let reference = directory.path().join("reference");
+    File::create(&reference).expect("create umask reference file");
+    let expected_new_mode = std::fs::metadata(&reference)
+        .expect("reference metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let path = directory.path().join("permissions.parquet");
+    let sql = "CREATE TABLE values (id Int64); SELECT * FROM values;";
+
+    let output = run_parquet(sql, &path);
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let new_mode = std::fs::metadata(&path)
+        .expect("Parquet metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(new_mode, expected_new_mode);
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+        .expect("set existing permissions");
+    let output = run_parquet(sql, &path);
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let replacement_mode = std::fs::metadata(&path)
+        .expect("replacement metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(replacement_mode, 0o640);
 }
 
 #[test]
