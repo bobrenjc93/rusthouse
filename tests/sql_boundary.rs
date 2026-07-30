@@ -815,3 +815,120 @@ fn direct_column_aggregate_names_use_schema_casing() {
         vec!["SUM(MixedCase)", "MIN(MixedCase)", "COUNT(MixedCase)"]
     );
 }
+
+#[test]
+fn row_arithmetic_evaluates_all_operators_and_numeric_promotion() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE arithmetic_rows (a Int64, b Int64, fraction Float64);
+             INSERT INTO arithmetic_rows VALUES
+                (10, 4, 1.5),
+                (-3, 2, 0.5);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT a + b AS added,
+                a - b AS subtracted,
+                a * b AS multiplied,
+                a / b AS divided,
+                -a AS negated,
+                a + fraction AS mixed_add,
+                a * fraction AS mixed_multiply
+         FROM arithmetic_rows
+         ORDER BY a DESC;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Float64,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(14),
+                Value::Int64(6),
+                Value::Int64(40),
+                Value::Float64(2.5),
+                Value::Int64(-10),
+                Value::Float64(11.5),
+                Value::Float64(15.0),
+            ],
+            vec![
+                Value::Int64(-1),
+                Value::Int64(-5),
+                Value::Int64(-6),
+                Value::Float64(-1.5),
+                Value::Int64(3),
+                Value::Float64(-2.5),
+                Value::Float64(-1.5),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn row_arithmetic_reports_checked_runtime_failures() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE arithmetic_limits (
+                maximum Int64, minimum Int64, zero Int64, huge Float64
+             );
+             INSERT INTO arithmetic_limits VALUES
+                (9223372036854775807, -9223372036854775808, 0, 1e308);",
+        )
+        .expect("setup succeeds");
+
+    for (sql, operation) in [
+        (
+            "SELECT maximum + 1 FROM arithmetic_limits;",
+            "Int64 '+' expression",
+        ),
+        (
+            "SELECT minimum - 1 FROM arithmetic_limits;",
+            "Int64 '-' expression",
+        ),
+        (
+            "SELECT maximum * 2 FROM arithmetic_limits;",
+            "Int64 '*' expression",
+        ),
+        (
+            "SELECT -minimum FROM arithmetic_limits;",
+            "unary '-' on Int64",
+        ),
+    ] {
+        let error = database
+            .execute(sql)
+            .expect_err("row arithmetic overflow must be reported");
+        assert!(
+            matches!(&error, Error::NumericOverflow(message) if message == operation),
+            "unexpected error for {sql}: {error}"
+        );
+    }
+
+    let division = database
+        .execute("SELECT maximum / zero FROM arithmetic_limits;")
+        .expect_err("row division by zero must be reported");
+    assert!(matches!(division, Error::DivisionByZero(_)));
+
+    let non_finite = database
+        .execute("SELECT huge * 2.0 FROM arithmetic_limits;")
+        .expect_err("non-finite row results must be rejected");
+    assert!(matches!(non_finite, Error::NonFiniteResult(_)));
+}
