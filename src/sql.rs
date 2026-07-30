@@ -5,6 +5,7 @@ use crate::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
@@ -15,7 +16,7 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
-    Select(Box<Select>),
+    Select(Select),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -386,7 +387,7 @@ impl Parser {
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
-            self.parse_select().map(Box::new).map(Statement::Select)
+            self.parse_select().map(Statement::Select)
         } else {
             self.error("expected CREATE, INSERT, or SELECT")
         }

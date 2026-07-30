@@ -66,6 +66,9 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 Database retains an in-memory catalog across calls and returns structured results:
 
+`Value::data_type()` retains its `DataType` return type; `Value::Null` reports the
+non-schema `DataType::Null` marker.
+
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
 ~~~rust

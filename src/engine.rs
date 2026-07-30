@@ -7,7 +7,7 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -86,7 +86,7 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(*select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
     }
 
@@ -615,9 +615,8 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values, _) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
-                else {
+                let column = &table.columns()[spec.argument.expect("SUM argument")];
+                let Some(values) = column.int64_values() else {
                     unreachable!("SUM input type is resolved")
                 };
                 let next = match *sum {
@@ -629,9 +628,8 @@ impl AggregateState {
                 *sum = Some(next);
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values, _) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
-                else {
+                let column = &table.columns()[spec.argument.expect("SUM argument")];
+                let Some(values) = column.float64_values() else {
                     unreachable!("SUM input type is resolved")
                 };
                 let next = sum.unwrap_or(0.0) + values[row];
@@ -661,9 +659,8 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values, _) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
-                else {
+                let column = &table.columns()[spec.argument.expect("AVG argument")];
+                let Some(values) = column.int64_values() else {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum = sum
@@ -674,9 +671,8 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values, _) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
-                else {
+                let column = &table.columns()[spec.argument.expect("AVG argument")];
+                let Some(values) = column.float64_values() else {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum += values[row];
@@ -871,7 +867,8 @@ impl CompiledOperand {
     fn data_type(&self) -> Option<DataType> {
         match self {
             Self::Column { data_type, .. } => Some(*data_type),
-            Self::Literal(value) => value.data_type(),
+            Self::Literal(Value::Null) => None,
+            Self::Literal(value) => Some(value.data_type()),
         }
     }
 
@@ -981,7 +978,8 @@ impl CompiledOutputOperand {
         match self {
             Self::Output { data_type, .. } => Some(*data_type),
             Self::Aggregate { data_type, .. } => Some(*data_type),
-            Self::Literal(value) => value.data_type(),
+            Self::Literal(Value::Null) => None,
+            Self::Literal(value) => Some(value.data_type()),
         }
     }
 

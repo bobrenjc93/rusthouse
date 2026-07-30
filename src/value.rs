@@ -2,9 +2,11 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+/// The four physical column types plus the marker for an untyped SQL NULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
+    /// The type marker returned for an untyped SQL NULL literal.
+    Null,
     Int64,
     Float64,
     Bool,
@@ -26,6 +28,7 @@ impl DataType {
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Null => "Null",
             Self::Int64 => "Int64",
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
@@ -56,13 +59,13 @@ pub(crate) enum ValueRef<'a> {
 
 impl Value {
     #[must_use]
-    pub fn data_type(&self) -> Option<DataType> {
+    pub fn data_type(&self) -> DataType {
         match self {
-            Self::Null => None,
-            Self::Int64(_) => Some(DataType::Int64),
-            Self::Float64(_) => Some(DataType::Float64),
-            Self::Bool(_) => Some(DataType::Bool),
-            Self::String(_) => Some(DataType::String),
+            Self::Null => DataType::Null,
+            Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
+            Self::Bool(_) => DataType::Bool,
+            Self::String(_) => DataType::String,
         }
     }
 
