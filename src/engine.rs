@@ -255,12 +255,12 @@ impl Database {
         let limit = match select.limit {
             Some(Limit::Literal(limit)) => Some(PreparedLimit::Literal(limit)),
             Some(Limit::Parameter(index)) => {
-                parameters.resolve(index, DataType::Int64)?;
+                parameters.require_exact(index, DataType::Int64)?;
                 Some(PreparedLimit::Parameter(index))
             }
             None => None,
         };
-        parameters.resolve_comparisons()?;
+        parameters.solve()?;
         let predicate = select
             .predicate
             .as_ref()
@@ -356,7 +356,7 @@ impl Database {
                         value,
                     )?,
                     ValueExpression::Parameter(index) => {
-                        parameters.resolve(*index, field.data_type)?;
+                        parameters.require_exact(*index, field.data_type)?;
                     }
                 }
             }
@@ -1036,14 +1036,15 @@ fn sort_and_limit(
 
 #[derive(Debug, Default)]
 struct ParameterTypes {
-    types: Vec<Option<DataType>>,
+    constraints: Vec<ParameterConstraint>,
     comparisons: Vec<(usize, usize)>,
 }
 
 impl ParameterTypes {
-    fn resolve(&mut self, index: usize, data_type: DataType) -> Result<()> {
+    fn require_exact(&mut self, index: usize, data_type: DataType) -> Result<()> {
         self.ensure(index);
-        match self.types[index] {
+        let constraint = &mut self.constraints[index];
+        match constraint.exact {
             Some(existing) if existing != data_type => Err(Error::TypeMismatch {
                 context: format!("parameter ${}", index + 1),
                 expected: existing.to_string(),
@@ -1051,10 +1052,38 @@ impl ParameterTypes {
             }),
             Some(_) => Ok(()),
             None => {
-                self.types[index] = Some(data_type);
+                if constraint
+                    .predicate
+                    .is_some_and(|predicate| !comparable(predicate, data_type))
+                {
+                    return Err(parameter_constraint_mismatch(
+                        index,
+                        constraint.predicate,
+                        data_type,
+                    ));
+                }
+                constraint.exact = Some(data_type);
                 Ok(())
             }
         }
+    }
+
+    fn require_comparable(&mut self, index: usize, data_type: DataType) -> Result<()> {
+        self.ensure(index);
+        let constraint = &mut self.constraints[index];
+        if let Some(existing) = constraint.exact.or(constraint.predicate)
+            && !comparable(existing, data_type)
+        {
+            return Err(parameter_constraint_mismatch(
+                index,
+                Some(existing),
+                data_type,
+            ));
+        }
+        if constraint.predicate.is_none() {
+            constraint.predicate = Some(data_type);
+        }
+        Ok(())
     }
 
     fn constrain_comparison(&mut self, left: usize, right: usize) {
@@ -1064,12 +1093,14 @@ impl ParameterTypes {
         }
     }
 
-    fn resolve_comparisons(&mut self) -> Result<()> {
+    fn solve(&mut self) -> Result<()> {
         let comparisons = self.comparisons.clone();
         loop {
             let mut changed = false;
             for &(left, right) in &comparisons {
-                match (self.types[left], self.types[right]) {
+                let left_type = self.constraints[left].known_type();
+                let right_type = self.constraints[right].known_type();
+                match (left_type, right_type) {
                     (Some(left_type), Some(right_type)) => {
                         if !comparable(left_type, right_type) {
                             return Err(Error::TypeMismatch {
@@ -1084,11 +1115,11 @@ impl ParameterTypes {
                         }
                     }
                     (Some(data_type), None) => {
-                        self.types[right] = Some(data_type);
+                        self.require_comparable(right, data_type)?;
                         changed = true;
                     }
                     (None, Some(data_type)) => {
-                        self.types[left] = Some(data_type);
+                        self.require_comparable(left, data_type)?;
                         changed = true;
                     }
                     (None, None) => {}
@@ -1101,15 +1132,21 @@ impl ParameterTypes {
     }
 
     fn data_type(&self, index: usize) -> Option<DataType> {
-        self.types.get(index).copied().flatten()
+        self.constraints
+            .get(index)
+            .and_then(|constraint| constraint.known_type())
     }
 
     fn ensure(&mut self, index: usize) {
-        self.types.resize(self.types.len().max(index + 1), None);
+        self.constraints.resize(
+            self.constraints.len().max(index + 1),
+            ParameterConstraint::default(),
+        );
     }
 
-    fn finish(self) -> Result<Vec<DataType>> {
-        (0..self.types.len())
+    fn finish(mut self) -> Result<Vec<DataType>> {
+        self.solve()?;
+        (0..self.constraints.len())
             .map(|index| {
                 let data_type = self.data_type(index);
                 data_type.ok_or_else(|| {
@@ -1120,6 +1157,31 @@ impl ParameterTypes {
                 })
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ParameterConstraint {
+    exact: Option<DataType>,
+    predicate: Option<DataType>,
+}
+
+impl ParameterConstraint {
+    fn known_type(self) -> Option<DataType> {
+        self.exact.or(self.predicate)
+    }
+}
+
+fn parameter_constraint_mismatch(
+    index: usize,
+    expected: Option<DataType>,
+    actual: DataType,
+) -> Error {
+    Error::TypeMismatch {
+        context: format!("parameter ${}", index + 1),
+        expected: expected
+            .map_or_else(|| "a compatible type".to_owned(), |value| value.to_string()),
+        actual: actual.to_string(),
     }
 }
 
@@ -1318,10 +1380,10 @@ fn infer_predicate_parameter_types(
                 Ok(())
             }
             (Operand::Parameter(index), right) => {
-                parameters.resolve(*index, operand_data_type(table, right)?)
+                parameters.require_comparable(*index, operand_data_type(table, right)?)
             }
             (left, Operand::Parameter(index)) => {
-                parameters.resolve(*index, operand_data_type(table, left)?)
+                parameters.require_comparable(*index, operand_data_type(table, left)?)
             }
             _ => Ok(()),
         },

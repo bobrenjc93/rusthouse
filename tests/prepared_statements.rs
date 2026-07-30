@@ -351,6 +351,44 @@ fn parameter_comparisons_use_types_inferred_across_the_statement() {
         .rows,
         vec![vec![Value::Int64(2)]]
     );
+
+    let reused_numeric_type = database
+        .prepare(
+            "SELECT id FROM typed_values
+             WHERE id = $1 AND reading > $1",
+        )
+        .expect("one numeric parameter can be compared with Int64 and Float64 columns");
+    assert_eq!(reused_numeric_type.parameter_types(), &[DataType::Int64]);
+    assert_eq!(
+        prepared_query(&mut database, &reused_numeric_type, &[Value::Int64(2)]).rows,
+        vec![vec![Value::Int64(2)]]
+    );
+
+    let float_predicate_with_limit = database
+        .prepare(
+            "SELECT id FROM typed_values
+             WHERE reading >= $1 ORDER BY id LIMIT $1",
+        )
+        .expect("LIMIT's exact Int64 type satisfies the Float64 predicate");
+    assert_eq!(
+        float_predicate_with_limit.parameter_types(),
+        &[DataType::Int64]
+    );
+    assert_eq!(
+        prepared_query(
+            &mut database,
+            &float_predicate_with_limit,
+            &[Value::Int64(1)]
+        )
+        .rows,
+        vec![vec![Value::Int64(1)]]
+    );
+
+    assert!(matches!(
+        database.prepare("INSERT INTO typed_values VALUES ($1, $1)"),
+        Err(Error::TypeMismatch { context, expected, actual })
+            if context == "parameter $1" && expected == "Int64" && actual == "Float64"
+    ));
 }
 
 #[test]
