@@ -31,8 +31,15 @@ pub struct Select {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitBy {
+    pub offset: usize,
     pub limit: usize,
-    pub keys: Vec<String>,
+    pub keys: LimitByKeys,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitByKeys {
+    All,
+    Explicit(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -499,22 +506,39 @@ impl Parser {
         let mut limit_by = None;
         let mut limit = None;
         if self.eat_keyword("LIMIT") {
-            let amount = self.parse_limit_amount()?;
+            let first_amount = self.parse_limit_amount()?;
+            let (offset, amount, offset_syntax) = if self.eat(&TokenKind::Comma) {
+                (first_amount, self.parse_limit_amount()?, true)
+            } else if self.eat_keyword("OFFSET") {
+                (self.parse_limit_amount()?, first_amount, true)
+            } else {
+                (0, first_amount, false)
+            };
             if self.eat_keyword("BY") {
-                let mut keys = Vec::new();
-                loop {
-                    keys.push(self.expect_identifier("LIMIT BY output column or alias")?);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
+                let keys = if self.eat_keyword("ALL") {
+                    LimitByKeys::All
+                } else {
+                    let mut keys = Vec::new();
+                    loop {
+                        keys.push(
+                            self.expect_identifier("LIMIT BY column, output column, or alias")?,
+                        );
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
-                }
+                    LimitByKeys::Explicit(keys)
+                };
                 limit_by = Some(LimitBy {
+                    offset,
                     limit: amount,
                     keys,
                 });
                 if self.eat_keyword("LIMIT") {
                     limit = Some(self.parse_limit_amount()?);
                 }
+            } else if offset_syntax {
+                return self.error("expected keyword BY after LIMIT offset");
             } else {
                 limit = Some(amount);
             }
@@ -803,8 +827,9 @@ mod tests {
         assert_eq!(
             select.limit_by,
             Some(LimitBy {
+                offset: 0,
                 limit: 2,
-                keys: vec!["region".to_owned()],
+                keys: LimitByKeys::Explicit(vec!["region".to_owned()]),
             })
         );
         assert_eq!(select.limit, Some(3));
@@ -824,11 +849,47 @@ mod tests {
         assert_eq!(
             select.limit_by,
             Some(LimitBy {
+                offset: 0,
                 limit: 0,
-                keys: vec!["area".to_owned(), "enabled".to_owned()],
+                keys: LimitByKeys::Explicit(vec!["area".to_owned(), "enabled".to_owned(),]),
             })
         );
         assert_eq!(select.limit, None);
+    }
+
+    #[test]
+    fn parses_both_limit_by_offset_forms_and_all() {
+        let comma =
+            parse("SELECT id FROM events LIMIT 3, 2 BY category").expect("comma offset is valid");
+        let offset =
+            parse("SELECT id FROM events LIMIT 2 OFFSET 3 BY category").expect("OFFSET is valid");
+        let all = parse("SELECT id FROM events LIMIT 1 BY ALL").expect("LIMIT BY ALL is valid");
+
+        for statement in [&comma[0], &offset[0]] {
+            let Statement::Select(select) = statement else {
+                panic!("expected select");
+            };
+            assert_eq!(
+                select.limit_by,
+                Some(LimitBy {
+                    offset: 3,
+                    limit: 2,
+                    keys: LimitByKeys::Explicit(vec!["category".to_owned()]),
+                })
+            );
+        }
+
+        let Statement::Select(select) = &all[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            select.limit_by,
+            Some(LimitBy {
+                offset: 0,
+                limit: 1,
+                keys: LimitByKeys::All,
+            })
+        );
     }
 
     #[test]

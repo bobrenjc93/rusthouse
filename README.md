@@ -17,6 +17,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
+`LIMIT n BY key[, ...]` keeps up to `n` ordered rows per typed key. Keys may be output aliases or table columns outside the projection; `BY ALL` uses every selected non-aggregate expression. Per-key offsets use either `LIMIT offset, n BY ...` or `LIMIT n OFFSET offset BY ...`, and a final `LIMIT n` may still cap the complete result.
+
 ## CLI
 
 Run a batch directly:

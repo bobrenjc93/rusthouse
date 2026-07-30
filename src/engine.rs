@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, LimitBy, Operand, OrderBy,
-    Predicate, Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, LimitBy, LimitByKeys, Operand,
+    OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -110,14 +110,21 @@ impl Database {
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
-        let limit_by = resolve_limit_by(&result_columns, select.limit_by.as_ref())?;
+        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        let limit_by = resolve_limit_by(
+            table,
+            &result_columns,
+            &items,
+            &group_columns,
+            grouped,
+            select.limit_by.as_ref(),
+        )?;
         let ordering_limit = if limit_by.is_none() {
             select.limit
         } else {
             None
         };
 
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let mut rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
@@ -128,14 +135,51 @@ impl Database {
                 &ordering,
                 ordering_limit,
             );
+            if let Some(limit_by) = &limit_by {
+                apply_limit_by(&mut selected_groups, limit_by, |group, key| match key {
+                    ResolvedLimitByKey::Output(output) => match items[output] {
+                        ResolvedItem::Column {
+                            group_position: Some(position),
+                            ..
+                        } => grouped.keys[*group].value(position).to_owned(),
+                        ResolvedItem::Column {
+                            group_position: None,
+                            ..
+                        } => unreachable!("grouped columns are validated"),
+                        ResolvedItem::Aggregate { state } => {
+                            grouped.aggregates[state][*group].clone()
+                        }
+                    },
+                    ResolvedLimitByKey::Group(position) => {
+                        grouped.keys[*group].value(position).to_owned()
+                    }
+                    ResolvedLimitByKey::Source(_) => {
+                        unreachable!("grouped LIMIT BY keys use group positions")
+                    }
+                });
+            }
             grouped.project(&selected_groups, &items)
         } else {
             order_source_rows(&mut matching_rows, table, &items, &ordering, ordering_limit);
+            if let Some(limit_by) = &limit_by {
+                apply_limit_by(&mut matching_rows, limit_by, |row, key| {
+                    let source = match key {
+                        ResolvedLimitByKey::Output(output) => {
+                            let ResolvedItem::Column { source, .. } = items[output] else {
+                                unreachable!("ungrouped projections cannot contain aggregates")
+                            };
+                            source
+                        }
+                        ResolvedLimitByKey::Source(source) => source,
+                        ResolvedLimitByKey::Group(_) => {
+                            unreachable!("ungrouped LIMIT BY keys use source columns")
+                        }
+                    };
+                    table.columns()[source].value(*row)
+                });
+            }
             execute_projection(table, &matching_rows, &items)
         };
-        if let Some(limit_by) = &limit_by {
-            apply_limit_by(&mut rows, limit_by);
-        }
         if let Some(limit) = select.limit {
             rows.truncate(limit);
         }
@@ -666,8 +710,16 @@ struct ResolvedOrder {
 
 #[derive(Debug)]
 struct ResolvedLimitBy {
+    offset: usize,
     limit: usize,
-    outputs: Vec<usize>,
+    keys: Vec<ResolvedLimitByKey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvedLimitByKey {
+    Output(usize),
+    Source(usize),
+    Group(usize),
 }
 
 fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
@@ -682,44 +734,94 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
 }
 
 fn resolve_limit_by(
+    table: &Table,
     columns: &[ResultColumn],
+    items: &[ResolvedItem],
+    group_columns: &[usize],
+    grouped: bool,
     requested: Option<&LimitBy>,
 ) -> Result<Option<ResolvedLimitBy>> {
     requested
         .map(|limit_by| {
-            let outputs = limit_by
-                .keys
-                .iter()
-                .map(|key| resolve_output_column(columns, key, "LIMIT BY"))
-                .collect::<Result<Vec<_>>>()?;
+            let keys = match &limit_by.keys {
+                LimitByKeys::All => items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(output, item)| {
+                        matches!(item, ResolvedItem::Column { .. })
+                            .then_some(ResolvedLimitByKey::Output(output))
+                    })
+                    .collect(),
+                LimitByKeys::Explicit(keys) => keys
+                    .iter()
+                    .map(|key| resolve_limit_by_key(table, columns, group_columns, grouped, key))
+                    .collect::<Result<Vec<_>>>()?,
+            };
             Ok(ResolvedLimitBy {
+                offset: limit_by.offset,
                 limit: limit_by.limit,
-                outputs,
+                keys,
             })
         })
         .transpose()
 }
 
+fn resolve_limit_by_key(
+    table: &Table,
+    columns: &[ResultColumn],
+    group_columns: &[usize],
+    grouped: bool,
+    name: &str,
+) -> Result<ResolvedLimitByKey> {
+    if let Some(output) = find_output_column(columns, name, "LIMIT BY")? {
+        return Ok(ResolvedLimitByKey::Output(output));
+    }
+
+    let source = table.column_index(name)?;
+    if !grouped {
+        return Ok(ResolvedLimitByKey::Source(source));
+    }
+    group_columns
+        .iter()
+        .position(|column| *column == source)
+        .map(ResolvedLimitByKey::Group)
+        .ok_or_else(|| {
+            Error::InvalidQuery(format!(
+                "LIMIT BY column '{name}' must appear in GROUP BY when it is not selected"
+            ))
+        })
+}
+
 fn resolve_output_column(columns: &[ResultColumn], name: &str, clause: &str) -> Result<usize> {
+    find_output_column(columns, name, clause)?.ok_or_else(|| {
+        Error::InvalidQuery(format!(
+            "{clause} column or alias '{name}' is not in the SELECT output"
+        ))
+    })
+}
+
+fn find_output_column(columns: &[ResultColumn], name: &str, clause: &str) -> Result<Option<usize>> {
     let mut matches = columns
         .iter()
         .enumerate()
         .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
         .map(|(index, _)| index);
     let Some(output) = matches.next() else {
-        return Err(Error::InvalidQuery(format!(
-            "{clause} column or alias '{name}' is not in the SELECT output"
-        )));
+        return Ok(None);
     };
     if matches.next().is_some() {
         return Err(Error::InvalidQuery(format!(
             "{clause} name '{name}' is ambiguous"
         )));
     }
-    Ok(output)
+    Ok(Some(output))
 }
 
-fn apply_limit_by(rows: &mut Vec<Vec<Value>>, limit_by: &ResolvedLimitBy) {
+fn apply_limit_by<T>(
+    rows: &mut Vec<T>,
+    limit_by: &ResolvedLimitBy,
+    mut value: impl FnMut(&T, ResolvedLimitByKey) -> Value,
+) {
     if limit_by.limit == 0 {
         rows.clear();
         return;
@@ -728,17 +830,14 @@ fn apply_limit_by(rows: &mut Vec<Vec<Value>>, limit_by: &ResolvedLimitBy) {
     let mut counts = HashMap::<Vec<Value>, usize>::with_capacity(rows.len().min(1_024));
     rows.retain(|row| {
         let key = limit_by
-            .outputs
+            .keys
             .iter()
-            .map(|output| row[*output].clone())
+            .map(|key| value(row, *key))
             .collect::<Vec<_>>();
         let count = counts.entry(key).or_default();
-        if *count >= limit_by.limit {
-            false
-        } else {
-            *count += 1;
-            true
-        }
+        let keep = *count >= limit_by.offset && *count - limit_by.offset < limit_by.limit;
+        *count += 1;
+        keep
     });
 }
 

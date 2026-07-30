@@ -304,6 +304,72 @@ fn limit_by_filters_grouped_results_in_deterministic_order() {
 }
 
 #[test]
+fn limit_by_supports_both_per_key_offset_forms() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE offset_items (id Int64, category String);
+             INSERT INTO offset_items VALUES
+                (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'),
+                (5, 'a'), (6, 'b'), (7, 'a');",
+        )
+        .expect("setup succeeds");
+
+    for clause in ["LIMIT 1, 2 BY category", "LIMIT 2 OFFSET 1 BY category"] {
+        let result = execute_query(
+            &mut database,
+            &format!("SELECT id, category FROM offset_items ORDER BY id {clause};"),
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int64(3), Value::String("a".to_owned())],
+                vec![Value::Int64(4), Value::String("b".to_owned())],
+                vec![Value::Int64(5), Value::String("a".to_owned())],
+                vec![Value::Int64(6), Value::String("b".to_owned())],
+            ],
+            "unexpected rows for {clause}"
+        );
+    }
+}
+
+#[test]
+fn limit_by_all_expands_selected_non_aggregate_expressions() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE all_sales (region String, category String, amount Int64);
+             INSERT INTO all_sales VALUES
+                ('west', 'hardware', 1),
+                ('west', 'hardware', 2),
+                ('west', 'hardware', 3),
+                ('west', 'books', 4),
+                ('west', 'books', 5),
+                ('east', 'hardware', 6),
+                ('east', 'hardware', 7),
+                ('east', 'books', 8);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region, COUNT(*) AS rows
+         FROM all_sales
+         GROUP BY region, category
+         ORDER BY rows DESC, region
+         LIMIT 1 BY ALL;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::String("west".to_owned()), Value::Int64(3)],
+            vec![Value::String("east".to_owned()), Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
 fn limit_by_composite_keys_support_every_scalar_type_and_zero() {
     let mut database = Database::new();
     database
@@ -351,20 +417,23 @@ fn limit_by_composite_keys_support_every_scalar_type_and_zero() {
 }
 
 #[test]
-fn limit_by_rejects_missing_and_ambiguous_output_names() {
+fn limit_by_uses_unprojected_source_columns_and_rejects_ambiguous_aliases() {
     let mut database = Database::new();
     database
         .execute(
-            "CREATE TABLE limit_names (id Int64, label String);
-             INSERT INTO limit_names VALUES (1, 'one');",
+            "CREATE TABLE limit_names (id Int64, label String, category String);
+             INSERT INTO limit_names VALUES
+                (1, 'one', 'a'), (2, 'two', 'a'), (3, 'three', 'b');",
         )
         .expect("setup succeeds");
 
-    let missing = database
-        .execute("SELECT id FROM limit_names LIMIT 1 BY label;")
-        .expect_err("LIMIT BY keys must be projected");
-    assert!(
-        matches!(missing, Error::InvalidQuery(message) if message.contains("LIMIT BY column or alias 'label' is not in the SELECT output"))
+    let projected = execute_query(
+        &mut database,
+        "SELECT id FROM limit_names ORDER BY id LIMIT 1 BY category;",
+    );
+    assert_eq!(
+        projected.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]
     );
 
     let ambiguous = database
@@ -372,6 +441,40 @@ fn limit_by_rejects_missing_and_ambiguous_output_names() {
         .expect_err("duplicate output names are ambiguous");
     assert!(
         matches!(ambiguous, Error::InvalidQuery(message) if message.contains("LIMIT BY name 'id' is ambiguous"))
+    );
+}
+
+#[test]
+fn grouped_limit_by_accepts_an_unprojected_group_column() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE hidden_groups (region String, category String, amount Int64);
+             INSERT INTO hidden_groups VALUES
+                ('west', 'hardware', 1),
+                ('west', 'hardware', 2),
+                ('west', 'books', 3),
+                ('east', 'books', 4),
+                ('east', 'hardware', 5),
+                ('east', 'hardware', 6);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT category, COUNT(*) AS rows
+         FROM hidden_groups
+         GROUP BY region, category
+         ORDER BY rows DESC, category
+         LIMIT 1 BY region;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::String("hardware".to_owned()), Value::Int64(2)],
+            vec![Value::String("hardware".to_owned()), Value::Int64(2)],
+        ]
     );
 }
 
