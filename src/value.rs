@@ -2,13 +2,17 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+use crate::temporal::{format_date, format_datetime64, parse_date, parse_datetime64};
+
+/// The physical column types supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Int64,
     Float64,
     Bool,
     String,
+    Date,
+    DateTime64,
 }
 
 impl DataType {
@@ -18,6 +22,8 @@ impl DataType {
             "FLOAT64" => Some(Self::Float64),
             "BOOL" | "BOOLEAN" => Some(Self::Bool),
             "STRING" => Some(Self::String),
+            "DATE" => Some(Self::Date),
+            "DATETIME64" => Some(Self::DateTime64),
             _ => None,
         }
     }
@@ -30,6 +36,8 @@ impl fmt::Display for DataType {
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
+            Self::Date => "Date",
+            Self::DateTime64 => "DateTime64(3)",
         })
     }
 }
@@ -41,6 +49,10 @@ pub enum Value {
     Float64(f64),
     Bool(bool),
     String(String),
+    /// Days since 1970-01-01, using the same compact range as ClickHouse Date.
+    Date(u16),
+    /// Milliseconds since 1970-01-01T00:00:00Z.
+    DateTime64(i64),
 }
 
 /// A non-owning scalar used while scanning immutable column storage.
@@ -50,9 +62,19 @@ pub(crate) enum ValueRef<'a> {
     Float64(f64),
     Bool(bool),
     String(&'a str),
+    Date(u16),
+    DateTime64(i64),
 }
 
 impl Value {
+    pub(crate) fn parse_temporal(data_type: DataType, input: &str) -> Result<Self, String> {
+        match data_type {
+            DataType::Date => parse_date(input).map(Self::Date),
+            DataType::DateTime64 => parse_datetime64(input).map(Self::DateTime64),
+            _ => Err(format!("{data_type} is not a temporal type")),
+        }
+    }
+
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -60,6 +82,8 @@ impl Value {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Date(_) => DataType::Date,
+            Self::DateTime64(_) => DataType::DateTime64,
         }
     }
 
@@ -70,6 +94,8 @@ impl Value {
             Self::Float64(value) => format_float(*value),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Date(value) => format_date(*value),
+            Self::DateTime64(value) => format_datetime64(*value),
         }
     }
 
@@ -79,6 +105,8 @@ impl Value {
             Self::Float64(value) => ValueRef::Float64(*value),
             Self::Bool(value) => ValueRef::Bool(*value),
             Self::String(value) => ValueRef::String(value),
+            Self::Date(value) => ValueRef::Date(*value),
+            Self::DateTime64(value) => ValueRef::DateTime64(*value),
         }
     }
 
@@ -95,6 +123,8 @@ impl ValueRef<'_> {
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
             Self::String(value) => Value::String(value.to_owned()),
+            Self::Date(value) => Value::Date(value),
+            Self::DateTime64(value) => Value::DateTime64(value),
         }
     }
 
@@ -108,6 +138,8 @@ impl ValueRef<'_> {
             }
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
+            (Self::Date(left), Self::Date(right)) => Some(left.cmp(&right)),
+            (Self::DateTime64(left), Self::DateTime64(right)) => Some(left.cmp(&right)),
             _ => None,
         }
     }
@@ -118,6 +150,8 @@ impl ValueRef<'_> {
             Self::Float64(_) => 1,
             Self::Bool(_) => 2,
             Self::String(_) => 3,
+            Self::Date(_) => 4,
+            Self::DateTime64(_) => 5,
         }
     }
 }
@@ -210,6 +244,8 @@ impl Ord for ValueRef<'_> {
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
             (Self::String(left), Self::String(right)) => left.cmp(right),
+            (Self::Date(left), Self::Date(right)) => left.cmp(right),
+            (Self::DateTime64(left), Self::DateTime64(right)) => left.cmp(right),
             _ => self.variant_index().cmp(&other.variant_index()),
         }
     }
@@ -229,6 +265,8 @@ impl Hash for ValueRef<'_> {
             Self::Float64(value) => canonical_float_bits(*value).hash(state),
             Self::Bool(value) => value.hash(state),
             Self::String(value) => value.hash(state),
+            Self::Date(value) => value.hash(state),
+            Self::DateTime64(value) => value.hash(state),
         }
     }
 }

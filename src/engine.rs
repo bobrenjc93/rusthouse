@@ -71,12 +71,12 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
+                let rows = {
                     let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
+                    rows.into_iter()
+                        .map(|row| target.coerce_row(row))
+                        .collect::<Result<Vec<_>>>()?
+                };
                 let target = self.catalog.table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
@@ -835,8 +835,19 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let mut left = compile_operand(table, left)?;
+            let mut right = compile_operand(table, right)?;
+            if matches!(left.data_type(), DataType::Date | DataType::DateTime64)
+                && right.data_type() == DataType::String
+                && matches!(&right, CompiledOperand::Literal(Value::String(_)))
+            {
+                right = coerce_temporal_operand(right, left.data_type())?;
+            } else if matches!(right.data_type(), DataType::Date | DataType::DateTime64)
+                && left.data_type() == DataType::String
+                && matches!(&left, CompiledOperand::Literal(Value::String(_)))
+            {
+                left = coerce_temporal_operand(left, right.data_type())?;
+            }
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -859,6 +870,18 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             Box::new(compile_predicate(table, right)?),
         )),
     }
+}
+
+fn coerce_temporal_operand(
+    operand: CompiledOperand,
+    data_type: DataType,
+) -> Result<CompiledOperand> {
+    let CompiledOperand::Literal(Value::String(input)) = operand else {
+        unreachable!("only string literals receive contextual temporal conversion")
+    };
+    Value::parse_temporal(data_type, &input)
+        .map(CompiledOperand::Literal)
+        .map_err(|message| Error::InvalidQuery(format!("invalid WHERE literal: {message}")))
 }
 
 fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {

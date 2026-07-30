@@ -396,14 +396,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_column_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -439,6 +432,38 @@ impl Parser {
             }
         }
         Ok(Statement::Insert { table, rows })
+    }
+
+    fn parse_column_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("DATETIME64") {
+            self.expect(
+                &TokenKind::LeftParen,
+                "'(' and millisecond precision in DateTime64(3)",
+            )?;
+            let precision = self.take_number().ok_or_else(|| Error::Sql {
+                position: self.position(),
+                message: "expected precision 3 in DateTime64(3)".to_owned(),
+            })?;
+            if precision != "3" {
+                return Err(Error::Sql {
+                    position,
+                    message: format!(
+                        "unsupported DateTime64 precision '{precision}'; only DateTime64(3) is supported"
+                    ),
+                });
+            }
+            self.expect(&TokenKind::RightParen, "')' after DateTime64 precision")?;
+            return Ok(DataType::DateTime64);
+        }
+
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, String, Date, or DateTime64(3)"
+            ),
+        })
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -617,6 +642,9 @@ impl Parser {
     }
 
     fn parse_operand(&mut self) -> Result<Operand> {
+        if self.is_typed_temporal_literal() {
+            return self.parse_temporal_literal().map(Operand::Literal);
+        }
         match self.peek() {
             TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
                 self.parse_literal().map(Operand::Literal)
@@ -634,6 +662,9 @@ impl Parser {
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
+        if self.is_typed_temporal_literal() {
+            return self.parse_temporal_literal();
+        }
         if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
             return Ok(Value::String(value));
@@ -673,8 +704,53 @@ impl Parser {
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, Date, or DateTime64(3) literal")
         }
+    }
+
+    fn is_typed_temporal_literal(&self) -> bool {
+        match (self.peek(), self.peek_offset(1)) {
+            (TokenKind::Identifier(name), Some(TokenKind::String(_))) => {
+                name.eq_ignore_ascii_case("DATE") || name.eq_ignore_ascii_case("DATETIME64")
+            }
+            (TokenKind::Identifier(name), Some(TokenKind::LeftParen)) => {
+                name.eq_ignore_ascii_case("DATETIME64")
+            }
+            _ => false,
+        }
+    }
+
+    fn parse_temporal_literal(&mut self) -> Result<Value> {
+        let position = self.position();
+        let type_name = self.expect_identifier("temporal literal type")?;
+        let data_type = if type_name.eq_ignore_ascii_case("DATE") {
+            DataType::Date
+        } else {
+            if self.eat(&TokenKind::LeftParen) {
+                let precision = self.take_number().ok_or_else(|| Error::Sql {
+                    position: self.position(),
+                    message: "expected precision 3 in DateTime64(3) literal".to_owned(),
+                })?;
+                if precision != "3" {
+                    return Err(Error::Sql {
+                        position,
+                        message: format!(
+                            "unsupported DateTime64 literal precision '{precision}'; only precision 3 is supported"
+                        ),
+                    });
+                }
+                self.expect(
+                    &TokenKind::RightParen,
+                    "')' after DateTime64 literal precision",
+                )?;
+            }
+            DataType::DateTime64
+        };
+        let input = self.take_string().ok_or_else(|| Error::Sql {
+            position: self.position(),
+            message: format!("expected an ISO-8601 string after {type_name}"),
+        })?;
+        Value::parse_temporal(data_type, &input).map_err(|message| Error::Sql { position, message })
     }
 
     fn expect_keyword(&mut self, expected: &str) -> Result<()> {
@@ -713,6 +789,15 @@ impl Parser {
         }
     }
 
+    fn take_string(&mut self) -> Option<String> {
+        if let TokenKind::String(value) = self.peek().clone() {
+            self.current += 1;
+            Some(value)
+        } else {
+            None
+        }
+    }
+
     fn expect(&mut self, expected: &TokenKind, description: &str) -> Result<()> {
         if self.eat(expected) {
             Ok(())
@@ -736,6 +821,12 @@ impl Parser {
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.current].kind
+    }
+
+    fn peek_offset(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| &token.kind)
     }
 
     fn position(&self) -> usize {

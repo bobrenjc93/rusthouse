@@ -1,11 +1,11 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, `Vec<String>`, `Vec<u16>` for dates, or `Vec<i64>` for millisecond timestamps).
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- CREATE TABLE with Int64, Float64, Bool, String, Date, and DateTime64(3) columns
+- multi-row INSERT INTO ... VALUES with row-width, type, and temporal input validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -16,6 +16,17 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+`Date` accepts `YYYY-MM-DD` and stores an unsigned day offset from the Unix epoch, covering `1970-01-01` through `2149-06-06`. `DateTime64(3)` accepts `YYYY-MM-DDTHH:MM:SS[.sss][Z|+HH:MM]` (a space may replace `T`) and stores signed Unix milliseconds for UTC instants from 1900 through 2299. Missing offsets mean UTC; output is always canonical UTC with exactly three fractional digits. More than three fractional digits are rejected rather than rounded or truncated.
+
+INSERT accepts ISO strings using the destination column type. Predicates also infer temporal types for string literals, while explicit typed literals work in both INSERT and WHERE:
+
+~~~sql
+CREATE TABLE events (day Date, occurred_at DateTime64(3));
+INSERT INTO events VALUES
+  (DATE '2024-02-29', DATETIME64(3) '2024-02-29T12:34:56.789-08:00');
+SELECT * FROM events WHERE day >= DATE '2024-01-01';
+~~~
 
 ## CLI
 

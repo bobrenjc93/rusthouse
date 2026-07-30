@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
+use crate::temporal::datetime64_in_range;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A named, typed field in a table schema.
@@ -21,6 +22,8 @@ pub enum Column {
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
+    Date(Vec<u16>),
+    DateTime64(Vec<i64>),
 }
 
 impl Column {
@@ -31,6 +34,8 @@ impl Column {
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
+            DataType::Date => Self::Date(Vec::new()),
+            DataType::DateTime64 => Self::DateTime64(Vec::new()),
         }
     }
 
@@ -41,6 +46,8 @@ impl Column {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Date(_) => DataType::Date,
+            Self::DateTime64(_) => DataType::DateTime64,
         }
     }
 
@@ -51,6 +58,8 @@ impl Column {
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
+            Self::Date(values) => values.len(),
+            Self::DateTime64(values) => values.len(),
         }
     }
 
@@ -70,6 +79,8 @@ impl Column {
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
+            Self::Date(values) => ValueRef::Date(values[row]),
+            Self::DateTime64(values) => ValueRef::DateTime64(values[row]),
         }
     }
 
@@ -83,6 +94,8 @@ impl Column {
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Date(values), Value::Date(value)) => values.push(value),
+            (Self::DateTime64(values), Value::DateTime64(value)) => values.push(value),
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -182,9 +195,46 @@ impl Table {
                     self.name, field.name
                 )));
             }
+            if matches!(value, Value::DateTime64(milliseconds) if !datetime64_in_range(*milliseconds))
+            {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' cannot store a DateTime64(3) outside 1900 through 2299 UTC",
+                    self.name, field.name
+                )));
+            }
         }
 
         Ok(())
+    }
+
+    /// Converts ISO-8601 strings using the destination schema, then validates the row.
+    pub(crate) fn coerce_row(&self, row: Vec<Value>) -> Result<Vec<Value>> {
+        if row.len() != self.schema.len() {
+            return Err(Error::RowLength {
+                table: self.name.clone(),
+                expected: self.schema.len(),
+                actual: row.len(),
+            });
+        }
+
+        let row = self
+            .schema
+            .iter()
+            .zip(row)
+            .map(|(field, value)| match (field.data_type, value) {
+                (data_type @ (DataType::Date | DataType::DateTime64), Value::String(input)) => {
+                    Value::parse_temporal(data_type, &input).map_err(|message| {
+                        Error::InvalidQuery(format!(
+                            "invalid value for column '{}.{}': {message}",
+                            self.name, field.name
+                        ))
+                    })
+                }
+                (_, value) => Ok(value),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.validate_row(&row)?;
+        Ok(row)
     }
 
     /// Validates the complete row before appending one value to each column.

@@ -95,6 +95,26 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn temporal_values_are_canonical_strings_in_cli_json() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE events (day Date, occurred_at DateTime64(3));
+             INSERT INTO events VALUES (DATE '2024-02-29', DATETIME64(3) '2024-03-01T01:02:03.4+05:30');
+             SELECT * FROM events;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"day\",\"type\":\"Date\"},{\"name\":\"occurred_at\",\"type\":\"DateTime64(3)\"}],\"rows\":[[\"2024-02-29\",\"2024-02-29T19:32:03.400Z\"]]}]}\n"
+    );
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
