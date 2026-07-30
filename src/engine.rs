@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -37,6 +38,35 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// Work performed by one SELECT statement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryProfile {
+    /// Rows whose blocks passed the skip indexes and were examined by the scan.
+    pub rows_read: usize,
+    /// Physical storage blocks examined by the scan.
+    pub blocks_read: usize,
+    /// Physical storage blocks rejected by min/max skip indexes.
+    pub blocks_pruned: usize,
+    /// Scanned rows retained by the predicate, or all scanned rows without WHERE.
+    pub predicate_matches: usize,
+    /// Aggregate groups created, including the single global aggregate group.
+    pub groups_created: usize,
+    /// Rows or groups supplied to an ORDER BY operation.
+    pub sort_inputs: usize,
+    /// Rows returned by the SELECT after ordering and LIMIT.
+    pub output_rows: usize,
+    /// Wall-clock time spent planning and executing the SELECT.
+    pub elapsed: Duration,
+}
+
+/// Results and SELECT profiles from a profiled SQL batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfiledExecution {
+    pub results: Vec<StatementResult>,
+    /// Profiles in the same order as query results in `results`.
+    pub profiles: Vec<QueryProfile>,
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -56,11 +86,44 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         sql::parse(sql)?
             .into_iter()
-            .map(|statement| self.execute_statement(statement))
+            .map(|statement| self.execute_statement(statement, None))
             .collect()
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    /// Execute a SQL batch and collect work counters for each SELECT.
+    ///
+    /// Command statements have no profile. The existing [`Self::execute`] path
+    /// does not allocate profile storage or read the wall clock.
+    pub fn execute_profiled(&mut self, sql: &str) -> Result<ProfiledExecution> {
+        let statements = sql::parse(sql)?;
+        let query_count = statements
+            .iter()
+            .filter(|statement| matches!(statement, Statement::Select(_)))
+            .count();
+        let mut results = Vec::with_capacity(statements.len());
+        let mut profiles = Vec::with_capacity(query_count);
+
+        for statement in statements {
+            if matches!(&statement, Statement::Select(_)) {
+                let started = Instant::now();
+                let mut profile = QueryProfile::default();
+                let result = self.execute_statement(statement, Some(&mut profile))?;
+                profile.elapsed = started.elapsed();
+                results.push(result);
+                profiles.push(profile);
+            } else {
+                results.push(self.execute_statement(statement, None)?);
+            }
+        }
+
+        Ok(ProfiledExecution { results, profiles })
+    }
+
+    fn execute_statement(
+        &mut self,
+        statement: Statement,
+        profile: Option<&mut QueryProfile>,
+    ) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog.create_table(name, columns)?;
@@ -86,11 +149,17 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self
+                .execute_select(select, profile)
+                .map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(
+        &self,
+        select: Select,
+        mut profile: Option<&mut QueryProfile>,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -98,13 +167,36 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
+        let mut matching_rows = Vec::with_capacity(table.row_count());
+        for block in 0..table.block_count() {
+            if predicate
+                .as_ref()
+                .is_some_and(|predicate| !predicate.may_match_block(table, block))
+            {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.blocks_pruned += 1;
+                }
+                continue;
+            }
+
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.blocks_read += 1;
+            }
+            for row in table.block_rows(block) {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.rows_read += 1;
+                }
+                if predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
+                    .is_none_or(|predicate| predicate.evaluate(table, row))
+                {
+                    matching_rows.push(row);
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.predicate_matches += 1;
+                    }
+                }
+            }
+        }
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -114,6 +206,12 @@ impl Database {
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.groups_created = grouped.len();
+                if !ordering.is_empty() {
+                    profile.sort_inputs = grouped.len();
+                }
+            }
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -124,9 +222,18 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
+            if let Some(profile) = profile.as_deref_mut()
+                && !ordering.is_empty()
+            {
+                profile.sort_inputs = matching_rows.len();
+            }
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
         };
+
+        if let Some(profile) = profile {
+            profile.output_rows = rows.len();
+        }
 
         Ok(QueryResult {
             columns: result_columns,
@@ -804,6 +911,54 @@ impl CompiledPredicate {
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
     }
+
+    fn may_match_block(&self, table: &Table, block: usize) -> bool {
+        match self {
+            Self::Comparison {
+                left,
+                operator,
+                right,
+            } => {
+                let (left_min, left_max) = left.block_bounds(table, block);
+                let (right_min, right_max) = right.block_bounds(table, block);
+                comparison_ranges_may_match(left_min, left_max, *operator, right_min, right_max)
+            }
+            Self::And(left, right) => {
+                left.may_match_block(table, block) && right.may_match_block(table, block)
+            }
+            Self::Or(left, right) => {
+                left.may_match_block(table, block) || right.may_match_block(table, block)
+            }
+        }
+    }
+}
+
+fn comparison_ranges_may_match(
+    left_min: ValueRef<'_>,
+    left_max: ValueRef<'_>,
+    operator: ComparisonOperator,
+    right_min: ValueRef<'_>,
+    right_max: ValueRef<'_>,
+) -> bool {
+    let compare = |left: ValueRef<'_>, right: ValueRef<'_>| {
+        left.sql_cmp(right)
+            .expect("predicate operand types are validated")
+    };
+    match operator {
+        ComparisonOperator::Equal => {
+            compare(left_min, right_max) != Ordering::Greater
+                && compare(left_max, right_min) != Ordering::Less
+        }
+        ComparisonOperator::NotEqual => {
+            compare(left_min, left_max) != Ordering::Equal
+                || compare(right_min, right_max) != Ordering::Equal
+                || compare(left_min, right_min) != Ordering::Equal
+        }
+        ComparisonOperator::Less => compare(left_min, right_max) == Ordering::Less,
+        ComparisonOperator::LessOrEqual => compare(left_min, right_max) != Ordering::Greater,
+        ComparisonOperator::Greater => compare(left_max, right_min) == Ordering::Greater,
+        ComparisonOperator::GreaterOrEqual => compare(left_max, right_min) != Ordering::Less,
+    }
 }
 
 #[derive(Debug)]
@@ -824,6 +979,13 @@ impl CompiledOperand {
         match self {
             Self::Column { index, .. } => table.columns()[*index].value_ref(row),
             Self::Literal(value) => value.as_ref(),
+        }
+    }
+
+    fn block_bounds<'a>(&'a self, table: &'a Table, block: usize) -> (ValueRef<'a>, ValueRef<'a>) {
+        match self {
+            Self::Column { index, .. } => table.block_index(*index, block).bounds(),
+            Self::Literal(value) => (value.as_ref(), value.as_ref()),
         }
     }
 }

@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{Database, QueryProfile, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,10 +14,12 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+        --profile             Write one query profile per line to stderr as NDJSON
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
-Command acknowledgements are written to stderr; query data is written to stdout.
+Without --profile, command acknowledgements are written to stderr.
+Query data is always written to stdout.
 JSON output is an object containing a results array, one entry per SELECT.
 ";
 
@@ -48,22 +50,55 @@ fn run() -> Result<(), String> {
     };
 
     let mut database = Database::new();
-    let results = database.execute(&sql).map_err(|error| error.to_string())?;
+    let (results, profiles) = if config.profile {
+        let execution = database
+            .execute_profiled(&sql)
+            .map_err(|error| error.to_string())?;
+        (execution.results, execution.profiles)
+    } else {
+        (
+            database.execute(&sql).map_err(|error| error.to_string())?,
+            Vec::new(),
+        )
+    };
     let mut queries = Vec::new();
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
-                    eprintln!("{tag} {affected_rows}");
-                } else {
-                    eprintln!("{tag}");
+                if !config.profile {
+                    if tag == "INSERT" {
+                        eprintln!("{tag} {affected_rows}");
+                    } else {
+                        eprintln!("{tag}");
+                    }
                 }
             }
             StatementResult::Query(result) => queries.push(result),
         }
     }
+    for profile in &profiles {
+        eprintln!("{}", render_profile(profile));
+    }
     print!("{}", render_query_results(&queries, config.format));
     Ok(())
+}
+
+fn render_profile(profile: &QueryProfile) -> String {
+    format!(
+        concat!(
+            "{{\"rows_read\":{},\"blocks_read\":{},\"blocks_pruned\":{},",
+            "\"predicate_matches\":{},\"groups_created\":{},\"sort_inputs\":{},",
+            "\"output_rows\":{},\"elapsed_ns\":{}}}"
+        ),
+        profile.rows_read,
+        profile.blocks_read,
+        profile.blocks_pruned,
+        profile.predicate_matches,
+        profile.groups_created,
+        profile.sort_inputs,
+        profile.output_rows,
+        profile.elapsed.as_nanos(),
+    )
 }
 
 fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {
@@ -94,16 +129,19 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    profile: bool,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut profile = false;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(None),
+            "--profile" => profile = true,
             "-e" | "--execute" => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -138,7 +176,11 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        profile,
+    }))
 }
 
 #[cfg(test)]

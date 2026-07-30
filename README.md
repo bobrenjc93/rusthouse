@@ -11,6 +11,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- min/max skip indexes on 1,024-row storage blocks
+- opt-in typed execution profiles with scan, pruning, grouping, and sorting counters
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -57,6 +59,13 @@ printf '%s\n' \
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
+Add `--profile` to write one compact JSON profile per SELECT to stderr. In this mode stderr is NDJSON and command acknowledgements are suppressed:
+
+~~~bash
+cargo run -- --profile --format csv --execute \
+  "CREATE TABLE t (id Int64); INSERT INTO t VALUES (1), (2); SELECT * FROM t WHERE id = 2"
+~~~
+
 ## Library API
 
 Database retains an in-memory catalog across calls and returns structured results:
@@ -76,8 +85,14 @@ let StatementResult::Query(result) = &results[0] else {
 };
 assert_eq!(result.rows.len(), 1);
 
+let profiled = database.execute_profiled("SELECT * FROM events WHERE id = 1")?;
+assert_eq!(profiled.profiles[0].rows_read, 1);
+assert_eq!(profiled.profiles[0].predicate_matches, 1);
+
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+`execute_profiled` returns a `ProfiledExecution`; its `profiles` are in SELECT order and contain `Duration`-typed elapsed time alongside exact work counters. Plain `execute` does not allocate profile storage or read the wall clock.
 
 ## Current boundaries
 

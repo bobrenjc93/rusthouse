@@ -3,6 +3,9 @@ use std::collections::HashSet;
 use crate::error::{Error, Result};
 use crate::value::{DataType, Value, ValueRef};
 
+/// Maximum rows covered by one min/max skip-index block.
+pub const BLOCK_SIZE: usize = 1_024;
+
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -21,6 +24,77 @@ pub enum Column {
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
+}
+
+/// Per-block min/max values used to reject blocks that cannot match a predicate.
+#[derive(Debug, Clone)]
+pub(crate) enum BlockIndex {
+    Int64 { min: i64, max: i64 },
+    Float64 { min: f64, max: f64 },
+    Bool { min: bool, max: bool },
+    String { min: String, max: String },
+}
+
+impl BlockIndex {
+    fn new(value: &Value) -> Self {
+        match value {
+            Value::Int64(value) => Self::Int64 {
+                min: *value,
+                max: *value,
+            },
+            Value::Float64(value) => Self::Float64 {
+                min: *value,
+                max: *value,
+            },
+            Value::Bool(value) => Self::Bool {
+                min: *value,
+                max: *value,
+            },
+            Value::String(value) => Self::String {
+                min: value.clone(),
+                max: value.clone(),
+            },
+        }
+    }
+
+    fn update(&mut self, value: &Value) {
+        match (self, value) {
+            (Self::Int64 { min, max }, Value::Int64(value)) => {
+                *min = (*min).min(*value);
+                *max = (*max).max(*value);
+            }
+            (Self::Float64 { min, max }, Value::Float64(value)) => {
+                if value.total_cmp(min).is_lt() {
+                    *min = *value;
+                }
+                if value.total_cmp(max).is_gt() {
+                    *max = *value;
+                }
+            }
+            (Self::Bool { min, max }, Value::Bool(value)) => {
+                *min = (*min).min(*value);
+                *max = (*max).max(*value);
+            }
+            (Self::String { min, max }, Value::String(value)) => {
+                if value < min {
+                    min.clone_from(value);
+                }
+                if value > max {
+                    max.clone_from(value);
+                }
+            }
+            _ => unreachable!("block indexes have the column's physical type"),
+        }
+    }
+
+    pub(crate) fn bounds(&self) -> (ValueRef<'_>, ValueRef<'_>) {
+        match self {
+            Self::Int64 { min, max } => (ValueRef::Int64(*min), ValueRef::Int64(*max)),
+            Self::Float64 { min, max } => (ValueRef::Float64(*min), ValueRef::Float64(*max)),
+            Self::Bool { min, max } => (ValueRef::Bool(*min), ValueRef::Bool(*max)),
+            Self::String { min, max } => (ValueRef::String(min), ValueRef::String(max)),
+        }
+    }
 }
 
 impl Column {
@@ -94,6 +168,7 @@ pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
+    block_indexes: Vec<Vec<BlockIndex>>,
     row_count: usize,
 }
 
@@ -119,11 +194,13 @@ impl Table {
         let columns = schema
             .iter()
             .map(|field| Column::new(field.data_type))
-            .collect();
+            .collect::<Vec<_>>();
+        let block_indexes = vec![Vec::new(); columns.len()];
         Ok(Self {
             name,
             schema,
             columns,
+            block_indexes,
             row_count: 0,
         })
     }
@@ -146,6 +223,20 @@ impl Table {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    #[must_use]
+    pub(crate) fn block_count(&self) -> usize {
+        self.row_count.div_ceil(BLOCK_SIZE)
+    }
+
+    pub(crate) fn block_rows(&self, block: usize) -> std::ops::Range<usize> {
+        let start = block * BLOCK_SIZE;
+        start..start.saturating_add(BLOCK_SIZE).min(self.row_count)
+    }
+
+    pub(crate) fn block_index(&self, column: usize, block: usize) -> &BlockIndex {
+        &self.block_indexes[column][block]
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
@@ -190,7 +281,16 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
-        for (column, value) in self.columns.iter_mut().zip(row) {
+        let starts_block = self.row_count.is_multiple_of(BLOCK_SIZE);
+        for (index, (column, value)) in self.columns.iter_mut().zip(row).enumerate() {
+            if starts_block {
+                self.block_indexes[index].push(BlockIndex::new(&value));
+            } else {
+                self.block_indexes[index]
+                    .last_mut()
+                    .expect("a partial block has an index")
+                    .update(&value);
+            }
             column.push(value);
         }
         self.row_count += 1;
