@@ -20,10 +20,12 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
+    pub having: Option<Box<Predicate>>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -79,6 +81,7 @@ impl AggregateFunction {
 pub enum AggregateArgument {
     Wildcard,
     Column(String),
+    DistinctColumn(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +98,10 @@ pub enum Predicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Column(String),
+    Aggregate {
+        function: AggregateFunction,
+        argument: AggregateArgument,
+    },
     Literal(Value),
 }
 
@@ -442,6 +449,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        let distinct = self.eat_keyword("DISTINCT");
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -453,9 +461,7 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
 
         let predicate = if self.eat_keyword("WHERE") {
-            self.predicate_depth = 0;
-            self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
+            Some(self.parse_predicate()?)
         } else {
             None
         };
@@ -470,6 +476,12 @@ impl Parser {
                 }
             }
         }
+
+        let having = if self.eat_keyword("HAVING") {
+            Some(Box::new(self.parse_predicate()?))
+        } else {
+            None
+        };
 
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
@@ -504,10 +516,12 @@ impl Parser {
         };
 
         Ok(Select {
+            distinct,
             items,
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -521,16 +535,7 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
-            let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!("unknown aggregate function '{name}'"),
-            })?;
-            let argument = if self.eat(&TokenKind::Star) {
-                AggregateArgument::Wildcard
-            } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
-            };
-            self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            let (function, argument) = self.parse_aggregate(&name, position)?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
@@ -549,6 +554,34 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_aggregate(
+        &mut self,
+        name: &str,
+        position: usize,
+    ) -> Result<(AggregateFunction, AggregateArgument)> {
+        let function = AggregateFunction::parse(name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!("unknown aggregate function '{name}'"),
+        })?;
+        let argument = if self.eat_keyword("DISTINCT") {
+            AggregateArgument::DistinctColumn(
+                self.expect_identifier("column after DISTINCT in aggregate")?,
+            )
+        } else if self.eat(&TokenKind::Star) {
+            AggregateArgument::Wildcard
+        } else {
+            AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+        };
+        self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+        Ok((function, argument))
+    }
+
+    fn parse_predicate(&mut self) -> Result<Predicate> {
+        self.predicate_depth = 0;
+        self.predicate_nodes = 0;
+        self.parse_or_predicate()
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -626,9 +659,16 @@ impl Parser {
             {
                 self.parse_literal().map(Operand::Literal)
             }
-            TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
-                .map(Operand::Column),
+            TokenKind::Identifier(_) => {
+                let position = self.position();
+                let name = self.expect_identifier("column, aggregate, or literal")?;
+                if self.eat(&TokenKind::LeftParen) {
+                    let (function, argument) = self.parse_aggregate(&name, position)?;
+                    Ok(Operand::Aggregate { function, argument })
+                } else {
+                    Ok(Operand::Column(name))
+                }
+            }
             _ => self.error("expected column or literal"),
         }
     }
@@ -757,20 +797,54 @@ mod tests {
     #[test]
     fn parses_complete_select_shape() {
         let statements = parse(
-            "SELECT region, SUM(amount) AS total FROM sales \
+            "SELECT DISTINCT region, SUM(amount) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region HAVING total > 5 OR COUNT(DISTINCT amount) >= 2 \
+             ORDER BY total DESC LIMIT 3;",
         )
         .expect("valid SQL");
 
         let Statement::Select(select) = &statements[0] else {
             panic!("expected select");
         };
+        assert!(select.distinct);
         assert_eq!(select.items.len(), 2);
         assert_eq!(select.group_by, ["region"]);
+        assert!(select.having.is_some());
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_count_distinct_in_select_and_having() {
+        let statements = parse(
+            "SELECT COUNT(DISTINCT reading) AS unique_readings FROM measurements \
+             HAVING COUNT(DISTINCT reading) > 0",
+        )
+        .expect("valid SQL");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            &select.items[0],
+            SelectItem::Aggregate {
+                function: AggregateFunction::Count,
+                argument: AggregateArgument::DistinctColumn(column),
+                alias: Some(alias),
+            } if column == "reading" && alias == "unique_readings"
+        ));
+        assert!(matches!(
+            select.having.as_deref(),
+            Some(Predicate::Comparison {
+                left: Operand::Aggregate {
+                    function: AggregateFunction::Count,
+                    argument: AggregateArgument::DistinctColumn(column),
+                },
+                ..
+            }) if column == "reading"
+        ));
     }
 
     #[test]
