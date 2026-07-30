@@ -2,6 +2,7 @@ mod config;
 mod dataset;
 mod normalize;
 mod process;
+mod runner;
 mod score;
 mod workload;
 
@@ -17,6 +18,7 @@ use config::{Config, ParseResult};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs};
 use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use runner::{CORRECTNESS_LIMITS, TIMING_LIMITS, VALIDATION_LIMITS};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -123,7 +125,12 @@ fn main() -> ExitCode {
 }
 
 fn emit_failure(error: String) -> ExitCode {
-    let report = Report {
+    println!("{}", failure_report(error).to_json());
+    ExitCode::FAILURE
+}
+
+fn failure_report(error: String) -> Report {
+    Report {
         score: 0.0,
         summary: "Benchmark rejected: no timing score was accepted.".to_owned(),
         evidence: vec![error],
@@ -131,9 +138,7 @@ fn emit_failure(error: String) -> ExitCode {
             "Fix the reported setup or correctness failure and rerun the identical command."
                 .to_owned(),
         ],
-    };
-    println!("{}", report.to_json());
-    ExitCode::FAILURE
+    }
 }
 
 fn default_rusthouse_path() -> Result<PathBuf, String> {
@@ -319,7 +324,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
+            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, boundedly drains and discards stdout, and performs no startup subtraction",
             settings.query_amplification, settings.query_amplification
         ),
         format!(
@@ -540,7 +545,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,8 +566,17 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"execution_limits\":{{\"validation\":{{\"deadline_ms\":{},\"stdout_byte_cap\":{},\"stderr_byte_cap\":{}}},\"correctness\":{{\"deadline_ms\":{},\"stdout_byte_cap\":{},\"stderr_byte_cap\":{}}},\"timing\":{{\"deadline_ms\":{},\"stdout_byte_cap\":{},\"stderr_byte_cap\":{}}}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
+        VALIDATION_LIMITS.deadline.as_millis(),
+        VALIDATION_LIMITS.stdout_bytes,
+        VALIDATION_LIMITS.stderr_bytes,
+        CORRECTNESS_LIMITS.deadline.as_millis(),
+        CORRECTNESS_LIMITS.stdout_bytes,
+        CORRECTNESS_LIMITS.stderr_bytes,
+        TIMING_LIMITS.deadline.as_millis(),
+        TIMING_LIMITS.stdout_bytes,
+        TIMING_LIMITS.stderr_bytes,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.version_output),
@@ -799,5 +813,53 @@ mod tests {
             "{\"score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
         );
         assert!(!report.contains('\n'));
+    }
+
+    #[test]
+    fn subprocess_rejections_fail_the_score_closed() {
+        let report = failure_report("timing child exceeded its stdout cap".to_owned());
+
+        assert_eq!(report.score, 0.0);
+        assert!(report.to_json().contains("\"score\":0.000000"));
+        assert!(
+            report
+                .to_json()
+                .contains("timing child exceeded its stdout cap")
+        );
+    }
+
+    #[test]
+    fn details_json_records_every_subprocess_limit() {
+        let config = Config {
+            mode: config::Mode::Quick,
+            seed: 1,
+            rusthouse: PathBuf::from("rusthouse"),
+            clickhouse: PathBuf::from("clickhouse"),
+            details: None,
+        };
+        let identity = ClickHouseIdentity {
+            version_output: "ClickHouse 26.7.1".to_owned(),
+            sha256: process::CLICKHOUSE_SHA256.to_owned(),
+        };
+        let score = ScoreBreakdown {
+            score: 50.0,
+            saturated_cases: 0,
+        };
+        let details = details_json(&config, &identity, &[], score, score, 0);
+
+        assert!(details.contains("\"schema_version\":3"));
+        for (phase, limits) in [
+            ("validation", VALIDATION_LIMITS),
+            ("correctness", CORRECTNESS_LIMITS),
+            ("timing", TIMING_LIMITS),
+        ] {
+            let recorded = format!(
+                "\"{phase}\":{{\"deadline_ms\":{},\"stdout_byte_cap\":{},\"stderr_byte_cap\":{}}}",
+                limits.deadline.as_millis(),
+                limits.stdout_bytes,
+                limits.stderr_bytes
+            );
+            assert!(details.contains(&recorded), "missing {phase} limits");
+        }
     }
 }

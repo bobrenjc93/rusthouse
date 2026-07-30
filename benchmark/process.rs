@@ -1,7 +1,8 @@
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
+
+use crate::runner::{CapturedStream, ExecutionPhase, run_bounded};
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
 pub const CLICKHOUSE_SHA256: &str =
@@ -77,7 +78,7 @@ impl EnginePaths {
         batch: &str,
         capture_stdout: bool,
     ) -> Result<(Duration, Option<String>), String> {
-        let mut command = match engine {
+        let command = match engine {
             Engine::RustHouse => {
                 let mut command = Command::new(&self.rusthouse);
                 command.args(["--format", "csv"]);
@@ -89,33 +90,19 @@ impl EnginePaths {
                 command
             }
         };
-        command
-            .stdin(Stdio::piped())
-            .stdout(if capture_stdout {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stderr(Stdio::piped());
-
-        let started = Instant::now();
-        let mut child = command.spawn().map_err(|error| {
-            format!(
-                "could not start {} at '{}': {error}",
-                engine.name(),
-                engine.path(self).display()
-            )
-        })?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("{} stdin was not piped", engine.name()))?
-            .write_all(batch.as_bytes())
-            .map_err(|error| format!("could not write SQL to {}: {error}", engine.name()))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("could not wait for {}: {error}", engine.name()))?;
-        let elapsed = started.elapsed();
+        let phase = if capture_stdout {
+            ExecutionPhase::Correctness
+        } else {
+            ExecutionPhase::Timing
+        };
+        let label = format!("{} at '{}'", engine.name(), engine.path(self).display());
+        let output = run_bounded(
+            command,
+            Some(batch.as_bytes().to_vec()),
+            phase,
+            capture_stdout,
+            &label,
+        )?;
 
         if !output.status.success() {
             return Err(format!(
@@ -127,13 +114,13 @@ impl EnginePaths {
         }
         let stdout =
             if capture_stdout {
-                Some(String::from_utf8(output.stdout).map_err(|error| {
+                Some(String::from_utf8(output.stdout.prefix).map_err(|error| {
                     format!("{} emitted non-UTF-8 output: {error}", engine.name())
                 })?)
             } else {
                 None
             };
-        Ok((elapsed, stdout))
+        Ok((output.elapsed, stdout))
     }
 }
 
@@ -176,12 +163,10 @@ impl Engine {
 }
 
 fn validate_rusthouse(path: &Path) -> Result<(), String> {
-    let output = Command::new(path).arg("--help").output().map_err(|error| {
-        format!(
-            "could not execute RustHouse at '{}': {error}",
-            path.display()
-        )
-    })?;
+    let mut command = Command::new(path);
+    command.arg("--help");
+    let label = format!("RustHouse validation at '{}'", path.display());
+    let output = run_bounded(command, None, ExecutionPhase::Validation, true, &label)?;
     if !output.status.success() {
         return Err(format!(
             "RustHouse validation failed with {}: {}",
@@ -193,15 +178,16 @@ fn validate_rusthouse(path: &Path) -> Result<(), String> {
 }
 
 fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
-    let output = Command::new(path)
-        .args(["local", "--version"])
-        .output()
-        .map_err(|error| {
-            format!(
-                "could not execute ClickHouse Local at '{}': {error}",
-                path.display()
-            )
-        })?;
+    let mut version_command = Command::new(path);
+    version_command.args(["local", "--version"]);
+    let version_label = format!("ClickHouse version validation at '{}'", path.display());
+    let output = run_bounded(
+        version_command,
+        None,
+        ExecutionPhase::Validation,
+        true,
+        &version_label,
+    )?;
     if !output.status.success() {
         return Err(format!(
             "ClickHouse version check failed with {}: {}",
@@ -209,7 +195,7 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
             summarize_stderr(&output.stderr)
         ));
     }
-    let version_output = String::from_utf8(output.stdout)
+    let version_output = String::from_utf8(output.stdout.prefix)
         .map_err(|error| format!("ClickHouse version output was not UTF-8: {error}"))?
         .trim()
         .to_owned();
@@ -219,11 +205,15 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
         ));
     }
 
-    let checksum = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .map_err(|error| format!("could not calculate ClickHouse SHA-256: {error}"))?;
+    let mut checksum_command = Command::new("shasum");
+    checksum_command.args(["-a", "256"]).arg(path);
+    let checksum = run_bounded(
+        checksum_command,
+        None,
+        ExecutionPhase::Validation,
+        true,
+        "ClickHouse SHA-256 validation",
+    )?;
     if !checksum.status.success() {
         return Err(format!(
             "ClickHouse checksum failed with {}: {}",
@@ -231,7 +221,7 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
             summarize_stderr(&checksum.stderr)
         ));
     }
-    let checksum_output = String::from_utf8(checksum.stdout)
+    let checksum_output = String::from_utf8(checksum.stdout.prefix)
         .map_err(|error| format!("checksum output was not UTF-8: {error}"))?;
     let sha256 = checksum_output
         .split_whitespace()
@@ -254,11 +244,11 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
     })
 }
 
-fn summarize_stderr(stderr: &[u8]) -> String {
-    let rendered = String::from_utf8_lossy(stderr);
-    let mut summary = rendered.trim().chars().take(2_000).collect::<String>();
-    if rendered.trim().chars().count() > 2_000 {
-        summary.push_str("...");
+fn summarize_stderr(stderr: &CapturedStream) -> String {
+    let rendered = String::from_utf8_lossy(&stderr.prefix);
+    let mut summary = rendered.trim().to_owned();
+    if stderr.total_bytes > stderr.prefix.len() {
+        summary.push_str("... [truncated]");
     }
     if summary.is_empty() {
         "<no stderr>".to_owned()
