@@ -101,6 +101,16 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
             ],
         },
         Workload {
+            name: "high_cardinality_grouped_top_k",
+            family: Family::HighCardinalityGroupBy,
+            sql: "SELECT high_key, COUNT(*) AS row_count, SUM(skewed_num) AS total FROM parity_data GROUP BY high_key ORDER BY total DESC, high_key LIMIT 100;".to_owned(),
+            columns: vec![
+                ("high_key", ColumnType::String),
+                ("row_count", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
+        Workload {
             name: "numeric_order_by_limit",
             family: Family::OrderByLimit,
             sql: "SELECT id, score, payload, uniform_num FROM parity_data ORDER BY score DESC, id LIMIT 25;".to_owned(),
@@ -138,6 +148,7 @@ mod tests {
             .map(|workload| workload.family)
             .collect::<BTreeSet<_>>();
 
+        assert_eq!(workloads.len(), 9);
         assert_eq!(families.len(), 7);
         assert!(
             workloads
@@ -164,6 +175,12 @@ mod tests {
                 .iter()
                 .any(|workload| workload.sql.contains("GROUP BY high_key"))
         );
+        assert!(workloads.iter().any(|workload| {
+            workload.name == "high_cardinality_grouped_top_k"
+                && workload
+                    .sql
+                    .contains("GROUP BY high_key ORDER BY total DESC, high_key LIMIT 100")
+        }));
         assert!(
             workloads
                 .iter()

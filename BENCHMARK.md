@@ -79,7 +79,7 @@ A dependency-free SplitMix64 generator produces deterministic typed rows. Every 
 
 The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix.
 
-Each row count runs eight cases spanning:
+Each row count runs nine cases spanning:
 
 | Family | Coverage |
 | --- | --- |
@@ -88,8 +88,11 @@ Each row count runs eight cases spanning:
 | Compound filter | Parenthesized AND/OR, Boolean, uniform, and skewed columns |
 | Nonselective filter | A predicate expected to retain about 97.5% of rows |
 | Low-cardinality grouping | String plus Boolean grouping with several aggregates |
-| High-cardinality grouping | Unique string-key grouping, deterministic ordering, bounded output |
+| High-cardinality grouping | Unique string-key grouping with key-ordered and aggregate-ordered bounded top-k output |
 | Ordering and limit | Numeric and string sort shapes with deterministic tie breakers |
+
+The aggregate-ordered high-cardinality case specifically guards against sorting every group by
+key before applying a limit-aware top-k on an aggregate result.
 
 The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
 

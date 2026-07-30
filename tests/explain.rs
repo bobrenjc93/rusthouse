@@ -1,4 +1,4 @@
-use rusthouse::plan::{LogicalOperator, PlanNode};
+use rusthouse::plan::{LogicalOperator, PlanNode, SortExpression};
 use rusthouse::sql::{self, Statement};
 use rusthouse::{Database, QueryResult, StatementResult, Value};
 
@@ -64,8 +64,14 @@ fn planner_builds_resolved_analytical_pipeline() {
         panic!("expected TopK root")
     };
     assert_eq!(*limit, 5);
-    assert_eq!(ordering[0].output, 2);
-    assert_eq!(ordering[0].name, "total");
+    assert!(matches!(
+        &ordering[0],
+        SortExpression::Output {
+            output: 2,
+            name,
+            descending: true,
+        } if name == "total"
+    ));
 
     let projection = input(&plan.root);
     assert!(matches!(
@@ -137,6 +143,31 @@ fn explain_distinguishes_sort_and_limit_nodes() {
         "EXPLAIN SELECT n FROM numbers LIMIT 2",
     ));
     assert_eq!(limited[0], "Limit [limit=2]");
+}
+
+#[test]
+fn implicit_group_ordering_is_an_explicit_sort_or_top_k() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE grouped (label String, amount Int64)")
+        .expect("setup");
+
+    let sorted = plan_lines(query(
+        &mut database,
+        "EXPLAIN SELECT label, SUM(amount) AS total FROM grouped GROUP BY label",
+    ));
+    assert_eq!(sorted[0], "Sort [order_by=[group_key=[label#0] ASC]]");
+    assert!(sorted[1].trim_start().starts_with("Projection "));
+    assert!(sorted[2].trim_start().starts_with("Aggregation "));
+
+    let limited = plan_lines(query(
+        &mut database,
+        "EXPLAIN SELECT label, SUM(amount) AS total FROM grouped GROUP BY label LIMIT 2",
+    ));
+    assert_eq!(
+        limited[0],
+        "TopK [order_by=[group_key=[label#0] ASC], limit=2]"
+    );
 }
 
 #[test]

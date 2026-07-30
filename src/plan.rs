@@ -35,8 +35,13 @@ impl LogicalPlan {
         let group_by = resolve_group_columns(table, &select.group_by)?;
         let (projection, output_columns, aggregates) =
             resolve_select_items(table, &select.items, &group_by)?;
-        let ordering = resolve_ordering(&output_columns, &select.order_by)?;
+        let mut ordering = resolve_ordering(&output_columns, &select.order_by)?;
         let grouped = !group_by.is_empty() || !aggregates.is_empty();
+        if ordering.is_empty() && !group_by.is_empty() {
+            ordering.push(SortExpression::GroupKey {
+                columns: group_by.clone(),
+            });
+        }
 
         let mut builder = PlanBuilder::default();
         let source_columns = table
@@ -293,10 +298,15 @@ impl AggregateExpression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SortExpression {
-    pub output: usize,
-    pub name: String,
-    pub descending: bool,
+pub enum SortExpression {
+    Output {
+        output: usize,
+        name: String,
+        descending: bool,
+    },
+    GroupKey {
+        columns: Vec<ResolvedColumn>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -598,7 +608,7 @@ fn resolve_ordering(
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
             match matches.as_slice() {
-                [output] => Ok(SortExpression {
+                [output] => Ok(SortExpression::Output {
                     output: *output,
                     name: columns[*output].name.clone(),
                     descending: order.descending,
@@ -678,12 +688,18 @@ fn comparable(left: DataType, right: DataType) -> bool {
 fn format_ordering(ordering: &[SortExpression]) -> String {
     ordering
         .iter()
-        .map(|order| {
-            format!(
-                "{} {}",
-                order.name,
-                if order.descending { "DESC" } else { "ASC" }
-            )
+        .map(|order| match order {
+            SortExpression::Output {
+                name, descending, ..
+            } => format!("{} {}", name, if *descending { "DESC" } else { "ASC" }),
+            SortExpression::GroupKey { columns } => format!(
+                "group_key=[{}] ASC",
+                columns
+                    .iter()
+                    .map(ResolvedColumn::reference)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         })
         .collect::<Vec<_>>()
         .join(", ")

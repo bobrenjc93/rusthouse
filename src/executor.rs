@@ -73,8 +73,7 @@ fn execute_node<'table, 'plan>(
                 unreachable!("Aggregation consumes source rows")
             };
             let grouped = execute_grouped(table, &rows, group_by, aggregates)?;
-            let mut selected = (0..grouped.len()).collect::<Vec<_>>();
-            selected.sort_unstable_by(|left, right| grouped.keys[*left].cmp(&grouped.keys[*right]));
+            let selected = (0..grouped.len()).collect::<Vec<_>>();
             let data = ExecutionData::Grouped { grouped, selected };
             record_metric(node, &data, started, metrics);
             Ok(data)
@@ -209,14 +208,20 @@ impl ProjectedData<'_, '_> {
             Self::Source { rows, columns } => {
                 sort_and_limit(rows, limit, |left, right| {
                     for order in ordering {
+                        let SortExpression::Output {
+                            output, descending, ..
+                        } = order
+                        else {
+                            unreachable!("source rows have no group key")
+                        };
                         let ProjectionExpression::Column { source, .. } =
-                            &columns[order.output].expression
+                            &columns[*output].expression
                         else {
                             unreachable!("ungrouped projections cannot contain aggregates")
                         };
                         let comparison = table.columns()[source.index].cmp_at(left, right);
                         if !comparison.is_eq() {
-                            return direction(comparison, order.descending);
+                            return direction(comparison, *descending);
                         }
                     }
                     left.cmp(&right)
@@ -229,23 +234,33 @@ impl ProjectedData<'_, '_> {
             } => {
                 sort_and_limit(selected, limit, |left, right| {
                     for order in ordering {
-                        let comparison = match &columns[order.output].expression {
-                            ProjectionExpression::Column {
-                                group_position: Some(position),
-                                ..
-                            } => grouped.keys[left]
-                                .value(*position)
-                                .cmp(&grouped.keys[right].value(*position)),
-                            ProjectionExpression::Column {
-                                group_position: None,
-                                ..
-                            } => unreachable!("grouped columns are resolved"),
-                            ProjectionExpression::Aggregate { state, .. } => grouped.aggregates
-                                [*state][left]
-                                .cmp(&grouped.aggregates[*state][right]),
+                        let (comparison, descending) = match order {
+                            SortExpression::Output {
+                                output, descending, ..
+                            } => {
+                                let comparison = match &columns[*output].expression {
+                                    ProjectionExpression::Column {
+                                        group_position: Some(position),
+                                        ..
+                                    } => grouped.keys[left]
+                                        .value(*position)
+                                        .cmp(&grouped.keys[right].value(*position)),
+                                    ProjectionExpression::Column {
+                                        group_position: None,
+                                        ..
+                                    } => unreachable!("grouped columns are resolved"),
+                                    ProjectionExpression::Aggregate { state, .. } => grouped
+                                        .aggregates[*state][left]
+                                        .cmp(&grouped.aggregates[*state][right]),
+                                };
+                                (comparison, *descending)
+                            }
+                            SortExpression::GroupKey { .. } => {
+                                (grouped.keys[left].cmp(&grouped.keys[right]), false)
+                            }
                         };
                         if !comparison.is_eq() {
-                            return direction(comparison, order.descending);
+                            return direction(comparison, descending);
                         }
                     }
                     grouped.keys[left].cmp(&grouped.keys[right])
