@@ -13,9 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::engine::{ExecutionBudget, ExecutionBudgetLimits, RetainedStateLimits};
-use crate::format::{OutputFormat, render};
+use crate::format::{OutputFormat, render, rendered_len};
 use crate::sql::{self, Statement};
-use crate::{Database, Error, QueryResult, StatementResult, Value};
+use crate::{Database, Error, StatementResult};
 
 /// Maximum accepted SQL request body size (1 MiB).
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -318,6 +318,12 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<Request, Re
                 400,
                 "Bad Request",
                 "Transfer-Encoding is not supported",
+            ));
+        } else if name.eq_ignore_ascii_case("expect") {
+            return Err(Response::error(
+                417,
+                "Expectation Failed",
+                "Expect header is not supported",
             ));
         } else if name.eq_ignore_ascii_case("accept") {
             accept = Some(value.to_owned());
@@ -680,11 +686,12 @@ fn execute_batch(
         };
         let separator = usize::from(query_count > 0);
         let closing = usize::from(format == OutputFormat::Json) * 3;
-        let estimated = render_size_upper_bound(&query)?;
+        let encoded_length = rendered_len(&query, format)
+            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
         let projected_size = output
             .len()
             .checked_add(separator)
-            .and_then(|size| size.checked_add(estimated))
+            .and_then(|size| size.checked_add(encoded_length))
             .and_then(|size| size.checked_add(closing))
             .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
         if projected_size > MAX_RESPONSE_BYTES {
@@ -713,35 +720,6 @@ fn execute_batch(
         output.push_str("]}\n");
     }
     Ok(output.into_bytes())
-}
-
-fn render_size_upper_bound(result: &QueryResult) -> crate::Result<usize> {
-    let mut size = 128_usize;
-    for column in &result.columns {
-        size = size
-            .checked_add(64)
-            .and_then(|size| size.checked_add(column.name.len().checked_mul(6)?))
-            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
-    }
-    for row in &result.rows {
-        size = size
-            .checked_add(16)
-            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
-        for value in row {
-            let value_size = match value {
-                Value::String(value) => value
-                    .len()
-                    .checked_mul(6)
-                    .and_then(|size| size.checked_add(8)),
-                Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => Some(40),
-            }
-            .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
-            size = size
-                .checked_add(value_size)
-                .ok_or_else(|| Error::ResourceLimit("encoded response size overflow".to_owned()))?;
-        }
-    }
-    Ok(size)
 }
 
 fn execution_error_response(error: Error) -> Response {

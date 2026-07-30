@@ -118,7 +118,7 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+The crate uses `ctrlc` for portable SIGINT and SIGTERM handling. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check

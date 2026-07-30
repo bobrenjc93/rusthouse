@@ -31,6 +31,93 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     }
 }
 
+pub(crate) fn rendered_len(result: &QueryResult, format: OutputFormat) -> Option<usize> {
+    match format {
+        OutputFormat::Json => json_len(result),
+        OutputFormat::Csv => csv_len(result),
+        OutputFormat::Table => None,
+    }
+}
+
+fn checked_add(total: &mut usize, amount: usize) -> Option<()> {
+    *total = total.checked_add(amount)?;
+    Some(())
+}
+
+fn json_len(result: &QueryResult) -> Option<usize> {
+    let mut length = "{\"columns\":[".len();
+    for (index, column) in result.columns.iter().enumerate() {
+        checked_add(&mut length, usize::from(index > 0))?;
+        checked_add(&mut length, "{\"name\":".len())?;
+        checked_add(&mut length, json_string_len(&column.name)?)?;
+        checked_add(&mut length, ",\"type\":".len())?;
+        checked_add(&mut length, json_string_len(&column.data_type.to_string())?)?;
+        checked_add(&mut length, 1)?;
+    }
+    checked_add(&mut length, "],\"rows\":[".len())?;
+    for (row_index, row) in result.rows.iter().enumerate() {
+        checked_add(&mut length, usize::from(row_index > 0) + 1)?;
+        for (column_index, value) in row.iter().enumerate() {
+            checked_add(&mut length, usize::from(column_index > 0))?;
+            checked_add(&mut length, json_value_len(value)?)?;
+        }
+        checked_add(&mut length, 1)?;
+    }
+    checked_add(&mut length, "]}".len())?;
+    Some(length)
+}
+
+fn json_value_len(value: &Value) -> Option<usize> {
+    match value {
+        Value::Int64(value) => Some(value.to_string().len()),
+        Value::Float64(value) => Some(Value::Float64(*value).as_display_string().len()),
+        Value::Bool(value) => Some(value.to_string().len()),
+        Value::String(value) => json_string_len(value),
+    }
+}
+
+fn json_string_len(value: &str) -> Option<usize> {
+    let mut length = 2_usize;
+    for character in value.chars() {
+        checked_add(
+            &mut length,
+            match character {
+                '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+                value if value.is_control() => 6,
+                value => value.len_utf8(),
+            },
+        )?;
+    }
+    Some(length)
+}
+
+fn csv_len(result: &QueryResult) -> Option<usize> {
+    let mut length = csv_row_len(result.columns.iter().map(|column| column.name.as_str()))?;
+    for row in &result.rows {
+        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
+        checked_add(&mut length, csv_row_len(values.iter().map(String::as_str))?)?;
+    }
+    Some(length)
+}
+
+fn csv_row_len<'a>(values: impl Iterator<Item = &'a str>) -> Option<usize> {
+    let mut length = 1_usize;
+    for (index, value) in values.enumerate() {
+        checked_add(&mut length, usize::from(index > 0))?;
+        if value.contains([',', '"', '\n', '\r']) {
+            checked_add(&mut length, value.len())?;
+            checked_add(
+                &mut length,
+                value.bytes().filter(|byte| *byte == b'"').count(),
+            )?;
+            checked_add(&mut length, 2)?;
+        } else {
+            checked_add(&mut length, value.len())?;
+        }
+    }
+    Some(length)
+}
+
 /// Render all query results from a statement batch.
 ///
 /// JSON is returned as one document. Non-JSON result sets are separated by a
@@ -268,6 +355,21 @@ mod tests {
         assert!(output.starts_with("{\"results\":[{"));
         assert_eq!(output.matches("\"columns\"").count(), 2);
         assert!(output.ends_with("]}\n"));
+    }
+
+    #[test]
+    fn exact_lengths_match_json_and_csv_rendering() {
+        let mut result = result();
+        result.rows.push(vec![
+            Value::Int64(-42),
+            Value::String("quote: \"; controls: \n\u{08}; unicode: cafe\u{301}".to_owned()),
+        ]);
+        for format in [OutputFormat::Json, OutputFormat::Csv] {
+            assert_eq!(
+                rendered_len(&result, format),
+                Some(render(&result, format).len())
+            );
+        }
     }
 
     #[test]

@@ -317,7 +317,7 @@ fn fragmented_requests_and_large_responses_complete() {
     let response = read_response(stream).expect("read fragmented request response");
     assert_eq!(response.status, 200);
 
-    let value = "x".repeat(512 * 1024);
+    let value = "x".repeat(800 * 1024);
     let insert = format!("INSERT INTO fragments VALUES ('{value}')");
     assert_eq!(
         server
@@ -340,6 +340,19 @@ fn fragmented_requests_and_large_responses_complete() {
         .and_then(|value| value.parse::<usize>().ok())
         .expect("response content length");
     assert_eq!(declared_length, response.body.len());
+}
+
+#[test]
+fn expect_continue_is_rejected_before_the_client_sends_a_body() {
+    let server = TestServer::start();
+    let started = Instant::now();
+    let response = server.raw_request(
+        b"POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/sql\r\nExpect: 100-continue\r\nContent-Length: 32\r\n\r\n",
+    );
+    assert_eq!(response.status, 417);
+    assert!(response.body.contains("Expect header is not supported"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(server.request("GET", "/health", None, b"").status, 200);
 }
 
 #[test]
