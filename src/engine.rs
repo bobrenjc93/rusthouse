@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::aggregate::{DEFAULT_HLL_PRECISION, HyperLogLog, MAX_HLL_PRECISION, MIN_HLL_PRECISION};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
@@ -151,6 +152,7 @@ struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+    precision: Option<u8>,
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -232,6 +234,7 @@ fn resolve_select_items(
             SelectItem::Aggregate {
                 function,
                 argument,
+                precision,
                 alias,
             } => {
                 let (argument_index, input_type, argument_name) = match argument {
@@ -253,18 +256,22 @@ fn resolve_select_items(
                         )
                     }
                 };
-                validate_aggregate(*function, input_type)?;
+                let resolved_precision = validate_aggregate(*function, input_type, *precision)?;
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
                     function: *function,
                     argument: argument_index,
                     input_type,
+                    precision: resolved_precision,
                 });
                 items.push(ResolvedItem::Aggregate { state });
+                let rendered_argument = precision.map_or(argument_name.clone(), |precision| {
+                    format!("{argument_name}, {precision}")
+                });
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
-                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                        .unwrap_or_else(|| format!("{}({rendered_argument})", function.name())),
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
@@ -274,7 +281,11 @@ fn resolve_select_items(
     Ok((items, result_columns, aggregate_specs))
 }
 
-fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
+fn validate_aggregate(
+    function: AggregateFunction,
+    input_type: Option<DataType>,
+    precision: Option<i64>,
+) -> Result<Option<u8>> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
         && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
     {
@@ -285,12 +296,26 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
             actual,
         });
     }
-    Ok(())
+    if function == AggregateFunction::ApproxCountDistinct {
+        let precision = precision.unwrap_or(i64::from(DEFAULT_HLL_PRECISION));
+        if !(i64::from(MIN_HLL_PRECISION)..=i64::from(MAX_HLL_PRECISION)).contains(&precision) {
+            return Err(Error::InvalidQuery(format!(
+                "APPROX_COUNT_DISTINCT precision must be between {MIN_HLL_PRECISION} and \
+                 {MAX_HLL_PRECISION}, found {precision}"
+            )));
+        }
+        return Ok(Some(precision as u8));
+    }
+    debug_assert!(
+        precision.is_none(),
+        "parser rejects extra aggregate arguments"
+    );
+    Ok(None)
 }
 
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
-        AggregateFunction::Count => DataType::Int64,
+        AggregateFunction::Count | AggregateFunction::ApproxCountDistinct => DataType::Int64,
         AggregateFunction::Avg => DataType::Float64,
         AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
             input_type.expect("validated column argument")
@@ -524,6 +549,7 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
+    ApproxCountDistinct(HyperLogLog),
     SumInt(i64),
     SumFloat(f64),
     Min(Option<Value>),
@@ -536,6 +562,9 @@ impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
+            AggregateFunction::ApproxCountDistinct => Self::ApproxCountDistinct(HyperLogLog::new(
+                spec.precision.expect("validated HLL precision"),
+            )),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
@@ -553,6 +582,11 @@ impl AggregateState {
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+            }
+            Self::ApproxCountDistinct(state) => {
+                let column =
+                    &table.columns()[spec.argument.expect("APPROX_COUNT_DISTINCT argument")];
+                state.insert(column.value_ref(row));
             }
             Self::SumInt(sum) => {
                 let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
@@ -627,6 +661,7 @@ impl AggregateState {
     fn finish(self) -> Result<Value> {
         match self {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
+            Self::ApproxCountDistinct(state) => state.estimate().map(Value::Int64),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {

@@ -311,6 +311,122 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn approximate_distinct_supports_all_scalar_types_duplicates_and_groups() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (
+                cohort String, int_value Int64, float_value Float64,
+                bool_value Bool, string_value String
+             );
+             INSERT INTO samples VALUES
+                ('a', 1, 1.0, true, 'x'),
+                ('a', 1, 1.0, true, 'x'),
+                ('a', 2, 2.0, false, 'y'),
+                ('b', 10, 10.0, true, 'z'),
+                ('b', 11, 11.0, true, 'zz');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT cohort,
+                APPROX_COUNT_DISTINCT(int_value) AS ints,
+                APPROX_COUNT_DISTINCT(float_value) AS floats,
+                APPROX_COUNT_DISTINCT(bool_value) AS bools,
+                APPROX_COUNT_DISTINCT(string_value, 10) AS strings
+         FROM samples GROUP BY cohort ORDER BY cohort;",
+    );
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::String,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(2),
+            ],
+        ]
+    );
+
+    database
+        .execute("CREATE TABLE empty_values (id Int64);")
+        .expect("empty table created");
+    let empty = execute_query(
+        &mut database,
+        "SELECT APPROX_COUNT_DISTINCT(id) AS distinct_ids FROM empty_values;",
+    );
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn approximate_distinct_validates_precision_and_argument_shape() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2);")
+        .expect("setup succeeds");
+
+    for precision in [-1, 3, 19] {
+        let error = database
+            .execute(&format!(
+                "SELECT APPROX_COUNT_DISTINCT(id, {precision}) FROM events"
+            ))
+            .expect_err("precision is outside the supported range");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message)
+                if message.contains("precision must be between 4 and 18")
+        ));
+    }
+
+    for precision in [4, 18] {
+        database
+            .execute(&format!(
+                "SELECT APPROX_COUNT_DISTINCT(id, {precision}) FROM events"
+            ))
+            .expect("boundary precision is valid");
+    }
+
+    let decimal = database
+        .execute("SELECT APPROX_COUNT_DISTINCT(id, 4.5) FROM events")
+        .expect_err("precision must be integral");
+    assert!(matches!(
+        decimal,
+        Error::Sql { message, .. } if message.contains("precision must be an integer literal")
+    ));
+
+    let wildcard = database
+        .execute("SELECT APPROX_COUNT_DISTINCT(*) FROM events")
+        .expect_err("a typed column is required");
+    assert!(matches!(
+        wildcard,
+        Error::InvalidQuery(message) if message.contains("use a column argument")
+    ));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database

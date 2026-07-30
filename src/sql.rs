@@ -38,6 +38,7 @@ pub enum SelectItem {
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
+        precision: Option<i64>,
         alias: Option<String>,
     },
 }
@@ -49,6 +50,7 @@ pub enum AggregateFunction {
     Min,
     Max,
     Avg,
+    ApproxCountDistinct,
 }
 
 impl AggregateFunction {
@@ -60,6 +62,7 @@ impl AggregateFunction {
             Self::Min => "MIN",
             Self::Max => "MAX",
             Self::Avg => "AVG",
+            Self::ApproxCountDistinct => "APPROX_COUNT_DISTINCT",
         }
     }
 
@@ -70,6 +73,7 @@ impl AggregateFunction {
             "MIN" => Some(Self::Min),
             "MAX" => Some(Self::Max),
             "AVG" => Some(Self::Avg),
+            "APPROX_COUNT_DISTINCT" => Some(Self::ApproxCountDistinct),
             _ => None,
         }
     }
@@ -530,11 +534,23 @@ impl Parser {
             } else {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
             };
+            let precision = if self.eat(&TokenKind::Comma) {
+                if function != AggregateFunction::ApproxCountDistinct {
+                    return self.error(format!(
+                        "{} does not accept a precision argument",
+                        function.name()
+                    ));
+                }
+                Some(self.parse_aggregate_precision()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
                 argument,
+                precision,
                 alias,
             })
         } else {
@@ -549,6 +565,32 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_aggregate_precision(&mut self) -> Result<i64> {
+        let position = self.position();
+        let negative = self.eat(&TokenKind::Minus);
+        let Some(number) = self.take_number() else {
+            return Err(Error::Sql {
+                position,
+                message: "aggregate precision must be an integer literal".to_owned(),
+            });
+        };
+        if number.contains(['.', 'e', 'E']) {
+            return Err(Error::Sql {
+                position,
+                message: "aggregate precision must be an integer literal".to_owned(),
+            });
+        }
+        let signed = if negative {
+            format!("-{number}")
+        } else {
+            number
+        };
+        signed.parse::<i64>().map_err(|_| Error::Sql {
+            position,
+            message: format!("invalid aggregate precision '{signed}'"),
+        })
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -771,6 +813,35 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_approx_count_distinct_precision() {
+        let statements = parse(
+            "SELECT APPROX_COUNT_DISTINCT(user_id, 15) AS users, \
+             APPROX_COUNT_DISTINCT(session_id) FROM events",
+        )
+        .expect("valid approximate aggregates");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            &select.items[0],
+            SelectItem::Aggregate {
+                function: AggregateFunction::ApproxCountDistinct,
+                argument: AggregateArgument::Column(column),
+                precision: Some(15),
+                alias: Some(alias),
+            } if column == "user_id" && alias == "users"
+        ));
+        assert!(matches!(
+            &select.items[1],
+            SelectItem::Aggregate {
+                function: AggregateFunction::ApproxCountDistinct,
+                precision: None,
+                ..
+            }
+        ));
     }
 
     #[test]
