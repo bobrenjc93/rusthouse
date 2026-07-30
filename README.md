@@ -11,11 +11,14 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- typed UNION ALL across two or more SELECT arms
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+`UNION ALL` requires the same number of output columns in every arm. Corresponding types must match, except that `Int64` and `Float64` are widened to `Float64`. Rows retain arm order unless a final `ORDER BY` is present, and output column names come from the first arm. A trailing `ORDER BY` or `LIMIT` applies to the combined result.
 
 ## CLI
 

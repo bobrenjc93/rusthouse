@@ -5,7 +5,7 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    Select, SelectArm, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -91,6 +91,65 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
+        if select.arms.len() == 1 {
+            return self.execute_select_arm(&select.arms[0], &select.order_by, select.limit);
+        }
+
+        self.execute_union_all(&select.arms, &select.order_by, select.limit)
+    }
+
+    fn execute_union_all(
+        &self,
+        arms: &[SelectArm],
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+    ) -> Result<QueryResult> {
+        let mut results = arms
+            .iter()
+            .map(|arm| self.execute_select_arm(arm, &[], None));
+        let mut combined = results
+            .next()
+            .expect("a parsed SELECT has at least one arm")?;
+
+        for (arm_index, result) in results.enumerate() {
+            let mut result = result?;
+            let arm_number = arm_index + 2;
+            if result.columns.len() != combined.columns.len() {
+                return Err(Error::InvalidQuery(format!(
+                    "UNION ALL arm {arm_number} has {} columns; first arm has {}",
+                    result.columns.len(),
+                    combined.columns.len()
+                )));
+            }
+
+            for (column_index, (combined_column, arm_column)) in
+                combined.columns.iter_mut().zip(&result.columns).enumerate()
+            {
+                combined_column.data_type = union_output_type(
+                    combined_column.data_type,
+                    arm_column.data_type,
+                )
+                .ok_or_else(|| Error::TypeMismatch {
+                    context: format!("UNION ALL arm {arm_number} column {}", column_index + 1),
+                    expected: combined_column.data_type.to_string(),
+                    actual: arm_column.data_type.to_string(),
+                })?;
+            }
+            combined.rows.append(&mut result.rows);
+        }
+
+        coerce_union_rows(&mut combined.rows, &combined.columns);
+        let ordering = resolve_ordering(&combined.columns, order_by)?;
+        order_result_rows(&mut combined.rows, &ordering, limit);
+        Ok(combined)
+    }
+
+    fn execute_select_arm(
+        &self,
+        select: &SelectArm,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -109,22 +168,16 @@ impl Database {
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let ordering = resolve_ordering(&result_columns, order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_grouped_rows(
-                &mut selected_groups,
-                &grouped,
-                &items,
-                &ordering,
-                select.limit,
-            );
+            order_grouped_rows(&mut selected_groups, &grouped, &items, &ordering, limit);
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            order_source_rows(&mut matching_rows, table, &items, &ordering, limit);
             execute_projection(table, &matching_rows, &items)
         };
 
@@ -132,6 +185,32 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+fn union_output_type(left: DataType, right: DataType) -> Option<DataType> {
+    if left == right {
+        Some(left)
+    } else if matches!(
+        (left, right),
+        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+    ) {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+fn coerce_union_rows(rows: &mut [Vec<Value>], columns: &[ResultColumn]) {
+    for row in rows {
+        for (value, column) in row.iter_mut().zip(columns) {
+            if column.data_type == DataType::Float64
+                && let Value::Int64(integer) = value
+            {
+                let float = *integer as f64;
+                *value = Value::Float64(float);
+            }
+        }
     }
 }
 
@@ -749,6 +828,39 @@ fn order_grouped_rows(
         }
         data.keys[left].cmp(&data.keys[right])
     });
+}
+
+fn order_result_rows(rows: &mut Vec<Vec<Value>>, ordering: &[ResolvedOrder], limit: Option<usize>) {
+    if ordering.is_empty() {
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        return;
+    }
+
+    let mut selected = (0..rows.len()).collect::<Vec<_>>();
+    sort_and_limit(&mut selected, limit, |left, right| {
+        for order in ordering {
+            let comparison = rows[left][order.output].cmp(&rows[right][order.output]);
+            if comparison != Ordering::Equal {
+                return if order.descending {
+                    comparison.reverse()
+                } else {
+                    comparison
+                };
+            }
+        }
+        left.cmp(&right)
+    });
+
+    let mut original = std::mem::take(rows)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    *rows = selected
+        .into_iter()
+        .map(|index| original[index].take().expect("row index is selected once"))
+        .collect();
 }
 
 fn sort_and_limit(

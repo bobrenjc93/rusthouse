@@ -107,6 +107,183 @@ fn order_by_limit_preserves_input_order_for_ties_and_accepts_zero() {
 }
 
 #[test]
+fn union_all_uses_first_arm_names_and_applies_final_order_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE current_scores (score Int64, label String);
+             CREATE TABLE archived_scores (score Int64, label String);
+             CREATE TABLE imported_scores (score Int64, label String);
+             INSERT INTO current_scores VALUES (7, 'current-7'), (9, 'current-9');
+             INSERT INTO archived_scores VALUES (9, 'archived-9'), (4, 'archived-4');
+             INSERT INTO imported_scores VALUES (9, 'imported-9'), (2, 'imported-2');",
+        )
+        .expect("setup succeeds");
+
+    let in_arm_order = execute_query(
+        &mut database,
+        "SELECT label AS origin FROM current_scores
+         UNION ALL SELECT label FROM archived_scores
+         UNION ALL SELECT label FROM imported_scores;",
+    );
+    assert_eq!(
+        in_arm_order.rows,
+        [
+            "current-7",
+            "current-9",
+            "archived-9",
+            "archived-4",
+            "imported-9",
+            "imported-2",
+        ]
+        .map(|label| vec![Value::String(label.to_owned())])
+    );
+
+    let result = execute_query(
+        &mut database,
+        "SELECT score AS rank, label AS origin FROM current_scores
+         UNION ALL SELECT score AS ignored_rank, label AS ignored_origin FROM archived_scores
+         UNION ALL SELECT score, label FROM imported_scores
+         ORDER BY rank DESC
+         LIMIT 4;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"rank".to_owned(), DataType::Int64),
+            (&"origin".to_owned(), DataType::String),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(9), Value::String("current-9".to_owned()),],
+            vec![Value::Int64(9), Value::String("archived-9".to_owned()),],
+            vec![Value::Int64(9), Value::String("imported-9".to_owned()),],
+            vec![Value::Int64(7), Value::String("current-7".to_owned()),],
+        ]
+    );
+
+    let error = database
+        .execute(
+            "SELECT score AS rank FROM current_scores
+             UNION ALL SELECT score AS second_name FROM archived_scores
+             ORDER BY second_name;",
+        )
+        .expect_err("later-arm aliases do not name UNION output columns");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message.contains("second_name") && message.contains("not in the SELECT output")
+    ));
+}
+
+#[test]
+fn union_all_preserves_empty_and_aggregate_arm_results() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE empty_values (value Int64);
+             CREATE TABLE populated_values (value Int64);
+             INSERT INTO populated_values VALUES (2), (3);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT value AS metric FROM empty_values
+         UNION ALL SELECT SUM(value) AS total FROM populated_values
+         UNION ALL SELECT COUNT(*) AS rows FROM empty_values;",
+    );
+
+    assert_eq!(result.columns[0].name, "metric");
+    assert_eq!(result.columns[0].data_type, DataType::Int64);
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(5)], vec![Value::Int64(0)]]
+    );
+
+    let all_empty = execute_query(
+        &mut database,
+        "SELECT value AS metric FROM empty_values
+         UNION ALL SELECT value FROM empty_values
+         LIMIT 0;",
+    );
+    assert!(all_empty.rows.is_empty());
+}
+
+#[test]
+fn union_all_rejects_incompatible_widths_and_types() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numbers (id Int64, label String);
+             CREATE TABLE flags (id Int64, active Bool);",
+        )
+        .expect("setup succeeds");
+
+    let width = database
+        .execute("SELECT id FROM numbers UNION ALL SELECT id, active FROM flags;")
+        .expect_err("UNION arms must have equal widths");
+    assert!(matches!(
+        width,
+        Error::InvalidQuery(message)
+            if message.contains("arm 2 has 2 columns") && message.contains("first arm has 1")
+    ));
+
+    let data_type = database
+        .execute("SELECT id, label FROM numbers UNION ALL SELECT id, active FROM flags;")
+        .expect_err("UNION column types must be compatible");
+    assert!(matches!(
+        data_type,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "UNION ALL arm 2 column 2"
+            && expected == "String"
+            && actual == "Bool"
+    ));
+}
+
+#[test]
+fn union_all_widens_mixed_numeric_columns_to_float64() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE integer_values (value Int64);
+             CREATE TABLE float_values (value Float64);
+             INSERT INTO integer_values VALUES (3), (1);
+             INSERT INTO float_values VALUES (2.5), (4.0);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT value AS measurement FROM integer_values
+         UNION ALL SELECT value AS other_name FROM float_values
+         ORDER BY measurement DESC;",
+    );
+
+    assert_eq!(result.columns[0].name, "measurement");
+    assert_eq!(result.columns[0].data_type, DataType::Float64);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Float64(4.0)],
+            vec![Value::Float64(3.0)],
+            vec![Value::Float64(2.5)],
+            vec![Value::Float64(1.0)],
+        ]
+    );
+}
+
+#[test]
 fn grouped_top_k_retains_deterministic_multi_column_ordering() {
     let mut database = Database::new();
     database

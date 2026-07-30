@@ -20,12 +20,17 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub arms: Vec<SelectArm>,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectArm {
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
-    pub order_by: Vec<OrderBy>,
-    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -442,6 +447,24 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        let mut arms = vec![self.parse_select_arm()?];
+        while self.eat_keyword("UNION") {
+            self.expect_keyword("ALL")?;
+            self.expect_keyword("SELECT")?;
+            arms.push(self.parse_select_arm()?);
+        }
+
+        let order_by = self.parse_order_by()?;
+        let limit = self.parse_limit()?;
+
+        Ok(Select {
+            arms,
+            order_by,
+            limit,
+        })
+    }
+
+    fn parse_select_arm(&mut self) -> Result<SelectArm> {
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -471,6 +494,15 @@ impl Parser {
             }
         }
 
+        Ok(SelectArm {
+            items,
+            table,
+            predicate,
+            group_by,
+        })
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderBy>> {
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
@@ -488,7 +520,10 @@ impl Parser {
                 }
             }
         }
+        Ok(order_by)
+    }
 
+    fn parse_limit(&mut self) -> Result<Option<usize>> {
         let limit = if self.eat_keyword("LIMIT") {
             let position = self.position();
             let number = self.take_number().ok_or_else(|| Error::Sql {
@@ -502,15 +537,7 @@ impl Parser {
         } else {
             None
         };
-
-        Ok(Select {
-            items,
-            table,
-            predicate,
-            group_by,
-            order_by,
-            limit,
-        })
+        Ok(limit)
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -766,11 +793,43 @@ mod tests {
         let Statement::Select(select) = &statements[0] else {
             panic!("expected select");
         };
-        assert_eq!(select.items.len(), 2);
-        assert_eq!(select.group_by, ["region"]);
+        assert_eq!(select.arms[0].items.len(), 2);
+        assert_eq!(select.arms[0].group_by, ["region"]);
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_union_all_with_query_level_order_and_limit() {
+        let statements = parse(
+            "SELECT id AS value FROM first \
+             UNION ALL SELECT score FROM second \
+             UNION ALL SELECT total FROM third \
+             ORDER BY value DESC LIMIT 4",
+        )
+        .expect("valid UNION ALL query");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(select.arms.len(), 3);
+        assert_eq!(select.arms[0].table, "first");
+        assert_eq!(select.arms[1].table, "second");
+        assert_eq!(select.arms[2].table, "third");
+        assert_eq!(select.order_by[0].name, "value");
+        assert!(select.order_by[0].descending);
+        assert_eq!(select.limit, Some(4));
+    }
+
+    #[test]
+    fn rejects_union_without_all() {
+        let error = parse("SELECT id FROM first UNION SELECT id FROM second")
+            .expect_err("UNION must specify ALL");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message == "expected keyword ALL"
+        ));
     }
 
     #[test]

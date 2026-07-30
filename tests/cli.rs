@@ -46,6 +46,30 @@ fn multiple_selects_emit_one_json_document() {
 }
 
 #[test]
+fn union_all_emits_combined_typed_json_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE whole (n Int64);
+             CREATE TABLE decimal (n Float64);
+             INSERT INTO whole VALUES (3), (1);
+             INSERT INTO decimal VALUES (2.5);
+             SELECT n AS value FROM whole
+             UNION ALL SELECT n AS ignored FROM decimal
+             ORDER BY value DESC LIMIT 2;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"value\",\"type\":\"Float64\"}],\"rows\":[[3.0],[2.5]]}]}\n"
+    );
+}
+
+#[test]
 fn positional_json_preserves_duplicate_alias_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
