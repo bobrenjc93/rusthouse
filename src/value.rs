@@ -2,13 +2,14 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+/// The physical column types supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Int64,
     Float64,
     Bool,
     String,
+    LowCardinalityString,
 }
 
 impl DataType {
@@ -21,6 +22,14 @@ impl DataType {
             _ => None,
         }
     }
+
+    pub(crate) fn accepts(self, actual: Self) -> bool {
+        self == actual || matches!((self, actual), (Self::LowCardinalityString, Self::String))
+    }
+
+    pub(crate) fn is_string(self) -> bool {
+        matches!(self, Self::String | Self::LowCardinalityString)
+    }
 }
 
 impl fmt::Display for DataType {
@@ -30,6 +39,7 @@ impl fmt::Display for DataType {
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
+            Self::LowCardinalityString => "LowCardinality(String)",
         })
     }
 }

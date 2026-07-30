@@ -66,6 +66,26 @@ fn positional_json_preserves_duplicate_alias_values() {
 }
 
 #[test]
+fn low_cardinality_strings_render_as_normal_json_strings() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE items (name LowCardinality(String));
+             INSERT INTO items VALUES ('zeta'), ('alpha'), ('zeta');
+             SELECT name FROM items ORDER BY name;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"LowCardinality(String)\"}],\"rows\":[[\"alpha\"],[\"zeta\"],[\"zeta\"]]}]}\n"
+    );
+}
+
+#[test]
 fn stdin_and_csv_output_work_together() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(["--format", "csv"])

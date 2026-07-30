@@ -1,3 +1,4 @@
+use rusthouse::storage::Column;
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
@@ -62,6 +63,95 @@ fn typed_projection_filter_order_and_limit_work_end_to_end() {
                 Value::Bool(true),
             ],
         ]
+    );
+}
+
+#[test]
+fn low_cardinality_strings_preserve_string_query_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE dimensions (
+                label LowCardinality(String), id Int64
+             );
+             INSERT INTO dimensions VALUES
+                ('zeta', 1),
+                ('alpha', 2),
+                ('zeta', 3),
+                ('beta', 4),
+                ('mango', 5),
+                ('alpha', 6);",
+        )
+        .expect("setup succeeds");
+
+    let table = database
+        .catalog()
+        .table("dimensions")
+        .expect("table exists");
+    let Column::LowCardinalityString(labels) = &table.columns()[0] else {
+        panic!("expected dictionary-encoded storage")
+    };
+    assert_eq!(
+        labels.dictionary().collect::<Vec<_>>(),
+        ["zeta", "alpha", "beta", "mango"]
+    );
+    assert_eq!(labels.codes(), &[0, 1, 0, 2, 3, 1]);
+
+    let ordered = execute_query(
+        &mut database,
+        "SELECT label, id FROM dimensions
+         WHERE label >= 'beta'
+         ORDER BY label, id;",
+    );
+    assert_eq!(ordered.columns[0].data_type, DataType::LowCardinalityString);
+    assert_eq!(
+        ordered.rows,
+        vec![
+            vec![Value::String("beta".to_owned()), Value::Int64(4)],
+            vec![Value::String("mango".to_owned()), Value::Int64(5)],
+            vec![Value::String("zeta".to_owned()), Value::Int64(1)],
+            vec![Value::String("zeta".to_owned()), Value::Int64(3)],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT label, COUNT(*) AS rows
+         FROM dimensions
+         GROUP BY label
+         ORDER BY label;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![Value::String("alpha".to_owned()), Value::Int64(2)],
+            vec![Value::String("beta".to_owned()), Value::Int64(1)],
+            vec![Value::String("mango".to_owned()), Value::Int64(1)],
+            vec![Value::String("zeta".to_owned()), Value::Int64(2)],
+        ]
+    );
+
+    let extrema = execute_query(
+        &mut database,
+        "SELECT MIN(label) AS first, MAX(label) AS last FROM dimensions;",
+    );
+    assert_eq!(
+        extrema
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        [
+            DataType::LowCardinalityString,
+            DataType::LowCardinalityString
+        ]
+    );
+    assert_eq!(
+        extrema.rows,
+        vec![vec![
+            Value::String("alpha".to_owned()),
+            Value::String("zeta".to_owned())
+        ]]
     );
 }
 

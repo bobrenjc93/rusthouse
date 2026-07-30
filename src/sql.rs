@@ -396,14 +396,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_data_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -414,6 +407,34 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_data_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("LOWCARDINALITY") {
+            self.expect(&TokenKind::LeftParen, "'(' after LowCardinality")?;
+            let inner_position = self.position();
+            let inner = self.expect_identifier("LowCardinality inner type")?;
+            if !inner.eq_ignore_ascii_case("STRING") {
+                return Err(Error::Sql {
+                    position: inner_position,
+                    message: format!("LowCardinality only supports String, found '{inner}'"),
+                });
+            }
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after LowCardinality inner type",
+            )?;
+            return Ok(DataType::LowCardinalityString);
+        }
+
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or LowCardinality(String)"
+            ),
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -782,6 +803,25 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_low_cardinality_string_columns() {
+        let statements =
+            parse("CREATE TABLE dimensions (name LowCardinality(String), value Int64)")
+                .expect("valid LowCardinality type");
+        let Statement::CreateTable { columns, .. } = &statements[0] else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(columns[0].data_type, DataType::LowCardinalityString);
+
+        let error = parse("CREATE TABLE invalid (id LowCardinality(Int64))")
+            .expect_err("only strings can use LowCardinality");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message == "LowCardinality only supports String, found 'Int64'"
+        ));
     }
 
     #[test]

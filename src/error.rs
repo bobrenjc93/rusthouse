@@ -30,6 +30,11 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    DictionaryLimit {
+        table: String,
+        column: String,
+        maximum_entries: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +78,14 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::DictionaryLimit {
+                table,
+                column,
+                maximum_entries,
+            } => write!(
+                f,
+                "LowCardinality dictionary for column '{table}.{column}' exceeds its limit of {maximum_entries} entries"
+            ),
         }
     }
 }
