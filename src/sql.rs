@@ -24,6 +24,7 @@ pub struct Select {
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
+    pub having: Option<Box<Predicate>>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -42,7 +43,7 @@ pub enum SelectItem {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggregateFunction {
     Count,
     Sum,
@@ -95,6 +96,10 @@ pub enum Predicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Column(String),
+    Aggregate {
+        function: AggregateFunction,
+        argument: AggregateArgument,
+    },
     Literal(Value),
 }
 
@@ -471,6 +476,14 @@ impl Parser {
             }
         }
 
+        let having = if self.eat_keyword("HAVING") {
+            self.predicate_depth = 0;
+            self.predicate_nodes = 0;
+            Some(Box::new(self.parse_or_predicate()?))
+        } else {
+            None
+        };
+
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
@@ -508,6 +521,7 @@ impl Parser {
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -521,16 +535,7 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
-            let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!("unknown aggregate function '{name}'"),
-            })?;
-            let argument = if self.eat(&TokenKind::Star) {
-                AggregateArgument::Wildcard
-            } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
-            };
-            self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            let (function, argument) = self.parse_aggregate_call(&name, position)?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
@@ -549,6 +554,24 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_aggregate_call(
+        &mut self,
+        name: &str,
+        position: usize,
+    ) -> Result<(AggregateFunction, AggregateArgument)> {
+        let function = AggregateFunction::parse(name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!("unknown aggregate function '{name}'"),
+        })?;
+        let argument = if self.eat(&TokenKind::Star) {
+            AggregateArgument::Wildcard
+        } else {
+            AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+        };
+        self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+        Ok((function, argument))
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -626,9 +649,16 @@ impl Parser {
             {
                 self.parse_literal().map(Operand::Literal)
             }
-            TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
-                .map(Operand::Column),
+            TokenKind::Identifier(_) => {
+                let position = self.position();
+                let name = self.expect_identifier("column, aggregate function, or literal")?;
+                if self.eat(&TokenKind::LeftParen) {
+                    let (function, argument) = self.parse_aggregate_call(&name, position)?;
+                    Ok(Operand::Aggregate { function, argument })
+                } else {
+                    Ok(Operand::Column(name))
+                }
+            }
             _ => self.error("expected column or literal"),
         }
     }
@@ -759,7 +789,8 @@ mod tests {
         let statements = parse(
             "SELECT region, SUM(amount) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region HAVING total >= 10 OR COUNT(*) > 2 \
+             ORDER BY total DESC LIMIT 3;",
         )
         .expect("valid SQL");
 
@@ -768,6 +799,10 @@ mod tests {
         };
         assert_eq!(select.items.len(), 2);
         assert_eq!(select.group_by, ["region"]);
+        assert!(matches!(
+            select.having.as_deref(),
+            Some(Predicate::Or(_, _))
+        ));
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));

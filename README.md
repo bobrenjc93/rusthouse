@@ -10,7 +10,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
-- GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- GROUP BY with post-aggregation HAVING predicates
+- output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -32,6 +33,7 @@ cargo run -- --execute "
   FROM sales
   WHERE online = true
   GROUP BY region
+  HAVING total >= 10
   ORDER BY total DESC
   LIMIT 10;
 "
@@ -83,7 +85,7 @@ assert_eq!(result.rows.len(), 1);
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+To keep recursive predicate processing bounded, each WHERE or HAVING expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

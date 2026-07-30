@@ -311,6 +311,135 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn having_filters_finalized_global_and_grouped_aggregates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE having_sales (category String, amount Int64);
+             INSERT INTO having_sales VALUES
+                ('priority', 40), ('priority', 60),
+                ('bulk', 20), ('bulk', 15), ('bulk', 10),
+                ('small', 8), ('small', 7),
+                ('single', 200),
+                ('blocked', 150), ('blocked', 150);",
+        )
+        .expect("setup succeeds");
+
+    let global = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS orders, SUM(amount) AS total
+         FROM having_sales
+         HAVING orders = 10 AND SUM(amount) = 660;",
+    );
+    assert_eq!(global.rows, vec![vec![Value::Int64(10), Value::Int64(660)]]);
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS orders FROM having_sales HAVING orders > 10;",
+    );
+    assert!(empty.rows.is_empty());
+
+    database
+        .execute("CREATE TABLE empty_having_sales (category String);")
+        .expect("empty table succeeds");
+    let empty_global = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS orders
+         FROM empty_having_sales
+         HAVING orders = 0;",
+    );
+    assert_eq!(empty_global.rows, vec![vec![Value::Int64(0)]]);
+    let empty_grouped = execute_query(
+        &mut database,
+        "SELECT category, COUNT(*) AS orders
+         FROM empty_having_sales
+         GROUP BY category
+         HAVING orders = 0;",
+    );
+    assert!(empty_grouped.rows.is_empty());
+
+    let top = execute_query(
+        &mut database,
+        "SELECT category AS kind, COUNT(*) AS orders, SUM(amount) AS total
+         FROM having_sales
+         GROUP BY category
+         HAVING kind != 'blocked'
+            AND COUNT(*) >= 2
+            AND (total >= 90 OR orders >= 3)
+         ORDER BY total DESC
+         LIMIT 1;",
+    );
+    assert_eq!(
+        top.rows,
+        vec![vec![
+            Value::String("priority".to_owned()),
+            Value::Int64(2),
+            Value::Int64(100),
+        ]]
+    );
+
+    let unselected_group_column = execute_query(
+        &mut database,
+        "SELECT SUM(amount) AS total
+         FROM having_sales
+         GROUP BY category
+         HAVING category = 'bulk';",
+    );
+    assert_eq!(unselected_group_column.rows, vec![vec![Value::Int64(45)]]);
+}
+
+#[test]
+fn having_rejects_ambiguous_aliases_and_ungrouped_columns() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE having_names (category String, amount Int64);
+             INSERT INTO having_names VALUES ('tools', 2);",
+        )
+        .expect("setup succeeds");
+
+    let ambiguous = database
+        .execute(
+            "SELECT category AS metric, SUM(amount) AS metric
+             FROM having_names GROUP BY category HAVING metric = 2;",
+        )
+        .expect_err("duplicate selected aliases are ambiguous");
+    assert!(
+        matches!(ambiguous, Error::InvalidQuery(message) if message.contains("HAVING name 'metric' is ambiguous"))
+    );
+
+    let ungrouped = database
+        .execute(
+            "SELECT SUM(amount) AS total
+             FROM having_names HAVING category = 'tools';",
+        )
+        .expect_err("source columns in HAVING must be grouped");
+    assert!(
+        matches!(ungrouped, Error::InvalidQuery(message) if message.contains("HAVING column 'category' must appear in GROUP BY"))
+    );
+}
+
+#[test]
+fn having_only_aggregate_overflow_is_propagated() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE having_overflow (amount Int64);
+             INSERT INTO having_overflow VALUES (9223372036854775807), (1);",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute(
+            "SELECT COUNT(*) AS rows
+             FROM having_overflow
+             HAVING SUM(amount) > 0;",
+        )
+        .expect_err("HAVING aggregate overflow must reach the caller");
+    assert_eq!(error, Error::NumericOverflow("SUM(Int64)".to_owned()));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
