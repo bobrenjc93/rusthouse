@@ -5,7 +5,7 @@ RustHouse should evolve through narrow modules with explicit boundaries:
 1. A catalog owns schemas and tables.
 2. A columnar storage layer owns typed vectors and validates row shape.
 3. A parser produces a small typed syntax tree without coupling syntax to execution.
-4. A query engine plans scans, filters, projections, grouping, aggregation, sorting, and limits.
+4. A query engine plans scans, filters, projections, grouping, aggregation, windows, sorting, and limits.
 5. Formats render results without changing execution semantics.
 6. Persistence serializes catalog state atomically and rejects corrupt or incompatible data.
 7. CLI and HTTP front ends share the same engine API.

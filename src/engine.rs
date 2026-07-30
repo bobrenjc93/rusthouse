@@ -1,13 +1,13 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    Select, SelectItem, Statement, WindowFrame, WindowFunction,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -102,12 +102,12 @@ impl Database {
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(table, *row) == TruthValue::True)
             })
             .collect::<Vec<_>>();
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
+        let (items, result_columns, aggregate_specs, window_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
@@ -124,8 +124,16 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            let windows = execute_windows(table, &matching_rows, &window_specs)?;
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &items,
+                &windows,
+                &ordering,
+                select.limit,
+            );
+            execute_projection(table, &matching_rows, &items, &windows)
         };
 
         Ok(QueryResult {
@@ -144,6 +152,9 @@ enum ResolvedItem {
     Aggregate {
         state: usize,
     },
+    Window {
+        state: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +163,35 @@ struct AggregateSpec {
     argument: Option<usize>,
     input_type: Option<DataType>,
 }
+
+#[derive(Debug)]
+struct WindowSpec {
+    function: ResolvedWindowFunction,
+    partition_by: Vec<usize>,
+    order_by: Vec<WindowOrder>,
+}
+
+#[derive(Debug)]
+enum ResolvedWindowFunction {
+    Ranking(WindowFunction),
+    Aggregate {
+        aggregate: AggregateSpec,
+        frame: WindowFrame,
+    },
+}
+
+#[derive(Debug)]
+struct WindowOrder {
+    source: usize,
+    descending: bool,
+}
+
+type ResolvedSelectItems = (
+    Vec<ResolvedItem>,
+    Vec<ResultColumn>,
+    Vec<AggregateSpec>,
+    Vec<WindowSpec>,
+);
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
@@ -171,10 +211,21 @@ fn resolve_select_items(
     table: &Table,
     requested: &[SelectItem],
     group_columns: &[usize],
-) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+) -> Result<ResolvedSelectItems> {
     let has_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
+    let has_window = requested.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Window { .. } | SelectItem::AggregateWindow { .. }
+        )
+    });
+    if has_window && (has_aggregate || !group_columns.is_empty()) {
+        return Err(Error::InvalidQuery(
+            "window functions cannot be combined with aggregates or GROUP BY".to_owned(),
+        ));
+    }
     if has_aggregate
         && requested
             .iter()
@@ -188,6 +239,7 @@ fn resolve_select_items(
     let mut items = Vec::new();
     let mut result_columns = Vec::new();
     let mut aggregate_specs = Vec::new();
+    let mut window_specs = Vec::new();
 
     for requested_item in requested {
         match requested_item {
@@ -234,32 +286,11 @@ fn resolve_select_items(
                 argument,
                 alias,
             } => {
-                let (argument_index, input_type, argument_name) = match argument {
-                    AggregateArgument::Wildcard => {
-                        if *function != AggregateFunction::Count {
-                            return Err(Error::InvalidQuery(format!(
-                                "{}(*) is not supported; use a column argument",
-                                function.name()
-                            )));
-                        }
-                        (None, None, "*".to_owned())
-                    }
-                    AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
-                        (
-                            Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
-                        )
-                    }
-                };
-                validate_aggregate(*function, input_type)?;
+                let (aggregate, argument_name) =
+                    resolve_aggregate_spec(table, *function, argument)?;
+                let input_type = aggregate.input_type;
                 let state = aggregate_specs.len();
-                aggregate_specs.push(AggregateSpec {
-                    function: *function,
-                    argument: argument_index,
-                    input_type,
-                });
+                aggregate_specs.push(aggregate);
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
                     name: alias
@@ -268,15 +299,142 @@ fn resolve_select_items(
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
+            SelectItem::Window {
+                function,
+                specification,
+                alias,
+            } => {
+                let state = window_specs.len();
+                window_specs.push(resolve_window_spec(
+                    table,
+                    ResolvedWindowFunction::Ranking(*function),
+                    specification,
+                    function.name(),
+                )?);
+                items.push(ResolvedItem::Window { state });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("{}()", function.name())),
+                    data_type: DataType::Int64,
+                });
+            }
+            SelectItem::AggregateWindow {
+                function,
+                argument,
+                specification,
+                alias,
+            } => {
+                let (aggregate, argument_name) =
+                    resolve_aggregate_spec(table, *function, argument)?;
+                let output_type = aggregate_output_type(*function, aggregate.input_type);
+                let frame = specification
+                    .frame
+                    .expect("aggregate windows require a parsed frame");
+                let state = window_specs.len();
+                window_specs.push(resolve_window_spec(
+                    table,
+                    ResolvedWindowFunction::Aggregate { aggregate, frame },
+                    specification,
+                    function.name(),
+                )?);
+                items.push(ResolvedItem::Window { state });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                    data_type: output_type,
+                });
+            }
         }
     }
 
-    Ok((items, result_columns, aggregate_specs))
+    Ok((items, result_columns, aggregate_specs, window_specs))
+}
+
+fn resolve_aggregate_spec(
+    table: &Table,
+    function: AggregateFunction,
+    argument: &AggregateArgument,
+) -> Result<(AggregateSpec, String)> {
+    let (argument, input_type, argument_name) = match argument {
+        AggregateArgument::Wildcard => {
+            if function != AggregateFunction::Count {
+                return Err(Error::InvalidQuery(format!(
+                    "{}(*) is not supported; use a column argument",
+                    function.name()
+                )));
+            }
+            (None, None, "*".to_owned())
+        }
+        AggregateArgument::Column(name) => {
+            let index = table.column_index(name)?;
+            (
+                Some(index),
+                Some(table.schema()[index].data_type),
+                table.schema()[index].name.clone(),
+            )
+        }
+    };
+    validate_aggregate(function, input_type)?;
+    Ok((
+        AggregateSpec {
+            function,
+            argument,
+            input_type,
+        },
+        argument_name,
+    ))
+}
+
+fn resolve_window_spec(
+    table: &Table,
+    function: ResolvedWindowFunction,
+    requested: &sql::WindowSpec,
+    function_name: &str,
+) -> Result<WindowSpec> {
+    let mut partition_by = Vec::with_capacity(requested.partition_by.len());
+    for name in &requested.partition_by {
+        let source = table.column_index(name)?;
+        if partition_by.contains(&source) {
+            return Err(Error::InvalidQuery(format!(
+                "{function_name} PARTITION BY column '{name}' is listed more than once"
+            )));
+        }
+        partition_by.push(source);
+    }
+
+    let mut order_by = Vec::with_capacity(requested.order_by.len());
+    for order in &requested.order_by {
+        let source = table.column_index(&order.name)?;
+        if order_by
+            .iter()
+            .any(|resolved: &WindowOrder| resolved.source == source)
+        {
+            return Err(Error::InvalidQuery(format!(
+                "{function_name} window ORDER BY column '{}' is listed more than once",
+                order.name
+            )));
+        }
+        order_by.push(WindowOrder {
+            source,
+            descending: order.descending,
+        });
+    }
+
+    Ok(WindowSpec {
+        function,
+        partition_by,
+        order_by,
+    })
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+        && !matches!(
+            input_type.map(DataType::underlying),
+            Some(DataType::Int64 | DataType::Float64)
+        )
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
@@ -291,10 +449,15 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => DataType::Float64,
-        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
-            input_type.expect("validated column argument")
-        }
+        AggregateFunction::Avg => DataType::NullableFloat64,
+        AggregateFunction::Sum => input_type
+            .expect("validated column argument")
+            .underlying()
+            .nullable(),
+        AggregateFunction::Min | AggregateFunction::Max => input_type
+            .expect("validated column argument")
+            .underlying()
+            .nullable(),
     }
 }
 
@@ -302,6 +465,7 @@ fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
+    windows: &[Vec<Value>],
 ) -> Vec<Vec<Value>> {
     matching_rows
         .iter()
@@ -313,10 +477,326 @@ fn execute_projection(
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
+                    ResolvedItem::Window { state } => windows[*state][*row].clone(),
                 })
                 .collect()
         })
         .collect()
+}
+
+fn execute_windows(
+    table: &Table,
+    matching_rows: &[usize],
+    specifications: &[WindowSpec],
+) -> Result<Vec<Vec<Value>>> {
+    specifications
+        .iter()
+        .map(|specification| execute_window(table, matching_rows, specification))
+        .collect()
+}
+
+fn execute_window(
+    table: &Table,
+    matching_rows: &[usize],
+    specification: &WindowSpec,
+) -> Result<Vec<Value>> {
+    let mut sorted_rows = matching_rows.to_vec();
+    sorted_rows.sort_unstable_by(|left, right| {
+        compare_partition_rows(table, specification, *left, *right)
+            .then_with(|| compare_window_order(table, specification, *left, *right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut values = vec![Value::Null; table.row_count()];
+    let mut partition_start = 0;
+    while partition_start < sorted_rows.len() {
+        let first = sorted_rows[partition_start];
+        let mut partition_end = partition_start + 1;
+        while partition_end < sorted_rows.len()
+            && compare_partition_rows(table, specification, first, sorted_rows[partition_end])
+                == Ordering::Equal
+        {
+            partition_end += 1;
+        }
+
+        let partition = &sorted_rows[partition_start..partition_end];
+        match &specification.function {
+            ResolvedWindowFunction::Ranking(function) => {
+                execute_ranking_partition(table, specification, *function, partition, &mut values)?;
+            }
+            ResolvedWindowFunction::Aggregate { aggregate, frame } => {
+                execute_aggregate_partition(table, aggregate, *frame, partition, &mut values)?;
+            }
+        }
+        partition_start = partition_end;
+    }
+    Ok(values)
+}
+
+fn execute_ranking_partition(
+    table: &Table,
+    specification: &WindowSpec,
+    function: WindowFunction,
+    rows: &[usize],
+    output: &mut [Value],
+) -> Result<()> {
+    let mut rank = 1_usize;
+    let mut dense_rank = 1_usize;
+    for (position, row) in rows.iter().copied().enumerate() {
+        if position > 0
+            && compare_window_order(table, specification, rows[position - 1], row)
+                != Ordering::Equal
+        {
+            rank = position + 1;
+            dense_rank += 1;
+        }
+        let value = match function {
+            WindowFunction::RowNumber => position + 1,
+            WindowFunction::Rank => rank,
+            WindowFunction::DenseRank => dense_rank,
+        };
+        output[row] = Value::Int64(
+            i64::try_from(value).map_err(|_| Error::NumericOverflow(function.name().to_owned()))?,
+        );
+    }
+    Ok(())
+}
+
+fn execute_aggregate_partition(
+    table: &Table,
+    aggregate: &AggregateSpec,
+    frame: WindowFrame,
+    rows: &[usize],
+    output: &mut [Value],
+) -> Result<()> {
+    match aggregate.function {
+        AggregateFunction::Count => execute_window_count(table, aggregate, frame, rows, output),
+        AggregateFunction::Sum | AggregateFunction::Avg => {
+            match aggregate
+                .input_type
+                .expect("SUM and AVG have a column argument")
+                .underlying()
+            {
+                DataType::Int64 => execute_window_int(table, aggregate, frame, rows, output),
+                DataType::Float64 => execute_window_float(table, aggregate, frame, rows, output),
+                _ => unreachable!("SUM and AVG input types are validated"),
+            }
+        }
+        AggregateFunction::Min | AggregateFunction::Max => {
+            execute_window_extreme(table, aggregate, frame, rows, output);
+            Ok(())
+        }
+    }
+}
+
+fn execute_window_count(
+    table: &Table,
+    aggregate: &AggregateSpec,
+    frame: WindowFrame,
+    rows: &[usize],
+    output: &mut [Value],
+) -> Result<()> {
+    let counts = prefix_counts(table, rows, aggregate.argument)?;
+    for (position, row) in rows.iter().copied().enumerate() {
+        let start = frame_start(frame, position);
+        let count = counts[position + 1] - counts[start];
+        output[row] = Value::Int64(
+            i64::try_from(count).map_err(|_| Error::NumericOverflow("COUNT window".to_owned()))?,
+        );
+    }
+    Ok(())
+}
+
+fn prefix_counts(table: &Table, rows: &[usize], argument: Option<usize>) -> Result<Vec<u64>> {
+    let mut counts = Vec::with_capacity(rows.len() + 1);
+    counts.push(0_u64);
+    for row in rows {
+        let present = argument.is_none_or(|column| !table.columns()[column].is_null(*row));
+        let next = counts
+            .last()
+            .copied()
+            .expect("prefix has an initial state")
+            .checked_add(u64::from(present))
+            .ok_or_else(|| Error::NumericOverflow("window aggregate count".to_owned()))?;
+        counts.push(next);
+    }
+    Ok(counts)
+}
+
+fn execute_window_int(
+    table: &Table,
+    aggregate: &AggregateSpec,
+    frame: WindowFrame,
+    rows: &[usize],
+    output: &mut [Value],
+) -> Result<()> {
+    let argument = aggregate.argument.expect("numeric aggregate argument");
+    let counts = prefix_counts(table, rows, Some(argument))?;
+    let mut sums = Vec::with_capacity(rows.len() + 1);
+    sums.push(0_i128);
+    for row in rows {
+        let value = match table.columns()[argument].value_ref(*row) {
+            ValueRef::Int64(value) => i128::from(value),
+            ValueRef::Null => 0,
+            _ => unreachable!("Int64 window input is resolved"),
+        };
+        let next = sums
+            .last()
+            .copied()
+            .expect("prefix has an initial state")
+            .checked_add(value)
+            .ok_or_else(|| Error::NumericOverflow("window Int64 prefix sum".to_owned()))?;
+        sums.push(next);
+    }
+
+    for (position, row) in rows.iter().copied().enumerate() {
+        let start = frame_start(frame, position);
+        let count = counts[position + 1] - counts[start];
+        if count == 0 {
+            output[row] = Value::Null;
+            continue;
+        }
+        let sum = sums[position + 1]
+            .checked_sub(sums[start])
+            .ok_or_else(|| Error::NumericOverflow("window Int64 frame sum".to_owned()))?;
+        output[row] = match aggregate.function {
+            AggregateFunction::Sum => Value::Int64(
+                i64::try_from(sum)
+                    .map_err(|_| Error::NumericOverflow("SUM(Int64) window".to_owned()))?,
+            ),
+            AggregateFunction::Avg => Value::Float64(sum as f64 / count as f64),
+            _ => unreachable!("numeric prefix is only used for SUM and AVG"),
+        };
+    }
+    Ok(())
+}
+
+fn execute_window_float(
+    table: &Table,
+    aggregate: &AggregateSpec,
+    frame: WindowFrame,
+    rows: &[usize],
+    output: &mut [Value],
+) -> Result<()> {
+    let argument = aggregate.argument.expect("numeric aggregate argument");
+    let counts = prefix_counts(table, rows, Some(argument))?;
+    let mut sums = Vec::with_capacity(rows.len() + 1);
+    sums.push(0.0_f64);
+    for row in rows {
+        let value = match table.columns()[argument].value_ref(*row) {
+            ValueRef::Float64(value) => value,
+            ValueRef::Null => 0.0,
+            _ => unreachable!("Float64 window input is resolved"),
+        };
+        let next = sums.last().copied().expect("prefix has an initial state") + value;
+        if !next.is_finite() {
+            return Err(Error::NumericOverflow(
+                "window Float64 prefix sum".to_owned(),
+            ));
+        }
+        sums.push(next);
+    }
+
+    for (position, row) in rows.iter().copied().enumerate() {
+        let start = frame_start(frame, position);
+        let count = counts[position + 1] - counts[start];
+        if count == 0 {
+            output[row] = Value::Null;
+            continue;
+        }
+        let sum = sums[position + 1] - sums[start];
+        let value = match aggregate.function {
+            AggregateFunction::Sum => sum,
+            AggregateFunction::Avg => sum / count as f64,
+            _ => unreachable!("numeric prefix is only used for SUM and AVG"),
+        };
+        if !value.is_finite() {
+            return Err(Error::NumericOverflow(format!(
+                "{}(Float64) window",
+                aggregate.function.name()
+            )));
+        }
+        output[row] = Value::Float64(value);
+    }
+    Ok(())
+}
+
+fn execute_window_extreme(
+    table: &Table,
+    aggregate: &AggregateSpec,
+    frame: WindowFrame,
+    rows: &[usize],
+    output: &mut [Value],
+) {
+    let argument = aggregate.argument.expect("MIN/MAX aggregate argument");
+    let column = &table.columns()[argument];
+    let minimum = aggregate.function == AggregateFunction::Min;
+    let mut queue = VecDeque::<(usize, usize)>::new();
+
+    for (position, row) in rows.iter().copied().enumerate() {
+        let start = frame_start(frame, position);
+        while queue.front().is_some_and(|(index, _)| *index < start) {
+            queue.pop_front();
+        }
+        if !column.is_null(row) {
+            let candidate = column.value_ref(row);
+            while queue.back().is_some_and(|(_, queued_row)| {
+                let comparison = column.value_ref(*queued_row).cmp(&candidate);
+                if minimum {
+                    comparison != Ordering::Less
+                } else {
+                    comparison != Ordering::Greater
+                }
+            }) {
+                queue.pop_back();
+            }
+            queue.push_back((position, row));
+        }
+        output[row] = queue
+            .front()
+            .map_or(Value::Null, |(_, row)| column.value(*row));
+    }
+}
+
+fn frame_start(frame: WindowFrame, position: usize) -> usize {
+    match frame {
+        WindowFrame::UnboundedPreceding => 0,
+        WindowFrame::Preceding(preceding) => position.saturating_sub(preceding),
+    }
+}
+
+fn compare_partition_rows(
+    table: &Table,
+    specification: &WindowSpec,
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for source in &specification.partition_by {
+        let comparison = table.columns()[*source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return comparison;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_window_order(
+    table: &Table,
+    specification: &WindowSpec,
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for order in &specification.order_by {
+        let comparison = table.columns()[order.source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    Ordering::Equal
 }
 
 fn execute_grouped<'a>(
@@ -514,6 +994,9 @@ impl GroupedData<'_> {
                         ResolvedItem::Aggregate { state } => {
                             self.aggregates[*state][*group].clone()
                         }
+                        ResolvedItem::Window { .. } => {
+                            unreachable!("grouped projections cannot contain windows")
+                        }
                     })
                     .collect()
             })
@@ -524,8 +1007,8 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
+    SumInt { sum: i64, seen: bool },
+    SumFloat { sum: f64, seen: bool },
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
@@ -536,11 +1019,23 @@ impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum
+                if spec.input_type.map(DataType::underlying) == Some(DataType::Int64) =>
+            {
+                Self::SumInt {
+                    sum: 0,
+                    seen: false,
+                }
+            }
+            AggregateFunction::Sum => Self::SumFloat {
+                sum: 0.0,
+                seen: false,
+            },
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+            AggregateFunction::Avg
+                if spec.input_type.map(DataType::underlying) == Some(DataType::Int64) =>
+            {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
@@ -548,31 +1043,41 @@ impl AggregateState {
     }
 
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        if spec
+            .argument
+            .is_some_and(|argument| table.columns()[argument].is_null(row))
+        {
+            return Ok(());
+        }
+
         match self {
             Self::Count(count) => {
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
-            Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+            Self::SumInt { sum, seen } => {
+                let ValueRef::Int64(value) =
+                    table.columns()[spec.argument.expect("SUM argument")].value_ref(row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(value)
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                *seen = true;
             }
-            Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
+            Self::SumFloat { sum, seen } => {
+                let ValueRef::Float64(value) =
+                    table.columns()[spec.argument.expect("SUM argument")].value_ref(row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
+                *seen = true;
             }
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
@@ -595,24 +1100,25 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Int64(value) =
+                    table.columns()[spec.argument.expect("AVG argument")].value_ref(row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Float64(value) =
+                    table.columns()[spec.argument.expect("AVG argument")].value_ref(row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -626,22 +1132,20 @@ impl AggregateState {
 
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt { sum, seen: true } => Ok(Value::Int64(sum)),
+            Self::SumFloat { sum, seen: true } => Ok(Value::Float64(sum)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
-            )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::SumInt { seen: false, .. }
+            | Self::SumFloat { seen: false, .. }
+            | Self::Min(None)
+            | Self::Max(None)
+            | Self::AvgInt { .. }
+            | Self::AvgFloat { .. } => Ok(Value::Null),
         }
     }
 }
@@ -687,6 +1191,7 @@ fn order_source_rows(
     rows: &mut Vec<usize>,
     table: &Table,
     items: &[ResolvedItem],
+    windows: &[Vec<Value>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) {
@@ -699,10 +1204,13 @@ fn order_source_rows(
 
     sort_and_limit(rows, limit, |left, right| {
         for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
+            let comparison = match items[order.output] {
+                ResolvedItem::Column { source, .. } => table.columns()[source].cmp_at(left, right),
+                ResolvedItem::Window { state } => windows[state][left].cmp(&windows[state][right]),
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                }
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -737,6 +1245,9 @@ fn order_grouped_rows(
                 } => unreachable!("grouped columns are validated"),
                 ResolvedItem::Aggregate { state } => {
                     data.aggregates[state][left].cmp(&data.aggregates[state][right])
+                }
+                ResolvedItem::Window { .. } => {
+                    unreachable!("grouped projections cannot contain windows")
                 }
             };
             if comparison != Ordering::Equal {
@@ -774,12 +1285,23 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    IsNull {
+        operand: CompiledOperand,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruthValue {
+    False,
+    True,
+    Unknown,
+}
+
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, table: &Table, row: usize) -> TruthValue {
         match self {
             Self::Comparison {
                 left,
@@ -788,20 +1310,47 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
-                match operator {
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return TruthValue::Unknown;
+                };
+                let result = match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
                     ComparisonOperator::Less => comparison == Ordering::Less,
                     ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
                     ComparisonOperator::Greater => comparison == Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
+                };
+                if result {
+                    TruthValue::True
+                } else {
+                    TruthValue::False
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::IsNull { operand, negated } => {
+                let is_null = matches!(operand.value(table, row), ValueRef::Null);
+                if is_null != *negated {
+                    TruthValue::True
+                } else {
+                    TruthValue::False
+                }
+            }
+            Self::And(left, right) => match left.evaluate(table, row) {
+                TruthValue::False => TruthValue::False,
+                TruthValue::True => right.evaluate(table, row),
+                TruthValue::Unknown => match right.evaluate(table, row) {
+                    TruthValue::False => TruthValue::False,
+                    TruthValue::True | TruthValue::Unknown => TruthValue::Unknown,
+                },
+            },
+            Self::Or(left, right) => match left.evaluate(table, row) {
+                TruthValue::True => TruthValue::True,
+                TruthValue::False => right.evaluate(table, row),
+                TruthValue::Unknown => match right.evaluate(table, row) {
+                    TruthValue::True => TruthValue::True,
+                    TruthValue::False | TruthValue::Unknown => TruthValue::Unknown,
+                },
+            },
         }
     }
 }
@@ -850,6 +1399,10 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::IsNull { operand, negated } => Ok(CompiledPredicate::IsNull {
+            operand: compile_operand(table, operand)?,
+            negated: *negated,
+        }),
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
@@ -875,9 +1428,11 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
 }
 
 fn comparable(left: DataType, right: DataType) -> bool {
-    left == right
+    left == DataType::Null
+        || right == DataType::Null
+        || left.underlying() == right.underlying()
         || matches!(
-            (left, right),
+            (left.underlying(), right.underlying()),
             (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
         )
 }

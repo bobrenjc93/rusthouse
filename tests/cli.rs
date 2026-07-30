@@ -95,6 +95,38 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn null_renders_through_every_cli_format() {
+    let sql = "CREATE TABLE samples (value Nullable(Int64));
+               INSERT INTO samples VALUES (NULL);
+               SELECT value FROM samples;";
+
+    for (format, expected) in [
+        ("table", "| NULL  |"),
+        ("csv", "value\nNULL\n"),
+        (
+            "json",
+            "{\"results\":[{\"columns\":[{\"name\":\"value\",\"type\":\"Nullable(Int64)\"}],\"rows\":[[null]]}]}\n",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .args(["--format", format, "--execute", sql])
+            .output()
+            .expect("run CLI");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+        if format == "table" {
+            assert!(
+                stdout.contains(expected),
+                "unexpected table output: {stdout}"
+            );
+        } else {
+            assert_eq!(stdout, expected);
+        }
+    }
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

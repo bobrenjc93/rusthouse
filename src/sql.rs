@@ -4,6 +4,7 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+pub const MAX_WINDOW_FRAME_PRECEDING: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -40,6 +41,17 @@ pub enum SelectItem {
         argument: AggregateArgument,
         alias: Option<String>,
     },
+    Window {
+        function: WindowFunction,
+        specification: WindowSpec,
+        alias: Option<String>,
+    },
+    AggregateWindow {
+        function: AggregateFunction,
+        argument: AggregateArgument,
+        specification: WindowSpec,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +61,33 @@ pub enum AggregateFunction {
     Min,
     Max,
     Avg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunction {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
+impl WindowFunction {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RowNumber => "ROW_NUMBER",
+            Self::Rank => "RANK",
+            Self::DenseRank => "DENSE_RANK",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "ROW_NUMBER" => Some(Self::RowNumber),
+            "RANK" => Some(Self::Rank),
+            "DENSE_RANK" => Some(Self::DenseRank),
+            _ => None,
+        }
+    }
 }
 
 impl AggregateFunction {
@@ -88,6 +127,10 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    IsNull {
+        operand: Operand,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -112,6 +155,19 @@ pub enum ComparisonOperator {
 pub struct OrderBy {
     pub name: String,
     pub descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowSpec {
+    pub partition_by: Vec<String>,
+    pub order_by: Vec<OrderBy>,
+    pub frame: Option<WindowFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrame {
+    UnboundedPreceding,
+    Preceding(usize),
 }
 
 /// Parse one or more semicolon-separated SQL statements.
@@ -396,14 +452,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_data_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -414,6 +463,31 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_data_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("NULLABLE") {
+            self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+            let inner_position = self.position();
+            let inner_name = self.expect_identifier("type inside Nullable(...)")?;
+            let inner = DataType::parse(&inner_name).ok_or_else(|| Error::Sql {
+                position: inner_position,
+                message: format!(
+                    "unknown nullable type '{inner_name}'; expected Int64, Float64, Bool, or String"
+                ),
+            })?;
+            self.expect(&TokenKind::RightParen, "')' after nullable column type")?;
+            return Ok(inner.nullable());
+        }
+
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(T)"
+            ),
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -471,23 +545,12 @@ impl Parser {
             }
         }
 
-        let mut order_by = Vec::new();
-        if self.eat_keyword("ORDER") {
+        let order_by = if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
-            loop {
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
-                let descending = if self.eat_keyword("DESC") {
-                    true
-                } else {
-                    self.eat_keyword("ASC");
-                    false
-                };
-                order_by.push(OrderBy { name, descending });
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
+            self.parse_ordering("ORDER BY output column or alias")?
+        } else {
+            Vec::new()
+        };
 
         let limit = if self.eat_keyword("LIMIT") {
             let position = self.position();
@@ -521,9 +584,21 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
+            if let Some(function) = WindowFunction::parse(&name) {
+                self.expect(&TokenKind::RightParen, "')' after window function")?;
+                self.expect_keyword("OVER")?;
+                let specification = self.parse_window_spec(false)?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Window {
+                    function,
+                    specification,
+                    alias,
+                });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
-                message: format!("unknown aggregate function '{name}'"),
+                message: format!("unknown aggregate or window function '{name}'"),
             })?;
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
@@ -531,6 +606,16 @@ impl Parser {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            if self.eat_keyword("OVER") {
+                let specification = self.parse_window_spec(true)?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::AggregateWindow {
+                    function,
+                    argument,
+                    specification,
+                    alias,
+                });
+            }
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
@@ -541,6 +626,103 @@ impl Parser {
             let alias = self.parse_alias()?;
             Ok(SelectItem::Column { name, alias })
         }
+    }
+
+    fn parse_window_spec(&mut self, require_frame: bool) -> Result<WindowSpec> {
+        self.expect(&TokenKind::LeftParen, "'(' after OVER")?;
+        self.expect_keyword("PARTITION")?;
+        self.expect_keyword("BY")?;
+        let partition_by = self.parse_identifier_list("PARTITION BY column")?;
+
+        self.expect_keyword("ORDER")?;
+        self.expect_keyword("BY")?;
+        let order_by = self.parse_ordering("window ORDER BY column")?;
+
+        let frame = if self.eat_keyword("ROWS") {
+            Some(self.parse_rows_frame()?)
+        } else if matches!(self.peek(), TokenKind::Identifier(value) if
+            value.eq_ignore_ascii_case("RANGE") || value.eq_ignore_ascii_case("GROUPS"))
+        {
+            return self.error("only ROWS window frames are supported");
+        } else {
+            None
+        };
+
+        if require_frame && frame.is_none() {
+            return self.error("aggregate window functions require an explicit ROWS frame");
+        }
+        if !require_frame && frame.is_some() {
+            return self.error("ranking window functions do not accept a frame");
+        }
+
+        self.expect(&TokenKind::RightParen, "')' after window specification")?;
+        Ok(WindowSpec {
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    fn parse_rows_frame(&mut self) -> Result<WindowFrame> {
+        let has_between = self.eat_keyword("BETWEEN");
+        let frame = if self.eat_keyword("UNBOUNDED") {
+            self.expect_keyword("PRECEDING")?;
+            WindowFrame::UnboundedPreceding
+        } else {
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected UNBOUNDED or a non-negative integer after ROWS BETWEEN"
+                    .to_owned(),
+            })?;
+            let preceding = number.parse::<usize>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid ROWS PRECEDING bound '{number}'"),
+            })?;
+            if preceding > MAX_WINDOW_FRAME_PRECEDING {
+                return Err(Error::Sql {
+                    position,
+                    message: format!(
+                        "ROWS PRECEDING bound {preceding} exceeds limit of {MAX_WINDOW_FRAME_PRECEDING}"
+                    ),
+                });
+            }
+            self.expect_keyword("PRECEDING")?;
+            WindowFrame::Preceding(preceding)
+        };
+
+        if has_between {
+            self.expect_keyword("AND")?;
+            self.expect_keyword("CURRENT")?;
+            self.expect_keyword("ROW")?;
+        }
+        Ok(frame)
+    }
+
+    fn parse_identifier_list(&mut self, description: &str) -> Result<Vec<String>> {
+        let mut names = vec![self.expect_identifier(description)?];
+        while self.eat(&TokenKind::Comma) {
+            names.push(self.expect_identifier(description)?);
+        }
+        Ok(names)
+    }
+
+    fn parse_ordering(&mut self, description: &str) -> Result<Vec<OrderBy>> {
+        let mut ordering = Vec::new();
+        loop {
+            let name = self.expect_identifier(description)?;
+            let descending = if self.eat_keyword("DESC") {
+                true
+            } else {
+                self.eat_keyword("ASC");
+                false
+            };
+            ordering.push(OrderBy { name, descending });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(ordering)
     }
 
     fn parse_alias(&mut self) -> Result<Option<String>> {
@@ -587,6 +769,15 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        if self.eat_keyword("IS") {
+            let negated = self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            self.record_predicate_node()?;
+            return Ok(Predicate::IsNull {
+                operand: left,
+                negated,
+            });
+        }
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -622,7 +813,9 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL") =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -672,8 +865,10 @@ impl Parser {
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
+        } else if self.eat_keyword("NULL") {
+            Ok(Value::Null)
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, or NULL literal")
         }
     }
 
@@ -771,6 +966,72 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_ranking_and_bounded_aggregate_windows() {
+        let statements = parse(
+            "SELECT RANK() OVER (
+                 PARTITION BY region ORDER BY sequence
+             ) AS place,
+             SUM(amount) OVER (
+                 PARTITION BY region ORDER BY sequence
+                 ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+             ) AS moving,
+             AVG(amount) OVER (
+                 PARTITION BY region ORDER BY sequence
+                 ROWS UNBOUNDED PRECEDING
+             ) AS running
+             FROM sales;",
+        )
+        .expect("valid windows");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        let SelectItem::Window {
+            function,
+            specification,
+            ..
+        } = &select.items[0]
+        else {
+            panic!("expected ranking window");
+        };
+        assert_eq!(*function, WindowFunction::Rank);
+        assert_eq!(specification.frame, None);
+
+        let SelectItem::AggregateWindow {
+            function,
+            specification,
+            ..
+        } = &select.items[1]
+        else {
+            panic!("expected aggregate window");
+        };
+        assert_eq!(*function, AggregateFunction::Sum);
+        assert_eq!(specification.frame, Some(WindowFrame::Preceding(4)));
+
+        let SelectItem::AggregateWindow { specification, .. } = &select.items[2] else {
+            panic!("expected cumulative aggregate window");
+        };
+        assert_eq!(specification.frame, Some(WindowFrame::UnboundedPreceding));
+    }
+
+    #[test]
+    fn rejects_window_frame_bounds_above_the_limit() {
+        let error = parse(
+            "SELECT SUM(amount) OVER (
+                PARTITION BY region ORDER BY sequence
+                ROWS BETWEEN 1000001 PRECEDING AND CURRENT ROW
+             ) FROM sales;",
+        )
+        .expect_err("oversized frame");
+
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message == "ROWS PRECEDING bound 1000001 exceeds limit of 1000000"
+        ));
     }
 
     #[test]

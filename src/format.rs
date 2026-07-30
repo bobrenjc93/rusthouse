@@ -184,6 +184,7 @@ fn write_json_value(output: &mut String, value: &Value) {
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
+        Value::Null => output.push_str("null"),
     }
 }
 
@@ -295,5 +296,23 @@ mod tests {
         assert!(!rendered.contains('\u{07}'));
         assert!(!rendered.contains('\u{00}'));
         assert!(!rendered.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn renders_null_in_every_output_format() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::NullableInt64,
+            }],
+            rows: vec![vec![Value::Null]],
+        };
+
+        assert!(render(&result, OutputFormat::Table).contains("| NULL  |"));
+        assert_eq!(render(&result, OutputFormat::Csv), "value\nNULL\n");
+        assert_eq!(
+            render(&result, OutputFormat::Json),
+            r#"{"columns":[{"name":"value","type":"Nullable(Int64)"}],"rows":[[null]]}"#
+        );
     }
 }

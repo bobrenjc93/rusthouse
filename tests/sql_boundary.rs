@@ -1,3 +1,4 @@
+use rusthouse::storage::{Column, ColumnDef, Table};
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
@@ -104,6 +105,344 @@ fn order_by_limit_preserves_input_order_for_ties_and_accepts_zero() {
         "SELECT label, id FROM ranked ORDER BY label, id DESC LIMIT 0;",
     );
     assert!(empty.rows.is_empty());
+}
+
+#[test]
+fn cumulative_aggregate_windows_handle_partitions_nulls_ties_and_final_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (
+                id Int64, cohort String, sequence Int64, amount Nullable(Int64)
+             );
+             INSERT INTO readings VALUES
+                (1, 'a', 1, 10),
+                (2, 'a', 2, NULL),
+                (3, 'a', 2, 5),
+                (4, 'a', 3, 7),
+                (5, 'b', 1, NULL),
+                (6, 'b', 2, 4);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id, cohort, amount,
+                COUNT(*) OVER (
+                    PARTITION BY cohort ORDER BY sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS rows_seen,
+                COUNT(amount) OVER (
+                    PARTITION BY cohort ORDER BY sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS values_seen,
+                SUM(amount) OVER (
+                    PARTITION BY cohort ORDER BY sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_sum,
+                MIN(amount) OVER (
+                    PARTITION BY cohort ORDER BY sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_min,
+                MAX(amount) OVER (
+                    PARTITION BY cohort ORDER BY sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_max,
+                AVG(amount) OVER (
+                    PARTITION BY cohort ORDER BY sequence
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_avg
+         FROM readings
+         ORDER BY cohort, id
+         LIMIT 5;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::String,
+            DataType::NullableInt64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::NullableInt64,
+            DataType::NullableInt64,
+            DataType::NullableInt64,
+            DataType::NullableFloat64,
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::String("a".to_owned()),
+                Value::Int64(10),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::Float64(10.0),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("a".to_owned()),
+                Value::Null,
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::Float64(10.0),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::String("a".to_owned()),
+                Value::Int64(5),
+                Value::Int64(3),
+                Value::Int64(2),
+                Value::Int64(15),
+                Value::Int64(5),
+                Value::Int64(10),
+                Value::Float64(7.5),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::String("a".to_owned()),
+                Value::Int64(7),
+                Value::Int64(4),
+                Value::Int64(3),
+                Value::Int64(22),
+                Value::Int64(5),
+                Value::Int64(10),
+                Value::Float64(22.0 / 3.0),
+            ],
+            vec![
+                Value::Int64(5),
+                Value::String("b".to_owned()),
+                Value::Null,
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+#[test]
+fn fixed_preceding_windows_use_sliding_prefixes_and_extreme_queues() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, cohort String, amount Nullable(Int64));
+             INSERT INTO samples VALUES
+                (1, 'x', 5), (2, 'x', NULL), (3, 'x', 3),
+                (4, 'x', 8), (5, 'x', 2);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id,
+                COUNT(amount) OVER (
+                    PARTITION BY cohort ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                ) AS count_value,
+                SUM(amount) OVER (
+                    PARTITION BY cohort ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                ) AS sum_value,
+                MIN(amount) OVER (
+                    PARTITION BY cohort ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                ) AS min_value,
+                MAX(amount) OVER (
+                    PARTITION BY cohort ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                ) AS max_value,
+                AVG(amount) OVER (
+                    PARTITION BY cohort ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                ) AS avg_value
+         FROM samples ORDER BY id;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(5),
+                Value::Int64(5),
+                Value::Int64(5),
+                Value::Float64(5.0),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(5),
+                Value::Int64(5),
+                Value::Int64(5),
+                Value::Float64(5.0),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Int64(2),
+                Value::Int64(8),
+                Value::Int64(3),
+                Value::Int64(5),
+                Value::Float64(4.0),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::Int64(2),
+                Value::Int64(11),
+                Value::Int64(3),
+                Value::Int64(8),
+                Value::Float64(5.5),
+            ],
+            vec![
+                Value::Int64(5),
+                Value::Int64(3),
+                Value::Int64(13),
+                Value::Int64(2),
+                Value::Int64(8),
+                Value::Float64(13.0 / 3.0),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn ranking_and_aggregate_windows_share_deterministic_partition_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE scores (team Int64, id Int64, score Int64);
+             INSERT INTO scores VALUES
+                (1, 1, 90), (1, 2, 90), (1, 3, 70), (2, 4, 100);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT team, id,
+                ROW_NUMBER() OVER (PARTITION BY team ORDER BY score DESC) AS row_number,
+                RANK() OVER (PARTITION BY team ORDER BY score DESC) AS rank,
+                DENSE_RANK() OVER (PARTITION BY team ORDER BY score DESC) AS dense_rank,
+                SUM(score) OVER (
+                    PARTITION BY team ORDER BY score DESC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_score
+         FROM scores ORDER BY team, row_number;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(90),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(180),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Int64(2),
+                Value::Int64(250),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(4),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(100),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn aggregate_windows_bound_frames_report_overflow_and_accept_empty_input() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE valueset (cohort Int64, id Int64, amount Int64, value Float64);
+             INSERT INTO valueset VALUES
+                (1, 1, 9223372036854775807, 1e308), (1, 2, 1, 1e308);",
+        )
+        .expect("setup succeeds");
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT SUM(amount) OVER (
+             PARTITION BY cohort ORDER BY id
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+         ) AS total FROM valueset WHERE id < 0;",
+    );
+    assert!(empty.rows.is_empty());
+
+    for bound in ["1000001", "99999999999999999999999999999999999999"] {
+        let error = database
+            .execute(&format!(
+                "SELECT SUM(amount) OVER (
+                    PARTITION BY cohort ORDER BY id
+                    ROWS BETWEEN {bound} PRECEDING AND CURRENT ROW
+                 ) FROM valueset;"
+            ))
+            .expect_err("frame bound is rejected");
+        assert!(matches!(error, Error::Sql { .. }));
+    }
+
+    let integer_overflow = database
+        .execute(
+            "SELECT SUM(amount) OVER (
+                PARTITION BY cohort ORDER BY id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) FROM valueset;",
+        )
+        .expect_err("running Int64 sum overflows");
+    assert!(matches!(integer_overflow, Error::NumericOverflow(_)));
+
+    let float_overflow = database
+        .execute(
+            "SELECT SUM(value) OVER (
+                PARTITION BY cohort ORDER BY id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) FROM valueset;",
+        )
+        .expect_err("running Float64 prefix overflows");
+    assert!(matches!(float_overflow, Error::NumericOverflow(_)));
+
+    for sql in [
+        "SELECT SUM(amount) OVER (PARTITION BY cohort ORDER BY id) FROM valueset;",
+        "SELECT SUM(amount) OVER (
+            PARTITION BY cohort ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW
+         ) FROM valueset;",
+        "SELECT RANK() OVER (
+            PARTITION BY cohort ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ) FROM valueset;",
+    ] {
+        assert!(matches!(database.execute(sql), Err(Error::Sql { .. })));
+    }
 }
 
 #[test]
@@ -244,10 +583,10 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
         vec![
             DataType::String,
             DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Float64,
+            DataType::NullableInt64,
+            DataType::NullableInt64,
+            DataType::NullableInt64,
+            DataType::NullableFloat64,
         ]
     );
     assert_eq!(
@@ -284,7 +623,15 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(
+        empty
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::Int64, DataType::NullableFloat64]
+    );
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -479,7 +826,7 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 
 #[test]
 fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+    for identifier in ["true", "FALSE", "null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
@@ -499,6 +846,210 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
             Err(Error::TableNotFound(_))
         ));
     }
+}
+
+#[test]
+fn nullable_columns_follow_sql_null_semantics_end_to_end() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (
+                id Int64,
+                category Nullable(String),
+                amount Nullable(Int64),
+                enabled Nullable(Bool)
+             );
+             INSERT INTO samples VALUES
+                (1, NULL, NULL, NULL),
+                (2, NULL, 5, true),
+                (3, 'a', NULL, false),
+                (4, 'a', 7, true),
+                (5, 'b', 3, NULL),
+                (6, 'c', NULL, false);",
+        )
+        .expect("nullable setup succeeds");
+
+    let projection = execute_query(
+        &mut database,
+        "SELECT id, category, amount FROM samples
+         WHERE amount = 5 OR category IS NULL
+         ORDER BY amount;",
+    );
+    assert_eq!(
+        projection
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Int64,
+            DataType::NullableString,
+            DataType::NullableInt64,
+        ]
+    );
+    assert_eq!(
+        projection.rows,
+        vec![
+            vec![Value::Int64(2), Value::Null, Value::Int64(5)],
+            vec![Value::Int64(1), Value::Null, Value::Null],
+        ]
+    );
+
+    let descending = execute_query(
+        &mut database,
+        "SELECT id, amount FROM samples ORDER BY amount DESC LIMIT 4;",
+    );
+    assert_eq!(
+        descending.rows,
+        vec![
+            vec![Value::Int64(1), Value::Null],
+            vec![Value::Int64(3), Value::Null],
+            vec![Value::Int64(6), Value::Null],
+            vec![Value::Int64(4), Value::Int64(7)],
+        ]
+    );
+
+    let unknown_comparison = execute_query(
+        &mut database,
+        "SELECT id FROM samples
+         WHERE amount = NULL OR enabled = true
+         ORDER BY id;",
+    );
+    assert_eq!(
+        unknown_comparison.rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(4)]]
+    );
+
+    let non_null = execute_query(
+        &mut database,
+        "SELECT id FROM samples WHERE amount IS NOT NULL ORDER BY id;",
+    );
+    assert_eq!(
+        non_null.rows,
+        vec![
+            vec![Value::Int64(2)],
+            vec![Value::Int64(4)],
+            vec![Value::Int64(5)],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT category,
+                COUNT(*) AS rows,
+                COUNT(amount) AS present,
+                SUM(amount) AS total,
+                MIN(amount) AS low,
+                MAX(amount) AS high,
+                AVG(amount) AS mean
+         FROM samples
+         GROUP BY category
+         ORDER BY category;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(7),
+                Value::Int64(7),
+                Value::Int64(7),
+                Value::Float64(7.0),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Int64(3),
+                Value::Float64(3.0),
+            ],
+            vec![
+                Value::String("c".to_owned()),
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Null,
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(5),
+                Value::Int64(5),
+                Value::Int64(5),
+                Value::Float64(5.0),
+            ],
+        ]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT SUM(amount) AS total, MIN(amount) AS low,
+                MAX(amount) AS high, AVG(amount) AS mean
+         FROM samples WHERE id < 0;",
+    );
+    assert_eq!(
+        empty.rows,
+        vec![vec![Value::Null, Value::Null, Value::Null, Value::Null]]
+    );
+}
+
+#[test]
+fn null_is_rejected_by_non_nullable_columns_without_partial_insert() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE required (id Int64);")
+        .expect("create succeeds");
+
+    let error = database
+        .execute("INSERT INTO required VALUES (1), (NULL);")
+        .expect_err("NULL is invalid for Int64");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "Int64" && actual == "NULL"
+    ));
+    let count = execute_query(&mut database, "SELECT COUNT(*) FROM required;");
+    assert_eq!(count.rows, vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn public_schema_construction_rejects_the_null_literal_type() {
+    let error = Table::new(
+        "invalid".to_owned(),
+        vec![ColumnDef {
+            name: "value".to_owned(),
+            data_type: DataType::Null,
+        }],
+    )
+    .expect_err("the NULL literal type is not a physical column type");
+
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message == "column 'invalid.value' cannot use NULL as a data type; use Nullable(T)"
+    ));
+}
+
+#[test]
+fn public_column_construction_rejects_the_null_literal_type() {
+    let error = Column::new(DataType::Null)
+        .expect_err("the NULL literal type is not a physical column type");
+
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message == "NULL is a literal type, not a physical column type; use Nullable(T)"
+    ));
 }
 
 #[test]
