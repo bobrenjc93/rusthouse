@@ -25,6 +25,34 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
 }
 
 #[test]
+fn query_results_can_be_materialized_end_to_end() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE source (id Int64);
+             INSERT INTO source VALUES (2), (1);
+             CREATE TABLE copied AS SELECT id FROM source;
+             CREATE TABLE target (value Int64);
+             INSERT INTO target SELECT id FROM copied;
+             SELECT value FROM target ORDER BY value;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"value\",\"type\":\"Int64\"}],\"rows\":[[1],[2]]}]}\n"
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("INSERT 2")
+    );
+}
+
+#[test]
 fn multiple_selects_emit_one_json_document() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

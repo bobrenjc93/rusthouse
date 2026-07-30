@@ -346,6 +346,205 @@ fn failed_multi_row_insert_is_atomic_and_actionable() {
 }
 
 #[test]
+fn create_table_as_select_infers_schema_and_materializes_query_results() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64, active Bool);
+             INSERT INTO sales VALUES
+                ('west', 10, true),
+                ('east', 4, true),
+                ('west', 7, true),
+                ('east', 100, false);
+             CREATE TABLE summary AS
+                SELECT region AS area, SUM(amount) AS total, AVG(amount) AS mean
+                FROM sales
+                WHERE active = true
+                GROUP BY region
+                ORDER BY total DESC
+                LIMIT 2;",
+        )
+        .expect("CTAS succeeds");
+
+    assert!(matches!(
+        results.last(),
+        Some(StatementResult::Command {
+            tag: "CREATE TABLE",
+            affected_rows: 0,
+        })
+    ));
+    let summary = database
+        .catalog()
+        .table("summary")
+        .expect("table published");
+    assert_eq!(
+        summary
+            .schema()
+            .iter()
+            .map(|field| (&field.name, field.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"area".to_owned(), DataType::String),
+            (&"total".to_owned(), DataType::Int64),
+            (&"mean".to_owned(), DataType::Float64),
+        ]
+    );
+    let materialized = execute_query(
+        &mut database,
+        "SELECT area, total, mean FROM summary ORDER BY total DESC;",
+    );
+    assert_eq!(
+        materialized.rows,
+        vec![
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(17),
+                Value::Float64(8.5),
+            ],
+            vec![
+                Value::String("east".to_owned()),
+                Value::Int64(4),
+                Value::Float64(4.0),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn insert_select_maps_positionally_and_reports_affected_rows() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE source (id Int64, label String);
+             CREATE TABLE target (number Int64, description String);
+             INSERT INTO source VALUES (2, 'two'), (1, 'one');
+             INSERT INTO target
+                SELECT id AS ignored_name, label AS another_name
+                FROM source ORDER BY ignored_name;",
+        )
+        .expect("INSERT SELECT succeeds");
+
+    assert!(matches!(
+        results.last(),
+        Some(StatementResult::Command {
+            tag: "INSERT",
+            affected_rows: 2,
+        })
+    ));
+    let inserted = execute_query(
+        &mut database,
+        "SELECT number, description FROM target ORDER BY number;",
+    );
+    assert_eq!(
+        inserted.rows,
+        vec![
+            vec![Value::Int64(1), Value::String("one".to_owned())],
+            vec![Value::Int64(2), Value::String("two".to_owned())],
+        ]
+    );
+}
+
+#[test]
+fn insert_select_validates_empty_output_schema_without_appending() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE source (id Int64, label String);
+             CREATE TABLE target (id Int64, label String);
+             INSERT INTO source VALUES (1, 'one');
+             INSERT INTO target VALUES (9, 'existing');",
+        )
+        .expect("setup succeeds");
+
+    let width = database
+        .execute("INSERT INTO target SELECT id FROM source WHERE id < 0;")
+        .expect_err("empty output still has the wrong width");
+    assert!(matches!(
+        width,
+        Error::RowLength {
+            expected: 2,
+            actual: 1,
+            ..
+        }
+    ));
+
+    let types = database
+        .execute("INSERT INTO target SELECT label, id FROM source WHERE id < 0;")
+        .expect_err("empty output still has incompatible types");
+    assert!(matches!(
+        types,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "Int64" && actual == "String"
+    ));
+    let unchanged = execute_query(&mut database, "SELECT id, label FROM target;");
+    assert_eq!(
+        unchanged.rows,
+        vec![vec![Value::Int64(9), Value::String("existing".to_owned())]]
+    );
+}
+
+#[test]
+fn materialization_errors_leave_catalog_and_target_unchanged() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE source (value Int64);
+             CREATE TABLE target (total Int64);
+             INSERT INTO source VALUES (9223372036854775807), (1);
+             INSERT INTO target VALUES (7);",
+        )
+        .expect("setup succeeds");
+
+    let insert_error = database
+        .execute("INSERT INTO target SELECT SUM(value) AS total FROM source;")
+        .expect_err("aggregate overflows");
+    assert!(matches!(insert_error, Error::NumericOverflow(operation) if operation == "SUM(Int64)"));
+    assert_eq!(database.catalog().table("target").unwrap().row_count(), 1);
+
+    let create_error = database
+        .execute("CREATE TABLE overflowed AS SELECT SUM(value) AS total FROM source;")
+        .expect_err("aggregate overflows");
+    assert!(matches!(create_error, Error::NumericOverflow(operation) if operation == "SUM(Int64)"));
+    assert!(matches!(
+        database.catalog().table("overflowed"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
+fn create_table_as_rejects_unusable_or_duplicate_output_names_atomically() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE source (id Int64); INSERT INTO source VALUES (1);")
+        .expect("setup succeeds");
+
+    let duplicate = database
+        .execute("CREATE TABLE duplicated AS SELECT id, id FROM source;")
+        .expect_err("duplicate inferred names");
+    assert!(matches!(duplicate, Error::DuplicateColumn(column) if column == "id"));
+
+    let invalid = database
+        .execute("CREATE TABLE unnamed_count AS SELECT COUNT(*) FROM source;")
+        .expect_err("generated aggregate name is not a usable identifier");
+    assert!(matches!(
+        invalid,
+        Error::InvalidIdentifier {
+            identifier,
+            context,
+        } if identifier == "COUNT(*)" && context == "column name"
+    ));
+    for name in ["duplicated", "unnamed_count"] {
+        assert!(matches!(
+            database.catalog().table(name),
+            Err(Error::TableNotFound(_))
+        ));
+    }
+}
+
+#[test]
 fn invalid_grouping_and_aggregate_types_are_rejected() {
     let mut database = Database::new();
     database

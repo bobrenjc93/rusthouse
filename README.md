@@ -4,8 +4,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- CREATE TABLE with Int64, Float64, Bool, and String columns, plus CREATE TABLE AS SELECT with inferred schemas
+- multi-row INSERT INTO ... VALUES and positional INSERT INTO ... SELECT with atomic width, type, and value validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -34,6 +34,12 @@ cargo run -- --execute "
   GROUP BY region
   ORDER BY total DESC
   LIMIT 10;
+  CREATE TABLE online_totals AS
+  SELECT region, SUM(amount) AS total
+  FROM sales WHERE online = true GROUP BY region;
+  INSERT INTO online_totals
+  SELECT region, SUM(amount) AS total
+  FROM sales WHERE online = false GROUP BY region;
 "
 ~~~
 
@@ -81,7 +87,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. Each INSERT is validated in full before any of its rows are appended, and CREATE TABLE AS SELECT is published only after its result has been fully validated.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

@@ -7,7 +7,7 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -69,18 +69,40 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateTableAs { name, query } => {
+                self.catalog.ensure_table_absent(&name)?;
+                let result = self.execute_select(query)?;
+                let schema = result
+                    .columns
+                    .into_iter()
+                    .map(|column| ColumnDef {
+                        name: column.name,
+                        data_type: column.data_type,
+                    })
+                    .collect();
+                let mut table = Table::new(name, schema)?;
+                table.insert_rows(result.rows)?;
+                self.catalog.insert_table(table)?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
                 let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                target.insert_rows(rows)?;
+                Ok(StatementResult::Command {
+                    tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::InsertSelect { table, query } => {
+                self.catalog.table(&table)?;
+                let result = self.execute_select(query)?;
+                let affected_rows = result.rows.len();
+                validate_insert_schema(self.catalog.table(&table)?, &result.columns)?;
+                self.catalog.table_mut(&table)?.insert_rows(result.rows)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
@@ -133,6 +155,26 @@ impl Database {
             rows,
         })
     }
+}
+
+fn validate_insert_schema(target: &Table, source: &[ResultColumn]) -> Result<()> {
+    if source.len() != target.schema().len() {
+        return Err(Error::RowLength {
+            table: target.name().to_owned(),
+            expected: target.schema().len(),
+            actual: source.len(),
+        });
+    }
+    for (field, output) in target.schema().iter().zip(source) {
+        if field.data_type != output.data_type {
+            return Err(Error::TypeMismatch {
+                context: format!("column '{}.{}'", target.name(), field.name),
+                expected: field.data_type.to_string(),
+                actual: output.data_type.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

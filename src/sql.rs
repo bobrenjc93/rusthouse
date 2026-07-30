@@ -11,9 +11,17 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    CreateTableAs {
+        name: String,
+        query: Select,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
+    },
+    InsertSelect {
+        table: String,
+        query: Select,
     },
     Select(Select),
 }
@@ -386,6 +394,12 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let name = self.expect_identifier("table name")?;
+        if self.eat_keyword("AS") {
+            self.expect_keyword("SELECT")?;
+            let query = self.parse_select()?;
+            return Ok(Statement::CreateTableAs { name, query });
+        }
+
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
@@ -419,7 +433,13 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
-        self.expect_keyword("VALUES")?;
+        if self.eat_keyword("SELECT") {
+            let query = self.parse_select()?;
+            return Ok(Statement::InsertSelect { table, query });
+        }
+        if !self.eat_keyword("VALUES") {
+            return self.error("expected VALUES or SELECT after table name");
+        }
         let mut rows = Vec::new();
         loop {
             self.expect(&TokenKind::LeftParen, "'(' before row values")?;
@@ -782,6 +802,26 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_create_table_as_and_insert_select() {
+        let statements = parse(
+            "CREATE TABLE summary AS SELECT category, SUM(amount) AS total FROM sales GROUP BY category; \
+             INSERT INTO archive SELECT category, total FROM summary",
+        )
+        .expect("valid materialization statements");
+
+        assert!(matches!(
+            &statements[0],
+            Statement::CreateTableAs { name, query }
+                if name == "summary" && query.group_by == ["category"]
+        ));
+        assert!(matches!(
+            &statements[1],
+            Statement::InsertSelect { table, query }
+                if table == "archive" && query.table == "summary"
+        ));
     }
 
     #[test]

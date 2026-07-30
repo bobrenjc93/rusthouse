@@ -16,11 +16,23 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
-        let key = normalize(&name);
-        if self.tables.contains_key(&key) {
-            return Err(Error::TableAlreadyExists(name));
-        }
+        self.ensure_table_absent(&name)?;
         let table = Table::new(name, schema)?;
+        self.insert_table(table)
+    }
+
+    pub(crate) fn ensure_table_absent(&self, name: &str) -> Result<()> {
+        if self.tables.contains_key(&normalize(name)) {
+            return Err(Error::TableAlreadyExists(name.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_table(&mut self, table: Table) -> Result<()> {
+        let key = normalize(table.name());
+        if self.tables.contains_key(&key) {
+            return Err(Error::TableAlreadyExists(table.name().to_owned()));
+        }
         self.tables.insert(key, table);
         Ok(())
     }

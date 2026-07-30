@@ -14,6 +14,14 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
 }
 
+fn is_valid_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 /// A physical column. Each variant owns a contiguous vector of one Rust type.
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -86,6 +94,18 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        match self {
+            Self::Int64(values) => values.try_reserve(additional),
+            Self::Float64(values) => values.try_reserve(additional),
+            Self::Bool(values) => values.try_reserve(additional),
+            Self::String(values) => values.try_reserve(additional),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -99,6 +119,12 @@ pub struct Table {
 
 impl Table {
     pub fn new(name: String, schema: Vec<ColumnDef>) -> Result<Self> {
+        if !is_valid_identifier(&name) {
+            return Err(Error::InvalidIdentifier {
+                identifier: name,
+                context: "table name".to_owned(),
+            });
+        }
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
                 "a table must contain at least one column".to_owned(),
@@ -106,6 +132,12 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
+            if !is_valid_identifier(&field.name) {
+                return Err(Error::InvalidIdentifier {
+                    identifier: field.name.clone(),
+                    context: "column name".to_owned(),
+                });
+            }
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
@@ -190,10 +222,40 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        let next_row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| Error::NumericOverflow(format!("table '{}' row count", self.name)))?;
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
-        self.row_count += 1;
+        self.row_count = next_row_count;
+        Ok(())
+    }
+
+    /// Validates and reserves a complete batch before appending any values.
+    pub(crate) fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<()> {
+        for row in &rows {
+            self.validate_row(row)?;
+        }
+        let next_row_count = self
+            .row_count
+            .checked_add(rows.len())
+            .ok_or_else(|| Error::NumericOverflow(format!("table '{}' row count", self.name)))?;
+        for column in &mut self.columns {
+            column.try_reserve(rows.len()).map_err(|_| {
+                Error::InvalidQuery(format!(
+                    "could not reserve storage for table '{}'",
+                    self.name
+                ))
+            })?;
+        }
+        for row in rows {
+            for (column, value) in self.columns.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        self.row_count = next_row_count;
         Ok(())
     }
 }
@@ -238,6 +300,29 @@ mod tests {
             .expect_err("wrong type");
 
         assert!(matches!(error, Error::TypeMismatch { .. }));
+        assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejected_batch_does_not_append_valid_prefix() {
+        let mut table = Table::new(
+            "measurements".to_owned(),
+            vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::Float64,
+            }],
+        )
+        .expect("valid schema");
+
+        let error = table
+            .insert_rows(vec![
+                vec![Value::Float64(1.0)],
+                vec![Value::Float64(f64::INFINITY)],
+            ])
+            .expect_err("non-finite value");
+
+        assert!(matches!(error, Error::InvalidQuery(message) if message.contains("non-finite")));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
     }
