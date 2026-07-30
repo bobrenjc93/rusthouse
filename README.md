@@ -10,7 +10,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
-- GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- GROUP BY with HAVING filters over group keys, selected aliases, and aggregate calls
+- output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -32,6 +33,7 @@ cargo run -- --execute "
   FROM sales
   WHERE online = true
   GROUP BY region
+  HAVING total >= 10
   ORDER BY total DESC
   LIMIT 10;
 "
@@ -83,7 +85,9 @@ assert_eq!(result.rows.len(), 1);
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+HAVING can use aggregates that are absent from the SELECT output. Repeated instances of the same aggregate in SELECT and HAVING share one state per group. A bare HAVING name must resolve unambiguously to a grouped column or selected output alias, and source columns that are not grouped are rejected.
+
+To keep recursive predicate processing bounded, each WHERE and HAVING expression is independently limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

@@ -107,14 +107,45 @@ impl Database {
             .collect::<Vec<_>>();
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
+        let grouped_query = !group_columns.is_empty()
+            || select.having.is_some()
+            || select
+                .items
+                .iter()
+                .any(|item| matches!(item, SelectItem::Aggregate { .. }));
+        let mut aggregate_specs = Vec::new();
+        let (items, result_columns) = resolve_select_items(
+            table,
+            &select.items,
+            &group_columns,
+            grouped_query,
+            &mut aggregate_specs,
+        )?;
+        let having = select
+            .having
+            .as_deref()
+            .map(|predicate| {
+                compile_having_predicate(
+                    table,
+                    predicate,
+                    &group_columns,
+                    &items,
+                    &result_columns,
+                    &mut aggregate_specs,
+                )
+            })
+            .transpose()?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
+        let rows = if grouped_query {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            let mut selected_groups = (0..grouped.len())
+                .filter(|group| {
+                    having
+                        .as_ref()
+                        .is_none_or(|predicate| predicate.evaluate(&grouped, *group))
+                })
+                .collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -146,7 +177,7 @@ enum ResolvedItem {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
@@ -171,7 +202,9 @@ fn resolve_select_items(
     table: &Table,
     requested: &[SelectItem],
     group_columns: &[usize],
-) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+    grouped_query: bool,
+    aggregate_specs: &mut Vec<AggregateSpec>,
+) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>)> {
     let has_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
@@ -187,14 +220,12 @@ fn resolve_select_items(
 
     let mut items = Vec::new();
     let mut result_columns = Vec::new();
-    let mut aggregate_specs = Vec::new();
-
     for requested_item in requested {
         match requested_item {
             SelectItem::Wildcard => {
                 for (source, field) in table.schema().iter().enumerate() {
                     let group_position = group_columns.iter().position(|column| *column == source);
-                    if !group_columns.is_empty() && group_position.is_none() {
+                    if grouped_query && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
                             field.name
@@ -213,7 +244,7 @@ fn resolve_select_items(
             SelectItem::Column { name, alias } => {
                 let source = table.column_index(name)?;
                 let group_position = group_columns.iter().position(|column| *column == source);
-                if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
+                if grouped_query && group_position.is_none() {
                     return Err(Error::InvalidQuery(format!(
                         "column '{name}' must appear in GROUP BY"
                     )));
@@ -234,32 +265,8 @@ fn resolve_select_items(
                 argument,
                 alias,
             } => {
-                let (argument_index, input_type, argument_name) = match argument {
-                    AggregateArgument::Wildcard => {
-                        if *function != AggregateFunction::Count {
-                            return Err(Error::InvalidQuery(format!(
-                                "{}(*) is not supported; use a column argument",
-                                function.name()
-                            )));
-                        }
-                        (None, None, "*".to_owned())
-                    }
-                    AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
-                        (
-                            Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
-                        )
-                    }
-                };
-                validate_aggregate(*function, input_type)?;
-                let state = aggregate_specs.len();
-                aggregate_specs.push(AggregateSpec {
-                    function: *function,
-                    argument: argument_index,
-                    input_type,
-                });
+                let (state, input_type, argument_name) =
+                    resolve_aggregate(table, *function, argument, aggregate_specs)?;
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
                     name: alias
@@ -271,7 +278,49 @@ fn resolve_select_items(
         }
     }
 
-    Ok((items, result_columns, aggregate_specs))
+    Ok((items, result_columns))
+}
+
+fn resolve_aggregate(
+    table: &Table,
+    function: AggregateFunction,
+    argument: &AggregateArgument,
+    aggregate_specs: &mut Vec<AggregateSpec>,
+) -> Result<(usize, Option<DataType>, String)> {
+    let (argument_index, input_type, argument_name) = match argument {
+        AggregateArgument::Wildcard => {
+            if function != AggregateFunction::Count {
+                return Err(Error::InvalidQuery(format!(
+                    "{}(*) is not supported; use a column argument",
+                    function.name()
+                )));
+            }
+            (None, None, "*".to_owned())
+        }
+        AggregateArgument::Column(name) => {
+            let index = table.column_index(name)?;
+            (
+                Some(index),
+                Some(table.schema()[index].data_type),
+                table.schema()[index].name.clone(),
+            )
+        }
+    };
+    validate_aggregate(function, input_type)?;
+    let spec = AggregateSpec {
+        function,
+        argument: argument_index,
+        input_type,
+    };
+    let state = aggregate_specs
+        .iter()
+        .position(|existing| existing == &spec)
+        .unwrap_or_else(|| {
+            let state = aggregate_specs.len();
+            aggregate_specs.push(spec);
+            state
+        });
+    Ok((state, input_type, argument_name))
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -518,6 +567,270 @@ impl GroupedData<'_> {
                     .collect()
             })
             .collect()
+    }
+}
+
+#[derive(Debug)]
+enum CompiledHavingPredicate {
+    Comparison {
+        left: CompiledHavingOperand,
+        operator: ComparisonOperator,
+        right: CompiledHavingOperand,
+    },
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+}
+
+impl CompiledHavingPredicate {
+    fn evaluate(&self, data: &GroupedData<'_>, group: usize) -> bool {
+        match self {
+            Self::Comparison {
+                left,
+                operator,
+                right,
+            } => {
+                let comparison = left
+                    .value(data, group)
+                    .sql_cmp(right.value(data, group))
+                    .expect("HAVING operand types are validated");
+                comparison_matches(comparison, *operator)
+            }
+            Self::And(left, right) => left.evaluate(data, group) && right.evaluate(data, group),
+            Self::Or(left, right) => left.evaluate(data, group) || right.evaluate(data, group),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupValueSource {
+    Key {
+        position: usize,
+        data_type: DataType,
+    },
+    Aggregate {
+        state: usize,
+        data_type: DataType,
+    },
+}
+
+#[derive(Debug)]
+enum CompiledHavingOperand {
+    GroupValue(GroupValueSource),
+    Literal(Value),
+}
+
+impl CompiledHavingOperand {
+    fn data_type(&self) -> DataType {
+        match self {
+            Self::GroupValue(
+                GroupValueSource::Key { data_type, .. }
+                | GroupValueSource::Aggregate { data_type, .. },
+            ) => *data_type,
+            Self::Literal(value) => value.data_type(),
+        }
+    }
+
+    fn value<'a>(&'a self, data: &'a GroupedData<'a>, group: usize) -> ValueRef<'a> {
+        match self {
+            Self::GroupValue(GroupValueSource::Key { position, .. }) => {
+                data.keys[group].value(*position)
+            }
+            Self::GroupValue(GroupValueSource::Aggregate { state, .. }) => {
+                data.aggregates[*state][group].as_ref()
+            }
+            Self::Literal(value) => value.as_ref(),
+        }
+    }
+}
+
+fn compile_having_predicate(
+    table: &Table,
+    predicate: &Predicate,
+    group_columns: &[usize],
+    items: &[ResolvedItem],
+    result_columns: &[ResultColumn],
+    aggregate_specs: &mut Vec<AggregateSpec>,
+) -> Result<CompiledHavingPredicate> {
+    match predicate {
+        Predicate::Comparison {
+            left,
+            operator,
+            right,
+        } => {
+            let left = compile_having_operand(
+                table,
+                left,
+                group_columns,
+                items,
+                result_columns,
+                aggregate_specs,
+            )?;
+            let right = compile_having_operand(
+                table,
+                right,
+                group_columns,
+                items,
+                result_columns,
+                aggregate_specs,
+            )?;
+            if !comparable(left.data_type(), right.data_type()) {
+                return Err(Error::TypeMismatch {
+                    context: "HAVING comparison".to_owned(),
+                    expected: left.data_type().to_string(),
+                    actual: right.data_type().to_string(),
+                });
+            }
+            Ok(CompiledHavingPredicate::Comparison {
+                left,
+                operator: *operator,
+                right,
+            })
+        }
+        Predicate::And(left, right) => Ok(CompiledHavingPredicate::And(
+            Box::new(compile_having_predicate(
+                table,
+                left,
+                group_columns,
+                items,
+                result_columns,
+                aggregate_specs,
+            )?),
+            Box::new(compile_having_predicate(
+                table,
+                right,
+                group_columns,
+                items,
+                result_columns,
+                aggregate_specs,
+            )?),
+        )),
+        Predicate::Or(left, right) => Ok(CompiledHavingPredicate::Or(
+            Box::new(compile_having_predicate(
+                table,
+                left,
+                group_columns,
+                items,
+                result_columns,
+                aggregate_specs,
+            )?),
+            Box::new(compile_having_predicate(
+                table,
+                right,
+                group_columns,
+                items,
+                result_columns,
+                aggregate_specs,
+            )?),
+        )),
+    }
+}
+
+fn compile_having_operand(
+    table: &Table,
+    operand: &Operand,
+    group_columns: &[usize],
+    items: &[ResolvedItem],
+    result_columns: &[ResultColumn],
+    aggregate_specs: &mut Vec<AggregateSpec>,
+) -> Result<CompiledHavingOperand> {
+    match operand {
+        Operand::Column(name) => resolve_having_name(
+            table,
+            name,
+            group_columns,
+            items,
+            result_columns,
+            aggregate_specs,
+        )
+        .map(CompiledHavingOperand::GroupValue),
+        Operand::Aggregate { function, argument } => {
+            let (state, input_type, _) =
+                resolve_aggregate(table, *function, argument, aggregate_specs)?;
+            Ok(CompiledHavingOperand::GroupValue(
+                GroupValueSource::Aggregate {
+                    state,
+                    data_type: aggregate_output_type(*function, input_type),
+                },
+            ))
+        }
+        Operand::Literal(value) => Ok(CompiledHavingOperand::Literal(value.clone())),
+    }
+}
+
+fn resolve_having_name(
+    table: &Table,
+    name: &str,
+    group_columns: &[usize],
+    items: &[ResolvedItem],
+    result_columns: &[ResultColumn],
+    aggregate_specs: &[AggregateSpec],
+) -> Result<GroupValueSource> {
+    let output_matches = result_columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if output_matches.len() > 1 {
+        return Err(Error::InvalidQuery(format!(
+            "HAVING name '{name}' is ambiguous"
+        )));
+    }
+    let output_source = output_matches
+        .first()
+        .map(|output| group_source_for_item(table, &items[*output], aggregate_specs))
+        .transpose()?;
+
+    let source_column = table.column_index(name).ok();
+    let group_source = source_column.and_then(|source| {
+        group_columns
+            .iter()
+            .position(|column| *column == source)
+            .map(|position| GroupValueSource::Key {
+                position,
+                data_type: table.schema()[source].data_type,
+            })
+    });
+
+    match (output_source, group_source) {
+        (Some(output), Some(group)) if output != group => Err(Error::InvalidQuery(format!(
+            "HAVING name '{name}' is ambiguous"
+        ))),
+        (Some(output), _) => Ok(output),
+        (None, Some(group)) => Ok(group),
+        (None, None) if source_column.is_some() => Err(Error::InvalidQuery(format!(
+            "column '{name}' must appear in GROUP BY"
+        ))),
+        (None, None) => table.column_index(name).map(|_| unreachable!()),
+    }
+}
+
+fn group_source_for_item(
+    table: &Table,
+    item: &ResolvedItem,
+    aggregate_specs: &[AggregateSpec],
+) -> Result<GroupValueSource> {
+    match item {
+        ResolvedItem::Column {
+            source,
+            group_position: Some(position),
+        } => Ok(GroupValueSource::Key {
+            position: *position,
+            data_type: table.schema()[*source].data_type,
+        }),
+        ResolvedItem::Column {
+            group_position: None,
+            ..
+        } => Err(Error::InvalidQuery(
+            "HAVING cannot reference an ungrouped output column".to_owned(),
+        )),
+        ResolvedItem::Aggregate { state } => {
+            let spec = &aggregate_specs[*state];
+            Ok(GroupValueSource::Aggregate {
+                state: *state,
+                data_type: aggregate_output_type(spec.function, spec.input_type),
+            })
+        }
     }
 }
 
@@ -791,14 +1104,7 @@ impl CompiledPredicate {
                 let comparison = left
                     .sql_cmp(right)
                     .expect("predicate operand types are validated");
-                match operator {
-                    ComparisonOperator::Equal => comparison == Ordering::Equal,
-                    ComparisonOperator::NotEqual => comparison != Ordering::Equal,
-                    ComparisonOperator::Less => comparison == Ordering::Less,
-                    ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
-                    ComparisonOperator::Greater => comparison == Ordering::Greater,
-                    ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
-                }
+                comparison_matches(comparison, *operator)
             }
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
@@ -870,7 +1176,21 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
                 data_type: table.schema()[index].data_type,
             })
         }
+        Operand::Aggregate { .. } => Err(Error::InvalidQuery(
+            "aggregate calls are not allowed in WHERE".to_owned(),
+        )),
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+    }
+}
+
+fn comparison_matches(comparison: Ordering, operator: ComparisonOperator) -> bool {
+    match operator {
+        ComparisonOperator::Equal => comparison == Ordering::Equal,
+        ComparisonOperator::NotEqual => comparison != Ordering::Equal,
+        ComparisonOperator::Less => comparison == Ordering::Less,
+        ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
+        ComparisonOperator::Greater => comparison == Ordering::Greater,
+        ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
     }
 }
 
@@ -944,6 +1264,50 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn repeated_projection_and_having_aggregates_share_states() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE metrics (value Int64);")
+            .expect("setup");
+        let mut statements = sql::parse(
+            "SELECT SUM(value) AS total, SUM(value) AS duplicate
+             FROM metrics
+             HAVING SUM(value) >= 0 AND COUNT(*) >= 0 AND COUNT(*) < 10",
+        )
+        .expect("query parses");
+        let Statement::Select(select) = statements.remove(0) else {
+            panic!("expected SELECT");
+        };
+        let table = database.catalog().table("metrics").expect("table exists");
+        let group_columns = resolve_group_columns(table, &select.group_by).expect("groups resolve");
+        let mut aggregate_specs = Vec::new();
+        let (items, result_columns) = resolve_select_items(
+            table,
+            &select.items,
+            &group_columns,
+            true,
+            &mut aggregate_specs,
+        )
+        .expect("projection resolves");
+        assert_eq!(aggregate_specs.len(), 1, "duplicate SUM uses one state");
+
+        compile_having_predicate(
+            table,
+            select.having.as_deref().expect("HAVING exists"),
+            &group_columns,
+            &items,
+            &result_columns,
+            &mut aggregate_specs,
+        )
+        .expect("HAVING resolves");
+        assert_eq!(
+            aggregate_specs.len(),
+            2,
+            "projected SUM and repeated hidden COUNT each use one state"
         );
     }
 }

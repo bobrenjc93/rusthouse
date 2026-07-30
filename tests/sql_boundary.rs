@@ -311,6 +311,181 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn global_having_filters_empty_and_nonempty_aggregate_rows() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE measurements (reading Int64);")
+        .expect("create succeeds");
+
+    let empty_match = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS samples, SUM(reading) AS total
+         FROM measurements
+         HAVING samples = 0 AND SUM(reading) = 0;",
+    );
+    assert_eq!(
+        empty_match.rows,
+        vec![vec![Value::Int64(0), Value::Int64(0)]]
+    );
+
+    let empty_rejected = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS samples FROM measurements HAVING samples > 0;",
+    );
+    assert!(empty_rejected.rows.is_empty());
+
+    database
+        .execute("INSERT INTO measurements VALUES (2), (3), (5);")
+        .expect("insert succeeds");
+    let hidden_sum = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS samples
+         FROM measurements
+         HAVING SUM(reading) = 10 AND samples >= 3;",
+    );
+    assert_eq!(hidden_sum.rows, vec![vec![Value::Int64(3)]]);
+}
+
+#[test]
+fn grouped_having_resolves_keys_aliases_and_hidden_aggregates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES
+                ('west', 10), ('west', 8),
+                ('east', 4), ('east', 3),
+                ('north', 20);",
+        )
+        .expect("setup succeeds");
+
+    let aliases = execute_query(
+        &mut database,
+        "SELECT region AS area, SUM(amount) AS total, COUNT(*) AS orders
+         FROM sales
+         GROUP BY region
+         HAVING (area = 'west' OR total >= 20) AND orders >= 1
+         ORDER BY total DESC;",
+    );
+    assert_eq!(
+        aliases.rows,
+        vec![
+            vec![
+                Value::String("north".to_owned()),
+                Value::Int64(20),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(18),
+                Value::Int64(2),
+            ],
+        ]
+    );
+
+    let hidden = execute_query(
+        &mut database,
+        "SELECT region
+         FROM sales
+         GROUP BY region
+         HAVING AVG(amount) >= 9 AND MAX(amount) < 21
+         ORDER BY region;",
+    );
+    assert_eq!(
+        hidden.rows,
+        vec![
+            vec![Value::String("north".to_owned())],
+            vec![Value::String("west".to_owned())],
+        ]
+    );
+
+    let hidden_key = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS orders
+         FROM sales
+         GROUP BY region
+         HAVING region = 'east';",
+    );
+    assert_eq!(hidden_key.rows, vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn having_rejects_ambiguous_and_ungrouped_names() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES ('west', 10), ('west', 8);",
+        )
+        .expect("setup succeeds");
+
+    let duplicate_alias = database
+        .execute(
+            "SELECT SUM(amount) AS metric, COUNT(*) AS metric
+             FROM sales
+             HAVING metric > 1;",
+        )
+        .expect_err("duplicate aliases are ambiguous");
+    assert!(matches!(
+        duplicate_alias,
+        Error::InvalidQuery(message) if message.contains("HAVING name 'metric' is ambiguous")
+    ));
+
+    let key_alias_collision = database
+        .execute(
+            "SELECT amount AS region, COUNT(*) AS rows
+             FROM sales
+             GROUP BY region, amount
+             HAVING region = 'west';",
+        )
+        .expect_err("an alias conflicting with a different key is ambiguous");
+    assert!(matches!(
+        key_alias_collision,
+        Error::InvalidQuery(message) if message.contains("HAVING name 'region' is ambiguous")
+    ));
+
+    let predicate_column = database
+        .execute("SELECT COUNT(*) FROM sales HAVING amount > 0;")
+        .expect_err("HAVING cannot read an ungrouped source column");
+    assert!(matches!(
+        predicate_column,
+        Error::InvalidQuery(message) if message.contains("amount") && message.contains("GROUP BY")
+    ));
+
+    let projection_column = database
+        .execute("SELECT amount FROM sales HAVING COUNT(*) > 0;")
+        .expect_err("HAVING creates a grouped query");
+    assert!(matches!(
+        projection_column,
+        Error::InvalidQuery(message) if message.contains("amount") && message.contains("GROUP BY")
+    ));
+}
+
+#[test]
+fn hidden_having_aggregate_reports_numeric_overflow() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE totals (bucket String, amount Int64);
+             INSERT INTO totals VALUES ('all', 9223372036854775807), ('all', 1);",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute(
+            "SELECT bucket
+             FROM totals
+             GROUP BY bucket
+             HAVING SUM(amount) > 0;",
+        )
+        .expect_err("the hidden SUM overflows");
+    assert!(matches!(
+        error,
+        Error::NumericOverflow(operation) if operation == "SUM(Int64)"
+    ));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
