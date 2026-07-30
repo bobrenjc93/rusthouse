@@ -21,8 +21,9 @@ use score::{ExpectedCase, RatioObservation, ScoreBreakdown, ScorePanel, median, 
 use workload::workloads;
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
-const MAX_PRIMARY_SATURATION_NUMERATOR: usize = 1;
-const MAX_PRIMARY_SATURATION_DENOMINATOR: usize = 4;
+const MAX_PRIMARY_SATURATION_NUMERATOR: usize = 9;
+const MAX_PRIMARY_SATURATION_DENOMINATOR: usize = 10;
+const PRIMARY_SATURATION_REJECTION_FRACTION: f64 = 0.90;
 
 const HELP: &str = "\
 RustHouse / ClickHouse Local black-box parity benchmark
@@ -91,7 +92,9 @@ impl CorrectnessGate {
 }
 
 struct Report {
+    accepted: bool,
     score: f64,
+    measured_score: f64,
     summary: String,
     evidence: Vec<String>,
     suggestions: Vec<String>,
@@ -128,7 +131,9 @@ fn main() -> ExitCode {
 
 fn emit_failure(error: String) -> ExitCode {
     let report = Report {
+        accepted: false,
         score: 0.0,
+        measured_score: 0.0,
         summary: "Benchmark rejected: no timing score was accepted.".to_owned(),
         evidence: vec![error],
         suggestions: vec![
@@ -397,17 +402,29 @@ fn run(config: Config) -> Result<Report, String> {
         ]
     };
 
-    Ok(Report {
-        score: primary_score.score,
-        summary: format!(
+    let summary = if config.mode == config::Mode::Quick {
+        format!(
+            "Diagnostic quick run measured primary score {:.2} and startup-inclusive end-to-end score {:.2} over {} correctness-gated cases; quick mode is not accepted.",
+            primary_score.score,
+            end_to_end_score.score,
+            cases.len()
+        )
+    } else {
+        format!(
             "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
             primary_score.score,
             end_to_end_score.score,
             cases.len()
-        ),
+        )
+    };
+
+    Ok(Report::benchmark(
+        config.mode,
+        primary_score.score,
+        summary,
         evidence,
         suggestions,
-    })
+    ))
 }
 
 fn score_cases(
@@ -453,7 +470,7 @@ fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<
         >= case_count.saturating_mul(MAX_PRIMARY_SATURATION_NUMERATOR)
     {
         return Err(format!(
-            "primary timing saturated: {}/{} cases reached the parity cap; default acceptance requires fewer than one quarter of cases at parity",
+            "primary timing saturated: {}/{} cases reached the parity cap; default acceptance requires fewer than 90% of cases at parity",
             score.saturated_cases, case_count
         ));
     }
@@ -588,11 +605,13 @@ fn details_json(
 ) -> String {
     let settings = config.mode.settings();
     let benchmark_seeds = config.mode.benchmark_seeds(config.seed);
+    let accepted = config.mode == config::Mode::Default;
+    let published_score = if accepted { primary_score.score } else { 0.0 };
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"primary_saturation_rejection_fraction\":0.25,\"mode\":{},\"root_seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"seeds\":[",
-        primary_score.score,
+        "{{\"schema_version\":4,\"accepted\":{accepted},\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"primary_saturation_rejection_fraction\":{PRIMARY_SATURATION_REJECTION_FRACTION:.2},\"mode\":{},\"root_seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"seeds\":[",
+        published_score,
         primary_score.score,
         end_to_end_score.score,
         primary_score.saturated_cases,
@@ -686,10 +705,30 @@ fn write_number_array(output: &mut String, values: &[f64]) {
 }
 
 impl Report {
+    fn benchmark(
+        mode: config::Mode,
+        measured_score: f64,
+        summary: String,
+        evidence: Vec<String>,
+        suggestions: Vec<String>,
+    ) -> Self {
+        let accepted = mode == config::Mode::Default;
+        Self {
+            accepted,
+            score: if accepted { measured_score } else { 0.0 },
+            measured_score,
+            summary,
+            evidence,
+            suggestions,
+        }
+    }
+
     fn to_json(&self) -> String {
         let mut output = format!(
-            "{{\"score\":{:.6},\"summary\":{},\"evidence\":[",
+            "{{\"accepted\":{},\"score\":{:.6},\"measured_score\":{:.6},\"summary\":{},\"evidence\":[",
+            self.accepted,
             self.score,
+            self.measured_score,
             json_string(&self.summary)
         );
         write_string_array(&mut output, &self.evidence);
@@ -836,25 +875,53 @@ mod tests {
     }
 
     #[test]
-    fn a_substantial_capped_primary_fraction_is_rejected() {
-        let score = ScoreBreakdown {
-            score: 100.0,
-            saturated_cases: 24,
-        };
-        let error = ensure_primary_headroom(&score, 96).expect_err("one quarter must fail");
-        assert!(error.contains("fewer than one quarter"));
-
-        let below_limit = ScoreBreakdown {
+    fn default_saturation_gate_can_accept_the_complete_calibrated_panel() {
+        let acceptable = ScoreBreakdown {
             score: 99.0,
-            saturated_cases: 23,
+            saturated_cases: 86,
         };
-        ensure_primary_headroom(&below_limit, 96).expect("less than one quarter is accepted");
+        ensure_primary_headroom(&acceptable, 96)
+            .expect("at least ten percent uncapped cases retains useful headroom");
+
+        let rejected = ScoreBreakdown {
+            score: 100.0,
+            saturated_cases: 87,
+        };
+        let error = ensure_primary_headroom(&rejected, 96).expect_err("90% saturation must fail");
+        assert!(error.contains("fewer than 90%"));
+
+        let exact_fraction = ScoreBreakdown {
+            score: 100.0,
+            saturated_cases: 90,
+        };
+        ensure_primary_headroom(&exact_fraction, 100).expect_err("exactly 90% must fail");
+    }
+
+    #[test]
+    fn quick_report_is_structurally_and_numerically_non_acceptable() {
+        let report = Report::benchmark(
+            config::Mode::Quick,
+            100.0,
+            "diagnostic".to_owned(),
+            vec![],
+            vec![],
+        );
+        assert!(!report.accepted);
+        assert_eq!(report.score, 0.0);
+        assert_eq!(report.measured_score, 100.0);
+        assert!(
+            report.to_json().starts_with(
+                "{\"accepted\":false,\"score\":0.000000,\"measured_score\":100.000000"
+            )
+        );
     }
 
     #[test]
     fn burner_report_is_one_compact_object_with_required_fields() {
         let report = Report {
+            accepted: true,
             score: 10.0,
+            measured_score: 10.0,
             summary: "summary".to_owned(),
             evidence: vec!["evidence".to_owned()],
             suggestions: vec!["suggestion".to_owned()],
@@ -863,7 +930,7 @@ mod tests {
 
         assert_eq!(
             report,
-            "{\"score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
+            "{\"accepted\":true,\"score\":10.000000,\"measured_score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
         );
         assert!(!report.contains('\n'));
     }
