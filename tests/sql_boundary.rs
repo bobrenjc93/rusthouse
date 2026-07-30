@@ -212,6 +212,170 @@ fn grouped_top_k_retains_deterministic_multi_column_ordering() {
 }
 
 #[test]
+fn limit_by_uses_projected_aliases_and_runs_before_global_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ranked_items (
+                id Int64, region String, category String, score Int64
+             );
+             INSERT INTO ranked_items VALUES
+                (1, 'west', 'a', 100),
+                (2, 'west', 'a', 90),
+                (3, 'east', 'a', 80),
+                (4, 'west', 'b', 70),
+                (5, 'east', 'b', 60);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id, region AS area, category AS kind, score
+         FROM ranked_items
+         ORDER BY score DESC
+         LIMIT 1 BY area, kind
+         LIMIT 3;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::String("west".to_owned()),
+                Value::String("a".to_owned()),
+                Value::Int64(100),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::String("east".to_owned()),
+                Value::String("a".to_owned()),
+                Value::Int64(80),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::String("west".to_owned()),
+                Value::String("b".to_owned()),
+                Value::Int64(70),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn limit_by_filters_grouped_results_in_deterministic_order() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE regional_sales (region String, category String, amount Int64);
+             INSERT INTO regional_sales VALUES
+                ('west', 'hardware', 8),
+                ('east', 'books', 7),
+                ('west', 'books', 4),
+                ('east', 'hardware', 2),
+                ('west', 'hardware', 3);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region AS area, category, SUM(amount) AS total
+         FROM regional_sales
+         GROUP BY region, category
+         ORDER BY total DESC
+         LIMIT 1 BY area;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("west".to_owned()),
+                Value::String("hardware".to_owned()),
+                Value::Int64(11),
+            ],
+            vec![
+                Value::String("east".to_owned()),
+                Value::String("books".to_owned()),
+                Value::Int64(7),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn limit_by_composite_keys_support_every_scalar_type_and_zero() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE typed_keys (
+                id Int64, int_key Int64, float_key Float64, bool_key Bool, string_key String
+             );
+             INSERT INTO typed_keys VALUES
+                (1, 1, 1.5, true, 'a'),
+                (2, 1, 1.5, true, 'a'),
+                (3, 2, 1.5, true, 'a'),
+                (4, 1, 2.5, true, 'a'),
+                (5, 1, 1.5, false, 'a'),
+                (6, 1, 1.5, true, 'b');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id, int_key, float_key, bool_key, string_key
+         FROM typed_keys
+         ORDER BY id
+         LIMIT 1 BY int_key, float_key, bool_key, string_key;",
+    );
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Int64(1),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(5),
+            Value::Int64(6),
+        ]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT id, int_key FROM typed_keys ORDER BY id LIMIT 0 BY int_key LIMIT 4;",
+    );
+    assert!(empty.rows.is_empty());
+}
+
+#[test]
+fn limit_by_rejects_missing_and_ambiguous_output_names() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE limit_names (id Int64, label String);
+             INSERT INTO limit_names VALUES (1, 'one');",
+        )
+        .expect("setup succeeds");
+
+    let missing = database
+        .execute("SELECT id FROM limit_names LIMIT 1 BY label;")
+        .expect_err("LIMIT BY keys must be projected");
+    assert!(
+        matches!(missing, Error::InvalidQuery(message) if message.contains("LIMIT BY column or alias 'label' is not in the SELECT output"))
+    );
+
+    let ambiguous = database
+        .execute("SELECT id, label AS id FROM limit_names LIMIT 1 BY id;")
+        .expect_err("duplicate output names are ambiguous");
+    assert!(
+        matches!(ambiguous, Error::InvalidQuery(message) if message.contains("LIMIT BY name 'id' is ambiguous"))
+    );
+}
+
+#[test]
 fn every_aggregate_groups_and_uses_declared_result_types() {
     let mut database = Database::new();
     database

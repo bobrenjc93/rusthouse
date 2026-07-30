@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, LimitBy, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -110,9 +110,15 @@ impl Database {
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let limit_by = resolve_limit_by(&result_columns, select.limit_by.as_ref())?;
+        let ordering_limit = if limit_by.is_none() {
+            select.limit
+        } else {
+            None
+        };
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
+        let mut rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
@@ -120,13 +126,19 @@ impl Database {
                 &grouped,
                 &items,
                 &ordering,
-                select.limit,
+                ordering_limit,
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            order_source_rows(&mut matching_rows, table, &items, &ordering, ordering_limit);
             execute_projection(table, &matching_rows, &items)
         };
+        if let Some(limit_by) = &limit_by {
+            apply_limit_by(&mut rows, limit_by);
+        }
+        if let Some(limit) = select.limit {
+            rows.truncate(limit);
+        }
 
         Ok(QueryResult {
             columns: result_columns,
@@ -652,35 +664,82 @@ struct ResolvedOrder {
     descending: bool,
 }
 
+#[derive(Debug)]
+struct ResolvedLimitBy {
+    limit: usize,
+    outputs: Vec<usize>,
+}
+
 fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [index] => ordering.push(ResolvedOrder {
-                output: *index,
-                descending: order.descending,
-            }),
-            [] => {
-                return Err(Error::InvalidQuery(format!(
-                    "ORDER BY column or alias '{}' is not in the SELECT output",
-                    order.name
-                )));
-            }
-            _ => {
-                return Err(Error::InvalidQuery(format!(
-                    "ORDER BY name '{}' is ambiguous",
-                    order.name
-                )));
-            }
-        }
+        ordering.push(ResolvedOrder {
+            output: resolve_output_column(columns, &order.name, "ORDER BY")?,
+            descending: order.descending,
+        });
     }
     Ok(ordering)
+}
+
+fn resolve_limit_by(
+    columns: &[ResultColumn],
+    requested: Option<&LimitBy>,
+) -> Result<Option<ResolvedLimitBy>> {
+    requested
+        .map(|limit_by| {
+            let outputs = limit_by
+                .keys
+                .iter()
+                .map(|key| resolve_output_column(columns, key, "LIMIT BY"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ResolvedLimitBy {
+                limit: limit_by.limit,
+                outputs,
+            })
+        })
+        .transpose()
+}
+
+fn resolve_output_column(columns: &[ResultColumn], name: &str, clause: &str) -> Result<usize> {
+    let mut matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+        .map(|(index, _)| index);
+    let Some(output) = matches.next() else {
+        return Err(Error::InvalidQuery(format!(
+            "{clause} column or alias '{name}' is not in the SELECT output"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(Error::InvalidQuery(format!(
+            "{clause} name '{name}' is ambiguous"
+        )));
+    }
+    Ok(output)
+}
+
+fn apply_limit_by(rows: &mut Vec<Vec<Value>>, limit_by: &ResolvedLimitBy) {
+    if limit_by.limit == 0 {
+        rows.clear();
+        return;
+    }
+
+    let mut counts = HashMap::<Vec<Value>, usize>::with_capacity(rows.len().min(1_024));
+    rows.retain(|row| {
+        let key = limit_by
+            .outputs
+            .iter()
+            .map(|output| row[*output].clone())
+            .collect::<Vec<_>>();
+        let count = counts.entry(key).or_default();
+        if *count >= limit_by.limit {
+            false
+        } else {
+            *count += 1;
+            true
+        }
+    });
 }
 
 fn order_source_rows(

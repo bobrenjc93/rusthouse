@@ -25,7 +25,14 @@ pub struct Select {
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
+    pub limit_by: Option<LimitBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitBy {
+    pub limit: usize,
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -489,19 +496,29 @@ impl Parser {
             }
         }
 
-        let limit = if self.eat_keyword("LIMIT") {
-            let position = self.position();
-            let number = self.take_number().ok_or_else(|| Error::Sql {
-                position,
-                message: "expected a non-negative integer after LIMIT".to_owned(),
-            })?;
-            Some(number.parse::<usize>().map_err(|_| Error::Sql {
-                position,
-                message: format!("invalid LIMIT '{number}'"),
-            })?)
-        } else {
-            None
-        };
+        let mut limit_by = None;
+        let mut limit = None;
+        if self.eat_keyword("LIMIT") {
+            let amount = self.parse_limit_amount()?;
+            if self.eat_keyword("BY") {
+                let mut keys = Vec::new();
+                loop {
+                    keys.push(self.expect_identifier("LIMIT BY output column or alias")?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                limit_by = Some(LimitBy {
+                    limit: amount,
+                    keys,
+                });
+                if self.eat_keyword("LIMIT") {
+                    limit = Some(self.parse_limit_amount()?);
+                }
+            } else {
+                limit = Some(amount);
+            }
+        }
 
         Ok(Select {
             items,
@@ -509,7 +526,20 @@ impl Parser {
             predicate,
             group_by,
             order_by,
+            limit_by,
             limit,
+        })
+    }
+
+    fn parse_limit_amount(&mut self) -> Result<usize> {
+        let position = self.position();
+        let number = self.take_number().ok_or_else(|| Error::Sql {
+            position,
+            message: "expected a non-negative integer after LIMIT".to_owned(),
+        })?;
+        number.parse::<usize>().map_err(|_| Error::Sql {
+            position,
+            message: format!("invalid LIMIT '{number}'"),
         })
     }
 
@@ -759,7 +789,7 @@ mod tests {
         let statements = parse(
             "SELECT region, SUM(amount) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region ORDER BY total DESC LIMIT 2 BY region LIMIT 3;",
         )
         .expect("valid SQL");
 
@@ -770,7 +800,35 @@ mod tests {
         assert_eq!(select.group_by, ["region"]);
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
+        assert_eq!(
+            select.limit_by,
+            Some(LimitBy {
+                limit: 2,
+                keys: vec!["region".to_owned()],
+            })
+        );
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_limit_by_with_multiple_alias_keys_and_no_global_limit() {
+        let statements = parse(
+            "SELECT region AS area, active AS enabled FROM sales \
+             ORDER BY area LIMIT 0 BY area, enabled;",
+        )
+        .expect("valid SQL");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            select.limit_by,
+            Some(LimitBy {
+                limit: 0,
+                keys: vec!["area".to_owned(), "enabled".to_owned()],
+            })
+        );
+        assert_eq!(select.limit, None);
     }
 
     #[test]
