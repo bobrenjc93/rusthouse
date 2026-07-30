@@ -245,11 +245,9 @@ impl Database {
         parameters: &mut ParameterTypes,
     ) -> Result<PreparedSelect> {
         let table = self.catalog.table(&select.table)?;
-        let predicate = select
-            .predicate
-            .as_ref()
-            .map(|predicate| compile_predicate(table, predicate, parameters))
-            .transpose()?;
+        if let Some(predicate) = &select.predicate {
+            infer_predicate_parameter_types(table, predicate, parameters)?;
+        }
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
@@ -262,6 +260,12 @@ impl Database {
             }
             None => None,
         };
+        parameters.resolve_comparisons()?;
+        let predicate = select
+            .predicate
+            .as_ref()
+            .map(|predicate| compile_predicate(table, predicate, parameters))
+            .transpose()?;
 
         Ok(PreparedSelect {
             table: select.table,
@@ -1033,13 +1037,12 @@ fn sort_and_limit(
 #[derive(Debug, Default)]
 struct ParameterTypes {
     types: Vec<Option<DataType>>,
+    comparisons: Vec<(usize, usize)>,
 }
 
 impl ParameterTypes {
     fn resolve(&mut self, index: usize, data_type: DataType) -> Result<()> {
-        if self.types.len() <= index {
-            self.types.resize(index + 1, None);
-        }
+        self.ensure(index);
         match self.types[index] {
             Some(existing) if existing != data_type => Err(Error::TypeMismatch {
                 context: format!("parameter ${}", index + 1),
@@ -1054,11 +1057,61 @@ impl ParameterTypes {
         }
     }
 
+    fn constrain_comparison(&mut self, left: usize, right: usize) {
+        self.ensure(left.max(right));
+        if left != right {
+            self.comparisons.push((left, right));
+        }
+    }
+
+    fn resolve_comparisons(&mut self) -> Result<()> {
+        let comparisons = self.comparisons.clone();
+        loop {
+            let mut changed = false;
+            for &(left, right) in &comparisons {
+                match (self.types[left], self.types[right]) {
+                    (Some(left_type), Some(right_type)) => {
+                        if !comparable(left_type, right_type) {
+                            return Err(Error::TypeMismatch {
+                                context: format!(
+                                    "comparison between parameters ${} and ${}",
+                                    left + 1,
+                                    right + 1
+                                ),
+                                expected: left_type.to_string(),
+                                actual: right_type.to_string(),
+                            });
+                        }
+                    }
+                    (Some(data_type), None) => {
+                        self.types[right] = Some(data_type);
+                        changed = true;
+                    }
+                    (None, Some(data_type)) => {
+                        self.types[left] = Some(data_type);
+                        changed = true;
+                    }
+                    (None, None) => {}
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn data_type(&self, index: usize) -> Option<DataType> {
+        self.types.get(index).copied().flatten()
+    }
+
+    fn ensure(&mut self, index: usize) {
+        self.types.resize(self.types.len().max(index + 1), None);
+    }
+
     fn finish(self) -> Result<Vec<DataType>> {
-        self.types
-            .into_iter()
-            .enumerate()
-            .map(|(index, data_type)| {
+        (0..self.types.len())
+            .map(|index| {
+                let data_type = self.data_type(index);
                 data_type.ok_or_else(|| {
                     Error::InvalidQuery(format!(
                         "parameter ${} is not used; parameter numbers must be contiguous",
@@ -1170,7 +1223,7 @@ impl CompiledOperand {
 fn compile_predicate(
     table: &Table,
     predicate: &Predicate,
-    parameters: &mut ParameterTypes,
+    parameters: &ParameterTypes,
 ) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
@@ -1207,27 +1260,37 @@ fn compile_comparison_operands(
     table: &Table,
     left: &Operand,
     right: &Operand,
-    parameters: &mut ParameterTypes,
+    parameters: &ParameterTypes,
 ) -> Result<(CompiledOperand, CompiledOperand)> {
     match (left, right) {
-        (Operand::Parameter(_), Operand::Parameter(_)) => Err(Error::InvalidQuery(
-            "cannot infer a type for a comparison between two parameters".to_owned(),
-        )),
+        (Operand::Parameter(left), Operand::Parameter(right)) => {
+            let left_type = inferred_parameter_type(parameters, *left)?;
+            let right_type = inferred_parameter_type(parameters, *right)?;
+            Ok((
+                CompiledOperand::Parameter {
+                    index: *left,
+                    data_type: left_type,
+                },
+                CompiledOperand::Parameter {
+                    index: *right,
+                    data_type: right_type,
+                },
+            ))
+        }
         (Operand::Parameter(index), right) => {
             let right = compile_typed_operand(table, right)?;
-            parameters.resolve(*index, right.data_type())?;
+            let data_type = inferred_parameter_type(parameters, *index)?;
             Ok((
                 CompiledOperand::Parameter {
                     index: *index,
-                    data_type: right.data_type(),
+                    data_type,
                 },
                 right,
             ))
         }
         (left, Operand::Parameter(index)) => {
             let left = compile_typed_operand(table, left)?;
-            let data_type = left.data_type();
-            parameters.resolve(*index, data_type)?;
+            let data_type = inferred_parameter_type(parameters, *index)?;
             Ok((
                 left,
                 CompiledOperand::Parameter {
@@ -1241,6 +1304,54 @@ fn compile_comparison_operands(
             compile_typed_operand(table, right)?,
         )),
     }
+}
+
+fn infer_predicate_parameter_types(
+    table: &Table,
+    predicate: &Predicate,
+    parameters: &mut ParameterTypes,
+) -> Result<()> {
+    match predicate {
+        Predicate::Comparison { left, right, .. } => match (left, right) {
+            (Operand::Parameter(left), Operand::Parameter(right)) => {
+                parameters.constrain_comparison(*left, *right);
+                Ok(())
+            }
+            (Operand::Parameter(index), right) => {
+                parameters.resolve(*index, operand_data_type(table, right)?)
+            }
+            (left, Operand::Parameter(index)) => {
+                parameters.resolve(*index, operand_data_type(table, left)?)
+            }
+            _ => Ok(()),
+        },
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            infer_predicate_parameter_types(table, left, parameters)?;
+            infer_predicate_parameter_types(table, right, parameters)
+        }
+    }
+}
+
+fn operand_data_type(table: &Table, operand: &Operand) -> Result<DataType> {
+    match operand {
+        Operand::Column(name) => {
+            let index = table.column_index(name)?;
+            Ok(table.schema()[index].data_type)
+        }
+        Operand::Literal(value) => Ok(value.data_type()),
+        Operand::Parameter(_) => {
+            unreachable!("parameter pairs are handled as comparison constraints")
+        }
+    }
+}
+
+fn inferred_parameter_type(parameters: &ParameterTypes, index: usize) -> Result<DataType> {
+    parameters.data_type(index).ok_or_else(|| {
+        Error::InvalidQuery(format!(
+            "cannot infer a type for parameter ${index}; compare it with a column or literal",
+            index = index + 1
+        ))
+    })
 }
 
 fn compile_typed_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {

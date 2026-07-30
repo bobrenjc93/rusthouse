@@ -282,6 +282,78 @@ fn data_changes_preserve_plans_but_schema_changes_make_them_stale() {
 }
 
 #[test]
+fn parameter_comparisons_use_types_inferred_across_the_statement() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE typed_values (id Int64, reading Float64);
+             INSERT INTO typed_values VALUES (1, 1.0), (2, 2.5)",
+        )
+        .expect("setup");
+
+    let reused = database
+        .prepare(
+            "SELECT id FROM typed_values
+             WHERE id = $1 AND $1 = $1",
+        )
+        .expect("the column comparison types every use of $1");
+    assert_eq!(reused.parameter_types(), &[DataType::Int64]);
+    assert_eq!(
+        prepared_query(&mut database, &reused, &[Value::Int64(2)]).rows,
+        vec![vec![Value::Int64(2)]]
+    );
+
+    let transitive = database
+        .prepare(
+            "SELECT id FROM typed_values
+             WHERE $1 = $2 AND id = $2 ORDER BY id",
+        )
+        .expect("the column type propagates through the parameter comparison");
+    assert_eq!(
+        transitive.parameter_types(),
+        &[DataType::Int64, DataType::Int64]
+    );
+    assert_eq!(
+        prepared_query(
+            &mut database,
+            &transitive,
+            &[Value::Int64(1), Value::Int64(1)]
+        )
+        .rows,
+        vec![vec![Value::Int64(1)]]
+    );
+    assert!(
+        prepared_query(
+            &mut database,
+            &transitive,
+            &[Value::Int64(1), Value::Int64(2)]
+        )
+        .rows
+        .is_empty()
+    );
+
+    let compatible_numeric_types = database
+        .prepare(
+            "SELECT id FROM typed_values
+             WHERE id = $1 AND reading = $2 AND $1 < $2",
+        )
+        .expect("parameter comparisons preserve compatible concrete numeric types");
+    assert_eq!(
+        compatible_numeric_types.parameter_types(),
+        &[DataType::Int64, DataType::Float64]
+    );
+    assert_eq!(
+        prepared_query(
+            &mut database,
+            &compatible_numeric_types,
+            &[Value::Int64(2), Value::Float64(2.5)]
+        )
+        .rows,
+        vec![vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
 fn prepare_rejects_unsupported_or_untyped_statements() {
     let mut database = Database::new();
     database
