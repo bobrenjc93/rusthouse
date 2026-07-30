@@ -120,6 +120,191 @@ pub fn parse(input: &str) -> Result<Vec<Statement>> {
     Parser::new(tokens).parse_script()
 }
 
+/// Render a parsed statement using the canonical spelling of this SQL dialect.
+///
+/// Identifiers in a parsed statement are always renderable because the dialect
+/// only accepts unquoted ASCII identifiers. String literals are escaped by
+/// doubling single quotes.
+#[must_use]
+pub fn render(statement: &Statement) -> String {
+    let mut output = String::new();
+    render_statement(&mut output, statement);
+    output
+}
+
+/// Render a non-empty SQL script with one canonical statement per line.
+#[must_use]
+pub fn render_script(statements: &[Statement]) -> String {
+    let mut output = String::new();
+    for (index, statement) in statements.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        render_statement(&mut output, statement);
+        output.push(';');
+    }
+    output
+}
+
+fn render_statement(output: &mut String, statement: &Statement) {
+    match statement {
+        Statement::CreateTable { name, columns } => {
+            output.push_str("CREATE TABLE ");
+            output.push_str(name);
+            output.push_str(" (");
+            for (index, column) in columns.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&column.name);
+                output.push(' ');
+                output.push_str(&column.data_type.to_string());
+            }
+            output.push(')');
+        }
+        Statement::Insert { table, rows } => {
+            output.push_str("INSERT INTO ");
+            output.push_str(table);
+            output.push_str(" VALUES ");
+            for (row_index, row) in rows.iter().enumerate() {
+                if row_index > 0 {
+                    output.push_str(", ");
+                }
+                output.push('(');
+                for (column_index, value) in row.iter().enumerate() {
+                    if column_index > 0 {
+                        output.push_str(", ");
+                    }
+                    render_value(output, value);
+                }
+                output.push(')');
+            }
+        }
+        Statement::Select(select) => render_select(output, select),
+    }
+}
+
+fn render_select(output: &mut String, select: &Select) {
+    output.push_str("SELECT ");
+    for (index, item) in select.items.iter().enumerate() {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        match item {
+            SelectItem::Wildcard => output.push('*'),
+            SelectItem::Column { name, alias } => {
+                output.push_str(name);
+                render_alias(output, alias);
+            }
+            SelectItem::Aggregate {
+                function,
+                argument,
+                alias,
+            } => {
+                output.push_str(function.name());
+                output.push('(');
+                match argument {
+                    AggregateArgument::Wildcard => output.push('*'),
+                    AggregateArgument::Column(name) => output.push_str(name),
+                }
+                output.push(')');
+                render_alias(output, alias);
+            }
+        }
+    }
+    output.push_str(" FROM ");
+    output.push_str(&select.table);
+
+    if let Some(predicate) = &select.predicate {
+        output.push_str(" WHERE ");
+        render_predicate(output, predicate);
+    }
+    if !select.group_by.is_empty() {
+        output.push_str(" GROUP BY ");
+        render_names(output, &select.group_by);
+    }
+    if !select.order_by.is_empty() {
+        output.push_str(" ORDER BY ");
+        for (index, order) in select.order_by.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&order.name);
+            output.push_str(if order.descending { " DESC" } else { " ASC" });
+        }
+    }
+    if let Some(limit) = select.limit {
+        output.push_str(" LIMIT ");
+        output.push_str(&limit.to_string());
+    }
+}
+
+fn render_alias(output: &mut String, alias: &Option<String>) {
+    if let Some(alias) = alias {
+        output.push_str(" AS ");
+        output.push_str(alias);
+    }
+}
+
+fn render_names(output: &mut String, names: &[String]) {
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        output.push_str(name);
+    }
+}
+
+fn render_predicate(output: &mut String, predicate: &Predicate) {
+    match predicate {
+        Predicate::Comparison {
+            left,
+            operator,
+            right,
+        } => {
+            render_operand(output, left);
+            output.push_str(match operator {
+                ComparisonOperator::Equal => " = ",
+                ComparisonOperator::NotEqual => " != ",
+                ComparisonOperator::Less => " < ",
+                ComparisonOperator::LessOrEqual => " <= ",
+                ComparisonOperator::Greater => " > ",
+                ComparisonOperator::GreaterOrEqual => " >= ",
+            });
+            render_operand(output, right);
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            output.push('(');
+            render_predicate(output, left);
+            output.push_str(if matches!(predicate, Predicate::And(_, _)) {
+                " AND "
+            } else {
+                " OR "
+            });
+            render_predicate(output, right);
+            output.push(')');
+        }
+    }
+}
+
+fn render_operand(output: &mut String, operand: &Operand) {
+    match operand {
+        Operand::Column(name) => output.push_str(name),
+        Operand::Literal(value) => render_value(output, value),
+    }
+}
+
+fn render_value(output: &mut String, value: &Value) {
+    match value {
+        Value::String(value) => {
+            output.push('\'');
+            output.push_str(&value.replace('\'', "''"));
+            output.push('\'');
+        }
+        _ => output.push_str(&value.as_display_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Token {
     kind: TokenKind,
@@ -782,6 +967,73 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn canonical_renderer_round_trips_complete_scripts() {
+        let source = "CREATE TABLE events (id Int64, score Float64, active Bool, label String);\
+                      INSERT INTO events VALUES (1, 2.0, true, 'it''s, valid'), \
+                          (-2, -3.25, false, 'line\nvalue');\
+                      SELECT active AS enabled, COUNT(*) AS n, SUM(score) AS total, \
+                          MIN(label) AS first, MAX(id) AS last, AVG(id) AS mean \
+                      FROM events WHERE (id >= -2 AND score != 0.5) OR label = 'x''y' \
+                      GROUP BY active ORDER BY total DESC, enabled ASC LIMIT 7;";
+        let statements = parse(source).expect("valid source script");
+        let rendered = render_script(&statements);
+
+        assert_eq!(
+            parse(&rendered).expect("rendered script parses"),
+            statements
+        );
+        assert_eq!(
+            render(&statements[0]),
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String)"
+        );
+    }
+
+    #[test]
+    fn bounded_arbitrary_text_is_panic_free() {
+        let alphabet = [
+            '\0',
+            '\n',
+            '\r',
+            '\t',
+            ' ',
+            '\'',
+            '"',
+            ',',
+            ';',
+            '(',
+            ')',
+            '-',
+            '!',
+            '<',
+            '>',
+            '=',
+            '*',
+            '.',
+            '0',
+            '9',
+            'A',
+            'z',
+            '_',
+            '\u{80}',
+            '\u{2028}',
+            '\u{10ffff}',
+        ];
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+
+        for case in 0..512 {
+            let length = case % 129;
+            let mut input = String::with_capacity(length);
+            for _ in 0..length {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                input.push(alphabet[(state as usize) % alphabet.len()]);
+            }
+            let _ = parse(&input);
+        }
     }
 
     #[test]

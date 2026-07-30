@@ -96,3 +96,24 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ~~~
+
+Normal `cargo test` runs a deterministic differential suite over 128 bounded
+mixed-type databases. Generated projections, predicates, all aggregate
+functions, grouping, ordering, and limits are compared with an independent
+row-oriented evaluator. SQL and CSV renderer round trips, malformed input
+rejection, benchmark SQL symmetry, and bounded arbitrary-input panic checks
+also remain in the normal test suite.
+
+Long-running parser and benchmark CSV-normalizer fuzzing lives in the separate
+`fuzz` package. Its checked-in corpus contains valid edge cases and malformed
+regressions:
+
+~~~bash
+cargo install cargo-fuzz
+cargo fuzz run parser
+cargo fuzz run csv_normalizer
+~~~
+
+Each fuzz target rejects inputs above 64 KiB so local and CI runs have an
+explicit per-case memory bound. Findings should be minimized and retained in
+the corresponding `fuzz/corpus` directory.

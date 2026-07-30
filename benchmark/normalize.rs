@@ -131,74 +131,117 @@ fn values_equal(left: &NormalizedValue, right: &NormalizedValue) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsvState {
+    FieldStart,
+    Unquoted,
+    Quoted,
+    AfterQuote,
+}
+
 fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, String> {
     let characters = input.chars().collect::<Vec<_>>();
     let mut records = Vec::new();
     let mut record = Vec::new();
     let mut field = String::new();
     let mut index = 0;
-    let mut in_quotes = false;
-    let mut field_started = false;
+    let mut state = CsvState::FieldStart;
 
     while index < characters.len() {
         let character = characters[index];
-        if in_quotes {
-            if character == '"' {
-                if characters.get(index + 1) == Some(&'"') {
-                    field.push('"');
-                    index += 1;
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                field.push(character);
-            }
-        } else {
-            match character {
-                '"' if !field_started => {
-                    in_quotes = true;
-                    field_started = true;
-                }
-                '"' => return Err("quote in the middle of an unquoted field".to_owned()),
-                ',' => {
-                    record.push(std::mem::take(&mut field));
-                    field_started = false;
-                }
-                '\n' => {
-                    record.push(std::mem::take(&mut field));
-                    records.push(std::mem::take(&mut record));
-                    field_started = false;
-                }
+        match state {
+            CsvState::FieldStart => match character {
+                '"' => state = CsvState::Quoted,
+                ',' => record.push(String::new()),
+                '\n' => finish_record(&mut records, &mut record, String::new()),
                 '\r' => {
-                    if characters.get(index + 1) == Some(&'\n') {
-                        index += 1;
-                    }
-                    record.push(std::mem::take(&mut field));
-                    records.push(std::mem::take(&mut record));
-                    field_started = false;
+                    consume_lf(&characters, &mut index);
+                    finish_record(&mut records, &mut record, String::new());
                 }
                 value => {
                     field.push(value);
-                    field_started = true;
+                    state = CsvState::Unquoted;
+                }
+            },
+            CsvState::Unquoted => match character {
+                '"' => return Err("quote in the middle of an unquoted field".to_owned()),
+                ',' => {
+                    record.push(std::mem::take(&mut field));
+                    state = CsvState::FieldStart;
+                }
+                '\n' => {
+                    finish_record(&mut records, &mut record, std::mem::take(&mut field));
+                    state = CsvState::FieldStart;
+                }
+                '\r' => {
+                    consume_lf(&characters, &mut index);
+                    finish_record(&mut records, &mut record, std::mem::take(&mut field));
+                    state = CsvState::FieldStart;
+                }
+                value => field.push(value),
+            },
+            CsvState::Quoted => {
+                if character == '"' {
+                    if characters.get(index + 1) == Some(&'"') {
+                        field.push('"');
+                        index += 1;
+                    } else {
+                        state = CsvState::AfterQuote;
+                    }
+                } else {
+                    field.push(character);
                 }
             }
+            CsvState::AfterQuote => match character {
+                ',' => {
+                    record.push(std::mem::take(&mut field));
+                    state = CsvState::FieldStart;
+                }
+                '\n' => {
+                    finish_record(&mut records, &mut record, std::mem::take(&mut field));
+                    state = CsvState::FieldStart;
+                }
+                '\r' => {
+                    consume_lf(&characters, &mut index);
+                    finish_record(&mut records, &mut record, std::mem::take(&mut field));
+                    state = CsvState::FieldStart;
+                }
+                _ => return Err("character after closing quote".to_owned()),
+            },
         }
         index += 1;
     }
 
-    if in_quotes {
-        return Err("unterminated quoted field".to_owned());
-    }
-    if field_started || !field.is_empty() || !record.is_empty() {
-        record.push(field);
-        records.push(record);
+    match state {
+        CsvState::Quoted => return Err("unterminated quoted field".to_owned()),
+        CsvState::Unquoted | CsvState::AfterQuote => {
+            finish_record(&mut records, &mut record, field);
+        }
+        CsvState::FieldStart if !record.is_empty() => {
+            finish_record(&mut records, &mut record, String::new());
+        }
+        CsvState::FieldStart => {}
     }
     Ok(records)
+}
+
+fn consume_lf(characters: &[char], index: &mut usize) {
+    if characters.get(*index + 1) == Some(&'\n') {
+        *index += 1;
+    }
+}
+
+fn finish_record(records: &mut Vec<Vec<String>>, record: &mut Vec<String>, field: String) {
+    record.push(field);
+    records.push(std::mem::take(record));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusthouse::engine::{QueryResult, ResultColumn};
+    use rusthouse::format::{self, OutputFormat};
+    use rusthouse::{DataType, Value};
 
     #[test]
     fn normalizes_engine_specific_scalar_spellings_and_csv_escaping() {
@@ -232,5 +275,129 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn renderer_csv_round_trips_bounded_typed_values() {
+        let columns = [
+            ("integer", ColumnType::Integer),
+            ("float", ColumnType::Float),
+            ("boolean", ColumnType::Boolean),
+            ("string", ColumnType::String),
+        ];
+        let strings = [
+            String::new(),
+            "plain".to_owned(),
+            "comma,inside".to_owned(),
+            "double \"quote\"".to_owned(),
+            "line one\nline two".to_owned(),
+            "carriage\rreturn".to_owned(),
+            "unicode \u{2603}".to_owned(),
+        ];
+
+        for case in 0..256_i64 {
+            let integer = case - 128;
+            let float = (case - 100) as f64 / 8.0;
+            let boolean = case % 2 == 0;
+            let string = format!("{}-{case}", strings[case as usize % strings.len()]);
+            let result = QueryResult {
+                columns: vec![
+                    ResultColumn {
+                        name: "integer".to_owned(),
+                        data_type: DataType::Int64,
+                    },
+                    ResultColumn {
+                        name: "float".to_owned(),
+                        data_type: DataType::Float64,
+                    },
+                    ResultColumn {
+                        name: "boolean".to_owned(),
+                        data_type: DataType::Bool,
+                    },
+                    ResultColumn {
+                        name: "string".to_owned(),
+                        data_type: DataType::String,
+                    },
+                ],
+                rows: vec![vec![
+                    Value::Int64(integer),
+                    Value::Float64(float),
+                    Value::Bool(boolean),
+                    Value::String(string.clone()),
+                ]],
+            };
+
+            let csv = format::render(&result, OutputFormat::Csv);
+            let normalized = normalize(&csv, &columns, "round trip").expect("valid CSV");
+            assert_eq!(
+                normalized.rows,
+                [vec![
+                    NormalizedValue::Integer(i128::from(integer)),
+                    NormalizedValue::Float(float),
+                    NormalizedValue::Boolean(boolean),
+                    NormalizedValue::String(string),
+                ]],
+                "case {case}: {csv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_quoted_fields_are_always_rejected() {
+        let columns = [("value", ColumnType::String)];
+        for malformed in [
+            "value\n\"closed\"trailing\n",
+            "value\nun\"quoted\n",
+            "value\n\"closed\" \n",
+            "value\n\"unterminated",
+            "value\n\"\"\"",
+        ] {
+            assert!(
+                compare_outputs(malformed, "value\nvalid\n", &columns).is_err(),
+                "accepted malformed CSV: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_arbitrary_csv_is_panic_free() {
+        let columns = [
+            ("i", ColumnType::Integer),
+            ("f", ColumnType::Float),
+            ("b", ColumnType::Boolean),
+            ("s", ColumnType::String),
+        ];
+        let alphabet = [
+            '\0',
+            '\n',
+            '\r',
+            ',',
+            '"',
+            '-',
+            '+',
+            '.',
+            '0',
+            '9',
+            'e',
+            'N',
+            'a',
+            't',
+            'f',
+            '\u{80}',
+            '\u{2028}',
+            '\u{10ffff}',
+        ];
+        let mut state = 0xbb67_ae85_84ca_a73b_u64;
+
+        for case in 0..512 {
+            let mut input = String::new();
+            for _ in 0..case % 129 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                input.push(alphabet[state as usize % alphabet.len()]);
+            }
+            let _ = compare_outputs(&input, &input, &columns);
+        }
     }
 }

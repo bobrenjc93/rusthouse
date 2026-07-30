@@ -91,7 +91,7 @@ Each row count runs eight cases spanning:
 | High-cardinality grouping | Unique string-key grouping, deterministic ordering, bounded output |
 | Ordering and limit | Numeric and string sort shapes with deterministic tie breakers |
 
-The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
+The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Each correctness or timing pair builds one amplified SQL `String` and passes that same buffer by reference to both child-process invocations; only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
 
 ## Correctness gate and normalization
 
@@ -99,7 +99,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, strict CSV normalization and renderer round trips, malformed-input and panic properties, shared per-engine SQL bytes, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting. The standalone `fuzz/csv_normalizer` target retains malformed quoting and row-width regressions in its checked-in corpus.
 
 ## Timing and calibration
 

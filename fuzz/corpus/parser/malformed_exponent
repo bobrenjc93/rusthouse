@@ -1,0 +1,1 @@
+SELECT value FROM fuzzed WHERE value = 1e+;

@@ -16,7 +16,9 @@ use std::time::Duration;
 use config::{Config, ParseResult};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use process::{
+    ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput, prepare_sql_batch,
+};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -416,13 +418,14 @@ fn execute_correctness_pair(
     query_sql: &str,
     rusthouse_first: bool,
 ) -> Result<(TimedOutput, TimedOutput), String> {
+    let batch = prepare_sql_batch(setup_sql, query_sql, 1)?;
     if rusthouse_first {
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
+        let rusthouse = paths.execute_correctness_batch(Engine::RustHouse, &batch)?;
+        let clickhouse = paths.execute_correctness_batch(Engine::ClickHouse, &batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
+        let clickhouse = paths.execute_correctness_batch(Engine::ClickHouse, &batch)?;
+        let rusthouse = paths.execute_correctness_batch(Engine::RustHouse, &batch)?;
         Ok((rusthouse, clickhouse))
     }
 }
@@ -434,17 +437,14 @@ fn execute_timed_pair(
     query_repetitions: usize,
     rusthouse_first: bool,
 ) -> Result<(TimedBatch, TimedBatch), String> {
+    let batch = prepare_sql_batch(setup_sql, query_sql, query_repetitions)?;
     if rusthouse_first {
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse = paths.execute_timed_batch(Engine::RustHouse, &batch)?;
+        let clickhouse = paths.execute_timed_batch(Engine::ClickHouse, &batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_timed_batch(Engine::ClickHouse, &batch)?;
+        let rusthouse = paths.execute_timed_batch(Engine::RustHouse, &batch)?;
         Ok((rusthouse, clickhouse))
     }
 }

@@ -36,38 +36,48 @@ pub struct TimedBatch {
     pub query_repetitions: usize,
 }
 
+#[derive(Debug)]
+pub struct PreparedBatch {
+    sql: String,
+    query_repetitions: usize,
+}
+
+impl PreparedBatch {
+    fn sql_for(&self, _engine: Engine) -> &str {
+        &self.sql
+    }
+}
+
 impl EnginePaths {
     pub fn validate(&self) -> Result<ClickHouseIdentity, String> {
         validate_rusthouse(&self.rusthouse)?;
         validate_clickhouse(&self.clickhouse)
     }
 
-    pub fn execute_correctness(
+    pub fn execute_correctness_batch(
         &self,
         engine: Engine,
-        setup_sql: &str,
-        query_sql: &str,
+        batch: &PreparedBatch,
     ) -> Result<TimedOutput, String> {
-        let batch = sql_batch(setup_sql, query_sql, 1)?;
-        let (_, stdout) = self.execute_batch(engine, &batch, true)?;
+        if batch.query_repetitions != 1 {
+            return Err("correctness batch must contain exactly one query".to_owned());
+        }
+        let (_, stdout) = self.execute_batch(engine, batch.sql_for(engine), true)?;
         Ok(TimedOutput {
             stdout: stdout.expect("captured execution returns stdout"),
         })
     }
 
-    pub fn execute_timed(
+    pub fn execute_timed_batch(
         &self,
         engine: Engine,
-        setup_sql: &str,
-        query_sql: &str,
-        query_repetitions: usize,
+        batch: &PreparedBatch,
     ) -> Result<TimedBatch, String> {
-        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
-        let (elapsed, stdout) = self.execute_batch(engine, &batch, false)?;
+        let (elapsed, stdout) = self.execute_batch(engine, batch.sql_for(engine), false)?;
         debug_assert!(stdout.is_none());
         Ok(TimedBatch {
             elapsed,
-            query_repetitions,
+            query_repetitions: batch.query_repetitions,
         })
     }
 
@@ -137,7 +147,11 @@ impl EnginePaths {
     }
 }
 
-fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Result<String, String> {
+pub fn prepare_sql_batch(
+    setup_sql: &str,
+    query_sql: &str,
+    query_repetitions: usize,
+) -> Result<PreparedBatch, String> {
     if query_repetitions == 0 {
         return Err("query repetition count must be positive".to_owned());
     }
@@ -156,7 +170,10 @@ fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Resu
         batch.push_str(query_sql);
         batch.push('\n');
     }
-    Ok(batch)
+    Ok(PreparedBatch {
+        sql: batch,
+        query_repetitions,
+    })
 }
 
 impl Engine {
@@ -273,14 +290,44 @@ mod tests {
 
     #[test]
     fn amplification_repeats_the_same_query_exactly() {
-        let batch =
-            sql_batch("CREATE TABLE t (n Int64);\n", "SELECT n FROM t;", 3).expect("valid batch");
-        assert_eq!(batch.matches("CREATE TABLE").count(), 1);
-        assert_eq!(batch.matches("SELECT n FROM t;").count(), 3);
+        let batch = prepare_sql_batch("CREATE TABLE t (n Int64);\n", "SELECT n FROM t;", 3)
+            .expect("valid batch");
+        assert_eq!(batch.sql.matches("CREATE TABLE").count(), 1);
+        assert_eq!(batch.sql.matches("SELECT n FROM t;").count(), 3);
+        assert_eq!(batch.query_repetitions, 3);
     }
 
     #[test]
     fn amplification_must_be_positive() {
-        assert!(sql_batch("", "SELECT 1;", 0).is_err());
+        assert!(prepare_sql_batch("", "SELECT 1;", 0).is_err());
+    }
+
+    #[test]
+    fn per_engine_sql_is_byte_identical_for_bounded_inputs() {
+        let mut state = 0x3c6e_f372_fe94_f82b_u64;
+        for case in 0..256 {
+            let setup = generated_sql_fragment(&mut state, case % 97);
+            let query = generated_sql_fragment(&mut state, case % 53);
+            let repetitions = 1 + case % 17;
+            let shared = prepare_sql_batch(&setup, &query, repetitions).expect("bounded batch");
+            let rusthouse_sql = shared.sql_for(Engine::RustHouse);
+            let clickhouse_sql = shared.sql_for(Engine::ClickHouse);
+
+            assert_eq!(rusthouse_sql.as_bytes(), clickhouse_sql.as_bytes());
+            assert!(std::ptr::eq(rusthouse_sql, clickhouse_sql));
+            assert_eq!(shared.query_repetitions, repetitions);
+        }
+    }
+
+    fn generated_sql_fragment(state: &mut u64, length: usize) -> String {
+        const ALPHABET: &[u8] = b" SELECT(),;'_-0123456789\n";
+        (0..length)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                char::from(ALPHABET[*state as usize % ALPHABET.len()])
+            })
+            .collect()
     }
 }

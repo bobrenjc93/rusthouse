@@ -1,0 +1,26 @@
+[package]
+name = "rusthouse-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusthouse = { path = ".." }
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csv_normalizer"
+path = "fuzz_targets/csv_normalizer.rs"
+test = false
+doc = false
+bench = false

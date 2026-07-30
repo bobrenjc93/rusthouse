@@ -1,0 +1,3 @@
+CREATE TABLE fuzzed (id Int64, score Float64, active Bool, label String);
+INSERT INTO fuzzed VALUES (-1, 0.125, true, 'quote''s value');
+SELECT active, COUNT(*) AS n, AVG(score) AS mean FROM fuzzed WHERE (id >= -1 AND label != 'x') OR active = false GROUP BY active ORDER BY n DESC LIMIT 3;

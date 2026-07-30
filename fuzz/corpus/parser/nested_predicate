@@ -1,0 +1,1 @@
+SELECT id FROM fuzzed WHERE (((id = 1 OR id != 2) AND id <= 3) OR id > 4);

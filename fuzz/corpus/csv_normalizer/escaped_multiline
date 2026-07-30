@@ -1,0 +1,3 @@
+integer,float,boolean,string
+-7,0.125,true,"comma, quote "" and
+newline"
