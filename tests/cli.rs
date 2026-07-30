@@ -232,6 +232,30 @@ fn interactive_quit_discards_buffered_sql() {
 }
 
 #[test]
+fn interactive_quit_text_inside_multiline_string_is_sql() {
+    let output = run_with_stdin(
+        &["--interactive"],
+        "CREATE TABLE notes (label String);\n\
+         INSERT INTO notes VALUES ('before\n\
+         \\q\n\
+         after');\n\
+         SELECT label FROM notes;\n\
+         \\q\n",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    assert!(
+        stdout.contains(r"before\n\\q\nafter"),
+        "unexpected stdout: {stdout}"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("INSERT 1"));
+    assert!(!stderr.contains("unexpected character"));
+}
+
+#[test]
 fn interactive_commands_change_format_read_files_and_quit() {
     let path = temp_sql_path();
     fs::write(

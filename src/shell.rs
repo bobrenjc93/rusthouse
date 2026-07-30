@@ -38,7 +38,7 @@ pub(crate) fn run(
             return Ok(());
         }
 
-        if line.trim() == "\\q" {
+        if line.trim() == "\\q" && !has_open_string_literal(&buffer) {
             return Ok(());
         }
 
@@ -194,48 +194,69 @@ fn is_ignorable_sql(sql: &str) -> bool {
     true
 }
 
-fn take_complete_statements(buffer: &mut String) -> Vec<String> {
-    let bytes = buffer.as_bytes();
-    let mut statements = Vec::new();
-    let mut statement_start = 0;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqlScanState {
+    Normal,
+    StringLiteral,
+    LineComment,
+}
+
+fn scan_sql(sql: &str, mut on_statement_end: impl FnMut(usize)) -> SqlScanState {
+    let bytes = sql.as_bytes();
     let mut index = 0;
-    let mut in_string = false;
-    let mut in_line_comment = false;
+    let mut state = SqlScanState::Normal;
 
     while index < bytes.len() {
-        if in_string {
-            if bytes[index] == b'\'' {
-                if bytes.get(index + 1) == Some(&b'\'') {
-                    index += 2;
-                    continue;
+        match state {
+            SqlScanState::StringLiteral => {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    state = SqlScanState::Normal;
                 }
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if in_line_comment {
-            if bytes[index] == b'\n' {
-                in_line_comment = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match bytes[index] {
-            b'\'' => in_string = true,
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                in_line_comment = true;
                 index += 1;
             }
-            b';' => {
-                statements.push(buffer[statement_start..=index].to_owned());
-                statement_start = index + 1;
+            SqlScanState::LineComment => {
+                if bytes[index] == b'\n' {
+                    state = SqlScanState::Normal;
+                }
+                index += 1;
             }
-            _ => {}
+            SqlScanState::Normal => match bytes[index] {
+                b'\'' => {
+                    state = SqlScanState::StringLiteral;
+                    index += 1;
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    state = SqlScanState::LineComment;
+                    index += 2;
+                }
+                b';' => {
+                    on_statement_end(index);
+                    index += 1;
+                }
+                _ => index += 1,
+            },
         }
-        index += 1;
+    }
+    state
+}
+
+fn has_open_string_literal(sql: &str) -> bool {
+    scan_sql(sql, |_| {}) == SqlScanState::StringLiteral
+}
+
+fn take_complete_statements(buffer: &mut String) -> Vec<String> {
+    let mut statement_ends = Vec::new();
+    scan_sql(buffer, |index| statement_ends.push(index));
+
+    let mut statements = Vec::with_capacity(statement_ends.len());
+    let mut statement_start = 0;
+    for statement_end in statement_ends {
+        statements.push(buffer[statement_start..=statement_end].to_owned());
+        statement_start = statement_end + 1;
     }
 
     if statement_start > 0 {
@@ -273,5 +294,11 @@ mod tests {
         assert!(!is_ignorable_sql("-"));
         assert!(!is_ignorable_sql("SELECT"));
         assert!(!is_ignorable_sql("'-- not a comment'"));
+    }
+
+    #[test]
+    fn detects_open_strings_without_treating_comments_or_escaped_quotes_as_code() {
+        assert!(has_open_string_literal("SELECT 'before'' quote\n\\q"));
+        assert!(!has_open_string_literal("-- 'ignored\nSELECT 'closed'"));
     }
 }
