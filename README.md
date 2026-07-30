@@ -12,6 +12,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
+- BEGIN, COMMIT, and ROLLBACK transactions spanning Database::execute calls
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
@@ -61,7 +62,7 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 Database retains an in-memory catalog across calls and returns structured results:
 
-Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
+Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order. Outside a transaction, a later execution error leaves earlier successful statements applied. Inside a transaction, an execution error marks the transaction aborted; only ROLLBACK is accepted until it restores created tables and inserted rows to their pre-transaction state.
 
 ~~~rust
 use rusthouse::{Database, StatementResult};
@@ -81,7 +82,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, HTTP API, or network protocol. Transactions are local to one Database value and use an in-memory undo journal. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

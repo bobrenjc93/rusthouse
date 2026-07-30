@@ -86,6 +86,15 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Int64(values) => values.truncate(len),
+            Self::Float64(values) => values.truncate(len),
+            Self::Bool(values) => values.truncate(len),
+            Self::String(values) => values.truncate(len),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -195,6 +204,14 @@ impl Table {
         }
         self.row_count += 1;
         Ok(())
+    }
+
+    pub(crate) fn truncate(&mut self, row_count: usize) {
+        debug_assert!(row_count <= self.row_count);
+        for column in &mut self.columns {
+            column.truncate(row_count);
+        }
+        self.row_count = row_count;
     }
 }
 

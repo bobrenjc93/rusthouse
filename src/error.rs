@@ -30,6 +30,9 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    TransactionAlreadyActive,
+    NoActiveTransaction,
+    TransactionAborted,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +76,12 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::TransactionAlreadyActive => write!(f, "a transaction is already active"),
+            Self::NoActiveTransaction => write!(f, "there is no active transaction"),
+            Self::TransactionAborted => write!(
+                f,
+                "the transaction is aborted; ROLLBACK is the only command allowed"
+            ),
         }
     }
 }

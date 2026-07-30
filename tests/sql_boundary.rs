@@ -445,6 +445,188 @@ fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
 }
 
 #[test]
+fn rollback_removes_created_tables_and_truncates_each_mutated_table() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String);
+             INSERT INTO events VALUES (1, 'before');",
+        )
+        .expect("setup succeeds");
+
+    database.execute("BEGIN;").expect("transaction begins");
+    database
+        .execute("INSERT INTO EVENTS VALUES (2, 'during'), (3, 'also during');")
+        .expect("first mutation succeeds");
+    database
+        .execute(
+            "INSERT INTO events VALUES (4, 'last');
+             CREATE TABLE temporary (id Int64);
+             INSERT INTO temporary VALUES (10), (20);",
+        )
+        .expect("later mutations succeed");
+    database.execute("ROLLBACK;").expect("rollback succeeds");
+
+    let events = execute_query(&mut database, "SELECT id, label FROM events ORDER BY id;");
+    assert_eq!(
+        events.rows,
+        vec![vec![Value::Int64(1), Value::String("before".to_owned())]]
+    );
+    assert!(matches!(
+        database.catalog().table("temporary"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
+fn committed_changes_remain_visible_across_execute_calls() {
+    let mut database = Database::new();
+
+    database.execute("BEGIN").expect("transaction begins");
+    database
+        .execute("CREATE TABLE committed (id Int64, active Bool)")
+        .expect("DDL succeeds");
+    database
+        .execute("INSERT INTO committed VALUES (1, true), (2, false)")
+        .expect("DML succeeds");
+
+    let before_commit = execute_query(
+        &mut database,
+        "SELECT id FROM committed WHERE active = true;",
+    );
+    assert_eq!(before_commit.rows, vec![vec![Value::Int64(1)]]);
+
+    database.execute("COMMIT").expect("commit succeeds");
+    let after_commit = execute_query(&mut database, "SELECT id FROM committed ORDER BY id;");
+    assert_eq!(
+        after_commit.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn execution_errors_abort_transactions_until_rollback() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE accounts (id Int64); INSERT INTO accounts VALUES (1);")
+        .expect("setup succeeds");
+    database.execute("BEGIN").expect("transaction begins");
+    database
+        .execute("INSERT INTO accounts VALUES (2)")
+        .expect("valid insert succeeds");
+
+    let statement_error = database
+        .execute("INSERT INTO accounts VALUES (false)")
+        .expect_err("invalid insert aborts the transaction");
+    assert!(matches!(statement_error, Error::TypeMismatch { .. }));
+    assert_eq!(
+        database
+            .catalog()
+            .table("accounts")
+            .expect("table remains until rollback")
+            .row_count(),
+        2
+    );
+
+    for sql in ["SELECT * FROM accounts", "COMMIT", "BEGIN"] {
+        assert_eq!(
+            database
+                .execute(sql)
+                .expect_err("only rollback is allowed after an execution error"),
+            Error::TransactionAborted
+        );
+    }
+
+    database
+        .execute("ROLLBACK")
+        .expect("rollback recovers session");
+    let restored = execute_query(&mut database, "SELECT id FROM accounts;");
+    assert_eq!(restored.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
+fn transaction_commands_have_tags_and_report_misuse() {
+    let mut database = Database::new();
+    assert_eq!(
+        database.execute("COMMIT").expect_err("commit is unmatched"),
+        Error::NoActiveTransaction
+    );
+    assert_eq!(
+        database
+            .execute("ROLLBACK")
+            .expect_err("rollback is unmatched"),
+        Error::NoActiveTransaction
+    );
+
+    let commands = database
+        .execute("BEGIN; COMMIT")
+        .expect("matched commands succeed");
+    assert_eq!(
+        commands,
+        vec![
+            StatementResult::Command {
+                tag: "BEGIN",
+                affected_rows: 0,
+            },
+            StatementResult::Command {
+                tag: "COMMIT",
+                affected_rows: 0,
+            },
+        ]
+    );
+
+    database.execute("BEGIN").expect("transaction begins");
+    assert_eq!(
+        database
+            .execute("BEGIN")
+            .expect_err("nested transaction is rejected"),
+        Error::TransactionAlreadyActive
+    );
+    assert_eq!(
+        database
+            .execute("COMMIT")
+            .expect_err("nested BEGIN aborts the transaction"),
+        Error::TransactionAborted
+    );
+    let rollback = database.execute("ROLLBACK").expect("rollback recovers");
+    assert_eq!(
+        rollback,
+        vec![StatementResult::Command {
+            tag: "ROLLBACK",
+            affected_rows: 0,
+        }]
+    );
+}
+
+#[test]
+fn parse_errors_do_not_abort_an_active_transaction() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE parsed (id Int64); BEGIN;")
+        .expect("transaction begins after setup");
+
+    assert!(matches!(
+        database
+            .execute("INSERT INTO parsed VALUE (1)")
+            .expect_err("invalid SQL is rejected before execution"),
+        Error::Sql { .. }
+    ));
+    database
+        .execute("INSERT INTO parsed VALUES (1)")
+        .expect("parse error did not abort transaction");
+    database.execute("ROLLBACK").expect("rollback succeeds");
+
+    assert_eq!(
+        database
+            .catalog()
+            .table("parsed")
+            .expect("pre-transaction table remains")
+            .row_count(),
+        0
+    );
+}
+
+#[test]
 fn avg_int64_accumulates_exactly_before_final_conversion() {
     let mut database = Database::new();
     database

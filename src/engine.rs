@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -14,6 +14,29 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    transaction: Option<TransactionJournal>,
+}
+
+#[derive(Debug, Default)]
+struct TransactionJournal {
+    created_tables: HashSet<String>,
+    original_row_counts: HashMap<String, usize>,
+    aborted: bool,
+}
+
+impl TransactionJournal {
+    fn record_created_table(&mut self, table: &str) {
+        self.created_tables.insert(table.to_ascii_lowercase());
+    }
+
+    fn record_table_mutation(&mut self, table: &str, original_row_count: usize) {
+        let table = table.to_ascii_lowercase();
+        if !self.created_tables.contains(&table) {
+            self.original_row_counts
+                .entry(table)
+                .or_insert(original_row_count);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,19 +74,62 @@ impl Database {
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
-    /// nothing. Once parsing succeeds, statements execute in order and earlier
-    /// statements remain applied if a later execution error occurs.
+    /// nothing. Once parsing succeeds, statements execute in order. Outside a
+    /// transaction, earlier statements remain applied if a later execution
+    /// error occurs. Inside a transaction, execution errors abort the
+    /// transaction and only `ROLLBACK` is accepted until it is recovered.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let statements = sql::parse(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+
+        for statement in statements {
+            if self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.aborted)
+                && !matches!(&statement, Statement::Rollback)
+            {
+                return Err(Error::TransactionAborted);
+            }
+
+            match self.execute_statement(statement) {
+                Ok(result) => results.push(result),
+                Err(error) => {
+                    if let Some(transaction) = &mut self.transaction {
+                        transaction.aborted = true;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
+            Statement::Begin => {
+                if self.transaction.is_some() {
+                    return Err(Error::TransactionAlreadyActive);
+                }
+                self.transaction = Some(TransactionJournal::default());
+                Ok(command_result("BEGIN"))
+            }
+            Statement::Commit => {
+                if self.transaction.take().is_none() {
+                    return Err(Error::NoActiveTransaction);
+                }
+                Ok(command_result("COMMIT"))
+            }
+            Statement::Rollback => {
+                self.rollback()?;
+                Ok(command_result("ROLLBACK"))
+            }
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+                self.catalog.create_table(name.clone(), columns)?;
+                if let Some(transaction) = &mut self.transaction {
+                    transaction.record_created_table(&name);
+                }
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -77,6 +143,10 @@ impl Database {
                         target.validate_row(row)?;
                     }
                 }
+                let original_row_count = self.catalog.table(&table)?.row_count();
+                if let Some(transaction) = &mut self.transaction {
+                    transaction.record_table_mutation(&table, original_row_count);
+                }
                 let target = self.catalog.table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
@@ -88,6 +158,23 @@ impl Database {
             }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        let transaction = self.transaction.take().ok_or(Error::NoActiveTransaction)?;
+
+        for (table, row_count) in transaction.original_row_counts {
+            self.catalog
+                .table_mut(&table)
+                .expect("transaction journal references an existing table")
+                .truncate(row_count);
+        }
+        for table in transaction.created_tables {
+            let removed = self.catalog.remove_table(&table);
+            debug_assert!(removed.is_some());
+        }
+
+        Ok(())
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
@@ -132,6 +219,13 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+fn command_result(tag: &'static str) -> StatementResult {
+    StatementResult::Command {
+        tag,
+        affected_rows: 0,
     }
 }
 

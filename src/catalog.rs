@@ -36,6 +36,10 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    pub(crate) fn remove_table(&mut self, name: &str) -> Option<Table> {
+        self.tables.remove(&normalize(name))
+    }
 }
 
 fn normalize(identifier: &str) -> String {
