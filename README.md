@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
 
 ## What works
 
@@ -14,6 +14,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
+- a bounded HTTP service with shared state and JSON/CSV responses
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
@@ -57,6 +58,30 @@ printf '%s\n' \
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
+## HTTP service
+
+Start a server on an explicit address:
+
+~~~bash
+cargo run -- serve --listen 127.0.0.1:8080
+~~~
+
+`POST /query` accepts a UTF-8 SQL batch as its request body. It defaults to JSON and negotiates `application/json` or `text/csv` through the `Accept` header. State is retained for the lifetime of the server process:
+
+~~~bash
+curl --data-binary \
+  "CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2)" \
+  http://127.0.0.1:8080/query
+
+curl -H 'Accept: text/csv' --data-binary \
+  "SELECT * FROM events ORDER BY id" \
+  http://127.0.0.1:8080/query
+
+curl http://127.0.0.1:8080/health
+~~~
+
+The server parses a batch before locking the database. Batches containing only `SELECT` statements share a read lock; any batch containing `CREATE` or `INSERT` holds the exclusive write lock through the complete batch. The service caps bodies at 1 MiB, headers at 16 KiB, accepted connections at 128, and request workers at 8. Queueing plus header and body reads have a 10-second total deadline. SIGINT and SIGTERM stop accepting connections and drain accepted work before exit.
+
 ## Library API
 
 Database retains an in-memory catalog across calls and returns structured results:
@@ -81,7 +106,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, or external network protocol beyond HTTP. Data exists only for the lifetime of the Database value, CLI process, or HTTP server process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

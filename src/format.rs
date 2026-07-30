@@ -31,6 +31,35 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     }
 }
 
+/// Render all query results from a statement batch.
+///
+/// JSON is returned as one document. Non-JSON result sets are separated by a
+/// blank line; command results do not produce output.
+#[must_use]
+pub fn render_results(results: &[QueryResult], format: OutputFormat) -> String {
+    if format == OutputFormat::Json {
+        let rendered = results
+            .iter()
+            .map(|result| render(result, format))
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("{{\"results\":[{rendered}]}}\n");
+    }
+
+    let mut output = String::new();
+    for (index, result) in results.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let rendered = render(result, format);
+        output.push_str(&rendered);
+        if !rendered.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
+}
+
 fn render_table(result: &QueryResult) -> String {
     let rendered_columns = result
         .columns
@@ -230,6 +259,15 @@ mod tests {
                 Value::String("quote: \", comma".to_owned()),
             ]],
         }
+    }
+
+    #[test]
+    fn renders_multiple_results_as_one_json_document() {
+        let result = result();
+        let output = render_results(&[result.clone(), result], OutputFormat::Json);
+        assert!(output.starts_with("{\"results\":[{"));
+        assert_eq!(output.matches("\"columns\"").count(), 2);
+        assert!(output.ends_with("]}\n"));
     }
 
     #[test]

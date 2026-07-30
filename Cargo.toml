@@ -8,6 +8,7 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+ctrlc = { version = "3.4.7", features = ["termination"] }
 
 [[bin]]
 name = "clickhouse-parity-bench"

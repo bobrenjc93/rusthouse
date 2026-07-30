@@ -54,9 +54,35 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
+        self.execute_statements(sql::parse(sql)?)
+    }
+
+    pub(crate) fn execute_statements(
+        &mut self,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<StatementResult>> {
+        statements
             .into_iter()
             .map(|statement| self.execute_statement(statement))
+            .collect()
+    }
+
+    pub(crate) fn execute_read_statements(
+        &self,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<StatementResult>> {
+        statements
+            .into_iter()
+            .map(|statement| match statement {
+                Statement::Select(select) => {
+                    self.execute_select(select).map(StatementResult::Query)
+                }
+                Statement::CreateTable { .. } | Statement::Insert { .. } => {
+                    Err(Error::InvalidQuery(
+                        "a read batch may only contain SELECT statements".to_owned(),
+                    ))
+                }
+            })
             .collect()
     }
 
