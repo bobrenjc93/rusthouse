@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{Database, QueryLimits, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,6 +14,11 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+        --max-scan-rows <N>   Maximum source rows inspected per SELECT
+        --max-group-count <N> Maximum groups created per SELECT
+        --max-sort-candidates <N>
+                              Maximum rows or groups considered by a sort
+        --max-result-rows <N> Maximum rows returned per SELECT
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -47,7 +52,7 @@ fn run() -> Result<(), String> {
         sql
     };
 
-    let mut database = Database::new();
+    let mut database = Database::with_query_limits(config.query_limits);
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +99,13 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    query_limits: QueryLimits,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut query_limits = QueryLimits::default();
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +129,38 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "--max-scan-rows" => {
+                query_limits.max_scan_rows = parse_limit_argument(
+                    &argument,
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a non-negative integer"))?,
+                )?;
+            }
+            "--max-group-count" => {
+                query_limits.max_group_count = parse_limit_argument(
+                    &argument,
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a non-negative integer"))?,
+                )?;
+            }
+            "--max-sort-candidates" => {
+                query_limits.max_sort_candidates = parse_limit_argument(
+                    &argument,
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a non-negative integer"))?,
+                )?;
+            }
+            "--max-result-rows" => {
+                query_limits.max_result_rows = parse_limit_argument(
+                    &argument,
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a non-negative integer"))?,
+                )?;
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +173,45 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--max-scan-rows=") => {
+                query_limits.max_scan_rows = parse_limit_argument(
+                    "--max-scan-rows",
+                    argument["--max-scan-rows=".len()..].to_owned(),
+                )?;
+            }
+            _ if argument.starts_with("--max-group-count=") => {
+                query_limits.max_group_count = parse_limit_argument(
+                    "--max-group-count",
+                    argument["--max-group-count=".len()..].to_owned(),
+                )?;
+            }
+            _ if argument.starts_with("--max-sort-candidates=") => {
+                query_limits.max_sort_candidates = parse_limit_argument(
+                    "--max-sort-candidates",
+                    argument["--max-sort-candidates=".len()..].to_owned(),
+                )?;
+            }
+            _ if argument.starts_with("--max-result-rows=") => {
+                query_limits.max_result_rows = parse_limit_argument(
+                    "--max-result-rows",
+                    argument["--max-result-rows=".len()..].to_owned(),
+                )?;
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        query_limits,
+    }))
+}
+
+fn parse_limit_argument(option: &str, value: String) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{option} requires a non-negative integer; found '{value}'"))
 }
 
 #[cfg(test)]
@@ -149,14 +222,29 @@ mod tests {
     #[test]
     fn parses_equals_style_options() {
         let config = parse_arguments(
-            ["--format=json", "--execute=SELECT * FROM t"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "--format=json",
+                "--max-scan-rows=12",
+                "--max-group-count=3",
+                "--max-sort-candidates=8",
+                "--max-result-rows=5",
+                "--execute=SELECT * FROM t",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         )
         .expect("valid arguments")
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(config.query_limits, QueryLimits::new(12, 3, 8, 5));
+    }
+
+    #[test]
+    fn rejects_invalid_query_limits() {
+        let error = parse_arguments(["--max-result-rows", "many"].into_iter().map(str::to_owned))
+            .expect_err("limit must be an integer");
+        assert!(error.contains("--max-result-rows requires a non-negative integer"));
     }
 
     #[test]

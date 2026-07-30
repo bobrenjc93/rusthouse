@@ -44,6 +44,17 @@ cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
 
+Bound work and output independently for each SELECT:
+
+~~~bash
+cargo run -- \
+  --max-scan-rows 100000 \
+  --max-group-count 10000 \
+  --max-sort-candidates 50000 \
+  --max-result-rows 1000 \
+  --execute "SELECT region, COUNT(*) FROM sales GROUP BY region"
+~~~
+
 Or pipe a batch through standard input:
 
 ~~~bash
@@ -79,11 +90,21 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+Library callers can configure the same limits with `Database::with_query_limits(QueryLimits)` or
+replace them between queries with `Database::set_query_limits`. Limit violations return a structured
+`Error::ResourceLimit` containing the resource, configured limit, and attempted usage. Rejected
+queries do not mutate or poison the database.
+
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+
+Each SELECT also has finite defaults for source rows scanned, groups created, sort candidates, and
+result rows. Counts equal to a limit are accepted; the next unit is rejected before its collection
+grows. An unordered, non-aggregate query with `LIMIT` stops scanning as soon as it has enough
+matching rows, so unvisited source rows do not count against its scan limit.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

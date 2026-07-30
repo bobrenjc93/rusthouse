@@ -111,6 +111,30 @@ fn sql_errors_are_reported_with_nonzero_status() {
 }
 
 #[test]
+fn query_limits_are_configurable_from_the_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--max-result-rows=1",
+            "--execute",
+            "CREATE TABLE t (id Int64);
+             INSERT INTO t VALUES (1), (2);
+             SELECT id FROM t;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 stdout")
+            .is_empty()
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("query result rows limit exceeded"));
+    assert!(stderr.contains("limit is 1, attempted 2"));
+}
+
+#[test]
 fn excessive_predicates_return_cli_errors_without_aborting() {
     let cases = [
         (

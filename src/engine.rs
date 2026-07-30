@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::catalog::Catalog;
-use crate::error::{Error, Result};
+use crate::error::{Error, QueryResource, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
@@ -14,6 +14,53 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    query_limits: QueryLimits,
+}
+
+/// Deterministic work and output limits applied independently to each SELECT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// Maximum source rows whose predicates may be evaluated.
+    pub max_scan_rows: usize,
+    /// Maximum distinct groups, including a global aggregate group.
+    pub max_group_count: usize,
+    /// Maximum row or group indices retained for one sort.
+    pub max_sort_candidates: usize,
+    /// Maximum rows materialized in the returned result.
+    pub max_result_rows: usize,
+}
+
+impl QueryLimits {
+    pub const DEFAULT_MAX_SCAN_ROWS: usize = 1_000_000;
+    pub const DEFAULT_MAX_GROUP_COUNT: usize = 100_000;
+    pub const DEFAULT_MAX_SORT_CANDIDATES: usize = 1_000_000;
+    pub const DEFAULT_MAX_RESULT_ROWS: usize = 100_000;
+
+    #[must_use]
+    pub const fn new(
+        max_scan_rows: usize,
+        max_group_count: usize,
+        max_sort_candidates: usize,
+        max_result_rows: usize,
+    ) -> Self {
+        Self {
+            max_scan_rows,
+            max_group_count,
+            max_sort_candidates,
+            max_result_rows,
+        }
+    }
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self::new(
+            Self::DEFAULT_MAX_SCAN_ROWS,
+            Self::DEFAULT_MAX_GROUP_COUNT,
+            Self::DEFAULT_MAX_SORT_CANDIDATES,
+            Self::DEFAULT_MAX_RESULT_ROWS,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +88,23 @@ impl Database {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_query_limits(query_limits: QueryLimits) -> Self {
+        Self {
+            catalog: Catalog::new(),
+            query_limits,
+        }
+    }
+
+    #[must_use]
+    pub fn query_limits(&self) -> QueryLimits {
+        self.query_limits
+    }
+
+    pub fn set_query_limits(&mut self, query_limits: QueryLimits) {
+        self.query_limits = query_limits;
     }
 
     #[must_use]
@@ -97,15 +161,6 @@ impl Database {
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
-
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
@@ -113,8 +168,23 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            let grouped = execute_grouped(
+                table,
+                predicate.as_ref(),
+                &group_columns,
+                &aggregate_specs,
+                self.query_limits,
+            )?;
+            let mut selected_groups = if select.limit == Some(0) {
+                Vec::new()
+            } else {
+                enforce_count(
+                    QueryResource::SortCandidates,
+                    grouped.len(),
+                    self.query_limits.max_sort_candidates,
+                )?;
+                (0..grouped.len()).collect::<Vec<_>>()
+            };
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -122,9 +192,26 @@ impl Database {
                 &ordering,
                 select.limit,
             );
+            enforce_count(
+                QueryResource::ResultRows,
+                selected_groups.len(),
+                self.query_limits.max_result_rows,
+            )?;
             grouped.project(&selected_groups, &items)
         } else {
+            let mut matching_rows = scan_source_rows(
+                table,
+                predicate.as_ref(),
+                !ordering.is_empty(),
+                select.limit,
+                self.query_limits,
+            )?;
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            enforce_count(
+                QueryResource::ResultRows,
+                matching_rows.len(),
+                self.query_limits.max_result_rows,
+            )?;
             execute_projection(table, &matching_rows, &items)
         };
 
@@ -133,6 +220,75 @@ impl Database {
             rows,
         })
     }
+}
+
+fn scan_source_rows(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    ordered: bool,
+    limit: Option<usize>,
+    query_limits: QueryLimits,
+) -> Result<Vec<usize>> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let capacity_limit = if ordered {
+        query_limits.max_sort_candidates
+    } else {
+        limit
+            .unwrap_or(query_limits.max_result_rows)
+            .min(query_limits.max_result_rows)
+    };
+    let initial_capacity = table.row_count().min(capacity_limit).min(1_024);
+    let mut matching_rows = Vec::with_capacity(initial_capacity);
+
+    for (scanned_rows, row) in (0..table.row_count()).enumerate() {
+        if !ordered && limit == Some(matching_rows.len()) {
+            break;
+        }
+        enforce_growth(
+            QueryResource::ScanRows,
+            scanned_rows,
+            query_limits.max_scan_rows,
+        )?;
+
+        if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+            let (resource, limit) = if ordered {
+                (
+                    QueryResource::SortCandidates,
+                    query_limits.max_sort_candidates,
+                )
+            } else {
+                (QueryResource::ResultRows, query_limits.max_result_rows)
+            };
+            enforce_growth(resource, matching_rows.len(), limit)?;
+            matching_rows.push(row);
+        }
+    }
+
+    Ok(matching_rows)
+}
+
+fn enforce_growth(resource: QueryResource, current: usize, limit: usize) -> Result<()> {
+    if current >= limit {
+        return Err(Error::ResourceLimit {
+            resource,
+            limit,
+            attempted: current.saturating_add(1),
+        });
+    }
+    Ok(())
+}
+
+fn enforce_count(resource: QueryResource, count: usize, limit: usize) -> Result<()> {
+    if count > limit {
+        return Err(Error::ResourceLimit {
+            resource,
+            limit,
+            attempted: count,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -321,26 +477,46 @@ fn execute_projection(
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    query_limits: QueryLimits,
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
-    let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let global_group = group_columns.is_empty();
+    if global_group {
+        enforce_growth(QueryResource::GroupCount, 0, query_limits.max_group_count)?;
+    }
+    let mut groups = GroupIndex::new(group_columns.len(), query_limits.max_group_count);
+    let mut group_count = usize::from(global_group);
+    let initial_capacity = query_limits.max_group_count.min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
             let mut states = Vec::with_capacity(initial_capacity);
-            if group_columns.is_empty() {
+            if global_group {
                 states.push(AggregateState::new(spec));
             }
             states
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for (scanned_rows, row) in (0..table.row_count()).enumerate() {
+        enforce_growth(
+            QueryResource::ScanRows,
+            scanned_rows,
+            query_limits.max_scan_rows,
+        )?;
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+
+        let (group, inserted) = groups.find_or_insert(
+            table,
+            group_columns,
+            row,
+            group_count,
+            query_limits.max_group_count,
+        )?;
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +525,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -374,8 +550,8 @@ enum GroupIndex<'a> {
 }
 
 impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize, row_count: usize) -> Self {
-        let initial_capacity = row_count.min(1_024);
+    fn new(column_count: usize, group_limit: usize) -> Self {
+        let initial_capacity = group_limit.min(1_024);
         match column_count {
             0 => Self::Global,
             1 => Self::One(HashMap::with_capacity(initial_capacity)),
@@ -389,16 +565,18 @@ impl<'a> GroupIndex<'a> {
         columns: &[usize],
         row: usize,
         next_group: usize,
-    ) -> (usize, bool) {
+        group_limit: usize,
+    ) -> Result<(usize, bool)> {
         match self {
-            Self::Global => (0, false),
+            Self::Global => Ok((0, false)),
             Self::One(groups) => {
                 let key = table.columns()[columns[0]].value_ref(row);
                 if let Some(group) = groups.get(&key) {
-                    (*group, false)
+                    Ok((*group, false))
                 } else {
+                    enforce_growth(QueryResource::GroupCount, next_group, group_limit)?;
                     groups.insert(key, next_group);
-                    (next_group, true)
+                    Ok((next_group, true))
                 }
             }
             Self::Multiple(groups) if columns.len() == 2 => {
@@ -406,14 +584,14 @@ impl<'a> GroupIndex<'a> {
                     table.columns()[columns[0]].value_ref(row),
                     table.columns()[columns[1]].value_ref(row),
                 ];
-                find_or_insert_group(groups, &key, next_group)
+                find_or_insert_group(groups, &key, next_group, group_limit)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
                     .map(|column| table.columns()[*column].value_ref(row))
                     .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
+                find_or_insert_group(groups, &key, next_group, group_limit)
             }
         }
     }
@@ -449,12 +627,14 @@ fn find_or_insert_group<'a>(
     groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
     key: &[ValueRef<'a>],
     next_group: usize,
-) -> (usize, bool) {
+    group_limit: usize,
+) -> Result<(usize, bool)> {
     if let Some(group) = groups.get(key) {
-        (*group, false)
+        Ok((*group, false))
     } else {
+        enforce_growth(QueryResource::GroupCount, next_group, group_limit)?;
         groups.insert(key.into(), next_group);
-        (next_group, true)
+        Ok((next_group, true))
     }
 }
 

@@ -1,5 +1,25 @@
 use std::fmt;
 
+/// A bounded resource consumed while executing one SELECT query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryResource {
+    ScanRows,
+    GroupCount,
+    SortCandidates,
+    ResultRows,
+}
+
+impl fmt::Display for QueryResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ScanRows => "scan rows",
+            Self::GroupCount => "group count",
+            Self::SortCandidates => "sort candidates",
+            Self::ResultRows => "result rows",
+        })
+    }
+}
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -30,6 +50,11 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    ResourceLimit {
+        resource: QueryResource,
+        limit: usize,
+        attempted: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +98,14 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::ResourceLimit {
+                resource,
+                limit,
+                attempted,
+            } => write!(
+                f,
+                "query {resource} limit exceeded: limit is {limit}, attempted {attempted}"
+            ),
         }
     }
 }

@@ -1,4 +1,6 @@
-use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
+use rusthouse::{
+    DataType, Database, Error, QueryLimits, QueryResource, QueryResult, StatementResult, Value,
+};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
     match results.into_iter().last().expect("statement result") {
@@ -9,6 +11,154 @@ fn last_query(results: Vec<StatementResult>) -> QueryResult {
 
 fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
     last_query(database.execute(sql).expect("SQL succeeds"))
+}
+
+fn assert_resource_limit(
+    error: Error,
+    expected_resource: QueryResource,
+    expected_limit: usize,
+    expected_attempted: usize,
+) {
+    assert_eq!(
+        error,
+        Error::ResourceLimit {
+            resource: expected_resource,
+            limit: expected_limit,
+            attempted: expected_attempted,
+        }
+    );
+}
+
+#[test]
+fn scan_limit_accepts_the_boundary_and_early_limit_stops_source_work() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64);
+             INSERT INTO events VALUES (1), (2), (3), (4);",
+        )
+        .expect("setup succeeds");
+    database.set_query_limits(QueryLimits {
+        max_scan_rows: 2,
+        ..QueryLimits::default()
+    });
+
+    let boundary = execute_query(&mut database, "SELECT id FROM events LIMIT 2;");
+    assert_eq!(
+        boundary.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+
+    let error = database
+        .execute("SELECT id FROM events WHERE id > 1 LIMIT 2;")
+        .expect_err("finding the second match requires a third scan");
+    assert_resource_limit(error, QueryResource::ScanRows, 2, 3);
+
+    let reusable = execute_query(&mut database, "SELECT id FROM events LIMIT 1;");
+    assert_eq!(reusable.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
+fn group_limit_is_checked_before_adding_a_new_group() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, category String);
+             INSERT INTO events VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+        )
+        .expect("setup succeeds");
+    database.set_query_limits(QueryLimits {
+        max_group_count: 2,
+        ..QueryLimits::default()
+    });
+
+    let boundary = execute_query(
+        &mut database,
+        "SELECT category, COUNT(*) AS n FROM events
+         WHERE id <= 2 GROUP BY category ORDER BY category;",
+    );
+    assert_eq!(boundary.rows.len(), 2);
+
+    let error = database
+        .execute("SELECT category, COUNT(*) FROM events GROUP BY category;")
+        .expect_err("the third distinct key exceeds the group limit");
+    assert_resource_limit(error, QueryResource::GroupCount, 2, 3);
+
+    let reusable = execute_query(&mut database, "SELECT id FROM events LIMIT 1;");
+    assert_eq!(reusable.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
+fn sort_candidate_limit_counts_all_ordered_matches_before_top_k() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE scores (id Int64, score Int64);
+             INSERT INTO scores VALUES (1, 30), (2, 20), (3, 10);",
+        )
+        .expect("setup succeeds");
+    database.set_query_limits(QueryLimits {
+        max_sort_candidates: 2,
+        ..QueryLimits::default()
+    });
+
+    let boundary = execute_query(
+        &mut database,
+        "SELECT id, score FROM scores WHERE id <= 2 ORDER BY score LIMIT 1;",
+    );
+    assert_eq!(boundary.rows, vec![vec![Value::Int64(2), Value::Int64(20)]]);
+
+    let error = database
+        .execute("SELECT id, score FROM scores ORDER BY score LIMIT 1;")
+        .expect_err("top-k still considers every matching source row");
+    assert_resource_limit(error, QueryResource::SortCandidates, 2, 3);
+
+    let reusable = execute_query(&mut database, "SELECT id FROM scores LIMIT 1;");
+    assert_eq!(reusable.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
+fn result_row_limit_accepts_exact_output_and_rejects_the_next_row() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE valueset (id Int64);
+             INSERT INTO valueset VALUES (1), (2), (3);",
+        )
+        .expect("setup succeeds");
+    database.set_query_limits(QueryLimits {
+        max_result_rows: 2,
+        ..QueryLimits::default()
+    });
+
+    let boundary = execute_query(&mut database, "SELECT id FROM valueset LIMIT 2;");
+    assert_eq!(boundary.rows.len(), 2);
+
+    let error = database
+        .execute("SELECT id FROM valueset;")
+        .expect_err("the third output row exceeds the result limit");
+    assert_resource_limit(error, QueryResource::ResultRows, 2, 3);
+
+    let reusable = execute_query(&mut database, "SELECT id FROM valueset LIMIT 1;");
+    assert_eq!(reusable.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
+fn zero_limits_allow_a_zero_row_query_without_scanning_or_sorting() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE valueset (id Int64);
+             INSERT INTO valueset VALUES (1), (2);",
+        )
+        .expect("setup succeeds");
+    database.set_query_limits(QueryLimits::new(0, 0, 0, 0));
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id FROM valueset ORDER BY id LIMIT 0;",
+    );
+    assert!(result.rows.is_empty());
 }
 
 #[test]
