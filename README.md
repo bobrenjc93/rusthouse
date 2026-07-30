@@ -53,7 +53,7 @@ cargo run -- --max-in-memory-sort-rows 10000 \
   --execute "SELECT id, score FROM events ORDER BY score DESC, id LIMIT 50000"
 ~~~
 
-Small LIMIT queries use in-memory top-k selection and do not create spill files. Larger sorts write row indices to bounded runs and use a fixed-fan-in merge; spill workspaces are removed after successful and failed queries. Query results themselves remain materialized in memory.
+Small LIMIT queries use in-memory top-k selection and do not create spill files. Larger sorts write row indices to bounded runs, compact the live run inventory incrementally, and use a fixed-fan-in merge; spill workspaces are removed after successful and failed queries. Query results themselves remain materialized in memory.
 
 Or pipe a batch through standard input:
 

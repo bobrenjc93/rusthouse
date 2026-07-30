@@ -802,8 +802,20 @@ fn compare_grouped_rows(
 }
 
 const MAX_MERGE_FAN_IN: usize = 32;
+const MAX_RUN_LEVELS: usize = max_run_levels();
+const MAX_LIVE_SORT_RUNS: usize = MAX_RUN_LEVELS * MAX_MERGE_FAN_IN + 1;
 const RUN_READER_BUFFER_RECORDS: usize = 128;
 static NEXT_SORT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+const fn max_run_levels() -> usize {
+    let mut remaining_runs = usize::MAX;
+    let mut levels = 0;
+    while remaining_runs > 0 {
+        levels += 1;
+        remaining_runs /= MAX_MERGE_FAN_IN;
+    }
+    levels
+}
 
 struct SortedOutput<T> {
     values: Vec<T>,
@@ -814,6 +826,7 @@ impl<T> SortedOutput<T> {
     fn into_values(self, max_in_memory_sort_rows: usize) -> Vec<T> {
         debug_assert!(self.statistics.peak_run_rows <= max_in_memory_sort_rows);
         debug_assert!(self.statistics.peak_merge_heads <= MAX_MERGE_FAN_IN);
+        debug_assert!(self.statistics.peak_live_runs <= MAX_LIVE_SORT_RUNS);
         self.values
     }
 }
@@ -822,6 +835,7 @@ impl<T> SortedOutput<T> {
 struct SortStatistics {
     peak_run_rows: usize,
     peak_merge_heads: usize,
+    peak_live_runs: usize,
 }
 
 fn sort_and_project<T>(
@@ -849,7 +863,7 @@ fn sort_and_project<T>(
 
     let mut buffer = Vec::with_capacity(options.max_in_memory_sort_rows.min(1_024));
     let mut workspace = None;
-    let mut runs = Vec::new();
+    let mut runs = RunInventory::new();
     for index in indices {
         let index = index?;
         if buffer.len() == options.max_in_memory_sort_rows {
@@ -859,7 +873,8 @@ fn sort_and_project<T>(
                     workspace.insert(SortWorkspace::new(options.temporary_directory.as_deref())?)
                 }
             };
-            runs.push(write_sorted_run(workspace, &mut buffer, &compare)?);
+            let run = write_sorted_run(workspace, &mut buffer, &compare)?;
+            runs.push(workspace, run, row_limit, &compare, &mut statistics)?;
         }
         buffer.push(index);
         statistics.peak_run_rows = statistics.peak_run_rows.max(buffer.len());
@@ -877,9 +892,16 @@ fn sort_and_project<T>(
     };
 
     if !buffer.is_empty() {
-        runs.push(write_sorted_run(&mut workspace, &mut buffer, &compare)?);
+        let run = write_sorted_run(&mut workspace, &mut buffer, &compare)?;
+        runs.push(&mut workspace, run, row_limit, &compare, &mut statistics)?;
     }
-    runs = collapse_runs(&mut workspace, runs, &compare, &mut statistics, row_limit)?;
+    let runs = collapse_runs(
+        &mut workspace,
+        runs.into_runs(),
+        &compare,
+        &mut statistics,
+        row_limit,
+    )?;
 
     let output_limit = limit.unwrap_or(usize::MAX);
     let mut values = Vec::with_capacity(output_limit.min(1_024));
@@ -890,6 +912,7 @@ fn sort_and_project<T>(
         values.push(project(index));
         Ok(values.len() < output_limit)
     })?;
+    statistics.peak_live_runs = workspace.peak_live_runs();
     workspace.cleanup()?;
     Ok(SortedOutput { values, statistics })
 }
@@ -1013,6 +1036,56 @@ fn write_sorted_run(
     Ok(run)
 }
 
+struct RunInventory {
+    levels: Vec<Vec<SortRun>>,
+}
+
+impl RunInventory {
+    fn new() -> Self {
+        Self {
+            levels: Vec::with_capacity(MAX_RUN_LEVELS),
+        }
+    }
+
+    fn push(
+        &mut self,
+        workspace: &mut SortWorkspace,
+        mut run: SortRun,
+        row_limit: usize,
+        compare: &impl Fn(usize, usize) -> Ordering,
+        statistics: &mut SortStatistics,
+    ) -> Result<()> {
+        for level in 0..MAX_RUN_LEVELS {
+            if level == self.levels.len() {
+                self.levels.push(Vec::with_capacity(MAX_MERGE_FAN_IN));
+            }
+            self.levels[level].push(run);
+            if self.levels[level].len() < MAX_MERGE_FAN_IN {
+                return Ok(());
+            }
+
+            let batch = std::mem::take(&mut self.levels[level]);
+            run = merge_runs_to_file(workspace, &batch, row_limit, compare, statistics)?;
+            for input in batch {
+                workspace.remove_run(&input.path)?;
+            }
+        }
+
+        Err(Error::TemporaryStorage(
+            "sort run inventory exceeded the platform row-index limit".to_owned(),
+        ))
+    }
+
+    fn into_runs(self) -> Vec<SortRun> {
+        let retained = self.levels.iter().map(Vec::len).sum();
+        let mut runs = Vec::with_capacity(retained);
+        for level in self.levels {
+            runs.extend(level);
+        }
+        runs
+    }
+}
+
 fn collapse_runs(
     workspace: &mut SortWorkspace,
     mut runs: Vec<SortRun>,
@@ -1034,7 +1107,7 @@ fn collapse_runs(
             }
             let merged = merge_runs_to_file(workspace, &batch, row_limit, compare, statistics)?;
             for run in batch {
-                remove_sort_run(&run.path)?;
+                workspace.remove_run(&run.path)?;
             }
             runs.push(merged);
         }
@@ -1172,6 +1245,8 @@ struct SortRun {
 struct SortWorkspace {
     path: PathBuf,
     next_file: u64,
+    live_runs: usize,
+    peak_live_runs: usize,
     active: bool,
 }
 
@@ -1190,6 +1265,8 @@ impl SortWorkspace {
                     return Ok(Self {
                         path,
                         next_file: 0,
+                        live_runs: 0,
+                        peak_live_runs: 0,
                         active: true,
                     });
                 }
@@ -1206,6 +1283,11 @@ impl SortWorkspace {
     }
 
     fn create_run(&mut self) -> Result<(SortRun, File)> {
+        if self.live_runs >= MAX_LIVE_SORT_RUNS {
+            return Err(Error::TemporaryStorage(format!(
+                "sort requires more than {MAX_LIVE_SORT_RUNS} live run files"
+            )));
+        }
         let path = self.path.join(format!("run-{}.bin", self.next_file));
         self.next_file += 1;
         let mut options = OpenOptions::new();
@@ -1215,7 +1297,23 @@ impl SortWorkspace {
         let file = options
             .open(&path)
             .map_err(|error| temporary_storage_error("create sort run", &path, error))?;
+        self.live_runs += 1;
+        self.peak_live_runs = self.peak_live_runs.max(self.live_runs);
         Ok((SortRun { path, row_count: 0 }, file))
+    }
+
+    fn remove_run(&mut self, path: &Path) -> Result<()> {
+        fs::remove_file(path)
+            .map_err(|error| temporary_storage_error("remove sort run", path, error))?;
+        self.live_runs = self
+            .live_runs
+            .checked_sub(1)
+            .expect("only live sort runs are removed");
+        Ok(())
+    }
+
+    fn peak_live_runs(&self) -> usize {
+        self.peak_live_runs
     }
 
     fn cleanup(mut self) -> Result<()> {
@@ -1325,10 +1423,6 @@ fn write_row_index(writer: &mut impl Write, index: usize, path: &Path) -> Result
     writer
         .write_all(&index.to_le_bytes())
         .map_err(|error| temporary_storage_error("write sort run", path, error))
-}
-
-fn remove_sort_run(path: &Path) -> Result<()> {
-    fs::remove_file(path).map_err(|error| temporary_storage_error("remove sort run", path, error))
 }
 
 fn temporary_storage_error(action: &str, path: &Path, error: io::Error) -> Error {
@@ -1550,6 +1644,7 @@ mod tests {
         assert_eq!(output.values[ROW_COUNT - 1], ROW_COUNT - 1);
         assert!(output.statistics.peak_run_rows <= MAX_IN_MEMORY_ROWS);
         assert!(output.statistics.peak_merge_heads <= MAX_MERGE_FAN_IN);
+        assert!(output.statistics.peak_live_runs <= MAX_LIVE_SORT_RUNS);
 
         let top = sort_and_project(
             (0..ROW_COUNT).rev().map(Ok),
@@ -1563,6 +1658,42 @@ mod tests {
         assert_eq!(top.values, (0..25).collect::<Vec<_>>());
         assert!(top.statistics.peak_run_rows <= MAX_IN_MEMORY_ROWS);
         assert_eq!(top.statistics.peak_merge_heads, 0);
+        assert_eq!(
+            fs::read_dir(&temporary_directory)
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
+        fs::remove_dir(temporary_directory).expect("remove test temporary directory");
+    }
+
+    #[test]
+    fn minimum_sort_cap_incrementally_bounds_live_run_files() {
+        const ROW_COUNT: usize = MAX_MERGE_FAN_IN * MAX_MERGE_FAN_IN + 1;
+        let temporary_directory = test_temporary_directory("minimum-cap-sort");
+        let options = DatabaseOptions {
+            max_in_memory_sort_rows: 1,
+            temporary_directory: Some(temporary_directory.clone()),
+        };
+
+        let output = sort_and_project(
+            (0..ROW_COUNT).rev().map(Ok),
+            None,
+            ROW_COUNT,
+            &options,
+            |left, right| left.cmp(&right),
+            |index| index,
+        )
+        .expect("minimum-cap external sort succeeds");
+
+        assert_eq!(output.values, (0..ROW_COUNT).collect::<Vec<_>>());
+        assert!(output.statistics.peak_live_runs >= MAX_MERGE_FAN_IN);
+        assert!(
+            output.statistics.peak_live_runs <= MAX_MERGE_FAN_IN * 2,
+            "peak live runs was {}",
+            output.statistics.peak_live_runs
+        );
+        assert!(output.statistics.peak_live_runs <= MAX_LIVE_SORT_RUNS);
         assert_eq!(
             fs::read_dir(&temporary_directory)
                 .expect("read temporary directory")
