@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod format;
+pub mod parquet;
 pub mod sql;
 pub mod storage;
 pub mod value;

@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
 
 ## What works
 
@@ -12,7 +12,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
-- table, CSV, and JSON output from the CLI
+- table, CSV, JSON, and typed Parquet output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
@@ -37,11 +37,20 @@ cargo run -- --execute "
 "
 ~~~
 
-Choose table (the default), csv, or json:
+Choose table (the default), csv, or json for standard output:
 
 ~~~bash
 cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
+~~~
+
+Export a batch containing exactly one SELECT to Parquet. Int64, Float64, Bool,
+and String columns retain their physical types, and the destination is replaced
+atomically only after the file is complete:
+
+~~~bash
+cargo run -- --format parquet --output results.parquet --execute \
+  "CREATE TABLE t (id Int64, label String); INSERT INTO t VALUES (1, 'one'); SELECT * FROM t"
 ~~~
 
 Or pipe a batch through standard input:
@@ -54,7 +63,7 @@ printf '%s\n' \
   cargo run -- --format csv
 ~~~
 
-Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
+Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines. Parquet writes no query data to stdout and requires `--output PATH`.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
 ## Library API
@@ -89,7 +98,7 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+Run the complete checks with:
 
 ~~~bash
 cargo fmt --check
