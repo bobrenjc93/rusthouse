@@ -4,6 +4,7 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_JOIN_KEYS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -22,6 +23,8 @@ pub enum Statement {
 pub struct Select {
     pub items: Vec<SelectItem>,
     pub table: String,
+    pub table_alias: Option<String>,
+    pub joins: Vec<Join>,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
@@ -31,6 +34,9 @@ pub struct Select {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
+    QualifiedWildcard {
+        qualifier: String,
+    },
     Column {
         name: String,
         alias: Option<String>,
@@ -40,6 +46,37 @@ pub enum SelectItem {
         argument: AggregateArgument,
         alias: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub table: String,
+    pub alias: Option<String>,
+    pub conditions: Vec<JoinCondition>,
+    pub predicate: Option<Predicate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+impl JoinKind {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Inner => "INNER JOIN",
+            Self::Left => "LEFT JOIN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinCondition {
+    pub left: String,
+    pub right: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +169,7 @@ enum TokenKind {
     Number(String),
     String(String),
     Comma,
+    Dot,
     LeftParen,
     RightParen,
     Semicolon,
@@ -173,6 +211,10 @@ impl<'a> Lexer<'a> {
                 ',' => {
                     self.advance();
                     TokenKind::Comma
+                }
+                '.' => {
+                    self.advance();
+                    TokenKind::Dot
                 }
                 '(' => {
                     self.advance();
@@ -398,6 +440,14 @@ impl Parser {
             }
             let position = self.position();
             let type_name = self.expect_identifier("column type")?;
+            let (type_name, nullable) = if type_name.eq_ignore_ascii_case("NULLABLE") {
+                self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+                let nested = self.expect_identifier("type inside Nullable")?;
+                self.expect(&TokenKind::RightParen, "')' after Nullable type")?;
+                (nested, true)
+            } else {
+                (type_name, false)
+            };
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
@@ -407,6 +457,7 @@ impl Parser {
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
+                nullable,
             });
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -451,6 +502,69 @@ impl Parser {
         }
         self.expect_keyword("FROM")?;
         let table = self.expect_identifier("table name")?;
+        let table_alias =
+            self.parse_table_alias(&["INNER", "LEFT", "WHERE", "GROUP", "ORDER", "LIMIT"])?;
+
+        let mut joins = Vec::new();
+        let join_kind = if self.eat_keyword("INNER") {
+            Some(JoinKind::Inner)
+        } else if self.eat_keyword("LEFT") {
+            self.eat_keyword("OUTER");
+            Some(JoinKind::Left)
+        } else {
+            None
+        };
+        if let Some(kind) = join_kind {
+            self.expect_keyword("JOIN")?;
+            let join_table = self.expect_identifier("joined table name")?;
+            let alias = self.parse_table_alias(&["ON"])?;
+            self.expect_keyword("ON")?;
+            let mut conditions = Vec::new();
+            let mut residual = Vec::new();
+            loop {
+                let left = self.parse_operand()?;
+                let operator = self.parse_comparison_operator()?;
+                let right = self.parse_operand()?;
+                match (&left, operator, &right) {
+                    (Operand::Column(left), ComparisonOperator::Equal, Operand::Column(right)) => {
+                        conditions.push(JoinCondition {
+                            left: left.clone(),
+                            right: right.clone(),
+                        })
+                    }
+                    _ => residual.push(Predicate::Comparison {
+                        left,
+                        operator,
+                        right,
+                    }),
+                }
+                if !self.eat_keyword("AND") {
+                    break;
+                }
+                if conditions.len() >= MAX_JOIN_KEYS {
+                    return self.error(format!(
+                        "{} has too many equality keys; maximum is {MAX_JOIN_KEYS}",
+                        kind.name()
+                    ));
+                }
+                if conditions.len() + residual.len() >= MAX_PREDICATE_NODES {
+                    return self.error(format!("{} condition is too complex", kind.name()));
+                }
+            }
+            let predicate = residual
+                .into_iter()
+                .reduce(|left, right| Predicate::And(Box::new(left), Box::new(right)));
+            joins.push(Join {
+                kind,
+                table: join_table,
+                alias,
+                conditions,
+                predicate,
+            });
+            if self.at_keyword("INNER") || self.at_keyword("LEFT") || self.at_keyword("JOIN") {
+                return self.error("only one JOIN is supported per SELECT");
+            }
+        }
 
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
@@ -464,7 +578,7 @@ impl Parser {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
-                group_by.push(self.expect_identifier("GROUP BY column")?);
+                group_by.push(self.parse_column_name("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -475,7 +589,7 @@ impl Parser {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
+                let name = self.parse_column_name("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true
                 } else {
@@ -506,6 +620,8 @@ impl Parser {
         Ok(Select {
             items,
             table,
+            table_alias,
+            joins,
             predicate,
             group_by,
             order_by,
@@ -519,7 +635,19 @@ impl Parser {
         }
 
         let position = self.position();
-        let name = self.expect_identifier("column or aggregate function")?;
+        let first = self.expect_identifier("column or aggregate function")?;
+        if self.eat(&TokenKind::Dot) {
+            if self.eat(&TokenKind::Star) {
+                return Ok(SelectItem::QualifiedWildcard { qualifier: first });
+            }
+            let name = format!(
+                "{first}.{}",
+                self.expect_identifier("column name after '.'")?
+            );
+            let alias = self.parse_alias()?;
+            return Ok(SelectItem::Column { name, alias });
+        }
+        let name = first;
         if self.eat(&TokenKind::LeftParen) {
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
@@ -528,7 +656,7 @@ impl Parser {
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                AggregateArgument::Column(self.parse_column_name("aggregate column")?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let alias = self.parse_alias()?;
@@ -548,6 +676,28 @@ impl Parser {
             self.expect_identifier("alias").map(Some)
         } else {
             Ok(None)
+        }
+    }
+
+    fn parse_table_alias(&mut self, terminators: &[&str]) -> Result<Option<String>> {
+        if self.eat_keyword("AS") {
+            return self.expect_identifier("table alias").map(Some);
+        }
+        if matches!(self.peek(), TokenKind::Identifier(value)
+            if !terminators.iter().any(|keyword| value.eq_ignore_ascii_case(keyword)))
+        {
+            return self.expect_identifier("table alias").map(Some);
+        }
+        Ok(None)
+    }
+
+    fn parse_column_name(&mut self, description: &str) -> Result<String> {
+        let qualifier_or_name = self.expect_identifier(description)?;
+        if self.eat(&TokenKind::Dot) {
+            let name = self.expect_identifier("column name after '.'")?;
+            Ok(format!("{qualifier_or_name}.{name}"))
+        } else {
+            Ok(qualifier_or_name)
         }
     }
 
@@ -587,6 +737,17 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        let operator = self.parse_comparison_operator()?;
+        let right = self.parse_operand()?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Comparison {
+            left,
+            operator,
+            right,
+        })
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator> {
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -597,13 +758,7 @@ impl Parser {
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
         self.current += 1;
-        let right = self.parse_operand()?;
-        self.record_predicate_node()?;
-        Ok(Predicate::Comparison {
-            left,
-            operator,
-            right,
-        })
+        Ok(operator)
     }
 
     fn record_predicate_node(&mut self) -> Result<()> {
@@ -622,12 +777,15 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if (value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL"))
+                    && !self.next_is(&TokenKind::Dot) =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
+                .parse_column_name("column or literal")
                 .map(Operand::Column),
             _ => self.error("expected column or literal"),
         }
@@ -672,8 +830,10 @@ impl Parser {
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
+        } else if self.eat_keyword("NULL") {
+            Ok(Value::Null)
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, or NULL literal")
         }
     }
 
@@ -693,6 +853,10 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
@@ -738,6 +902,12 @@ impl Parser {
         &self.tokens[self.current].kind
     }
 
+    fn next_is(&self, expected: &TokenKind) -> bool {
+        self.tokens
+            .get(self.current + 1)
+            .is_some_and(|token| &token.kind == expected)
+    }
+
     fn position(&self) -> usize {
         self.tokens[self.current].position
     }
@@ -771,6 +941,66 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_one_aliased_composite_inner_join() {
+        let statements = parse(
+            "SELECT a.*, SUM(b.amount) AS total
+             FROM accounts AS a
+             INNER JOIN bills b ON a.id = b.account_id AND a.region = b.region
+             GROUP BY a.id, a.region
+             ORDER BY a.id;",
+        )
+        .expect("valid join");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(select.table, "accounts");
+        assert_eq!(select.table_alias.as_deref(), Some("a"));
+        assert_eq!(select.joins.len(), 1);
+        assert_eq!(select.joins[0].alias.as_deref(), Some("b"));
+        assert_eq!(select.joins[0].conditions.len(), 2);
+        assert_eq!(select.group_by, ["a.id", "a.region"]);
+        assert_eq!(select.order_by[0].name, "a.id");
+
+        let error = parse(
+            "SELECT a.id FROM a INNER JOIN b ON a.id = b.id
+             INNER JOIN c ON b.id = c.id",
+        )
+        .expect_err("only one join is supported");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("only one JOIN")
+        ));
+    }
+
+    #[test]
+    fn parses_left_outer_join_nullable_types_and_null_literals() {
+        let statements = parse(
+            "CREATE TABLE right_rows (id Nullable(Int64));
+             INSERT INTO right_rows VALUES (NULL);
+             SELECT l.id, r.id
+             FROM left_rows l LEFT OUTER JOIN right_rows r
+               ON l.id = r.id AND r.id > 0;",
+        )
+        .expect("valid left outer join batch");
+
+        let Statement::CreateTable { columns, .. } = &statements[0] else {
+            panic!("expected create table");
+        };
+        assert!(columns[0].nullable);
+        let Statement::Insert { rows, .. } = &statements[1] else {
+            panic!("expected insert");
+        };
+        assert_eq!(rows[0], [Value::Null]);
+        let Statement::Select(select) = &statements[2] else {
+            panic!("expected select");
+        };
+        assert_eq!(select.joins[0].kind, JoinKind::Left);
+        assert_eq!(select.joins[0].conditions.len(), 1);
+        assert!(select.joins[0].predicate.is_some());
     }
 
     #[test]
