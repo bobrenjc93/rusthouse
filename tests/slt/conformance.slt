@@ -1,0 +1,375 @@
+# RustHouse's deterministic end-to-end SQLLogicTest conformance corpus.
+# Query signatures use I=Int64, R=Float64, B=Bool, and T=String.
+
+# Typed DDL, inserts, projection, escaping, and exact numeric boundaries.
+statement count 0
+CREATE TABLE scalar_values (
+    id Int64,
+    ratio Float64,
+    enabled Bool,
+    label String
+)
+
+statement count 5
+INSERT INTO scalar_values VALUES
+    (-9223372036854775808, -1.5, false, 'negative'),
+    (0, 0.0, true, 'zero'),
+    (2, 2.0, false, 'two'),
+    (9007199254740993, 3.25, true, 'large'),
+    (9223372036854775807, 4.5, true, 'O''Brien')
+
+query IRBT
+SELECT id, ratio, enabled, label
+FROM scalar_values
+ORDER BY id
+----
+-9223372036854775808 -1.5 false negative
+0 0.0 true zero
+2 2.0 false two
+9007199254740993 3.25 true large
+9223372036854775807 4.5 true O'Brien
+
+# rowsort makes this an explicitly unordered query record.
+query T rowsort
+SELECT label FROM scalar_values WHERE enabled = true
+----
+O'Brien
+large
+zero
+
+# nosort checks the database's multi-column ordering and limit behavior.
+query TI nosort
+SELECT label AS name, id
+FROM scalar_values
+ORDER BY name DESC, id ASC
+LIMIT 3
+----
+zero 0
+two 2
+negative -9223372036854775808
+
+query T
+SELECT label FROM scalar_values ORDER BY label LIMIT 0
+----
+
+# Every comparison operator, Boolean precedence, and parenthesized predicates.
+query T
+SELECT label FROM scalar_values WHERE id = 0
+----
+zero
+
+query T rowsort
+SELECT label FROM scalar_values WHERE id != 0 AND id <> 2
+----
+O'Brien
+large
+negative
+
+query T rowsort
+SELECT label FROM scalar_values WHERE ratio < 0.0 OR ratio > 4.0
+----
+O'Brien
+negative
+
+query T rowsort
+SELECT label FROM scalar_values WHERE ratio <= 0.0 OR ratio >= 4.5
+----
+O'Brien
+negative
+zero
+
+query I
+SELECT id
+FROM scalar_values
+WHERE enabled = true AND id = 0 OR label = 'two'
+ORDER BY id
+----
+0
+2
+
+query I
+SELECT id
+FROM scalar_values
+WHERE enabled = true AND (id = 0 OR label = 'two')
+ORDER BY id
+----
+0
+
+query I
+SELECT id
+FROM scalar_values
+WHERE 9007199254740992.0 < id
+ORDER BY id
+----
+9007199254740993
+9223372036854775807
+
+query I
+SELECT COUNT(*) AS count
+FROM scalar_values
+WHERE id < 9223372036854775808.0
+----
+5
+
+query I
+SELECT id
+FROM scalar_values
+WHERE id = -9223372036854775808.0
+----
+-9223372036854775808
+
+statement error invalid Int64 literal
+INSERT INTO scalar_values VALUES (9223372036854775808, 1.0, true, 'overflow')
+
+statement error Float64 literal must be finite
+INSERT INTO scalar_values VALUES (1, 1e309, true, 'infinite')
+
+statement error type mismatch for WHERE comparison
+SELECT id FROM scalar_values WHERE enabled = 1
+
+# All aggregates, global and grouped execution, aliases, and result types.
+statement count 0
+CREATE TABLE sales (
+    region String,
+    active Bool,
+    units Int64,
+    revenue Float64
+)
+
+statement count 6
+INSERT INTO sales VALUES
+    ('west', true, 10, 1.5),
+    ('west', true, 20, 2.5),
+    ('east', false, 4, 5.0),
+    ('east', true, 8, 3.0),
+    ('north', false, 0, 2.0),
+    ('east', false, 6, 1.0)
+
+query IIIRIIRRTTBB
+SELECT COUNT(*) AS rows,
+       COUNT(units) AS values,
+       SUM(units) AS total_units,
+       SUM(revenue) AS total_revenue,
+       MIN(units) AS low_units,
+       MAX(units) AS high_units,
+       AVG(units) AS mean_units,
+       AVG(revenue) AS mean_revenue,
+       MIN(region) AS first_region,
+       MAX(region) AS last_region,
+       MIN(active) AS first_active,
+       MAX(active) AS last_active
+FROM sales
+----
+6 6 48 15.0 0 20 8.0 2.5 east west false true
+
+query TBIIRIIRR
+SELECT region,
+       active,
+       COUNT(*) AS rows,
+       SUM(units) AS total,
+       SUM(revenue) AS revenue,
+       MIN(units) AS low,
+       MAX(units) AS high,
+       AVG(units) AS mean_units,
+       AVG(revenue) AS mean_revenue
+FROM sales
+GROUP BY region, active
+ORDER BY total DESC, region ASC
+----
+west true 2 30 4.0 10 20 15.0 2.0
+east false 2 10 6.0 4 6 5.0 3.0
+east true 1 8 3.0 8 8 8.0 3.0
+north false 1 0 2.0 0 0 0.0 2.0
+
+query TB rowsort
+SELECT region, active FROM sales GROUP BY region, active
+----
+east false
+east true
+north false
+west true
+
+statement count 0
+CREATE TABLE empty_metrics (amount Int64, ratio Float64)
+
+query IIR
+SELECT COUNT(*) AS rows, SUM(amount) AS amount, SUM(ratio) AS ratio
+FROM empty_metrics
+----
+0 0 0.0
+
+statement error MIN is undefined for an empty input
+SELECT MIN(amount) FROM empty_metrics
+
+statement error MAX is undefined for an empty input
+SELECT MAX(ratio) FROM empty_metrics
+
+statement error AVG is undefined for an empty input
+SELECT AVG(amount) FROM empty_metrics
+
+statement error SUM argument
+SELECT SUM(region) FROM sales
+
+statement error AVG argument
+SELECT AVG(active) FROM sales
+
+statement error must appear in GROUP BY
+SELECT region, units, SUM(revenue) FROM sales GROUP BY region
+
+statement error GROUP BY column 'region' is listed more than once
+SELECT region, COUNT(*) FROM sales GROUP BY region, region
+
+statement error '\*' projection cannot be combined with aggregates
+SELECT *, COUNT(*) FROM sales
+
+# Aggregate overflow is reported instead of wrapping or storing infinity.
+statement count 0
+CREATE TABLE overflow_values (integer_value Int64, float_value Float64)
+
+statement count 2
+INSERT INTO overflow_values VALUES
+    (9223372036854775807, 1e308),
+    (1, 1e308)
+
+statement error numeric overflow while computing SUM\(Int64\)
+SELECT SUM(integer_value) FROM overflow_values
+
+statement error numeric overflow while computing SUM\(Float64\)
+SELECT SUM(float_value) FROM overflow_values
+
+statement error numeric overflow while computing AVG\(Float64\) sum
+SELECT AVG(float_value) FROM overflow_values
+
+# AVG(Int64) accumulates exactly before converting the final result to Float64.
+statement count 0
+CREATE TABLE avg_precision (forward_order Bool, value Int64)
+
+statement count 6
+INSERT INTO avg_precision VALUES
+    (true, 9007199254740993),
+    (true, 1),
+    (true, -9007199254740993),
+    (false, 9007199254740993),
+    (false, -9007199254740993),
+    (false, 1)
+
+query BR
+SELECT forward_order, AVG(value) AS mean
+FROM avg_precision
+GROUP BY forward_order
+ORDER BY forward_order
+----
+false 0.3333333333333333
+true 0.3333333333333333
+
+# Stable tie ordering, output aliases, and errors in ordering resolution.
+statement count 0
+CREATE TABLE ranked (id Int64, score Int64, label String)
+
+statement count 4
+INSERT INTO ranked VALUES
+    (1, 5, 'later'),
+    (2, 9, 'first_tie'),
+    (3, 9, 'second_tie'),
+    (4, 1, 'last')
+
+query IIT
+SELECT id, score, label FROM ranked ORDER BY score DESC LIMIT 2
+----
+2 9 first_tie
+3 9 second_tie
+
+query TI
+SELECT label AS name, id FROM ranked ORDER BY name ASC, id DESC
+----
+first_tie 2
+last 4
+later 1
+second_tie 3
+
+statement error is not in the SELECT output
+SELECT id FROM ranked ORDER BY score
+
+statement error ORDER BY name 'id' is ambiguous
+SELECT id, label AS id FROM ranked ORDER BY id
+
+# A failed multi-row insert is atomic.
+statement count 0
+CREATE TABLE insert_atomic (id Int64, label String)
+
+statement error type mismatch for column 'insert_atomic.label'
+INSERT INTO insert_atomic VALUES (1, 'valid'), (2, false)
+
+query I
+SELECT COUNT(*) AS rows FROM insert_atomic
+----
+0
+
+statement error has 1 values; expected 2
+INSERT INTO insert_atomic VALUES (1)
+
+# The whole SQL batch is parsed before execution, so this CREATE is rolled back.
+statement error expected keyword FROM
+CREATE TABLE parse_rollback (id Int64);
+SELECT id FORM parse_rollback;
+
+statement count 0
+CREATE TABLE parse_rollback (id Int64)
+
+# Execution errors stop a parsed batch but preserve prior successful statements.
+statement error type mismatch for column 'execution_partial.id'
+CREATE TABLE execution_partial (id Int64);
+INSERT INTO execution_partial VALUES (false);
+
+query I
+SELECT COUNT(*) AS rows FROM execution_partial
+----
+0
+
+# Common catalog and statement failures remain actionable.
+statement error already exists
+CREATE TABLE ranked (other Int64)
+
+statement error duplicate column
+CREATE TABLE duplicate_columns (id Int64, ID String)
+
+statement error does not exist
+SELECT id FROM missing_table
+
+statement error does not exist in table 'ranked'
+SELECT missing_column FROM ranked
+
+statement error reserved
+CREATE TABLE reserved_column (true Bool)
+
+# Force SQLLogicTest's canonical MD5 form for a result larger than the threshold.
+statement count 0
+CREATE TABLE hash_rows (id Int64, label String)
+
+statement count 64
+INSERT INTO hash_rows VALUES
+    (0, 'item00'), (1, 'item01'), (2, 'item02'), (3, 'item03'),
+    (4, 'item04'), (5, 'item05'), (6, 'item06'), (7, 'item07'),
+    (8, 'item08'), (9, 'item09'), (10, 'item10'), (11, 'item11'),
+    (12, 'item12'), (13, 'item13'), (14, 'item14'), (15, 'item15'),
+    (16, 'item16'), (17, 'item17'), (18, 'item18'), (19, 'item19'),
+    (20, 'item20'), (21, 'item21'), (22, 'item22'), (23, 'item23'),
+    (24, 'item24'), (25, 'item25'), (26, 'item26'), (27, 'item27'),
+    (28, 'item28'), (29, 'item29'), (30, 'item30'), (31, 'item31'),
+    (32, 'item32'), (33, 'item33'), (34, 'item34'), (35, 'item35'),
+    (36, 'item36'), (37, 'item37'), (38, 'item38'), (39, 'item39'),
+    (40, 'item40'), (41, 'item41'), (42, 'item42'), (43, 'item43'),
+    (44, 'item44'), (45, 'item45'), (46, 'item46'), (47, 'item47'),
+    (48, 'item48'), (49, 'item49'), (50, 'item50'), (51, 'item51'),
+    (52, 'item52'), (53, 'item53'), (54, 'item54'), (55, 'item55'),
+    (56, 'item56'), (57, 'item57'), (58, 'item58'), (59, 'item59'),
+    (60, 'item60'), (61, 'item61'), (62, 'item62'), (63, 'item63')
+
+hash-threshold 32
+
+query IT
+SELECT id, label FROM hash_rows ORDER BY id
+----
+128 values hashing to 0e56c5e66308acd0713c8106a3b37ad0
+
+hash-threshold 0

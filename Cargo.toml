@@ -9,6 +9,9 @@ repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
 
+[dev-dependencies]
+sqllogictest = "0.29.1"
+
 [[bin]]
 name = "clickhouse-parity-bench"
 path = "benchmark/main.rs"

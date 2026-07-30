@@ -89,7 +89,9 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+The runtime crate has no third-party dependencies. The test suite uses the
+`sqllogictest` dev dependency to run `tests/slt/conformance.slt` directly
+against `Database`, without an external database. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check
