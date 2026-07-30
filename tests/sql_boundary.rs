@@ -394,7 +394,9 @@ fn having_rejects_ambiguous_aliases_and_ungrouped_columns() {
     database
         .execute(
             "CREATE TABLE having_names (category String, amount Int64);
-             INSERT INTO having_names VALUES ('tools', 2);",
+             INSERT INTO having_names VALUES ('tools', 2);
+             CREATE TABLE having_collision (region String, area String);
+             INSERT INTO having_collision VALUES ('west', 'east');",
         )
         .expect("setup succeeds");
 
@@ -406,6 +408,30 @@ fn having_rejects_ambiguous_aliases_and_ungrouped_columns() {
         .expect_err("duplicate selected aliases are ambiguous");
     assert!(
         matches!(ambiguous, Error::InvalidQuery(message) if message.contains("HAVING name 'metric' is ambiguous"))
+    );
+
+    let namespace_collision = database
+        .execute(
+            "SELECT area AS region, COUNT(*) AS rows
+             FROM having_collision
+             GROUP BY region, area
+             HAVING region = 'west';",
+        )
+        .expect_err("an alias cannot shadow a different grouped column");
+    assert!(
+        matches!(namespace_collision, Error::InvalidQuery(message) if message.contains("HAVING name 'region' is ambiguous"))
+    );
+
+    let same_binding = execute_query(
+        &mut database,
+        "SELECT region, COUNT(*) AS rows
+         FROM having_collision
+         GROUP BY region, area
+         HAVING region = 'west';",
+    );
+    assert_eq!(
+        same_binding.rows,
+        vec![vec![Value::String("west".to_owned()), Value::Int64(1)]]
     );
 
     let ungrouped = database
@@ -607,7 +633,7 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
+fn boolean_literal_names_are_reserved_for_columns_and_aliases() {
     for identifier in ["true", "FALSE"] {
         let mut database = Database::new();
         let error = database
@@ -626,6 +652,27 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
         assert!(matches!(
             database.catalog().table("reserved_names"),
             Err(Error::TableNotFound(_))
+        ));
+
+        database
+            .execute(
+                "CREATE TABLE valid_flags (enabled Bool);
+                 INSERT INTO valid_flags VALUES (false);",
+            )
+            .expect("valid setup");
+        let alias_error = database
+            .execute(&format!(
+                "SELECT MIN(enabled) AS {identifier}
+                 FROM valid_flags
+                 HAVING {identifier} = false"
+            ))
+            .expect_err("Boolean literal names are reserved aliases");
+        assert!(matches!(
+            alias_error,
+            Error::ReservedIdentifier {
+                identifier: rejected,
+                context,
+            } if rejected.eq_ignore_ascii_case(identifier) && context == "alias"
         ));
     }
 }

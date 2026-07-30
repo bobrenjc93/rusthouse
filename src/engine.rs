@@ -631,6 +631,13 @@ impl CompiledHavingOperand {
             Self::Literal(value) => value.as_ref(),
         }
     }
+
+    fn group_position(&self) -> Option<usize> {
+        match self {
+            Self::GroupColumn { position, .. } => Some(*position),
+            Self::Aggregate { .. } | Self::Literal(_) => None,
+        }
+    }
 }
 
 fn compile_having_predicate(
@@ -715,42 +722,70 @@ impl HavingResolver<'_> {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         match output_matches.as_slice() {
-            [output] => match self.items[*output] {
-                ResolvedItem::Column {
-                    group_position: Some(position),
-                    ..
-                } => Ok(CompiledHavingOperand::GroupColumn {
-                    position,
-                    data_type: self.result_columns[*output].data_type,
-                }),
-                ResolvedItem::Column {
-                    group_position: None,
-                    source,
-                } => Err(ungrouped_having_column(&self.table.schema()[source].name)),
-                ResolvedItem::Aggregate { state } => Ok(CompiledHavingOperand::Aggregate {
-                    state,
-                    data_type: self.result_columns[*output].data_type,
-                }),
-            },
-            [] => {
-                let source = self.table.column_index(name)?;
-                let Some(position) = self
-                    .group_columns
-                    .iter()
-                    .position(|column| *column == source)
-                else {
-                    return Err(ungrouped_having_column(name));
-                };
-                Ok(CompiledHavingOperand::GroupColumn {
-                    position,
-                    data_type: self.table.schema()[source].data_type,
-                })
+            [output] => {
+                let output_binding = self.compile_output(*output)?;
+                if self
+                    .grouped_source_position(name)
+                    .is_some_and(|position| output_binding.group_position() != Some(position))
+                {
+                    return Err(ambiguous_having_name(name));
+                }
+                Ok(output_binding)
             }
-            _ => Err(Error::InvalidQuery(format!(
-                "HAVING name '{name}' is ambiguous"
-            ))),
+            [] => self.compile_source(name),
+            _ => Err(ambiguous_having_name(name)),
         }
     }
+
+    fn compile_output(&self, output: usize) -> Result<CompiledHavingOperand> {
+        match self.items[output] {
+            ResolvedItem::Column {
+                group_position: Some(position),
+                ..
+            } => Ok(CompiledHavingOperand::GroupColumn {
+                position,
+                data_type: self.result_columns[output].data_type,
+            }),
+            ResolvedItem::Column {
+                group_position: None,
+                source,
+            } => Err(ungrouped_having_column(&self.table.schema()[source].name)),
+            ResolvedItem::Aggregate { state } => Ok(CompiledHavingOperand::Aggregate {
+                state,
+                data_type: self.result_columns[output].data_type,
+            }),
+        }
+    }
+
+    fn compile_source(&self, name: &str) -> Result<CompiledHavingOperand> {
+        let source = self.table.column_index(name)?;
+        let Some(position) = self
+            .group_columns
+            .iter()
+            .position(|column| *column == source)
+        else {
+            return Err(ungrouped_having_column(name));
+        };
+        Ok(CompiledHavingOperand::GroupColumn {
+            position,
+            data_type: self.table.schema()[source].data_type,
+        })
+    }
+
+    fn grouped_source_position(&self, name: &str) -> Option<usize> {
+        let source = self
+            .table
+            .schema()
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))?;
+        self.group_columns
+            .iter()
+            .position(|column| *column == source)
+    }
+}
+
+fn ambiguous_having_name(name: &str) -> Error {
+    Error::InvalidQuery(format!("HAVING name '{name}' is ambiguous"))
 }
 
 fn ungrouped_having_column(name: &str) -> Error {
