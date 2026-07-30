@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- bounded group aggregation with deterministic temporary hash partitions
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -43,6 +44,24 @@ Choose table (the default), csv, or json:
 cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
+
+Grouped queries keep their hash keys and aggregate states under a configurable
+memory budget. If the budget is reached, RustHouse writes row indices to
+query-owned hash partitions and removes the workspace on success or error.
+The CLI accepts byte counts or KiB, MiB, and GiB suffixes:
+
+~~~bash
+cargo run -- \
+  --group-memory-limit 32MiB \
+  --temporary-directory /var/tmp/rusthouse \
+  --temporary-directory-limit 2GiB \
+  --execute "SELECT region, SUM(amount) FROM sales GROUP BY region"
+~~~
+
+The library exposes the same controls through DatabaseOptions. The defaults
+are 64 MiB of group state, the operating system temporary directory, and
+1 GiB of spill files per query. The temporary-directory limit counts only the
+active query workspace, not unrelated files under the configured root.
 
 Or pipe a batch through standard input:
 

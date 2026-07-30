@@ -7,11 +7,15 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod format;
+mod group_spill;
 pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{
+    DEFAULT_GROUP_MEMORY_LIMIT_BYTES, DEFAULT_TEMPORARY_DIRECTORY_LIMIT_BYTES, Database,
+    DatabaseOptions, QueryResult, ResultColumn, StatementResult,
+};
 pub use error::{Error, Result};
 pub use value::{DataType, Value};
 

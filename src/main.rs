@@ -1,9 +1,10 @@
 use std::env;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{Database, DatabaseOptions, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,6 +15,12 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+        --group-memory-limit <BYTES>
+                              Group-state budget (supports KiB, MiB, GiB)
+        --temporary-directory <PATH>
+                              Root directory for group spill files
+        --temporary-directory-limit <BYTES>
+                              Per-query spill budget (supports KiB, MiB, GiB)
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -47,7 +54,7 @@ fn run() -> Result<(), String> {
         sql
     };
 
-    let mut database = Database::new();
+    let mut database = Database::with_options(config.database_options);
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +101,16 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    database_options: DatabaseOptions,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut database_options = DatabaseOptions::default();
+    let mut group_memory_limit_set = false;
+    let mut temporary_directory_set = false;
+    let mut temporary_directory_limit_set = false;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +134,41 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "--group-memory-limit" => {
+                if group_memory_limit_set {
+                    return Err("--group-memory-limit may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a byte limit"))?;
+                database_options.group_memory_limit_bytes =
+                    parse_byte_limit_usize(&value, "--group-memory-limit")?;
+                group_memory_limit_set = true;
+            }
+            "--temporary-directory" | "--temp-dir" => {
+                if temporary_directory_set {
+                    return Err("--temporary-directory may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a path"))?;
+                if value.is_empty() {
+                    return Err("--temporary-directory requires a non-empty path".to_owned());
+                }
+                database_options.temporary_directory = PathBuf::from(value);
+                temporary_directory_set = true;
+            }
+            "--temporary-directory-limit" => {
+                if temporary_directory_limit_set {
+                    return Err("--temporary-directory-limit may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a byte limit"))?;
+                database_options.temporary_directory_limit_bytes =
+                    parse_byte_limit(&value, "--temporary-directory-limit")?;
+                temporary_directory_limit_set = true;
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +181,79 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--group-memory-limit=") => {
+                if group_memory_limit_set {
+                    return Err("--group-memory-limit may only be supplied once".to_owned());
+                }
+                let value = &argument["--group-memory-limit=".len()..];
+                database_options.group_memory_limit_bytes =
+                    parse_byte_limit_usize(value, "--group-memory-limit")?;
+                group_memory_limit_set = true;
+            }
+            _ if argument.starts_with("--temporary-directory=")
+                || argument.starts_with("--temp-dir=") =>
+            {
+                if temporary_directory_set {
+                    return Err("--temporary-directory may only be supplied once".to_owned());
+                }
+                let value = argument
+                    .split_once('=')
+                    .expect("matched an equals-style option")
+                    .1;
+                if value.is_empty() {
+                    return Err("--temporary-directory requires a non-empty path".to_owned());
+                }
+                database_options.temporary_directory = PathBuf::from(value);
+                temporary_directory_set = true;
+            }
+            _ if argument.starts_with("--temporary-directory-limit=") => {
+                if temporary_directory_limit_set {
+                    return Err("--temporary-directory-limit may only be supplied once".to_owned());
+                }
+                let value = &argument["--temporary-directory-limit=".len()..];
+                database_options.temporary_directory_limit_bytes =
+                    parse_byte_limit(value, "--temporary-directory-limit")?;
+                temporary_directory_limit_set = true;
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        database_options,
+    }))
+}
+
+fn parse_byte_limit_usize(value: &str, option: &str) -> Result<usize, String> {
+    let bytes = parse_byte_limit(value, option)?;
+    usize::try_from(bytes).map_err(|_| format!("{option} value '{value}' is too large"))
+}
+
+fn parse_byte_limit(value: &str, option: &str) -> Result<u64, String> {
+    let digit_count = value.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 {
+        return Err(format!("{option} requires a non-negative byte limit"));
+    }
+    let number = value[..digit_count]
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {option} value '{value}'"))?;
+    let suffix = value[digit_count..].to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(format!(
+                "invalid {option} value '{value}'; expected bytes, KiB, MiB, or GiB"
+            ));
+        }
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{option} value '{value}' is too large"))
 }
 
 #[cfg(test)]
@@ -157,6 +272,49 @@ mod tests {
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+    }
+
+    #[test]
+    fn parses_group_spill_resource_options() {
+        let config = parse_arguments(
+            [
+                "--group-memory-limit=2MiB",
+                "--temporary-directory",
+                "/tmp/rusthouse-spills",
+                "--temporary-directory-limit=3GiB",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("valid arguments")
+        .expect("not help");
+
+        assert_eq!(
+            config.database_options.group_memory_limit_bytes,
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            config.database_options.temporary_directory,
+            PathBuf::from("/tmp/rusthouse-spills")
+        );
+        assert_eq!(
+            config.database_options.temporary_directory_limit_bytes,
+            3 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_group_spill_limits() {
+        for arguments in [
+            vec!["--group-memory-limit", "-1"],
+            vec!["--temporary-directory-limit=5MB"],
+            vec!["--group-memory-limit=18446744073709551615GiB"],
+        ] {
+            assert!(
+                parse_arguments(arguments.into_iter().map(str::to_owned)).is_err(),
+                "arguments should be rejected"
+            );
+        }
     }
 
     #[test]

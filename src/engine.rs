@@ -1,8 +1,13 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::mem;
+use std::path::PathBuf;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
+use crate::group_spill::{
+    PartitionRows, ROW_INDEX_BYTES, TempWorkspace, repartition, write_initial_partitions,
+};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
@@ -10,10 +15,35 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+pub const DEFAULT_GROUP_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_TEMPORARY_DIRECTORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Resource limits used while executing grouped queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseOptions {
+    /// Approximate upper bound for live hash keys and aggregate states.
+    pub group_memory_limit_bytes: usize,
+    /// Root under which query-owned spill directories are created.
+    pub temporary_directory: PathBuf,
+    /// Maximum bytes written by one query's spill workspace.
+    pub temporary_directory_limit_bytes: u64,
+}
+
+impl Default for DatabaseOptions {
+    fn default() -> Self {
+        Self {
+            group_memory_limit_bytes: DEFAULT_GROUP_MEMORY_LIMIT_BYTES,
+            temporary_directory: std::env::temp_dir(),
+            temporary_directory_limit_bytes: DEFAULT_TEMPORARY_DIRECTORY_LIMIT_BYTES,
+        }
+    }
+}
+
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    options: DatabaseOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +71,19 @@ impl Database {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_options(options: DatabaseOptions) -> Self {
+        Self {
+            catalog: Catalog::default(),
+            options,
+        }
+    }
+
+    #[must_use]
+    pub fn options(&self) -> &DatabaseOptions {
+        &self.options
     }
 
     #[must_use]
@@ -113,16 +156,14 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_grouped_rows(
-                &mut selected_groups,
-                &grouped,
-                &items,
-                &ordering,
-                select.limit,
-            );
-            grouped.project(&selected_groups, &items)
+            let request = GroupingRequest {
+                group_columns: &group_columns,
+                aggregate_specs: &aggregate_specs,
+                items: &items,
+                ordering: &ordering,
+                limit: select.limit,
+            };
+            execute_grouped_query(table, &matching_rows, &request, &self.options)?
         } else {
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
@@ -151,6 +192,14 @@ struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+}
+
+struct GroupingRequest<'a> {
+    group_columns: &'a [usize],
+    aggregate_specs: &'a [AggregateSpec],
+    items: &'a [ResolvedItem],
+    ordering: &'a [ResolvedOrder],
+    limit: Option<usize>,
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -319,15 +368,74 @@ fn execute_projection(
         .collect()
 }
 
-fn execute_grouped<'a>(
-    table: &'a Table,
+fn execute_grouped_query(
+    table: &Table,
     matching_rows: &[usize],
+    request: &GroupingRequest<'_>,
+    options: &DatabaseOptions,
+) -> Result<Vec<Vec<Value>>> {
+    let max_groups = group_capacity(
+        options.group_memory_limit_bytes,
+        request.group_columns.len(),
+        request.aggregate_specs.len(),
+    );
+    match aggregate_rows(
+        table,
+        matching_rows.iter().copied().map(Ok),
+        matching_rows.len(),
+        request.group_columns,
+        request.aggregate_specs,
+        max_groups,
+    )? {
+        GroupAttempt::Complete(grouped) => {
+            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            order_grouped_rows(
+                &mut selected_groups,
+                &grouped,
+                request.items,
+                request.ordering,
+                request.limit,
+            );
+            Ok(grouped.project(&selected_groups, request.items))
+        }
+        GroupAttempt::BudgetExceeded => {
+            execute_spilled_grouped(table, matching_rows, request, max_groups, options)
+        }
+    }
+}
+
+fn group_capacity(memory_limit: usize, group_column_count: usize, aggregate_count: usize) -> usize {
+    let key_bytes = match group_column_count {
+        0 => 0,
+        1 => mem::size_of::<ValueRef<'static>>(),
+        count => mem::size_of::<Box<[ValueRef<'static>]>>()
+            .saturating_add(count.saturating_mul(mem::size_of::<ValueRef<'static>>())),
+    };
+    let aggregate_bytes = aggregate_count.saturating_mul(mem::size_of::<AggregateState>());
+    let estimated_bytes = key_bytes
+        .saturating_add(aggregate_bytes)
+        .saturating_add(mem::size_of::<usize>() * 4)
+        .max(1);
+    (memory_limit / estimated_bytes).max(1)
+}
+
+#[derive(Debug)]
+enum GroupAttempt<'a> {
+    Complete(GroupedData<'a>),
+    BudgetExceeded,
+}
+
+fn aggregate_rows<'a>(
+    table: &'a Table,
+    rows: impl IntoIterator<Item = Result<usize>>,
+    row_count_hint: usize,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
-) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    max_groups: usize,
+) -> Result<GroupAttempt<'a>> {
+    let initial_capacity = row_count_hint.min(1_024).min(max_groups);
+    let mut groups = GroupIndex::new(group_columns.len(), initial_capacity);
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -339,8 +447,13 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in rows {
+        let row = row?;
+        let Some((group, inserted)) =
+            groups.find_or_insert(table, group_columns, row, group_count, max_groups)
+        else {
+            return Ok(GroupAttempt::BudgetExceeded);
+        };
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,21 +462,22 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
     let keys = groups.into_keys(group_count);
     let aggregates = aggregate_states
         .into_iter()
-        .map(|states| {
+        .zip(aggregate_specs)
+        .map(|(states, spec)| {
             states
                 .into_iter()
-                .map(AggregateState::finish)
+                .map(|state| state.finish(spec, table))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(GroupedData { keys, aggregates })
+    Ok(GroupAttempt::Complete(GroupedData { keys, aggregates }))
 }
 
 #[derive(Debug)]
@@ -374,8 +488,7 @@ enum GroupIndex<'a> {
 }
 
 impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize, row_count: usize) -> Self {
-        let initial_capacity = row_count.min(1_024);
+    fn new(column_count: usize, initial_capacity: usize) -> Self {
         match column_count {
             0 => Self::Global,
             1 => Self::One(HashMap::with_capacity(initial_capacity)),
@@ -389,16 +502,19 @@ impl<'a> GroupIndex<'a> {
         columns: &[usize],
         row: usize,
         next_group: usize,
-    ) -> (usize, bool) {
+        max_groups: usize,
+    ) -> Option<(usize, bool)> {
         match self {
-            Self::Global => (0, false),
+            Self::Global => Some((0, false)),
             Self::One(groups) => {
                 let key = table.columns()[columns[0]].value_ref(row);
                 if let Some(group) = groups.get(&key) {
-                    (*group, false)
+                    Some((*group, false))
+                } else if next_group >= max_groups {
+                    None
                 } else {
                     groups.insert(key, next_group);
-                    (next_group, true)
+                    Some((next_group, true))
                 }
             }
             Self::Multiple(groups) if columns.len() == 2 => {
@@ -406,14 +522,14 @@ impl<'a> GroupIndex<'a> {
                     table.columns()[columns[0]].value_ref(row),
                     table.columns()[columns[1]].value_ref(row),
                 ];
-                find_or_insert_group(groups, &key, next_group)
+                find_or_insert_group(groups, &key, next_group, max_groups)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
                     .map(|column| table.columns()[*column].value_ref(row))
                     .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
+                find_or_insert_group(groups, &key, next_group, max_groups)
             }
         }
     }
@@ -449,12 +565,15 @@ fn find_or_insert_group<'a>(
     groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
     key: &[ValueRef<'a>],
     next_group: usize,
-) -> (usize, bool) {
+    max_groups: usize,
+) -> Option<(usize, bool)> {
     if let Some(group) = groups.get(key) {
-        (*group, false)
+        Some((*group, false))
+    } else if next_group >= max_groups {
+        None
     } else {
         groups.insert(key.into(), next_group);
-        (next_group, true)
+        Some((next_group, true))
     }
 }
 
@@ -483,6 +602,14 @@ impl GroupKey<'_> {
             _ => unreachable!("all keys for a query have the same shape"),
         }
     }
+
+    fn to_owned_values(&self) -> Vec<Value> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(value) => vec![(*value).to_owned()],
+            Self::Multiple(values) => values.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -491,7 +618,7 @@ struct GroupedData<'a> {
     aggregates: Vec<Vec<Value>>,
 }
 
-impl GroupedData<'_> {
+impl<'a> GroupedData<'a> {
     fn len(&self) -> usize {
         self.keys.len()
     }
@@ -499,25 +626,33 @@ impl GroupedData<'_> {
     fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
         selected
             .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
+            .map(|group| self.project_group(*group, items))
+            .collect()
+    }
+
+    fn project_group(&self, group: usize, items: &[ResolvedItem]) -> Vec<Value> {
+        items
+            .iter()
+            .map(|item| match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => self.keys[group].value(*position).to_owned(),
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => self.aggregates[*state][group].clone(),
             })
             .collect()
+    }
+
+    fn append(&mut self, mut other: GroupedData<'a>) {
+        self.keys.append(&mut other.keys);
+        debug_assert_eq!(self.aggregates.len(), other.aggregates.len());
+        for (target, mut values) in self.aggregates.iter_mut().zip(other.aggregates) {
+            target.append(&mut values);
+        }
     }
 }
 
@@ -526,8 +661,8 @@ enum AggregateState {
     Count(i64),
     SumInt(i64),
     SumFloat(f64),
-    Min(Option<Value>),
-    Max(Option<Value>),
+    Min(Option<usize>),
+    Max(Option<usize>),
     AvgInt { sum: i128, count: u64 },
     AvgFloat { sum: f64, count: u64 },
 }
@@ -577,21 +712,15 @@ impl AggregateState {
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
                 let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate < existing.as_ref())
-                {
-                    *current = Some(candidate.to_owned());
+                if current.is_none_or(|existing| candidate < column.value_ref(existing)) {
+                    *current = Some(row);
                 }
             }
             Self::Max(current) => {
                 let column = &table.columns()[spec.argument.expect("MAX argument")];
                 let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate > existing.as_ref())
-                {
-                    *current = Some(candidate.to_owned());
+                if current.is_none_or(|existing| candidate > column.value_ref(existing)) {
+                    *current = Some(row);
                 }
             }
             Self::AvgInt { sum, count } => {
@@ -624,11 +753,13 @@ impl AggregateState {
         Ok(())
     }
 
-    fn finish(self) -> Result<Value> {
+    fn finish(self, spec: &AggregateSpec, table: &Table) -> Result<Value> {
         match self {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
-            Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
+            Self::Min(Some(row)) | Self::Max(Some(row)) => {
+                Ok(table.columns()[spec.argument.expect("MIN/MAX argument")].value(row))
+            }
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
@@ -765,6 +896,157 @@ fn sort_and_limit(
         indices.truncate(limit);
     }
     indices.sort_unstable_by(|left, right| compare(*left, *right));
+}
+
+#[derive(Debug)]
+struct GroupCandidate {
+    key: Vec<Value>,
+    row: Vec<Value>,
+}
+
+fn compare_candidates(
+    left: &GroupCandidate,
+    right: &GroupCandidate,
+    ordering: &[ResolvedOrder],
+) -> Ordering {
+    for order in ordering {
+        let comparison = left.row[order.output].cmp(&right.row[order.output]);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    left.key.cmp(&right.key)
+}
+
+fn push_top_candidate(
+    heap: &mut Vec<GroupCandidate>,
+    candidate: GroupCandidate,
+    limit: usize,
+    ordering: &[ResolvedOrder],
+) {
+    if limit == 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(candidate);
+        let mut child = heap.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if compare_candidates(&heap[parent], &heap[child], ordering) != Ordering::Less {
+                break;
+            }
+            heap.swap(parent, child);
+            child = parent;
+        }
+        return;
+    }
+    if compare_candidates(&candidate, &heap[0], ordering) != Ordering::Less {
+        return;
+    }
+    heap[0] = candidate;
+    let mut parent = 0;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            break;
+        }
+        let right = left + 1;
+        let largest = if right < heap.len()
+            && compare_candidates(&heap[left], &heap[right], ordering) == Ordering::Less
+        {
+            right
+        } else {
+            left
+        };
+        if compare_candidates(&heap[parent], &heap[largest], ordering) != Ordering::Less {
+            break;
+        }
+        heap.swap(parent, largest);
+        parent = largest;
+    }
+}
+
+fn execute_spilled_grouped(
+    table: &Table,
+    matching_rows: &[usize],
+    request: &GroupingRequest<'_>,
+    max_groups: usize,
+    options: &DatabaseOptions,
+) -> Result<Vec<Vec<Value>>> {
+    debug_assert!(!request.group_columns.is_empty());
+    let mut workspace = TempWorkspace::new(
+        &options.temporary_directory,
+        options.temporary_directory_limit_bytes,
+    )?;
+    let result = (|| {
+        let initial =
+            write_initial_partitions(&mut workspace, table, matching_rows, request.group_columns)?;
+        let mut pending = VecDeque::from(initial);
+        let bounded_limit = request.limit.filter(|_| !request.ordering.is_empty());
+        let mut top = Vec::new();
+        let mut all = GroupedData {
+            keys: Vec::new(),
+            aggregates: request.aggregate_specs.iter().map(|_| Vec::new()).collect(),
+        };
+
+        while let Some(partition) = pending.pop_front() {
+            let row_count =
+                usize::try_from(partition.bytes / ROW_INDEX_BYTES).unwrap_or(usize::MAX);
+            let rows = PartitionRows::open(&partition.path)?;
+            match aggregate_rows(
+                table,
+                rows,
+                row_count,
+                request.group_columns,
+                request.aggregate_specs,
+                max_groups,
+            )? {
+                GroupAttempt::Complete(grouped) => {
+                    workspace.remove_partition(&partition)?;
+                    if let Some(limit) = bounded_limit {
+                        for group in 0..grouped.len() {
+                            let candidate = GroupCandidate {
+                                key: grouped.keys[group].to_owned_values(),
+                                row: grouped.project_group(group, request.items),
+                            };
+                            push_top_candidate(&mut top, candidate, limit, request.ordering);
+                        }
+                    } else {
+                        all.append(grouped);
+                    }
+                }
+                GroupAttempt::BudgetExceeded => {
+                    let children =
+                        repartition(&mut workspace, table, &partition, request.group_columns)?;
+                    pending.extend(children);
+                }
+            }
+        }
+
+        if bounded_limit.is_some() {
+            top.sort_unstable_by(|left, right| compare_candidates(left, right, request.ordering));
+            Ok(top.into_iter().map(|candidate| candidate.row).collect())
+        } else {
+            let mut selected_groups = (0..all.len()).collect::<Vec<_>>();
+            order_grouped_rows(
+                &mut selected_groups,
+                &all,
+                request.items,
+                request.ordering,
+                request.limit,
+            );
+            Ok(all.project(&selected_groups, request.items))
+        }
+    })();
+    let cleanup = workspace.cleanup();
+    match result {
+        Err(error) => Err(error),
+        Ok(rows) => cleanup.map(|()| rows),
+    }
 }
 
 #[derive(Debug)]

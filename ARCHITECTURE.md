@@ -13,3 +13,8 @@ RustHouse should evolve through narrow modules with explicit boundaries:
 The initial engine can be single-process and single-node. Public interfaces should leave room for immutable parts, parallel scans, compression, and a write-ahead log, but those are later experiments rather than premature abstractions.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.
+
+High-cardinality grouping keeps its in-memory path until a fixed group-state
+budget is reached. Spill I/O is isolated from aggregate semantics: it owns
+deterministic hash partitions of row indices, recursive repartitioning,
+temporary-space accounting, and cleanup.

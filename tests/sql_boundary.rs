@@ -1,4 +1,53 @@
-use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rusthouse::{DataType, Database, DatabaseOptions, Error, QueryResult, StatementResult, Value};
+
+static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(label: &str) -> Self {
+        let id = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusthouse-test-{label}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir(&path).expect("create test temporary directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn assert_empty(&self) {
+        assert_eq!(
+            fs::read_dir(&self.0)
+                .expect("read test temporary directory")
+                .count(),
+            0,
+            "spill workspace was not cleaned"
+        );
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn spilling_database(directory: &TestDirectory, temporary_limit: u64) -> Database {
+    Database::with_options(DatabaseOptions {
+        group_memory_limit_bytes: 1,
+        temporary_directory: directory.path().to_owned(),
+        temporary_directory_limit_bytes: temporary_limit,
+    })
+}
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
     match results.into_iter().last().expect("statement result") {
@@ -523,4 +572,124 @@ fn creates_a_fifty_thousand_column_schema() {
             .len(),
         column_count
     );
+}
+
+#[test]
+fn forced_group_spills_match_in_memory_results_and_tie_breaking() {
+    let rows = (0..120)
+        .map(|index| {
+            let amount = i64::from(index % 11) - 5;
+            format!(
+                "('region{}', {}, {}, 'label{}')",
+                index % 40,
+                index % 3 == 0,
+                amount,
+                index % 17
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let setup = format!(
+        "CREATE TABLE spill_equivalence (
+            region String, active Bool, amount Int64, label String
+         );
+         INSERT INTO spill_equivalence VALUES {rows};"
+    );
+    let queries = [
+        "SELECT region, active, COUNT(*) AS rows, SUM(amount) AS total,
+                MIN(amount) AS low, MAX(amount) AS high, AVG(amount) AS mean,
+                MIN(label) AS first_label, MAX(label) AS last_label
+         FROM spill_equivalence
+         GROUP BY region, active
+         ORDER BY total DESC, rows DESC
+         LIMIT 17;",
+        "SELECT region, active, COUNT(*) AS rows
+         FROM spill_equivalence
+         GROUP BY region, active;",
+    ];
+
+    let mut in_memory = Database::new();
+    in_memory.execute(&setup).expect("in-memory setup");
+
+    let directory = TestDirectory::new("equivalence");
+    let mut spilled = spilling_database(&directory, 8 * 1024 * 1024);
+    spilled.execute(&setup).expect("spilled setup");
+
+    for sql in queries {
+        assert_eq!(
+            execute_query(&mut spilled, sql),
+            execute_query(&mut in_memory, sql)
+        );
+        directory.assert_empty();
+    }
+}
+
+#[test]
+fn recursively_repartitions_skewed_buckets_without_splitting_groups() {
+    let mut rows = (0..96).map(|key| format!("({key}, 1)")).collect::<Vec<_>>();
+    rows.extend(std::iter::repeat_n("(7, 2)".to_owned(), 300));
+    let directory = TestDirectory::new("skew");
+    let mut database = spilling_database(&directory, 16 * 1024 * 1024);
+    database
+        .execute(&format!(
+            "CREATE TABLE skewed (key Int64, amount Int64);
+             INSERT INTO skewed VALUES {};",
+            rows.join(",")
+        ))
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT key, COUNT(*) AS rows, SUM(amount) AS total
+         FROM skewed
+         GROUP BY key
+         ORDER BY total DESC, rows DESC
+         LIMIT 3;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(7), Value::Int64(301), Value::Int64(601)],
+            vec![Value::Int64(0), Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(1), Value::Int64(1), Value::Int64(1)],
+        ]
+    );
+    directory.assert_empty();
+}
+
+#[test]
+fn spill_errors_preserve_overflow_and_clean_every_temporary_file() {
+    let directory = TestDirectory::new("overflow");
+    let mut database = spilling_database(&directory, 1024 * 1024);
+    database
+        .execute(
+            "CREATE TABLE overflowing (key Int64, amount Int64);
+             INSERT INTO overflowing VALUES
+                (0, 9223372036854775807), (1, 0), (0, 1);",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute("SELECT key, SUM(amount) FROM overflowing GROUP BY key;")
+        .expect_err("sum overflows after the rows have spilled");
+    assert_eq!(error, Error::NumericOverflow("SUM(Int64)".to_owned()));
+    directory.assert_empty();
+}
+
+#[test]
+fn temporary_directory_limit_failures_clean_partial_partitions() {
+    let directory = TestDirectory::new("quota");
+    let mut database = spilling_database(&directory, 8);
+    database
+        .execute(
+            "CREATE TABLE quota (key Int64);
+             INSERT INTO quota VALUES (1), (2), (3);",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute("SELECT key, COUNT(*) FROM quota GROUP BY key;")
+        .expect_err("three row indices exceed the spill budget");
+    assert_eq!(error, Error::TemporaryStorageLimit { limit_bytes: 8 });
+    directory.assert_empty();
 }

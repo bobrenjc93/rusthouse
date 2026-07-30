@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -153,4 +154,42 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         );
         assert!(!stderr.contains("stack overflow"));
     }
+}
+
+#[test]
+fn group_spill_limits_and_directory_work_end_to_end() {
+    let temporary_directory =
+        std::env::temp_dir().join(format!("rusthouse-cli-spill-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temporary_directory);
+    fs::create_dir(&temporary_directory).expect("create CLI spill directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=csv",
+            "--group-memory-limit=1",
+            "--temporary-directory",
+            temporary_directory.to_str().expect("UTF-8 temporary path"),
+            "--temporary-directory-limit=1MiB",
+            "--execute",
+            "CREATE TABLE grouped (key Int64, amount Int64);
+             INSERT INTO grouped VALUES
+                (1, 2), (2, 2), (3, 1), (4, 1), (5, 1);
+             SELECT key, SUM(amount) AS total
+             FROM grouped GROUP BY key ORDER BY total DESC LIMIT 2;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "key,total\n1,2\n2,2\n"
+    );
+    assert_eq!(
+        fs::read_dir(&temporary_directory)
+            .expect("read CLI spill directory")
+            .count(),
+        0
+    );
+    fs::remove_dir(&temporary_directory).expect("remove empty CLI spill directory");
 }

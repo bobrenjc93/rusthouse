@@ -30,6 +30,13 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    TemporaryStorageLimit {
+        limit_bytes: u64,
+    },
+    Io {
+        context: String,
+        message: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +80,11 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::TemporaryStorageLimit { limit_bytes } => write!(
+                f,
+                "temporary storage limit of {limit_bytes} bytes exceeded while spilling groups"
+            ),
+            Self::Io { context, message } => write!(f, "{context}: {message}"),
         }
     }
 }
