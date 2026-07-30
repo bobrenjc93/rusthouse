@@ -336,20 +336,23 @@ fn global_statistical_aggregates_support_int64_and_float64() {
             .iter()
             .all(|column| column.data_type == DataType::Float64)
     );
-    let sample_variance = 32.0 / 7.0;
-    assert_eq!(
-        result.rows,
-        vec![vec![
-            Value::Float64(4.0),
-            Value::Float64(sample_variance),
-            Value::Float64(2.0),
-            Value::Float64(sample_variance.sqrt()),
-            Value::Float64(4.0),
-            Value::Float64(sample_variance),
-            Value::Float64(2.0),
-            Value::Float64(sample_variance.sqrt()),
-        ]]
-    );
+    let sample_variance: f64 = 32.0 / 7.0;
+    let expected = [
+        4.0,
+        sample_variance,
+        2.0,
+        sample_variance.sqrt(),
+        4.0,
+        sample_variance,
+        2.0,
+        sample_variance.sqrt(),
+    ];
+    for (actual, expected) in result.rows[0].iter().zip(expected) {
+        let Value::Float64(actual) = actual else {
+            panic!("statistical aggregate must return Float64");
+        };
+        assert!((actual - expected).abs() <= expected * 2e-15);
+    }
 }
 
 #[test]
@@ -382,6 +385,56 @@ fn statistical_aggregates_preserve_small_spreads_at_large_magnitudes() {
             Value::Float64(1.0),
         ]]
     );
+}
+
+#[test]
+fn statistical_aggregates_scale_extreme_second_moments() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE extreme_statistics (kind String, value Float64);
+             INSERT INTO extreme_statistics VALUES
+                ('large', 0.0), ('large', 0.0), ('large', 2e154),
+                ('small', 0.0), ('small', 2e-200);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT kind, VAR_POP(value), VAR_SAMP(value),
+                STDDEV_POP(value), STDDEV_SAMP(value)
+         FROM extreme_statistics
+         GROUP BY kind
+         ORDER BY kind;",
+    );
+
+    let large = 2e154;
+    let expected = [
+        [
+            large * (large * (2.0 / 9.0)),
+            large * (large / 3.0),
+            large * 2.0_f64.sqrt() / 3.0,
+            large / 3.0_f64.sqrt(),
+        ],
+        [0.0, 0.0, 1e-200, 2e-200 / 2.0_f64.sqrt()],
+    ];
+
+    for (row, expected_values) in result.rows.iter().zip(expected) {
+        for (actual, expected) in row[1..].iter().zip(expected_values) {
+            let Value::Float64(actual) = actual else {
+                panic!("statistical aggregate must return Float64");
+            };
+            let scale = actual.abs().max(expected.abs());
+            assert!(
+                (*actual - expected).abs() <= scale * 2e-15,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+    assert_eq!(result.rows[0][0], Value::String("large".to_owned()));
+    assert_eq!(result.rows[1][0], Value::String("small".to_owned()));
+    assert_ne!(result.rows[1][3], Value::Float64(0.0));
+    assert_ne!(result.rows[1][4], Value::Float64(0.0));
 }
 
 #[test]
@@ -507,11 +560,23 @@ fn statistical_aggregates_reject_insufficient_input_and_non_finite_results() {
     database
         .execute("INSERT INTO samples VALUES (1e308), (-1e308);")
         .expect("finite inputs are accepted");
-    for function in ["VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"] {
+    for function in ["VAR_POP", "VAR_SAMP"] {
         assert!(matches!(
             database.execute(&format!("SELECT {function}(value) FROM samples;")),
             Err(Error::NumericOverflow(operation)) if operation.contains(function)
         ));
+    }
+    let deviations = execute_query(
+        &mut database,
+        "SELECT STDDEV_POP(value), STDDEV_SAMP(value) FROM samples;",
+    );
+    let expected = [1e308 * (2.0_f64 / 3.0).sqrt(), 1e308];
+    for (actual, expected) in deviations.rows[0].iter().zip(expected) {
+        let Value::Float64(actual) = actual else {
+            panic!("standard deviation must return Float64");
+        };
+        assert!(actual.is_finite());
+        assert!((*actual - expected).abs() <= expected * 2e-15);
     }
 }
 

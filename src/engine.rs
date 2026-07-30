@@ -693,8 +693,9 @@ enum MomentOrigin {
 struct CentralMoments {
     origin: Option<MomentOrigin>,
     count: u64,
-    mean: f64,
-    m2: f64,
+    mean_scale: f64,
+    scaled_mean: f64,
+    m2: ScaledSumSquares,
 }
 
 impl CentralMoments {
@@ -703,8 +704,9 @@ impl CentralMoments {
         Self {
             origin: None,
             count: 0,
-            mean: 0.0,
-            m2: 0.0,
+            mean_scale: 0.0,
+            scaled_mean: 0.0,
+            m2: ScaledSumSquares::default(),
         }
     }
 
@@ -717,36 +719,65 @@ impl CentralMoments {
             Some(MomentOrigin::Int64(origin)) => (i128::from(value) - i128::from(origin)) as f64,
             Some(MomentOrigin::Float64(_)) => unreachable!("aggregate input type is stable"),
         };
-        self.update_centered(centered, function)
+        let (scale, scaled_value) = scale_value(centered);
+        self.update_scaled(scale, scaled_value, function)
     }
 
     fn update_float(&mut self, value: f64, function: AggregateFunction) -> Result<()> {
-        let centered = match self.origin {
+        let (scale, scaled_value) = match self.origin {
             None => {
                 self.origin = Some(MomentOrigin::Float64(value));
-                0.0
+                (0.0, 0.0)
             }
-            Some(MomentOrigin::Float64(origin)) => value - origin,
+            Some(MomentOrigin::Float64(origin)) => {
+                let centered = value - origin;
+                if centered.is_finite() {
+                    scale_value(centered)
+                } else {
+                    let scale = value.abs().max(origin.abs());
+                    (scale, value / scale - origin / scale)
+                }
+            }
             Some(MomentOrigin::Int64(_)) => unreachable!("aggregate input type is stable"),
         };
-        self.update_centered(centered, function)
+        self.update_scaled(scale, scaled_value, function)
     }
 
-    fn update_centered(&mut self, value: f64, function: AggregateFunction) -> Result<()> {
+    fn update_scaled(
+        &mut self,
+        value_scale: f64,
+        scaled_value: f64,
+        function: AggregateFunction,
+    ) -> Result<()> {
         let operation = || format!("{} accumulation", function.name());
         let count = self
             .count
             .checked_add(1)
             .ok_or_else(|| Error::NumericOverflow(operation()))?;
-        let delta = value - self.mean;
-        let mean = self.mean + delta / count as f64;
-        let m2 = self.m2 + delta * (value - mean);
-        if !value.is_finite() || !mean.is_finite() || !m2.is_finite() {
+        let scale = self.mean_scale.max(value_scale);
+        let (mean, value) = if scale == 0.0 {
+            (0.0, 0.0)
+        } else {
+            (
+                self.scaled_mean * (self.mean_scale / scale),
+                scaled_value * (value_scale / scale),
+            )
+        };
+        let delta = value - mean;
+        let mean = mean + delta / count as f64;
+        let residual = value - mean;
+        if !scale.is_finite()
+            || !scaled_value.is_finite()
+            || !mean.is_finite()
+            || !residual.is_finite()
+        {
             return Err(Error::NumericOverflow(operation()));
         }
+        self.m2
+            .add_scaled_product(scale, delta, residual, function)?;
         self.count = count;
-        self.mean = mean;
-        self.m2 = m2;
+        self.mean_scale = scale;
+        self.scaled_mean = mean;
         Ok(())
     }
 
@@ -773,14 +804,13 @@ impl CentralMoments {
         } else {
             self.count as f64
         };
-        let variance = self.m2 / divisor;
         let result = if matches!(
             function,
             AggregateFunction::StddevPop | AggregateFunction::StddevSamp
         ) {
-            variance.sqrt()
+            self.m2.standard_deviation(divisor)
         } else {
-            variance
+            self.m2.variance(divisor)
         };
         if !result.is_finite() {
             return Err(Error::NumericOverflow(format!(
@@ -789,6 +819,82 @@ impl CentralMoments {
             )));
         }
         Ok(Value::Float64(result))
+    }
+}
+
+fn scale_value(value: f64) -> (f64, f64) {
+    if value == 0.0 {
+        (0.0, 0.0)
+    } else {
+        (value.abs(), value.signum())
+    }
+}
+
+/// A non-negative sum represented as `scale^2 * scaled_sum`.
+///
+/// This is the same scaling strategy used by stable sum-of-squares routines:
+/// it retains Welford's M2 contributions without ever forming their products.
+#[derive(Debug, Default)]
+struct ScaledSumSquares {
+    scale: f64,
+    scaled_sum: f64,
+}
+
+impl ScaledSumSquares {
+    fn add_scaled_product(
+        &mut self,
+        scale: f64,
+        left: f64,
+        right: f64,
+        function: AggregateFunction,
+    ) -> Result<()> {
+        if left.is_sign_negative() != right.is_sign_negative() && left != 0.0 && right != 0.0 {
+            return Err(Error::NumericOverflow(format!(
+                "{} accumulation",
+                function.name()
+            )));
+        }
+
+        if scale == 0.0 || left == 0.0 || right == 0.0 {
+            return Ok(());
+        }
+        let scaled_contribution = left.abs() * right.abs();
+        if !scaled_contribution.is_finite() {
+            return Err(Error::NumericOverflow(format!(
+                "{} accumulation",
+                function.name()
+            )));
+        }
+
+        if self.scale < scale {
+            let ratio = self.scale / scale;
+            self.scaled_sum = scaled_contribution + self.scaled_sum * ratio * ratio;
+            self.scale = scale;
+        } else {
+            let ratio = scale / self.scale;
+            self.scaled_sum += scaled_contribution * ratio * ratio;
+        }
+        if !self.scaled_sum.is_finite() {
+            return Err(Error::NumericOverflow(format!(
+                "{} accumulation",
+                function.name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn variance(&self, divisor: f64) -> f64 {
+        let scaled_variance = self.scaled_sum / divisor;
+        if scaled_variance <= 1.0 {
+            self.scale * (self.scale * scaled_variance)
+        } else {
+            let adjusted_scale = self.scale * scaled_variance.sqrt();
+            adjusted_scale * adjusted_scale
+        }
+    }
+
+    fn standard_deviation(&self, divisor: f64) -> f64 {
+        self.scale * (self.scaled_sum / divisor).sqrt()
     }
 }
 
