@@ -196,6 +196,21 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Append an already validated table with the same schema.
+    pub(crate) fn append(&mut self, mut other: Self) {
+        debug_assert_eq!(self.schema, other.schema);
+        for (target, source) in self.columns.iter_mut().zip(&mut other.columns) {
+            match (target, source) {
+                (Column::Int64(target), Column::Int64(source)) => target.append(source),
+                (Column::Float64(target), Column::Float64(source)) => target.append(source),
+                (Column::Bool(target), Column::Bool(source)) => target.append(source),
+                (Column::String(target), Column::String(source)) => target.append(source),
+                _ => unreachable!("matching schemas have matching physical columns"),
+            }
+        }
+        self.row_count += other.row_count;
+    }
 }
 
 #[cfg(test)]

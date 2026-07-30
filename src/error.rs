@@ -30,6 +30,15 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    Io {
+        context: String,
+        message: String,
+    },
+    JsonEachRow {
+        path: String,
+        record: usize,
+        message: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +82,15 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::Io { context, message } => write!(f, "{context}: {message}"),
+            Self::JsonEachRow {
+                path,
+                record,
+                message,
+            } => write!(
+                f,
+                "JSONEachRow error in '{path}' at record {record}: {message}"
+            ),
         }
     }
 }

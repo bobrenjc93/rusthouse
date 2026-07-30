@@ -3,9 +3,10 @@ use std::collections::HashMap;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
+use crate::json_each_row;
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, CopyFormat, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -83,6 +84,22 @@ impl Database {
                 }
                 Ok(StatementResult::Command {
                     tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::Copy {
+                table,
+                path,
+                format: CopyFormat::JsonEachRow,
+            } => {
+                let staged = {
+                    let target = self.catalog.table(&table)?;
+                    json_each_row::read_file(&path, target.name(), target.schema())?
+                };
+                let affected_rows = staged.row_count();
+                self.catalog.table_mut(&table)?.append(staged);
+                Ok(StatementResult::Command {
+                    tag: "COPY",
                     affected_rows,
                 })
             }

@@ -1,8 +1,8 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use rusthouse::format::{OutputFormat, render};
+use rusthouse::format::{OutputFormat, write as write_result};
 use rusthouse::{Database, QueryResult, StatementResult};
 
 const HELP: &str = "\
@@ -13,12 +13,13 @@ USAGE:
 
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
-    -f, --format <FORMAT>     Output format: table (default), csv, or json
+    -f, --format <FORMAT>     Output format: table, csv, json, or JSONEachRow
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
 Command acknowledgements are written to stderr; query data is written to stdout.
 JSON output is an object containing a results array, one entry per SELECT.
+JSONEachRow output writes one object per result row.
 ";
 
 fn main() -> ExitCode {
@@ -53,7 +54,7 @@ fn run() -> Result<(), String> {
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
+                if matches!(tag, "INSERT" | "COPY") {
                     eprintln!("{tag} {affected_rows}");
                 } else {
                     eprintln!("{tag}");
@@ -62,32 +63,38 @@ fn run() -> Result<(), String> {
             StatementResult::Query(result) => queries.push(result),
         }
     }
-    print!("{}", render_query_results(&queries, config.format));
+    let stdout = io::stdout();
+    write_query_results(&queries, config.format, &mut stdout.lock())
+        .map_err(|error| format!("could not write query output: {error}"))?;
     Ok(())
 }
 
-fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {
+fn write_query_results<W: Write>(
+    results: &[QueryResult],
+    format: OutputFormat,
+    writer: &mut W,
+) -> io::Result<()> {
     if format == OutputFormat::Json {
-        let rendered = results
-            .iter()
-            .map(|result| render(result, format))
-            .collect::<Vec<_>>()
-            .join(",");
-        return format!("{{\"results\":[{rendered}]}}\n");
+        writer.write_all(b"{\"results\":[")?;
+        for (index, result) in results.iter().enumerate() {
+            if index > 0 {
+                writer.write_all(b",")?;
+            }
+            write_result(result, format, writer)?;
+        }
+        return writer.write_all(b"]}\n");
     }
 
-    let mut output = String::new();
     for (index, result) in results.iter().enumerate() {
-        if index > 0 {
-            output.push('\n');
+        if index > 0 && format != OutputFormat::JsonEachRow {
+            writer.write_all(b"\n")?;
         }
-        let rendered = render(result, format);
-        output.push_str(&rendered);
-        if !rendered.ends_with('\n') {
-            output.push('\n');
+        write_result(result, format, writer)?;
+        if format == OutputFormat::Table {
+            writer.write_all(b"\n")?;
         }
     }
-    output
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -119,7 +126,9 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     .next()
                     .ok_or_else(|| format!("{argument} requires a format"))?;
                 format = OutputFormat::parse(&value).ok_or_else(|| {
-                    format!("unknown output format '{value}'; expected table, csv, or json")
+                    format!(
+                        "unknown output format '{value}'; expected table, csv, json, or JSONEachRow"
+                    )
                 })?;
             }
             _ if argument.starts_with("--execute=") => {
@@ -131,7 +140,9 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
             _ if argument.starts_with("--format=") => {
                 let value = &argument["--format=".len()..];
                 format = OutputFormat::parse(value).ok_or_else(|| {
-                    format!("unknown output format '{value}'; expected table, csv, or json")
+                    format!(
+                        "unknown output format '{value}'; expected table, csv, json, or JSONEachRow"
+                    )
                 })?;
             }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
@@ -163,7 +174,7 @@ mod tests {
     fn rejects_unknown_formats() {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
-        assert!(error.contains("table, csv, or json"));
+        assert!(error.contains("table, csv, json, or JSONEachRow"));
     }
 
     #[test]
@@ -177,7 +188,12 @@ mod tests {
         };
 
         assert_eq!(
-            render_query_results(&[result.clone(), result], OutputFormat::Json),
+            {
+                let mut output = Vec::new();
+                write_query_results(&[result.clone(), result], OutputFormat::Json, &mut output)
+                    .expect("write results");
+                String::from_utf8(output).expect("UTF-8")
+            },
             "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
         );
     }

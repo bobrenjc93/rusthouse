@@ -1,4 +1,5 @@
-use std::fmt::Write;
+use std::fmt::Write as FmtWrite;
+use std::io::{self, Write as IoWrite};
 
 use crate::engine::QueryResult;
 use crate::value::Value;
@@ -8,6 +9,7 @@ pub enum OutputFormat {
     Table,
     Csv,
     Json,
+    JsonEachRow,
 }
 
 impl OutputFormat {
@@ -17,6 +19,7 @@ impl OutputFormat {
             "table" => Some(Self::Table),
             "csv" => Some(Self::Csv),
             "json" => Some(Self::Json),
+            "jsoneachrow" => Some(Self::JsonEachRow),
             _ => None,
         }
     }
@@ -28,7 +31,29 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
         OutputFormat::Table => render_table(result),
         OutputFormat::Csv => render_csv(result),
         OutputFormat::Json => render_json(result),
+        OutputFormat::JsonEachRow => render_json_each_row(result),
     }
+}
+
+/// Write a result in the selected format.
+///
+/// JSONEachRow is emitted one record at a time, so serialized output is not
+/// accumulated into a second result-sized allocation.
+pub fn write<W: IoWrite>(
+    result: &QueryResult,
+    format: OutputFormat,
+    writer: &mut W,
+) -> io::Result<()> {
+    if format != OutputFormat::JsonEachRow {
+        return writer.write_all(render(result, format).as_bytes());
+    }
+
+    for row in &result.rows {
+        let record = render_json_each_row_record(result, row);
+        writer.write_all(record.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn render_table(result: &QueryResult) -> String {
@@ -178,6 +203,28 @@ fn render_json(result: &QueryResult) -> String {
     output
 }
 
+fn render_json_each_row(result: &QueryResult) -> String {
+    let mut output = Vec::new();
+    write(result, OutputFormat::JsonEachRow, &mut output)
+        .expect("writing JSONEachRow to a Vec cannot fail");
+    String::from_utf8(output).expect("JSON output is UTF-8")
+}
+
+fn render_json_each_row_record(result: &QueryResult, row: &[Value]) -> String {
+    debug_assert_eq!(result.columns.len(), row.len());
+    let mut output = String::from("{");
+    for (index, (column, value)) in result.columns.iter().zip(row).enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write_json_string(&mut output, &column.name);
+        output.push(':');
+        write_json_value(&mut output, value);
+    }
+    output.push('}');
+    output
+}
+
 fn write_json_value(output: &mut String, value: &Value) {
     match value {
         Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
@@ -245,6 +292,14 @@ mod tests {
         assert_eq!(
             render(&result(), OutputFormat::Json),
             r#"{"columns":[{"name":"id","type":"Int64"},{"name":"note","type":"String"}],"rows":[[1,"quote: \", comma"]]}"#
+        );
+    }
+
+    #[test]
+    fn renders_json_each_row_as_independent_objects() {
+        assert_eq!(
+            render(&result(), OutputFormat::JsonEachRow),
+            "{\"id\":1,\"note\":\"quote: \\\", comma\"}\n"
         );
     }
 

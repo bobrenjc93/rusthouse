@@ -12,7 +12,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
-- table, CSV, and JSON output from the CLI
+- table, CSV, JSON, and streaming JSONEachRow output from the CLI
+- atomic `COPY table FROM 'path' FORMAT JSONEachRow` bulk imports
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
@@ -37,7 +38,7 @@ cargo run -- --execute "
 "
 ~~~
 
-Choose table (the default), csv, or json:
+Choose table (the default), csv, json, or JSONEachRow:
 
 ~~~bash
 cargo run -- --format json --execute \
@@ -56,6 +57,7 @@ printf '%s\n' \
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
+JSONEachRow writes each query row immediately as an independent JSON object. `COPY` accepts one object per line, matches fields case-insensitively in any order, applies the type default to omitted fields, and rejects duplicate fields, unknown fields, explicit `null`, malformed JSON, and type mismatches. An import is appended only after every record succeeds.
 
 ## Library API
 

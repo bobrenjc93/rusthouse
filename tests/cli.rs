@@ -95,6 +95,27 @@ fn stdin_and_csv_output_work_together() {
 }
 
 #[test]
+fn json_each_row_output_is_one_object_per_query_row() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=JSONEachRow",
+            "--execute",
+            "CREATE TABLE items (id Int64, note String);
+             INSERT INTO items VALUES (2, 'line
+break'), (1, 'quote: \"');
+             SELECT id, note FROM items ORDER BY id;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"id\":1,\"note\":\"quote: \\\"\"}\n{\"id\":2,\"note\":\"line\\nbreak\"}\n"
+    );
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod format;
+mod json_each_row;
 pub mod sql;
 pub mod storage;
 pub mod value;
