@@ -158,45 +158,69 @@ fn run_bounded_with_limits(
         limits.stderr_bytes.min(DIAGNOSTIC_BYTES),
     );
 
-    let mut timed_out = false;
-    let mut wait_error = None;
-    let status = loop {
-        if stdout_reader.monitor.exceeded_limit.load(Ordering::Acquire)
-            || stderr_reader.monitor.exceeded_limit.load(Ordering::Acquire)
-            || stdout_reader.monitor.read_failed.load(Ordering::Acquire)
+    let mut status = None;
+    loop {
+        if stdout_reader.monitor.exceeded_limit.load(Ordering::Acquire) {
+            terminate_and_reap(&mut child, &mut status);
+            return Err(stream_limit_error(
+                label,
+                phase,
+                "stdout",
+                limits.stdout_bytes,
+                stdout_retained,
+            ));
+        }
+        if stderr_reader.monitor.exceeded_limit.load(Ordering::Acquire) {
+            terminate_and_reap(&mut child, &mut status);
+            return Err(stream_limit_error(
+                label,
+                phase,
+                "stderr",
+                limits.stderr_bytes,
+                limits.stderr_bytes.min(DIAGNOSTIC_BYTES),
+            ));
+        }
+        if stdout_reader.monitor.read_failed.load(Ordering::Acquire)
             || stderr_reader.monitor.read_failed.load(Ordering::Acquire)
         {
-            break None;
+            terminate_and_reap(&mut child, &mut status);
+            return Err(format!(
+                "could not drain bounded output from {label}; process was killed"
+            ));
         }
 
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() >= limits.deadline => {
-                timed_out = true;
-                break None;
-            }
-            Ok(None) => thread::sleep(CHILD_POLL_INTERVAL),
-            Err(error) => {
-                wait_error = Some(error);
-                break None;
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(child_status)) => status = Some(child_status),
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_and_reap(&mut child, &mut status);
+                    return Err(format!("could not wait for {label}: {error}"));
+                }
             }
         }
-    };
 
-    let status = match status {
-        Some(status) => status,
-        None => {
-            terminate_child(&mut child);
-            child
-                .wait()
-                .map_err(|error| format!("could not reap {label} after termination: {error}"))?
+        if status.is_some() && io_threads_finished(writer.as_ref(), &stdout_reader, &stderr_reader)
+        {
+            break;
         }
-    };
-    let elapsed = started.elapsed();
+        if started.elapsed() >= limits.deadline {
+            terminate_and_reap(&mut child, &mut status);
+            return Err(format!(
+                "{label} {} timed out after {} ms and was killed",
+                phase.name(),
+                limits.deadline.as_millis()
+            ));
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    }
+
+    let status = status.expect("completed child has an exit status");
 
     let writer_error = join_writer(writer, label)?;
     let stdout = join_reader(stdout_reader, "stdout", label)?;
     let stderr = join_reader(stderr_reader, "stderr", label)?;
+    let elapsed = started.elapsed();
 
     if stdout.total_bytes > limits.stdout_bytes {
         return Err(stream_limit_error(
@@ -216,16 +240,6 @@ fn run_bounded_with_limits(
             stderr.prefix.len(),
         ));
     }
-    if timed_out {
-        return Err(format!(
-            "{label} {} timed out after {} ms and was killed",
-            phase.name(),
-            limits.deadline.as_millis()
-        ));
-    }
-    if let Some(error) = wait_error {
-        return Err(format!("could not wait for {label}: {error}"));
-    }
     if status.success()
         && let Some(error) = writer_error
     {
@@ -238,6 +252,23 @@ fn run_bounded_with_limits(
         stderr,
         elapsed,
     })
+}
+
+fn io_threads_finished(
+    writer: Option<&thread::JoinHandle<io::Result<()>>>,
+    stdout_reader: &ReaderThread,
+    stderr_reader: &ReaderThread,
+) -> bool {
+    writer.is_none_or(thread::JoinHandle::is_finished)
+        && stdout_reader.handle.is_finished()
+        && stderr_reader.handle.is_finished()
+}
+
+fn terminate_and_reap(child: &mut Child, status: &mut Option<ExitStatus>) {
+    terminate_child(child);
+    if status.is_none() {
+        *status = child.wait().ok();
+    }
 }
 
 #[cfg(unix)]
@@ -421,6 +452,49 @@ mod tests {
             assert_eq!(
                 error,
                 "fake hang validation timed out after 100 ms and was killed"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn parent_exit_does_not_stop_supervision_of_inherited_pipes() {
+            let executable = FakeExecutable::new("sleep 30 & exit 0");
+            let started = Instant::now();
+            let error = run_bounded_with_limits(
+                executable.command(),
+                None,
+                ExecutionPhase::Validation,
+                limits(Duration::from_millis(100), 1024, 1024),
+                true,
+                "fake exited parent",
+            )
+            .expect_err("inherited pipes must remain under the deadline");
+
+            assert_eq!(
+                error,
+                "fake exited parent validation timed out after 100 ms and was killed"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn parent_exit_does_not_stop_supervision_of_background_output() {
+            let executable =
+                FakeExecutable::new("(while :; do printf '0123456789abcdef'; done) & exit 0");
+            let started = Instant::now();
+            let error = run_bounded_with_limits(
+                executable.command(),
+                None,
+                ExecutionPhase::Correctness,
+                limits(Duration::from_secs(2), 1024, 1024),
+                true,
+                "fake exited flood parent",
+            )
+            .expect_err("background output must remain under its cap");
+
+            assert_eq!(
+                error,
+                "fake exited flood parent correctness stdout exceeded the 1024-byte limit; output was truncated to the first 1024 bytes and the process result was rejected"
             );
             assert!(started.elapsed() < Duration::from_secs(2));
         }
