@@ -591,6 +591,32 @@ fn inner_join_rejects_ambiguous_unqualified_columns() {
 }
 
 #[test]
+fn boolean_table_aliases_remain_qualified_references_in_where() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE alias_left (id Int64);
+             CREATE TABLE alias_right (left_id Int64, enabled Bool);
+             INSERT INTO alias_left VALUES (1), (2);
+             INSERT INTO alias_right VALUES (1, true), (2, false);",
+        )
+        .expect("setup succeeds");
+
+    for alias in ["true", "false"] {
+        let result = execute_query(
+            &mut database,
+            &format!(
+                "SELECT {alias}.id
+                 FROM alias_left AS {alias}
+                 INNER JOIN alias_right AS x ON {alias}.id = x.left_id
+                 WHERE {alias}.id = 1 AND x.enabled = true;"
+            ),
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
+    }
+}
+
+#[test]
 fn inner_join_rejects_mismatched_keys_and_same_side_equalities() {
     let mut database = Database::new();
     database

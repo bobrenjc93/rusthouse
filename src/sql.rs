@@ -713,7 +713,8 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if (value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE"))
+                    && !self.next_is(&TokenKind::Dot) =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -788,6 +789,12 @@ impl Parser {
 
     fn at_keyword(&self, expected: &str) -> bool {
         matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+    }
+
+    fn next_is(&self, expected: &TokenKind) -> bool {
+        self.tokens
+            .get(self.current + 1)
+            .is_some_and(|token| &token.kind == expected)
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
