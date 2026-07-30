@@ -502,6 +502,26 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
+fn index_keyword_remains_a_valid_column_name() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_column (index Int64, label String);
+             INSERT INTO keyword_column VALUES (7, 'kept');",
+        )
+        .expect("INDEX is not a reserved column name");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT index, label FROM keyword_column WHERE index = 7",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(7), Value::String("kept".to_owned()),]]
+    );
+}
+
+#[test]
 fn creates_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)

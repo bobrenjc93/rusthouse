@@ -413,7 +413,8 @@ impl Parser {
         let mut columns = Vec::new();
         let mut indexes = Vec::new();
         loop {
-            if self.eat_keyword("INDEX") {
+            if self.inline_index_definition_ahead() {
+                self.expect_keyword("INDEX")?;
                 indexes.push(self.parse_inline_bloom_index()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -816,6 +817,38 @@ impl Parser {
         } else {
             self.error(format!("expected keyword {expected}"))
         }
+    }
+
+    fn inline_index_definition_ahead(&self) -> bool {
+        if !matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("INDEX"))
+        {
+            return false;
+        }
+
+        let token = |offset: usize| -> Option<&TokenKind> {
+            self.tokens
+                .get(self.current + offset)
+                .map(|token| &token.kind)
+        };
+        let bare_column = matches!(
+            (token(1), token(2), token(3)),
+            (
+                Some(TokenKind::Identifier(_)),
+                Some(TokenKind::Identifier(_)),
+                Some(TokenKind::Identifier(keyword))
+            ) if keyword.eq_ignore_ascii_case("TYPE")
+        );
+        let parenthesized_column = matches!(
+            (token(1), token(2), token(3), token(4), token(5)),
+            (
+                Some(TokenKind::Identifier(_)),
+                Some(TokenKind::LeftParen),
+                Some(TokenKind::Identifier(_)),
+                Some(TokenKind::RightParen),
+                Some(TokenKind::Identifier(keyword))
+            ) if keyword.eq_ignore_ascii_case("TYPE")
+        );
+        bare_column || parenthesized_column
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
