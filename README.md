@@ -6,6 +6,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- atomic, streaming `COPY table FROM 'file.csv' FORMAT CSV [HEADER]` ingestion
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -44,6 +45,18 @@ cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
 
+Load RFC 4180 CSV directly from a file, optionally matching a reordered header
+to table columns case-insensitively:
+
+~~~bash
+cargo run -- --execute \
+  "CREATE TABLE events (id Int64, label String); COPY events FROM 'events.csv' FORMAT CSV HEADER; SELECT * FROM events"
+~~~
+
+COPY streams bounded records into typed column batches. A malformed record,
+invalid value, size-limit violation, or file I/O failure restores the table to
+its row count before that COPY statement.
+
 Or pipe a batch through standard input:
 
 ~~~bash
@@ -61,7 +74,7 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 Database retains an in-memory catalog across calls and returns structured results:
 
-Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
+Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied. COPY is atomic within its own statement.
 
 ~~~rust
 use rusthouse::{Database, StatementResult};

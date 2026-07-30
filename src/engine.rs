@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs::File;
 
 use crate::catalog::Catalog;
+use crate::copy;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
@@ -83,6 +85,27 @@ impl Database {
                 }
                 Ok(StatementResult::Command {
                     tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::Copy {
+                table,
+                path,
+                header,
+            } => {
+                // Resolve the table before opening the file so missing-table errors
+                // remain deterministic and no input is consumed unnecessarily.
+                self.catalog.table(&table)?;
+                let file = File::open(&path).map_err(|error| Error::Copy {
+                    path: path.clone(),
+                    row: None,
+                    column: None,
+                    message: format!("could not open file: {error}"),
+                })?;
+                let affected_rows =
+                    copy::copy_csv(self.catalog.table_mut(&table)?, file, &path, header)?;
+                Ok(StatementResult::Command {
+                    tag: "COPY",
                     affected_rows,
                 })
             }

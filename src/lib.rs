@@ -4,6 +4,7 @@
 //! returns structured results that can be rendered by the format module.
 
 pub mod catalog;
+mod copy;
 pub mod engine;
 pub mod error;
 pub mod format;

@@ -28,6 +28,12 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    Copy {
+        path: String,
+        row: Option<usize>,
+        column: Option<String>,
+        message: String,
+    },
     InvalidQuery(String),
     NumericOverflow(String),
 }
@@ -69,6 +75,21 @@ impl fmt::Display for Error {
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
             ),
+            Self::Copy {
+                path,
+                row,
+                column,
+                message,
+            } => {
+                write!(f, "COPY from {path:?} failed")?;
+                if let Some(row) = row {
+                    write!(f, " at CSV row {row}")?;
+                }
+                if let Some(column) = column {
+                    write!(f, ", column {column:?}")?;
+                }
+                write!(f, ": {message}")
+            }
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
