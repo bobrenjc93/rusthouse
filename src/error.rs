@@ -30,6 +30,9 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    DatabaseLockPoisoned {
+        access: &'static str,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +75,9 @@ impl fmt::Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
+            }
+            Self::DatabaseLockPoisoned { access } => {
+                write!(f, "database {access} lock is poisoned")
             }
         }
     }

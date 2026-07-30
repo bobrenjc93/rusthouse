@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -14,6 +15,15 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+}
+
+/// A cloneable database handle that coordinates access across threads.
+///
+/// SELECT-only batches share a read lock. A batch containing CREATE TABLE or
+/// INSERT holds the write lock for the complete execution of the batch.
+#[derive(Debug, Clone, Default)]
+pub struct SharedDatabase {
+    database: Arc<RwLock<Database>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,15 +58,39 @@ impl Database {
         &self.catalog
     }
 
+    /// Convert this database into a cloneable, thread-safe handle.
+    #[must_use]
+    pub fn into_shared(self) -> SharedDatabase {
+        SharedDatabase::from(self)
+    }
+
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
+        self.execute_statements(sql::parse(sql)?)
+    }
+
+    fn execute_statements(&mut self, statements: Vec<Statement>) -> Result<Vec<StatementResult>> {
+        statements
             .into_iter()
             .map(|statement| self.execute_statement(statement))
+            .collect()
+    }
+
+    fn execute_selects(&self, statements: Vec<Statement>) -> Result<Vec<StatementResult>> {
+        statements
+            .into_iter()
+            .map(|statement| match statement {
+                Statement::Select(select) => {
+                    self.execute_select(select).map(StatementResult::Query)
+                }
+                Statement::CreateTable { .. } | Statement::Insert { .. } => {
+                    unreachable!("read-only batches contain only SELECT statements")
+                }
+            })
             .collect()
     }
 
@@ -132,6 +166,49 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+impl SharedDatabase {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Execute a parsed SQL batch under the lock required by the whole batch.
+    ///
+    /// Parsing happens before locking or execution. Earlier successful
+    /// mutations remain applied if a later statement fails, and the exclusive
+    /// lock prevents other sessions from observing the batch in between.
+    pub fn execute(&self, sql: &str) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        if statements.is_empty() {
+            return Ok(Vec::new());
+        }
+        if statements
+            .iter()
+            .all(|statement| matches!(statement, Statement::Select(_)))
+        {
+            let database = self
+                .database
+                .read()
+                .map_err(|_| Error::DatabaseLockPoisoned { access: "read" })?;
+            database.execute_selects(statements)
+        } else {
+            let mut database = self
+                .database
+                .write()
+                .map_err(|_| Error::DatabaseLockPoisoned { access: "write" })?;
+            database.execute_statements(statements)
+        }
+    }
+}
+
+impl From<Database> for SharedDatabase {
+    fn from(database: Database) -> Self {
+        Self {
+            database: Arc::new(RwLock::new(database)),
+        }
     }
 }
 
@@ -884,6 +961,10 @@ fn comparable(left: DataType, right: DataType) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
@@ -944,6 +1025,56 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn select_batches_share_the_database_read_lock() {
+        let database = SharedDatabase::new();
+        database
+            .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1);")
+            .expect("setup");
+
+        let existing_reader = database.database.read().expect("first read lock");
+        let session = database.clone();
+        let (completed, completion) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            completed
+                .send(session.execute("SELECT * FROM events; SELECT COUNT(*) FROM events;"))
+                .expect("send query result");
+        });
+
+        let results = completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("SELECT batch should not wait for another reader")
+            .expect("SELECT batch");
+        assert_eq!(results.len(), 2);
+        drop(existing_reader);
+        reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn poisoned_database_locks_return_structured_errors() {
+        let database = SharedDatabase::new();
+        let poisoner = database.clone();
+        thread::spawn(move || {
+            let _guard = poisoner.database.write().expect("write lock");
+            panic!("poison database lock for test");
+        })
+        .join()
+        .expect_err("poisoner thread should panic");
+
+        assert_eq!(
+            database
+                .execute("SELECT * FROM events")
+                .expect_err("read fails"),
+            Error::DatabaseLockPoisoned { access: "read" }
+        );
+        assert_eq!(
+            database
+                .execute("CREATE TABLE events (id Int64)")
+                .expect_err("write fails"),
+            Error::DatabaseLockPoisoned { access: "write" }
         );
     }
 }
