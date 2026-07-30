@@ -550,7 +550,14 @@ impl Parser {
 
     fn parse_alias(&mut self) -> Result<Option<String>> {
         if self.eat_keyword("AS") {
-            self.expect_identifier("alias").map(Some)
+            let alias = self.expect_identifier("alias")?;
+            if is_reserved_column_name(&alias) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: alias,
+                    context: "alias".to_owned(),
+                });
+            }
+            Ok(Some(alias))
         } else {
             Ok(None)
         }

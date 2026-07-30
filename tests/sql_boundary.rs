@@ -257,6 +257,31 @@ fn having_filters_multi_column_groups_before_ordering_and_limit() {
 }
 
 #[test]
+fn having_only_aggregate_allows_fully_grouped_wildcard_projection() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (category String, active Bool);
+             INSERT INTO events VALUES
+                ('west', true), ('west', true), ('east', false);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT *
+         FROM events
+         GROUP BY category, active
+         HAVING COUNT(*) > 1;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::String("west".to_owned()), Value::Bool(true)]]
+    );
+}
+
+#[test]
 fn having_rejects_invalid_and_ambiguous_references() {
     let mut database = Database::new();
     database
@@ -563,7 +588,7 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
+fn boolean_literals_cannot_be_ambiguous_column_names_or_aliases() {
     for identifier in ["true", "FALSE"] {
         let mut database = Database::new();
         let error = database
@@ -582,6 +607,25 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
         assert!(matches!(
             database.catalog().table("reserved_names"),
             Err(Error::TableNotFound(_))
+        ));
+
+        database
+            .execute("CREATE TABLE flags (active Bool);")
+            .expect("legal table name succeeds");
+        let error = database
+            .execute(&format!(
+                "SELECT active AS {identifier}, COUNT(*) AS rows
+                 FROM flags
+                 GROUP BY active
+                 HAVING {identifier} = false;"
+            ))
+            .expect_err("Boolean literal aliases are reserved");
+        assert!(matches!(
+            error,
+            Error::ReservedIdentifier {
+                identifier: rejected,
+                context,
+            } if rejected.eq_ignore_ascii_case(identifier) && context == "alias"
         ));
     }
 }

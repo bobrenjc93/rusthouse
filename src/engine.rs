@@ -107,17 +107,19 @@ impl Database {
             .collect::<Vec<_>>();
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let has_aggregate = select
+        let projected_has_aggregate = select
             .items
             .iter()
-            .any(|item| matches!(item, SelectItem::Aggregate { .. }))
-            || select
-                .having
-                .as_deref()
-                .is_some_and(predicate_has_aggregate);
-        let grouped = !group_columns.is_empty() || has_aggregate || select.having.is_some();
-        let (items, result_columns, mut aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns, grouped, has_aggregate)?;
+            .any(|item| matches!(item, SelectItem::Aggregate { .. }));
+        let grouped =
+            !group_columns.is_empty() || projected_has_aggregate || select.having.is_some();
+        let (items, result_columns, mut aggregate_specs) = resolve_select_items(
+            table,
+            &select.items,
+            &group_columns,
+            grouped,
+            projected_has_aggregate,
+        )?;
         let having = select
             .having
             .as_deref()
@@ -198,9 +200,9 @@ fn resolve_select_items(
     requested: &[SelectItem],
     group_columns: &[usize],
     grouped: bool,
-    has_aggregate: bool,
+    projected_has_aggregate: bool,
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
-    if has_aggregate
+    if projected_has_aggregate
         && requested
             .iter()
             .any(|item| matches!(item, SelectItem::Wildcard))
@@ -310,17 +312,6 @@ fn resolve_aggregate_spec(
         },
         argument_name,
     ))
-}
-
-fn predicate_has_aggregate(predicate: &Predicate) -> bool {
-    match predicate {
-        Predicate::Comparison { left, right, .. } => {
-            matches!(left, Operand::Aggregate { .. }) || matches!(right, Operand::Aggregate { .. })
-        }
-        Predicate::And(left, right) | Predicate::Or(left, right) => {
-            predicate_has_aggregate(left) || predicate_has_aggregate(right)
-        }
-    }
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
