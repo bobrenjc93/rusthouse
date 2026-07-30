@@ -4,9 +4,10 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, String, and Nullable(...) columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
+- one bounded INNER, LEFT [OUTER], LEFT SEMI, or LEFT ANTI hash join with aliases, qualified columns, and composite keys
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
@@ -15,7 +16,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+Identifiers are unquoted and case-insensitive; TRUE, FALSE, and NULL are reserved literals and cannot be column names. String literals use single quotes; write a quote inside one as ''. NULL can be inserted into Nullable(...) columns. Joined columns can be qualified with a table name or alias, and ambiguous unqualified names are rejected.
 
 ## CLI
 
@@ -79,13 +80,34 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+INNER and LEFT JOIN hash the smaller input; LEFT SEMI and LEFT ANTI JOIN hash the right input so
+their existence probes can stop at the first match. All join kinds preserve left-to-right input
+order unless ORDER BY requests another order. LEFT JOIN applies all ON conjuncts before adding a NULL right side,
+then applies WHERE to the joined rows.
+LEFT SEMI JOIN keeps each left row once when any right row satisfies ON; LEFT ANTI JOIN keeps it
+when none do. Their right columns are available only inside ON, and NULL equality keys never match.
+By default, the hash build, joined output, and hash-key candidate pairs are each capped at 1,000,000,
+with an estimated 64 MiB cap on peak bucket, entry, flat-key, row-index, retained-input, and
+temporary output allocations. Library callers can set the per-operator limits:
+
+~~~rust
+use rusthouse::{Database, JoinLimits};
+
+let mut database = Database::with_join_limits(JoinLimits {
+    max_rows: 100_000,
+    max_bytes: 16 * 1024 * 1024,
+    max_candidate_pairs: 250_000,
+});
+# let _ = &mut database;
+~~~
+
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no multi-stage joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Joins are limited to two tables, require at least one equality key, allow at most 64 equality keys, and combine ON conditions with AND. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+On empty non-nullable input, COUNT and SUM return numeric zero while MIN, MAX, and AVG return an actionable error. Aggregates ignore NULL values; nullable aggregates return NULL when they receive no non-NULL value.
 
 ## Development
 

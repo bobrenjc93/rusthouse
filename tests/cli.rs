@@ -154,3 +154,25 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         assert!(!stderr.contains("stack overflow"));
     }
 }
+
+#[test]
+fn json_emits_nulls_and_nullable_types_for_left_join_rows() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE left_rows (id Int64); INSERT INTO left_rows VALUES (1), (2);
+             CREATE TABLE right_rows (id Int64, label String);
+             INSERT INTO right_rows VALUES (1, 'one');
+             SELECT l.id, r.label FROM left_rows l
+             LEFT JOIN right_rows r ON l.id = r.id ORDER BY l.id;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"},{\"name\":\"label\",\"type\":\"Nullable(String)\"}],\"rows\":[[1,\"one\"],[2,null]]}]}\n"
+    );
+}

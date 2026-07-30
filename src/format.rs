@@ -157,7 +157,12 @@ fn render_json(result: &QueryResult) -> String {
         output.push_str("{\"name\":");
         write_json_string(&mut output, &column.name);
         output.push_str(",\"type\":");
-        write_json_string(&mut output, &column.data_type.to_string());
+        let data_type = if column.nullable {
+            format!("Nullable({})", column.data_type)
+        } else {
+            column.data_type.to_string()
+        };
+        write_json_string(&mut output, &data_type);
         output.push('}');
     }
     output.push_str("],\"rows\":[");
@@ -184,6 +189,7 @@ fn write_json_value(output: &mut String, value: &Value) {
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
+        Value::Null => output.push_str("null"),
     }
 }
 
@@ -219,10 +225,12 @@ mod tests {
                 ResultColumn {
                     name: "id".to_owned(),
                     data_type: DataType::Int64,
+                    nullable: false,
                 },
                 ResultColumn {
                     name: "note".to_owned(),
                     data_type: DataType::String,
+                    nullable: false,
                 },
             ],
             rows: vec![vec![
@@ -255,10 +263,12 @@ mod tests {
                 ResultColumn {
                     name: "id".to_owned(),
                     data_type: DataType::Int64,
+                    nullable: false,
                 },
                 ResultColumn {
                     name: "id".to_owned(),
                     data_type: DataType::String,
+                    nullable: false,
                 },
             ],
             rows: vec![vec![Value::Int64(1), Value::String("x".to_owned())]],
@@ -283,6 +293,7 @@ mod tests {
             columns: vec![ResultColumn {
                 name: "text".to_owned(),
                 data_type: DataType::String,
+                nullable: false,
             }],
             rows: vec![vec![Value::String(
                 "\u{1b}[31mred\u{07}\u{00}\u{7f}".to_owned(),
