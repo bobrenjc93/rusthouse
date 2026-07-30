@@ -6,7 +6,9 @@ use rusthouse::format::{
     OutputFormat, render, write_csv_header, write_csv_rows, write_json_query_end,
     write_json_query_start, write_json_rows,
 };
-use rusthouse::{Database, QueryResult, ResultColumn, ResultSink, StatementResult, Value};
+use rusthouse::{
+    Database, ExecuteError, QueryResult, ResultColumn, ResultSink, StatementResult, Value,
+};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -68,12 +70,33 @@ fn run() -> Result<(), String> {
             .write_all(render_query_results(&queries, config.format).as_bytes())
             .map_err(|error| format!("could not write query output: {error}"))?;
     } else {
-        let mut sink = CliSink::new(&mut output, config.format);
-        database
-            .execute_into(&sql, &mut sink)
-            .map_err(|error| error.to_string())?;
-        sink.finish()
-            .map_err(|error| format!("could not write query output: {error}"))?;
+        let deferred_error = {
+            let mut sink = CliSink::new(&mut output, config.format);
+            match database.execute_into(&sql, &mut sink) {
+                Ok(()) => {
+                    sink.finish()
+                        .map_err(|error| format!("could not write query output: {error}"))?;
+                    None
+                }
+                Err(error) => {
+                    let mut message = error.to_string();
+                    if matches!(&error, ExecuteError::Database(_))
+                        && let Err(finalize_error) = sink.finish_after_database_error()
+                    {
+                        message.push_str(&format!(
+                            "; could not finalize query output: {finalize_error}"
+                        ));
+                    }
+                    Some(message)
+                }
+            }
+        };
+        if let Some(error) = deferred_error {
+            output.flush().map_err(|flush_error| {
+                format!("{error}; could not flush query output: {flush_error}")
+            })?;
+            return Err(error);
+        }
     }
     output
         .flush()
@@ -115,6 +138,13 @@ impl<'a, W: Write> CliSink<'a, W> {
                 self.output.write_all(b"]}")?;
             }
             self.output.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    fn finish_after_database_error(&mut self) -> io::Result<()> {
+        if self.format == OutputFormat::Json && self.query_count > 0 {
+            self.finish()?;
         }
         Ok(())
     }

@@ -481,7 +481,8 @@ fn emit_unordered_rows<S: ResultSink>(
     batch_size: usize,
     sink: &mut S,
 ) -> std::result::Result<(), S::Error> {
-    let mut rows = Vec::with_capacity(batch_size);
+    let possible_rows = limit.unwrap_or(table.row_count()).min(table.row_count());
+    let mut rows = Vec::with_capacity(batch_size.min(possible_rows));
     let mut emitted = 0;
 
     for row in 0..table.row_count() {
@@ -513,7 +514,7 @@ fn emit_source_rows<S: ResultSink>(
     batch_size: usize,
     sink: &mut S,
 ) -> std::result::Result<(), S::Error> {
-    let mut rows = Vec::with_capacity(batch_size);
+    let mut rows = Vec::with_capacity(batch_size.min(selected.len()));
     for row in selected {
         rows.push(project_source_row(table, *row, items));
         if rows.len() == batch_size {
@@ -732,7 +733,7 @@ fn emit_grouped_rows<S: ResultSink>(
     batch_size: usize,
     sink: &mut S,
 ) -> std::result::Result<(), S::Error> {
-    let mut rows = Vec::with_capacity(batch_size);
+    let mut rows = Vec::with_capacity(batch_size.min(selected.len()));
     for group in selected {
         rows.push(data.project_row(*group, items));
         if rows.len() == batch_size {
@@ -1314,6 +1315,29 @@ mod tests {
             database.catalog.table("skipped"),
             Err(Error::TableNotFound(_))
         ));
+    }
+
+    #[test]
+    fn oversized_batch_bounds_do_not_overallocate_for_small_results() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE empty (n Int64)")
+            .expect("create succeeds");
+        let mut sink = RecordingSink::default();
+
+        database
+            .execute_into_with_batch_size(
+                "SELECT n FROM empty; \
+                 SELECT n FROM empty ORDER BY n; \
+                 SELECT n, COUNT(*) AS count FROM empty GROUP BY n; \
+                 SELECT COUNT(*) AS count FROM empty;",
+                usize::MAX,
+                &mut sink,
+            )
+            .expect("oversized bound is capped by each result's possible rows");
+
+        assert_eq!(sink.results.len(), 4);
+        assert_eq!(sink.batch_sizes, vec![1]);
     }
 
     #[test]

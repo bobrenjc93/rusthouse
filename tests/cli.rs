@@ -46,6 +46,29 @@ fn multiple_selects_emit_one_json_document() {
 }
 
 #[test]
+fn later_database_errors_leave_complete_json_for_prior_queries() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE numbers (n Int64);
+             INSERT INTO numbers VALUES (1), (2);
+             SELECT n FROM numbers ORDER BY n;
+             SELECT missing FROM numbers;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1],[2]]}]}\n"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("column 'missing' does not exist in table 'numbers'"));
+}
+
+#[test]
 fn positional_json_preserves_duplicate_alias_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
