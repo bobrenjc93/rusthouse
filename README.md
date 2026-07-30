@@ -6,16 +6,22 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
-- SELECT * and named projections, with optional AS aliases
+- SELECT * and scalar-expression projections, with optional AS aliases
+- typed arithmetic expressions and CAST between Int64, Float64, Bool, and String
+- ABS, ROUND, LOWER, UPPER, LENGTH, and SUBSTRING scalar functions
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
-- GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- expression GROUP BY, expression or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Scalar expression types are resolved once before rows are scanned. Int64 arithmetic, `ABS`, and negative-precision `ROUND` use checked operations. Division always returns Float64. Float64-to-Int64 casts truncate toward zero and reject non-finite or out-of-range inputs; string-to-number and string-to-Bool casts reject invalid text. Numeric and Boolean casts use zero as false and nonzero as true.
+
+String functions operate on UTF-8 Unicode scalar values rather than bytes. `LENGTH` counts scalar values, while `LOWER` and `UPPER` use Unicode case conversion. `SUBSTRING(value, start[, length])` is 1-based, accepts negative starts relative to the end (`-1` is the last scalar value), returns an empty string for zero or out-of-range starts, and rejects negative lengths. `ROUND(value[, precision])` rounds halfway cases away from zero.
 
 ## CLI
 
@@ -81,7 +87,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

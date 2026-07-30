@@ -1,9 +1,13 @@
+use std::fmt;
+
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_EXPRESSION_DEPTH: usize = 64;
+const MAX_EXPRESSION_NODES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -23,7 +27,7 @@ pub struct Select {
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
-    pub group_by: Vec<String>,
+    pub group_by: Vec<Expression>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -31,8 +35,8 @@ pub struct Select {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
-    Column {
-        name: String,
+    Expression {
+        expression: Expression,
         alias: Option<String>,
     },
     Aggregate {
@@ -75,27 +79,180 @@ impl AggregateFunction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggregateArgument {
     Wildcard,
-    Column(String),
+    Expression(Expression),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     Comparison {
-        left: Operand,
+        left: Expression,
         operator: ComparisonOperator,
-        right: Operand,
+        right: Expression,
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Operand {
+pub enum Expression {
     Column(String),
     Literal(Value),
+    UnaryMinus(Box<Self>),
+    Binary {
+        left: Box<Self>,
+        operator: ArithmeticOperator,
+        right: Box<Self>,
+    },
+    Cast {
+        expression: Box<Self>,
+        target: DataType,
+    },
+    Function {
+        function: ScalarFunction,
+        arguments: Vec<Self>,
+    },
+}
+
+impl Expression {
+    fn precedence(&self) -> u8 {
+        match self {
+            Self::Binary {
+                operator: ArithmeticOperator::Add | ArithmeticOperator::Subtract,
+                ..
+            } => 1,
+            Self::Binary { .. } => 2,
+            Self::UnaryMinus(_) => 3,
+            Self::Column(_) | Self::Literal(_) | Self::Cast { .. } | Self::Function { .. } => 4,
+        }
+    }
+
+    fn fmt_with_precedence(&self, f: &mut fmt::Formatter<'_>, parent: u8) -> fmt::Result {
+        let precedence = self.precedence();
+        let parenthesize = precedence < parent;
+        if parenthesize {
+            f.write_str("(")?;
+        }
+        match self {
+            Self::Column(name) => f.write_str(name)?,
+            Self::Literal(Value::String(value)) => {
+                write!(f, "'{}'", value.replace('\'', "''"))?;
+            }
+            Self::Literal(value) => write!(f, "{value}")?,
+            Self::UnaryMinus(expression) => {
+                f.write_str("-")?;
+                expression.fmt_with_precedence(f, precedence)?;
+            }
+            Self::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                left.fmt_with_precedence(f, precedence)?;
+                write!(f, " {operator} ")?;
+                right.fmt_with_precedence(f, precedence + 1)?;
+            }
+            Self::Cast { expression, target } => {
+                write!(f, "CAST({expression} AS {target})")?;
+            }
+            Self::Function {
+                function,
+                arguments,
+            } => {
+                write!(f, "{}(", function.name())?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{argument}")?;
+                }
+                f.write_str(")")?;
+            }
+        }
+        if parenthesize {
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunction {
+    Abs,
+    Round,
+    Lower,
+    Upper,
+    Length,
+    Substring,
+}
+
+impl ScalarFunction {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Abs => "ABS",
+            Self::Round => "ROUND",
+            Self::Lower => "LOWER",
+            Self::Upper => "UPPER",
+            Self::Length => "LENGTH",
+            Self::Substring => "SUBSTRING",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "ABS" => Some(Self::Abs),
+            "ROUND" => Some(Self::Round),
+            "LOWER" => Some(Self::Lower),
+            "UPPER" => Some(Self::Upper),
+            "LENGTH" => Some(Self::Length),
+            "SUBSTRING" => Some(Self::Substring),
+            _ => None,
+        }
+    }
+
+    fn accepts_argument_count(self, count: usize) -> bool {
+        match self {
+            Self::Abs | Self::Lower | Self::Upper | Self::Length => count == 1,
+            Self::Round => (1..=2).contains(&count),
+            Self::Substring => (2..=3).contains(&count),
+        }
+    }
+
+    fn expected_arguments(self) -> &'static str {
+        match self {
+            Self::Abs | Self::Lower | Self::Upper | Self::Length => "1",
+            Self::Round => "1 or 2",
+            Self::Substring => "2 or 3",
+        }
+    }
+}
+
+impl fmt::Display for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_with_precedence(f, 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+impl fmt::Display for ArithmeticOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,9 +265,9 @@ pub enum ComparisonOperator {
     GreaterOrEqual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderBy {
-    pub name: String,
+    pub expression: Expression,
     pub descending: bool,
 }
 
@@ -135,7 +292,9 @@ enum TokenKind {
     LeftParen,
     RightParen,
     Semicolon,
+    Plus,
     Star,
+    Slash,
     Minus,
     Equal,
     NotEqual,
@@ -186,9 +345,17 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     TokenKind::Semicolon
                 }
+                '+' => {
+                    self.advance();
+                    TokenKind::Plus
+                }
                 '*' => {
                     self.advance();
                     TokenKind::Star
+                }
+                '/' => {
+                    self.advance();
+                    TokenKind::Slash
                 }
                 '-' => {
                     self.advance();
@@ -343,6 +510,8 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    expression_depth: usize,
+    expression_nodes: usize,
 }
 
 impl Parser {
@@ -352,6 +521,8 @@ impl Parser {
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            expression_depth: 0,
+            expression_nodes: 0,
         }
     }
 
@@ -464,7 +635,7 @@ impl Parser {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
-                group_by.push(self.expect_identifier("GROUP BY column")?);
+                group_by.push(self.parse_expression()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -475,14 +646,17 @@ impl Parser {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
+                let expression = self.parse_expression()?;
                 let descending = if self.eat_keyword("DESC") {
                     true
                 } else {
                     self.eat_keyword("ASC");
                     false
                 };
-                order_by.push(OrderBy { name, descending });
+                order_by.push(OrderBy {
+                    expression,
+                    descending,
+                });
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -518,17 +692,16 @@ impl Parser {
             return Ok(SelectItem::Wildcard);
         }
 
-        let position = self.position();
-        let name = self.expect_identifier("column or aggregate function")?;
-        if self.eat(&TokenKind::LeftParen) {
-            let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!("unknown aggregate function '{name}'"),
-            })?;
+        if let TokenKind::Identifier(name) = self.peek().clone()
+            && self.tokens.get(self.current + 1).map(|token| &token.kind)
+                == Some(&TokenKind::LeftParen)
+            && let Some(function) = AggregateFunction::parse(&name)
+        {
+            self.current += 2;
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                AggregateArgument::Expression(self.parse_expression()?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let alias = self.parse_alias()?;
@@ -538,8 +711,9 @@ impl Parser {
                 alias,
             })
         } else {
+            let expression = self.parse_expression()?;
             let alias = self.parse_alias()?;
-            Ok(SelectItem::Column { name, alias })
+            Ok(SelectItem::Expression { expression, alias })
         }
     }
 
@@ -572,7 +746,18 @@ impl Parser {
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
-        if self.eat(&TokenKind::LeftParen) {
+        if self.at(&TokenKind::LeftParen) {
+            let checkpoint = self.current;
+            let expression_depth = self.expression_depth;
+            let expression_nodes = self.expression_nodes;
+            if let Ok(comparison) = self.parse_comparison() {
+                return Ok(comparison);
+            }
+            self.current = checkpoint;
+            self.expression_depth = expression_depth;
+            self.expression_nodes = expression_nodes;
+
+            self.current += 1;
             if self.predicate_depth >= MAX_PREDICATE_DEPTH {
                 return self.error(format!(
                     "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
@@ -586,7 +771,11 @@ impl Parser {
             return Ok(predicate);
         }
 
-        let left = self.parse_operand()?;
+        self.parse_comparison()
+    }
+
+    fn parse_comparison(&mut self) -> Result<Predicate> {
+        let left = self.parse_expression()?;
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -597,7 +786,7 @@ impl Parser {
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
         self.current += 1;
-        let right = self.parse_operand()?;
+        let right = self.parse_expression()?;
         self.record_predicate_node()?;
         Ok(Predicate::Comparison {
             left,
@@ -616,21 +805,189 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_operand(&mut self) -> Result<Operand> {
-        match self.peek() {
-            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
-                self.parse_literal().map(Operand::Literal)
+    fn parse_expression(&mut self) -> Result<Expression> {
+        self.expression_depth = 0;
+        self.expression_nodes = 0;
+        self.parse_additive_expression()
+    }
+
+    fn parse_additive_expression(&mut self) -> Result<Expression> {
+        let mut expression = self.parse_multiplicative_expression()?;
+        loop {
+            let operator = if self.eat(&TokenKind::Plus) {
+                ArithmeticOperator::Add
+            } else if self.eat(&TokenKind::Minus) {
+                ArithmeticOperator::Subtract
+            } else {
+                break;
+            };
+            let right = self.parse_multiplicative_expression()?;
+            self.record_expression_node()?;
+            expression = Expression::Binary {
+                left: Box::new(expression),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<Expression> {
+        let mut expression = self.parse_unary_expression()?;
+        loop {
+            let operator = if self.eat(&TokenKind::Star) {
+                ArithmeticOperator::Multiply
+            } else if self.eat(&TokenKind::Slash) {
+                ArithmeticOperator::Divide
+            } else {
+                break;
+            };
+            let right = self.parse_unary_expression()?;
+            self.record_expression_node()?;
+            expression = Expression::Binary {
+                left: Box::new(expression),
+                operator,
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<Expression> {
+        if self.eat(&TokenKind::Minus) {
+            if matches!(self.peek(), TokenKind::Number(_)) {
+                self.current -= 1;
+                let literal = self.parse_literal()?;
+                self.record_expression_node()?;
+                return Ok(Expression::Literal(literal));
+            }
+            if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+                return self.error(format!(
+                    "scalar expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+                ));
+            }
+            self.expression_depth += 1;
+            let expression = self.parse_unary_expression();
+            self.expression_depth -= 1;
+            let expression = expression?;
+            self.record_expression_node()?;
+            return Ok(Expression::UnaryMinus(Box::new(expression)));
+        }
+        self.parse_primary_expression()
+    }
+
+    fn parse_primary_expression(&mut self) -> Result<Expression> {
+        if self.eat(&TokenKind::LeftParen) {
+            if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+                return self.error(format!(
+                    "scalar expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+                ));
+            }
+            self.expression_depth += 1;
+            let expression = self.parse_additive_expression();
+            self.expression_depth -= 1;
+            let expression = expression?;
+            self.expect(
+                &TokenKind::RightParen,
+                "right parenthesis after scalar expression",
+            )?;
+            return Ok(expression);
+        }
+
+        let expression = match self.peek() {
+            TokenKind::String(_) | TokenKind::Number(_) => {
+                Expression::Literal(self.parse_literal()?)
             }
             TokenKind::Identifier(value)
                 if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
             {
-                self.parse_literal().map(Operand::Literal)
+                Expression::Literal(self.parse_literal()?)
             }
-            TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
-                .map(Operand::Column),
-            _ => self.error("expected column or literal"),
+            TokenKind::Identifier(_)
+                if self.tokens.get(self.current + 1).map(|token| &token.kind)
+                    == Some(&TokenKind::LeftParen) =>
+            {
+                self.parse_function_expression()?
+            }
+            TokenKind::Identifier(_) => {
+                Expression::Column(self.expect_identifier("column or literal")?)
+            }
+            _ => return self.error("expected column, literal, or parenthesized expression"),
+        };
+        self.record_expression_node()?;
+        Ok(expression)
+    }
+
+    fn parse_function_expression(&mut self) -> Result<Expression> {
+        if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+            return self.error(format!(
+                "scalar expression nesting exceeds limit of {MAX_EXPRESSION_DEPTH}"
+            ));
         }
+        let position = self.position();
+        let name = self.expect_identifier("scalar function")?;
+        self.expect(&TokenKind::LeftParen, "'(' after scalar function")?;
+        self.expression_depth += 1;
+
+        let result = if name.eq_ignore_ascii_case("CAST") {
+            let expression = self.parse_additive_expression()?;
+            self.expect_keyword("AS")?;
+            let type_name = self.expect_identifier("CAST target type")?;
+            let target = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+                position,
+                message: format!(
+                    "unknown CAST target type '{type_name}'; expected Int64, Float64, Bool, or String"
+                ),
+            })?;
+            self.expect(&TokenKind::RightParen, "')' after CAST expression")?;
+            Expression::Cast {
+                expression: Box::new(expression),
+                target,
+            }
+        } else {
+            let function = ScalarFunction::parse(&name).ok_or_else(|| Error::Sql {
+                position,
+                message: format!("unknown scalar function '{name}'"),
+            })?;
+            let mut arguments = Vec::new();
+            if !self.at(&TokenKind::RightParen) {
+                loop {
+                    arguments.push(self.parse_additive_expression()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after scalar function arguments",
+            )?;
+            if !function.accepts_argument_count(arguments.len()) {
+                return self.error(format!(
+                    "{} expects {} argument(s), found {}",
+                    function.name(),
+                    function.expected_arguments(),
+                    arguments.len()
+                ));
+            }
+            Expression::Function {
+                function,
+                arguments,
+            }
+        };
+
+        self.expression_depth -= 1;
+        Ok(result)
+    }
+
+    fn record_expression_node(&mut self) -> Result<()> {
+        if self.expression_nodes >= MAX_EXPRESSION_NODES {
+            return self.error(format!(
+                "scalar expression is too complex; maximum {MAX_EXPRESSION_NODES} nodes"
+            ));
+        }
+        self.expression_nodes += 1;
+        Ok(())
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
@@ -767,10 +1124,74 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(select.items.len(), 2);
-        assert_eq!(select.group_by, ["region"]);
-        assert_eq!(select.order_by[0].name, "total");
+        assert_eq!(select.group_by, [Expression::Column("region".to_owned())]);
+        assert_eq!(
+            select.order_by[0].expression,
+            Expression::Column("total".to_owned())
+        );
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_scalar_expression_precedence_in_every_query_position() {
+        let statements = parse(
+            "SELECT amount + 2 * (tax - 1) AS adjusted, SUM(amount / 2) AS half \
+             FROM sales WHERE -(amount + 1) < -3",
+        )
+        .expect("valid expressions");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select")
+        };
+        let SelectItem::Expression { expression, .. } = &select.items[0] else {
+            panic!("expected scalar expression")
+        };
+        assert_eq!(expression.to_string(), "amount + 2 * (tax - 1)");
+        let SelectItem::Aggregate { argument, .. } = &select.items[1] else {
+            panic!("expected aggregate")
+        };
+        let AggregateArgument::Expression(expression) = argument else {
+            panic!("expected aggregate expression")
+        };
+        assert_eq!(expression.to_string(), "amount / 2");
+        assert!(select.predicate.is_some());
+    }
+
+    #[test]
+    fn parses_casts_and_functions_in_grouping_and_ordering() {
+        let statements = parse(
+            "SELECT LOWER(label), SUM(ABS(CAST(amount AS Int64))) \
+             FROM sales GROUP BY LOWER(label) ORDER BY LENGTH(LOWER(label)) DESC",
+        )
+        .expect("valid scalar functions");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected SELECT")
+        };
+
+        assert_eq!(select.group_by[0].to_string(), "LOWER(label)");
+        assert_eq!(
+            select.order_by[0].expression.to_string(),
+            "LENGTH(LOWER(label))"
+        );
+        let SelectItem::Aggregate { argument, .. } = &select.items[1] else {
+            panic!("expected aggregate")
+        };
+        let AggregateArgument::Expression(expression) = argument else {
+            panic!("expected aggregate expression")
+        };
+        assert_eq!(expression.to_string(), "ABS(CAST(amount AS Int64))");
+    }
+
+    #[test]
+    fn rejects_unknown_functions_targets_and_invalid_arities() {
+        for sql in [
+            "SELECT UNKNOWN(value) FROM valueset",
+            "SELECT ABS(value, 1) FROM valueset",
+            "SELECT SUBSTRING(value) FROM valueset",
+            "SELECT CAST(value AS UInt64) FROM valueset",
+        ] {
+            assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
+        }
     }
 
     #[test]
@@ -816,6 +1237,18 @@ mod tests {
             error,
             Error::Sql { message, .. }
                 if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn rejects_deep_scalar_expressions_without_overflowing_the_stack() {
+        let sql = format!("SELECT {}id FROM things", "- ".repeat(50_000));
+
+        let error = parse(&sql).expect_err("nesting limit should reject expression");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("scalar expression nesting exceeds limit of 64")
         ));
     }
 }

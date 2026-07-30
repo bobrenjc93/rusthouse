@@ -524,3 +524,225 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn scalar_functions_work_across_every_expression_position() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE transforms (
+                label String, amount String, score Float64, enabled String
+             );
+             INSERT INTO transforms VALUES
+                ('éclair', '-12', 1.26, 'true'),
+                ('ÉCOLE', '7', 1.24, '1'),
+                ('alpha', '-5', 2.66, 'false'),
+                ('Atom', '3', 2.64, 'true');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT UPPER(SUBSTRING(label, 1, 1)) AS initial,
+                SUM(ABS(CAST(amount AS Int64))) AS total,
+                MIN(ROUND(score, 1)) AS lowest
+         FROM transforms
+         WHERE LENGTH(LOWER(label)) > 3
+           AND CAST(enabled AS Bool) = true
+         GROUP BY UPPER(SUBSTRING(label, 1, 1))
+         ORDER BY LOWER(UPPER(SUBSTRING(label, 1, 1))) DESC;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::String, DataType::Int64, DataType::Float64]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("É".to_owned()),
+                Value::Int64(19),
+                Value::Float64(1.2),
+            ],
+            vec![
+                Value::String("A".to_owned()),
+                Value::Int64(3),
+                Value::Float64(2.6),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn casts_unicode_and_substring_boundaries_are_defined() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE one (id Int64); INSERT INTO one VALUES (1);")
+        .expect("setup succeeds");
+
+    let casts = execute_query(
+        &mut database,
+        "SELECT CAST('-9223372036854775808' AS Int64),
+                CAST('1.25' AS Float64),
+                CAST(0 AS Bool),
+                CAST(true AS String),
+                CAST(7.9 AS Int64)
+         FROM one;",
+    );
+    assert_eq!(
+        casts.rows,
+        vec![vec![
+            Value::Int64(i64::MIN),
+            Value::Float64(1.25),
+            Value::Bool(false),
+            Value::String("true".to_owned()),
+            Value::Int64(7),
+        ]]
+    );
+
+    let strings = execute_query(
+        &mut database,
+        "SELECT LENGTH('Aé🙂'),
+                LOWER('ÉCOLE'),
+                UPPER('straße'),
+                SUBSTRING('Aé🙂Z', 2, 2),
+                SUBSTRING('Aé🙂Z', -2),
+                SUBSTRING('Aé🙂Z', 0, 2),
+                SUBSTRING('Aé🙂Z', -99, 2),
+                SUBSTRING('Aé🙂Z', 2, 0),
+                SUBSTRING('Aé🙂Z', -9223372036854775808, 2)
+         FROM one;",
+    );
+    assert_eq!(
+        strings.rows,
+        vec![vec![
+            Value::Int64(3),
+            Value::String("école".to_owned()),
+            Value::String("STRASSE".to_owned()),
+            Value::String("é🙂".to_owned()),
+            Value::String("🙂Z".to_owned()),
+            Value::String(String::new()),
+            Value::String(String::new()),
+            Value::String(String::new()),
+            Value::String(String::new()),
+        ]]
+    );
+
+    let rounding = execute_query(
+        &mut database,
+        "SELECT ROUND(12345, -2), ROUND(-125, -1), ROUND(1.235, 2),
+                ROUND(1.25, 309), ROUND(-1.25, -309),
+                ROUND(-9223372036854775808, -20)
+         FROM one;",
+    );
+    assert_eq!(
+        rounding.rows,
+        vec![vec![
+            Value::Int64(12_300),
+            Value::Int64(-130),
+            Value::Float64(1.24),
+            Value::Float64(1.25),
+            Value::Float64(-0.0),
+            Value::Int64(0),
+        ]]
+    );
+}
+
+#[test]
+fn conversion_and_scalar_boundary_failures_are_explicit() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE empty_values (n Int64, text String);")
+        .expect("setup succeeds");
+
+    for sql in [
+        "SELECT CAST('not an integer' AS Int64) FROM empty_values;",
+        "SELECT CAST('9223372036854775808' AS Int64) FROM empty_values;",
+        "SELECT CAST(9223372036854775808.0 AS Int64) FROM empty_values;",
+        "SELECT CAST('NaN' AS Float64) FROM empty_values;",
+        "SELECT CAST('yes' AS Bool) FROM empty_values;",
+    ] {
+        let error = database
+            .execute(sql)
+            .expect_err("invalid constants fail during expression resolution");
+        assert!(matches!(error, Error::CastFailed { .. }), "{error}");
+    }
+
+    let abs = database
+        .execute("SELECT ABS(-9223372036854775808) FROM empty_values;")
+        .expect_err("the absolute value is outside Int64");
+    assert!(matches!(abs, Error::NumericOverflow(_)));
+
+    let round = database
+        .execute("SELECT ROUND(9223372036854775807, -19) FROM empty_values;")
+        .expect_err("rounded Int64 result is outside Int64");
+    assert!(matches!(round, Error::NumericOverflow(_)));
+
+    let negative_length = database
+        .execute("SELECT SUBSTRING('abc', 1, -1) FROM empty_values;")
+        .expect_err("negative substring lengths are rejected");
+    assert!(
+        matches!(negative_length, Error::InvalidQuery(message) if message.contains("non-negative"))
+    );
+
+    let mismatch = database
+        .execute("SELECT LOWER(n) FROM empty_values;")
+        .expect_err("function types resolve before scanning an empty table");
+    assert!(matches!(
+        mismatch,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "String" && actual == "Int64"
+    ));
+
+    database
+        .execute("INSERT INTO empty_values VALUES (1, 'still not an integer');")
+        .expect("insert succeeds");
+    let row_cast = database
+        .execute("SELECT CAST(text AS Int64) FROM empty_values;")
+        .expect_err("invalid column text fails while scanning");
+    assert!(matches!(row_cast, Error::CastFailed { .. }));
+}
+
+#[test]
+fn ordering_expressions_need_not_be_projected_and_grouping_is_strict() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ordered_values (n Int64, label String);
+             INSERT INTO ordered_values VALUES (-3, 'A'), (2, 'a'), (-1, 'B');",
+        )
+        .expect("setup succeeds");
+
+    let ordered = execute_query(
+        &mut database,
+        "SELECT n FROM ordered_values ORDER BY ABS(n), LOWER(label);",
+    );
+    assert_eq!(
+        ordered.rows,
+        vec![
+            vec![Value::Int64(-1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(-3)],
+        ]
+    );
+
+    let error = database
+        .execute(
+            "SELECT label, COUNT(*)
+             FROM ordered_values
+             GROUP BY LOWER(label);",
+        )
+        .expect_err("a raw column is not determined by its transformed group key");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message) if message.contains("must appear in GROUP BY")
+    ));
+}

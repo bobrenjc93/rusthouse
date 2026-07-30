@@ -30,6 +30,13 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    DivisionByZero(String),
+    NonFiniteResult(String),
+    CastFailed {
+        value: String,
+        source: crate::value::DataType,
+        target: crate::value::DataType,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +80,17 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::DivisionByZero(operation) => {
+                write!(f, "division by zero while computing {operation}")
+            }
+            Self::NonFiniteResult(operation) => {
+                write!(f, "non-finite result while computing {operation}")
+            }
+            Self::CastFailed {
+                value,
+                source,
+                target,
+            } => write!(f, "cannot CAST {value:?} from {source} to {target}"),
         }
     }
 }

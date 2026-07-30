@@ -89,6 +89,24 @@ impl Value {
 }
 
 impl ValueRef<'_> {
+    pub(crate) fn data_type(self) -> DataType {
+        match self {
+            Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
+            Self::Bool(_) => DataType::Bool,
+            Self::String(_) => DataType::String,
+        }
+    }
+
+    pub(crate) fn as_display_string(self) -> String {
+        match self {
+            Self::Int64(value) => value.to_string(),
+            Self::Float64(value) => format_float(value),
+            Self::Bool(value) => value.to_string(),
+            Self::String(value) => value.to_owned(),
+        }
+    }
+
     pub(crate) fn to_owned(self) -> Value {
         match self {
             Self::Int64(value) => Value::Int64(value),
