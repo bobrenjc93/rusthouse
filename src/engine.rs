@@ -6,6 +6,9 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
@@ -530,7 +533,7 @@ impl SpillExecution<'_, '_> {
         let fits = groups_fit_in_memory(
             self.table,
             self.group_columns,
-            RowIndexReader::open(&partition.path)?,
+            RowIndexReader::open(&partition.path, self.table.row_count())?,
             self.max_groups,
         )?;
         if fits {
@@ -538,7 +541,7 @@ impl SpillExecution<'_, '_> {
                 self.table,
                 self.group_columns,
                 self.aggregate_specs,
-                RowIndexReader::open(&partition.path)?,
+                RowIndexReader::open(&partition.path, self.table.row_count())?,
                 partition.row_count,
                 self.max_groups,
             )?;
@@ -558,7 +561,7 @@ impl SpillExecution<'_, '_> {
             self.workspace,
             self.table,
             self.group_columns,
-            RowIndexReader::open(&partition.path)?,
+            RowIndexReader::open(&partition.path, self.table.row_count())?,
             depth,
         )?;
         remove_spill_file(&partition.path)?;
@@ -576,21 +579,11 @@ fn partition_rows(
     rows: impl Iterator<Item = Result<usize>>,
     depth: usize,
 ) -> Result<Vec<SpillFile>> {
-    let mut partitions = (0..SPILL_PARTITION_COUNT)
+    let created_partitions = (0..SPILL_PARTITION_COUNT)
         .map(|_| workspace.create_partition())
         .collect::<Result<Vec<_>>>()?;
-    let mut writers = partitions
-        .iter()
-        .map(|partition| {
-            OpenOptions::new()
-                .write(true)
-                .open(&partition.path)
-                .map(BufWriter::new)
-                .map_err(|error| {
-                    temporary_storage_error("open spill partition", &partition.path, error)
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let (mut partitions, files): (Vec<_>, Vec<_>) = created_partitions.into_iter().unzip();
+    let mut writers = files.into_iter().map(BufWriter::new).collect::<Vec<_>>();
 
     for row in rows {
         let row = row?;
@@ -684,7 +677,7 @@ impl SpillWorkspace {
         loop {
             let sequence = NEXT_SPILL_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
             let path = parent.join(format!("rusthouse-group-{}-{sequence}", std::process::id()));
-            match fs::create_dir(&path) {
+            match create_private_directory(&path) {
                 Ok(()) => {
                     return Ok(Self {
                         path,
@@ -704,15 +697,17 @@ impl SpillWorkspace {
         }
     }
 
-    fn create_partition(&mut self) -> Result<SpillFile> {
+    fn create_partition(&mut self) -> Result<(SpillFile, File)> {
         let path = self.path.join(format!("partition-{}.bin", self.next_file));
         self.next_file += 1;
-        OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
             .open(&path)
             .map_err(|error| temporary_storage_error("create spill partition", &path, error))?;
-        Ok(SpillFile { path, row_count: 0 })
+        Ok((SpillFile { path, row_count: 0 }, file))
     }
 
     fn cleanup(mut self) -> Result<()> {
@@ -722,6 +717,18 @@ impl SpillWorkspace {
         self.active = false;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
 }
 
 impl Drop for SpillWorkspace {
@@ -735,11 +742,12 @@ impl Drop for SpillWorkspace {
 struct RowIndexReader {
     reader: BufReader<File>,
     remaining: usize,
+    row_limit: usize,
     path: PathBuf,
 }
 
 impl RowIndexReader {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, row_limit: usize) -> Result<Self> {
         let file = File::open(path)
             .map_err(|error| temporary_storage_error("open spill partition", path, error))?;
         let byte_len = file
@@ -761,6 +769,7 @@ impl RowIndexReader {
         Ok(Self {
             reader: BufReader::new(file),
             remaining: record_count,
+            row_limit,
             path: path.to_path_buf(),
         })
     }
@@ -783,12 +792,16 @@ impl Iterator for RowIndexReader {
             )));
         }
         self.remaining -= 1;
-        Some(usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
-            Error::TemporaryStorage(format!(
-                "spill partition '{}' contains an invalid row index",
-                self.path.display()
-            ))
-        }))
+        let row = match usize::try_from(u64::from_le_bytes(bytes)) {
+            Ok(row) if row < self.row_limit => row,
+            Ok(_) | Err(_) => {
+                return Some(Err(Error::TemporaryStorage(format!(
+                    "spill partition '{}' contains an invalid row index",
+                    self.path.display()
+                ))));
+            }
+        };
+        Some(Ok(row))
     }
 }
 
@@ -1342,6 +1355,16 @@ fn comparable(left: DataType, right: DataType) -> bool {
 mod tests {
     use super::*;
 
+    fn spill_test_parent(label: &str) -> PathBuf {
+        let sequence = NEXT_SPILL_DIRECTORY.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusthouse-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create spill test parent");
+        path
+    }
+
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
         match results.into_iter().last().expect("one result") {
@@ -1401,5 +1424,57 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_workspace_and_partition_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = spill_test_parent("permissions-test");
+        let mut workspace = SpillWorkspace::new(Some(&parent)).expect("create spill workspace");
+        let workspace_mode = fs::metadata(&workspace.path)
+            .expect("inspect spill workspace")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(workspace_mode, 0o700);
+
+        let (partition, file) = workspace.create_partition().expect("create partition");
+        drop(file);
+        let partition_mode = fs::metadata(&partition.path)
+            .expect("inspect spill partition")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(partition_mode, 0o600);
+
+        remove_spill_file(&partition.path).expect("remove partition");
+        workspace.cleanup().expect("remove spill workspace");
+        fs::remove_dir(parent).expect("remove spill test parent");
+    }
+
+    #[test]
+    fn spill_reader_rejects_out_of_range_row_indices() {
+        let parent = spill_test_parent("row-index-test");
+        let mut workspace = SpillWorkspace::new(Some(&parent)).expect("create spill workspace");
+        let (partition, mut file) = workspace.create_partition().expect("create partition");
+        file.write_all(&9_u64.to_le_bytes())
+            .expect("write invalid row index");
+        file.flush().expect("flush invalid row index");
+        drop(file);
+
+        let error = RowIndexReader::open(&partition.path, 3)
+            .expect("open partition")
+            .next()
+            .expect("one record")
+            .expect_err("row index is outside table");
+        assert!(
+            matches!(error, Error::TemporaryStorage(message) if message.contains("invalid row index"))
+        );
+
+        remove_spill_file(&partition.path).expect("remove partition");
+        workspace.cleanup().expect("remove spill workspace");
+        fs::remove_dir(parent).expect("remove spill test parent");
     }
 }
