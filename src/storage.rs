@@ -6,7 +6,9 @@ use crate::value::{DataType, Value, ValueRef};
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
+    /// The column name.
     pub name: String,
+    /// The values accepted by the column.
     pub data_type: DataType,
 }
 
@@ -17,13 +19,18 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
 /// A physical column. Each variant owns a contiguous vector of one Rust type.
 #[derive(Debug, Clone)]
 pub enum Column {
+    /// Contiguous signed 64-bit integer storage.
     Int64(Vec<i64>),
+    /// Contiguous 64-bit floating-point storage.
     Float64(Vec<f64>),
+    /// Contiguous Boolean storage.
     Bool(Vec<bool>),
+    /// Contiguous owned UTF-8 string storage.
     String(Vec<String>),
 }
 
 impl Column {
+    /// Creates an empty physical column for a data type.
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
         match data_type {
@@ -34,6 +41,7 @@ impl Column {
         }
     }
 
+    /// Returns the physical data type stored by this column.
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -44,6 +52,7 @@ impl Column {
         }
     }
 
+    /// Returns the number of values in the column.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -54,11 +63,17 @@ impl Column {
         }
     }
 
+    /// Returns `true` when the column contains no values.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Clones the value at `row`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `row` is outside the column.
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
         self.value_ref(row).to_owned()
@@ -98,6 +113,12 @@ pub struct Table {
 }
 
 impl Table {
+    /// Creates an empty table with a validated schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty schema, duplicate columns, or reserved
+    /// column names.
     pub fn new(name: String, schema: Vec<ColumnDef>) -> Result<Self> {
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
@@ -128,26 +149,31 @@ impl Table {
         })
     }
 
+    /// Returns the table's original name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the table schema in physical column order.
     #[must_use]
     pub fn schema(&self) -> &[ColumnDef] {
         &self.schema
     }
 
+    /// Returns the physical columns in schema order.
     #[must_use]
     pub fn columns(&self) -> &[Column] {
         &self.columns
     }
 
+    /// Returns the number of stored rows.
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 
+    /// Resolves a case-insensitive column name to its schema index.
     pub fn column_index(&self, name: &str) -> Result<usize> {
         self.schema
             .iter()
@@ -187,7 +213,9 @@ impl Table {
         Ok(())
     }
 
-    /// Validates the complete row before appending one value to each column.
+    /// Validates and appends one complete row.
+    ///
+    /// Validation happens before any physical column is changed.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
         for (column, value) in self.columns.iter_mut().zip(row) {

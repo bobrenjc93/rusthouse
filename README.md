@@ -89,10 +89,21 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+The crate has no third-party dependencies. Its minimum supported Rust version
+(MSRV) is 1.85, the first release with Rust 2024 edition support. Both local
+development and CI are pinned to Rust 1.85.0 by `rust-toolchain.toml`; raising
+the MSRV requires an explicit update to both that file and `Cargo.toml`.
+
+Run the same quality gates as CI with:
 
 ~~~bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ~~~
+
+## License
+
+RustHouse is available under the [MIT License](LICENSE).

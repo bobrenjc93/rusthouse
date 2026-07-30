@@ -10,11 +10,15 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Creates an empty catalog.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates a named table with the supplied schema.
+    ///
+    /// Table names are compared case-insensitively.
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
@@ -25,12 +29,14 @@ impl Catalog {
         Ok(())
     }
 
+    /// Returns a table by its case-insensitive name.
     pub fn table(&self, name: &str) -> Result<&Table> {
         self.tables
             .get(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    /// Returns a mutable table by its case-insensitive name.
     pub fn table_mut(&mut self, name: &str) -> Result<&mut Table> {
         self.tables
             .get_mut(&normalize(name))

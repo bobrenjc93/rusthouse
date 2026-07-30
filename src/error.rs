@@ -3,35 +3,58 @@ use std::fmt;
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// The SQL text could not be parsed.
     Sql {
+        /// Zero-based byte offset at which parsing failed.
         position: usize,
+        /// Human-readable description of the invalid syntax.
         message: String,
     },
+    /// A table with the supplied name already exists.
     TableAlreadyExists(String),
+    /// No table exists with the supplied name.
     TableNotFound(String),
+    /// A table schema contains a duplicate column name.
     DuplicateColumn(String),
+    /// An identifier conflicts with a reserved SQL literal.
     ReservedIdentifier {
+        /// The rejected identifier.
         identifier: String,
+        /// The syntactic role in which it was used.
         context: String,
     },
+    /// No column exists with the supplied name.
     ColumnNotFound {
+        /// The table searched for the column.
         table: String,
+        /// The requested column name.
         column: String,
     },
+    /// An inserted row does not match the table width.
     RowLength {
+        /// The target table name.
         table: String,
+        /// The number of values required by the schema.
         expected: usize,
+        /// The number of values supplied.
         actual: usize,
     },
+    /// A value or expression has an incompatible data type.
     TypeMismatch {
+        /// The column or operation requiring a particular type.
         context: String,
+        /// The required type.
         expected: String,
+        /// The supplied type.
         actual: String,
     },
+    /// A parsed query violates an execution rule.
     InvalidQuery(String),
+    /// An aggregate calculation exceeded its numeric representation.
     NumericOverflow(String),
 }
 
+/// A result whose error type is [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl fmt::Display for Error {

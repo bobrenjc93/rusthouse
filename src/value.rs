@@ -5,9 +5,13 @@ use std::hash::{Hash, Hasher};
 /// The four physical column types supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
+    /// A signed 64-bit integer.
     Int64,
+    /// A 64-bit IEEE 754 floating-point number.
     Float64,
+    /// A Boolean value.
     Bool,
+    /// An owned UTF-8 string.
     String,
 }
 
@@ -37,9 +41,13 @@ impl fmt::Display for DataType {
 /// A scalar value read from or written to a typed column.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// A signed 64-bit integer value.
     Int64(i64),
+    /// A 64-bit IEEE 754 floating-point value.
     Float64(f64),
+    /// A Boolean value.
     Bool(bool),
+    /// An owned UTF-8 string value.
     String(String),
 }
 
@@ -53,6 +61,7 @@ pub(crate) enum ValueRef<'a> {
 }
 
 impl Value {
+    /// Returns the physical type of this value.
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -63,6 +72,10 @@ impl Value {
         }
     }
 
+    /// Formats the value for table and CSV output.
+    ///
+    /// Integral floating-point values retain a decimal point so they remain
+    /// distinguishable from [`Value::Int64`] values.
     #[must_use]
     pub fn as_display_string(&self) -> String {
         match self {

@@ -3,14 +3,19 @@ use std::fmt::Write;
 use crate::engine::QueryResult;
 use crate::value::Value;
 
+/// A supported query-result output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
+    /// A bordered, human-readable table.
     Table,
+    /// Comma-separated values with a header row.
     Csv,
+    /// An object containing column metadata and positional rows.
     Json,
 }
 
 impl OutputFormat {
+    /// Parses `table`, `csv`, or `json` case-insensitively.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -22,6 +27,7 @@ impl OutputFormat {
     }
 }
 
+/// Renders one query result in the requested format.
 #[must_use]
 pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     match format {

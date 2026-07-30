@@ -171,7 +171,7 @@ fn run(config: Config) -> Result<Report, String> {
                 settings.end_to_end_samples
             );
 
-            let correctness_order = (row_count_index + workload_index).is_multiple_of(2);
+            let correctness_order = (row_count_index + workload_index) % 2 == 0;
             let (rusthouse_output, clickhouse_output) =
                 execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
             let mut correctness_gate = CorrectnessGate::default();
@@ -188,8 +188,7 @@ fn run(config: Config) -> Result<Report, String> {
             let mut primary = TimingSeries::default();
             let primary_iterations = settings.warmups + settings.samples;
             for iteration in 0..primary_iterations {
-                let rusthouse_first =
-                    (row_count_index + workload_index + iteration + 1).is_multiple_of(2);
+                let rusthouse_first = (row_count_index + workload_index + iteration + 1) % 2 == 0;
                 let (rusthouse, clickhouse) = execute_timed_pair(
                     &paths,
                     &setup_sql,
@@ -210,8 +209,7 @@ fn run(config: Config) -> Result<Report, String> {
             let mut end_to_end = TimingSeries::default();
             for iteration in 0..settings.end_to_end_samples {
                 let rusthouse_first =
-                    (row_count_index + workload_index + iteration + primary_iterations)
-                        .is_multiple_of(2);
+                    (row_count_index + workload_index + iteration + primary_iterations) % 2 == 0;
                 let (rusthouse, clickhouse) =
                     execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
                 accept_timed_pair(

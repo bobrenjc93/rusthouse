@@ -5,53 +5,84 @@ use crate::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 
+/// A parsed SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// A `CREATE TABLE` statement.
     CreateTable {
+        /// The new table name.
         name: String,
+        /// The table's ordered column definitions.
         columns: Vec<ColumnDef>,
     },
+    /// An `INSERT INTO ... VALUES` statement.
     Insert {
+        /// The target table name.
         table: String,
+        /// Rows of literal values in schema order.
         rows: Vec<Vec<Value>>,
     },
+    /// A `SELECT` statement.
     Select(Select),
 }
 
+/// A parsed `SELECT` query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// Projected columns and aggregate expressions.
     pub items: Vec<SelectItem>,
+    /// The source table name.
     pub table: String,
+    /// An optional `WHERE` expression.
     pub predicate: Option<Predicate>,
+    /// Column names in the `GROUP BY` clause.
     pub group_by: Vec<String>,
+    /// Result-column ordering terms.
     pub order_by: Vec<OrderBy>,
+    /// Maximum number of rows to return.
     pub limit: Option<usize>,
 }
 
+/// One expression in a `SELECT` projection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
+    /// All source-table columns in schema order.
     Wildcard,
+    /// A source-table column.
     Column {
+        /// The source column name.
         name: String,
+        /// An optional output name.
         alias: Option<String>,
     },
+    /// An aggregate expression.
     Aggregate {
+        /// The aggregate operation.
         function: AggregateFunction,
+        /// The aggregate input.
         argument: AggregateArgument,
+        /// An optional output name.
         alias: Option<String>,
     },
 }
 
+/// A supported aggregate function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFunction {
+    /// Count input rows or non-null column values.
     Count,
+    /// Sum numeric input values.
     Sum,
+    /// Return the least input value.
     Min,
+    /// Return the greatest input value.
     Max,
+    /// Return the arithmetic mean of numeric input values.
     Avg,
 }
 
 impl AggregateFunction {
+    /// Returns the canonical uppercase SQL function name.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -75,46 +106,77 @@ impl AggregateFunction {
     }
 }
 
+/// The input to an aggregate function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArgument {
+    /// The `*` input accepted by `COUNT(*)`.
     Wildcard,
+    /// A source-column name.
     Column(String),
 }
 
+/// A Boolean expression in a `WHERE` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
+    /// A comparison between two operands.
     Comparison {
+        /// The left-hand operand.
         left: Operand,
+        /// The comparison operation.
         operator: ComparisonOperator,
+        /// The right-hand operand.
         right: Operand,
     },
+    /// A conjunction that requires both predicates to match.
     And(Box<Self>, Box<Self>),
+    /// A disjunction that requires either predicate to match.
     Or(Box<Self>, Box<Self>),
 }
 
+/// One side of a comparison predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
+    /// A source-column name.
     Column(String),
+    /// A literal scalar value.
     Literal(Value),
 }
 
+/// A supported comparison operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOperator {
+    /// Equality (`=`).
     Equal,
+    /// Inequality (`!=` or `<>`).
     NotEqual,
+    /// Strictly less than (`<`).
     Less,
+    /// Less than or equal to (`<=`).
     LessOrEqual,
+    /// Strictly greater than (`>`).
     Greater,
+    /// Greater than or equal to (`>=`).
     GreaterOrEqual,
 }
 
+/// One term in an `ORDER BY` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBy {
+    /// The output column name or alias.
     pub name: String,
+    /// Whether to sort in descending rather than ascending order.
     pub descending: bool,
 }
 
 /// Parse one or more semicolon-separated SQL statements.
+///
+/// Parsing consumes the complete input before returning any statement, making
+/// it suitable for the parse-first batch behavior of
+/// [`Database::execute`](crate::Database::execute).
+///
+/// # Errors
+///
+/// Returns [`Error::Sql`] when the input contains invalid or unsupported SQL.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
     let tokens = Lexer::new(input).tokenize()?;
     Parser::new(tokens).parse_script()

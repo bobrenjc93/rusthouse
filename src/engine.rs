@@ -16,33 +16,46 @@ pub struct Database {
     catalog: Catalog,
 }
 
+/// Metadata for one output column in a [`QueryResult`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
+    /// The column name or projection alias.
     pub name: String,
+    /// The data type shared by every value in the column.
     pub data_type: DataType,
 }
 
+/// The columns and materialized rows returned by a `SELECT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
+    /// Output column metadata, in projection order.
     pub columns: Vec<ResultColumn>,
+    /// Result rows, with values in the same order as [`Self::columns`].
     pub rows: Vec<Vec<Value>>,
 }
 
+/// The result of one successfully executed SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementResult {
+    /// A data-definition or data-modification acknowledgement.
     Command {
+        /// A stable command name such as `"CREATE TABLE"` or `"INSERT"`.
         tag: &'static str,
+        /// The number of rows changed by the command.
         affected_rows: usize,
     },
+    /// The structured output from a `SELECT` statement.
     Query(QueryResult),
 }
 
 impl Database {
+    /// Creates an empty database.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the database's table catalog.
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
@@ -53,6 +66,44 @@ impl Database {
     /// The complete batch is parsed before execution, so a syntax error applies
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
+    ///
+    /// Every multi-row `INSERT` is validated in full before any row is added.
+    ///
+    /// # Errors and batch behavior
+    ///
+    /// ```
+    /// use rusthouse::{Database, Error};
+    ///
+    /// let mut database = Database::new();
+    ///
+    /// // A parse error prevents every statement in the batch from running.
+    /// let error = database
+    ///     .execute("CREATE TABLE not_created (id Int64); this is not SQL")
+    ///     .expect_err("invalid SQL should fail");
+    /// assert!(matches!(error, Error::Sql { .. }));
+    /// assert!(matches!(
+    ///     database.catalog().table("not_created"),
+    ///     Err(Error::TableNotFound(_))
+    /// ));
+    ///
+    /// // After parsing, completed statements remain applied on a later error.
+    /// let error = database
+    ///     .execute(
+    ///         "CREATE TABLE retained (id Int64);
+    ///          INSERT INTO retained VALUES ('wrong type');",
+    ///     )
+    ///     .expect_err("the INSERT should fail");
+    /// assert!(matches!(error, Error::TypeMismatch { .. }));
+    /// assert_eq!(database.catalog().table("retained")?.row_count(), 0);
+    ///
+    /// // A bad row rejects its complete multi-row INSERT.
+    /// let error = database
+    ///     .execute("INSERT INTO retained VALUES (1), ('wrong type')")
+    ///     .expect_err("the batch should fail validation");
+    /// assert!(matches!(error, Error::TypeMismatch { .. }));
+    /// assert_eq!(database.catalog().table("retained")?.row_count(), 0);
+    /// # Ok::<(), rusthouse::Error>(())
+    /// ```
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         sql::parse(sql)?
             .into_iter()
