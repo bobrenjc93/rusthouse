@@ -6,6 +6,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- streaming `COPY table [(columns)] FROM 'path' FORMAT CSV` bulk ingestion
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -57,6 +58,21 @@ printf '%s\n' \
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
+## CSV COPY
+
+CSV COPY reads directly from a file and converts each field to its target column's exact declared type:
+
+~~~sql
+CREATE TABLE events (id Int64, label String, active Bool, score Float64);
+COPY events FROM '/data/events.csv' FORMAT CSV;
+~~~
+
+The first CSV record is required to be a header and must match the table's column order. An explicit column list can reorder the input, for example `COPY events (label, id, score, active) ...`; it must name every table column exactly once because RustHouse has no NULL or default values. Header matching follows SQL's case-insensitive identifier rules.
+
+Fields follow standard CSV quoting: quoted fields may contain commas, newlines, and doubled quotes. Int64 and Float64 use checked Rust numeric parsing, non-finite floats are rejected, Bool accepts case-insensitive `true` or `false`, and String preserves the decoded field exactly. Whitespace is not trimmed.
+
+COPY streams records and commits atomic batches of 1,024 rows. If file I/O, CSV syntax, row width, or type conversion fails, all prior complete batches remain in the table and the current incomplete batch is discarded. The error identifies the CSV record; record 1 is the header. COPY is not a whole-file transaction.
+
 ## Library API
 
 Database retains an in-memory catalog across calls and returns structured results:
@@ -81,7 +97,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended; COPY has the fixed-batch partial-failure behavior described above.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

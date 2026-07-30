@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::catalog::Catalog;
+use crate::csv_copy;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
@@ -52,7 +53,8 @@ impl Database {
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
     /// nothing. Once parsing succeeds, statements execute in order and earlier
-    /// statements remain applied if a later execution error occurs.
+    /// statements remain applied if a later execution error occurs. COPY also
+    /// retains its completed 1,024-row batches if a later CSV record fails.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         sql::parse(sql)?
             .into_iter()
@@ -83,6 +85,18 @@ impl Database {
                 }
                 Ok(StatementResult::Command {
                     tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::Copy {
+                table,
+                columns,
+                path,
+            } => {
+                let target = self.catalog.table_mut(&table)?;
+                let affected_rows = csv_copy::copy_from_path(target, columns.as_deref(), &path)?;
+                Ok(StatementResult::Command {
+                    tag: "COPY",
                     affected_rows,
                 })
             }

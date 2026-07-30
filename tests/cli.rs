@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -91,6 +92,41 @@ fn stdin_and_csv_output_work_together() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 stdout"),
         "label,active\n\"hello, world\",true\n"
+    );
+}
+
+#[test]
+fn copy_imports_a_csv_file_and_reports_affected_rows() {
+    let path = std::env::temp_dir().join(format!("rusthouse-cli-copy-{}.csv", std::process::id()));
+    fs::write(&path, "id,label\n2,\"hello, world\"\n1,first\n").expect("write CSV");
+    let sql_path = path
+        .to_str()
+        .expect("temporary path is UTF-8")
+        .replace('\'', "''");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=csv",
+            "--execute",
+            &format!(
+                "CREATE TABLE imported (id Int64, label String);
+                 COPY imported FROM '{sql_path}' FORMAT CSV;
+                 SELECT id, label FROM imported ORDER BY id"
+            ),
+        ])
+        .output()
+        .expect("run CLI");
+    let _ = fs::remove_file(path);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "id,label\n1,first\n2,\"hello, world\"\n"
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("COPY 2")
     );
 }
 

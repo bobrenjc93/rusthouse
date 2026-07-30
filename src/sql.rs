@@ -15,6 +15,11 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
+    Copy {
+        table: String,
+        columns: Option<Vec<String>>,
+        path: String,
+    },
     Select(Select),
 }
 
@@ -376,10 +381,12 @@ impl Parser {
             self.parse_create()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
+        } else if self.eat_keyword("COPY") {
+            self.parse_copy()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, COPY, or SELECT")
         }
     }
 
@@ -439,6 +446,37 @@ impl Parser {
             }
         }
         Ok(Statement::Insert { table, rows })
+    }
+
+    fn parse_copy(&mut self) -> Result<Statement> {
+        let table = self.expect_identifier("table name")?;
+        let columns = if self.eat(&TokenKind::LeftParen) {
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.expect_identifier("COPY column name")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after COPY columns")?;
+            Some(columns)
+        } else {
+            None
+        };
+        self.expect_keyword("FROM")?;
+        let path = if let TokenKind::String(path) = self.peek().clone() {
+            self.current += 1;
+            path
+        } else {
+            return self.error("expected file path string after FROM");
+        };
+        self.expect_keyword("FORMAT")?;
+        self.expect_keyword("CSV")?;
+        Ok(Statement::Copy {
+            table,
+            columns,
+            path,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -782,6 +820,21 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_copy_with_an_optional_column_order() {
+        let statements =
+            parse("COPY events (label, id) FROM '/tmp/events.csv' FORMAT CSV").expect("valid copy");
+
+        assert_eq!(
+            statements,
+            vec![Statement::Copy {
+                table: "events".to_owned(),
+                columns: Some(vec!["label".to_owned(), "id".to_owned()]),
+                path: "/tmp/events.csv".to_owned(),
+            }]
+        );
     }
 
     #[test]
