@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::aggregate::{DEFAULT_HLL_PRECISION, HyperLogLog, MAX_HLL_PRECISION, MIN_HLL_PRECISION};
+use crate::aggregate::{
+    DEFAULT_HLL_PRECISION, HyperLogLog, MAX_HLL_PRECISION, MIN_HLL_PRECISION, register_bytes,
+};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
@@ -10,6 +12,8 @@ use crate::sql::{
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
+
+const MAX_HLL_REGISTER_BYTES_PER_QUERY: usize = 16 * 1024 * 1024;
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
@@ -99,6 +103,17 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
+        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let (items, result_columns, aggregate_specs) =
+            resolve_select_items(table, &select.items, &group_columns)?;
+        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        if select.limit == Some(0) {
+            return Ok(QueryResult {
+                columns: result_columns,
+                rows: Vec::new(),
+            });
+        }
+
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
@@ -106,11 +121,6 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -153,6 +163,58 @@ struct AggregateSpec {
     argument: Option<usize>,
     input_type: Option<DataType>,
     precision: Option<u8>,
+}
+
+impl AggregateSpec {
+    fn hll_register_bytes(&self) -> usize {
+        self.precision.map_or(0, register_bytes)
+    }
+}
+
+#[derive(Debug)]
+struct HllMemoryBudget {
+    register_bytes_per_group: usize,
+    group_count: usize,
+}
+
+impl HllMemoryBudget {
+    fn new(specs: &[AggregateSpec]) -> Result<Self> {
+        let register_bytes_per_group = specs.iter().try_fold(0_usize, |total, spec| {
+            total.checked_add(spec.hll_register_bytes()).ok_or_else(|| {
+                Error::InvalidQuery(
+                    "APPROX_COUNT_DISTINCT register memory calculation overflowed".to_owned(),
+                )
+            })
+        })?;
+        Ok(Self {
+            register_bytes_per_group,
+            group_count: 0,
+        })
+    }
+
+    fn reserve_group(&mut self) -> Result<()> {
+        let group_count = self.group_count.checked_add(1).ok_or_else(|| {
+            Error::InvalidQuery("APPROX_COUNT_DISTINCT group count overflowed".to_owned())
+        })?;
+        let requested = self
+            .register_bytes_per_group
+            .checked_mul(group_count)
+            .ok_or_else(|| {
+                Error::InvalidQuery(
+                    "APPROX_COUNT_DISTINCT register memory calculation overflowed".to_owned(),
+                )
+            })?;
+        if requested > MAX_HLL_REGISTER_BYTES_PER_QUERY {
+            return Err(Error::InvalidQuery(format!(
+                "APPROX_COUNT_DISTINCT states require {requested} register bytes across \
+                 {group_count} groups; the per-query limit is \
+                 {MAX_HLL_REGISTER_BYTES_PER_QUERY} bytes; lower precision, reduce grouping \
+                 cardinality, or use fewer approximate aggregates"
+            )));
+        }
+        self.group_count = group_count;
+        Ok(())
+    }
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -352,24 +414,27 @@ fn execute_grouped<'a>(
 ) -> Result<GroupedData<'a>> {
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
+    let mut hll_memory = HllMemoryBudget::new(aggregate_specs)?;
+    if group_columns.is_empty() {
+        hll_memory.reserve_group()?;
+    }
     let initial_capacity = matching_rows.len().min(1_024);
-    let mut aggregate_states = aggregate_specs
-        .iter()
-        .map(|spec| {
-            let mut states = Vec::with_capacity(initial_capacity);
-            if group_columns.is_empty() {
-                states.push(AggregateState::new(spec));
-            }
-            states
-        })
-        .collect::<Vec<_>>();
+    let mut aggregate_states = Vec::with_capacity(aggregate_specs.len());
+    for spec in aggregate_specs {
+        let mut states = Vec::with_capacity(initial_capacity);
+        if group_columns.is_empty() {
+            states.push(AggregateState::new(spec)?);
+        }
+        aggregate_states.push(states);
+    }
 
     for row in matching_rows {
         let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
         if inserted {
+            hll_memory.reserve_group()?;
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
-                states.push(AggregateState::new(spec));
+                states.push(AggregateState::new(spec)?);
             }
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -559,12 +624,12 @@ enum AggregateState {
 }
 
 impl AggregateState {
-    fn new(spec: &AggregateSpec) -> Self {
-        match spec.function {
+    fn new(spec: &AggregateSpec) -> Result<Self> {
+        let state = match spec.function {
             AggregateFunction::Count => Self::Count(0),
             AggregateFunction::ApproxCountDistinct => Self::ApproxCountDistinct(HyperLogLog::new(
                 spec.precision.expect("validated HLL precision"),
-            )),
+            )?),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
@@ -573,7 +638,8 @@ impl AggregateState {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
-        }
+        };
+        Ok(state)
     }
 
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {

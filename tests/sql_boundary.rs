@@ -427,6 +427,54 @@ fn approximate_distinct_validates_precision_and_argument_shape() {
 }
 
 #[test]
+fn approximate_distinct_bounds_query_wide_register_memory() {
+    let values = (0..512)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE cardinalities (id Int64); \
+             INSERT INTO cardinalities VALUES {values};"
+        ))
+        .expect("setup succeeds");
+
+    let limited = execute_query(
+        &mut database,
+        "SELECT id, APPROX_COUNT_DISTINCT(id, 18) AS distinct_ids
+         FROM cardinalities GROUP BY id LIMIT 0;",
+    );
+    assert!(limited.rows.is_empty());
+
+    let grouped_error = database
+        .execute(
+            "SELECT id, APPROX_COUNT_DISTINCT(id, 18) AS distinct_ids
+             FROM cardinalities GROUP BY id;",
+        )
+        .expect_err("dense grouped states must respect the memory limit");
+    assert!(matches!(
+        grouped_error,
+        Error::InvalidQuery(message)
+            if message.contains("per-query limit is 16777216 bytes")
+                && message.contains("lower precision")
+    ));
+
+    let repeated = std::iter::repeat_n("APPROX_COUNT_DISTINCT(id, 18)", 65)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let repeated_error = database
+        .execute(&format!("SELECT {repeated} FROM cardinalities"))
+        .expect_err("all approximate states count toward one query budget");
+    assert!(matches!(
+        repeated_error,
+        Error::InvalidQuery(message)
+            if message.contains("per-query limit is 16777216 bytes")
+                && message.contains("fewer approximate aggregates")
+    ));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database

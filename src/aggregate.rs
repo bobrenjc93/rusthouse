@@ -20,12 +20,20 @@ pub(crate) struct HyperLogLog {
 }
 
 impl HyperLogLog {
-    pub(crate) fn new(precision: u8) -> Self {
+    pub(crate) fn new(precision: u8) -> Result<Self> {
         debug_assert!((MIN_HLL_PRECISION..=MAX_HLL_PRECISION).contains(&precision));
-        Self {
+        let register_count = register_bytes(precision);
+        let mut registers = Vec::new();
+        registers.try_reserve_exact(register_count).map_err(|_| {
+            Error::InvalidQuery(format!(
+                "unable to allocate {register_count} bytes for APPROX_COUNT_DISTINCT state"
+            ))
+        })?;
+        registers.resize(register_count, 0);
+        Ok(Self {
             precision,
-            registers: vec![0; 1_usize << precision].into_boxed_slice(),
-        }
+            registers: registers.into_boxed_slice(),
+        })
     }
 
     pub(crate) fn insert(&mut self, value: ValueRef<'_>) {
@@ -88,6 +96,10 @@ impl HyperLogLog {
     fn register_storage_bytes(&self) -> usize {
         self.registers.len() * std::mem::size_of::<u8>()
     }
+}
+
+pub(crate) fn register_bytes(precision: u8) -> usize {
+    1_usize << precision
 }
 
 fn alpha(register_count: usize) -> f64 {
@@ -173,7 +185,7 @@ mod tests {
 
     #[test]
     fn duplicates_and_small_cardinalities_use_linear_counting() {
-        let mut state = HyperLogLog::new(DEFAULT_HLL_PRECISION);
+        let mut state = HyperLogLog::new(DEFAULT_HLL_PRECISION).expect("state allocation");
         for _ in 0..100 {
             for value in [11, 22, 33] {
                 state.insert(ValueRef::Int64(value));
@@ -182,6 +194,7 @@ mod tests {
         assert_eq!(state.estimate().expect("estimate"), 3);
         assert_eq!(
             HyperLogLog::new(DEFAULT_HLL_PRECISION)
+                .expect("state allocation")
                 .estimate()
                 .expect("empty estimate"),
             0
@@ -190,9 +203,9 @@ mod tests {
 
     #[test]
     fn merge_matches_single_state_and_rejects_different_precision() {
-        let mut combined = HyperLogLog::new(10);
-        let mut left = HyperLogLog::new(10);
-        let mut right = HyperLogLog::new(10);
+        let mut combined = HyperLogLog::new(10).expect("state allocation");
+        let mut left = HyperLogLog::new(10).expect("state allocation");
+        let mut right = HyperLogLog::new(10).expect("state allocation");
         for value in 0..20_000 {
             combined.insert(ValueRef::Int64(value));
             if value % 2 == 0 {
@@ -203,13 +216,16 @@ mod tests {
         }
         left.merge(&right).expect("matching states merge");
         assert_eq!(left, combined);
-        assert!(left.merge(&HyperLogLog::new(11)).is_err());
+        assert!(
+            left.merge(&HyperLogLog::new(11).expect("state allocation"))
+                .is_err()
+        );
     }
 
     #[test]
     fn estimate_is_deterministic_and_within_the_expected_error_envelope() {
-        let mut forward = HyperLogLog::new(DEFAULT_HLL_PRECISION);
-        let mut reverse = HyperLogLog::new(DEFAULT_HLL_PRECISION);
+        let mut forward = HyperLogLog::new(DEFAULT_HLL_PRECISION).expect("state allocation");
+        let mut reverse = HyperLogLog::new(DEFAULT_HLL_PRECISION).expect("state allocation");
         for value in 0..100_000 {
             forward.insert(ValueRef::Int64(value));
         }
@@ -228,7 +244,7 @@ mod tests {
 
     #[test]
     fn register_storage_is_fixed_by_precision() {
-        let mut state = HyperLogLog::new(9);
+        let mut state = HyperLogLog::new(9).expect("state allocation");
         let bytes = state.register_storage_bytes();
         assert_eq!(bytes, 1 << 9);
         for value in 0..1_000_000 {
@@ -239,7 +255,7 @@ mod tests {
 
     #[test]
     fn estimates_are_checked_before_int64_conversion() {
-        let mut state = HyperLogLog::new(MIN_HLL_PRECISION);
+        let mut state = HyperLogLog::new(MIN_HLL_PRECISION).expect("state allocation");
         state.registers.fill(u8::MAX);
         assert!(matches!(state.estimate(), Err(Error::NumericOverflow(_))));
     }
