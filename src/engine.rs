@@ -7,7 +7,7 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -102,7 +102,7 @@ impl Database {
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(table, *row).is_true())
             })
             .collect::<Vec<_>>();
 
@@ -276,7 +276,10 @@ fn resolve_select_items(
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+        && !matches!(
+            input_type.map(DataType::underlying),
+            Some(DataType::Int64 | DataType::Float64)
+        )
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
@@ -291,10 +294,12 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => DataType::Float64,
-        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
-            input_type.expect("validated column argument")
-        }
+        AggregateFunction::Avg => DataType::Nullable(crate::value::ScalarType::Float64),
+        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => input_type
+            .expect("validated column argument")
+            .underlying()
+            .nullable()
+            .expect("aggregate input is a scalar column"),
     }
 }
 
@@ -524,8 +529,8 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
+    SumInt { sum: i64, seen: bool },
+    SumFloat { sum: f64, seen: bool },
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
@@ -536,11 +541,23 @@ impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum
+                if spec.input_type.map(DataType::underlying) == Some(DataType::Int64) =>
+            {
+                Self::SumInt {
+                    sum: 0,
+                    seen: false,
+                }
+            }
+            AggregateFunction::Sum => Self::SumFloat {
+                sum: 0.0,
+                seen: false,
+            },
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+            AggregateFunction::Avg
+                if spec.input_type.map(DataType::underlying) == Some(DataType::Int64) =>
+            {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
@@ -548,35 +565,44 @@ impl AggregateState {
     }
 
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        let argument = spec
+            .argument
+            .map(|column| table.columns()[column].value_ref(row));
         match self {
             Self::Count(count) => {
+                if argument.is_some_and(ValueRef::is_null) {
+                    return Ok(());
+                }
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
-            Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
+            Self::SumInt { sum, seen } => {
+                let Some(ValueRef::Int64(value)) = argument else {
+                    debug_assert!(argument.is_some_and(ValueRef::is_null));
+                    return Ok(());
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(value)
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                *seen = true;
             }
-            Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
+            Self::SumFloat { sum, seen } => {
+                let Some(ValueRef::Float64(value)) = argument else {
+                    debug_assert!(argument.is_some_and(ValueRef::is_null));
+                    return Ok(());
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
+                *seen = true;
             }
             Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
+                let candidate = argument.expect("MIN has a column argument");
+                if candidate.is_null() {
+                    return Ok(());
+                }
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -585,8 +611,10 @@ impl AggregateState {
                 }
             }
             Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
+                let candidate = argument.expect("MAX has a column argument");
+                if candidate.is_null() {
+                    return Ok(());
+                }
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -595,24 +623,23 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
-                else {
-                    unreachable!("AVG input type is resolved")
+                let Some(ValueRef::Int64(value)) = argument else {
+                    debug_assert!(argument.is_some_and(ValueRef::is_null));
+                    return Ok(());
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
-                else {
-                    unreachable!("AVG input type is resolved")
+                let Some(ValueRef::Float64(value)) = argument else {
+                    debug_assert!(argument.is_some_and(ValueRef::is_null));
+                    return Ok(());
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -626,22 +653,20 @@ impl AggregateState {
 
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt { sum, seen: true } => Ok(Value::Int64(sum)),
+            Self::SumFloat { sum, seen: true } => Ok(Value::Float64(sum)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
-            )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::SumInt { seen: false, .. }
+            | Self::SumFloat { seen: false, .. }
+            | Self::Min(None)
+            | Self::Max(None)
+            | Self::AvgInt { .. }
+            | Self::AvgFloat { .. } => Ok(Value::Null),
         }
     }
 }
@@ -702,13 +727,13 @@ fn order_source_rows(
             let ResolvedItem::Column { source, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
+            let comparison = compare_order_values(
+                table.columns()[source].value_ref(left),
+                table.columns()[source].value_ref(right),
+                order.descending,
+            );
             if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
+                return comparison;
             }
         }
         left.cmp(&right)
@@ -724,31 +749,47 @@ fn order_grouped_rows(
 ) {
     sort_and_limit(groups, limit, |left, right| {
         for order in ordering {
-            let comparison = match items[order.output] {
+            let (left_value, right_value) = match items[order.output] {
                 ResolvedItem::Column {
                     group_position: Some(position),
                     ..
-                } => data.keys[left]
-                    .value(position)
-                    .cmp(&data.keys[right].value(position)),
+                } => (
+                    data.keys[left].value(position),
+                    data.keys[right].value(position),
+                ),
                 ResolvedItem::Column {
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
-                ResolvedItem::Aggregate { state } => {
-                    data.aggregates[state][left].cmp(&data.aggregates[state][right])
-                }
+                ResolvedItem::Aggregate { state } => (
+                    data.aggregates[state][left].as_ref(),
+                    data.aggregates[state][right].as_ref(),
+                ),
             };
+            let comparison = compare_order_values(left_value, right_value, order.descending);
             if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
+                return comparison;
             }
         }
         data.keys[left].cmp(&data.keys[right])
     });
+}
+
+/// NULL sorts after non-NULL values for both directions, matching ClickHouse's default.
+fn compare_order_values(left: ValueRef<'_>, right: ValueRef<'_>, descending: bool) -> Ordering {
+    match (left.is_null(), right.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            let comparison = left.cmp(&right);
+            if descending {
+                comparison.reverse()
+            } else {
+                comparison
+            }
+        }
+    }
 }
 
 fn sort_and_limit(
@@ -774,12 +815,16 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    IsNull {
+        operand: CompiledOperand,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, table: &Table, row: usize) -> TruthValue {
         match self {
             Self::Comparison {
                 left,
@@ -788,21 +833,59 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
-                match operator {
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return TruthValue::Unknown;
+                };
+                TruthValue::from(match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
                     ComparisonOperator::Less => comparison == Ordering::Less,
                     ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
                     ComparisonOperator::Greater => comparison == Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
-                }
+                })
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::IsNull { operand, negated } => {
+                TruthValue::from(operand.value(table, row).is_null() != *negated)
+            }
+            Self::And(left, right) => left.evaluate(table, row).and(right.evaluate(table, row)),
+            Self::Or(left, right) => left.evaluate(table, row).or(right.evaluate(table, row)),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruthValue {
+    True,
+    False,
+    Unknown,
+}
+
+impl TruthValue {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn is_true(self) -> bool {
+        self == Self::True
+    }
+}
+
+impl From<bool> for TruthValue {
+    fn from(value: bool) -> Self {
+        if value { Self::True } else { Self::False }
     }
 }
 
@@ -850,6 +933,10 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::IsNull { operand, negated } => Ok(CompiledPredicate::IsNull {
+            operand: compile_operand(table, operand)?,
+            negated: *negated,
+        }),
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
@@ -875,9 +962,11 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
 }
 
 fn comparable(left: DataType, right: DataType) -> bool {
-    left == right
+    left == DataType::Null
+        || right == DataType::Null
+        || left.underlying() == right.underlying()
         || matches!(
-            (left, right),
+            (left.underlying(), right.underlying()),
             (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
         )
 }

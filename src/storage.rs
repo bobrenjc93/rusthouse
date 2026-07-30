@@ -11,16 +11,64 @@ pub struct ColumnDef {
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
+    name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+        || name.eq_ignore_ascii_case("NULL")
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// A compact, one-bit-per-row map in which set bits denote non-NULL values.
+#[derive(Debug, Clone, Default)]
+pub struct ValidityBitmap {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl ValidityBitmap {
+    fn push(&mut self, valid: bool) {
+        let bit = self.len % 8;
+        if bit == 0 {
+            self.bytes.push(0);
+        }
+        if valid {
+            let byte = self.bytes.last_mut().expect("a byte was just allocated");
+            *byte |= 1 << bit;
+        }
+        self.len += 1;
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, row: usize) -> bool {
+        assert!(row < self.len, "validity bitmap row out of bounds");
+        self.bytes[row / 8] & (1 << (row % 8)) != 0
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A physical column. Scalar values stay contiguous; nullable columns add a bitmap.
 #[derive(Debug, Clone)]
 pub enum Column {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
+    Nullable {
+        values: Box<Column>,
+        validity: ValidityBitmap,
+    },
 }
 
 impl Column {
@@ -31,6 +79,11 @@ impl Column {
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
+            DataType::Nullable(scalar) => Self::Nullable {
+                values: Box::new(Self::new(scalar.data_type())),
+                validity: ValidityBitmap::default(),
+            },
+            DataType::Null => unreachable!("NULL is not a physical column type"),
         }
     }
 
@@ -41,6 +94,10 @@ impl Column {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Nullable { values, .. } => values
+                .data_type()
+                .nullable()
+                .expect("nullable storage contains a scalar column"),
         }
     }
 
@@ -51,6 +108,10 @@ impl Column {
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
+            Self::Nullable { values, validity } => {
+                debug_assert_eq!(values.len(), validity.len());
+                values.len()
+            }
         }
     }
 
@@ -70,11 +131,14 @@ impl Column {
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
+            Self::Nullable { values, validity } => {
+                if validity.is_valid(row) {
+                    values.value_ref(row)
+                } else {
+                    ValueRef::Null
+                }
+            }
         }
-    }
-
-    pub(crate) fn cmp_at(&self, left: usize, right: usize) -> std::cmp::Ordering {
-        self.value_ref(left).cmp(&self.value_ref(right))
     }
 
     fn push(&mut self, value: Value) {
@@ -83,7 +147,25 @@ impl Column {
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Nullable { values, validity }, Value::Null) => {
+                values.push_default();
+                validity.push(false);
+            }
+            (Self::Nullable { values, validity }, value) => {
+                values.push(value);
+                validity.push(true);
+            }
             _ => unreachable!("values are validated before insertion"),
+        }
+    }
+
+    fn push_default(&mut self) {
+        match self {
+            Self::Int64(values) => values.push(0),
+            Self::Float64(values) => values.push(0.0),
+            Self::Bool(values) => values.push(false),
+            Self::String(values) => values.push(String::new()),
+            Self::Nullable { .. } => unreachable!("nested nullable columns are not supported"),
         }
     }
 }
@@ -106,6 +188,11 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
+            if field.data_type == DataType::Null {
+                return Err(Error::InvalidQuery(
+                    "NULL is a literal, not a column type".to_owned(),
+                ));
+            }
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
@@ -169,11 +256,17 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            let value_type = value.data_type();
+            let valid_type = if value_type == DataType::Null {
+                field.data_type.is_nullable()
+            } else {
+                field.data_type.underlying() == value_type
+            };
+            if !valid_type {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: value_type.to_string(),
                 });
             }
             if matches!(value, Value::Float64(number) if !number.is_finite()) {
@@ -240,5 +333,40 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn nullable_columns_pack_validity_into_bits() {
+        let mut table = Table::new(
+            "samples".to_owned(),
+            vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::Int64.nullable().expect("scalar type"),
+            }],
+        )
+        .expect("valid schema");
+
+        for value in [
+            Value::Int64(1),
+            Value::Null,
+            Value::Int64(3),
+            Value::Null,
+            Value::Null,
+            Value::Int64(6),
+            Value::Null,
+            Value::Int64(8),
+            Value::Int64(9),
+        ] {
+            table.insert_row(vec![value]).expect("valid row");
+        }
+
+        let Column::Nullable { values, validity } = &table.columns()[0] else {
+            panic!("nullable physical column")
+        };
+        assert!(
+            matches!(values.as_ref(), Column::Int64(values) if values == &[1, 0, 3, 0, 0, 6, 0, 8, 9])
+        );
+        assert_eq!(validity.len(), 9);
+        assert_eq!(validity.as_bytes(), &[0b1010_0101, 0b0000_0001]);
     }
 }

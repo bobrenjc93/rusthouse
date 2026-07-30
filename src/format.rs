@@ -123,10 +123,18 @@ fn render_csv(result: &QueryResult) -> String {
         result.columns.iter().map(|column| column.name.as_str()),
     );
     for row in &result.rows {
-        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
+        let values = row.iter().map(csv_value).collect::<Vec<_>>();
         write_csv_row(&mut output, values.iter().map(String::as_str));
     }
     output
+}
+
+fn csv_value(value: &Value) -> String {
+    if matches!(value, Value::Null) {
+        r"\N".to_owned()
+    } else {
+        value.as_display_string()
+    }
 }
 
 fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>) {
@@ -184,6 +192,7 @@ fn write_json_value(output: &mut String, value: &Value) {
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
+        Value::Null => output.push_str("null"),
     }
 }
 
@@ -295,5 +304,23 @@ mod tests {
         assert!(!rendered.contains('\u{07}'));
         assert!(!rendered.contains('\u{00}'));
         assert!(!rendered.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn renders_null_in_every_output_format() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::Int64.nullable().expect("scalar type"),
+            }],
+            rows: vec![vec![Value::Null]],
+        };
+
+        assert!(render(&result, OutputFormat::Table).contains("| NULL  |"));
+        assert_eq!(render(&result, OutputFormat::Csv), "value\n\\N\n");
+        assert_eq!(
+            render(&result, OutputFormat::Json),
+            r#"{"columns":[{"name":"value","type":"Nullable(Int64)"}],"rows":[[null]]}"#
+        );
     }
 }

@@ -2,13 +2,43 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+/// A scalar type that can be wrapped by [`DataType::Nullable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarType {
+    Int64,
+    Float64,
+    Bool,
+    String,
+}
+
+impl ScalarType {
+    #[must_use]
+    pub fn data_type(self) -> DataType {
+        match self {
+            Self::Int64 => DataType::Int64,
+            Self::Float64 => DataType::Float64,
+            Self::Bool => DataType::Bool,
+            Self::String => DataType::String,
+        }
+    }
+}
+
+impl fmt::Display for ScalarType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.data_type().fmt(f)
+    }
+}
+
+/// A physical column type supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Int64,
     Float64,
     Bool,
     String,
+    Nullable(ScalarType),
+    /// The type of an unbound NULL literal, never a physical column type.
+    Null,
 }
 
 impl DataType {
@@ -21,6 +51,36 @@ impl DataType {
             _ => None,
         }
     }
+
+    #[must_use]
+    pub fn nullable(self) -> Option<Self> {
+        self.scalar_type().map(Self::Nullable)
+    }
+
+    #[must_use]
+    pub fn scalar_type(self) -> Option<ScalarType> {
+        match self {
+            Self::Int64 => Some(ScalarType::Int64),
+            Self::Float64 => Some(ScalarType::Float64),
+            Self::Bool => Some(ScalarType::Bool),
+            Self::String => Some(ScalarType::String),
+            Self::Nullable(scalar) => Some(scalar),
+            Self::Null => None,
+        }
+    }
+
+    #[must_use]
+    pub fn underlying(self) -> Self {
+        match self {
+            Self::Nullable(scalar) => scalar.data_type(),
+            value => value,
+        }
+    }
+
+    #[must_use]
+    pub fn is_nullable(self) -> bool {
+        matches!(self, Self::Nullable(_))
+    }
 }
 
 impl fmt::Display for DataType {
@@ -30,6 +90,8 @@ impl fmt::Display for DataType {
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
+            Self::Nullable(scalar) => return write!(f, "Nullable({scalar})"),
+            Self::Null => "NULL",
         })
     }
 }
@@ -41,6 +103,7 @@ pub enum Value {
     Float64(f64),
     Bool(bool),
     String(String),
+    Null,
 }
 
 /// A non-owning scalar used while scanning immutable column storage.
@@ -50,6 +113,7 @@ pub(crate) enum ValueRef<'a> {
     Float64(f64),
     Bool(bool),
     String(&'a str),
+    Null,
 }
 
 impl Value {
@@ -60,6 +124,7 @@ impl Value {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Null => DataType::Null,
         }
     }
 
@@ -70,6 +135,7 @@ impl Value {
             Self::Float64(value) => format_float(*value),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Null => "NULL".to_owned(),
         }
     }
 
@@ -79,6 +145,7 @@ impl Value {
             Self::Float64(value) => ValueRef::Float64(*value),
             Self::Bool(value) => ValueRef::Bool(*value),
             Self::String(value) => ValueRef::String(value),
+            Self::Null => ValueRef::Null,
         }
     }
 
@@ -95,6 +162,7 @@ impl ValueRef<'_> {
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
             Self::String(value) => Value::String(value.to_owned()),
+            Self::Null => Value::Null,
         }
     }
 
@@ -108,8 +176,13 @@ impl ValueRef<'_> {
             }
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
+            (Self::Null, _) | (_, Self::Null) => None,
             _ => None,
         }
+    }
+
+    pub(crate) fn is_null(self) -> bool {
+        matches!(self, Self::Null)
     }
 
     fn variant_index(&self) -> u8 {
@@ -118,6 +191,7 @@ impl ValueRef<'_> {
             Self::Float64(_) => 1,
             Self::Bool(_) => 2,
             Self::String(_) => 3,
+            Self::Null => 4,
         }
     }
 }
@@ -210,6 +284,7 @@ impl Ord for ValueRef<'_> {
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
             (Self::String(left), Self::String(right)) => left.cmp(right),
+            (Self::Null, Self::Null) => Ordering::Equal,
             _ => self.variant_index().cmp(&other.variant_index()),
         }
     }
@@ -229,6 +304,7 @@ impl Hash for ValueRef<'_> {
             Self::Float64(value) => canonical_float_bits(*value).hash(state),
             Self::Bool(value) => value.hash(state),
             Self::String(value) => value.hash(state),
+            Self::Null => {}
         }
     }
 }

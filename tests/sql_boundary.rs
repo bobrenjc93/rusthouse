@@ -244,10 +244,10 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
         vec![
             DataType::String,
             DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Float64,
+            DataType::Int64.nullable().expect("scalar type"),
+            DataType::Int64.nullable().expect("scalar type"),
+            DataType::Int64.nullable().expect("scalar type"),
+            DataType::Float64.nullable().expect("scalar type"),
         ]
     );
     assert_eq!(
@@ -284,7 +284,7 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
