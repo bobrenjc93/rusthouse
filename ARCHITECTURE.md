@@ -17,6 +17,6 @@ Every feature should include end-to-end tests at the SQL boundary. Benchmarks sh
 High-cardinality grouping keeps its in-memory path until a fixed group-state
 budget is reached. Spill I/O is isolated from aggregate semantics: it owns
 deterministic hash partitions of row indices, recursive repartitioning,
-physical-allocation accounting, private file creation, and cleanup. Recursive
-partitions are consumed depth-first so the live file and path count is fixed
-independently of group cardinality.
+filesystem-unit-aware allocation and metadata accounting, private file
+creation, and cleanup. Recursive partitions are consumed depth-first so the
+live file and path count is fixed independently of group cardinality.

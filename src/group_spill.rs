@@ -15,8 +15,13 @@ const MAX_PARTITION_DEPTH: usize = 64;
 pub(crate) const MAX_LIVE_PARTITIONS: usize =
     1 + PARTITION_FANOUT + (PARTITION_FANOUT - 1) * MAX_PARTITION_DEPTH;
 pub(crate) const ROW_INDEX_BYTES: u64 = mem::size_of::<u64>() as u64;
-// Charge sparse files by allocation blocks, not only their eight-byte payloads.
-const ALLOCATION_UNIT_BYTES: u64 = 4 * 1024;
+// Reserve complete blocks for directory roots/indexes, file inodes/extent
+// metadata, and a worst-case directory leaf plus index split per live name.
+const WORKSPACE_METADATA_UNITS: u64 = 4;
+const FILE_METADATA_UNITS: u64 = 2;
+const DIRECTORY_ENTRY_UNITS: u64 = 2;
+#[cfg(not(any(unix, windows)))]
+const FALLBACK_ALLOCATION_UNIT_BYTES: u64 = 1024 * 1024;
 const WORKSPACE_CREATION_ATTEMPTS: usize = 128;
 
 #[derive(Debug)]
@@ -24,6 +29,7 @@ pub(crate) struct Partition {
     pub(crate) path: PathBuf,
     pub(crate) bytes: u64,
     allocated_bytes: u64,
+    file_slot: u64,
     depth: usize,
 }
 
@@ -32,7 +38,11 @@ pub(crate) struct TempWorkspace {
     path: Option<PathBuf>,
     limit_bytes: u64,
     used_bytes: u64,
+    allocation_unit_bytes: u64,
+    live_files: usize,
+    directory_slots: usize,
     next_file: u64,
+    free_file_slots: Vec<u64>,
 }
 
 impl TempWorkspace {
@@ -43,20 +53,34 @@ impl TempWorkspace {
                 error,
             )
         })?;
+        let allocation_unit_bytes = filesystem_allocation_unit(root)?;
+        Self::new_with_allocation_unit(root, limit_bytes, allocation_unit_bytes)
+    }
+
+    fn new_with_allocation_unit(
+        root: &Path,
+        limit_bytes: u64,
+        allocation_unit_bytes: u64,
+    ) -> Result<Self> {
+        let allocation_unit_bytes = allocation_unit_bytes.max(1);
+        let workspace_bytes = allocation_unit_bytes
+            .checked_mul(WORKSPACE_METADATA_UNITS)
+            .filter(|bytes| *bytes <= limit_bytes)
+            .ok_or(Error::TemporaryStorageLimit { limit_bytes })?;
         for _ in 0..WORKSPACE_CREATION_ATTEMPTS {
             let path = root.join(format!("rusthouse-group-{}", random_token()?));
             match create_private_directory(&path) {
                 Ok(()) => {
-                    let mut workspace = Self {
+                    let workspace = Self {
                         path: Some(path),
                         limit_bytes,
-                        used_bytes: 0,
+                        used_bytes: workspace_bytes,
+                        allocation_unit_bytes,
+                        live_files: 0,
+                        directory_slots: 0,
                         next_file: 0,
+                        free_file_slots: Vec::new(),
                     };
-                    if let Err(error) = workspace.reserve(ALLOCATION_UNIT_BYTES) {
-                        let _ = workspace.cleanup();
-                        return Err(error);
-                    }
                     return Ok(workspace);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -81,11 +105,20 @@ impl TempWorkspace {
         self.path.as_deref().expect("workspace is active")
     }
 
-    fn allocate_path(&mut self, depth: usize, bucket: usize) -> PathBuf {
-        let file = self.next_file;
-        self.next_file += 1;
-        self.path()
-            .join(format!("partition-{depth}-{bucket}-{file}.bin"))
+    fn allocate_path(&mut self) -> (u64, PathBuf) {
+        let file_slot = self.free_file_slots.pop().unwrap_or_else(|| {
+            let file_slot = self.next_file;
+            self.next_file += 1;
+            file_slot
+        });
+        (
+            file_slot,
+            self.path().join(format!("partition-{file_slot}.bin")),
+        )
+    }
+
+    fn recycle_file_slot(&mut self, file_slot: u64) {
+        self.free_file_slots.push(file_slot);
     }
 
     fn reserve(&mut self, bytes: u64) -> Result<()> {
@@ -103,6 +136,52 @@ impl TempWorkspace {
         Ok(())
     }
 
+    fn allocation_bytes(&self, units: u64) -> Result<u64> {
+        self.allocation_unit_bytes
+            .checked_mul(units)
+            .ok_or(Error::TemporaryStorageLimit {
+                limit_bytes: self.limit_bytes,
+            })
+    }
+
+    fn reserve_file(&mut self) -> Result<FileReservation> {
+        let file_bytes = self.allocation_bytes(1 + FILE_METADATA_UNITS)?;
+        let added_directory_slot = self.live_files == self.directory_slots;
+        let directory_bytes = if added_directory_slot {
+            self.allocation_bytes(DIRECTORY_ENTRY_UNITS)?
+        } else {
+            0
+        };
+        let reservation_bytes =
+            file_bytes
+                .checked_add(directory_bytes)
+                .ok_or(Error::TemporaryStorageLimit {
+                    limit_bytes: self.limit_bytes,
+                })?;
+        self.reserve(reservation_bytes)?;
+        self.live_files += 1;
+        if added_directory_slot {
+            self.directory_slots += 1;
+        }
+        Ok(FileReservation {
+            file_bytes,
+            directory_bytes,
+        })
+    }
+
+    fn rollback_file(&mut self, reservation: FileReservation) {
+        self.live_files -= 1;
+        if reservation.directory_bytes > 0 {
+            self.directory_slots -= 1;
+        }
+        self.release(reservation.file_bytes + reservation.directory_bytes);
+    }
+
+    fn release_file(&mut self, bytes: u64) {
+        self.live_files -= 1;
+        self.release(bytes);
+    }
+
     fn release(&mut self, bytes: u64) {
         self.used_bytes = self
             .used_bytes
@@ -117,7 +196,8 @@ impl TempWorkspace {
                 error,
             )
         })?;
-        self.release(partition.allocated_bytes);
+        self.recycle_file_slot(partition.file_slot);
+        self.release_file(partition.allocated_bytes);
         Ok(())
     }
 
@@ -142,6 +222,124 @@ impl TempWorkspace {
             )),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileReservation {
+    file_bytes: u64,
+    directory_bytes: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_allocation_unit(path: &Path) -> Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| Error::Io {
+        context: format!(
+            "could not inspect temporary filesystem for '{}'",
+            path.display()
+        ),
+        message: "path contains an interior NUL byte".to_owned(),
+    })?;
+    let mut statistics = mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: path is NUL-terminated and statistics points to writable storage.
+    let status = unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) };
+    if status != 0 {
+        return Err(io_error(
+            "could not inspect temporary filesystem allocation size".to_owned(),
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: a successful statvfs call initialized the output structure.
+    let statistics = unsafe { statistics.assume_init() };
+    let unit = if statistics.f_frsize > 0 {
+        statvfs_value_to_u64(statistics.f_frsize)
+    } else {
+        statvfs_value_to_u64(statistics.f_bsize)
+    };
+    Ok(unit.max(512))
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn statvfs_value_to_u64(value: libc::c_ulong) -> u64 {
+    value
+}
+
+#[cfg(all(unix, target_pointer_width = "32"))]
+fn statvfs_value_to_u64(value: libc::c_ulong) -> u64 {
+    u64::from(value)
+}
+
+#[cfg(windows)]
+fn filesystem_allocation_unit(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
+
+    let absolute = fs::canonicalize(path).map_err(|error| {
+        io_error(
+            format!(
+                "could not inspect temporary filesystem for '{}'",
+                path.display()
+            ),
+            error,
+        )
+    })?;
+    let path = absolute
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut volume_path = vec![0_u16; 32_768];
+    // SAFETY: both UTF-16 buffers are NUL-terminated/writable for the supplied lengths.
+    let status = unsafe {
+        GetVolumePathNameW(
+            path.as_ptr(),
+            volume_path.as_mut_ptr(),
+            volume_path.len() as u32,
+        )
+    };
+    if status == 0 {
+        return Err(io_error(
+            "could not resolve the temporary filesystem volume".to_owned(),
+            io::Error::last_os_error(),
+        ));
+    }
+
+    let mut sectors_per_cluster = 0_u32;
+    let mut bytes_per_sector = 0_u32;
+    let mut free_clusters = 0_u32;
+    let mut total_clusters = 0_u32;
+    // SAFETY: volume_path contains the NUL-terminated path returned above, and all outputs
+    // point to initialized writable integers.
+    let status = unsafe {
+        GetDiskFreeSpaceW(
+            volume_path.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if status == 0 {
+        return Err(io_error(
+            "could not inspect temporary filesystem allocation size".to_owned(),
+            io::Error::last_os_error(),
+        ));
+    }
+    u64::from(sectors_per_cluster)
+        .checked_mul(u64::from(bytes_per_sector))
+        .filter(|unit| *unit > 0)
+        .ok_or_else(|| Error::Io {
+            context: "could not inspect temporary filesystem allocation size".to_owned(),
+            message: "the volume reported an invalid allocation unit".to_owned(),
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_allocation_unit(_path: &Path) -> Result<u64> {
+    // Deliberately over-reserve where the standard library has no allocation query.
+    Ok(FALLBACK_ALLOCATION_UNIT_BYTES)
 }
 
 fn random_token() -> Result<String> {
@@ -204,6 +402,7 @@ struct PartitionOutput {
     writer: BufWriter<File>,
     bytes: u64,
     allocated_bytes: u64,
+    file_slot: u64,
 }
 
 struct PartitionWriters {
@@ -228,12 +427,13 @@ impl PartitionWriters {
         row: usize,
     ) -> Result<()> {
         if self.outputs[bucket].is_none() {
-            workspace.reserve(ALLOCATION_UNIT_BYTES)?;
-            let path = workspace.allocate_path(self.depth, bucket);
+            let reservation = workspace.reserve_file()?;
+            let (file_slot, path) = workspace.allocate_path();
             let file = match create_private_file(&path) {
                 Ok(file) => file,
                 Err(error) => {
-                    workspace.release(ALLOCATION_UNIT_BYTES);
+                    workspace.recycle_file_slot(file_slot);
+                    workspace.rollback_file(reservation);
                     return Err(io_error(
                         format!("could not create spill file '{}'", path.display()),
                         error,
@@ -244,7 +444,8 @@ impl PartitionWriters {
                 path,
                 writer: BufWriter::new(file),
                 bytes: 0,
-                allocated_bytes: ALLOCATION_UNIT_BYTES,
+                allocated_bytes: reservation.file_bytes,
+                file_slot,
             });
         }
         let output = self.outputs[bucket].as_mut().expect("output was created");
@@ -252,10 +453,16 @@ impl PartitionWriters {
             .bytes
             .checked_add(ROW_INDEX_BYTES)
             .expect("one partition cannot exceed the u64 storage counter");
-        let required_bytes = new_bytes
-            .div_ceil(ALLOCATION_UNIT_BYTES)
-            .checked_mul(ALLOCATION_UNIT_BYTES)
+        let payload_bytes = new_bytes
+            .div_ceil(workspace.allocation_unit_bytes)
+            .checked_mul(workspace.allocation_unit_bytes)
             .expect("rounded partition allocation fits in u64");
+        let required_bytes = workspace
+            .allocation_bytes(FILE_METADATA_UNITS)?
+            .checked_add(payload_bytes)
+            .ok_or(Error::TemporaryStorageLimit {
+                limit_bytes: workspace.limit_bytes,
+            })?;
         if required_bytes > output.allocated_bytes {
             let additional_bytes = required_bytes - output.allocated_bytes;
             workspace.reserve(additional_bytes)?;
@@ -282,6 +489,7 @@ impl PartitionWriters {
                 mut writer,
                 bytes,
                 allocated_bytes,
+                file_slot,
             } = output;
             writer.flush().map_err(|error| {
                 io_error(
@@ -293,6 +501,7 @@ impl PartitionWriters {
                 path,
                 bytes,
                 allocated_bytes,
+                file_slot,
                 depth: self.depth,
             });
         }
@@ -462,11 +671,18 @@ mod tests {
     }
 
     #[test]
-    fn allocation_accounting_bounds_files_and_uses_exclusive_private_creation() {
+    fn non_4k_allocation_accounting_bounds_files_and_uses_private_creation() {
+        const TEST_ALLOCATION_UNIT: u64 = 64 * 1024;
+        const ONE_FILE_LIMIT: u64 = TEST_ALLOCATION_UNIT
+            * (WORKSPACE_METADATA_UNITS + 1 + FILE_METADATA_UNITS + DIRECTORY_ENTRY_UNITS);
         let root = test_root("allocation");
         let mut workspace =
-            TempWorkspace::new(&root, ALLOCATION_UNIT_BYTES * 2).expect("create workspace");
-        assert_eq!(workspace.used_bytes, ALLOCATION_UNIT_BYTES);
+            TempWorkspace::new_with_allocation_unit(&root, ONE_FILE_LIMIT, TEST_ALLOCATION_UNIT)
+                .expect("create 64 KiB allocation workspace");
+        assert_eq!(
+            workspace.used_bytes,
+            TEST_ALLOCATION_UNIT * WORKSPACE_METADATA_UNITS
+        );
 
         #[cfg(unix)]
         {
@@ -485,8 +701,8 @@ mod tests {
         let mut writers = PartitionWriters::new(0);
         writers
             .write_row(&mut workspace, 0, 7)
-            .expect("one allocation unit remains");
-        assert_eq!(workspace.used_bytes, ALLOCATION_UNIT_BYTES * 2);
+            .expect("one file reservation remains");
+        assert_eq!(workspace.used_bytes, ONE_FILE_LIMIT);
         let file_path = writers.outputs[0]
             .as_ref()
             .expect("first partition exists")
@@ -517,11 +733,39 @@ mod tests {
                 .write_row(&mut workspace, 1, 8)
                 .expect_err("a second file exceeds the physical allocation budget"),
             Error::TemporaryStorageLimit {
-                limit_bytes: ALLOCATION_UNIT_BYTES * 2
+                limit_bytes: ONE_FILE_LIMIT
             }
         );
 
-        drop(writers);
+        let partition = writers.finish().expect("flush partition").pop().unwrap();
+        workspace
+            .remove_partition(&partition)
+            .expect("remove first partition");
+        assert_eq!(
+            workspace.used_bytes,
+            TEST_ALLOCATION_UNIT * (WORKSPACE_METADATA_UNITS + DIRECTORY_ENTRY_UNITS)
+        );
+
+        let mut replacement = PartitionWriters::new(1);
+        replacement
+            .write_row(&mut workspace, 0, 9)
+            .expect("released file allocation is reusable");
+        assert_eq!(
+            replacement.outputs[0]
+                .as_ref()
+                .expect("replacement partition")
+                .path,
+            file_path,
+            "reusing the same name bounds retained directory metadata"
+        );
+        let partition = replacement
+            .finish()
+            .expect("flush replacement")
+            .pop()
+            .unwrap();
+        workspace
+            .remove_partition(&partition)
+            .expect("remove replacement partition");
         workspace.cleanup().expect("clean workspace");
         fs::remove_dir(&root).expect("remove test root");
     }
@@ -542,8 +786,7 @@ mod tests {
     #[test]
     fn cleanup_failures_are_reported_and_drop_retries() {
         let root = test_root("cleanup");
-        let mut workspace =
-            TempWorkspace::new(&root, ALLOCATION_UNIT_BYTES).expect("create workspace");
+        let mut workspace = TempWorkspace::new(&root, u64::MAX).expect("create workspace");
         let workspace_path = workspace.path().to_owned();
         let moved_path = root.join("moved-workspace");
         fs::rename(&workspace_path, &moved_path).expect("move workspace");

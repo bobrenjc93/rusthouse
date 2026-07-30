@@ -63,8 +63,9 @@ The library exposes the same controls through DatabaseOptions. The defaults
 are 64 MiB of group state, the operating system temporary directory, and
 1 GiB of spill files per query. The temporary-directory limit counts only the
 active query workspace, not unrelated files under the configured root.
-Workspace and file usage is charged in conservative 4 KiB allocation units,
-including empty filesystem blocks rather than only row-index payload bytes.
+RustHouse queries the filesystem allocation unit and reserves whole units for
+payload, inode, workspace, and retained directory-growth overhead. Platforms
+without an allocation-size query use a conservative 1 MiB unit.
 
 Or pipe a batch through standard input:
 
@@ -111,7 +112,8 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The engine uses one small third-party dependency to obtain operating-system randomness for private spill workspaces. Run the complete checks with:
+The engine uses small OS-support dependencies for private spill workspaces and
+filesystem allocation queries. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check
