@@ -752,7 +752,8 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if (value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE"))
+                    && !matches!(self.peek_offset(1), Some(TokenKind::Dot)) =>
             {
                 self.parse_literal().map(Operand::Literal)
             }

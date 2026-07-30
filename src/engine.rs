@@ -1153,24 +1153,32 @@ fn resolve_ordering(
 ) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = if order.name.contains('.') {
+        if order.name.contains('.') {
             let source = input.column_index(&order.name)?;
-            items
+            let output = items
                 .iter()
-                .enumerate()
-                .filter(|(_, item)| {
+                .position(|item| {
                     matches!(item, ResolvedItem::Column { source: item_source, .. } if *item_source == source)
                 })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>()
-        } else {
-            columns
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>()
-        };
+                .ok_or_else(|| {
+                    Error::InvalidQuery(format!(
+                        "ORDER BY column or alias '{}' is not in the SELECT output",
+                        order.name
+                    ))
+                })?;
+            ordering.push(ResolvedOrder {
+                output,
+                descending: order.descending,
+            });
+            continue;
+        }
+
+        let matches = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
         match matches.as_slice() {
             [index] => ordering.push(ResolvedOrder {
                 output: *index,

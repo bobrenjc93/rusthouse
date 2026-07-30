@@ -502,6 +502,31 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
+fn qualified_order_by_accepts_repeated_source_projections() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE repeated (id Int64);
+             INSERT INTO repeated VALUES (2), (1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT t.id AS one, t.id AS two
+         FROM repeated t
+         ORDER BY t.id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
 fn creates_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)

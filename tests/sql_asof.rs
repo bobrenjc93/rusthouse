@@ -282,3 +282,30 @@ fn asof_row_memory_and_candidate_limits_fail_before_results() {
         ));
     }
 }
+
+#[test]
+fn boolean_word_aliases_qualify_asof_conditions_and_predicates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE probes (id Int64, key Int64, ts Int64);
+             CREATE TABLE history (key Int64, ts Int64, value String);
+             INSERT INTO probes VALUES (2, 1, 8), (1, 1, 5);
+             INSERT INTO history VALUES (1, 3, 'old'), (1, 7, 'new');",
+        )
+        .expect("setup succeeds");
+
+    let result = query(
+        &mut database,
+        "SELECT true.id, false.value
+         FROM probes AS true
+         ASOF LEFT JOIN history AS false
+           ON true.key = false.key AND true.ts >= false.ts
+         WHERE true.id = 1 AND false.value = 'old'
+         ORDER BY true.id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(1), Value::String("old".to_owned()),]]
+    );
+}
