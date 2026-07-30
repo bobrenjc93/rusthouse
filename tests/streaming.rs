@@ -195,3 +195,40 @@ fn database_errors_abort_json_as_a_valid_document() {
         "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[7]]}]}\n"
     );
 }
+
+#[derive(Debug, Default)]
+struct FailingFinishSink {
+    callbacks: Vec<&'static str>,
+}
+
+impl RowBatchSink for FailingFinishSink {
+    type Error = &'static str;
+
+    fn start(&mut self) -> std::result::Result<(), Self::Error> {
+        self.callbacks.push("start");
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), Self::Error> {
+        self.callbacks.push("finish");
+        Err("finish failed")
+    }
+
+    fn abort(&mut self) -> std::result::Result<(), Self::Error> {
+        self.callbacks.push("abort");
+        Ok(())
+    }
+}
+
+#[test]
+fn finish_failures_run_abort_and_preserve_the_finish_error() {
+    let mut database = Database::new();
+    let mut sink = FailingFinishSink::default();
+
+    let error = database
+        .execute_stream("CREATE TABLE lifecycle (id Int64);", &mut sink)
+        .expect_err("finish fails");
+
+    assert!(matches!(error, StreamError::Sink("finish failed")));
+    assert_eq!(sink.callbacks, ["start", "finish", "abort"]);
+}

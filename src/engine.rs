@@ -100,7 +100,8 @@ pub trait RowBatchSink {
         Ok(())
     }
 
-    /// Finalize any output that was started before execution failed.
+    /// Finalize any output that was started before execution or completion
+    /// failed.
     ///
     /// Cleanup is best-effort: the execution error remains the return value if
     /// this callback also fails.
@@ -171,8 +172,9 @@ impl Database {
     /// The complete SQL batch is parsed before the sink is started or any
     /// statement is applied. Unordered projections are emitted directly while
     /// scanning; grouping and ordering retain their required operator state.
-    /// If execution fails after the sink starts, its [`RowBatchSink::abort`]
-    /// callback is invoked before the original error is returned.
+    /// If execution or successful-path finalization fails after the sink
+    /// starts, its [`RowBatchSink::abort`] callback is invoked before the
+    /// original error is returned.
     pub fn execute_stream<S: RowBatchSink>(
         &mut self,
         sql: &str,
@@ -215,8 +217,9 @@ impl Database {
             Ok(())
         })();
 
-        match execution {
-            Ok(()) => sink.finish().map_err(StreamError::Sink),
+        let completion = execution.and_then(|()| sink.finish().map_err(StreamError::Sink));
+        match completion {
+            Ok(()) => Ok(()),
             Err(error) => {
                 let _ = sink.abort();
                 Err(error)
