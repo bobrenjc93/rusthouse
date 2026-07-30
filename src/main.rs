@@ -74,16 +74,32 @@ fn stream_query_results(
     let stdout = io::stdout();
     let writer = StreamingWriter::new(BufWriter::new(stdout.lock()), format)
         .map_err(|error| error.to_string())?;
-    let mut sink = CliStreamingSink { writer };
-    database
-        .execute_with_sink(sql, &mut sink)
-        .map_err(|error| error.to_string())?;
-    sink.writer.finish().map_err(|error| error.to_string())?;
-    Ok(())
+    let mut sink = CliStreamingSink {
+        writer,
+        completed_queries: 0,
+    };
+    match database.execute_with_sink(sql, &mut sink) {
+        Ok(()) => sink
+            .writer
+            .finish()
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(execution_error) => {
+            if sink.completed_queries > 0 {
+                sink.writer.finish().map_err(|output_error| {
+                    format!(
+                        "{execution_error}; additionally failed to finalize output: {output_error}"
+                    )
+                })?;
+            }
+            Err(execution_error.to_string())
+        }
+    }
 }
 
 struct CliStreamingSink<W> {
     writer: StreamingWriter<W>,
+    completed_queries: usize,
 }
 
 impl<W: Write> RowSink for CliStreamingSink<W> {
@@ -101,7 +117,9 @@ impl<W: Write> RowSink for CliStreamingSink<W> {
     }
 
     fn end_query(&mut self) -> rusthouse::Result<()> {
-        self.writer.end_query()
+        self.writer.end_query()?;
+        self.completed_queries += 1;
+        Ok(())
     }
 }
 

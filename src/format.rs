@@ -27,8 +27,9 @@ impl OutputFormat {
 /// Streams CSV or JSON query results to an [`std::io::Write`] destination.
 ///
 /// JSON is emitted as one document with a top-level `results` array. CSV
-/// result sets are separated by a blank line. Call [`Self::finish`] after a
-/// successful execution to close JSON output and flush the destination.
+/// result sets are separated by a blank line. Call [`Self::finish`] whenever
+/// completed output should be kept, including after a later execution error,
+/// to close JSON output and flush the destination.
 #[derive(Debug)]
 pub struct StreamingWriter<W> {
     output: W,
