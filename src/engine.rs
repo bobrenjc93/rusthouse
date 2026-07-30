@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ColumnReference, ComparisonOperator, InnerJoin,
+    Operand, OrderBy, Predicate, Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -86,34 +86,46 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select(*select).map(StatementResult::Query),
         }
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        let left_table = self.catalog.table(&select.table)?;
+        let left_binding = select
+            .table_alias
+            .as_deref()
+            .unwrap_or_else(|| left_table.name());
+        let source = if let Some(join) = &select.join {
+            let right_table = self.catalog.table(&join.table)?;
+            let right_binding = join.alias.as_deref().unwrap_or_else(|| right_table.name());
+            RowSource::joined(left_table, left_binding, right_table, right_binding, join)?
+        } else {
+            RowSource::single(left_table, left_binding)
+        };
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| compile_predicate(&source, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
+        let mut matching_rows = (0..source.row_count())
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(&source, *row))
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let group_columns = resolve_group_columns(&source, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+            resolve_select_items(&source, &select.items, &group_columns)?;
+        let ordering = resolve_ordering(&source, &items, &result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped =
+                execute_grouped(&source, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -124,14 +136,226 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            order_source_rows(&mut matching_rows, &source, &items, &ordering, select.limit);
+            execute_projection(&source, &matching_rows, &items)
         };
 
         Ok(QueryResult {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+#[derive(Debug)]
+struct Relation<'a> {
+    table: &'a Table,
+    binding: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceColumn {
+    relation: usize,
+    physical: usize,
+    data_type: DataType,
+}
+
+#[derive(Debug)]
+struct RowSource<'a> {
+    relations: Vec<Relation<'a>>,
+    columns: Vec<SourceColumn>,
+    joined_rows: Option<Vec<[usize; 2]>>,
+}
+
+impl<'a> RowSource<'a> {
+    fn single(table: &'a Table, binding: &str) -> Self {
+        Self::from_relations(vec![Relation {
+            table,
+            binding: binding.to_owned(),
+        }])
+    }
+
+    fn joined(
+        left: &'a Table,
+        left_binding: &str,
+        right: &'a Table,
+        right_binding: &str,
+        join: &InnerJoin,
+    ) -> Result<Self> {
+        if left_binding.eq_ignore_ascii_case(right_binding) {
+            return Err(Error::InvalidQuery(format!(
+                "table name or alias '{left_binding}' is used more than once"
+            )));
+        }
+
+        let mut source = Self::from_relations(vec![
+            Relation {
+                table: left,
+                binding: left_binding.to_owned(),
+            },
+            Relation {
+                table: right,
+                binding: right_binding.to_owned(),
+            },
+        ]);
+        let first_key = source.column_index(&join.left_key)?;
+        let second_key = source.column_index(&join.right_key)?;
+        let (left_key, right_key) = match (
+            source.columns[first_key].relation,
+            source.columns[second_key].relation,
+        ) {
+            (0, 1) => (first_key, second_key),
+            (1, 0) => (second_key, first_key),
+            _ => {
+                return Err(Error::InvalidQuery(
+                    "INNER JOIN ON must compare one column from each table".to_owned(),
+                ));
+            }
+        };
+        let left_type = source.columns[left_key].data_type;
+        let right_type = source.columns[right_key].data_type;
+        if left_type != right_type {
+            return Err(Error::TypeMismatch {
+                context: "INNER JOIN equality keys".to_owned(),
+                expected: left_type.to_string(),
+                actual: right_type.to_string(),
+            });
+        }
+
+        let mut build = HashMap::<ValueRef<'a>, Vec<usize>>::with_capacity(right.row_count());
+        for right_row in 0..right.row_count() {
+            let key = source.value_ref_physical(right_key, right_row);
+            build.entry(key).or_default().push(right_row);
+        }
+
+        let mut joined_rows = Vec::new();
+        for left_row in 0..left.row_count() {
+            let key = source.value_ref_physical(left_key, left_row);
+            if let Some(matches) = build.get(&key) {
+                joined_rows.extend(matches.iter().map(|right_row| [left_row, *right_row]));
+            }
+        }
+        source.joined_rows = Some(joined_rows);
+        Ok(source)
+    }
+
+    fn from_relations(relations: Vec<Relation<'a>>) -> Self {
+        let columns = relations
+            .iter()
+            .enumerate()
+            .flat_map(|(relation, source)| {
+                source
+                    .table
+                    .schema()
+                    .iter()
+                    .enumerate()
+                    .map(move |(physical, field)| SourceColumn {
+                        relation,
+                        physical,
+                        data_type: field.data_type,
+                    })
+            })
+            .collect();
+        Self {
+            relations,
+            columns,
+            joined_rows: None,
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        self.joined_rows
+            .as_ref()
+            .map_or_else(|| self.relations[0].table.row_count(), Vec::len)
+    }
+
+    fn value_ref(&self, column: usize, row: usize) -> ValueRef<'a> {
+        let source_column = self.columns[column];
+        let physical_row = self
+            .joined_rows
+            .as_ref()
+            .map_or(row, |rows| rows[row][source_column.relation]);
+        self.value_ref_physical(column, physical_row)
+    }
+
+    fn value_ref_physical(&self, column: usize, physical_row: usize) -> ValueRef<'a> {
+        let source_column = self.columns[column];
+        self.relations[source_column.relation].table.columns()[source_column.physical]
+            .value_ref(physical_row)
+    }
+
+    fn column_index(&self, reference: &ColumnReference) -> Result<usize> {
+        if let Some(qualifier) = &reference.qualifier {
+            let Some(relation) = self
+                .relations
+                .iter()
+                .position(|source| source.binding.eq_ignore_ascii_case(qualifier))
+            else {
+                return Err(Error::InvalidQuery(format!(
+                    "unknown table or alias '{qualifier}'"
+                )));
+            };
+            return self
+                .columns
+                .iter()
+                .position(|column| {
+                    column.relation == relation
+                        && self
+                            .column_name(column)
+                            .eq_ignore_ascii_case(&reference.name)
+                })
+                .ok_or_else(|| Error::ColumnNotFound {
+                    table: self.relations[relation].binding.clone(),
+                    column: reference.name.clone(),
+                });
+        }
+
+        let matches = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                self.column_name(column)
+                    .eq_ignore_ascii_case(&reference.name)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(Error::ColumnNotFound {
+                table: self
+                    .relations
+                    .iter()
+                    .map(|source| source.binding.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                column: reference.name.clone(),
+            }),
+            _ => Err(Error::AmbiguousColumn(reference.name.clone())),
+        }
+    }
+
+    fn columns_for_qualifier(&self, qualifier: &str) -> Result<Vec<usize>> {
+        let Some(relation) = self
+            .relations
+            .iter()
+            .position(|source| source.binding.eq_ignore_ascii_case(qualifier))
+        else {
+            return Err(Error::InvalidQuery(format!(
+                "unknown table or alias '{qualifier}'"
+            )));
+        };
+        Ok(self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.relation == relation)
+            .map(|(index, _)| index)
+            .collect())
+    }
+
+    fn column_name<'b>(&'b self, column: &SourceColumn) -> &'b str {
+        &self.relations[column.relation].table.schema()[column.physical].name
     }
 }
 
@@ -153,13 +377,16 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
-    let mut columns = Vec::with_capacity(names.len());
-    for name in names {
-        let column = table.column_index(name)?;
+fn resolve_group_columns(
+    source: &RowSource<'_>,
+    references: &[ColumnReference],
+) -> Result<Vec<usize>> {
+    let mut columns = Vec::with_capacity(references.len());
+    for reference in references {
+        let column = source.column_index(reference)?;
         if columns.contains(&column) {
             return Err(Error::InvalidQuery(format!(
-                "GROUP BY column '{name}' is listed more than once"
+                "GROUP BY column '{reference}' is listed more than once"
             )));
         }
         columns.push(column);
@@ -168,7 +395,7 @@ fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> 
 }
 
 fn resolve_select_items(
-    table: &Table,
+    source: &RowSource<'_>,
     requested: &[SelectItem],
     group_columns: &[usize],
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
@@ -176,9 +403,12 @@ fn resolve_select_items(
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
     if has_aggregate
-        && requested
-            .iter()
-            .any(|item| matches!(item, SelectItem::Wildcard))
+        && requested.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        })
     {
         return Err(Error::InvalidQuery(
             "'*' projection cannot be combined with aggregates".to_owned(),
@@ -192,41 +422,44 @@ fn resolve_select_items(
     for requested_item in requested {
         match requested_item {
             SelectItem::Wildcard => {
-                for (source, field) in table.schema().iter().enumerate() {
-                    let group_position = group_columns.iter().position(|column| *column == source);
-                    if !group_columns.is_empty() && group_position.is_none() {
-                        return Err(Error::InvalidQuery(format!(
-                            "column '{}' must appear in GROUP BY",
-                            field.name
-                        )));
-                    }
-                    items.push(ResolvedItem::Column {
+                for column in 0..source.columns.len() {
+                    push_resolved_column(
                         source,
-                        group_position,
-                    });
-                    result_columns.push(ResultColumn {
-                        name: field.name.clone(),
-                        data_type: field.data_type,
-                    });
+                        column,
+                        group_columns,
+                        &mut items,
+                        &mut result_columns,
+                    )?;
                 }
             }
-            SelectItem::Column { name, alias } => {
-                let source = table.column_index(name)?;
-                let group_position = group_columns.iter().position(|column| *column == source);
+            SelectItem::QualifiedWildcard(qualifier) => {
+                for column in source.columns_for_qualifier(qualifier)? {
+                    push_resolved_column(
+                        source,
+                        column,
+                        group_columns,
+                        &mut items,
+                        &mut result_columns,
+                    )?;
+                }
+            }
+            SelectItem::Column { reference, alias } => {
+                let column = source.column_index(reference)?;
+                let group_position = group_columns.iter().position(|group| *group == column);
                 if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
                     return Err(Error::InvalidQuery(format!(
-                        "column '{name}' must appear in GROUP BY"
+                        "column '{reference}' must appear in GROUP BY"
                     )));
                 }
                 items.push(ResolvedItem::Column {
-                    source,
+                    source: column,
                     group_position,
                 });
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
-                        .unwrap_or_else(|| table.schema()[source].name.clone()),
-                    data_type: table.schema()[source].data_type,
+                        .unwrap_or_else(|| source.column_name(&source.columns[column]).to_owned()),
+                    data_type: source.columns[column].data_type,
                 });
             }
             SelectItem::Aggregate {
@@ -244,12 +477,12 @@ fn resolve_select_items(
                         }
                         (None, None, "*".to_owned())
                     }
-                    AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
+                    AggregateArgument::Column(reference) => {
+                        let index = source.column_index(reference)?;
                         (
                             Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
+                            Some(source.columns[index].data_type),
+                            source.column_name(&source.columns[index]).to_owned(),
                         )
                     }
                 };
@@ -272,6 +505,31 @@ fn resolve_select_items(
     }
 
     Ok((items, result_columns, aggregate_specs))
+}
+
+fn push_resolved_column(
+    source: &RowSource<'_>,
+    column: usize,
+    group_columns: &[usize],
+    items: &mut Vec<ResolvedItem>,
+    result_columns: &mut Vec<ResultColumn>,
+) -> Result<()> {
+    let group_position = group_columns.iter().position(|group| *group == column);
+    if !group_columns.is_empty() && group_position.is_none() {
+        return Err(Error::InvalidQuery(format!(
+            "column '{}' must appear in GROUP BY",
+            source.column_name(&source.columns[column])
+        )));
+    }
+    items.push(ResolvedItem::Column {
+        source: column,
+        group_position,
+    });
+    result_columns.push(ResultColumn {
+        name: source.column_name(&source.columns[column]).to_owned(),
+        data_type: source.columns[column].data_type,
+    });
+    Ok(())
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -299,7 +557,7 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 }
 
 fn execute_projection(
-    table: &Table,
+    source: &RowSource<'_>,
     matching_rows: &[usize],
     items: &[ResolvedItem],
 ) -> Vec<Vec<Value>> {
@@ -309,7 +567,9 @@ fn execute_projection(
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::Column { source: column, .. } => {
+                        source.value_ref(*column, *row).to_owned()
+                    }
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
@@ -320,7 +580,7 @@ fn execute_projection(
 }
 
 fn execute_grouped<'a>(
-    table: &'a Table,
+    source: &RowSource<'a>,
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
@@ -340,7 +600,7 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) = groups.find_or_insert(source, group_columns, *row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +609,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, source, *row)?;
         }
     }
 
@@ -385,7 +645,7 @@ impl<'a> GroupIndex<'a> {
 
     fn find_or_insert(
         &mut self,
-        table: &'a Table,
+        source: &RowSource<'a>,
         columns: &[usize],
         row: usize,
         next_group: usize,
@@ -393,7 +653,7 @@ impl<'a> GroupIndex<'a> {
         match self {
             Self::Global => (0, false),
             Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
+                let key = source.value_ref(columns[0], row);
                 if let Some(group) = groups.get(&key) {
                     (*group, false)
                 } else {
@@ -403,15 +663,15 @@ impl<'a> GroupIndex<'a> {
             }
             Self::Multiple(groups) if columns.len() == 2 => {
                 let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
+                    source.value_ref(columns[0], row),
+                    source.value_ref(columns[1], row),
                 ];
                 find_or_insert_group(groups, &key, next_group)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
+                    .map(|column| source.value_ref(*column, row))
                     .collect::<Vec<_>>();
                 find_or_insert_group(groups, &key, next_group)
             }
@@ -547,7 +807,7 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+    fn update(&mut self, spec: &AggregateSpec, source: &RowSource<'_>, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -555,28 +815,28 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Int64(value) =
+                    source.value_ref(spec.argument.expect("SUM argument"), row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(value)
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Float64(value) =
+                    source.value_ref(spec.argument.expect("SUM argument"), row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
             }
             Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
+                let candidate = source.value_ref(spec.argument.expect("MIN argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -585,8 +845,7 @@ impl AggregateState {
                 }
             }
             Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
+                let candidate = source.value_ref(spec.argument.expect("MAX argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -595,24 +854,25 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Int64(value) =
+                    source.value_ref(spec.argument.expect("AVG argument"), row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Float64(value) =
+                    source.value_ref(spec.argument.expect("AVG argument"), row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -652,15 +912,32 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
+fn resolve_ordering(
+    source: &RowSource<'_>,
+    items: &[ResolvedItem],
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let matches = if order.reference.qualifier.is_some() {
+            let requested_column = source.column_index(&order.reference)?;
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    matches!(item, ResolvedItem::Column { source, .. } if *source == requested_column)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        } else {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.reference.name))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
         match matches.as_slice() {
             [index] => ordering.push(ResolvedOrder {
                 output: *index,
@@ -669,13 +946,13 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
             [] => {
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY column or alias '{}' is not in the SELECT output",
-                    order.name
+                    order.reference
                 )));
             }
             _ => {
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY name '{}' is ambiguous",
-                    order.name
+                    order.reference
                 )));
             }
         }
@@ -685,7 +962,7 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
 
 fn order_source_rows(
     rows: &mut Vec<usize>,
-    table: &Table,
+    source: &RowSource<'_>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
@@ -699,10 +976,12 @@ fn order_source_rows(
 
     sort_and_limit(rows, limit, |left, right| {
         for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
+            let ResolvedItem::Column { source: column, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
+            let comparison = source
+                .value_ref(column, left)
+                .cmp(&source.value_ref(column, right));
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -779,15 +1058,15 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, source: &RowSource<'_>, row: usize) -> bool {
         match self {
             Self::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
+                let left = left.value(source, row);
+                let right = right.value(source, row);
                 let comparison = left
                     .sql_cmp(right)
                     .expect("predicate operand types are validated");
@@ -800,8 +1079,8 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::And(left, right) => left.evaluate(source, row) && right.evaluate(source, row),
+            Self::Or(left, right) => left.evaluate(source, row) || right.evaluate(source, row),
         }
     }
 }
@@ -820,23 +1099,23 @@ impl CompiledOperand {
         }
     }
 
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
+    fn value<'a>(&'a self, source: &'a RowSource<'_>, row: usize) -> ValueRef<'a> {
         match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
+            Self::Column { index, .. } => source.value_ref(*index, row),
             Self::Literal(value) => value.as_ref(),
         }
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn compile_predicate(source: &RowSource<'_>, predicate: &Predicate) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let left = compile_operand(source, left)?;
+            let right = compile_operand(source, right)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -851,23 +1130,23 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             })
         }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(source, left)?),
+            Box::new(compile_predicate(source, right)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(source, left)?),
+            Box::new(compile_predicate(source, right)?),
         )),
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_operand(source: &RowSource<'_>, operand: &Operand) -> Result<CompiledOperand> {
     match operand {
-        Operand::Column(name) => {
-            let index = table.column_index(name)?;
+        Operand::Column(reference) => {
+            let index = source.column_index(reference)?;
             Ok(CompiledOperand::Column {
                 index,
-                data_type: table.schema()[index].data_type,
+                data_type: source.columns[index].data_type,
             })
         }
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),

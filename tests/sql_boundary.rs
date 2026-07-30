@@ -524,3 +524,171 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn inner_join_preserves_duplicate_order_and_supports_filter_order_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE users (id Int64, name String);
+             CREATE TABLE events (event_id Int64, user_id Int64, score Int64, keep Bool);
+             INSERT INTO users VALUES (2, 'beta'), (1, 'alpha'), (3, 'none');
+             INSERT INTO events VALUES
+                (20, 1, 5, true),
+                (21, 1, 7, true),
+                (10, 2, 3, true),
+                (22, 1, 9, false),
+                (99, 4, 100, true);",
+        )
+        .expect("setup succeeds");
+
+    let insertion_order = execute_query(
+        &mut database,
+        "SELECT u.id, e.event_id, e.score
+         FROM users u INNER JOIN events AS e ON e.user_id = u.id
+         WHERE e.keep = true;",
+    );
+    assert_eq!(
+        insertion_order.rows,
+        vec![
+            vec![Value::Int64(2), Value::Int64(10), Value::Int64(3)],
+            vec![Value::Int64(1), Value::Int64(20), Value::Int64(5)],
+            vec![Value::Int64(1), Value::Int64(21), Value::Int64(7)],
+        ]
+    );
+
+    let top = execute_query(
+        &mut database,
+        "SELECT u.name, e.event_id, e.score
+         FROM users AS u INNER JOIN events e ON u.id = e.user_id
+         WHERE e.keep = true
+         ORDER BY e.score DESC LIMIT 2;",
+    );
+    assert_eq!(
+        top.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Int64(21),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Int64(20),
+                Value::Int64(5),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn joined_filtering_grouping_and_empty_aggregates_work() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE teams (id Int64, name String, active Bool);
+             CREATE TABLE sales (team_id Int64, amount Int64);
+             INSERT INTO teams VALUES
+                (1, 'north', true), (2, 'south', true), (3, 'closed', false);
+             INSERT INTO sales VALUES
+                (1, 4), (1, 8), (2, 9), (3, 100), (4, 200);",
+        )
+        .expect("setup succeeds");
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT t.name, COUNT(*) AS rows, SUM(s.amount) AS total
+         FROM teams t INNER JOIN sales s ON t.id = s.team_id
+         WHERE t.active = true AND s.amount >= 5
+         GROUP BY t.name
+         ORDER BY total DESC LIMIT 2;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("south".to_owned()),
+                Value::Int64(1),
+                Value::Int64(9),
+            ],
+            vec![
+                Value::String("north".to_owned()),
+                Value::Int64(1),
+                Value::Int64(8),
+            ],
+        ]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows, SUM(s.amount) AS total
+         FROM teams t INNER JOIN sales s ON t.id = s.team_id
+         WHERE s.amount > 1000;",
+    );
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Int64(0)]]);
+}
+
+#[test]
+fn invalid_inner_joins_return_actionable_errors() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE left_side (id Int64, label String);
+             CREATE TABLE right_side (id Int64, float_id Float64);",
+        )
+        .expect("setup succeeds");
+
+    let ambiguous = database
+        .execute(
+            "SELECT id FROM left_side l
+             INNER JOIN right_side r ON l.id = r.id;",
+        )
+        .expect_err("unqualified id exists in both inputs");
+    assert_eq!(ambiguous, Error::AmbiguousColumn("id".to_owned()));
+
+    let key_types = database
+        .execute(
+            "SELECT l.id FROM left_side l
+             INNER JOIN right_side r ON l.id = r.float_id;",
+        )
+        .expect_err("join keys require the same physical type");
+    assert!(matches!(
+        key_types,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "INNER JOIN equality keys" && expected == "Int64" && actual == "Float64"
+    ));
+
+    let same_input = database
+        .execute(
+            "SELECT l.id FROM left_side l
+             INNER JOIN right_side r ON l.id = l.id;",
+        )
+        .expect_err("ON must reference both inputs");
+    assert!(matches!(
+        same_input,
+        Error::InvalidQuery(message) if message.contains("one column from each table")
+    ));
+
+    let duplicate_alias = database
+        .execute(
+            "SELECT x.id FROM left_side x
+             INNER JOIN right_side x ON x.id = x.id;",
+        )
+        .expect_err("bindings must be unique");
+    assert!(matches!(
+        duplicate_alias,
+        Error::InvalidQuery(message) if message.contains("used more than once")
+    ));
+
+    for sql in [
+        "SELECT l.id FROM left_side l JOIN right_side r ON l.id = r.id;",
+        "SELECT l.id FROM left_side l INNER JOIN right_side r ON l.id > r.id;",
+        "SELECT l.id FROM left_side l INNER JOIN right_side r ON l.id = r.id
+         INNER JOIN right_side r2 ON r.id = r2.id;",
+    ] {
+        assert!(matches!(database.execute(sql), Err(Error::Sql { .. })));
+    }
+}

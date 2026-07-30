@@ -18,6 +18,7 @@ pub enum Error {
         table: String,
         column: String,
     },
+    AmbiguousColumn(String),
     RowLength {
         table: String,
         expected: usize,
@@ -52,6 +53,9 @@ impl fmt::Display for Error {
             ),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")
+            }
+            Self::AmbiguousColumn(column) => {
+                write!(f, "column reference '{column}' is ambiguous")
             }
             Self::RowLength {
                 table,

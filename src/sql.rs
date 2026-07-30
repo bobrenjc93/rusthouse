@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
+use std::fmt;
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
@@ -15,24 +16,51 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
-    Select(Select),
+    Select(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub items: Vec<SelectItem>,
     pub table: String,
+    pub table_alias: Option<String>,
+    pub join: Option<InnerJoin>,
     pub predicate: Option<Predicate>,
-    pub group_by: Vec<String>,
+    pub group_by: Vec<ColumnReference>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InnerJoin {
+    pub table: String,
+    pub alias: Option<String>,
+    pub left_key: ColumnReference,
+    pub right_key: ColumnReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnReference {
+    pub qualifier: Option<String>,
+    pub name: String,
+}
+
+impl fmt::Display for ColumnReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(qualifier) = &self.qualifier {
+            write!(f, "{qualifier}.{}", self.name)
+        } else {
+            f.write_str(&self.name)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
+    QualifiedWildcard(String),
     Column {
-        name: String,
+        reference: ColumnReference,
         alias: Option<String>,
     },
     Aggregate {
@@ -78,7 +106,7 @@ impl AggregateFunction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArgument {
     Wildcard,
-    Column(String),
+    Column(ColumnReference),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +122,7 @@ pub enum Predicate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
-    Column(String),
+    Column(ColumnReference),
     Literal(Value),
 }
 
@@ -110,7 +138,7 @@ pub enum ComparisonOperator {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBy {
-    pub name: String,
+    pub reference: ColumnReference,
     pub descending: bool,
 }
 
@@ -132,6 +160,7 @@ enum TokenKind {
     Number(String),
     String(String),
     Comma,
+    Dot,
     LeftParen,
     RightParen,
     Semicolon,
@@ -173,6 +202,10 @@ impl<'a> Lexer<'a> {
                 ',' => {
                     self.advance();
                     TokenKind::Comma
+                }
+                '.' => {
+                    self.advance();
+                    TokenKind::Dot
                 }
                 '(' => {
                     self.advance();
@@ -377,7 +410,7 @@ impl Parser {
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
-            self.parse_select().map(Statement::Select)
+            self.parse_select().map(Box::new).map(Statement::Select)
         } else {
             self.error("expected CREATE, INSERT, or SELECT")
         }
@@ -451,6 +484,31 @@ impl Parser {
         }
         self.expect_keyword("FROM")?;
         let table = self.expect_identifier("table name")?;
+        let table_alias = self.parse_table_alias()?;
+
+        if self.at_keyword("JOIN") {
+            return self.error("expected INNER JOIN; only INNER JOIN is supported");
+        }
+        let join = if self.eat_keyword("INNER") {
+            self.expect_keyword("JOIN")?;
+            let join_table = self.expect_identifier("joined table name")?;
+            let alias = self.parse_table_alias()?;
+            self.expect_keyword("ON")?;
+            let left_key = self.parse_column_reference("left INNER JOIN key")?;
+            self.expect(&TokenKind::Equal, "'=' between INNER JOIN keys")?;
+            let right_key = self.parse_column_reference("right INNER JOIN key")?;
+            if self.at_keyword("INNER") || self.at_keyword("JOIN") {
+                return self.error("only one INNER JOIN is supported per SELECT");
+            }
+            Some(InnerJoin {
+                table: join_table,
+                alias,
+                left_key,
+                right_key,
+            })
+        } else {
+            None
+        };
 
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
@@ -464,7 +522,7 @@ impl Parser {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
-                group_by.push(self.expect_identifier("GROUP BY column")?);
+                group_by.push(self.parse_column_reference("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -475,14 +533,17 @@ impl Parser {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
+                let reference = self.parse_column_reference("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true
                 } else {
                     self.eat_keyword("ASC");
                     false
                 };
-                order_by.push(OrderBy { name, descending });
+                order_by.push(OrderBy {
+                    reference,
+                    descending,
+                });
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -506,6 +567,8 @@ impl Parser {
         Ok(Select {
             items,
             table,
+            table_alias,
+            join,
             predicate,
             group_by,
             order_by,
@@ -528,7 +591,7 @@ impl Parser {
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                AggregateArgument::Column(self.parse_column_reference("aggregate column")?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let alias = self.parse_alias()?;
@@ -537,9 +600,59 @@ impl Parser {
                 argument,
                 alias,
             })
+        } else if self.eat(&TokenKind::Dot) {
+            if self.eat(&TokenKind::Star) {
+                return Ok(SelectItem::QualifiedWildcard(name));
+            }
+            let column = self.expect_identifier("column after '.'")?;
+            let alias = self.parse_alias()?;
+            Ok(SelectItem::Column {
+                reference: ColumnReference {
+                    qualifier: Some(name),
+                    name: column,
+                },
+                alias,
+            })
         } else {
             let alias = self.parse_alias()?;
-            Ok(SelectItem::Column { name, alias })
+            Ok(SelectItem::Column {
+                reference: ColumnReference {
+                    qualifier: None,
+                    name,
+                },
+                alias,
+            })
+        }
+    }
+
+    fn parse_table_alias(&mut self) -> Result<Option<String>> {
+        if self.eat_keyword("AS") {
+            return self.expect_identifier("table alias").map(Some);
+        }
+        let is_clause = [
+            "INNER", "JOIN", "ON", "WHERE", "GROUP", "ORDER", "LIMIT", "ASC", "DESC",
+        ]
+        .iter()
+        .any(|keyword| self.at_keyword(keyword));
+        if !is_clause && matches!(self.peek(), TokenKind::Identifier(_)) {
+            self.expect_identifier("table alias").map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_column_reference(&mut self, description: &str) -> Result<ColumnReference> {
+        let first = self.expect_identifier(description)?;
+        if self.eat(&TokenKind::Dot) {
+            Ok(ColumnReference {
+                qualifier: Some(first),
+                name: self.expect_identifier("column after '.'")?,
+            })
+        } else {
+            Ok(ColumnReference {
+                qualifier: None,
+                name: first,
+            })
         }
     }
 
@@ -627,7 +740,7 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
+                .parse_column_reference("column or literal")
                 .map(Operand::Column),
             _ => self.error("expected column or literal"),
         }
@@ -686,13 +799,16 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.at_keyword(expected) {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
@@ -767,10 +883,47 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(select.items.len(), 2);
-        assert_eq!(select.group_by, ["region"]);
-        assert_eq!(select.order_by[0].name, "total");
+        assert_eq!(select.group_by[0].name, "region");
+        assert_eq!(select.order_by[0].reference.name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_qualified_inner_join_with_aliases() {
+        let statements = parse(
+            "SELECT u.name, SUM(o.amount) AS total FROM users AS u \
+             INNER JOIN orders o ON u.id = o.user_id \
+             WHERE o.active = true GROUP BY u.name ORDER BY total DESC LIMIT 5",
+        )
+        .expect("valid join");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(select.table, "users");
+        assert_eq!(select.table_alias.as_deref(), Some("u"));
+        let join = select.join.as_ref().expect("join");
+        assert_eq!(join.table, "orders");
+        assert_eq!(join.alias.as_deref(), Some("o"));
+        assert_eq!(join.left_key.to_string(), "u.id");
+        assert_eq!(join.right_key.to_string(), "o.user_id");
+    }
+
+    #[test]
+    fn rejects_non_equality_and_multiple_joins() {
+        let inequality = parse("SELECT a.id FROM a INNER JOIN b ON a.id > b.id")
+            .expect_err("only equality joins are supported");
+        assert!(matches!(inequality, Error::Sql { message, .. } if message.contains("'='")));
+
+        let multiple = parse(
+            "SELECT a.id FROM a INNER JOIN b ON a.id = b.id \
+             INNER JOIN c ON b.id = c.id",
+        )
+        .expect_err("only one join is supported");
+        assert!(
+            matches!(multiple, Error::Sql { message, .. } if message.contains("only one INNER JOIN"))
+        );
     }
 
     #[test]
