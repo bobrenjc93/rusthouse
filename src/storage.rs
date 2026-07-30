@@ -299,13 +299,7 @@ impl Table {
     }
 
     pub(crate) fn columnarize_rows(&self, rows: Vec<Vec<Value>>) -> Result<ColumnBatch> {
-        let mut columns = self
-            .schema
-            .iter()
-            .map(|field| Column::with_capacity(field.data_type, rows.len()))
-            .collect::<Vec<_>>();
-
-        for row in rows {
+        for row in &rows {
             if row.len() != self.schema.len() {
                 return Err(Error::RowLength {
                     table: self.name.clone(),
@@ -313,7 +307,7 @@ impl Table {
                     actual: row.len(),
                 });
             }
-            for ((field, column), value) in self.schema.iter().zip(&mut columns).zip(row) {
+            for (field, value) in self.schema.iter().zip(row) {
                 if field.data_type != value.data_type() {
                     return Err(Error::TypeMismatch {
                         context: format!("column '{}.{}'", self.name, field.name),
@@ -321,6 +315,17 @@ impl Table {
                         actual: value.data_type().to_string(),
                     });
                 }
+            }
+        }
+
+        let mut columns = self
+            .schema
+            .iter()
+            .map(|field| Column::with_capacity(field.data_type, rows.len()))
+            .collect::<Vec<_>>();
+
+        for row in rows {
+            for (column, value) in columns.iter_mut().zip(row) {
                 column.push(value);
             }
         }
@@ -390,5 +395,36 @@ mod tests {
         );
         assert_eq!(table.row_count(), usize::MAX);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejects_many_short_rows_before_allocating_wide_columns() {
+        let width = 50_000;
+        let table = Table::new(
+            "wide".to_owned(),
+            (0..width)
+                .map(|index| ColumnDef {
+                    name: format!("c{index}"),
+                    data_type: DataType::Int64,
+                })
+                .collect(),
+        )
+        .expect("valid wide table");
+        let rows = (0..50_000)
+            .map(|_| vec![Value::Int64(1)])
+            .collect::<Vec<_>>();
+
+        let error = table
+            .columnarize_rows(rows)
+            .expect_err("short rows are rejected");
+
+        assert!(matches!(
+            error,
+            Error::RowLength {
+                expected,
+                actual: 1,
+                ..
+            } if expected == width
+        ));
     }
 }
