@@ -212,6 +212,91 @@ fn grouped_top_k_retains_deterministic_multi_column_ordering() {
 }
 
 #[test]
+fn having_filters_multi_column_groups_before_ordering_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, channel String, amount Int64);
+             INSERT INTO sales VALUES
+                ('west', 'web', 10),
+                ('west', 'web', 8),
+                ('west', 'store', 30),
+                ('east', 'web', 20),
+                ('east', 'web', 1),
+                ('north', 'web', 7);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region AS area, channel, COUNT(*) AS orders
+         FROM sales
+         GROUP BY region, channel
+         HAVING area != 'east'
+            AND channel = 'web'
+            AND orders >= 2
+            AND SUM(amount) >= 15
+         ORDER BY orders DESC, area
+         LIMIT 1;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::String("west".to_owned()),
+            Value::String("web".to_owned()),
+            Value::Int64(2),
+        ]]
+    );
+
+    let global = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows FROM sales HAVING rows = 6;",
+    );
+    assert_eq!(global.rows, vec![vec![Value::Int64(6)]]);
+}
+
+#[test]
+fn having_rejects_invalid_and_ambiguous_references() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE inventory (category String, amount Int64);
+             INSERT INTO inventory VALUES ('tools', 2);",
+        )
+        .expect("setup succeeds");
+
+    for reference in ["amount", "missing"] {
+        let error = database
+            .execute(&format!(
+                "SELECT category, COUNT(*) AS rows
+                 FROM inventory
+                 GROUP BY category
+                 HAVING {reference} > 0;"
+            ))
+            .expect_err("HAVING reference must be grouped or an alias");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message)
+                if message.contains("not a SELECT alias or GROUP BY column")
+        ));
+    }
+
+    let ambiguous = database
+        .execute(
+            "SELECT category AS duplicate, COUNT(*) AS duplicate
+             FROM inventory
+             GROUP BY category
+             HAVING duplicate > 0;",
+        )
+        .expect_err("duplicate output aliases are ambiguous");
+    assert!(matches!(
+        ambiguous,
+        Error::InvalidQuery(message) if message.contains("HAVING name 'duplicate' is ambiguous")
+    ));
+}
+
+#[test]
 fn every_aggregate_groups_and_uses_declared_result_types() {
     let mut database = Database::new();
     database
