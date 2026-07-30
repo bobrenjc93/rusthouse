@@ -593,7 +593,8 @@ impl Parser {
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
         let mut not_count = 0;
-        while self.eat_keyword("NOT") {
+        while self.at_keyword("NOT") && !self.not_starts_operand() {
+            self.current += 1;
             self.record_predicate_node()?;
             not_count += 1;
         }
@@ -603,6 +604,87 @@ impl Parser {
             predicate = Predicate::Not(Box::new(predicate));
         }
         Ok(predicate)
+    }
+
+    // Keywords are valid column names, so `not = 1` must not consume NOT as unary.
+    fn not_starts_operand(&self) -> bool {
+        let operator = self.current + 1;
+        Self::is_comparison_operator(self.token_at(operator))
+            || self.is_in_operator(operator)
+            || self.is_between_operator(operator)
+            || self.is_like_operator(operator)
+            || (self.is_keyword_at(operator, "NOT")
+                && (self.is_in_operator(operator + 1)
+                    || self.is_between_operator(operator + 1)
+                    || self.is_like_operator(operator + 1)))
+    }
+
+    fn is_comparison_operator(token: Option<&TokenKind>) -> bool {
+        matches!(
+            token,
+            Some(
+                TokenKind::Equal
+                    | TokenKind::NotEqual
+                    | TokenKind::Less
+                    | TokenKind::LessOrEqual
+                    | TokenKind::Greater
+                    | TokenKind::GreaterOrEqual
+            )
+        )
+    }
+
+    fn is_in_operator(&self, index: usize) -> bool {
+        self.is_keyword_at(index, "IN")
+            && matches!(self.token_at(index + 1), Some(TokenKind::LeftParen))
+    }
+
+    fn is_between_operator(&self, index: usize) -> bool {
+        if !self.is_keyword_at(index, "BETWEEN") {
+            return false;
+        }
+        let Some(lower_length) = self.operand_length_at(index + 1) else {
+            return false;
+        };
+        let delimiter = index + 1 + lower_length;
+        self.is_keyword_at(delimiter, "AND") && self.operand_length_at(delimiter + 1).is_some()
+    }
+
+    fn is_like_operator(&self, index: usize) -> bool {
+        self.is_keyword_at(index, "LIKE") && self.literal_length_at(index + 1).is_some()
+    }
+
+    fn operand_length_at(&self, index: usize) -> Option<usize> {
+        match self.token_at(index)? {
+            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Identifier(_) => Some(1),
+            TokenKind::Minus if matches!(self.token_at(index + 1), Some(TokenKind::Number(_))) => {
+                Some(2)
+            }
+            _ => None,
+        }
+    }
+
+    fn literal_length_at(&self, index: usize) -> Option<usize> {
+        match self.token_at(index)? {
+            TokenKind::String(_) | TokenKind::Number(_) => Some(1),
+            TokenKind::Identifier(value)
+                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+            {
+                Some(1)
+            }
+            TokenKind::Minus if matches!(self.token_at(index + 1), Some(TokenKind::Number(_))) => {
+                Some(2)
+            }
+            _ => None,
+        }
+    }
+
+    fn token_at(&self, index: usize) -> Option<&TokenKind> {
+        self.tokens.get(index).map(|token| &token.kind)
+    }
+
+    fn is_keyword_at(&self, index: usize, expected: &str) -> bool {
+        self.token_at(index)
+            .is_some_and(|token| Self::is_keyword(token, expected))
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
@@ -794,9 +876,16 @@ impl Parser {
         }
     }
 
+    fn at_keyword(&self, expected: &str) -> bool {
+        Self::is_keyword(self.peek(), expected)
+    }
+
+    fn is_keyword(token: &TokenKind, expected: &str) -> bool {
+        matches!(token, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+    }
+
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.at_keyword(expected) {
             self.current += 1;
             true
         } else {

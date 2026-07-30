@@ -717,6 +717,39 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
+fn not_remains_a_valid_column_name_in_predicates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_column
+                (not Int64, in Int64, between Int64, like String);
+             INSERT INTO keyword_column VALUES
+                (1, 1, 1, 'first'), (2, 2, 2, 'second');",
+        )
+        .expect("setup succeeds");
+
+    let direct = execute_query(
+        &mut database,
+        "SELECT not FROM keyword_column WHERE not = 1;",
+    );
+    assert_eq!(direct.rows, vec![vec![Value::Int64(1)]]);
+
+    let unary = execute_query(
+        &mut database,
+        "SELECT not FROM keyword_column
+         WHERE NOT not = 1 AND NOT in = 1
+           AND NOT between = 1 AND NOT like = 'first';",
+    );
+    assert_eq!(unary.rows, vec![vec![Value::Int64(2)]]);
+
+    let postfix = execute_query(
+        &mut database,
+        "SELECT not FROM keyword_column WHERE not NOT IN (2);",
+    );
+    assert_eq!(postfix.rows, vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
 fn creates_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)
