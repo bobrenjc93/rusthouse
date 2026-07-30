@@ -120,11 +120,27 @@ fn render_csv(result: &QueryResult) -> String {
     let mut output = String::new();
     write_csv_row(
         &mut output,
-        result.columns.iter().map(|column| column.name.as_str()),
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), false)),
     );
     for row in &result.rows {
-        let values = row.iter().map(csv_value).collect::<Vec<_>>();
-        write_csv_row(&mut output, values.iter().map(String::as_str));
+        let values = row
+            .iter()
+            .map(|value| {
+                (
+                    csv_value(value),
+                    matches!(value, Value::String(text) if text == r"\N"),
+                )
+            })
+            .collect::<Vec<_>>();
+        write_csv_row(
+            &mut output,
+            values
+                .iter()
+                .map(|(value, quoted)| (value.as_str(), *quoted)),
+        );
     }
     output
 }
@@ -137,12 +153,12 @@ fn csv_value(value: &Value) -> String {
     }
 }
 
-fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>) {
-    for (index, value) in values.enumerate() {
+fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = (&'a str, bool)>) {
+    for (index, (value, force_quotes)) in values.enumerate() {
         if index > 0 {
             output.push(',');
         }
-        if value.contains([',', '"', '\n', '\r']) {
+        if force_quotes || value.contains([',', '"', '\n', '\r']) {
             output.push('"');
             output.push_str(&value.replace('"', "\"\""));
             output.push('"');
@@ -247,6 +263,19 @@ mod tests {
             render(&result(), OutputFormat::Csv),
             "id,note\n1,\"quote: \"\", comma\"\n"
         );
+    }
+
+    #[test]
+    fn csv_distinguishes_null_from_the_null_sentinel_string() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: DataType::String.nullable().expect("scalar type"),
+            }],
+            rows: vec![vec![Value::Null], vec![Value::String(r"\N".to_owned())]],
+        };
+
+        assert_eq!(render(&result, OutputFormat::Csv), "value\n\\N\n\"\\N\"\n");
     }
 
     #[test]
