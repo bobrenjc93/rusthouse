@@ -46,6 +46,28 @@ fn multiple_selects_emit_one_json_document() {
 }
 
 #[test]
+fn database_commands_and_discovery_work_from_the_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE DATABASE warehouse; USE warehouse; SHOW DATABASES;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"String\"}],\"rows\":[[\"default\"],[\"warehouse\"]]}]}\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "CREATE DATABASE\nUSE\n"
+    );
+}
+
+#[test]
 fn positional_json_preserves_duplicate_alias_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

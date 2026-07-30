@@ -4,6 +4,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
+- CREATE DATABASE, DROP DATABASE, USE, and SHOW DATABASES
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
@@ -15,7 +16,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+The initial database is `default`. Table names may be unqualified (and resolve in the active database) or qualified as `database.table` in CREATE TABLE, INSERT, and SELECT. Identifiers are unquoted and case-insensitive; their original spelling is retained for discovery output. TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
 ## CLI
 
@@ -23,6 +24,8 @@ Run a batch directly:
 
 ~~~bash
 cargo run -- --execute "
+  CREATE DATABASE analytics;
+  USE analytics;
   CREATE TABLE sales (region String, amount Int64, online Bool);
   INSERT INTO sales VALUES
     ('west', 10, true),
@@ -55,11 +58,11 @@ printf '%s\n' \
 ~~~
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
-JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
+JSON output is always one document with a top-level results array. Each query result contains explicit column name/type metadata and positional row arrays, so multiple query statements and duplicate aliases preserve every value.
 
 ## Library API
 
-Database retains an in-memory catalog across calls and returns structured results:
+Database retains its in-memory catalog and active database across calls and returns structured results:
 
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
@@ -67,10 +70,11 @@ Database parses a complete SQL batch before execution: any syntax error leaves t
 use rusthouse::{Database, StatementResult};
 
 let mut database = Database::new();
+database.execute("CREATE DATABASE analytics; USE analytics")?;
 database.execute("CREATE TABLE events (id Int64, name String)")?;
 database.execute("INSERT INTO events VALUES (1, 'launch')")?;
 
-let results = database.execute("SELECT * FROM events WHERE id = 1")?;
+let results = database.execute("SELECT * FROM analytics.events WHERE id = 1")?;
 let StatementResult::Query(result) = &results[0] else {
     unreachable!();
 };

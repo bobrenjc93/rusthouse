@@ -7,21 +7,47 @@ const MAX_PREDICATE_NODES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    CreateTable {
+    CreateDatabase {
         name: String,
+    },
+    DropDatabase {
+        name: String,
+    },
+    UseDatabase {
+        name: String,
+    },
+    ShowDatabases,
+    CreateTable {
+        name: TableReference,
         columns: Vec<ColumnDef>,
     },
     Insert {
-        table: String,
+        table: TableReference,
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableReference {
+    pub database: Option<String>,
+    pub table: String,
+}
+
+impl TableReference {
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.database.as_ref().map_or_else(
+            || self.table.clone(),
+            |database| format!("{database}.{}", self.table),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub items: Vec<SelectItem>,
-    pub table: String,
+    pub table: TableReference,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
@@ -132,6 +158,7 @@ enum TokenKind {
     Number(String),
     String(String),
     Comma,
+    Dot,
     LeftParen,
     RightParen,
     Semicolon,
@@ -173,6 +200,10 @@ impl<'a> Lexer<'a> {
                 ',' => {
                     self.advance();
                     TokenKind::Comma
+                }
+                '.' => {
+                    self.advance();
+                    TokenKind::Dot
                 }
                 '(' => {
                     self.advance();
@@ -374,18 +405,29 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_keyword("CREATE") {
             self.parse_create()
+        } else if self.eat_keyword("DROP") {
+            self.parse_drop()
+        } else if self.eat_keyword("USE") {
+            self.parse_use()
+        } else if self.eat_keyword("SHOW") {
+            self.parse_show()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, DROP, USE, SHOW, INSERT, or SELECT")
         }
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
+        if self.eat_keyword("DATABASE") {
+            return self
+                .expect_identifier("database name")
+                .map(|name| Statement::CreateDatabase { name });
+        }
         self.expect_keyword("TABLE")?;
-        let name = self.expect_identifier("table name")?;
+        let name = self.parse_table_reference()?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
@@ -416,9 +458,25 @@ impl Parser {
         Ok(Statement::CreateTable { name, columns })
     }
 
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword("DATABASE")?;
+        self.expect_identifier("database name")
+            .map(|name| Statement::DropDatabase { name })
+    }
+
+    fn parse_use(&mut self) -> Result<Statement> {
+        self.expect_identifier("database name")
+            .map(|name| Statement::UseDatabase { name })
+    }
+
+    fn parse_show(&mut self) -> Result<Statement> {
+        self.expect_keyword("DATABASES")?;
+        Ok(Statement::ShowDatabases)
+    }
+
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
-        let table = self.expect_identifier("table name")?;
+        let table = self.parse_table_reference()?;
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -450,7 +508,7 @@ impl Parser {
             }
         }
         self.expect_keyword("FROM")?;
-        let table = self.expect_identifier("table name")?;
+        let table = self.parse_table_reference()?;
 
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
@@ -549,6 +607,25 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_table_reference(&mut self) -> Result<TableReference> {
+        let first = self.expect_identifier("table name")?;
+        if !self.eat(&TokenKind::Dot) {
+            return Ok(TableReference {
+                database: None,
+                table: first,
+            });
+        }
+
+        let table = self.expect_identifier("table name after database qualifier")?;
+        if self.at(&TokenKind::Dot) {
+            return self.error("table names may contain at most one database qualifier");
+        }
+        Ok(TableReference {
+            database: Some(first),
+            table,
+        })
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {

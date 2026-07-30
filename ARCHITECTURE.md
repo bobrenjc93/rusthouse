@@ -2,7 +2,7 @@
 
 RustHouse should evolve through narrow modules with explicit boundaries:
 
-1. A catalog owns schemas and tables.
+1. A catalog owns case-insensitive database namespaces, schemas, and tables; the engine owns session selection state.
 2. A columnar storage layer owns typed vectors and validates row shape.
 3. A parser produces a small typed syntax tree without coupling syntax to execution.
 4. A query engine plans scans, filters, projections, grouping, aggregation, sorting, and limits.

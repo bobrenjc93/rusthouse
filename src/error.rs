@@ -7,6 +7,10 @@ pub enum Error {
         position: usize,
         message: String,
     },
+    DatabaseAlreadyExists(String),
+    DatabaseNotFound(String),
+    DatabaseNotEmpty(String),
+    DatabaseIsActive(String),
     TableAlreadyExists(String),
     TableNotFound(String),
     DuplicateColumn(String),
@@ -39,6 +43,18 @@ impl fmt::Display for Error {
         match self {
             Self::Sql { position, message } => {
                 write!(f, "SQL error at byte {position}: {message}")
+            }
+            Self::DatabaseAlreadyExists(database) => {
+                write!(f, "database '{database}' already exists")
+            }
+            Self::DatabaseNotFound(database) => {
+                write!(f, "database '{database}' does not exist")
+            }
+            Self::DatabaseNotEmpty(database) => {
+                write!(f, "database '{database}' is not empty")
+            }
+            Self::DatabaseIsActive(database) => {
+                write!(f, "cannot drop active database '{database}'")
             }
             Self::TableAlreadyExists(table) => write!(f, "table '{table}' already exists"),
             Self::TableNotFound(table) => write!(f, "table '{table}' does not exist"),

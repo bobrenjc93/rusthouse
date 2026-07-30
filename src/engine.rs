@@ -1,19 +1,20 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, DEFAULT_DATABASE};
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    Select, SelectItem, Statement, TableReference,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    active_database: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,15 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            catalog: Catalog::new(),
+            active_database: DEFAULT_DATABASE.to_owned(),
+        }
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -46,6 +56,11 @@ impl Database {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    #[must_use]
+    pub fn current_database(&self) -> &str {
+        &self.active_database
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -62,8 +77,38 @@ impl Database {
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
+            Statement::CreateDatabase { name } => {
+                self.catalog.create_database(name)?;
+                Ok(command("CREATE DATABASE"))
+            }
+            Statement::DropDatabase { name } => {
+                if name.eq_ignore_ascii_case(&self.active_database) {
+                    return Err(Error::DatabaseIsActive(name));
+                }
+                self.catalog.drop_database(&name)?;
+                Ok(command("DROP DATABASE"))
+            }
+            Statement::UseDatabase { name } => {
+                let name = self.catalog.database(&name)?.name().to_owned();
+                self.active_database = name;
+                Ok(command("USE"))
+            }
+            Statement::ShowDatabases => Ok(StatementResult::Query(QueryResult {
+                columns: vec![ResultColumn {
+                    name: "name".to_owned(),
+                    data_type: DataType::String,
+                }],
+                rows: self
+                    .catalog
+                    .database_names()
+                    .into_iter()
+                    .map(|name| vec![Value::String(name.to_owned())])
+                    .collect(),
+            })),
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+                let database = self.reference_database(&name).to_owned();
+                self.catalog
+                    .create_table_in(&database, name.table, columns)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -71,13 +116,14 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
+                let database = self.reference_database(&table).to_owned();
                 {
-                    let target = self.catalog.table(&table)?;
+                    let target = self.catalog.table_in(&database, &table.table)?;
                     for row in &rows {
                         target.validate_row(row)?;
                     }
                 }
-                let target = self.catalog.table_mut(&table)?;
+                let target = self.catalog.table_mut_in(&database, &table.table)?;
                 for row in rows {
                     target.insert_row(row)?;
                 }
@@ -91,7 +137,8 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        let database = self.reference_database(&select.table);
+        let table = self.catalog.table_in(database, &select.table.table)?;
         let predicate = select
             .predicate
             .as_ref()
@@ -132,6 +179,17 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+
+    fn reference_database<'a>(&'a self, table: &'a TableReference) -> &'a str {
+        table.database.as_deref().unwrap_or(&self.active_database)
+    }
+}
+
+fn command(tag: &'static str) -> StatementResult {
+    StatementResult::Command {
+        tag,
+        affected_rows: 0,
     }
 }
 
