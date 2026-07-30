@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use normalize::{ColumnType, compare_output_batches};
+use process::{ClickHouseIdentity, Engine, EnginePaths, SqlBatch, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
-use workload::workloads;
+use workload::{ParameterValue, VariantParameter, workloads};
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
 
@@ -56,6 +56,10 @@ struct CaseResult {
     family: &'static str,
     row_count: usize,
     query_amplification: usize,
+    variant_seed: u64,
+    batch_sha256: String,
+    end_to_end_batch_sha256: String,
+    variant_parameters: Vec<Vec<VariantParameter>>,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
     clickhouse_primary_batch_median_ms: f64,
@@ -77,10 +81,28 @@ impl CorrectnessGate {
     fn verify(
         &mut self,
         columns: &[(&str, ColumnType)],
+        expected_batch: &SqlBatch,
         rusthouse: &TimedOutput,
         clickhouse: &TimedOutput,
     ) -> Result<(), String> {
-        compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
+        verify_batch_identity(
+            expected_batch,
+            rusthouse.query_repetitions,
+            &rusthouse.batch_sha256,
+            "RustHouse correctness",
+        )?;
+        verify_batch_identity(
+            expected_batch,
+            clickhouse.query_repetitions,
+            &clickhouse.batch_sha256,
+            "ClickHouse correctness",
+        )?;
+        compare_output_batches(
+            &rusthouse.stdout,
+            &clickhouse.stdout,
+            columns,
+            expected_batch.query_repetitions(),
+        )?;
         self.passed = true;
         Ok(())
     }
@@ -161,11 +183,27 @@ fn run(config: Config) -> Result<Report, String> {
         let setup_sql = dataset.setup_sql();
 
         for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
+            let variant_set = workload
+                .variants(dataset_seed, settings.query_amplification)
+                .map_err(|error| {
+                    format!(
+                        "could not generate variants for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
+            let variant_sql = variant_set
+                .queries
+                .iter()
+                .map(|variant| variant.sql.as_str())
+                .collect::<Vec<_>>();
+            let primary_batch = SqlBatch::new(&setup_sql, &variant_sql)?;
+            let end_to_end_batch = SqlBatch::new(&setup_sql, &[variant_sql[0]])?;
             eprintln!(
-                "benchmarking {} at {} rows ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
+                "benchmarking {} at {} rows ({} deterministic variants, batch {}, {} warmups, {} primary samples, {} end-to-end samples)",
                 workload.name,
                 row_count,
                 settings.query_amplification,
+                &primary_batch.sha256()[..12],
                 settings.warmups,
                 settings.samples,
                 settings.end_to_end_samples
@@ -173,35 +211,35 @@ fn run(config: Config) -> Result<Report, String> {
 
             let correctness_order = (row_count_index + workload_index).is_multiple_of(2);
             let (rusthouse_output, clickhouse_output) =
-                execute_correctness_pair(&paths, &setup_sql, &workload.sql, correctness_order)?;
+                execute_correctness_pair(&paths, &primary_batch, correctness_order)?;
             let mut correctness_gate = CorrectnessGate::default();
             correctness_gate
-                .verify(&workload.columns, &rusthouse_output, &clickhouse_output)
+                .verify(
+                    &workload.columns,
+                    &primary_batch,
+                    &rusthouse_output,
+                    &clickhouse_output,
+                )
                 .map_err(|error| {
                     format!(
-                        "correctness gate failed for '{}' at {row_count} rows: {error}",
-                        workload.name
+                        "variant preflight failed for '{}' at {row_count} rows: {error}",
+                        workload.name,
                     )
                 })?;
-            correctness_checks += 1;
+            correctness_checks += primary_batch.query_repetitions();
 
             let mut primary = TimingSeries::default();
             let primary_iterations = settings.warmups + settings.samples;
             for iteration in 0..primary_iterations {
                 let rusthouse_first =
                     (row_count_index + workload_index + iteration + 1).is_multiple_of(2);
-                let (rusthouse, clickhouse) = execute_timed_pair(
-                    &paths,
-                    &setup_sql,
-                    &workload.sql,
-                    settings.query_amplification,
-                    rusthouse_first,
-                )?;
+                let (rusthouse, clickhouse) =
+                    execute_timed_pair(&paths, &primary_batch, rusthouse_first)?;
                 accept_timed_pair(
                     &correctness_gate,
+                    &primary_batch,
                     &rusthouse,
                     &clickhouse,
-                    settings.query_amplification,
                     iteration >= settings.warmups,
                     &mut primary,
                 )?;
@@ -213,12 +251,12 @@ fn run(config: Config) -> Result<Report, String> {
                     (row_count_index + workload_index + iteration + primary_iterations)
                         .is_multiple_of(2);
                 let (rusthouse, clickhouse) =
-                    execute_timed_pair(&paths, &setup_sql, &workload.sql, 1, rusthouse_first)?;
+                    execute_timed_pair(&paths, &end_to_end_batch, rusthouse_first)?;
                 accept_timed_pair(
                     &correctness_gate,
+                    &end_to_end_batch,
                     &rusthouse,
                     &clickhouse,
-                    1,
                     true,
                     &mut end_to_end,
                 )?;
@@ -274,6 +312,14 @@ fn run(config: Config) -> Result<Report, String> {
                 family: workload.family.name(),
                 row_count,
                 query_amplification: settings.query_amplification,
+                variant_seed: variant_set.seed,
+                batch_sha256: primary_batch.sha256().to_owned(),
+                end_to_end_batch_sha256: end_to_end_batch.sha256().to_owned(),
+                variant_parameters: variant_set
+                    .queries
+                    .into_iter()
+                    .map(|variant| variant.parameters)
+                    .collect(),
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
@@ -309,7 +355,7 @@ fn run(config: Config) -> Result<Report, String> {
 
     let mut evidence = vec![
         format!(
-            "{} separate correctness pairs passed across {} cases and {} row counts",
+            "{} ordered variant result pairs passed preflight across {} cases and {} row counts",
             correctness_checks,
             cases.len(),
             settings.row_counts.len()
@@ -319,7 +365,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score.score, end_to_end_score.score
         ),
         format!(
-            "primary timing uses setup plus {} identical queries per process, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
+            "primary timing uses setup plus {} deterministic parameter variants per process, reuses byte-identical SHA-256-addressed batches, divides positive batch wall time by {}, discards stdout, and performs no startup subtraction",
             settings.query_amplification, settings.query_amplification
         ),
         format!(
@@ -340,7 +386,7 @@ fn run(config: Config) -> Result<Report, String> {
         ),
         format!("ClickHouse identity: {}", identity.version_output),
         format!(
-            "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
+            "limitation: amplification measures varied but warm in-process work, retains 1/{} of startup/setup, and does not model cold planning, concurrency, durable storage, or network access",
             settings.query_amplification
         ),
     ];
@@ -412,62 +458,59 @@ fn ensure_primary_headroom(score: &ScoreBreakdown, case_count: usize) -> Result<
 
 fn execute_correctness_pair(
     paths: &EnginePaths,
-    setup_sql: &str,
-    query_sql: &str,
+    batch: &SqlBatch,
     rusthouse_first: bool,
 ) -> Result<(TimedOutput, TimedOutput), String> {
     if rusthouse_first {
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
+        let rusthouse = paths.execute_correctness(Engine::RustHouse, batch)?;
+        let clickhouse = paths.execute_correctness(Engine::ClickHouse, batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse = paths.execute_correctness(Engine::ClickHouse, setup_sql, query_sql)?;
-        let rusthouse = paths.execute_correctness(Engine::RustHouse, setup_sql, query_sql)?;
+        let clickhouse = paths.execute_correctness(Engine::ClickHouse, batch)?;
+        let rusthouse = paths.execute_correctness(Engine::RustHouse, batch)?;
         Ok((rusthouse, clickhouse))
     }
 }
 
 fn execute_timed_pair(
     paths: &EnginePaths,
-    setup_sql: &str,
-    query_sql: &str,
-    query_repetitions: usize,
+    batch: &SqlBatch,
     rusthouse_first: bool,
 ) -> Result<(TimedBatch, TimedBatch), String> {
     if rusthouse_first {
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse = paths.execute_timed(Engine::RustHouse, batch)?;
+        let clickhouse = paths.execute_timed(Engine::ClickHouse, batch)?;
         Ok((rusthouse, clickhouse))
     } else {
-        let clickhouse =
-            paths.execute_timed(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
-        let rusthouse =
-            paths.execute_timed(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse = paths.execute_timed(Engine::ClickHouse, batch)?;
+        let rusthouse = paths.execute_timed(Engine::RustHouse, batch)?;
         Ok((rusthouse, clickhouse))
     }
 }
 
 fn accept_timed_pair(
     gate: &CorrectnessGate,
+    expected_batch: &SqlBatch,
     rusthouse: &TimedBatch,
     clickhouse: &TimedBatch,
-    expected_repetitions: usize,
     record: bool,
     samples: &mut TimingSeries,
 ) -> Result<(), String> {
     if !gate.passed {
         return Err("timed batch was not preceded by a passing correctness run".to_owned());
     }
-    if rusthouse.query_repetitions != clickhouse.query_repetitions
-        || rusthouse.query_repetitions != expected_repetitions
-    {
-        return Err(format!(
-            "query amplification mismatch: expected {expected_repetitions}, RustHouse used {}, ClickHouse used {}",
-            rusthouse.query_repetitions, clickhouse.query_repetitions
-        ));
-    }
+    verify_batch_identity(
+        expected_batch,
+        rusthouse.query_repetitions,
+        &rusthouse.batch_sha256,
+        "RustHouse timing",
+    )?;
+    verify_batch_identity(
+        expected_batch,
+        clickhouse.query_repetitions,
+        &clickhouse.batch_sha256,
+        "ClickHouse timing",
+    )?;
 
     let rusthouse_batch_ms = rusthouse.elapsed.as_secs_f64() * 1_000.0;
     let clickhouse_batch_ms = clickhouse.elapsed.as_secs_f64() * 1_000.0;
@@ -482,6 +525,27 @@ fn accept_timed_pair(
         samples
             .clickhouse_per_query_ms
             .push(clickhouse_per_query_ms);
+    }
+    Ok(())
+}
+
+fn verify_batch_identity(
+    expected: &SqlBatch,
+    actual_repetitions: usize,
+    actual_sha256: &str,
+    source: &str,
+) -> Result<(), String> {
+    if actual_repetitions != expected.query_repetitions() {
+        return Err(format!(
+            "{source} query amplification mismatch: expected {}, got {actual_repetitions}",
+            expected.query_repetitions()
+        ));
+    }
+    if actual_sha256 != expected.sha256() {
+        return Err(format!(
+            "{source} batch digest mismatch: expected {}, got {actual_sha256}",
+            expected.sha256()
+        ));
     }
     Ok(())
 }
@@ -540,7 +604,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,13 +625,13 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_parameter_variant_amplification\",\"calibration\":\"fixed_shared_ordered_variants\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"all_variants_preflighted\":true,\"byte_identical_engine_batches\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.version_output),
         json_string(&identity.sha256),
-        json_string("amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup"),
+        json_string("amplification measures varied but warm in-process work, does not model cold planning, and retains one divided by the amplification factor of startup and setup"),
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
@@ -578,11 +642,20 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"variant_seed\":{},\"batch_sha256\":{},\"end_to_end_batch_sha256\":{},\"variant_parameters\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
             case.query_amplification,
+            case.variant_seed,
+            json_string(&case.batch_sha256),
+            json_string(&case.end_to_end_batch_sha256),
+        )
+        .expect("writing to String cannot fail");
+        write_variant_parameters(&mut output, &case.variant_parameters);
+        write!(
+            output,
+            ",\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
@@ -612,6 +685,34 @@ fn details_json(
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_variant_parameters(output: &mut String, variants: &[Vec<VariantParameter>]) {
+    output.push('[');
+    for (variant_index, parameters) in variants.iter().enumerate() {
+        if variant_index > 0 {
+            output.push(',');
+        }
+        output.push('{');
+        for (parameter_index, parameter) in parameters.iter().enumerate() {
+            if parameter_index > 0 {
+                output.push(',');
+            }
+            output.push_str(&json_string(parameter.name));
+            output.push(':');
+            match &parameter.value {
+                ParameterValue::Integer(value) => {
+                    write!(output, "{value}").expect("writing to String cannot fail");
+                }
+                ParameterValue::Boolean(value) => {
+                    output.push_str(if *value { "true" } else { "false" })
+                }
+                ParameterValue::String(value) => output.push_str(&json_string(value)),
+            }
+        }
+        output.push('}');
+    }
+    output.push(']');
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -672,27 +773,36 @@ fn json_string(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn batch(milliseconds: f64, repetitions: usize) -> TimedBatch {
+    fn sql_batch(repetitions: usize) -> SqlBatch {
+        SqlBatch::new("", &vec!["SELECT 1;"; repetitions]).expect("SQL batch")
+    }
+
+    fn batch(milliseconds: f64, sql_batch: &SqlBatch) -> TimedBatch {
         TimedBatch {
             elapsed: Duration::from_secs_f64(milliseconds / 1_000.0),
-            query_repetitions: repetitions,
+            query_repetitions: sql_batch.query_repetitions(),
+            batch_sha256: sql_batch.sha256().to_owned(),
         }
     }
 
-    fn output(csv: &str) -> TimedOutput {
+    fn output(csv: &str, sql_batch: &SqlBatch) -> TimedOutput {
         TimedOutput {
             stdout: csv.to_owned(),
+            query_repetitions: sql_batch.query_repetitions(),
+            batch_sha256: sql_batch.sha256().to_owned(),
         }
     }
 
     #[test]
     fn correctness_failure_leaves_timing_gate_closed() {
         let mut gate = CorrectnessGate::default();
+        let sql_batch = sql_batch(1);
         let error = gate
             .verify(
                 &[("n", ColumnType::Integer)],
-                &output("n\n1\n"),
-                &output("n\n2\n"),
+                &sql_batch,
+                &output("n\n1\n", &sql_batch),
+                &output("n\n2\n", &sql_batch),
             )
             .expect_err("mismatch must fail");
 
@@ -703,11 +813,12 @@ mod tests {
     #[test]
     fn timed_batches_require_a_correctness_gate() {
         let mut samples = TimingSeries::default();
+        let sql_batch = sql_batch(64);
         let error = accept_timed_pair(
             &CorrectnessGate::default(),
-            &batch(10.0, 64),
-            &batch(10.0, 64),
-            64,
+            &sql_batch,
+            &batch(10.0, &sql_batch),
+            &batch(10.0, &sql_batch),
             true,
             &mut samples,
         )
@@ -721,11 +832,15 @@ mod tests {
     #[test]
     fn amplification_must_match_for_both_engines() {
         let mut samples = TimingSeries::default();
+        let sql_batch = sql_batch(64);
+        let rusthouse = batch(10.0, &sql_batch);
+        let mut clickhouse = batch(10.0, &sql_batch);
+        clickhouse.query_repetitions = 63;
         let error = accept_timed_pair(
             &CorrectnessGate { passed: true },
-            &batch(10.0, 64),
-            &batch(10.0, 63),
-            64,
+            &sql_batch,
+            &rusthouse,
+            &clickhouse,
             true,
             &mut samples,
         )
@@ -754,25 +869,70 @@ mod tests {
     #[test]
     fn normalized_match_opens_gate_and_accepts_positive_timing() {
         let mut gate = CorrectnessGate::default();
+        let sql_batch = sql_batch(1);
         gate.verify(
             &[("enabled", ColumnType::Boolean)],
-            &output("enabled\ntrue\n"),
-            &output("enabled\n1\n"),
+            &sql_batch,
+            &output("enabled\ntrue\n", &sql_batch),
+            &output("enabled\n1\n", &sql_batch),
         )
         .expect("matching output");
 
         let mut samples = TimingSeries::default();
         accept_timed_pair(
             &gate,
-            &batch(64.0, 64),
-            &batch(32.0, 64),
-            64,
+            &sql_batch,
+            &batch(64.0, &sql_batch),
+            &batch(32.0, &sql_batch),
             true,
             &mut samples,
         )
         .expect("gated sample");
-        assert_eq!(samples.rusthouse_per_query_ms, [1.0]);
-        assert_eq!(samples.clickhouse_per_query_ms, [0.5]);
+        assert_eq!(samples.rusthouse_per_query_ms, [64.0]);
+        assert_eq!(samples.clickhouse_per_query_ms, [32.0]);
+    }
+
+    #[test]
+    fn mismatched_batch_digest_is_rejected() {
+        let expected = sql_batch(2);
+        let different = SqlBatch::new("", &["SELECT 1;", "SELECT 2;"]).expect("batch");
+        let mut samples = TimingSeries::default();
+        let error = accept_timed_pair(
+            &CorrectnessGate { passed: true },
+            &expected,
+            &batch(10.0, &expected),
+            &batch(10.0, &different),
+            true,
+            &mut samples,
+        )
+        .expect_err("different engine bytes must fail");
+        assert!(error.contains("batch digest mismatch"));
+    }
+
+    #[test]
+    fn variant_parameters_keep_json_scalar_types_and_order() {
+        let variants = vec![
+            vec![
+                VariantParameter {
+                    name: "threshold",
+                    value: ParameterValue::Integer(-7),
+                },
+                VariantParameter {
+                    name: "enabled",
+                    value: ParameterValue::Boolean(true),
+                },
+            ],
+            vec![VariantParameter {
+                name: "label",
+                value: ParameterValue::String("quote\"inside".to_owned()),
+            }],
+        ];
+        let mut json = String::new();
+        write_variant_parameters(&mut json, &variants);
+        assert_eq!(
+            json,
+            "[{\"threshold\":-7,\"enabled\":true},{\"label\":\"quote\\\"inside\"}]"
+        );
     }
 
     #[test]

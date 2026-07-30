@@ -19,17 +19,43 @@ struct NormalizedTable {
     rows: Vec<Vec<NormalizedValue>>,
 }
 
+#[cfg(test)]
 pub fn compare_outputs(
     rusthouse_csv: &str,
     clickhouse_csv: &str,
     columns: &[(&str, ColumnType)],
 ) -> Result<(), String> {
-    let rusthouse = normalize(rusthouse_csv, columns, "RustHouse")?;
-    let clickhouse = normalize(clickhouse_csv, columns, "ClickHouse")?;
+    compare_output_batches(rusthouse_csv, clickhouse_csv, columns, 1)
+}
 
+pub fn compare_output_batches(
+    rusthouse_csv: &str,
+    clickhouse_csv: &str,
+    columns: &[(&str, ColumnType)],
+    expected_results: usize,
+) -> Result<(), String> {
+    if expected_results == 0 {
+        return Err("expected result count must be positive".to_owned());
+    }
+    let rusthouse = normalize_batch(rusthouse_csv, columns, "RustHouse", expected_results)?;
+    let clickhouse = normalize_batch(clickhouse_csv, columns, "ClickHouse", expected_results)?;
+
+    for (result_index, (left, right)) in rusthouse.iter().zip(&clickhouse).enumerate() {
+        compare_tables(left, right, columns, result_index)?;
+    }
+    Ok(())
+}
+
+fn compare_tables(
+    rusthouse: &NormalizedTable,
+    clickhouse: &NormalizedTable,
+    columns: &[(&str, ColumnType)],
+    result_index: usize,
+) -> Result<(), String> {
     if rusthouse.rows.len() != clickhouse.rows.len() {
         return Err(format!(
-            "row count mismatch: RustHouse returned {}, ClickHouse returned {}",
+            "result {} row count mismatch: RustHouse returned {}, ClickHouse returned {}",
+            result_index + 1,
             rusthouse.rows.len(),
             clickhouse.rows.len()
         ));
@@ -39,7 +65,8 @@ pub fn compare_outputs(
         for (column_index, (left, right)) in left.iter().zip(right).enumerate() {
             if !values_equal(left, right) {
                 return Err(format!(
-                    "result mismatch at row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
+                    "result mismatch in variant {}, row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
+                    result_index + 1,
                     row_index + 1,
                     columns[column_index].0
                 ));
@@ -49,27 +76,63 @@ pub fn compare_outputs(
     Ok(())
 }
 
-fn normalize(
+fn normalize_batch(
     csv: &str,
     columns: &[(&str, ColumnType)],
     engine: &str,
-) -> Result<NormalizedTable, String> {
+    expected_results: usize,
+) -> Result<Vec<NormalizedTable>, String> {
     let records = parse_csv(csv).map_err(|error| format!("{engine} CSV: {error}"))?;
-    let (header, rows) = records
-        .split_first()
-        .ok_or_else(|| format!("{engine} returned no CSV header"))?;
     let expected_header = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-    if header.iter().map(String::as_str).collect::<Vec<_>>() != expected_header {
+    let mut result_records = Vec::<Vec<Vec<String>>>::new();
+
+    for record in records {
+        let is_header = record
+            .iter()
+            .map(String::as_str)
+            .eq(expected_header.iter().copied());
+        if is_header {
+            if let Some(rows) = result_records.last_mut()
+                && rows.last().is_some_and(|row| row == &[String::new()])
+            {
+                rows.pop();
+            }
+            result_records.push(Vec::new());
+        } else if let Some(rows) = result_records.last_mut() {
+            rows.push(record);
+        } else {
+            return Err(format!(
+                "{engine} header mismatch: expected {expected_header:?}, got {record:?}"
+            ));
+        }
+    }
+
+    if result_records.len() != expected_results {
         return Err(format!(
-            "{engine} header mismatch: expected {expected_header:?}, got {header:?}"
+            "{engine} result count mismatch: expected {expected_results}, got {} (missing, extra, or malformed output)",
+            result_records.len()
         ));
     }
 
+    result_records
+        .iter()
+        .enumerate()
+        .map(|(result_index, rows)| normalize_rows(rows, columns, engine, result_index))
+        .collect()
+}
+
+fn normalize_rows(
+    rows: &[Vec<String>],
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+    result_index: usize,
+) -> Result<NormalizedTable, String> {
     let mut normalized_rows = Vec::with_capacity(rows.len());
     for (row_index, row) in rows.iter().enumerate() {
         if row.len() != columns.len() {
             return Err(format!(
-                "{engine} row {} has {} columns; expected {}",
+                "{engine} result {}, row {} has {} columns; expected {}",
+                result_index + 1,
                 row_index + 1,
                 row.len(),
                 columns.len()
@@ -82,7 +145,8 @@ fn normalize(
             .map(|(column_index, (value, (_, column_type)))| {
                 normalize_value(value, *column_type).map_err(|error| {
                     format!(
-                        "{engine} row {}, column '{}': {error}",
+                        "{engine} result {}, row {}, column '{}': {error}",
+                        result_index + 1,
                         row_index + 1,
                         columns[column_index].0
                     )
@@ -232,5 +296,32 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn compares_every_result_set_in_order() {
+        let columns = [("value", ColumnType::Integer)];
+        let rusthouse = "value\n1\n\nvalue\n2\n\nvalue\n3\n";
+        let clickhouse = "value\n1\nvalue\n2\nvalue\n3\n";
+
+        compare_output_batches(rusthouse, clickhouse, &columns, 3).expect("ordered batch");
+
+        let reordered = "value\n1\nvalue\n3\nvalue\n2\n";
+        let error = compare_output_batches(rusthouse, reordered, &columns, 3)
+            .expect_err("reordered output must fail");
+        assert!(error.contains("variant 2"));
+    }
+
+    #[test]
+    fn rejects_missing_and_extra_result_sets() {
+        let columns = [("value", ColumnType::Integer)];
+        let expected = "value\n1\nvalue\n2\n";
+        let missing = compare_output_batches(expected, "value\n1\n", &columns, 2)
+            .expect_err("missing output must fail");
+        assert!(missing.contains("result count mismatch"));
+
+        let extra = compare_output_batches(expected, "value\n1\nvalue\n2\nvalue\n3\n", &columns, 2)
+            .expect_err("extra output must fail");
+        assert!(extra.contains("result count mismatch"));
     }
 }
