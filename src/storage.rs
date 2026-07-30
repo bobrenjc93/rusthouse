@@ -86,6 +86,15 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn truncate(&mut self, length: usize) {
+        match self {
+            Self::Int64(values) => values.truncate(length),
+            Self::Float64(values) => values.truncate(length),
+            Self::Bool(values) => values.truncate(length),
+            Self::String(values) => values.truncate(length),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -99,6 +108,23 @@ pub struct Table {
 
 impl Table {
     pub fn new(name: String, schema: Vec<ColumnDef>) -> Result<Self> {
+        Self::build(name, schema, || Ok(()))
+    }
+
+    pub(crate) fn new_with_checkpoint(
+        name: String,
+        schema: Vec<ColumnDef>,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        Self::build(name, schema, checkpoint)
+    }
+
+    fn build(
+        name: String,
+        schema: Vec<ColumnDef>,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        checkpoint()?;
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
                 "a table must contain at least one column".to_owned(),
@@ -106,6 +132,7 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
+            checkpoint()?;
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
@@ -116,10 +143,12 @@ impl Table {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
-        let columns = schema
-            .iter()
-            .map(|field| Column::new(field.data_type))
-            .collect();
+        let mut columns = Vec::with_capacity(schema.len());
+        for field in &schema {
+            checkpoint()?;
+            columns.push(Column::new(field.data_type));
+        }
+        checkpoint()?;
         Ok(Self {
             name,
             schema,
@@ -160,6 +189,23 @@ impl Table {
 
     /// Checks a row without mutating any physical column.
     pub(crate) fn validate_row(&self, row: &[Value]) -> Result<()> {
+        self.validate_row_inner(row, || Ok(()))
+    }
+
+    fn validate_row_with_checkpoint(
+        &self,
+        row: &[Value],
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.validate_row_inner(row, checkpoint)
+    }
+
+    fn validate_row_inner(
+        &self,
+        row: &[Value],
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        checkpoint()?;
         if row.len() != self.schema.len() {
             return Err(Error::RowLength {
                 table: self.name.clone(),
@@ -169,6 +215,7 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
+            checkpoint()?;
             if field.data_type != value.data_type() {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
@@ -184,7 +231,44 @@ impl Table {
             }
         }
 
+        checkpoint()?;
         Ok(())
+    }
+
+    pub(crate) fn insert_rows_with_checkpoint(
+        &mut self,
+        rows: Vec<Vec<Value>>,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        for row in &rows {
+            checkpoint()?;
+            self.validate_row_with_checkpoint(row, checkpoint)?;
+        }
+        checkpoint()?;
+
+        let original_row_count = self.row_count;
+        for row in rows {
+            for (column, value) in self.columns.iter_mut().zip(row) {
+                if let Err(error) = checkpoint() {
+                    self.truncate_rows(original_row_count);
+                    return Err(error);
+                }
+                column.push(value);
+            }
+        }
+        if let Err(error) = checkpoint() {
+            self.truncate_rows(original_row_count);
+            return Err(error);
+        }
+        self.row_count = self.columns[0].len();
+        Ok(())
+    }
+
+    fn truncate_rows(&mut self, row_count: usize) {
+        for column in &mut self.columns {
+            column.truncate(row_count);
+        }
+        self.row_count = row_count;
     }
 
     /// Validates the complete row before appending one value to each column.
@@ -240,5 +324,37 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn cancelled_batch_append_rolls_back_every_column() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(1), Value::String("existing".to_owned())])
+            .expect("initial row");
+        let rows = vec![
+            vec![Value::Int64(2), Value::String("first".to_owned())],
+            vec![Value::Int64(3), Value::String("second".to_owned())],
+        ];
+        let mut checkpoints = 0;
+        let error = table
+            .insert_rows_with_checkpoint(rows, &mut || {
+                checkpoints += 1;
+                if checkpoints == 13 {
+                    Err(Error::ExecutionCancelled)
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("cancellation during append should abort the batch");
+
+        assert_eq!(error, Error::ExecutionCancelled);
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.columns()[0].value(0), Value::Int64(1));
+        assert_eq!(
+            table.columns()[1].value(0),
+            Value::String("existing".to_owned())
+        );
+        assert!(table.columns().iter().all(|column| column.len() == 1));
     }
 }

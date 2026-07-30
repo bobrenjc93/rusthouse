@@ -44,6 +44,48 @@ struct ExecutionControl<'a> {
     cancellation_token: Option<&'a CancellationToken>,
     scanned_rows: usize,
     output_rows: usize,
+    #[cfg(test)]
+    checkpoint_observer: Option<&'a CheckpointObserver>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CheckpointObserver {
+    pause_at: usize,
+    count: std::sync::atomic::AtomicUsize,
+    reached: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl CheckpointObserver {
+    fn new(pause_at: usize) -> Self {
+        Self {
+            pause_at,
+            count: std::sync::atomic::AtomicUsize::new(0),
+            reached: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        }
+    }
+
+    fn observe(&self) {
+        let count = self
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if count == self.pause_at {
+            self.reached.wait();
+            self.resume.wait();
+        }
+    }
+
+    fn wait_until_reached(&self) {
+        self.reached.wait();
+    }
+
+    fn resume(&self) {
+        self.resume.wait();
+    }
 }
 
 impl<'a> ExecutionControl<'a> {
@@ -53,6 +95,8 @@ impl<'a> ExecutionControl<'a> {
             cancellation_token: None,
             scanned_rows: 0,
             output_rows: 0,
+            #[cfg(test)]
+            checkpoint_observer: None,
         }
     }
 
@@ -62,10 +106,16 @@ impl<'a> ExecutionControl<'a> {
             cancellation_token: Some(&options.cancellation_token),
             scanned_rows: 0,
             output_rows: 0,
+            #[cfg(test)]
+            checkpoint_observer: None,
         }
     }
 
     fn checkpoint(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(observer) = self.checkpoint_observer {
+            observer.observe();
+        }
         let Some(limits) = self.limits else {
             return Ok(());
         };
@@ -194,7 +244,13 @@ impl Database {
         control.checkpoint()?;
         match statement {
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+                if control.is_unlimited() {
+                    self.catalog.create_table(name, columns)?;
+                } else {
+                    let mut checkpoint = || control.checkpoint();
+                    self.catalog
+                        .create_table_with_checkpoint(name, columns, &mut checkpoint)?;
+                }
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -202,15 +258,21 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
+                if control.is_unlimited() {
+                    {
+                        let target = self.catalog.table(&table)?;
+                        for row in &rows {
+                            target.validate_row(row)?;
+                        }
                     }
-                }
-                let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
+                    let target = self.catalog.table_mut(&table)?;
+                    for row in rows {
+                        target.insert_row(row)?;
+                    }
+                } else {
+                    let target = self.catalog.table_mut(&table)?;
+                    let mut checkpoint = || control.checkpoint();
+                    target.insert_rows_with_checkpoint(rows, &mut checkpoint)?;
                 }
                 Ok(StatementResult::Command {
                     tag: "INSERT",
@@ -974,6 +1036,7 @@ fn order_grouped_rows(
     control: &ExecutionControl<'_>,
 ) -> Result<()> {
     sort_and_limit(groups, limit, control, |left, right| {
+        control.checkpoint()?;
         for order in ordering {
             control.checkpoint()?;
             let comparison = match items[order.output] {
@@ -1304,5 +1367,122 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn cancellation_mid_insert_rolls_back_the_command() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE events (id Int64)")
+            .expect("create table");
+        let rows = (0..10_000).map(|value| vec![Value::Int64(value)]).collect();
+        let statement = Statement::Insert {
+            table: "events".to_owned(),
+            rows,
+        };
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let options = ExecutionOptions::new(ExecutionLimits::unlimited(), token);
+        let observer = CheckpointObserver::new(40_100);
+        let mut control = ExecutionControl::new(&options);
+        control.checkpoint_observer = Some(&observer);
+
+        let error = std::thread::scope(|scope| {
+            let database = &mut database;
+            let handle = scope.spawn(move || database.execute_statement(statement, &mut control));
+            observer.wait_until_reached();
+            canceller.cancel();
+            observer.resume();
+            handle
+                .join()
+                .expect("command thread should not panic")
+                .expect_err("mid-append cancellation should abort")
+        });
+
+        assert_eq!(error, Error::ExecutionCancelled);
+        assert_eq!(
+            database
+                .catalog()
+                .table("events")
+                .expect("table remains available")
+                .row_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cancellation_mid_create_does_not_publish_the_table() {
+        let mut database = Database::new();
+        let columns = (0..50_000)
+            .map(|index| crate::storage::ColumnDef {
+                name: format!("column_{index}"),
+                data_type: DataType::Int64,
+            })
+            .collect();
+        let statement = Statement::CreateTable {
+            name: "wide".to_owned(),
+            columns,
+        };
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let options = ExecutionOptions::new(ExecutionLimits::unlimited(), token);
+        let observer = CheckpointObserver::new(100);
+        let mut control = ExecutionControl::new(&options);
+        control.checkpoint_observer = Some(&observer);
+
+        let error = std::thread::scope(|scope| {
+            let database = &mut database;
+            let handle = scope.spawn(move || database.execute_statement(statement, &mut control));
+            observer.wait_until_reached();
+            canceller.cancel();
+            observer.resume();
+            handle
+                .join()
+                .expect("command thread should not panic")
+                .expect_err("mid-build cancellation should abort")
+        });
+
+        assert_eq!(error, Error::ExecutionCancelled);
+        assert!(matches!(
+            database.catalog().table("wide"),
+            Err(Error::TableNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn unordered_group_sort_observes_midflight_cancellation() {
+        let group_count: usize = 50_000;
+        let data = GroupedData {
+            keys: (0..group_count)
+                .rev()
+                .map(|value| {
+                    GroupKey::One(ValueRef::Int64(
+                        i64::try_from(value).expect("test group fits Int64"),
+                    ))
+                })
+                .collect(),
+            aggregates: Vec::new(),
+        };
+        let mut groups = (0..group_count).collect::<Vec<_>>();
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let options = ExecutionOptions::new(ExecutionLimits::unlimited(), token);
+        let observer = CheckpointObserver::new(100);
+        let mut control = ExecutionControl::new(&options);
+        control.checkpoint_observer = Some(&observer);
+
+        let error = std::thread::scope(|scope| {
+            let handle = scope
+                .spawn(move || order_grouped_rows(&mut groups, &data, &[], &[], None, &control));
+            observer.wait_until_reached();
+            canceller.cancel();
+            observer.resume();
+            handle
+                .join()
+                .expect("sort thread should not panic")
+                .expect_err("unordered group sorting should observe cancellation")
+        });
+
+        assert_eq!(error, Error::ExecutionCancelled);
     }
 }
