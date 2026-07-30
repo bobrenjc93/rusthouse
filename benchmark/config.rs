@@ -197,11 +197,15 @@ fn destinations_collide(left: &Path, right: &Path) -> bool {
         return true;
     }
     if let (Some(left), Some(right)) = (resolved_destination(left), resolved_destination(right))
-        && left == right
+        && (left == right || case_folded_paths_equal(&left, &right))
     {
         return true;
     }
     same_existing_file(left, right)
+}
+
+fn case_folded_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
 }
 
 fn resolved_destination(path: &Path) -> Option<PathBuf> {
@@ -362,6 +366,12 @@ mod tests {
                 "--correctness-audit",
                 "--audit-sql=output/../artifact",
                 "--details=artifact",
+            ],
+            vec![
+                "--clickhouse=/clickhouse",
+                "--correctness-audit",
+                "--audit-sql=audit.sql",
+                "--details=AUDIT.SQL",
             ],
             vec![
                 "--clickhouse=/clickhouse",
