@@ -57,7 +57,7 @@ printf '%s\n' \
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
-JSONEachRow writes each query row immediately as an independent JSON object. `COPY` accepts one object per line, matches fields case-insensitively in any order, applies the type default to omitted fields, and rejects duplicate fields, unknown fields, explicit `null`, malformed JSON, and type mismatches. An import is appended only after every record succeeds.
+JSONEachRow writes each query row immediately as an independent JSON object and rejects duplicate output names before writing. `COPY` accepts one object per line, matches fields case-insensitively in any order, applies the type default to omitted fields, and rejects duplicate fields, unknown fields, explicit `null`, malformed JSON, and type mismatches. An import is appended only after every record succeeds.
 
 ## Library API
 

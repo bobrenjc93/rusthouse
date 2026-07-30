@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write as IoWrite};
 
@@ -25,14 +26,47 @@ impl OutputFormat {
     }
 }
 
+/// Render a result into an owned string.
+///
+/// # Panics
+///
+/// Panics when JSONEachRow output has duplicate column names. Use
+/// [`try_render`] when the result schema is not already known to be valid.
 #[must_use]
 pub fn render(result: &QueryResult, format: OutputFormat) -> String {
+    try_render(result, format)
+        .unwrap_or_else(|error| panic!("could not render {format:?}: {error}"))
+}
+
+/// Render a result, returning schema errors for object-based formats.
+pub fn try_render(result: &QueryResult, format: OutputFormat) -> io::Result<String> {
     match format {
-        OutputFormat::Table => render_table(result),
-        OutputFormat::Csv => render_csv(result),
-        OutputFormat::Json => render_json(result),
+        OutputFormat::Table => Ok(render_table(result)),
+        OutputFormat::Csv => Ok(render_csv(result)),
+        OutputFormat::Json => Ok(render_json(result)),
         OutputFormat::JsonEachRow => render_json_each_row(result),
     }
+}
+
+/// Validate that a result can be represented by the selected format.
+pub fn validate(result: &QueryResult, format: OutputFormat) -> io::Result<()> {
+    if format != OutputFormat::JsonEachRow {
+        return Ok(());
+    }
+
+    let mut names = HashSet::with_capacity(result.columns.len());
+    for column in &result.columns {
+        if !names.insert(column.name.to_ascii_lowercase()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "duplicate JSONEachRow output column '{}'; column names must be unique",
+                    column.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Write a result in the selected format.
@@ -48,6 +82,7 @@ pub fn write<W: IoWrite>(
         return writer.write_all(render(result, format).as_bytes());
     }
 
+    validate(result, format)?;
     for row in &result.rows {
         let record = render_json_each_row_record(result, row);
         writer.write_all(record.as_bytes())?;
@@ -203,11 +238,10 @@ fn render_json(result: &QueryResult) -> String {
     output
 }
 
-fn render_json_each_row(result: &QueryResult) -> String {
+fn render_json_each_row(result: &QueryResult) -> io::Result<String> {
     let mut output = Vec::new();
-    write(result, OutputFormat::JsonEachRow, &mut output)
-        .expect("writing JSONEachRow to a Vec cannot fail");
-    String::from_utf8(output).expect("JSON output is UTF-8")
+    write(result, OutputFormat::JsonEachRow, &mut output)?;
+    Ok(String::from_utf8(output).expect("JSON output is UTF-8"))
 }
 
 fn render_json_each_row_record(result: &QueryResult, row: &[Value]) -> String {
@@ -301,6 +335,36 @@ mod tests {
             render(&result(), OutputFormat::JsonEachRow),
             "{\"id\":1,\"note\":\"quote: \\\", comma\"}\n"
         );
+    }
+
+    #[test]
+    fn json_each_row_rejects_duplicate_names_before_writing() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "ID".to_owned(),
+                    data_type: DataType::Int64,
+                },
+            ],
+            rows: vec![vec![Value::Int64(1), Value::Int64(1)]],
+        };
+        let mut output = Vec::new();
+
+        let error = write(&result, OutputFormat::JsonEachRow, &mut output)
+            .expect_err("duplicate output names must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate JSONEachRow output column 'ID'")
+        );
+        assert!(output.is_empty());
+        assert!(try_render(&result, OutputFormat::JsonEachRow).is_err());
     }
 
     #[test]

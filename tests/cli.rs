@@ -116,6 +116,26 @@ break'), (1, 'quote: \"');
 }
 
 #[test]
+fn json_each_row_rejects_duplicate_select_names_without_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=JSONEachRow",
+            "--execute",
+            "CREATE TABLE items (id Int64); INSERT INTO items VALUES (1); SELECT id, id FROM items;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("duplicate JSONEachRow output column 'id'")
+    );
+}
+
+#[test]
 fn sql_errors_are_reported_with_nonzero_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

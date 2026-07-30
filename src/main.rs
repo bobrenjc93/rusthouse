@@ -2,7 +2,7 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use rusthouse::format::{OutputFormat, write as write_result};
+use rusthouse::format::{OutputFormat, validate as validate_result, write as write_result};
 use rusthouse::{Database, QueryResult, StatementResult};
 
 const HELP: &str = "\
@@ -74,6 +74,10 @@ fn write_query_results<W: Write>(
     format: OutputFormat,
     writer: &mut W,
 ) -> io::Result<()> {
+    for result in results {
+        validate_result(result, format)?;
+    }
+
     if format == OutputFormat::Json {
         writer.write_all(b"{\"results\":[")?;
         for (index, result) in results.iter().enumerate() {
@@ -196,5 +200,37 @@ mod tests {
             },
             "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
         );
+    }
+
+    #[test]
+    fn json_each_row_preflight_prevents_partial_batch_output() {
+        let valid = QueryResult {
+            columns: vec![ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: vec![vec![Value::Int64(1)]],
+        };
+        let duplicate = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "ID".to_owned(),
+                    data_type: DataType::Int64,
+                },
+            ],
+            rows: vec![vec![Value::Int64(2), Value::Int64(2)]],
+        };
+        let mut output = Vec::new();
+
+        let error =
+            write_query_results(&[valid, duplicate], OutputFormat::JsonEachRow, &mut output)
+                .expect_err("duplicate output names must fail the batch");
+
+        assert!(error.to_string().contains("duplicate JSONEachRow output"));
+        assert!(output.is_empty());
     }
 }
