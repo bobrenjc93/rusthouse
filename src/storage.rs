@@ -16,23 +16,66 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
         .any(|keyword| name.eq_ignore_ascii_case(keyword))
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// Typed physical values and their NULL validity bitmap.
+///
+/// Logical reads are exposed by [`Column::value`]; the placeholder stored in a
+/// NULL physical slot is intentionally not part of the public API.
+#[derive(Debug, Clone)]
+pub struct ColumnStorage<T> {
+    values: Vec<T>,
+    nulls: Vec<bool>,
+}
+
+impl<T> ColumnStorage<T> {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            nulls: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, value: T, is_null: bool) {
+        self.values.push(value);
+        self.nulls.push(is_null);
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_null(&self, row: usize) -> bool {
+        self.nulls[row]
+    }
+
+    pub(crate) fn physical_values(&self) -> &[T] {
+        &self.values
+    }
+}
+
+/// A physical column. Each variant owns contiguous values and validity bits.
 #[derive(Debug, Clone)]
 pub enum Column {
-    Int64(Vec<i64>),
-    Float64(Vec<f64>),
-    Bool(Vec<bool>),
-    String(Vec<String>),
+    Int64(ColumnStorage<i64>),
+    Float64(ColumnStorage<f64>),
+    Bool(ColumnStorage<bool>),
+    String(ColumnStorage<String>),
 }
 
 impl Column {
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
         match data_type {
-            DataType::Int64 => Self::Int64(Vec::new()),
-            DataType::Float64 => Self::Float64(Vec::new()),
-            DataType::Bool => Self::Bool(Vec::new()),
-            DataType::String => Self::String(Vec::new()),
+            DataType::Int64 => Self::Int64(ColumnStorage::new()),
+            DataType::Float64 => Self::Float64(ColumnStorage::new()),
+            DataType::Bool => Self::Bool(ColumnStorage::new()),
+            DataType::String => Self::String(ColumnStorage::new()),
         }
     }
 
@@ -62,35 +105,43 @@ impl Column {
     }
 
     #[must_use]
+    pub fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Int64(storage) => storage.is_null(row),
+            Self::Float64(storage) => storage.is_null(row),
+            Self::Bool(storage) => storage.is_null(row),
+            Self::String(storage) => storage.is_null(row),
+        }
+    }
+
+    #[must_use]
     pub fn value(&self, row: usize) -> Value {
         self.value_ref(row).to_owned()
     }
 
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
+        if self.is_null(row) {
+            return ValueRef::Null;
+        }
         match self {
-            Self::Int64(values) => ValueRef::Int64(values[row]),
-            Self::Float64(values) => ValueRef::Float64(values[row]),
-            Self::Bool(values) => ValueRef::Bool(values[row]),
-            Self::String(values) => ValueRef::String(&values[row]),
+            Self::Int64(storage) => ValueRef::Int64(storage.values[row]),
+            Self::Float64(storage) => ValueRef::Float64(storage.values[row]),
+            Self::Bool(storage) => ValueRef::Bool(storage.values[row]),
+            Self::String(storage) => ValueRef::String(&storage.values[row]),
         }
     }
 
     fn push(&mut self, value: Value) {
         match (self, value) {
-            (Self::Int64(values), Value::Int64(value)) => values.push(value),
-            (Self::Float64(values), Value::Float64(value)) => values.push(value),
-            (Self::Bool(values), Value::Bool(value)) => values.push(value),
-            (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Int64(storage), Value::Int64(value)) => storage.push(value, false),
+            (Self::Float64(storage), Value::Float64(value)) => storage.push(value, false),
+            (Self::Bool(storage), Value::Bool(value)) => storage.push(value, false),
+            (Self::String(storage), Value::String(value)) => storage.push(value, false),
+            (Self::Int64(storage), Value::Null) => storage.push(0, true),
+            (Self::Float64(storage), Value::Null) => storage.push(0.0, true),
+            (Self::Bool(storage), Value::Null) => storage.push(false, true),
+            (Self::String(storage), Value::Null) => storage.push(String::new(), true),
             _ => unreachable!("values are validated before insertion"),
-        }
-    }
-
-    fn push_null_placeholder(&mut self) {
-        match self {
-            Self::Int64(values) => values.push(0),
-            Self::Float64(values) => values.push(0.0),
-            Self::Bool(values) => values.push(false),
-            Self::String(values) => values.push(String::new()),
         }
     }
 }
@@ -101,7 +152,6 @@ pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
-    nulls: Vec<Vec<bool>>,
     row_count: usize,
 }
 
@@ -128,12 +178,10 @@ impl Table {
             .iter()
             .map(|field| Column::new(field.data_type))
             .collect::<Vec<_>>();
-        let nulls = (0..columns.len()).map(|_| Vec::new()).collect();
         Ok(Self {
             name,
             schema,
             columns,
-            nulls,
             row_count: 0,
         })
     }
@@ -164,11 +212,7 @@ impl Table {
     }
 
     pub(crate) fn value_ref(&self, column: usize, row: usize) -> ValueRef<'_> {
-        if self.nulls[column][row] {
-            ValueRef::Null
-        } else {
-            self.columns[column].value_ref(row)
-        }
+        self.columns[column].value_ref(row)
     }
 
     pub(crate) fn cmp_at(&self, column: usize, left: usize, right: usize) -> std::cmp::Ordering {
@@ -223,14 +267,8 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
-        for (index, (column, value)) in self.columns.iter_mut().zip(row).enumerate() {
-            if value == Value::Null {
-                column.push_null_placeholder();
-                self.nulls[index].push(true);
-            } else {
-                column.push(value);
-                self.nulls[index].push(false);
-            }
+        for (column, value) in self.columns.iter_mut().zip(row) {
+            column.push(value);
         }
         self.row_count += 1;
         Ok(())
@@ -265,8 +303,8 @@ mod tests {
             .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
             .expect("valid row");
 
-        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
-        assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v.physical_values() == [7]));
+        assert!(matches!(&table.columns()[1], Column::String(v) if v.physical_values() == ["ok"]));
     }
 
     #[test]
@@ -290,7 +328,9 @@ mod tests {
 
         assert_eq!(table.value(0, 0), Value::Null);
         assert_eq!(table.value(1, 0), Value::Null);
-        assert!(matches!(&table.columns()[0], Column::Int64(values) if values == &[0]));
-        assert!(matches!(&table.columns()[1], Column::String(values) if values == &[""]));
+        assert_eq!(table.columns()[0].value(0), Value::Null);
+        assert_eq!(table.columns()[1].value(0), Value::Null);
+        assert!(table.columns()[0].is_null(0));
+        assert!(table.columns()[1].is_null(0));
     }
 }

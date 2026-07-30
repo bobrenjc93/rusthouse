@@ -657,10 +657,11 @@ impl AggregateAccumulator {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+                let Column::Int64(storage) = &table.columns()[spec.argument.expect("SUM argument")]
                 else {
                     unreachable!("SUM input type is resolved")
                 };
+                let values = storage.physical_values();
                 *sum = Some(match *sum {
                     Some(current) => current
                         .checked_add(values[row])
@@ -669,11 +670,12 @@ impl AggregateAccumulator {
                 });
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values) =
+                let Column::Float64(storage) =
                     &table.columns()[spec.argument.expect("SUM argument")]
                 else {
                     unreachable!("SUM input type is resolved")
                 };
+                let values = storage.physical_values();
                 let next = sum.unwrap_or(0.0) + values[row];
                 if !next.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
@@ -699,10 +701,11 @@ impl AggregateAccumulator {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let Column::Int64(storage) = &table.columns()[spec.argument.expect("AVG argument")]
                 else {
                     unreachable!("AVG input type is resolved")
                 };
+                let values = storage.physical_values();
                 *sum = sum
                     .checked_add(i128::from(values[row]))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
@@ -711,11 +714,12 @@ impl AggregateAccumulator {
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
+                let Column::Float64(storage) =
                     &table.columns()[spec.argument.expect("AVG argument")]
                 else {
                     unreachable!("AVG input type is resolved")
                 };
+                let values = storage.physical_values();
                 *sum += values[row];
                 *count = count
                     .checked_add(1)

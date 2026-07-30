@@ -677,3 +677,34 @@ fn distinct_applies_to_final_grouped_rows() {
         vec![vec![Value::Int64(2)], vec![Value::Int64(1)]]
     );
 }
+
+#[test]
+fn public_catalog_column_reads_preserve_null_values() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE nullable_values (
+                int_value Int64,
+                float_value Float64,
+                bool_value Bool,
+                string_value String
+             );
+             INSERT INTO nullable_values VALUES
+                (NULL, NULL, NULL, NULL),
+                (7, 1.5, true, 'present');",
+        )
+        .expect("setup succeeds");
+
+    let table = database
+        .catalog()
+        .table("nullable_values")
+        .expect("table is publicly accessible");
+    let columns = table.columns();
+
+    assert!(columns.iter().all(|column| column.is_null(0)));
+    assert!(columns.iter().all(|column| column.value(0) == Value::Null));
+    assert_eq!(columns[0].value(1), Value::Int64(7));
+    assert_eq!(columns[1].value(1), Value::Float64(1.5));
+    assert_eq!(columns[2].value(1), Value::Bool(true));
+    assert_eq!(columns[3].value(1), Value::String("present".to_owned()));
+}
