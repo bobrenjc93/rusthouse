@@ -311,6 +311,147 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn select_distinct_deduplicates_aliased_projection_before_order_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE offers (region String, amount Int64);
+             INSERT INTO offers VALUES
+                ('west', 30),
+                ('west', 30),
+                ('west', 20),
+                ('east', 20),
+                ('east', 20),
+                ('north', 10);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT DISTINCT region AS area, amount AS total
+         FROM offers
+         ORDER BY total DESC, area
+         LIMIT 3;",
+    );
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["area", "total"]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::String("west".to_owned()), Value::Int64(30)],
+            vec![Value::String("east".to_owned()), Value::Int64(20)],
+            vec![Value::String("west".to_owned()), Value::Int64(20)],
+        ]
+    );
+}
+
+#[test]
+fn distinct_aggregates_use_canonical_numeric_equality_per_group() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (bucket String, value Float64);
+             INSERT INTO samples VALUES
+                ('a', -0.0), ('a', 0.0), ('a', 2.0), ('a', 2.0),
+                ('b', -0.0), ('b', 0.0), ('b', -2.0), ('b', -2.0);",
+        )
+        .expect("setup succeeds");
+
+    let projection = execute_query(
+        &mut database,
+        "SELECT DISTINCT value FROM samples WHERE bucket = 'a' ORDER BY value;",
+    );
+    assert_eq!(
+        projection.rows,
+        vec![vec![Value::Float64(0.0)], vec![Value::Float64(2.0)]]
+    );
+
+    let aggregates = execute_query(
+        &mut database,
+        "SELECT bucket AS group_name,
+                COUNT(DISTINCT value) AS count,
+                SUM(DISTINCT value) AS total,
+                MIN(DISTINCT value) AS low,
+                MAX(DISTINCT value) AS high,
+                AVG(DISTINCT value) AS mean
+         FROM samples
+         GROUP BY bucket
+         ORDER BY group_name;",
+    );
+    assert_eq!(
+        aggregates.rows,
+        vec![
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Float64(2.0),
+                Value::Float64(0.0),
+                Value::Float64(2.0),
+                Value::Float64(1.0),
+            ],
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(2),
+                Value::Float64(-2.0),
+                Value::Float64(-2.0),
+                Value::Float64(0.0),
+                Value::Float64(-1.0),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn distinct_handles_empty_inputs_and_grouped_projection_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE empty_values (value Int64);
+             CREATE TABLE dimensions (region String, channel String);
+             INSERT INTO dimensions VALUES
+                ('east', 'online'),
+                ('west', 'online'),
+                ('west', 'store');",
+        )
+        .expect("setup succeeds");
+
+    let empty_projection = execute_query(
+        &mut database,
+        "SELECT DISTINCT value AS unique_value FROM empty_values;",
+    );
+    assert!(empty_projection.rows.is_empty());
+
+    let empty_count = execute_query(
+        &mut database,
+        "SELECT COUNT(DISTINCT value) FROM empty_values;",
+    );
+    assert_eq!(empty_count.columns[0].name, "COUNT(DISTINCT value)");
+    assert_eq!(empty_count.rows, vec![vec![Value::Int64(0)]]);
+
+    let grouped_projection = execute_query(
+        &mut database,
+        "SELECT DISTINCT region AS area
+         FROM dimensions
+         GROUP BY region, channel
+         ORDER BY area;",
+    );
+    assert_eq!(
+        grouped_projection.rows,
+        vec![
+            vec![Value::String("east".to_owned())],
+            vec![Value::String("west".to_owned())],
+        ]
+    );
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database

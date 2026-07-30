@@ -20,6 +20,7 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
@@ -38,6 +39,7 @@ pub enum SelectItem {
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
+        distinct: bool,
         alias: Option<String>,
     },
 }
@@ -442,6 +444,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        let distinct = self.eat_keyword("DISTINCT");
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -504,6 +507,7 @@ impl Parser {
         };
 
         Ok(Select {
+            distinct,
             items,
             table,
             predicate,
@@ -525,7 +529,11 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
+            let distinct = self.eat_keyword("DISTINCT");
             let argument = if self.eat(&TokenKind::Star) {
+                if distinct {
+                    return self.error("DISTINCT aggregate argument must be a column");
+                }
                 AggregateArgument::Wildcard
             } else {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
@@ -535,6 +543,7 @@ impl Parser {
             Ok(SelectItem::Aggregate {
                 function,
                 argument,
+                distinct,
                 alias,
             })
         } else {
@@ -771,6 +780,40 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_projection_and_aggregate_distinct() {
+        let statements = parse(
+            "SELECT DISTINCT region AS area, COUNT(DISTINCT amount) AS values \
+             FROM sales GROUP BY region",
+        )
+        .expect("valid DISTINCT query");
+
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert!(select.distinct);
+        assert!(matches!(
+            &select.items[1],
+            SelectItem::Aggregate {
+                function: AggregateFunction::Count,
+                argument: AggregateArgument::Column(name),
+                distinct: true,
+                alias: Some(alias),
+            } if name == "amount" && alias == "values"
+        ));
+    }
+
+    #[test]
+    fn rejects_distinct_wildcard_aggregate() {
+        let error = parse("SELECT COUNT(DISTINCT *) FROM sales")
+            .expect_err("DISTINCT * is not an aggregate argument");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("DISTINCT aggregate argument must be a column")
+        ));
     }
 
     #[test]

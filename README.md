@@ -6,10 +6,10 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
-- SELECT * and named projections, with optional AS aliases
+- SELECT * and named projections, with optional DISTINCT and AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- COUNT, SUM, MIN, MAX, and AVG, including DISTINCT column arguments
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -115,6 +115,9 @@ impl Database {
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            if select.distinct {
+                retain_distinct_grouped_rows(&mut selected_groups, &grouped, &items);
+            }
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -124,6 +127,9 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
+            if select.distinct {
+                retain_distinct_source_rows(&mut matching_rows, table, &items);
+            }
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
         };
@@ -151,6 +157,7 @@ struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+    distinct: bool,
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -232,6 +239,7 @@ fn resolve_select_items(
             SelectItem::Aggregate {
                 function,
                 argument,
+                distinct,
                 alias,
             } => {
                 let (argument_index, input_type, argument_name) = match argument {
@@ -259,12 +267,14 @@ fn resolve_select_items(
                     function: *function,
                     argument: argument_index,
                     input_type,
+                    distinct: *distinct,
                 });
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                    name: alias.clone().unwrap_or_else(|| {
+                        let qualifier = if *distinct { "DISTINCT " } else { "" };
+                        format!("{}({qualifier}{argument_name})", function.name())
+                    }),
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
@@ -317,6 +327,36 @@ fn execute_projection(
                 .collect()
         })
         .collect()
+}
+
+fn retain_distinct_source_rows<'a>(
+    rows: &mut Vec<usize>,
+    table: &'a Table,
+    items: &[ResolvedItem],
+) {
+    let initial_capacity = rows.len().min(1_024);
+    if items.len() == 1 {
+        let mut seen = HashSet::with_capacity(initial_capacity);
+        rows.retain(|row| seen.insert(source_projection_value(table, *row, &items[0])));
+    } else {
+        let mut seen = HashSet::<Box<[ValueRef<'a>]>>::with_capacity(initial_capacity);
+        rows.retain(|row| {
+            let key = items
+                .iter()
+                .map(|item| source_projection_value(table, *row, item))
+                .collect::<Box<[_]>>();
+            seen.insert(key)
+        });
+    }
+}
+
+fn source_projection_value<'a>(table: &'a Table, row: usize, item: &ResolvedItem) -> ValueRef<'a> {
+    match item {
+        ResolvedItem::Column { source, .. } => table.columns()[*source].value_ref(row),
+        ResolvedItem::Aggregate { .. } => {
+            unreachable!("ungrouped projections cannot contain aggregates")
+        }
+    }
 }
 
 fn execute_grouped<'a>(
@@ -502,27 +542,35 @@ impl GroupedData<'_> {
             .map(|group| {
                 items
                     .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
+                    .map(|item| self.projection_value(*group, item).to_owned())
                     .collect()
             })
             .collect()
     }
+
+    fn projection_value(&self, group: usize, item: &ResolvedItem) -> ValueRef<'_> {
+        match item {
+            ResolvedItem::Column {
+                group_position: Some(position),
+                ..
+            } => self.keys[group].value(*position),
+            ResolvedItem::Column {
+                group_position: None,
+                ..
+            } => unreachable!("grouped columns are validated"),
+            ResolvedItem::Aggregate { state } => self.aggregates[*state][group].as_ref(),
+        }
+    }
 }
 
 #[derive(Debug)]
-enum AggregateState {
+struct AggregateState<'a> {
+    accumulator: AggregateAccumulator,
+    distinct_values: Option<HashSet<ValueRef<'a>>>,
+}
+
+#[derive(Debug)]
+enum AggregateAccumulator {
     Count(i64),
     SumInt(i64),
     SumFloat(f64),
@@ -532,21 +580,45 @@ enum AggregateState {
     AvgFloat { sum: f64, count: u64 },
 }
 
-impl AggregateState {
+impl<'a> AggregateState<'a> {
     fn new(spec: &AggregateSpec) -> Self {
-        match spec.function {
-            AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
-            AggregateFunction::Min => Self::Min(None),
-            AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
-                Self::AvgInt { sum: 0, count: 0 }
+        let accumulator = match spec.function {
+            AggregateFunction::Count => AggregateAccumulator::Count(0),
+            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => {
+                AggregateAccumulator::SumInt(0)
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Sum => AggregateAccumulator::SumFloat(0.0),
+            AggregateFunction::Min => AggregateAccumulator::Min(None),
+            AggregateFunction::Max => AggregateAccumulator::Max(None),
+            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+                AggregateAccumulator::AvgInt { sum: 0, count: 0 }
+            }
+            AggregateFunction::Avg => AggregateAccumulator::AvgFloat { sum: 0.0, count: 0 },
+        };
+        Self {
+            accumulator,
+            distinct_values: spec.distinct.then(HashSet::new),
         }
     }
 
+    fn update(&mut self, spec: &AggregateSpec, table: &'a Table, row: usize) -> Result<()> {
+        if let Some(seen) = &mut self.distinct_values {
+            let argument = spec
+                .argument
+                .expect("DISTINCT aggregate has a column argument");
+            if !seen.insert(table.columns()[argument].value_ref(row)) {
+                return Ok(());
+            }
+        }
+        self.accumulator.update(spec, table, row)
+    }
+
+    fn finish(self) -> Result<Value> {
+        self.accumulator.finish()
+    }
+}
+
+impl AggregateAccumulator {
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
@@ -643,6 +715,27 @@ impl AggregateState {
                 "AVG is undefined for an empty input".to_owned(),
             )),
         }
+    }
+}
+
+fn retain_distinct_grouped_rows<'a>(
+    groups: &mut Vec<usize>,
+    data: &'a GroupedData<'_>,
+    items: &[ResolvedItem],
+) {
+    let initial_capacity = groups.len().min(1_024);
+    if items.len() == 1 {
+        let mut seen = HashSet::with_capacity(initial_capacity);
+        groups.retain(|group| seen.insert(data.projection_value(*group, &items[0])));
+    } else {
+        let mut seen = HashSet::<Box<[ValueRef<'a>]>>::with_capacity(initial_capacity);
+        groups.retain(|group| {
+            let key = items
+                .iter()
+                .map(|item| data.projection_value(*group, item))
+                .collect::<Box<[_]>>();
+            seen.insert(key)
+        });
     }
 }
 
