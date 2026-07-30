@@ -47,6 +47,18 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
+The fail-closed audit runs that same suite for the documented panel `20260729`, `20260730`, and `20260731`, then publishes one aggregate details artifact:
+
+~~~bash
+RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
+  target/release/clickhouse-parity-bench \
+  --mode default \
+  --seeds \
+  --details /tmp/rusthouse-parity-audit.json
+~~~
+
+`--seeds` is a value-free audit flag. It is mutually exclusive with `--seed`; use `--seed U64` for a single configurable exploratory run. Any setup, execution, correctness, sample-stability, or default-suite saturation failure in any panel member rejects the entire audit with score zero. A failed audit never writes a partial details artifact.
+
 ## Grouping and top-k optimization measurement
 
 On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
@@ -64,20 +76,21 @@ The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 1
 
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
-Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.
+Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes one schema-version 3 JSON document containing the seed mode and panel, aggregation hierarchy, timing method and limitations, amplification, correctness count, seed-tagged raw batch and per-query samples, medians, both ratios and scores, paths, mode, and ClickHouse identity. Each case records both its panel seed and row-count-derived dataset seed. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one stdout object with score zero and exit nonzero.
 
 ## Dataset and workloads
 
 A dependency-free SplitMix64 generator produces deterministic typed rows. Every dataset has:
 
 - a broad uniform integer and a 90%-near-zero skewed integer;
+- a seed-shuffled permutation of unique IDs;
 - eight low-cardinality string keys and unique high-cardinality keys;
 - variable-length strings, including commas and SQL quotes;
 - both Boolean values;
 - negative numbers and signed integers around four quadrillion;
 - exactly representable eighth-step floating-point values.
 
-The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix.
+The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. ID and high-cardinality-key assignments use separate deterministic seed-derived shuffles, preserving their exact cardinalities while changing their row layouts across seeds. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix.
 
 Each row count runs eight cases spanning:
 
@@ -99,7 +112,7 @@ Correctness and timing use separate processes. Before any timing for a case, the
 
 The normalizer parses standards-compliant CSV, validates exact column names and widths, and compares values using declared workload types. Integers and strings remain exact. Boolean word and numeric spellings normalize to the same value. Finite floats use a relative tolerance of 1e-9 solely for rendering and accumulation-order noise. It does not sort results, discard columns, coerce strings, or accept malformed output.
 
-Tests cover generator reproducibility, runtime-seed variation, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, and family/scale weighting.
+Tests cover generator reproducibility, runtime-seed variation, shuffled-key cardinality, dataset-shape and workload-diversity invariants, CSV normalization, separate correctness gating, equal engine amplification, positive amortized timings, unstable-sample rejection, score saturation detection, family/scale weighting, outer equal-seed weighting, and the schema-versioned audit artifact.
 
 ## Timing and calibration
 
@@ -117,9 +130,10 @@ Aggregation is hierarchical in log space:
 
 1. Workloads receive equal weight within each family and row count.
 2. Row counts receive equal weight within each family.
-3. Workload families receive equal weight in the final geometric mean.
+3. Workload families receive equal weight within each seed.
+4. Seeds receive equal weight in the final geometric mean, outside the existing family and scale hierarchy.
 
-The same aggregation produces primary and end-to-end scores. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default rejects a result if every primary case reaches the 100 cap because that indicates no useful optimization headroom was measured. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
+The same aggregation produces primary and end-to-end scores. A single-seed run is the one-member form of this hierarchy. A ratio of one maps to 100, while a uniform ratio of 0.1 maps to 10. The decision-grade default rejects a result if every primary case across the selected seed set reaches the 100 cap because that indicates no useful optimization headroom was measured. Quick mode reports its cap count without rejecting because its deliberately tiny scales can legitimately favor a minimal in-memory engine.
 
 ## Fairness, limitations, and anti-gaming
 
@@ -127,4 +141,4 @@ Amplification measures repeated work on one loaded in-memory table. It can benef
 
 OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
-Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.
+Anti-gaming properties are the fixed external ClickHouse identity, configurable single seeds, the explicit equally weighted audit panel, seed-shuffled key layouts, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained seed-tagged raw samples, conservative per-case caps, and equal seed/family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.

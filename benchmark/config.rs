@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+pub const DEFAULT_SEED: u64 = 20_260_729;
+pub const AUDIT_SEED_PANEL: [u64; 3] = [20_260_729, 20_260_730, 20_260_731];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Quick,
@@ -43,10 +46,39 @@ pub struct BenchmarkSettings {
     pub end_to_end_samples: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSelection {
+    Single(u64),
+    AuditPanel,
+}
+
+impl SeedSelection {
+    pub fn values(self) -> Vec<u64> {
+        match self {
+            Self::Single(seed) => vec![seed],
+            Self::AuditPanel => AUDIT_SEED_PANEL.to_vec(),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Single(_) => "single",
+            Self::AuditPanel => "audit_panel",
+        }
+    }
+
+    pub fn single_seed(self) -> Option<u64> {
+        match self {
+            Self::Single(seed) => Some(seed),
+            Self::AuditPanel => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mode: Mode,
-    pub seed: u64,
+    pub seed_selection: SeedSelection,
     pub rusthouse: PathBuf,
     pub clickhouse: PathBuf,
     pub details: Option<PathBuf>,
@@ -64,7 +96,8 @@ pub fn parse(
     default_rusthouse: PathBuf,
 ) -> Result<ParseResult, String> {
     let mut mode = Mode::Default;
-    let mut seed = 20_260_729_u64;
+    let mut seed = None;
+    let mut audit_seeds = false;
     let mut clickhouse = clickhouse_from_env.map(PathBuf::from);
     let mut rusthouse = rusthouse_from_env
         .map(PathBuf::from)
@@ -83,10 +116,20 @@ pub fn parse(
                 mode = parse_mode(&value)?;
             }
             "--seed" => {
+                reject_seed_conflict(audit_seeds)?;
                 let value = arguments
                     .next()
                     .ok_or_else(|| "--seed requires an unsigned integer".to_owned())?;
-                seed = parse_seed(&value)?;
+                seed = Some(parse_seed(&value)?);
+            }
+            "--seeds" => {
+                if seed.is_some() {
+                    return Err("--seed and --seeds are mutually exclusive".to_owned());
+                }
+                if audit_seeds {
+                    return Err("--seeds may only be supplied once".to_owned());
+                }
+                audit_seeds = true;
             }
             "--clickhouse" => {
                 clickhouse = Some(PathBuf::from(
@@ -113,7 +156,8 @@ pub fn parse(
                 mode = parse_mode(&argument["--mode=".len()..])?;
             }
             _ if argument.starts_with("--seed=") => {
-                seed = parse_seed(&argument["--seed=".len()..])?;
+                reject_seed_conflict(audit_seeds)?;
+                seed = Some(parse_seed(&argument["--seed=".len()..])?);
             }
             _ if argument.starts_with("--clickhouse=") => {
                 clickhouse = Some(PathBuf::from(&argument["--clickhouse=".len()..]));
@@ -131,13 +175,26 @@ pub fn parse(
     let clickhouse = clickhouse.ok_or_else(|| {
         "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN".to_owned()
     })?;
+    let seed_selection = if audit_seeds {
+        SeedSelection::AuditPanel
+    } else {
+        SeedSelection::Single(seed.unwrap_or(DEFAULT_SEED))
+    };
     Ok(ParseResult::Run(Config {
         mode,
-        seed,
+        seed_selection,
         rusthouse,
         clickhouse,
         details,
     }))
+}
+
+fn reject_seed_conflict(audit_seeds: bool) -> Result<(), String> {
+    if audit_seeds {
+        Err("--seed and --seeds are mutually exclusive".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_mode(value: &str) -> Result<Mode, String> {
@@ -179,7 +236,7 @@ mod tests {
         };
 
         assert_eq!(config.mode, Mode::Quick);
-        assert_eq!(config.seed, 99);
+        assert_eq!(config.seed_selection, SeedSelection::Single(99));
         assert_eq!(config.clickhouse, PathBuf::from("/command/clickhouse"));
         assert_eq!(config.rusthouse, PathBuf::from("/command/rusthouse"));
         assert_eq!(config.details, Some(PathBuf::from("details.json")));
@@ -194,6 +251,43 @@ mod tests {
             assert!(settings.samples >= 3);
             assert!(settings.query_amplification > 1);
             assert!(settings.end_to_end_samples >= 3);
+        }
+    }
+
+    #[test]
+    fn audit_flag_selects_the_documented_seed_panel() {
+        let ParseResult::Run(config) = parse(
+            ["--seeds", "--clickhouse=/clickhouse"]
+                .into_iter()
+                .map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("/rusthouse"),
+        )
+        .expect("configuration") else {
+            panic!("expected run");
+        };
+
+        assert_eq!(config.seed_selection, SeedSelection::AuditPanel);
+        assert_eq!(config.seed_selection.values(), AUDIT_SEED_PANEL);
+    }
+
+    #[test]
+    fn single_seed_and_audit_panel_are_mutually_exclusive() {
+        for arguments in [
+            vec!["--seed=1", "--seeds", "--clickhouse=/clickhouse"],
+            vec!["--seeds", "--seed=1", "--clickhouse=/clickhouse"],
+        ] {
+            let error = match parse(
+                arguments.into_iter().map(str::to_owned),
+                None,
+                None,
+                PathBuf::from("/rusthouse"),
+            ) {
+                Ok(_) => panic!("conflicting seed options should fail"),
+                Err(error) => error,
+            };
+            assert!(error.contains("mutually exclusive"));
         }
     }
 

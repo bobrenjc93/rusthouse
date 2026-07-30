@@ -24,6 +24,13 @@ pub struct Dataset {
 impl Dataset {
     pub fn generate(seed: u64, row_count: usize) -> Self {
         let mut random = SplitMix64::new(seed);
+        let mut ids = (0..row_count).map(|value| value as i64).collect::<Vec<_>>();
+        let mut high_key_ordinals = (0..row_count).collect::<Vec<_>>();
+        shuffle(&mut ids, SplitMix64::new(seed ^ 0xa076_1d64_78bd_642f));
+        shuffle(
+            &mut high_key_ordinals,
+            SplitMix64::new(seed ^ 0xe703_7ed1_a0b4_28db),
+        );
         let low_keys = [
             "amber", "blue", "coral", "green", "indigo", "red", "silver", "violet",
         ];
@@ -56,7 +63,7 @@ impl Dataset {
             };
             let score = ((random.next() % 160_001) as i64 - 80_000) as f64 / 8.0;
             let low_key = low_keys[(random.next() as usize) % low_keys.len()].to_owned();
-            let high_key = format!("entity_{index:08}");
+            let high_key = format!("entity_{:08}", high_key_ordinals[index]);
             let word = words[(random.next() as usize) % words.len()];
             let suffix_len = (random.next() % 13) as usize;
             let payload = if index == 0 {
@@ -81,7 +88,7 @@ impl Dataset {
             };
 
             rows.push(Row {
-                id: index as i64,
+                id: ids[index],
                 uniform_num,
                 skewed_num,
                 score,
@@ -125,6 +132,13 @@ impl Dataset {
         }
         sql.push_str(";\n");
         sql
+    }
+}
+
+fn shuffle<T>(values: &mut [T], mut random: SplitMix64) {
+    for index in (1..values.len()).rev() {
+        let other = (random.next() % (index as u64 + 1)) as usize;
+        values.swap(index, other);
     }
 }
 
@@ -183,10 +197,18 @@ mod tests {
             .iter()
             .map(|row| &row.high_key)
             .collect::<std::collections::BTreeSet<_>>();
+        let ids = dataset
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect::<std::collections::BTreeSet<_>>();
 
         assert!(near_zero > dataset.rows.len() * 4 / 5);
         assert!(low_keys.len() <= 8);
         assert_eq!(high_keys.len(), dataset.rows.len());
+        assert_eq!(ids.len(), dataset.rows.len());
+        assert_eq!(ids.first(), Some(&0));
+        assert_eq!(ids.last(), Some(&1_999));
         assert!(dataset.rows.iter().any(|row| row.uniform_num < 0));
         assert!(dataset.rows.iter().any(|row| row.uniform_num > 0));
         assert!(
@@ -223,5 +245,38 @@ mod tests {
         assert!(sql.contains("quote''s payload"));
         assert!(sql.starts_with("CREATE TABLE parity_data"));
         assert!(sql.ends_with(";\n"));
+    }
+
+    #[test]
+    fn seed_shuffles_ids_and_high_keys_without_changing_cardinality() {
+        let first = Dataset::generate(100, 256);
+        let second = Dataset::generate(101, 256);
+        let ids = |dataset: &Dataset| dataset.rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let high_keys = |dataset: &Dataset| {
+            dataset
+                .rows
+                .iter()
+                .map(|row| row.high_key.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_ne!(ids(&first), ids(&second));
+        assert_ne!(high_keys(&first), high_keys(&second));
+        assert_eq!(
+            ids(&first)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids(&second)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            high_keys(&first)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            high_keys(&second)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 }
