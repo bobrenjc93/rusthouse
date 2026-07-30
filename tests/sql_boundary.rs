@@ -502,6 +502,33 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
+fn boolean_literals_cannot_be_select_aliases() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE flags (enabled Bool);
+             INSERT INTO flags VALUES (false);",
+        )
+        .expect("setup succeeds");
+
+    for alias in ["true", "FALSE"] {
+        let error = database
+            .execute(&format!(
+                "SELECT MIN(enabled) AS {alias} FROM flags HAVING {alias} = false"
+            ))
+            .expect_err("Boolean literals are reserved aliases");
+
+        assert!(matches!(
+            error,
+            Error::ReservedIdentifier {
+                identifier: rejected,
+                context,
+            } if rejected.eq_ignore_ascii_case(alias) && context == "alias"
+        ));
+    }
+}
+
+#[test]
 fn creates_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)
