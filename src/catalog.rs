@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, Table};
+use crate::value::Value;
 
 /// An in-memory collection of named tables.
 #[derive(Debug, Default)]
@@ -16,11 +17,21 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
+        self.create_table_with_rows(name, schema, Vec::new())
+    }
+
+    pub(crate) fn create_table_with_rows(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
             return Err(Error::TableAlreadyExists(name));
         }
-        let table = Table::new(name, schema)?;
+        let mut table = Table::new(name, schema)?;
+        table.insert_rows(rows)?;
         self.tables.insert(key, table);
         Ok(())
     }

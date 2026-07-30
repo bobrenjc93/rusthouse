@@ -196,6 +196,22 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Validates every row before appending any of them.
+    pub(crate) fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<usize> {
+        for row in &rows {
+            self.validate_row(row)?;
+        }
+
+        let inserted = rows.len();
+        for row in rows {
+            for (column, value) in self.columns.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        self.row_count += inserted;
+        Ok(inserted)
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +252,21 @@ mod tests {
         let error = table
             .insert_row(vec![Value::Int64(7), Value::Bool(true)])
             .expect_err("wrong type");
+
+        assert!(matches!(error, Error::TypeMismatch { .. }));
+        assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejected_row_batches_do_not_partially_mutate_columns() {
+        let mut table = test_table();
+        let error = table
+            .insert_rows(vec![
+                vec![Value::Int64(7), Value::String("ok".to_owned())],
+                vec![Value::Int64(8), Value::Bool(false)],
+            ])
+            .expect_err("wrong type in second row");
 
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);

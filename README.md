@@ -4,8 +4,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- CREATE TABLE with Int64, Float64, Bool, and String columns, or CREATE TABLE AS SELECT with an inferred result schema
+- multi-row INSERT INTO ... VALUES and INSERT INTO ... SELECT with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -54,7 +54,7 @@ printf '%s\n' \
   cargo run -- --format csv
 ~~~
 
-Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
+Command acknowledgements and affected-row counts go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
 ## Library API
@@ -84,6 +84,8 @@ assert_eq!(result.rows.len(), 1);
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+
+Query-backed CREATE and INSERT statements fully evaluate their SELECT before changing the catalog. INSERT SELECT matches target columns positionally and requires the same column count and exact types, including for an empty result. A self-insert reads a stable snapshot and appends each selected row once.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

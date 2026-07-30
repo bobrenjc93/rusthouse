@@ -20,8 +20,34 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
         "{\"results\":[{\"columns\":[{\"name\":\"name\",\"type\":\"String\"},{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[\"a\",1],[\"b\",2]]}]}\n"
     );
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
-    assert!(stderr.contains("CREATE TABLE"));
+    assert!(stderr.contains("CREATE TABLE 0"));
     assert!(stderr.contains("INSERT 2"));
+}
+
+#[test]
+fn query_backed_writes_report_affected_rows() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=csv",
+            "--execute",
+            "CREATE TABLE source (n Int64);
+             INSERT INTO source VALUES (3), (1), (2);
+             CREATE TABLE selected AS
+                SELECT n FROM source WHERE n >= 2 ORDER BY n;
+             INSERT INTO selected SELECT n FROM source WHERE n = 1;
+             SELECT n FROM selected;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "n\n2\n3\n1\n"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("CREATE TABLE 2"));
+    assert!(stderr.contains("INSERT 1"));
 }
 
 #[test]

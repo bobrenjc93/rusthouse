@@ -11,6 +11,14 @@ fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
     last_query(database.execute(sql).expect("SQL succeeds"))
 }
 
+fn only_command(results: Vec<StatementResult>) -> (&'static str, usize) {
+    assert_eq!(results.len(), 1);
+    match results.into_iter().next().expect("statement result") {
+        StatementResult::Command { tag, affected_rows } => (tag, affected_rows),
+        StatementResult::Query(_) => panic!("expected command result"),
+    }
+}
+
 #[test]
 fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let mut database = Database::new();
@@ -343,6 +351,259 @@ fn failed_multi_row_insert_is_atomic_and_actionable() {
             ..
         }
     ));
+}
+
+#[test]
+fn create_table_as_infers_filtered_grouped_and_ordered_result_schema() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64, active Bool);
+             INSERT INTO sales VALUES
+                ('west', 10, true),
+                ('east', 20, true),
+                ('west', 5, true),
+                ('east', 100, false);",
+        )
+        .expect("setup succeeds");
+
+    let command = only_command(
+        database
+            .execute(
+                "CREATE TABLE active_totals AS
+                 SELECT region AS market,
+                        COUNT(*) AS orders,
+                        SUM(amount) AS total,
+                        AVG(amount) AS mean
+                 FROM sales
+                 WHERE active = true
+                 GROUP BY region
+                 ORDER BY total DESC;",
+            )
+            .expect("CTAS succeeds"),
+    );
+    assert_eq!(command, ("CREATE TABLE", 2));
+
+    let table = database
+        .catalog()
+        .table("active_totals")
+        .expect("derived table exists");
+    assert_eq!(table.row_count(), 2);
+    assert_eq!(
+        table
+            .schema()
+            .iter()
+            .map(|column| (column.name.as_str(), column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            ("market", DataType::String),
+            ("orders", DataType::Int64),
+            ("total", DataType::Int64),
+            ("mean", DataType::Float64),
+        ]
+    );
+
+    let result = execute_query(&mut database, "SELECT * FROM active_totals;");
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("east".to_owned()),
+                Value::Int64(1),
+                Value::Int64(20),
+                Value::Float64(20.0),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(2),
+                Value::Int64(15),
+                Value::Float64(7.5),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn create_table_as_supports_empty_results_and_rejects_name_collisions_atomically() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE source (id Int64, label String);
+             INSERT INTO source VALUES (1, 'one'), (2, 'two');",
+        )
+        .expect("setup succeeds");
+
+    let command = only_command(
+        database
+            .execute(
+                "CREATE TABLE empty_copy AS
+                 SELECT id AS source_id, label FROM source WHERE id < 0;",
+            )
+            .expect("empty CTAS succeeds"),
+    );
+    assert_eq!(command, ("CREATE TABLE", 0));
+    let empty = database
+        .catalog()
+        .table("empty_copy")
+        .expect("table exists");
+    assert_eq!(empty.row_count(), 0);
+    assert_eq!(empty.schema()[0].name, "source_id");
+    assert_eq!(empty.schema()[0].data_type, DataType::Int64);
+    assert_eq!(empty.schema()[1].data_type, DataType::String);
+
+    database
+        .execute("CREATE TABLE occupied (id Int64); INSERT INTO occupied VALUES (99);")
+        .expect("occupied table setup succeeds");
+    let collision = database
+        .execute("CREATE TABLE occupied AS SELECT id FROM source;")
+        .expect_err("existing table name is rejected");
+    assert!(matches!(collision, Error::TableAlreadyExists(name) if name == "occupied"));
+    assert_eq!(
+        execute_query(&mut database, "SELECT id FROM occupied;").rows,
+        vec![vec![Value::Int64(99)]]
+    );
+
+    let duplicate = database
+        .execute("CREATE TABLE duplicate_names AS SELECT id, label AS id FROM source;")
+        .expect_err("duplicate inferred names are rejected");
+    assert!(matches!(duplicate, Error::DuplicateColumn(name) if name == "id"));
+    assert!(matches!(
+        database.catalog().table("duplicate_names"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
+fn insert_select_materializes_filtered_ordered_rows_and_reports_the_count() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE source (id Int64, label String, active Bool);
+             INSERT INTO source VALUES
+                (1, 'one', false), (2, 'two', true), (3, 'three', true);
+             CREATE TABLE destination (id Int64, label String);",
+        )
+        .expect("setup succeeds");
+
+    let command = only_command(
+        database
+            .execute(
+                "INSERT INTO destination
+                 SELECT id AS source_id, label AS source_label
+                 FROM source WHERE active = true ORDER BY source_id DESC;",
+            )
+            .expect("INSERT SELECT succeeds"),
+    );
+    assert_eq!(command, ("INSERT", 2));
+    assert_eq!(
+        execute_query(&mut database, "SELECT * FROM destination;").rows,
+        vec![
+            vec![Value::Int64(3), Value::String("three".to_owned())],
+            vec![Value::Int64(2), Value::String("two".to_owned())],
+        ]
+    );
+}
+
+#[test]
+fn insert_select_validates_empty_result_schema_and_keeps_failures_atomic() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE source (id Int64, label String);
+             INSERT INTO source VALUES (1, 'one'), (2, 'two');
+             CREATE TABLE destination (id Int64, label String);
+             INSERT INTO destination VALUES (99, 'existing');",
+        )
+        .expect("setup succeeds");
+
+    let width = database
+        .execute("INSERT INTO destination SELECT id FROM source WHERE id < 0;")
+        .expect_err("empty result still has the wrong width");
+    assert!(matches!(
+        width,
+        Error::RowLength {
+            expected: 2,
+            actual: 1,
+            ..
+        }
+    ));
+
+    let data_type = database
+        .execute(
+            "INSERT INTO destination
+             SELECT label, label AS second_label FROM source WHERE id < 0;",
+        )
+        .expect_err("empty result still has the wrong types");
+    assert!(matches!(
+        data_type,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "column 'destination.id'" && expected == "Int64" && actual == "String"
+    ));
+
+    assert_eq!(
+        execute_query(&mut database, "SELECT * FROM destination;").rows,
+        vec![vec![Value::Int64(99), Value::String("existing".to_owned())]]
+    );
+}
+
+#[test]
+fn insert_select_reads_a_self_insert_from_a_stable_snapshot() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE numbers (n Int64); INSERT INTO numbers VALUES (1), (2), (3);")
+        .expect("setup succeeds");
+
+    let command = only_command(
+        database
+            .execute("INSERT INTO numbers SELECT n FROM numbers ORDER BY n;")
+            .expect("self-insert succeeds"),
+    );
+    assert_eq!(command, ("INSERT", 3));
+    assert_eq!(
+        execute_query(&mut database, "SELECT n FROM numbers;").rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+}
+
+#[test]
+fn query_execution_errors_do_not_publish_or_append_partial_results() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE source (n Int64);
+             INSERT INTO source VALUES (9223372036854775807), (1);
+             CREATE TABLE destination (n Int64);
+             INSERT INTO destination VALUES (7);",
+        )
+        .expect("setup succeeds");
+
+    let ctas_error = database
+        .execute("CREATE TABLE overflowed AS SELECT SUM(n) AS n FROM source;")
+        .expect_err("source aggregate overflows");
+    assert!(matches!(ctas_error, Error::NumericOverflow(_)));
+    assert!(matches!(
+        database.catalog().table("overflowed"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    let insert_error = database
+        .execute("INSERT INTO destination SELECT SUM(n) AS n FROM source;")
+        .expect_err("source aggregate overflows");
+    assert!(matches!(insert_error, Error::NumericOverflow(_)));
+    assert_eq!(
+        execute_query(&mut database, "SELECT n FROM destination;").rows,
+        vec![vec![Value::Int64(7)]]
+    );
 }
 
 #[test]

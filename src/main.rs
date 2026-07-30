@@ -53,11 +53,7 @@ fn run() -> Result<(), String> {
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
-                    eprintln!("{tag} {affected_rows}");
-                } else {
-                    eprintln!("{tag}");
-                }
+                eprintln!("{tag} {affected_rows}");
             }
             StatementResult::Query(result) => queries.push(result),
         }
