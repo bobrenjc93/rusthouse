@@ -409,6 +409,23 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
          WHERE id < 9223372036854775808.0;",
     );
     assert_eq!(below_i64_upper_bound.rows, vec![vec![Value::Int64(4)]]);
+
+    database
+        .execute(
+            "CREATE TABLE float_boundaries (value Float64);
+             INSERT INTO float_boundaries VALUES (9007199254740992.0);",
+        )
+        .expect("floating-point membership setup succeeds");
+    let exact_membership = execute_query(
+        &mut database,
+        "SELECT id FROM boundaries
+         WHERE id IN (SELECT value FROM float_boundaries)
+         ORDER BY id;",
+    );
+    assert_eq!(
+        exact_membership.rows,
+        vec![vec![Value::Int64(9_007_199_254_740_992)]]
+    );
 }
 
 #[test]
@@ -478,14 +495,14 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+fn literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE", "null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
                 "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
             ))
-            .expect_err("Boolean literal names are reserved");
+            .expect_err("literal names are reserved");
 
         assert!(matches!(
             error,
@@ -499,6 +516,18 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
             Err(Error::TableNotFound(_))
         ));
     }
+}
+
+#[test]
+fn contextual_subquery_keywords_remain_usable_as_column_names() {
+    let mut database = Database::new();
+    let result = execute_query(
+        &mut database,
+        "CREATE TABLE keyword_columns (id Int64, exists Bool, not Bool);
+         INSERT INTO keyword_columns VALUES (1, true, false), (2, false, true);
+         SELECT id FROM keyword_columns WHERE exists = true AND not = false;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
 }
 
 #[test]
@@ -522,5 +551,176 @@ fn creates_a_fifty_thousand_column_schema() {
             .schema()
             .len(),
         column_count
+    );
+}
+
+#[test]
+fn in_subqueries_deduplicate_and_preserve_null_truth_values() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE candidates (id Int64);
+             CREATE TABLE selected (value Int64);
+             INSERT INTO candidates VALUES (1), (2), (3), (NULL);
+             INSERT INTO selected VALUES (2), (2), (NULL);",
+        )
+        .expect("setup succeeds");
+
+    let matching = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id IN (SELECT value FROM selected)
+         ORDER BY id;",
+    );
+    assert_eq!(matching.rows, vec![vec![Value::Int64(2)]]);
+
+    let unknown_not_in = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id NOT IN (SELECT value FROM selected) OR id = 1
+         ORDER BY id;",
+    );
+    assert_eq!(unknown_not_in.rows, vec![vec![Value::Int64(1)]]);
+
+    let empty_not_in = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id NOT IN (SELECT value FROM selected WHERE value = 99)
+         ORDER BY id;",
+    );
+    assert_eq!(
+        empty_not_in.rows,
+        vec![
+            vec![Value::Null],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+
+    let aggregate = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id IN (SELECT MAX(value) FROM selected);",
+    );
+    assert_eq!(aggregate.rows, vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn exists_subqueries_handle_empty_results_and_global_aggregates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE candidates (id Int64);
+             CREATE TABLE selected (value Int64);
+             INSERT INTO candidates VALUES (1), (2);
+             INSERT INTO selected VALUES (2);",
+        )
+        .expect("setup succeeds");
+
+    let missing = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE NOT EXISTS (SELECT value FROM selected WHERE value = 99)
+         ORDER BY id;",
+    );
+    assert_eq!(
+        missing.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+
+    let aggregate_row = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE EXISTS (SELECT COUNT(*) FROM selected WHERE value = 99)
+         ORDER BY id;",
+    );
+    assert_eq!(
+        aggregate_row.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+
+    let limited_away = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE EXISTS (SELECT value FROM selected LIMIT 0);",
+    );
+    assert!(limited_away.rows.is_empty());
+}
+
+#[test]
+fn invalid_subquery_shapes_types_and_correlations_are_rejected() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE candidates (id Int64);
+             CREATE TABLE selected (value Int64, label String);
+             INSERT INTO candidates VALUES (1);
+             INSERT INTO selected VALUES (1, 'one');",
+        )
+        .expect("setup succeeds");
+
+    let width = database
+        .execute("SELECT id FROM candidates WHERE id IN (SELECT value, label FROM selected);")
+        .expect_err("IN requires one output column");
+    assert!(
+        matches!(width, Error::InvalidQuery(message) if message.contains("exactly one column"))
+    );
+
+    let mismatch = database
+        .execute("SELECT id FROM candidates WHERE id IN (SELECT label FROM selected);")
+        .expect_err("IN types must be comparable");
+    assert!(matches!(
+        mismatch,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "IN subquery" && expected == "Int64" && actual == "String"
+    ));
+
+    let correlation = database
+        .execute(
+            "SELECT id FROM candidates
+             WHERE EXISTS (SELECT value FROM selected WHERE value = id);",
+        )
+        .expect_err("outer column references are rejected");
+    assert!(
+        matches!(correlation, Error::InvalidQuery(message) if message.contains("correlated subqueries are not supported"))
+    );
+}
+
+#[test]
+fn subquery_nesting_and_materialization_are_bounded() {
+    let mut nested = "SELECT value FROM selected".to_owned();
+    for _ in 0..8 {
+        nested = format!("SELECT value FROM selected WHERE EXISTS ({nested})");
+    }
+    let nesting_error = rusthouse::sql::parse(&format!(
+        "SELECT id FROM candidates WHERE EXISTS ({nested})"
+    ))
+    .expect_err("nine nested subqueries exceed the parser limit");
+    assert!(
+        matches!(nesting_error, Error::Sql { message, .. } if message.contains("subquery nesting exceeds limit of 8"))
+    );
+
+    let values = (0..=10_000)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE candidates (id Int64);
+             CREATE TABLE selected (value Int64);
+             INSERT INTO candidates VALUES (1);
+             INSERT INTO selected VALUES {values};"
+        ))
+        .expect("large setup succeeds");
+    let materialization = database
+        .execute("SELECT id FROM candidates WHERE id IN (SELECT value FROM selected);")
+        .expect_err("materialized IN state is bounded");
+    assert!(
+        matches!(materialization, Error::InvalidQuery(message) if message.contains("materialization limit of 10000 rows"))
     );
 }

@@ -11,16 +11,18 @@ pub struct ColumnDef {
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
+    name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+        || name.eq_ignore_ascii_case("NULL")
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// A physical column. Each variant owns a contiguous nullable vector of one Rust type.
 #[derive(Debug, Clone)]
 pub enum Column {
-    Int64(Vec<i64>),
-    Float64(Vec<f64>),
-    Bool(Vec<bool>),
-    String(Vec<String>),
+    Int64(Vec<Option<i64>>),
+    Float64(Vec<Option<f64>>),
+    Bool(Vec<Option<bool>>),
+    String(Vec<Option<String>>),
 }
 
 impl Column {
@@ -66,10 +68,12 @@ impl Column {
 
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
-            Self::Int64(values) => ValueRef::Int64(values[row]),
-            Self::Float64(values) => ValueRef::Float64(values[row]),
-            Self::Bool(values) => ValueRef::Bool(values[row]),
-            Self::String(values) => ValueRef::String(&values[row]),
+            Self::Int64(values) => values[row].map_or(ValueRef::Null, ValueRef::Int64),
+            Self::Float64(values) => values[row].map_or(ValueRef::Null, ValueRef::Float64),
+            Self::Bool(values) => values[row].map_or(ValueRef::Null, ValueRef::Bool),
+            Self::String(values) => values[row]
+                .as_deref()
+                .map_or(ValueRef::Null, ValueRef::String),
         }
     }
 
@@ -79,10 +83,14 @@ impl Column {
 
     fn push(&mut self, value: Value) {
         match (self, value) {
-            (Self::Int64(values), Value::Int64(value)) => values.push(value),
-            (Self::Float64(values), Value::Float64(value)) => values.push(value),
-            (Self::Bool(values), Value::Bool(value)) => values.push(value),
-            (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Int64(values), Value::Null) => values.push(None),
+            (Self::Float64(values), Value::Null) => values.push(None),
+            (Self::Bool(values), Value::Null) => values.push(None),
+            (Self::String(values), Value::Null) => values.push(None),
+            (Self::Int64(values), Value::Int64(value)) => values.push(Some(value)),
+            (Self::Float64(values), Value::Float64(value)) => values.push(Some(value)),
+            (Self::Bool(values), Value::Bool(value)) => values.push(Some(value)),
+            (Self::String(values), Value::String(value)) => values.push(Some(value)),
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -169,11 +177,17 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            if value
+                .data_type()
+                .is_some_and(|data_type| field.data_type != data_type)
+            {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: value
+                        .data_type()
+                        .expect("non-null type was checked")
+                        .to_string(),
                 });
             }
             if matches!(value, Value::Float64(number) if !number.is_finite()) {
@@ -226,8 +240,8 @@ mod tests {
             .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
             .expect("valid row");
 
-        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
-        assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[Some(7)]));
+        assert!(matches!(&table.columns()[1], Column::String(v) if v == &[Some("ok".to_owned())]));
     }
 
     #[test]

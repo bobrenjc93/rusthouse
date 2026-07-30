@@ -4,6 +4,7 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_SUBQUERY_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -87,6 +88,15 @@ pub enum Predicate {
         left: Operand,
         operator: ComparisonOperator,
         right: Operand,
+    },
+    InSubquery {
+        operand: Operand,
+        negated: bool,
+        subquery: Box<Select>,
+    },
+    Exists {
+        negated: bool,
+        subquery: Box<Select>,
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
@@ -343,6 +353,7 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    subquery_depth: usize,
 }
 
 impl Parser {
@@ -352,6 +363,7 @@ impl Parser {
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            subquery_depth: 0,
         }
     }
 
@@ -453,9 +465,14 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
 
         let predicate = if self.eat_keyword("WHERE") {
+            let previous_depth = self.predicate_depth;
+            let previous_nodes = self.predicate_nodes;
             self.predicate_depth = 0;
             self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
+            let predicate = self.parse_or_predicate();
+            self.predicate_depth = previous_depth;
+            self.predicate_nodes = previous_nodes;
+            Some(predicate?)
         } else {
             None
         };
@@ -572,6 +589,18 @@ impl Parser {
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
+        if self.keyword_at(0, "EXISTS") && self.token_at(1) == Some(&TokenKind::LeftParen) {
+            self.current += 1;
+            return self.parse_exists_subquery(false);
+        }
+        if self.keyword_at(0, "NOT")
+            && self.keyword_at(1, "EXISTS")
+            && self.token_at(2) == Some(&TokenKind::LeftParen)
+        {
+            self.current += 2;
+            return self.parse_exists_subquery(true);
+        }
+
         if self.eat(&TokenKind::LeftParen) {
             if self.predicate_depth >= MAX_PREDICATE_DEPTH {
                 return self.error(format!(
@@ -587,6 +616,19 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        let negated = self.eat_keyword("NOT");
+        if self.eat_keyword("IN") {
+            let subquery = self.parse_subquery()?;
+            self.record_predicate_node()?;
+            return Ok(Predicate::InSubquery {
+                operand: left,
+                negated,
+                subquery: Box::new(subquery),
+            });
+        }
+        if negated {
+            return self.error("expected IN after NOT");
+        }
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -606,6 +648,33 @@ impl Parser {
         })
     }
 
+    fn parse_exists_subquery(&mut self, negated: bool) -> Result<Predicate> {
+        let subquery = self.parse_subquery()?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Exists {
+            negated,
+            subquery: Box::new(subquery),
+        })
+    }
+
+    fn parse_subquery(&mut self) -> Result<Select> {
+        self.expect(&TokenKind::LeftParen, "'(' before subquery")?;
+        if self.subquery_depth >= MAX_SUBQUERY_DEPTH {
+            return self.error(format!(
+                "subquery nesting exceeds limit of {MAX_SUBQUERY_DEPTH}"
+            ));
+        }
+        self.subquery_depth += 1;
+        let result = (|| {
+            self.expect_keyword("SELECT")?;
+            let select = self.parse_select()?;
+            self.expect(&TokenKind::RightParen, "')' after subquery")?;
+            Ok(select)
+        })();
+        self.subquery_depth -= 1;
+        result
+    }
+
     fn record_predicate_node(&mut self) -> Result<()> {
         if self.predicate_nodes >= MAX_PREDICATE_NODES {
             return self.error(format!(
@@ -622,7 +691,9 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL") =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -672,8 +743,10 @@ impl Parser {
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
+        } else if self.eat_keyword("NULL") {
+            Ok(Value::Null)
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, or NULL literal")
         }
     }
 
@@ -686,13 +759,25 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.keyword_at(0, expected) {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn keyword_at(&self, offset: usize, expected: &str) -> bool {
+        matches!(
+            self.token_at(offset),
+            Some(TokenKind::Identifier(value)) if value.eq_ignore_ascii_case(expected)
+        )
+    }
+
+    fn token_at(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| &token.kind)
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {

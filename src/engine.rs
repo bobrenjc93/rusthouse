@@ -10,6 +10,8 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+const MAX_SUBQUERY_ROWS: usize = 10_000;
+
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
@@ -86,23 +88,33 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select(&select).map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(&self, select: &Select) -> Result<QueryResult> {
+        self.execute_select_scoped(select, &[], None)
+    }
+
+    fn execute_select_scoped<'a>(
+        &'a self,
+        select: &Select,
+        outer_tables: &[&'a Table],
+        output_bound: Option<OutputBound>,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
+        validate_uncorrelated(table, select, outer_tables)?;
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| self.compile_predicate(table, predicate, outer_tables))
             .transpose()?;
 
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(table, *row).is_true())
             })
             .collect::<Vec<_>>();
 
@@ -122,9 +134,11 @@ impl Database {
                 &ordering,
                 select.limit,
             );
+            apply_output_bound(&mut selected_groups, output_bound)?;
             grouped.project(&selected_groups, &items)
         } else {
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            apply_output_bound(&mut matching_rows, output_bound)?;
             execute_projection(table, &matching_rows, &items)
         };
 
@@ -133,6 +147,130 @@ impl Database {
             rows,
         })
     }
+
+    fn compile_predicate<'a>(
+        &'a self,
+        table: &'a Table,
+        predicate: &Predicate,
+        outer_tables: &[&'a Table],
+    ) -> Result<CompiledPredicate> {
+        match predicate {
+            Predicate::Comparison {
+                left,
+                operator,
+                right,
+            } => {
+                let left = compile_operand(table, left)?;
+                let right = compile_operand(table, right)?;
+                if let (Some(left_type), Some(right_type)) = (left.data_type(), right.data_type())
+                    && !comparable(left_type, right_type)
+                {
+                    return Err(Error::TypeMismatch {
+                        context: "WHERE comparison".to_owned(),
+                        expected: left_type.to_string(),
+                        actual: right_type.to_string(),
+                    });
+                }
+                Ok(CompiledPredicate::Comparison {
+                    left,
+                    operator: *operator,
+                    right,
+                })
+            }
+            Predicate::InSubquery {
+                operand,
+                negated,
+                subquery,
+            } => {
+                let operand = compile_operand(table, operand)?;
+                let mut scopes = outer_tables.to_vec();
+                scopes.push(table);
+                let result = self.execute_select_scoped(
+                    subquery,
+                    &scopes,
+                    Some(OutputBound::materialized()),
+                )?;
+                if result.columns.len() != 1 {
+                    return Err(Error::InvalidQuery(format!(
+                        "IN subquery must return exactly one column; found {}",
+                        result.columns.len()
+                    )));
+                }
+                let result_type = result.columns[0].data_type;
+                if operand
+                    .data_type()
+                    .is_some_and(|operand_type| !comparable(operand_type, result_type))
+                {
+                    return Err(Error::TypeMismatch {
+                        context: "IN subquery".to_owned(),
+                        expected: operand
+                            .data_type()
+                            .expect("non-null operand type was checked")
+                            .to_string(),
+                        actual: result_type.to_string(),
+                    });
+                }
+                Ok(CompiledPredicate::InSubquery {
+                    operand,
+                    negated: *negated,
+                    state: MaterializedIn::new(result_type, result.rows),
+                })
+            }
+            Predicate::Exists { negated, subquery } => {
+                let mut scopes = outer_tables.to_vec();
+                scopes.push(table);
+                let result =
+                    self.execute_select_scoped(subquery, &scopes, Some(OutputBound::exists()))?;
+                let exists = !result.rows.is_empty();
+                Ok(CompiledPredicate::Exists {
+                    value: if *negated { !exists } else { exists },
+                })
+            }
+            Predicate::And(left, right) => Ok(CompiledPredicate::And(
+                Box::new(self.compile_predicate(table, left, outer_tables)?),
+                Box::new(self.compile_predicate(table, right, outer_tables)?),
+            )),
+            Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
+                Box::new(self.compile_predicate(table, left, outer_tables)?),
+                Box::new(self.compile_predicate(table, right, outer_tables)?),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputBound {
+    max_rows: usize,
+    reject_excess: bool,
+}
+
+impl OutputBound {
+    fn materialized() -> Self {
+        Self {
+            max_rows: MAX_SUBQUERY_ROWS,
+            reject_excess: true,
+        }
+    }
+
+    fn exists() -> Self {
+        Self {
+            max_rows: 1,
+            reject_excess: false,
+        }
+    }
+}
+
+fn apply_output_bound(rows: &mut Vec<usize>, bound: Option<OutputBound>) -> Result<()> {
+    let Some(bound) = bound else {
+        return Ok(());
+    };
+    if rows.len() > bound.max_rows && bound.reject_excess {
+        return Err(Error::InvalidQuery(format!(
+            "subquery result exceeds materialization limit of {MAX_SUBQUERY_ROWS} rows"
+        )));
+    }
+    rows.truncate(bound.max_rows);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -550,6 +688,11 @@ impl AggregateState {
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
+                if spec.argument.is_some_and(|column| {
+                    matches!(table.columns()[column].value_ref(row), ValueRef::Null)
+                }) {
+                    return Ok(());
+                }
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
@@ -559,9 +702,11 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                if let Some(value) = values[row] {
+                    *sum = sum
+                        .checked_add(value)
+                        .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                }
             }
             Self::SumFloat(sum) => {
                 let Column::Float64(values) =
@@ -569,7 +714,10 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
+                let Some(value) = values[row] else {
+                    return Ok(());
+                };
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
@@ -577,6 +725,9 @@ impl AggregateState {
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
                 let candidate = column.value_ref(row);
+                if matches!(candidate, ValueRef::Null) {
+                    return Ok(());
+                }
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -587,6 +738,9 @@ impl AggregateState {
             Self::Max(current) => {
                 let column = &table.columns()[spec.argument.expect("MAX argument")];
                 let candidate = column.value_ref(row);
+                if matches!(candidate, ValueRef::Null) {
+                    return Ok(());
+                }
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -599,8 +753,11 @@ impl AggregateState {
                 else {
                     unreachable!("AVG input type is resolved")
                 };
+                let Some(value) = values[row] else {
+                    return Ok(());
+                };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
@@ -612,7 +769,10 @@ impl AggregateState {
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                let Some(value) = values[row] else {
+                    return Ok(());
+                };
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -633,15 +793,9 @@ impl AggregateState {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
-            )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::Min(None) | Self::Max(None) | Self::AvgInt { .. } | Self::AvgFloat { .. } => {
+                Ok(Value::Null)
+            }
         }
     }
 }
@@ -774,12 +928,20 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    InSubquery {
+        operand: CompiledOperand,
+        negated: bool,
+        state: MaterializedIn,
+    },
+    Exists {
+        value: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, table: &Table, row: usize) -> TruthValue {
         match self {
             Self::Comparison {
                 left,
@@ -788,21 +950,230 @@ impl CompiledPredicate {
             } => {
                 let left = left.value(table, row);
                 let right = right.value(table, row);
-                let comparison = left
-                    .sql_cmp(right)
-                    .expect("predicate operand types are validated");
-                match operator {
+                let Some(comparison) = left.sql_cmp(right) else {
+                    return TruthValue::Unknown;
+                };
+                TruthValue::from_bool(match operator {
                     ComparisonOperator::Equal => comparison == Ordering::Equal,
                     ComparisonOperator::NotEqual => comparison != Ordering::Equal,
                     ComparisonOperator::Less => comparison == Ordering::Less,
                     ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
                     ComparisonOperator::Greater => comparison == Ordering::Greater,
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
-                }
+                })
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::InSubquery {
+                operand,
+                negated,
+                state,
+            } => {
+                let value = state.contains(operand.value(table, row));
+                if *negated { value.not() } else { value }
+            }
+            Self::Exists { value } => TruthValue::from_bool(*value),
+            Self::And(left, right) => left.evaluate(table, row).and(right.evaluate(table, row)),
+            Self::Or(left, right) => left.evaluate(table, row).or(right.evaluate(table, row)),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruthValue {
+    False,
+    True,
+    Unknown,
+}
+
+impl TruthValue {
+    fn from_bool(value: bool) -> Self {
+        if value { Self::True } else { Self::False }
+    }
+
+    fn is_true(self) -> bool {
+        self == Self::True
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Self::False => Self::True,
+            Self::True => Self::False,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MaterializedIn {
+    values: MaterializedValues,
+    contains_null: bool,
+}
+
+impl MaterializedIn {
+    fn new(data_type: DataType, rows: Vec<Vec<Value>>) -> Self {
+        let (values, contains_null) = match data_type {
+            DataType::Int64 => {
+                let (values, contains_null) = materialize_values(
+                    rows,
+                    |value| {
+                        let Value::Int64(value) = value else {
+                            unreachable!("IN result matches its declared Int64 type")
+                        };
+                        value
+                    },
+                    i64::cmp,
+                );
+                (MaterializedValues::Int64(values), contains_null)
+            }
+            DataType::Float64 => {
+                let (values, contains_null) = materialize_values(
+                    rows,
+                    |value| {
+                        let Value::Float64(value) = value else {
+                            unreachable!("IN result matches its declared Float64 type")
+                        };
+                        value
+                    },
+                    compare_f64,
+                );
+                (MaterializedValues::Float64(values), contains_null)
+            }
+            DataType::Bool => {
+                let (values, contains_null) = materialize_values(
+                    rows,
+                    |value| {
+                        let Value::Bool(value) = value else {
+                            unreachable!("IN result matches its declared Bool type")
+                        };
+                        value
+                    },
+                    bool::cmp,
+                );
+                (MaterializedValues::Bool(values), contains_null)
+            }
+            DataType::String => {
+                let (values, contains_null) = materialize_values(
+                    rows,
+                    |value| {
+                        let Value::String(value) = value else {
+                            unreachable!("IN result matches its declared String type")
+                        };
+                        value
+                    },
+                    String::cmp,
+                );
+                (MaterializedValues::String(values), contains_null)
+            }
+        };
+        Self {
+            values,
+            contains_null,
+        }
+    }
+
+    fn contains(&self, value: ValueRef<'_>) -> TruthValue {
+        if self.values.is_empty() && !self.contains_null {
+            return TruthValue::False;
+        }
+        if matches!(value, ValueRef::Null) {
+            return TruthValue::Unknown;
+        }
+        let found = match (&self.values, value) {
+            (MaterializedValues::Int64(values), ValueRef::Int64(_) | ValueRef::Float64(_)) => {
+                values
+                    .binary_search_by(|candidate| {
+                        ValueRef::Int64(*candidate)
+                            .sql_cmp(value)
+                            .expect("numeric IN operand is comparable")
+                    })
+                    .is_ok()
+            }
+            (MaterializedValues::Float64(values), ValueRef::Int64(_) | ValueRef::Float64(_)) => {
+                values
+                    .binary_search_by(|candidate| {
+                        ValueRef::Float64(*candidate)
+                            .sql_cmp(value)
+                            .expect("numeric IN operand is comparable")
+                    })
+                    .is_ok()
+            }
+            (MaterializedValues::Bool(values), ValueRef::Bool(value)) => {
+                values.binary_search(&value).is_ok()
+            }
+            (MaterializedValues::String(values), ValueRef::String(value)) => values
+                .binary_search_by(|candidate| candidate.as_str().cmp(value))
+                .is_ok(),
+            _ => unreachable!("IN operand types are validated"),
+        };
+        if found {
+            TruthValue::True
+        } else if self.contains_null {
+            TruthValue::Unknown
+        } else {
+            TruthValue::False
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MaterializedValues {
+    Int64(Vec<i64>),
+    Float64(Vec<f64>),
+    Bool(Vec<bool>),
+    String(Vec<String>),
+}
+
+impl MaterializedValues {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Int64(values) => values.is_empty(),
+            Self::Float64(values) => values.is_empty(),
+            Self::Bool(values) => values.is_empty(),
+            Self::String(values) => values.is_empty(),
+        }
+    }
+}
+
+fn materialize_values<T>(
+    rows: Vec<Vec<Value>>,
+    mut extract: impl FnMut(Value) -> T,
+    compare: impl Fn(&T, &T) -> Ordering + Copy,
+) -> (Vec<T>, bool) {
+    let mut values = Vec::with_capacity(rows.len());
+    let mut contains_null = false;
+    for row in rows {
+        let value = row.into_iter().next().expect("IN result has one column");
+        if value == Value::Null {
+            contains_null = true;
+        } else {
+            values.push(extract(value));
+        }
+    }
+    values.sort_unstable_by(compare);
+    values.dedup_by(|left, right| compare(left, right) == Ordering::Equal);
+    (values, contains_null)
+}
+
+fn compare_f64(left: &f64, right: &f64) -> Ordering {
+    if left == right {
+        Ordering::Equal
+    } else {
+        left.total_cmp(right)
     }
 }
 
@@ -813,9 +1184,9 @@ enum CompiledOperand {
 }
 
 impl CompiledOperand {
-    fn data_type(&self) -> DataType {
+    fn data_type(&self) -> Option<DataType> {
         match self {
-            Self::Column { data_type, .. } => *data_type,
+            Self::Column { data_type, .. } => Some(*data_type),
             Self::Literal(value) => value.data_type(),
         }
     }
@@ -828,37 +1199,77 @@ impl CompiledOperand {
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
-    match predicate {
-        Predicate::Comparison {
-            left,
-            operator,
-            right,
-        } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
-            if !comparable(left.data_type(), right.data_type()) {
-                return Err(Error::TypeMismatch {
-                    context: "WHERE comparison".to_owned(),
-                    expected: left.data_type().to_string(),
-                    actual: right.data_type().to_string(),
-                });
-            }
-            Ok(CompiledPredicate::Comparison {
-                left,
-                operator: *operator,
-                right,
-            })
+fn validate_uncorrelated(table: &Table, select: &Select, outer_tables: &[&Table]) -> Result<()> {
+    for item in &select.items {
+        match item {
+            SelectItem::Column { name, .. } => validate_local_column(table, name, outer_tables)?,
+            SelectItem::Aggregate {
+                argument: AggregateArgument::Column(name),
+                ..
+            } => validate_local_column(table, name, outer_tables)?,
+            SelectItem::Wildcard
+            | SelectItem::Aggregate {
+                argument: AggregateArgument::Wildcard,
+                ..
+            } => {}
         }
-        Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
-        )),
-        Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
-        )),
     }
+    if let Some(predicate) = &select.predicate {
+        validate_predicate_scope(table, predicate, outer_tables)?;
+    }
+    for name in &select.group_by {
+        validate_local_column(table, name, outer_tables)?;
+    }
+    Ok(())
+}
+
+fn validate_predicate_scope(
+    table: &Table,
+    predicate: &Predicate,
+    outer_tables: &[&Table],
+) -> Result<()> {
+    match predicate {
+        Predicate::Comparison { left, right, .. } => {
+            validate_operand_scope(table, left, outer_tables)?;
+            validate_operand_scope(table, right, outer_tables)
+        }
+        Predicate::InSubquery { operand, .. } => {
+            validate_operand_scope(table, operand, outer_tables)
+        }
+        Predicate::Exists { .. } => Ok(()),
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            validate_predicate_scope(table, left, outer_tables)?;
+            validate_predicate_scope(table, right, outer_tables)
+        }
+    }
+}
+
+fn validate_operand_scope(table: &Table, operand: &Operand, outer_tables: &[&Table]) -> Result<()> {
+    if let Operand::Column(name) = operand {
+        validate_local_column(table, name, outer_tables)?;
+    }
+    Ok(())
+}
+
+fn validate_local_column(table: &Table, name: &str, outer_tables: &[&Table]) -> Result<()> {
+    if table
+        .schema()
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(name))
+    {
+        return Ok(());
+    }
+    if outer_tables.iter().rev().any(|outer| {
+        outer
+            .schema()
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(name))
+    }) {
+        return Err(Error::InvalidQuery(format!(
+            "correlated subqueries are not supported: column '{name}' references an outer query"
+        )));
+    }
+    Ok(())
 }
 
 fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
