@@ -9,6 +9,9 @@ repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "clickhouse-parity-bench"
 path = "benchmark/main.rs"

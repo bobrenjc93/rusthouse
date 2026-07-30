@@ -112,6 +112,7 @@ fn run_bounded_with_limits(
     retain_stdout: bool,
     label: &str,
 ) -> Result<BoundedOutput, String> {
+    ensure_supported_platform()?;
     configure_process_group(&mut command);
     command
         .stdin(Stdio::piped())
@@ -135,11 +136,26 @@ fn run_bounded_with_limits(
         .take()
         .expect("bounded runner configured child stderr as piped");
 
+    if let Err(error) = set_nonblocking(&stdin)
+        .and_then(|()| set_nonblocking(&stdout))
+        .and_then(|()| set_nonblocking(&stderr))
+    {
+        let mut status = None;
+        let cleanup_errors = terminate_and_reap_checked(&mut child, &mut status);
+        return Err(with_cleanup_errors(
+            format!("could not configure bounded pipes for {label}: {error}"),
+            cleanup_errors,
+        ));
+    }
+
+    let cancellation = Arc::new(AtomicBool::new(false));
     let writer = match stdin_bytes {
-        Some(bytes) => Some(thread::spawn(move || {
-            let mut stdin = stdin;
-            stdin.write_all(&bytes)
-        })),
+        Some(bytes) => {
+            let writer_cancellation = Arc::clone(&cancellation);
+            Some(thread::spawn(move || {
+                write_stdin(stdin, &bytes, &writer_cancellation)
+            }))
+        }
         None => {
             drop(stdin);
             None
@@ -151,18 +167,23 @@ fn run_bounded_with_limits(
     } else {
         limits.stdout_bytes.min(DIAGNOSTIC_BYTES)
     };
-    let stdout_reader = spawn_reader(stdout, limits.stdout_bytes, stdout_retained);
+    let stdout_reader = spawn_reader(
+        stdout,
+        limits.stdout_bytes,
+        stdout_retained,
+        Arc::clone(&cancellation),
+    );
     let stderr_reader = spawn_reader(
         stderr,
         limits.stderr_bytes,
         limits.stderr_bytes.min(DIAGNOSTIC_BYTES),
+        Arc::clone(&cancellation),
     );
 
     let mut status = None;
-    loop {
+    let failure_reason = loop {
         if stdout_reader.monitor.exceeded_limit.load(Ordering::Acquire) {
-            terminate_and_reap(&mut child, &mut status);
-            return Err(stream_limit_error(
+            break Some(stream_limit_error(
                 label,
                 phase,
                 "stdout",
@@ -171,8 +192,7 @@ fn run_bounded_with_limits(
             ));
         }
         if stderr_reader.monitor.exceeded_limit.load(Ordering::Acquire) {
-            terminate_and_reap(&mut child, &mut status);
-            return Err(stream_limit_error(
+            break Some(stream_limit_error(
                 label,
                 phase,
                 "stderr",
@@ -183,10 +203,7 @@ fn run_bounded_with_limits(
         if stdout_reader.monitor.read_failed.load(Ordering::Acquire)
             || stderr_reader.monitor.read_failed.load(Ordering::Acquire)
         {
-            terminate_and_reap(&mut child, &mut status);
-            return Err(format!(
-                "could not drain bounded output from {label}; process was killed"
-            ));
+            break Some(format!("could not drain bounded output from {label}"));
         }
 
         if status.is_none() {
@@ -194,58 +211,80 @@ fn run_bounded_with_limits(
                 Ok(Some(child_status)) => status = Some(child_status),
                 Ok(None) => {}
                 Err(error) => {
-                    terminate_and_reap(&mut child, &mut status);
-                    return Err(format!("could not wait for {label}: {error}"));
+                    break Some(format!("could not wait for {label}: {error}"));
                 }
             }
         }
 
         if status.is_some() && io_threads_finished(writer.as_ref(), &stdout_reader, &stderr_reader)
         {
-            break;
+            break None;
         }
         if started.elapsed() >= limits.deadline {
-            terminate_and_reap(&mut child, &mut status);
-            return Err(format!(
-                "{label} {} timed out after {} ms and was killed",
+            break Some(format!(
+                "{label} {} timed out after {} ms",
                 phase.name(),
                 limits.deadline.as_millis()
             ));
         }
         thread::sleep(CHILD_POLL_INTERVAL);
+    };
+
+    if let Some(reason) = failure_reason {
+        cancellation.store(true, Ordering::Release);
+        let mut cleanup_errors = terminate_and_reap_checked(&mut child, &mut status);
+        cleanup_errors.extend(join_cancelled_workers(
+            writer,
+            stdout_reader,
+            stderr_reader,
+            label,
+        ));
+        return Err(with_cleanup_errors(reason, cleanup_errors));
     }
 
     let status = status.expect("completed child has an exit status");
-    terminate_process_group(&child)
-        .map_err(|error| format!("could not terminate remaining processes for {label}: {error}"))?;
+    let process_group_error = terminate_process_group(&child)
+        .err()
+        .map(|error| format!("could not terminate remaining processes for {label}: {error}"));
 
-    let writer_error = join_writer(writer, label)?;
-    let stdout = join_reader(stdout_reader, "stdout", label)?;
-    let stderr = join_reader(stderr_reader, "stderr", label)?;
+    let writer_error = join_writer(writer, label).map_err(|error| {
+        with_cleanup_errors(error, process_group_error.iter().cloned().collect())
+    })?;
+    let stdout = join_reader(stdout_reader, "stdout", label).map_err(|error| {
+        with_cleanup_errors(error, process_group_error.iter().cloned().collect())
+    })?;
+    let stderr = join_reader(stderr_reader, "stderr", label).map_err(|error| {
+        with_cleanup_errors(error, process_group_error.iter().cloned().collect())
+    })?;
     let elapsed = started.elapsed();
 
-    if stdout.total_bytes > limits.stdout_bytes {
-        return Err(stream_limit_error(
+    let rejection = if stdout.total_bytes > limits.stdout_bytes {
+        Some(stream_limit_error(
             label,
             phase,
             "stdout",
             limits.stdout_bytes,
             stdout.prefix.len(),
-        ));
-    }
-    if stderr.total_bytes > limits.stderr_bytes {
-        return Err(stream_limit_error(
+        ))
+    } else if stderr.total_bytes > limits.stderr_bytes {
+        Some(stream_limit_error(
             label,
             phase,
             "stderr",
             limits.stderr_bytes,
             stderr.prefix.len(),
+        ))
+    } else if status.success() {
+        writer_error.map(|error| format!("could not write stdin to {label}: {error}"))
+    } else {
+        None
+    };
+    if rejection.is_some() || process_group_error.is_some() {
+        let reason = rejection.unwrap_or_else(|| format!("subprocess cleanup failed for {label}"));
+        return Err(with_cleanup_errors(
+            reason,
+            process_group_error.into_iter().collect(),
         ));
-    }
-    if status.success()
-        && let Some(error) = writer_error
-    {
-        return Err(format!("could not write stdin to {label}: {error}"));
     }
 
     Ok(BoundedOutput {
@@ -266,11 +305,99 @@ fn io_threads_finished(
         && stderr_reader.handle.is_finished()
 }
 
-fn terminate_and_reap(child: &mut Child, status: &mut Option<ExitStatus>) {
-    terminate_child(child);
-    if status.is_none() {
-        *status = child.wait().ok();
+fn with_cleanup_errors(reason: String, cleanup_errors: Vec<String>) -> String {
+    if cleanup_errors.is_empty() {
+        reason
+    } else {
+        format!("{reason}; cleanup failed: {}", cleanup_errors.join("; "))
     }
+}
+
+fn terminate_and_reap_checked(child: &mut Child, status: &mut Option<ExitStatus>) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = terminate_process_group(child) {
+        errors.push(format!("could not terminate process group: {error}"));
+    }
+    if status.is_some() {
+        return errors;
+    }
+
+    match child.kill() {
+        Ok(()) => match child.wait() {
+            Ok(child_status) => *status = Some(child_status),
+            Err(error) => errors.push(format!("could not reap direct child: {error}")),
+        },
+        Err(kill_error) => {
+            let reap_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(child_status)) => {
+                        *status = Some(child_status);
+                        break;
+                    }
+                    Ok(None) if Instant::now() < reap_deadline => {
+                        thread::sleep(CHILD_POLL_INTERVAL);
+                    }
+                    Ok(None) => {
+                        errors.push(format!("could not kill direct child: {kill_error}"));
+                        errors.push("direct child was not reaped within 1000 ms".to_owned());
+                        break;
+                    }
+                    Err(error) => {
+                        errors.push(format!("could not kill direct child: {kill_error}"));
+                        errors.push(format!("could not reap direct child: {error}"));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn join_cancelled_workers(
+    writer: Option<thread::JoinHandle<io::Result<()>>>,
+    stdout_reader: ReaderThread,
+    stderr_reader: ReaderThread,
+    label: &str,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Some(writer) = writer
+        && writer.join().is_err()
+    {
+        errors.push(format!("stdin writer thread panicked for {label}"));
+    }
+    join_cancelled_reader(stdout_reader, "stdout", label, &mut errors);
+    join_cancelled_reader(stderr_reader, "stderr", label, &mut errors);
+    errors
+}
+
+fn join_cancelled_reader(
+    reader: ReaderThread,
+    stream: &str,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    match reader.handle.join() {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => errors.push(format!(
+            "could not stop {stream} reader for {label}: {error}"
+        )),
+        Err(_) => errors.push(format!("{stream} reader thread panicked for {label}")),
+    }
+}
+
+#[cfg(unix)]
+fn ensure_supported_platform() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_supported_platform() -> Result<(), String> {
+    Err(format!(
+        "bounded subprocess execution is unsupported on {}; Unix process-group isolation is required",
+        std::env::consts::OS
+    ))
 }
 
 #[cfg(unix)]
@@ -282,25 +409,39 @@ fn configure_process_group(command: &mut Command) {
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn terminate_process_group(child: &Child) -> io::Result<()> {
-    const ESRCH: i32 = 3;
-    const SIGKILL: i32 = 9;
-
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
+fn set_nonblocking(stream: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    let descriptor = stream.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
     }
+    if flags & libc::O_NONBLOCK != 0 {
+        return Ok(());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
+#[cfg(not(unix))]
+fn set_nonblocking<T>(_stream: &T) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &Child) -> io::Result<()> {
     let pid = i32::try_from(child.id())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child PID exceeds i32"))?;
     // The child was placed in a new process group whose ID is its PID.
     // A negative PID asks POSIX kill(2) to signal the whole group.
-    let result = unsafe { kill(-pid, SIGKILL) };
+    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
     if result == 0 {
         return Ok(());
     }
 
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(ESRCH) {
+    if error.raw_os_error() == Some(libc::ESRCH) {
         Ok(())
     } else {
         Err(error)
@@ -312,20 +453,44 @@ fn terminate_process_group(_child: &Child) -> io::Result<()> {
     Ok(())
 }
 
-fn terminate_child(child: &mut Child) {
-    let _ = terminate_process_group(child);
-    let _ = child.kill();
+fn write_stdin(
+    mut stream: impl Write,
+    mut bytes: &[u8],
+    cancellation: &AtomicBool,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(CHILD_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn spawn_reader(
     mut stream: impl Read + Send + 'static,
     byte_limit: usize,
     retained_bytes: usize,
+    cancellation: Arc<AtomicBool>,
 ) -> ReaderThread {
     let monitor = Arc::new(StreamMonitor::default());
     let thread_monitor = Arc::clone(&monitor);
     let handle = thread::spawn(move || {
-        let result = read_stream(&mut stream, byte_limit, retained_bytes, &thread_monitor);
+        let result = read_stream(
+            &mut stream,
+            byte_limit,
+            retained_bytes,
+            &thread_monitor,
+            &cancellation,
+        );
         if result.is_err() {
             thread_monitor.read_failed.store(true, Ordering::Release);
         }
@@ -339,20 +504,30 @@ fn read_stream(
     byte_limit: usize,
     retained_bytes: usize,
     monitor: &StreamMonitor,
+    cancellation: &AtomicBool,
 ) -> io::Result<CapturedStream> {
     let mut prefix = Vec::with_capacity(retained_bytes.min(READ_BUFFER_BYTES));
     let mut total_bytes = 0_usize;
     let mut buffer = [0_u8; READ_BUFFER_BYTES];
     loop {
-        let bytes_read = stream.read(&mut buffer)?;
-        if bytes_read == 0 {
+        if cancellation.load(Ordering::Acquire) {
             break;
         }
-        let remaining = retained_bytes.saturating_sub(prefix.len());
-        prefix.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
-        total_bytes = total_bytes.saturating_add(bytes_read);
-        if total_bytes > byte_limit {
-            monitor.exceeded_limit.store(true, Ordering::Release);
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                let remaining = retained_bytes.saturating_sub(prefix.len());
+                prefix.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+                total_bytes = total_bytes.saturating_add(bytes_read);
+                if total_bytes > byte_limit {
+                    monitor.exceeded_limit.store(true, Ordering::Release);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(CHILD_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(CapturedStream {
@@ -398,16 +573,49 @@ fn stream_limit_error(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(unix))]
+    mod non_unix {
+        use std::process::Command;
+        use std::time::Duration;
+
+        use super::super::*;
+
+        #[test]
+        fn execution_is_rejected_before_spawning_without_process_group_isolation() {
+            let error = run_bounded_with_limits(
+                Command::new("this-command-must-not-be-spawned"),
+                None,
+                ExecutionPhase::Validation,
+                ExecutionLimits {
+                    deadline: Duration::from_secs(1),
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                },
+                true,
+                "unsupported platform child",
+            )
+            .expect_err("non-Unix execution must fail closed");
+
+            assert!(error.contains("unsupported"));
+            assert!(error.contains("process-group isolation"));
+        }
+    }
+
     #[cfg(unix)]
     mod unix {
         use std::fs;
         use std::os::unix::fs::PermissionsExt as _;
         use std::path::PathBuf;
         use std::process::Command;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        };
         use std::time::{Duration, Instant};
 
         use super::super::*;
+
+        static RUNNER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
         struct FakeExecutable {
             path: PathBuf,
@@ -432,13 +640,28 @@ mod tests {
             }
 
             fn command(&self) -> Command {
-                Command::new(&self.path)
+                let mut command = Command::new(&self.path);
+                command.arg(self.pid_path());
+                command
+            }
+
+            fn pid_path(&self) -> PathBuf {
+                PathBuf::from(format!("{}.pid", self.path.display()))
+            }
+
+            fn recorded_pid(&self) -> i32 {
+                fs::read_to_string(self.pid_path())
+                    .expect("read recorded descendant PID")
+                    .trim()
+                    .parse()
+                    .expect("recorded descendant PID")
             }
         }
 
         impl Drop for FakeExecutable {
             fn drop(&mut self) {
                 let _ = fs::remove_file(&self.path);
+                let _ = fs::remove_file(self.pid_path());
             }
         }
 
@@ -451,41 +674,43 @@ mod tests {
         }
 
         fn process_exists(pid: i32) -> bool {
-            const ESRCH: i32 = 3;
-
-            unsafe extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-
             // Signal zero performs existence and permission checks without
             // changing the target process.
-            let result = unsafe { kill(pid, 0) };
-            result == 0 || io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+            let result = unsafe { libc::kill(pid, 0) };
+            result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+
+        fn assert_process_stopped(pid: i32) {
+            let reaping_deadline = Instant::now() + Duration::from_secs(2);
+            while process_exists(pid) && Instant::now() < reaping_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!process_exists(pid), "descendant {pid} survived cleanup");
         }
 
         #[test]
         fn hanging_executable_and_its_descendant_are_killed_at_deadline() {
-            let executable = FakeExecutable::new("sleep 30");
+            let _guard = RUNNER_TEST_LOCK.lock().expect("runner test lock");
+            let executable = FakeExecutable::new("sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait");
             let started = Instant::now();
             let error = run_bounded_with_limits(
                 executable.command(),
                 Some(vec![b'x'; 1024 * 1024]),
                 ExecutionPhase::Validation,
-                limits(Duration::from_millis(100), 1024, 1024),
+                limits(Duration::from_millis(500), 1024, 1024),
                 true,
                 "fake hang",
             )
             .expect_err("hanging child must time out");
 
-            assert_eq!(
-                error,
-                "fake hang validation timed out after 100 ms and was killed"
-            );
+            assert_eq!(error, "fake hang validation timed out after 500 ms");
             assert!(started.elapsed() < Duration::from_secs(2));
+            assert_process_stopped(executable.recorded_pid());
         }
 
         #[test]
         fn parent_exit_does_not_stop_supervision_of_inherited_pipes() {
+            let _guard = RUNNER_TEST_LOCK.lock().expect("runner test lock");
             let executable = FakeExecutable::new("sleep 30 & exit 0");
             let started = Instant::now();
             let error = run_bounded_with_limits(
@@ -500,15 +725,17 @@ mod tests {
 
             assert_eq!(
                 error,
-                "fake exited parent validation timed out after 100 ms and was killed"
+                "fake exited parent validation timed out after 100 ms"
             );
             assert!(started.elapsed() < Duration::from_secs(2));
         }
 
         #[test]
         fn parent_exit_does_not_stop_supervision_of_background_output() {
-            let executable =
-                FakeExecutable::new("(while :; do printf '0123456789abcdef'; done) & exit 0");
+            let _guard = RUNNER_TEST_LOCK.lock().expect("runner test lock");
+            let executable = FakeExecutable::new(
+                "(sleep 0.05; while :; do printf '0123456789abcdef'; done) & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+            );
             let started = Instant::now();
             let error = run_bounded_with_limits(
                 executable.command(),
@@ -525,10 +752,12 @@ mod tests {
                 "fake exited flood parent correctness stdout exceeded the 1024-byte limit; output was truncated to the first 1024 bytes and the process result was rejected"
             );
             assert!(started.elapsed() < Duration::from_secs(2));
+            assert_process_stopped(executable.recorded_pid());
         }
 
         #[test]
         fn redirected_background_child_is_terminated_before_success() {
+            let _guard = RUNNER_TEST_LOCK.lock().expect("runner test lock");
             let executable = FakeExecutable::new(
                 "sleep 30 </dev/null >/dev/null 2>/dev/null & printf '%s\\n' \"$!\"; exit 0",
             );
@@ -547,18 +776,12 @@ mod tests {
                 .parse::<i32>()
                 .expect("background PID");
 
-            let reaping_deadline = Instant::now() + Duration::from_secs(2);
-            while process_exists(descendant_pid) && Instant::now() < reaping_deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(
-                !process_exists(descendant_pid),
-                "background descendant {descendant_pid} survived an accepted run"
-            );
+            assert_process_stopped(descendant_pid);
         }
 
         #[test]
         fn stdout_flood_is_killed_and_reports_deterministic_truncation() {
+            let _guard = RUNNER_TEST_LOCK.lock().expect("runner test lock");
             let executable = FakeExecutable::new("while :; do printf '0123456789abcdef'; done");
             let error = run_bounded_with_limits(
                 executable.command(),
@@ -578,6 +801,7 @@ mod tests {
 
         #[test]
         fn stderr_flood_is_killed_and_reports_deterministic_truncation() {
+            let _guard = RUNNER_TEST_LOCK.lock().expect("runner test lock");
             let executable = FakeExecutable::new("while :; do printf '0123456789abcdef' >&2; done");
             let error = run_bounded_with_limits(
                 executable.command(),
