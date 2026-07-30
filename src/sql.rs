@@ -24,6 +24,7 @@ pub struct Select {
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
+    pub having: Option<Box<Predicate>>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -95,6 +96,10 @@ pub enum Predicate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Column(String),
+    Aggregate {
+        function: AggregateFunction,
+        argument: AggregateArgument,
+    },
     Literal(Value),
 }
 
@@ -455,7 +460,7 @@ impl Parser {
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
             self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
+            Some(self.parse_or_predicate(false)?)
         } else {
             None
         };
@@ -470,6 +475,14 @@ impl Parser {
                 }
             }
         }
+
+        let having = if self.eat_keyword("HAVING") {
+            self.predicate_depth = 0;
+            self.predicate_nodes = 0;
+            Some(Box::new(self.parse_or_predicate(true)?))
+        } else {
+            None
+        };
 
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
@@ -508,6 +521,7 @@ impl Parser {
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -521,16 +535,7 @@ impl Parser {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
-            let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!("unknown aggregate function '{name}'"),
-            })?;
-            let argument = if self.eat(&TokenKind::Star) {
-                AggregateArgument::Wildcard
-            } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
-            };
-            self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            let (function, argument) = self.parse_aggregate_call(&name, position)?;
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
@@ -543,6 +548,24 @@ impl Parser {
         }
     }
 
+    fn parse_aggregate_call(
+        &mut self,
+        name: &str,
+        position: usize,
+    ) -> Result<(AggregateFunction, AggregateArgument)> {
+        let function = AggregateFunction::parse(name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!("unknown aggregate function '{name}'"),
+        })?;
+        let argument = if self.eat(&TokenKind::Star) {
+            AggregateArgument::Wildcard
+        } else {
+            AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+        };
+        self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+        Ok((function, argument))
+    }
+
     fn parse_alias(&mut self) -> Result<Option<String>> {
         if self.eat_keyword("AS") {
             self.expect_identifier("alias").map(Some)
@@ -551,27 +574,27 @@ impl Parser {
         }
     }
 
-    fn parse_or_predicate(&mut self) -> Result<Predicate> {
-        let mut predicate = self.parse_and_predicate()?;
+    fn parse_or_predicate(&mut self, allow_aggregates: bool) -> Result<Predicate> {
+        let mut predicate = self.parse_and_predicate(allow_aggregates)?;
         while self.eat_keyword("OR") {
-            let right = self.parse_and_predicate()?;
+            let right = self.parse_and_predicate(allow_aggregates)?;
             self.record_predicate_node()?;
             predicate = Predicate::Or(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
     }
 
-    fn parse_and_predicate(&mut self) -> Result<Predicate> {
-        let mut predicate = self.parse_predicate_atom()?;
+    fn parse_and_predicate(&mut self, allow_aggregates: bool) -> Result<Predicate> {
+        let mut predicate = self.parse_predicate_atom(allow_aggregates)?;
         while self.eat_keyword("AND") {
-            let right = self.parse_predicate_atom()?;
+            let right = self.parse_predicate_atom(allow_aggregates)?;
             self.record_predicate_node()?;
             predicate = Predicate::And(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
     }
 
-    fn parse_predicate_atom(&mut self) -> Result<Predicate> {
+    fn parse_predicate_atom(&mut self, allow_aggregates: bool) -> Result<Predicate> {
         if self.eat(&TokenKind::LeftParen) {
             if self.predicate_depth >= MAX_PREDICATE_DEPTH {
                 return self.error(format!(
@@ -579,14 +602,14 @@ impl Parser {
                 ));
             }
             self.predicate_depth += 1;
-            let predicate = self.parse_or_predicate();
+            let predicate = self.parse_or_predicate(allow_aggregates);
             self.predicate_depth -= 1;
             let predicate = predicate?;
             self.expect(&TokenKind::RightParen, "right parenthesis after predicate")?;
             return Ok(predicate);
         }
 
-        let left = self.parse_operand()?;
+        let left = self.parse_operand(allow_aggregates)?;
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -597,7 +620,7 @@ impl Parser {
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
         self.current += 1;
-        let right = self.parse_operand()?;
+        let right = self.parse_operand(allow_aggregates)?;
         self.record_predicate_node()?;
         Ok(Predicate::Comparison {
             left,
@@ -616,7 +639,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_operand(&mut self) -> Result<Operand> {
+    fn parse_operand(&mut self, allow_aggregates: bool) -> Result<Operand> {
         match self.peek() {
             TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
                 self.parse_literal().map(Operand::Literal)
@@ -626,9 +649,19 @@ impl Parser {
             {
                 self.parse_literal().map(Operand::Literal)
             }
-            TokenKind::Identifier(_) => self
-                .expect_identifier("column or literal")
-                .map(Operand::Column),
+            TokenKind::Identifier(_) => {
+                let position = self.position();
+                let name = self.expect_identifier("column or literal")?;
+                if self.eat(&TokenKind::LeftParen) {
+                    if !allow_aggregates {
+                        return self.error("aggregate calls are only allowed in HAVING");
+                    }
+                    let (function, argument) = self.parse_aggregate_call(&name, position)?;
+                    Ok(Operand::Aggregate { function, argument })
+                } else {
+                    Ok(Operand::Column(name))
+                }
+            }
             _ => self.error("expected column or literal"),
         }
     }
@@ -759,7 +792,8 @@ mod tests {
         let statements = parse(
             "SELECT region, SUM(amount) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region HAVING total > 5 AND COUNT(*) >= 2 \
+             ORDER BY total DESC LIMIT 3;",
         )
         .expect("valid SQL");
 
@@ -768,6 +802,7 @@ mod tests {
         };
         assert_eq!(select.items.len(), 2);
         assert_eq!(select.group_by, ["region"]);
+        assert!(select.having.is_some());
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
@@ -812,6 +847,19 @@ mod tests {
         let sql = format!("SELECT id FROM things WHERE {predicate}");
 
         let error = parse(&sql).expect_err("node limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn bounds_having_predicate_complexity_independently() {
+        let predicate = vec!["COUNT(*) > 0"; 300].join(" OR ");
+        let sql = format!("SELECT COUNT(*) FROM things HAVING {predicate}");
+
+        let error = parse(&sql).expect_err("node limit should reject HAVING");
         assert!(matches!(
             error,
             Error::Sql { message, .. }

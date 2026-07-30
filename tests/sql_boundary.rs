@@ -524,3 +524,171 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn having_filters_grouped_results_before_ordering_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES
+                ('a', 6), ('a', 6),
+                ('b', 20),
+                ('c', 4), ('c', 4),
+                ('d', 30);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region, SUM(amount) AS total
+         FROM sales
+         GROUP BY region
+         HAVING total >= 25 AND COUNT(*) > 1 OR region = 'b'
+         ORDER BY total DESC
+         LIMIT 1;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::String("b".to_owned()), Value::Int64(20)]]
+    );
+}
+
+#[test]
+fn having_supports_unprojected_and_aliased_aggregates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES
+                ('west', 10), ('east', 4), ('west', 7);",
+        )
+        .expect("setup succeeds");
+
+    let hidden = execute_query(
+        &mut database,
+        "SELECT region AS area
+         FROM sales
+         GROUP BY region
+         HAVING SUM(amount) > 5 AND area != 'east'
+         ORDER BY area;",
+    );
+    assert_eq!(hidden.rows, vec![vec![Value::String("west".to_owned())]]);
+
+    let alias = execute_query(
+        &mut database,
+        "SELECT region, AVG(amount) AS mean
+         FROM sales
+         GROUP BY region
+         HAVING mean >= 8.5
+         ORDER BY region;",
+    );
+    assert_eq!(
+        alias.rows,
+        vec![vec![Value::String("west".to_owned()), Value::Float64(8.5),]]
+    );
+}
+
+#[test]
+fn having_handles_global_aggregates_and_empty_input() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE measurements (reading Int64);")
+        .expect("create succeeds");
+
+    let included = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS count, SUM(reading) AS total
+         FROM measurements
+         HAVING count = 0 AND SUM(reading) = 0;",
+    );
+    assert_eq!(included.rows, vec![vec![Value::Int64(0), Value::Int64(0)]]);
+
+    let excluded = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS count FROM measurements HAVING count > 0;",
+    );
+    assert!(excluded.rows.is_empty());
+
+    database
+        .execute("INSERT INTO measurements VALUES (2), (4), (6);")
+        .expect("insert succeeds");
+    let populated = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS count FROM measurements HAVING AVG(reading) = 4;",
+    );
+    assert_eq!(populated.rows, vec![vec![Value::Int64(3)]]);
+}
+
+#[test]
+fn having_preserves_exact_mixed_numeric_comparisons() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE exact_values (value Int64);
+             INSERT INTO exact_values VALUES (9007199254740992), (1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT SUM(value) AS total
+         FROM exact_values
+         HAVING total > 9007199254740992.0;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(9_007_199_254_740_993)]]);
+}
+
+#[test]
+fn having_rejects_ambiguous_names_and_invalid_types() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE inventory (category String, quantity Int64);
+             INSERT INTO inventory VALUES ('tools', 2);",
+        )
+        .expect("setup succeeds");
+
+    let ambiguous = database
+        .execute(
+            "SELECT COUNT(*) AS metric, SUM(quantity) AS metric
+             FROM inventory
+             HAVING metric > 0;",
+        )
+        .expect_err("duplicate aliases are ambiguous");
+    assert!(
+        matches!(ambiguous, Error::InvalidQuery(message) if message.contains("HAVING name 'metric' is ambiguous"))
+    );
+
+    let ungrouped = database
+        .execute("SELECT COUNT(*) FROM inventory HAVING category = 'tools';")
+        .expect_err("source columns in HAVING must be grouped");
+    assert!(
+        matches!(ungrouped, Error::InvalidQuery(message) if message.contains("must appear in GROUP BY"))
+    );
+
+    let comparison = database
+        .execute("SELECT COUNT(*) FROM inventory HAVING COUNT(*) = '1';")
+        .expect_err("HAVING comparisons remain typed");
+    assert!(matches!(
+        comparison,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "HAVING comparison" && expected == "Int64" && actual == "String"
+    ));
+
+    let aggregate = database
+        .execute("SELECT COUNT(*) FROM inventory HAVING SUM(category) > 0;")
+        .expect_err("HAVING aggregates validate input types");
+    assert!(matches!(
+        aggregate,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "Int64 or Float64" && actual == "String"
+    ));
+}
