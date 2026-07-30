@@ -81,7 +81,8 @@ fn forced_spill_matches_in_memory_aggregation() {
                     AVG(revenue) AS mean_revenue
                  FROM sales
                  GROUP BY region, online
-                 ORDER BY revenue DESC;";
+                 ORDER BY revenue DESC
+                 LIMIT 3;";
 
     let mut in_memory = configured_database(128, temporary_directory.path());
     in_memory.execute(setup).expect("in-memory setup");

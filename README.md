@@ -54,6 +54,7 @@ cargo run -- --max-in-memory-groups 10000 \
 ~~~
 
 Spill workspaces are removed after successful and failed queries.
+For a spilled `GROUP BY ... LIMIT k`, the merge retains at most the configured partition cap plus `k` finalized groups. Queries without a limit still materialize every output row in `QueryResult`.
 
 Or pipe a batch through standard input:
 

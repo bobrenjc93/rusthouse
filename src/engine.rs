@@ -161,13 +161,15 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(
-                table,
-                &matching_rows,
-                &group_columns,
-                &aggregate_specs,
-                &self.options,
-            )?;
+            let plan = GroupedExecutionPlan {
+                group_columns: &group_columns,
+                aggregate_specs: &aggregate_specs,
+                items: &items,
+                ordering: &ordering,
+                limit: select.limit,
+                options: &self.options,
+            };
+            let grouped = execute_grouped(table, &matching_rows, &plan)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -373,34 +375,40 @@ fn execute_projection(
         .collect()
 }
 
-fn execute_grouped<'a>(
-    table: &'a Table,
+struct GroupedExecutionPlan<'query> {
+    group_columns: &'query [usize],
+    aggregate_specs: &'query [AggregateSpec],
+    items: &'query [ResolvedItem],
+    ordering: &'query [ResolvedOrder],
+    limit: Option<usize>,
+    options: &'query DatabaseOptions,
+}
+
+fn execute_grouped<'table>(
+    table: &'table Table,
     matching_rows: &[usize],
-    group_columns: &[usize],
-    aggregate_specs: &[AggregateSpec],
-    options: &DatabaseOptions,
-) -> Result<GroupedData<'a>> {
+    plan: &GroupedExecutionPlan<'_>,
+) -> Result<GroupedData<'table>> {
     let rows = matching_rows.iter().copied().map(Ok);
-    if group_columns.is_empty()
-        || groups_fit_in_memory(table, group_columns, rows, options.max_in_memory_groups)?
+    if plan.group_columns.is_empty()
+        || groups_fit_in_memory(
+            table,
+            plan.group_columns,
+            rows,
+            plan.options.max_in_memory_groups,
+        )?
     {
         return aggregate_rows(
             table,
-            group_columns,
-            aggregate_specs,
+            plan.group_columns,
+            plan.aggregate_specs,
             matching_rows.iter().copied().map(Ok),
             matching_rows.len(),
-            options.max_in_memory_groups,
+            plan.options.max_in_memory_groups,
         );
     }
 
-    execute_spilled_grouped(
-        table,
-        matching_rows,
-        group_columns,
-        aggregate_specs,
-        options,
-    )
+    execute_spilled_grouped(table, matching_rows, plan).map(|result| result.grouped)
 }
 
 fn groups_fit_in_memory(
@@ -480,18 +488,16 @@ const SPILL_PARTITION_COUNT: usize = 16;
 const MAX_REPARTITION_DEPTH: usize = 64;
 static NEXT_SPILL_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-fn execute_spilled_grouped<'a>(
-    table: &'a Table,
+fn execute_spilled_grouped<'table>(
+    table: &'table Table,
     matching_rows: &[usize],
-    group_columns: &[usize],
-    aggregate_specs: &[AggregateSpec],
-    options: &DatabaseOptions,
-) -> Result<GroupedData<'a>> {
-    let mut workspace = SpillWorkspace::new(options.temporary_directory.as_deref())?;
+    plan: &GroupedExecutionPlan<'_>,
+) -> Result<SpilledGroupedData<'table>> {
+    let mut workspace = SpillWorkspace::new(plan.options.temporary_directory.as_deref())?;
     let root_partitions = partition_rows(
         &mut workspace,
         table,
-        group_columns,
+        plan.group_columns,
         matching_rows.iter().copied().map(Ok),
         0,
     )?;
@@ -499,19 +505,41 @@ fn execute_spilled_grouped<'a>(
         let mut execution = SpillExecution {
             workspace: &mut workspace,
             table,
-            group_columns,
-            aggregate_specs,
-            max_groups: options.max_in_memory_groups,
-            grouped: GroupedData::empty(aggregate_specs.len()),
+            group_columns: plan.group_columns,
+            aggregate_specs: plan.aggregate_specs,
+            items: plan.items,
+            ordering: plan.ordering,
+            limit: plan.limit,
+            max_groups: plan.options.max_in_memory_groups,
+            grouped: GroupedData::empty(plan.aggregate_specs.len()),
+            peak_retained_groups: 0,
         };
         for partition in root_partitions {
             execution.process_partition(partition, 1)?;
         }
-        execution.grouped
+        let SpillExecution {
+            grouped,
+            peak_retained_groups,
+            ..
+        } = execution;
+        SpilledGroupedData {
+            grouped,
+            peak_retained_groups,
+        }
     };
 
     workspace.cleanup()?;
+    if let Some(limit) = plan.limit {
+        debug_assert!(
+            grouped.peak_retained_groups <= plan.options.max_in_memory_groups.saturating_add(limit)
+        );
+    }
     Ok(grouped)
+}
+
+struct SpilledGroupedData<'table> {
+    grouped: GroupedData<'table>,
+    peak_retained_groups: usize,
 }
 
 struct SpillExecution<'config, 'table> {
@@ -519,8 +547,12 @@ struct SpillExecution<'config, 'table> {
     table: &'table Table,
     group_columns: &'config [usize],
     aggregate_specs: &'config [AggregateSpec],
+    items: &'config [ResolvedItem],
+    ordering: &'config [ResolvedOrder],
+    limit: Option<usize>,
     max_groups: usize,
     grouped: GroupedData<'table>,
+    peak_retained_groups: usize,
 }
 
 impl SpillExecution<'_, '_> {
@@ -545,7 +577,13 @@ impl SpillExecution<'_, '_> {
                 partition.row_count,
                 self.max_groups,
             )?;
+            self.peak_retained_groups = self
+                .peak_retained_groups
+                .max(self.grouped.len().saturating_add(partition_grouped.len()));
             self.grouped.append(partition_grouped);
+            if let Some(limit) = self.limit {
+                self.grouped.retain_best(self.items, self.ordering, limit);
+            }
             remove_spill_file(&partition.path)?;
             return Ok(());
         }
@@ -961,6 +999,18 @@ impl<'a> GroupedData<'a> {
         }
     }
 
+    fn retain_best(&mut self, items: &[ResolvedItem], ordering: &[ResolvedOrder], limit: usize) {
+        if self.len() <= limit {
+            return;
+        }
+        let mut selected = (0..self.len()).collect::<Vec<_>>();
+        order_grouped_rows(&mut selected, self, items, ordering, Some(limit));
+        retain_selected(&mut self.keys, &selected);
+        for values in &mut self.aggregates {
+            retain_selected(values, &selected);
+        }
+    }
+
     fn len(&self) -> usize {
         self.keys.len()
     }
@@ -987,6 +1037,21 @@ impl<'a> GroupedData<'a> {
                     .collect()
             })
             .collect()
+    }
+}
+
+fn retain_selected<T>(values: &mut Vec<T>, selected: &[usize]) {
+    let mut available = std::mem::take(values)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    values.reserve(selected.len());
+    for index in selected {
+        values.push(
+            available[*index]
+                .take()
+                .expect("selected group indices are unique"),
+        );
     }
 }
 
@@ -1475,6 +1540,74 @@ mod tests {
 
         remove_spill_file(&partition.path).expect("remove partition");
         workspace.cleanup().expect("remove spill workspace");
+        fs::remove_dir(parent).expect("remove spill test parent");
+    }
+
+    #[test]
+    fn spilled_limit_bounds_peak_retained_groups() {
+        use crate::storage::ColumnDef;
+
+        let parent = spill_test_parent("bounded-limit-test");
+        let mut table = Table::new(
+            "totals".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "key".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ColumnDef {
+                    name: "amount".to_owned(),
+                    data_type: DataType::Int64,
+                },
+            ],
+        )
+        .expect("create table");
+        for key in 0_i64..200 {
+            table
+                .insert_row(vec![Value::Int64(key), Value::Int64(200 - key)])
+                .expect("insert row");
+        }
+
+        let aggregate_specs = [AggregateSpec {
+            function: AggregateFunction::Sum,
+            argument: Some(1),
+            input_type: Some(DataType::Int64),
+        }];
+        let items = [
+            ResolvedItem::Column {
+                source: 0,
+                group_position: Some(0),
+            },
+            ResolvedItem::Aggregate { state: 0 },
+        ];
+        let ordering = [ResolvedOrder {
+            output: 1,
+            descending: true,
+        }];
+        let options = DatabaseOptions {
+            max_in_memory_groups: 1,
+            temporary_directory: Some(parent.clone()),
+        };
+        let group_columns = [0];
+        let plan = GroupedExecutionPlan {
+            group_columns: &group_columns,
+            aggregate_specs: &aggregate_specs,
+            items: &items,
+            ordering: &ordering,
+            limit: Some(1),
+            options: &options,
+        };
+        let matching_rows = (0..table.row_count()).collect::<Vec<_>>();
+
+        let spilled =
+            execute_spilled_grouped(&table, &matching_rows, &plan).expect("execute bounded spill");
+
+        assert_eq!(spilled.peak_retained_groups, 2);
+        assert_eq!(
+            spilled.grouped.project(&[0], &items),
+            vec![vec![Value::Int64(0), Value::Int64(200)]]
+        );
+        assert_eq!(fs::read_dir(&parent).expect("read parent").count(), 0);
         fs::remove_dir(parent).expect("remove spill test parent");
     }
 }
