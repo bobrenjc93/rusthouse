@@ -444,7 +444,7 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        let distinct = self.eat_keyword("DISTINCT");
+        let distinct = self.eat_select_distinct_modifier();
         let mut items = Vec::new();
         loop {
             items.push(self.parse_select_item()?);
@@ -529,7 +529,7 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
-            let distinct = self.eat_keyword("DISTINCT");
+            let distinct = self.eat_aggregate_distinct_modifier();
             let argument = if self.eat(&TokenKind::Star) {
                 if distinct {
                     return self.error("DISTINCT aggregate argument must be a column");
@@ -695,13 +695,44 @@ impl Parser {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+        if self.at_keyword(expected) {
+            self.current += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_select_distinct_modifier(&mut self) -> bool {
+        if !self.at_keyword("DISTINCT") {
+            return false;
+        }
+
+        let next = &self.tokens[self.current + 1].kind;
+        let distinct_is_column = matches!(next, TokenKind::Comma)
+            || matches!(next, TokenKind::Identifier(value) if
+                value.eq_ignore_ascii_case("AS") || value.eq_ignore_ascii_case("FROM"));
+        if distinct_is_column {
+            false
+        } else {
+            self.current += 1;
+            true
+        }
+    }
+
+    fn eat_aggregate_distinct_modifier(&mut self) -> bool {
+        if self.at_keyword("DISTINCT")
+            && !matches!(self.tokens[self.current + 1].kind, TokenKind::RightParen)
         {
             self.current += 1;
             true
         } else {
             false
         }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {

@@ -452,6 +452,58 @@ fn distinct_handles_empty_inputs_and_grouped_projection_rows() {
 }
 
 #[test]
+fn distinct_column_name_remains_projectable() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_column (distinct Int64);
+             INSERT INTO keyword_column VALUES (2), (1), (1);",
+        )
+        .expect("setup succeeds");
+
+    let all_rows = execute_query(
+        &mut database,
+        "SELECT distinct AS value FROM keyword_column ORDER BY value;",
+    );
+    assert_eq!(
+        all_rows.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+        ]
+    );
+
+    let unique_rows = execute_query(
+        &mut database,
+        "SELECT DISTINCT distinct AS value FROM keyword_column ORDER BY value;",
+    );
+    assert_eq!(
+        unique_rows.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn distinct_column_name_remains_plain_aggregate_argument() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_column (distinct Int64);
+             INSERT INTO keyword_column VALUES (2), (1), (1);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT COUNT(distinct) AS all_values,
+                COUNT(DISTINCT distinct) AS unique_values
+         FROM keyword_column;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(3), Value::Int64(2)]]);
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
