@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::storage::{ColumnDef, Table};
+use crate::storage::{BloomIndexDef, ColumnDef, Table};
 
 /// An in-memory collection of named tables.
 #[derive(Debug, Default)]
@@ -16,11 +16,20 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
+        self.create_table_with_indexes(name, schema, Vec::new())
+    }
+
+    pub fn create_table_with_indexes(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        indexes: Vec<BloomIndexDef>,
+    ) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
             return Err(Error::TableAlreadyExists(name));
         }
-        let table = Table::new(name, schema)?;
+        let table = Table::new_with_indexes(name, schema, indexes)?;
         self.tables.insert(key, table);
         Ok(())
     }

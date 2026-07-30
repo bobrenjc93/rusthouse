@@ -1,5 +1,8 @@
 use crate::error::{Error, Result};
-use crate::storage::{ColumnDef, is_reserved_column_name};
+use crate::storage::{
+    BloomIndexDef, ColumnDef, DEFAULT_BLOOM_FALSE_POSITIVE_RATE, DEFAULT_BLOOM_GRANULE_ROWS,
+    is_reserved_column_name,
+};
 use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
@@ -10,6 +13,15 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        indexes: Vec<BloomIndexDef>,
+    },
+    CreateIndex {
+        table: String,
+        index: BloomIndexDef,
+    },
+    RebuildIndex {
+        table: String,
+        index: String,
     },
     Insert {
         table: String,
@@ -378,17 +390,36 @@ impl Parser {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
+        } else if self.eat_keyword("ALTER") {
+            self.parse_alter()
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, SELECT, or ALTER")
         }
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
-        self.expect_keyword("TABLE")?;
+        if self.eat_keyword("TABLE") {
+            self.parse_create_table()
+        } else if self.eat_keyword("INDEX") {
+            self.parse_create_index()
+        } else {
+            self.error("expected TABLE or INDEX after CREATE")
+        }
+    }
+
+    fn parse_create_table(&mut self) -> Result<Statement> {
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
+        let mut indexes = Vec::new();
         loop {
+            if self.eat_keyword("INDEX") {
+                indexes.push(self.parse_inline_bloom_index()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                continue;
+            }
             let column_name = self.expect_identifier("column name")?;
             if is_reserved_column_name(&column_name) {
                 return Err(Error::ReservedIdentifier {
@@ -401,7 +432,7 @@ impl Parser {
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected Int64, UInt64, Float64, Bool, or String"
                 ),
             })?;
             columns.push(ColumnDef {
@@ -413,7 +444,106 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            indexes,
+        })
+    }
+
+    fn parse_create_index(&mut self) -> Result<Statement> {
+        let name = self.expect_identifier("index name")?;
+        self.expect_keyword("ON")?;
+        let table = self.expect_identifier("table name")?;
+        let parenthesized = self.eat(&TokenKind::LeftParen);
+        let column = self.expect_identifier("indexed column")?;
+        if parenthesized {
+            self.expect(&TokenKind::RightParen, "')' after indexed column")?;
+        }
+        let index = self.parse_bloom_index_options(name, column)?;
+        Ok(Statement::CreateIndex { table, index })
+    }
+
+    fn parse_inline_bloom_index(&mut self) -> Result<BloomIndexDef> {
+        let name = self.expect_identifier("index name")?;
+        let parenthesized = self.eat(&TokenKind::LeftParen);
+        let column = self.expect_identifier("indexed column")?;
+        if parenthesized {
+            self.expect(&TokenKind::RightParen, "')' after indexed column")?;
+        }
+        self.parse_bloom_index_options(name, column)
+    }
+
+    fn parse_bloom_index_options(&mut self, name: String, column: String) -> Result<BloomIndexDef> {
+        self.expect_keyword("TYPE")?;
+        let position = self.position();
+        let index_type = self.expect_identifier("index type")?;
+        if !index_type.eq_ignore_ascii_case("bloom_filter") {
+            return Err(Error::Sql {
+                position,
+                message: format!("unsupported index type '{index_type}'; expected bloom_filter"),
+            });
+        }
+
+        let false_positive_rate = if self.eat(&TokenKind::LeftParen) {
+            if self.eat(&TokenKind::RightParen) {
+                DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+            } else {
+                let position = self.position();
+                let value = self.take_number().ok_or_else(|| Error::Sql {
+                    position,
+                    message: "expected false-positive rate in bloom_filter(...)".to_owned(),
+                })?;
+                let value = value.parse::<f64>().map_err(|_| Error::Sql {
+                    position,
+                    message: format!("invalid Bloom false-positive rate '{value}'"),
+                })?;
+                self.expect(
+                    &TokenKind::RightParen,
+                    "')' after Bloom false-positive rate",
+                )?;
+                value
+            }
+        } else {
+            DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+        };
+
+        let granule_rows = if self.eat_keyword("GRANULARITY") {
+            let position = self.position();
+            let value = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a positive integer after GRANULARITY".to_owned(),
+            })?;
+            value.parse::<usize>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid GRANULARITY '{value}'"),
+            })?
+        } else {
+            DEFAULT_BLOOM_GRANULE_ROWS
+        };
+
+        Ok(BloomIndexDef {
+            name,
+            column,
+            false_positive_rate,
+            granule_rows,
+        })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_identifier("table name")?;
+        if self.eat_keyword("MATERIALIZE") || self.eat_keyword("REBUILD") {
+            self.expect_keyword("INDEX")?;
+            let index = self.expect_identifier("index name")?;
+            Ok(Statement::RebuildIndex { table, index })
+        } else if self.eat_keyword("ADD") {
+            self.expect_keyword("INDEX")?;
+            let index = self.parse_inline_bloom_index()?;
+            Ok(Statement::CreateIndex { table, index })
+        } else {
+            self.error("expected ADD INDEX, MATERIALIZE INDEX, or REBUILD INDEX")
+        }
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -656,13 +786,16 @@ impl Parser {
                 }
                 return Ok(Value::Float64(value));
             }
-            return signed
-                .parse::<i64>()
-                .map(Value::Int64)
-                .map_err(|_| Error::Sql {
-                    position: self.position(),
-                    message: format!("invalid Int64 literal '{signed}'"),
-                });
+            if let Ok(value) = signed.parse::<i64>() {
+                return Ok(Value::Int64(value));
+            }
+            if !negative && let Ok(value) = signed.parse::<u64>() {
+                return Ok(Value::UInt64(value));
+            }
+            return Err(Error::Sql {
+                position: self.position(),
+                message: format!("invalid 64-bit integer literal '{signed}'"),
+            });
         }
         if negative {
             return self.error("expected a number after '-'");
@@ -782,6 +915,28 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_clickhouse_style_bloom_indexes() {
+        let statements = parse(
+            "CREATE TABLE events (
+                id UInt64,
+                label String,
+                INDEX id_bloom (id) TYPE bloom_filter(0.01) GRANULARITY 8
+             );
+             ALTER TABLE events MATERIALIZE INDEX id_bloom;",
+        )
+        .expect("valid index SQL");
+
+        let Statement::CreateTable { indexes, .. } = &statements[0] else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].column, "id");
+        assert_eq!(indexes[0].granule_rows, 8);
+        assert_eq!(indexes[0].false_positive_rate, 0.01);
+        assert!(matches!(statements[1], Statement::RebuildIndex { .. }));
     }
 
     #[test]

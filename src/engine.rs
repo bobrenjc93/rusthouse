@@ -14,6 +14,18 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    last_scan_stats: Option<ScanStats>,
+}
+
+/// Work performed by the most recent successful SELECT scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub total_rows: usize,
+    pub scanned_rows: usize,
+    pub skipped_rows: usize,
+    pub total_granules: usize,
+    pub scanned_granules: usize,
+    pub skipped_granules: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +60,11 @@ impl Database {
         &self.catalog
     }
 
+    #[must_use]
+    pub fn last_scan_stats(&self) -> Option<ScanStats> {
+        self.last_scan_stats
+    }
+
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
@@ -62,8 +79,13 @@ impl Database {
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
-            Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+            Statement::CreateTable {
+                name,
+                columns,
+                indexes,
+            } => {
+                self.catalog
+                    .create_table_with_indexes(name, columns, indexes)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -71,26 +93,32 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
                 let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                target.insert_rows(rows)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
+                })
+            }
+            Statement::CreateIndex { table, index } => {
+                self.catalog.table_mut(&table)?.add_bloom_index(index)?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE INDEX",
+                    affected_rows: 0,
+                })
+            }
+            Statement::RebuildIndex { table, index } => {
+                self.catalog.table_mut(&table)?.rebuild_index(&index)?;
+                Ok(StatementResult::Command {
+                    tag: "MATERIALIZE INDEX",
+                    affected_rows: 0,
                 })
             }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(&mut self, select: Select) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -98,13 +126,7 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
+        let (mut matching_rows, scan_stats) = scan_matching_rows(table, predicate.as_ref());
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -128,11 +150,45 @@ impl Database {
             execute_projection(table, &matching_rows, &items)
         };
 
-        Ok(QueryResult {
+        let result = QueryResult {
             columns: result_columns,
             rows,
-        })
+        };
+        self.last_scan_stats = Some(scan_stats);
+        Ok(result)
     }
+}
+
+fn scan_matching_rows(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+) -> (Vec<usize>, ScanStats) {
+    let mut matching_rows = Vec::new();
+    let mut stats = ScanStats {
+        total_rows: table.row_count(),
+        ..ScanStats::default()
+    };
+    let mut start = 0;
+    while start < table.row_count() {
+        let end = table.next_index_boundary(start);
+        debug_assert!(end > start);
+        stats.total_granules += 1;
+        let might_match = predicate.is_none_or(|predicate| predicate.might_match(table, start));
+        if might_match {
+            stats.scanned_granules += 1;
+            stats.scanned_rows += end - start;
+            matching_rows.extend(
+                (start..end).filter(|row| {
+                    predicate.is_none_or(|predicate| predicate.evaluate(table, *row))
+                }),
+            );
+        } else {
+            stats.skipped_granules += 1;
+            stats.skipped_rows += end - start;
+        }
+        start = end;
+    }
+    (matching_rows, stats)
 }
 
 #[derive(Debug)]
@@ -276,12 +332,15 @@ fn resolve_select_items(
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
     if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+        && !matches!(
+            input_type,
+            Some(DataType::Int64 | DataType::UInt64 | DataType::Float64)
+        )
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
             context: format!("{} argument", function.name()),
-            expected: "Int64 or Float64".to_owned(),
+            expected: "Int64, UInt64, or Float64".to_owned(),
             actual,
         });
     }
@@ -525,10 +584,12 @@ impl GroupedData<'_> {
 enum AggregateState {
     Count(i64),
     SumInt(i64),
+    SumUInt(u64),
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
+    AvgUInt { sum: u128, count: u64 },
     AvgFloat { sum: f64, count: u64 },
 }
 
@@ -537,11 +598,15 @@ impl AggregateState {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
+            AggregateFunction::Sum if spec.input_type == Some(DataType::UInt64) => Self::SumUInt(0),
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
             AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
                 Self::AvgInt { sum: 0, count: 0 }
+            }
+            AggregateFunction::Avg if spec.input_type == Some(DataType::UInt64) => {
+                Self::AvgUInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
         }
@@ -562,6 +627,15 @@ impl AggregateState {
                 *sum = sum
                     .checked_add(values[row])
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+            }
+            Self::SumUInt(sum) => {
+                let Column::UInt64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+                else {
+                    unreachable!("SUM input type is resolved")
+                };
+                *sum = sum
+                    .checked_add(values[row])
+                    .ok_or_else(|| Error::NumericOverflow("SUM(UInt64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
                 let Column::Float64(values) =
@@ -606,6 +680,18 @@ impl AggregateState {
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
+            Self::AvgUInt { sum, count } => {
+                let Column::UInt64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                else {
+                    unreachable!("AVG input type is resolved")
+                };
+                *sum = sum
+                    .checked_add(u128::from(values[row]))
+                    .ok_or_else(|| Error::NumericOverflow("AVG(UInt64) sum".to_owned()))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
             Self::AvgFloat { sum, count } => {
                 let Column::Float64(values) =
                     &table.columns()[spec.argument.expect("AVG argument")]
@@ -627,9 +713,13 @@ impl AggregateState {
     fn finish(self) -> Result<Value> {
         match self {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
+            Self::SumUInt(value) => Ok(Value::UInt64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
+                Ok(Value::Float64(sum as f64 / count as f64))
+            }
+            Self::AvgUInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
@@ -639,9 +729,9 @@ impl AggregateState {
             Self::Max(None) => Err(Error::InvalidQuery(
                 "MAX is undefined for an empty input".to_owned(),
             )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::AvgInt { .. } | Self::AvgUInt { .. } | Self::AvgFloat { .. } => Err(
+                Error::InvalidQuery("AVG is undefined for an empty input".to_owned()),
+            ),
         }
     }
 }
@@ -779,6 +869,25 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
+    fn might_match(&self, table: &Table, row: usize) -> bool {
+        match self {
+            Self::Comparison {
+                left,
+                operator: ComparisonOperator::Equal,
+                right,
+            } => match (left, right) {
+                (CompiledOperand::Column { index, .. }, CompiledOperand::Literal(value))
+                | (CompiledOperand::Literal(value), CompiledOperand::Column { index, .. }) => table
+                    .bloom_might_contain(*index, value.as_ref(), row)
+                    .unwrap_or(true),
+                _ => true,
+            },
+            Self::Comparison { .. } => true,
+            Self::And(left, right) => left.might_match(table, row) && right.might_match(table, row),
+            Self::Or(left, right) => left.might_match(table, row) || right.might_match(table, row),
+        }
+    }
+
     fn evaluate(&self, table: &Table, row: usize) -> bool {
         match self {
             Self::Comparison {
@@ -878,7 +987,10 @@ fn comparable(left: DataType, right: DataType) -> bool {
     left == right
         || matches!(
             (left, right),
-            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+            (DataType::Int64 | DataType::UInt64, DataType::Float64)
+                | (DataType::Float64, DataType::Int64 | DataType::UInt64)
+                | (DataType::Int64, DataType::UInt64)
+                | (DataType::UInt64, DataType::Int64)
         )
 }
 

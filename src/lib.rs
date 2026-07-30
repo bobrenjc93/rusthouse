@@ -11,8 +11,9 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{Database, QueryResult, ResultColumn, ScanStats, StatementResult};
 pub use error::{Error, Result};
+pub use storage::{BloomIndex, BloomIndexDef};
 pub use value::{DataType, Value};
 
 /// Returns the product name.
