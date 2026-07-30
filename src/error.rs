@@ -29,6 +29,11 @@ pub enum Error {
         actual: String,
     },
     InvalidQuery(String),
+    JoinLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+        actual: usize,
+    },
     NumericOverflow(String),
 }
 
@@ -70,6 +75,14 @@ impl fmt::Display for Error {
                 "type mismatch for {context}: expected {expected}, found {actual}"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
+            Self::JoinLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                f,
+                "INNER JOIN {resource} limit exceeded: limit {limit}, requires at least {actual}"
+            ),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }

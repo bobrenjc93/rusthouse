@@ -1,19 +1,45 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, Join, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
+
+pub const DEFAULT_JOIN_MAX_ROWS: usize = 1_000_000;
+pub const DEFAULT_JOIN_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Per-operator bounds for an INNER JOIN's hash input and output working set.
+///
+/// `max_rows` limits both hash-build rows and joined output pairs. `max_bytes`
+/// limits estimated peak allocation bytes for buckets, entries, flat hash
+/// keys, row chains, retained input rows, and temporary output pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinLimits {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for JoinLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_JOIN_MAX_ROWS,
+            max_bytes: DEFAULT_JOIN_MAX_BYTES,
+        }
+    }
+}
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    join_limits: JoinLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +67,23 @@ impl Database {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_join_limits(join_limits: JoinLimits) -> Self {
+        Self {
+            catalog: Catalog::new(),
+            join_limits,
+        }
+    }
+
+    #[must_use]
+    pub fn join_limits(&self) -> JoinLimits {
+        self.join_limits
+    }
+
+    pub fn set_join_limits(&mut self, join_limits: JoinLimits) {
+        self.join_limits = join_limits;
     }
 
     #[must_use]
@@ -91,29 +134,36 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        let input = QueryInput::build(
+            &self.catalog,
+            &select.table,
+            select.table_alias.as_deref(),
+            &select.joins,
+            self.join_limits,
+        )?;
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| compile_predicate(&input, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
+        let mut matching_rows = (0..input.row_count())
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(&input, *row))
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let group_columns = resolve_group_columns(&input, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+            resolve_select_items(&input, &select.items, &group_columns)?;
+        let ordering = resolve_ordering(&input, &items, &result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped =
+                execute_grouped(&input, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -124,14 +174,692 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            order_source_rows(&mut matching_rows, &input, &items, &ordering, select.limit);
+            execute_projection(&input, &matching_rows, &items)
         };
 
         Ok(QueryResult {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+#[derive(Debug)]
+struct Relation<'a> {
+    qualifier: String,
+    table: &'a Table,
+}
+
+#[derive(Debug, Clone)]
+struct InputColumn<'a> {
+    relation: usize,
+    physical: usize,
+    name: &'a str,
+    data_type: DataType,
+}
+
+#[derive(Debug)]
+struct QueryInput<'a> {
+    relations: Vec<Relation<'a>>,
+    columns: Vec<InputColumn<'a>>,
+    rows: Option<Vec<usize>>,
+    row_count: usize,
+}
+
+impl<'a> QueryInput<'a> {
+    fn build(
+        catalog: &'a Catalog,
+        table_name: &str,
+        alias: Option<&str>,
+        joins: &[Join],
+        limits: JoinLimits,
+    ) -> Result<Self> {
+        let table = catalog.table(table_name)?;
+        let mut input = Self {
+            relations: Vec::new(),
+            columns: Vec::new(),
+            rows: None,
+            row_count: table.row_count(),
+        };
+        input.push_relation(table, alias.unwrap_or(table_name))?;
+        for join in joins {
+            input.apply_join(catalog, join, limits)?;
+        }
+        Ok(input)
+    }
+
+    fn push_relation(&mut self, table: &'a Table, qualifier: &str) -> Result<()> {
+        if self
+            .relations
+            .iter()
+            .any(|relation| relation.qualifier.eq_ignore_ascii_case(qualifier))
+        {
+            return Err(Error::InvalidQuery(format!(
+                "table name or alias '{qualifier}' is specified more than once"
+            )));
+        }
+        let relation = self.relations.len();
+        self.relations.push(Relation {
+            qualifier: qualifier.to_owned(),
+            table,
+        });
+        self.columns
+            .extend(
+                table
+                    .schema()
+                    .iter()
+                    .enumerate()
+                    .map(|(physical, field)| InputColumn {
+                        relation,
+                        physical,
+                        name: &field.name,
+                        data_type: field.data_type,
+                    }),
+            );
+        Ok(())
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    fn column_index(&self, name: &str) -> Result<usize> {
+        if let Some((qualifier, column_name)) = name.split_once('.') {
+            let relation = self
+                .relations
+                .iter()
+                .position(|relation| relation.qualifier.eq_ignore_ascii_case(qualifier))
+                .ok_or_else(|| {
+                    Error::InvalidQuery(format!("unknown table name or alias '{qualifier}'"))
+                })?;
+            return self
+                .columns
+                .iter()
+                .position(|column| {
+                    column.relation == relation && column.name.eq_ignore_ascii_case(column_name)
+                })
+                .ok_or_else(|| Error::ColumnNotFound {
+                    table: self.relations[relation].table.name().to_owned(),
+                    column: column_name.to_owned(),
+                });
+        }
+
+        let matches = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [index] => Ok(*index),
+            [] if self.relations.len() == 1 => Err(Error::ColumnNotFound {
+                table: self.relations[0].table.name().to_owned(),
+                column: name.to_owned(),
+            }),
+            [] => Err(Error::InvalidQuery(format!(
+                "column '{name}' does not exist in any input table"
+            ))),
+            _ => Err(Error::InvalidQuery(format!(
+                "column reference '{name}' is ambiguous; qualify it with a table name or alias"
+            ))),
+        }
+    }
+
+    fn qualifier_index(&self, qualifier: &str) -> Result<usize> {
+        self.relations
+            .iter()
+            .position(|relation| relation.qualifier.eq_ignore_ascii_case(qualifier))
+            .ok_or_else(|| {
+                Error::InvalidQuery(format!("unknown table name or alias '{qualifier}'"))
+            })
+    }
+
+    fn physical_row(&self, logical_row: usize, relation: usize) -> usize {
+        self.rows.as_ref().map_or(logical_row, |rows| {
+            rows[logical_row * self.relations.len() + relation]
+        })
+    }
+
+    fn value(&self, column: usize, logical_row: usize) -> ValueRef<'_> {
+        let column = &self.columns[column];
+        let physical_row = self.physical_row(logical_row, column.relation);
+        self.relations[column.relation].table.columns()[column.physical].value_ref(physical_row)
+    }
+
+    fn cmp_at(&self, column: usize, left: usize, right: usize) -> Ordering {
+        self.value(column, left).cmp(&self.value(column, right))
+    }
+
+    fn apply_join(&mut self, catalog: &'a Catalog, join: &Join, limits: JoinLimits) -> Result<()> {
+        let old_width = self.relations.len();
+        let old_row_count = self.row_count;
+        let old_rows = self.rows.take();
+        let table = catalog.table(&join.table)?;
+        self.push_relation(table, join.alias.as_deref().unwrap_or(&join.table))?;
+        let right_relation = old_width;
+
+        let mut keys = Vec::with_capacity(join.conditions.len());
+        for condition in &join.conditions {
+            let left = self.column_index(&condition.left)?;
+            let right = self.column_index(&condition.right)?;
+            let left_relation = self.columns[left].relation;
+            let right_side_relation = self.columns[right].relation;
+            let (left_column, right_column) = match (
+                left_relation == right_relation,
+                right_side_relation == right_relation,
+            ) {
+                (false, true) => (left, right),
+                (true, false) => (right, left),
+                _ => {
+                    return Err(Error::InvalidQuery(format!(
+                        "INNER JOIN condition '{} = {}' must connect '{}' to an earlier input",
+                        condition.left, condition.right, self.relations[right_relation].qualifier
+                    )));
+                }
+            };
+            let left_type = self.columns[left_column].data_type;
+            let right_type = self.columns[right_column].data_type;
+            if !comparable(left_type, right_type) {
+                return Err(Error::TypeMismatch {
+                    context: "INNER JOIN equality".to_owned(),
+                    expected: left_type.to_string(),
+                    actual: right_type.to_string(),
+                });
+            }
+            keys.push((left_column, right_column));
+        }
+
+        let right_row_count = table.row_count();
+        let build_left = old_row_count <= right_row_count;
+        let build_rows = if build_left {
+            old_row_count
+        } else {
+            right_row_count
+        };
+        if build_rows > limits.max_rows {
+            return Err(Error::JoinLimitExceeded {
+                resource: "rows",
+                limit: limits.max_rows,
+                actual: build_rows,
+            });
+        }
+
+        let joined_rows = if old_row_count == 0 || right_row_count == 0 {
+            Vec::new()
+        } else if build_left {
+            let resident_bytes = checked_join_resident_bytes(old_rows.as_ref(), &keys, limits)?;
+            let layout = JoinHashLayout::new(build_rows, keys.len(), limits)?;
+            checked_join_bytes(resident_bytes, layout.estimated_bytes, 0, limits)?;
+            let mut hash = JoinHashTable::new(layout);
+            let mut scratch = Vec::with_capacity(keys.len());
+            for left_row in 0..old_row_count {
+                scratch.clear();
+                scratch.extend(keys.iter().map(|(left, _)| {
+                    JoinKeyPart::from(self.old_value(
+                        old_rows.as_deref(),
+                        old_width,
+                        *left,
+                        left_row,
+                    ))
+                }));
+                hash.insert(&scratch, left_row);
+            }
+            let mut match_count = 0usize;
+            for right_row in 0..right_row_count {
+                scratch.clear();
+                scratch.extend(
+                    keys.iter()
+                        .map(|(_, right)| JoinKeyPart::from(self.right_value(*right, right_row))),
+                );
+                if let Some(entry) = hash.get(&scratch) {
+                    match_count = checked_join_match_count(match_count, entry.row_count, limits)?;
+                }
+            }
+            let joined_indices = checked_join_output_layout(
+                match_count,
+                old_width,
+                true,
+                resident_bytes,
+                layout.estimated_bytes,
+                limits,
+            )?;
+            let mut matches = Vec::with_capacity(match_count);
+            for right_row in 0..right_row_count {
+                scratch.clear();
+                scratch.extend(
+                    keys.iter()
+                        .map(|(_, right)| JoinKeyPart::from(self.right_value(*right, right_row))),
+                );
+                if let Some(entry) = hash.get(&scratch) {
+                    let mut left_row = entry.first_row;
+                    while left_row != NO_JOIN_INDEX {
+                        matches.push((left_row, right_row));
+                        left_row = hash.next_row(left_row);
+                    }
+                }
+            }
+            debug_assert_eq!(matches.len(), match_count);
+            matches.sort_unstable();
+            drop(scratch);
+            drop(hash);
+            self.flatten_join_matches(old_rows.as_deref(), old_width, &matches, joined_indices)
+        } else {
+            let resident_bytes = checked_join_resident_bytes(old_rows.as_ref(), &keys, limits)?;
+            let layout = JoinHashLayout::new(build_rows, keys.len(), limits)?;
+            checked_join_bytes(resident_bytes, layout.estimated_bytes, 0, limits)?;
+            let mut hash = JoinHashTable::new(layout);
+            let mut scratch = Vec::with_capacity(keys.len());
+            for right_row in 0..right_row_count {
+                scratch.clear();
+                scratch.extend(
+                    keys.iter()
+                        .map(|(_, right)| JoinKeyPart::from(self.right_value(*right, right_row))),
+                );
+                hash.insert(&scratch, right_row);
+            }
+            let mut match_count = 0usize;
+            for left_row in 0..old_row_count {
+                scratch.clear();
+                scratch.extend(keys.iter().map(|(left, _)| {
+                    JoinKeyPart::from(self.old_value(
+                        old_rows.as_deref(),
+                        old_width,
+                        *left,
+                        left_row,
+                    ))
+                }));
+                if let Some(entry) = hash.get(&scratch) {
+                    match_count = checked_join_match_count(match_count, entry.row_count, limits)?;
+                }
+            }
+            let joined_indices = checked_join_output_layout(
+                match_count,
+                old_width,
+                false,
+                resident_bytes,
+                layout.estimated_bytes,
+                limits,
+            )?;
+            let mut joined = Vec::with_capacity(joined_indices);
+            for left_row in 0..old_row_count {
+                scratch.clear();
+                scratch.extend(keys.iter().map(|(left, _)| {
+                    JoinKeyPart::from(self.old_value(
+                        old_rows.as_deref(),
+                        old_width,
+                        *left,
+                        left_row,
+                    ))
+                }));
+                if let Some(entry) = hash.get(&scratch) {
+                    let mut right_row = entry.first_row;
+                    while right_row != NO_JOIN_INDEX {
+                        append_join_match(
+                            &mut joined,
+                            old_rows.as_deref(),
+                            old_width,
+                            left_row,
+                            right_row,
+                        );
+                        right_row = hash.next_row(right_row);
+                    }
+                }
+            }
+            debug_assert_eq!(joined.len(), joined_indices);
+            joined
+        };
+
+        self.row_count = joined_rows.len() / (old_width + 1);
+        self.rows = Some(joined_rows);
+        Ok(())
+    }
+
+    fn old_value(
+        &self,
+        old_rows: Option<&[usize]>,
+        old_width: usize,
+        column: usize,
+        logical_row: usize,
+    ) -> ValueRef<'_> {
+        let column = &self.columns[column];
+        debug_assert!(column.relation < old_width);
+        let physical_row = old_rows.map_or(logical_row, |rows| {
+            rows[logical_row * old_width + column.relation]
+        });
+        self.relations[column.relation].table.columns()[column.physical].value_ref(physical_row)
+    }
+
+    fn right_value(&self, column: usize, physical_row: usize) -> ValueRef<'_> {
+        let column = &self.columns[column];
+        self.relations[column.relation].table.columns()[column.physical].value_ref(physical_row)
+    }
+
+    fn flatten_join_matches(
+        &self,
+        old_rows: Option<&[usize]>,
+        old_width: usize,
+        matches: &[(usize, usize)],
+        joined_indices: usize,
+    ) -> Vec<usize> {
+        let mut joined = Vec::with_capacity(joined_indices);
+        for (left_row, right_row) in matches {
+            append_join_match(&mut joined, old_rows, old_width, *left_row, *right_row);
+        }
+        debug_assert_eq!(joined.len(), joined_indices);
+        joined
+    }
+}
+
+fn checked_join_match_count(
+    current: usize,
+    additional: usize,
+    limits: JoinLimits,
+) -> Result<usize> {
+    current
+        .checked_add(additional)
+        .ok_or(Error::JoinLimitExceeded {
+            resource: "output rows",
+            limit: limits.max_rows,
+            actual: usize::MAX,
+        })
+}
+
+fn checked_join_output_layout(
+    match_count: usize,
+    old_width: usize,
+    keeps_pairs: bool,
+    resident_bytes: usize,
+    hash_bytes: usize,
+    limits: JoinLimits,
+) -> Result<usize> {
+    if match_count > limits.max_rows {
+        return Err(Error::JoinLimitExceeded {
+            resource: "output rows",
+            limit: limits.max_rows,
+            actual: match_count,
+        });
+    }
+
+    let overflow = || join_byte_limit_error(limits, usize::MAX);
+    let joined_width = old_width.checked_add(1).ok_or_else(overflow)?;
+    let joined_indices = match_count.checked_mul(joined_width).ok_or_else(overflow)?;
+    let joined_bytes = std::mem::size_of::<Vec<usize>>()
+        .checked_add(checked_allocation_bytes::<usize>(joined_indices, limits)?)
+        .ok_or_else(overflow)?;
+    let pair_bytes = if keeps_pairs {
+        std::mem::size_of::<Vec<(usize, usize)>>()
+            .checked_add(checked_allocation_bytes::<(usize, usize)>(
+                match_count,
+                limits,
+            )?)
+            .ok_or_else(overflow)?
+    } else {
+        0
+    };
+    let peak_bytes = if keeps_pairs {
+        resident_bytes
+            .checked_add(pair_bytes)
+            .ok_or_else(overflow)?
+            .checked_add(hash_bytes)
+            .ok_or_else(overflow)?
+            .max(
+                resident_bytes
+                    .checked_add(pair_bytes)
+                    .ok_or_else(overflow)?
+                    .checked_add(joined_bytes)
+                    .ok_or_else(overflow)?,
+            )
+    } else {
+        resident_bytes
+            .checked_add(hash_bytes)
+            .ok_or_else(overflow)?
+            .checked_add(joined_bytes)
+            .ok_or_else(overflow)?
+    };
+    if peak_bytes > limits.max_bytes {
+        return Err(Error::JoinLimitExceeded {
+            resource: "bytes",
+            limit: limits.max_bytes,
+            actual: peak_bytes,
+        });
+    }
+    Ok(joined_indices)
+}
+
+fn checked_join_resident_bytes(
+    old_rows: Option<&Vec<usize>>,
+    keys: &Vec<(usize, usize)>,
+    limits: JoinLimits,
+) -> Result<usize> {
+    let old_rows_bytes = if let Some(old_rows) = old_rows {
+        std::mem::size_of::<Option<Vec<usize>>>()
+            .checked_add(checked_allocation_bytes::<usize>(
+                old_rows.capacity(),
+                limits,
+            )?)
+            .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))?
+    } else {
+        std::mem::size_of::<Option<Vec<usize>>>()
+    };
+    let keys_bytes = std::mem::size_of::<Vec<(usize, usize)>>()
+        .checked_add(checked_allocation_bytes::<(usize, usize)>(
+            keys.capacity(),
+            limits,
+        )?)
+        .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))?;
+    old_rows_bytes
+        .checked_add(keys_bytes)
+        .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))
+}
+
+fn checked_join_bytes(
+    resident_bytes: usize,
+    structure_bytes: usize,
+    output_bytes: usize,
+    limits: JoinLimits,
+) -> Result<usize> {
+    let actual = resident_bytes
+        .checked_add(structure_bytes)
+        .and_then(|bytes| bytes.checked_add(output_bytes))
+        .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))?;
+    if actual > limits.max_bytes {
+        Err(join_byte_limit_error(limits, actual))
+    } else {
+        Ok(actual)
+    }
+}
+
+const ESTIMATED_ALLOCATION_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
+
+fn checked_allocation_bytes<T>(capacity: usize, limits: JoinLimits) -> Result<usize> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| bytes.checked_add(ESTIMATED_ALLOCATION_OVERHEAD))
+        .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))
+}
+
+fn join_byte_limit_error(limits: JoinLimits, actual: usize) -> Error {
+    Error::JoinLimitExceeded {
+        resource: "bytes",
+        limit: limits.max_bytes,
+        actual,
+    }
+}
+
+fn append_join_match(
+    joined: &mut Vec<usize>,
+    old_rows: Option<&[usize]>,
+    old_width: usize,
+    left_row: usize,
+    right_row: usize,
+) {
+    if let Some(old_rows) = old_rows {
+        let start = left_row * old_width;
+        joined.extend_from_slice(&old_rows[start..start + old_width]);
+    } else {
+        joined.push(left_row);
+    }
+    joined.push(right_row);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum JoinKeyPart<'a> {
+    Int64(i64),
+    Float64(u64),
+    Bool(bool),
+    String(&'a str),
+}
+
+impl<'a> From<ValueRef<'a>> for JoinKeyPart<'a> {
+    fn from(value: ValueRef<'a>) -> Self {
+        match value {
+            ValueRef::Int64(value) => Self::Int64(value),
+            ValueRef::Float64(value) if value.fract() == 0.0 => {
+                const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+                if value >= i64::MIN as f64 && value < I64_UPPER_EXCLUSIVE {
+                    Self::Int64(value as i64)
+                } else {
+                    Self::Float64(value.to_bits())
+                }
+            }
+            ValueRef::Float64(value) => Self::Float64(value.to_bits()),
+            ValueRef::Bool(value) => Self::Bool(value),
+            ValueRef::String(value) => Self::String(value),
+        }
+    }
+}
+
+const NO_JOIN_INDEX: usize = usize::MAX;
+
+#[derive(Debug, Clone, Copy)]
+struct JoinHashLayout {
+    bucket_count: usize,
+    entry_capacity: usize,
+    key_capacity: usize,
+    row_capacity: usize,
+    key_width: usize,
+    estimated_bytes: usize,
+}
+
+impl JoinHashLayout {
+    fn new(build_rows: usize, key_width: usize, limits: JoinLimits) -> Result<Self> {
+        let bucket_count = build_rows
+            .checked_next_power_of_two()
+            .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))?;
+        let key_capacity = build_rows
+            .checked_mul(key_width)
+            .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))?;
+        let allocations = [
+            checked_allocation_bytes::<usize>(bucket_count, limits)?,
+            checked_allocation_bytes::<JoinHashEntry>(build_rows, limits)?,
+            checked_allocation_bytes::<JoinKeyPart<'_>>(key_capacity, limits)?,
+            checked_allocation_bytes::<usize>(build_rows, limits)?,
+            checked_allocation_bytes::<JoinKeyPart<'_>>(key_width, limits)?,
+        ];
+        let mut estimated_bytes =
+            std::mem::size_of::<JoinHashTable<'_>>() + std::mem::size_of::<Vec<JoinKeyPart<'_>>>();
+        for allocation in allocations {
+            estimated_bytes = estimated_bytes
+                .checked_add(allocation)
+                .ok_or_else(|| join_byte_limit_error(limits, usize::MAX))?;
+        }
+        Ok(Self {
+            bucket_count,
+            entry_capacity: build_rows,
+            key_capacity,
+            row_capacity: build_rows,
+            key_width,
+            estimated_bytes,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct JoinHashEntry {
+    first_row: usize,
+    last_row: usize,
+    row_count: usize,
+    next_entry: usize,
+}
+
+#[derive(Debug)]
+struct JoinHashTable<'a> {
+    buckets: Vec<usize>,
+    entries: Vec<JoinHashEntry>,
+    keys: Vec<JoinKeyPart<'a>>,
+    row_next: Vec<usize>,
+    key_width: usize,
+}
+
+impl<'a> JoinHashTable<'a> {
+    fn new(layout: JoinHashLayout) -> Self {
+        Self {
+            buckets: vec![NO_JOIN_INDEX; layout.bucket_count],
+            entries: Vec::with_capacity(layout.entry_capacity),
+            keys: Vec::with_capacity(layout.key_capacity),
+            row_next: vec![NO_JOIN_INDEX; layout.row_capacity],
+            key_width: layout.key_width,
+        }
+    }
+
+    fn insert(&mut self, key: &[JoinKeyPart<'a>], row: usize) {
+        debug_assert_eq!(key.len(), self.key_width);
+        debug_assert!(row < self.row_next.len());
+        let bucket = self.bucket(key);
+        let mut entry_index = self.buckets[bucket];
+        while entry_index != NO_JOIN_INDEX {
+            if self.entry_key(entry_index) == key {
+                let last_row = self.entries[entry_index].last_row;
+                self.row_next[last_row] = row;
+                let entry = &mut self.entries[entry_index];
+                entry.last_row = row;
+                entry.row_count += 1;
+                return;
+            }
+            entry_index = self.entries[entry_index].next_entry;
+        }
+
+        let entry_index = self.entries.len();
+        self.keys.extend_from_slice(key);
+        self.entries.push(JoinHashEntry {
+            first_row: row,
+            last_row: row,
+            row_count: 1,
+            next_entry: self.buckets[bucket],
+        });
+        self.buckets[bucket] = entry_index;
+    }
+
+    fn get(&self, key: &[JoinKeyPart<'_>]) -> Option<&JoinHashEntry> {
+        debug_assert_eq!(key.len(), self.key_width);
+        let mut entry_index = self.buckets[self.bucket(key)];
+        while entry_index != NO_JOIN_INDEX {
+            if self.entry_key(entry_index) == key {
+                return Some(&self.entries[entry_index]);
+            }
+            entry_index = self.entries[entry_index].next_entry;
+        }
+        None
+    }
+
+    fn next_row(&self, row: usize) -> usize {
+        self.row_next[row]
+    }
+
+    fn bucket(&self, key: &[JoinKeyPart<'_>]) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) & (self.buckets.len() - 1)
+    }
+
+    fn entry_key(&self, entry: usize) -> &[JoinKeyPart<'a>] {
+        let start = entry * self.key_width;
+        &self.keys[start..start + self.key_width]
     }
 }
 
@@ -153,10 +881,10 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
+fn resolve_group_columns(input: &QueryInput<'_>, names: &[String]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
     for name in names {
-        let column = table.column_index(name)?;
+        let column = input.column_index(name)?;
         if columns.contains(&column) {
             return Err(Error::InvalidQuery(format!(
                 "GROUP BY column '{name}' is listed more than once"
@@ -168,7 +896,7 @@ fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> 
 }
 
 fn resolve_select_items(
-    table: &Table,
+    input: &QueryInput<'_>,
     requested: &[SelectItem],
     group_columns: &[usize],
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
@@ -176,9 +904,12 @@ fn resolve_select_items(
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
     if has_aggregate
-        && requested
-            .iter()
-            .any(|item| matches!(item, SelectItem::Wildcard))
+        && requested.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard { .. }
+            )
+        })
     {
         return Err(Error::InvalidQuery(
             "'*' projection cannot be combined with aggregates".to_owned(),
@@ -192,7 +923,7 @@ fn resolve_select_items(
     for requested_item in requested {
         match requested_item {
             SelectItem::Wildcard => {
-                for (source, field) in table.schema().iter().enumerate() {
+                for (source, field) in input.columns.iter().enumerate() {
                     let group_position = group_columns.iter().position(|column| *column == source);
                     if !group_columns.is_empty() && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
@@ -205,13 +936,38 @@ fn resolve_select_items(
                         group_position,
                     });
                     result_columns.push(ResultColumn {
-                        name: field.name.clone(),
+                        name: field.name.to_owned(),
+                        data_type: field.data_type,
+                    });
+                }
+            }
+            SelectItem::QualifiedWildcard { qualifier } => {
+                let relation = input.qualifier_index(qualifier)?;
+                for (source, field) in input
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| field.relation == relation)
+                {
+                    let group_position = group_columns.iter().position(|column| *column == source);
+                    if !group_columns.is_empty() && group_position.is_none() {
+                        return Err(Error::InvalidQuery(format!(
+                            "column '{}.{}' must appear in GROUP BY",
+                            qualifier, field.name
+                        )));
+                    }
+                    items.push(ResolvedItem::Column {
+                        source,
+                        group_position,
+                    });
+                    result_columns.push(ResultColumn {
+                        name: field.name.to_owned(),
                         data_type: field.data_type,
                     });
                 }
             }
             SelectItem::Column { name, alias } => {
-                let source = table.column_index(name)?;
+                let source = input.column_index(name)?;
                 let group_position = group_columns.iter().position(|column| *column == source);
                 if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
                     return Err(Error::InvalidQuery(format!(
@@ -225,8 +981,8 @@ fn resolve_select_items(
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
-                        .unwrap_or_else(|| table.schema()[source].name.clone()),
-                    data_type: table.schema()[source].data_type,
+                        .unwrap_or_else(|| input.columns[source].name.to_owned()),
+                    data_type: input.columns[source].data_type,
                 });
             }
             SelectItem::Aggregate {
@@ -245,11 +1001,11 @@ fn resolve_select_items(
                         (None, None, "*".to_owned())
                     }
                     AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
+                        let index = input.column_index(name)?;
                         (
                             Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
+                            Some(input.columns[index].data_type),
+                            input.columns[index].name.to_owned(),
                         )
                     }
                 };
@@ -299,7 +1055,7 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 }
 
 fn execute_projection(
-    table: &Table,
+    input: &QueryInput<'_>,
     matching_rows: &[usize],
     items: &[ResolvedItem],
 ) -> Vec<Vec<Value>> {
@@ -309,7 +1065,7 @@ fn execute_projection(
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::Column { source, .. } => input.value(*source, *row).to_owned(),
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
@@ -320,7 +1076,7 @@ fn execute_projection(
 }
 
 fn execute_grouped<'a>(
-    table: &'a Table,
+    input: &'a QueryInput<'_>,
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
@@ -340,7 +1096,7 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) = groups.find_or_insert(input, group_columns, *row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +1105,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, input, *row)?;
         }
     }
 
@@ -385,7 +1141,7 @@ impl<'a> GroupIndex<'a> {
 
     fn find_or_insert(
         &mut self,
-        table: &'a Table,
+        input: &'a QueryInput<'_>,
         columns: &[usize],
         row: usize,
         next_group: usize,
@@ -393,7 +1149,7 @@ impl<'a> GroupIndex<'a> {
         match self {
             Self::Global => (0, false),
             Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
+                let key = input.value(columns[0], row);
                 if let Some(group) = groups.get(&key) {
                     (*group, false)
                 } else {
@@ -402,16 +1158,13 @@ impl<'a> GroupIndex<'a> {
                 }
             }
             Self::Multiple(groups) if columns.len() == 2 => {
-                let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
-                ];
+                let key = [input.value(columns[0], row), input.value(columns[1], row)];
                 find_or_insert_group(groups, &key, next_group)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
+                    .map(|column| input.value(*column, row))
                     .collect::<Vec<_>>();
                 find_or_insert_group(groups, &key, next_group)
             }
@@ -547,7 +1300,7 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+    fn update(&mut self, spec: &AggregateSpec, input: &QueryInput<'_>, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -555,28 +1308,27 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Int64(value) = input.value(spec.argument.expect("SUM argument"), row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(value)
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Float64(value) =
+                    input.value(spec.argument.expect("SUM argument"), row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
             }
             Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
+                let candidate = input.value(spec.argument.expect("MIN argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -585,8 +1337,7 @@ impl AggregateState {
                 }
             }
             Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
+                let candidate = input.value(spec.argument.expect("MAX argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -595,24 +1346,24 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Int64(value) = input.value(spec.argument.expect("AVG argument"), row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Float64(value) =
+                    input.value(spec.argument.expect("AVG argument"), row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -652,15 +1403,32 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
+fn resolve_ordering(
+    input: &QueryInput<'_>,
+    items: &[ResolvedItem],
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let matches = if order.name.contains('.') {
+            let source = input.column_index(&order.name)?;
+            items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    matches!(item, ResolvedItem::Column { source: item_source, .. } if *item_source == source)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        } else {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
         match matches.as_slice() {
             [index] => ordering.push(ResolvedOrder {
                 output: *index,
@@ -685,7 +1453,7 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
 
 fn order_source_rows(
     rows: &mut Vec<usize>,
-    table: &Table,
+    input: &QueryInput<'_>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
@@ -702,7 +1470,7 @@ fn order_source_rows(
             let ResolvedItem::Column { source, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
+            let comparison = input.cmp_at(source, left, right);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -779,15 +1547,15 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, input: &QueryInput<'_>, row: usize) -> bool {
         match self {
             Self::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
+                let left = left.value(input, row);
+                let right = right.value(input, row);
                 let comparison = left
                     .sql_cmp(right)
                     .expect("predicate operand types are validated");
@@ -800,8 +1568,8 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::And(left, right) => left.evaluate(input, row) && right.evaluate(input, row),
+            Self::Or(left, right) => left.evaluate(input, row) || right.evaluate(input, row),
         }
     }
 }
@@ -820,23 +1588,23 @@ impl CompiledOperand {
         }
     }
 
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
+    fn value<'a>(&'a self, input: &'a QueryInput<'_>, row: usize) -> ValueRef<'a> {
         match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
+            Self::Column { index, .. } => input.value(*index, row),
             Self::Literal(value) => value.as_ref(),
         }
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn compile_predicate(input: &QueryInput<'_>, predicate: &Predicate) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let left = compile_operand(input, left)?;
+            let right = compile_operand(input, right)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -851,23 +1619,23 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             })
         }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(input, left)?),
+            Box::new(compile_predicate(input, right)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(input, left)?),
+            Box::new(compile_predicate(input, right)?),
         )),
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_operand(input: &QueryInput<'_>, operand: &Operand) -> Result<CompiledOperand> {
     match operand {
         Operand::Column(name) => {
-            let index = table.column_index(name)?;
+            let index = input.column_index(name)?;
             Ok(CompiledOperand::Column {
                 index,
-                data_type: table.schema()[index].data_type,
+                data_type: input.columns[index].data_type,
             })
         }
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
