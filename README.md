@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- bounded parallel scans for global and grouped aggregates on large tables
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -44,6 +45,14 @@ cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
 ~~~
 
+Large aggregate scans use the host's available parallelism by default. Set a
+per-query worker limit with `--threads` (or `-j`); tables below 32,768 rows stay
+single-threaded:
+
+~~~bash
+cargo run -- --threads 4 --execute "SELECT region, SUM(amount) FROM sales GROUP BY region"
+~~~
+
 Or pipe a batch through standard input:
 
 ~~~bash
@@ -67,6 +76,7 @@ Database parses a complete SQL batch before execution: any syntax error leaves t
 use rusthouse::{Database, StatementResult};
 
 let mut database = Database::new();
+database.set_query_parallelism(4)?;
 database.execute("CREATE TABLE events (id Int64, name String)")?;
 database.execute("INSERT INTO events VALUES (1, 'launch')")?;
 

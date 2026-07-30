@@ -14,6 +14,7 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+    -j, --threads <COUNT>     Maximum aggregate-query workers (default: host CPUs)
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -48,6 +49,11 @@ fn run() -> Result<(), String> {
     };
 
     let mut database = Database::new();
+    if let Some(threads) = config.threads {
+        database
+            .set_query_parallelism(threads)
+            .map_err(|error| error.to_string())?;
+    }
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +100,13 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    threads: Option<usize>,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut threads = None;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +130,12 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "-j" | "--threads" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a positive integer"))?;
+                threads = Some(parse_thread_count(&value)?);
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +148,26 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--threads=") => {
+                threads = Some(parse_thread_count(&argument["--threads=".len()..])?);
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        threads,
+    }))
+}
+
+fn parse_thread_count(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| format!("invalid thread count '{value}'; expected a positive integer"))
 }
 
 #[cfg(test)]
@@ -157,6 +186,7 @@ mod tests {
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(config.threads, None);
     }
 
     #[test]
@@ -164,6 +194,18 @@ mod tests {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
         assert!(error.contains("table, csv, or json"));
+    }
+
+    #[test]
+    fn parses_and_validates_query_threads() {
+        let config = parse_arguments(["--threads=3"].into_iter().map(str::to_owned))
+            .expect("valid arguments")
+            .expect("not help");
+        assert_eq!(config.threads, Some(3));
+
+        let error = parse_arguments(["--threads", "0"].into_iter().map(str::to_owned))
+            .expect_err("zero threads");
+        assert!(error.contains("positive integer"));
     }
 
     #[test]

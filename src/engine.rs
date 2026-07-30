@@ -1,5 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::thread;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -10,10 +13,14 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+const PARALLEL_SCAN_THRESHOLD: usize = 32 * 1_024;
+const SCAN_PARTITION_ROWS: usize = 16 * 1_024;
+
 /// A reusable in-memory SQL database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    query_parallelism: NonZeroUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +53,27 @@ impl Database {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Construct an empty database with an explicit per-query worker limit.
+    pub fn with_query_parallelism(query_parallelism: usize) -> Result<Self> {
+        let mut database = Self::new();
+        database.set_query_parallelism(query_parallelism)?;
+        Ok(database)
+    }
+
+    /// Set the maximum number of workers used by one aggregate query.
+    pub fn set_query_parallelism(&mut self, query_parallelism: usize) -> Result<()> {
+        self.query_parallelism = NonZeroUsize::new(query_parallelism).ok_or_else(|| {
+            Error::InvalidQuery("query parallelism must be at least 1".to_owned())
+        })?;
+        Ok(())
+    }
+
+    /// Return the configured per-query worker limit.
+    #[must_use]
+    pub fn query_parallelism(&self) -> usize {
+        self.query_parallelism.get()
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -98,14 +126,6 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
@@ -113,7 +133,13 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                predicate.as_ref(),
+                &group_columns,
+                &aggregate_specs,
+                self.query_parallelism,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -124,6 +150,13 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
+            let mut matching_rows = (0..table.row_count())
+                .filter(|row| {
+                    predicate
+                        .as_ref()
+                        .is_none_or(|predicate| predicate.evaluate(table, *row))
+                })
+                .collect::<Vec<_>>();
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
         };
@@ -132,6 +165,16 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        let query_parallelism = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+        Self {
+            catalog: Catalog::default(),
+            query_parallelism,
+        }
     }
 }
 
@@ -321,13 +364,101 @@ fn execute_projection(
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    query_parallelism: NonZeroUsize,
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let ranges = scan_ranges(table.row_count());
+    let partitions = if ranges.len() == 1 || query_parallelism.get() == 1 {
+        ranges
+            .into_iter()
+            .map(|range| {
+                scan_grouped_partition(table, range, predicate, group_columns, aggregate_specs)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        scan_grouped_partitions_parallel(
+            table,
+            &ranges,
+            predicate,
+            group_columns,
+            aggregate_specs,
+            query_parallelism.get(),
+        )?
+    };
+
+    merge_grouped_partitions(table, partitions, group_columns, aggregate_specs)
+}
+
+fn scan_ranges(row_count: usize) -> Vec<Range<usize>> {
+    if row_count < PARALLEL_SCAN_THRESHOLD {
+        return std::iter::once(0..row_count).collect();
+    }
+
+    (0..row_count)
+        .step_by(SCAN_PARTITION_ROWS)
+        .map(|start| start..start.saturating_add(SCAN_PARTITION_ROWS).min(row_count))
+        .collect()
+}
+
+fn scan_grouped_partitions_parallel<'a>(
+    table: &'a Table,
+    ranges: &[Range<usize>],
+    predicate: Option<&CompiledPredicate>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+    query_parallelism: usize,
+) -> Result<Vec<GroupedPartition<'a>>> {
+    let worker_count = query_parallelism.min(ranges.len());
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        let base_ranges = ranges.len() / worker_count;
+        let extra_ranges = ranges.len() % worker_count;
+        for worker in 0..worker_count {
+            let start = worker * base_ranges + worker.min(extra_ranges);
+            let end = start + base_ranges + usize::from(worker < extra_ranges);
+            let worker_ranges = &ranges[start..end];
+            handles.push(scope.spawn(move || {
+                worker_ranges
+                    .iter()
+                    .cloned()
+                    .map(|range| {
+                        scan_grouped_partition(
+                            table,
+                            range,
+                            predicate,
+                            group_columns,
+                            aggregate_specs,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            }));
+        }
+
+        let mut partitions = Vec::with_capacity(ranges.len());
+        for handle in handles {
+            let worker_partitions = handle.join().map_err(|_| {
+                Error::InvalidQuery("parallel aggregate worker panicked".to_owned())
+            })??;
+            partitions.extend(worker_partitions);
+        }
+        Ok(partitions)
+    })
+}
+
+fn scan_grouped_partition<'a>(
+    table: &'a Table,
+    range: Range<usize>,
+    predicate: Option<&CompiledPredicate>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+) -> Result<GroupedPartition<'a>> {
+    let range_len = range.len();
+    let mut groups = GroupIndex::new(group_columns.len(), range_len);
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let initial_capacity = range_len.min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -339,8 +470,11 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in range {
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,11 +483,55 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
-    let keys = groups.into_keys(group_count);
+    Ok(GroupedPartition {
+        keys: groups.into_keys(group_count),
+        aggregate_states,
+    })
+}
+
+fn merge_grouped_partitions<'a>(
+    table: &'a Table,
+    partitions: Vec<GroupedPartition<'a>>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+) -> Result<GroupedData<'a>> {
+    let mut groups = GroupIndex::new(group_columns.len(), table.row_count());
+    let mut group_count = usize::from(group_columns.is_empty());
+    let mut aggregate_states = aggregate_specs
+        .iter()
+        .map(|spec| {
+            let mut states = Vec::new();
+            if group_columns.is_empty() {
+                states.push(AggregateState::new(spec));
+            }
+            states
+        })
+        .collect::<Vec<_>>();
+
+    for partition in partitions {
+        let mut global_groups = Vec::with_capacity(partition.keys.len());
+        for key in &partition.keys {
+            let (group, inserted) = groups.find_or_insert_key(key, group_count);
+            if inserted {
+                group_count += 1;
+                for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
+                    states.push(AggregateState::new(spec));
+                }
+            }
+            global_groups.push(group);
+        }
+
+        for (states, local_states) in aggregate_states.iter_mut().zip(partition.aggregate_states) {
+            for (state, group) in local_states.into_iter().zip(&global_groups) {
+                states[*group].merge(state)?;
+            }
+        }
+    }
+
     let aggregates = aggregate_states
         .into_iter()
         .map(|states| {
@@ -363,7 +541,16 @@ fn execute_grouped<'a>(
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(GroupedData { keys, aggregates })
+    Ok(GroupedData {
+        keys: groups.into_keys(group_count),
+        aggregates,
+    })
+}
+
+#[derive(Debug)]
+struct GroupedPartition<'a> {
+    keys: Vec<GroupKey<'a>>,
+    aggregate_states: Vec<Vec<AggregateState>>,
 }
 
 #[derive(Debug)]
@@ -415,6 +602,24 @@ impl<'a> GroupIndex<'a> {
                     .collect::<Vec<_>>();
                 find_or_insert_group(groups, &key, next_group)
             }
+        }
+    }
+
+    fn find_or_insert_key(&mut self, key: &GroupKey<'a>, next_group: usize) -> (usize, bool) {
+        match (self, key) {
+            (Self::Global, GroupKey::Empty) => (0, false),
+            (Self::One(groups), GroupKey::One(key)) => {
+                if let Some(group) = groups.get(key) {
+                    (*group, false)
+                } else {
+                    groups.insert(*key, next_group);
+                    (next_group, true)
+                }
+            }
+            (Self::Multiple(groups), GroupKey::Multiple(key)) => {
+                find_or_insert_group(groups, key, next_group)
+            }
+            _ => unreachable!("group index and key shapes match"),
         }
     }
 
@@ -524,7 +729,7 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
+    SumInt(IntSum),
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
@@ -536,7 +741,9 @@ impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
+            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => {
+                Self::SumInt(IntSum::default())
+            }
             AggregateFunction::Sum => Self::SumFloat(0.0),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
@@ -559,9 +766,7 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                sum.update(values[row])?;
             }
             Self::SumFloat(sum) => {
                 let Column::Float64(values) =
@@ -624,9 +829,82 @@ impl AggregateState {
         Ok(())
     }
 
+    fn merge(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
+            (Self::Count(left), Self::Count(right)) => {
+                *left = left
+                    .checked_add(right)
+                    .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+            }
+            (Self::SumInt(left), Self::SumInt(right)) => left.merge(right)?,
+            (Self::SumFloat(left), Self::SumFloat(right)) => {
+                *left += right;
+                if !left.is_finite() {
+                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
+                }
+            }
+            (Self::Min(left), Self::Min(right)) => {
+                if let Some(candidate) = right
+                    && left
+                        .as_ref()
+                        .is_none_or(|current| candidate.as_ref() < current.as_ref())
+                {
+                    *left = Some(candidate);
+                }
+            }
+            (Self::Max(left), Self::Max(right)) => {
+                if let Some(candidate) = right
+                    && left
+                        .as_ref()
+                        .is_none_or(|current| candidate.as_ref() > current.as_ref())
+                {
+                    *left = Some(candidate);
+                }
+            }
+            (
+                Self::AvgInt {
+                    sum: left_sum,
+                    count: left_count,
+                },
+                Self::AvgInt {
+                    sum: right_sum,
+                    count: right_count,
+                },
+            ) => {
+                *left_sum = left_sum
+                    .checked_add(right_sum)
+                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+                *left_count = left_count
+                    .checked_add(right_count)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
+            (
+                Self::AvgFloat {
+                    sum: left_sum,
+                    count: left_count,
+                },
+                Self::AvgFloat {
+                    sum: right_sum,
+                    count: right_count,
+                },
+            ) => {
+                *left_sum += right_sum;
+                *left_count = left_count
+                    .checked_add(right_count)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+                if !left_sum.is_finite() {
+                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
+                }
+            }
+            _ => unreachable!("states for the same aggregate have matching variants"),
+        }
+        Ok(())
+    }
+
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt(value) => value.finish().map(Value::Int64),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
@@ -644,6 +922,54 @@ impl AggregateState {
             )),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct IntSum {
+    total: i128,
+    min_prefix: i128,
+    max_prefix: i128,
+}
+
+impl IntSum {
+    fn update(&mut self, value: i64) -> Result<()> {
+        self.total = self
+            .total
+            .checked_add(i128::from(value))
+            .ok_or_else(sum_int_overflow)?;
+        self.min_prefix = self.min_prefix.min(self.total);
+        self.max_prefix = self.max_prefix.max(self.total);
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        let translated_min = self
+            .total
+            .checked_add(other.min_prefix)
+            .ok_or_else(sum_int_overflow)?;
+        let translated_max = self
+            .total
+            .checked_add(other.max_prefix)
+            .ok_or_else(sum_int_overflow)?;
+        self.total = self
+            .total
+            .checked_add(other.total)
+            .ok_or_else(sum_int_overflow)?;
+        self.min_prefix = self.min_prefix.min(translated_min);
+        self.max_prefix = self.max_prefix.max(translated_max);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<i64> {
+        if self.min_prefix < i128::from(i64::MIN) || self.max_prefix > i128::from(i64::MAX) {
+            return Err(sum_int_overflow());
+        }
+        i64::try_from(self.total).map_err(|_| sum_int_overflow())
+    }
+}
+
+fn sum_int_overflow() -> Error {
+    Error::NumericOverflow("SUM(Int64)".to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]
