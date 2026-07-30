@@ -181,6 +181,7 @@ fn render_json(result: &QueryResult) -> String {
 fn write_json_value(output: &mut String, value: &Value) {
     match value {
         Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
+        Value::UInt64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
@@ -267,6 +268,27 @@ mod tests {
         assert_eq!(
             render(&result, OutputFormat::Json),
             r#"{"columns":[{"name":"id","type":"Int64"},{"name":"id","type":"String"}],"rows":[[1,"x"]]}"#
+        );
+    }
+
+    #[test]
+    fn renders_uint64_losslessly_in_every_format() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "counter".to_owned(),
+                data_type: DataType::UInt64,
+            }],
+            rows: vec![vec![Value::UInt64(u64::MAX)]],
+        };
+
+        assert!(render(&result, OutputFormat::Table).contains("| 18446744073709551615 |"));
+        assert_eq!(
+            render(&result, OutputFormat::Csv),
+            "counter\n18446744073709551615\n"
+        );
+        assert_eq!(
+            render(&result, OutputFormat::Json),
+            r#"{"columns":[{"name":"counter","type":"UInt64"}],"rows":[[18446744073709551615]]}"#
         );
     }
 

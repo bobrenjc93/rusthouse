@@ -2,10 +2,11 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// The four physical column types supported by RustHouse.
+/// The five physical column types supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Int64,
+    UInt64,
     Float64,
     Bool,
     String,
@@ -15,6 +16,7 @@ impl DataType {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_uppercase().as_str() {
             "INT64" => Some(Self::Int64),
+            "UINT64" => Some(Self::UInt64),
             "FLOAT64" => Some(Self::Float64),
             "BOOL" | "BOOLEAN" => Some(Self::Bool),
             "STRING" => Some(Self::String),
@@ -27,6 +29,7 @@ impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Int64 => "Int64",
+            Self::UInt64 => "UInt64",
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
@@ -38,6 +41,7 @@ impl fmt::Display for DataType {
 #[derive(Debug, Clone)]
 pub enum Value {
     Int64(i64),
+    UInt64(u64),
     Float64(f64),
     Bool(bool),
     String(String),
@@ -47,6 +51,7 @@ pub enum Value {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ValueRef<'a> {
     Int64(i64),
+    UInt64(u64),
     Float64(f64),
     Bool(bool),
     String(&'a str),
@@ -57,6 +62,7 @@ impl Value {
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
+            Self::UInt64(_) => DataType::UInt64,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
@@ -67,6 +73,7 @@ impl Value {
     pub fn as_display_string(&self) -> String {
         match self {
             Self::Int64(value) => value.to_string(),
+            Self::UInt64(value) => value.to_string(),
             Self::Float64(value) => format_float(*value),
             Self::Bool(value) => value.to_string(),
             Self::String(value) => value.clone(),
@@ -76,6 +83,7 @@ impl Value {
     pub(crate) fn as_ref(&self) -> ValueRef<'_> {
         match self {
             Self::Int64(value) => ValueRef::Int64(*value),
+            Self::UInt64(value) => ValueRef::UInt64(*value),
             Self::Float64(value) => ValueRef::Float64(*value),
             Self::Bool(value) => ValueRef::Bool(*value),
             Self::String(value) => ValueRef::String(value),
@@ -92,6 +100,7 @@ impl ValueRef<'_> {
     pub(crate) fn to_owned(self) -> Value {
         match self {
             Self::Int64(value) => Value::Int64(value),
+            Self::UInt64(value) => Value::UInt64(value),
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
             Self::String(value) => Value::String(value.to_owned()),
@@ -101,10 +110,17 @@ impl ValueRef<'_> {
     pub(crate) fn sql_cmp(self, other: Self) -> Option<Ordering> {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(&right)),
+            (Self::UInt64(left), Self::UInt64(right)) => Some(left.cmp(&right)),
             (Self::Float64(left), Self::Float64(right)) => left.partial_cmp(&right),
+            (Self::Int64(left), Self::UInt64(right)) => Some(int_uint_cmp(left, right)),
+            (Self::UInt64(left), Self::Int64(right)) => Some(int_uint_cmp(right, left).reverse()),
             (Self::Int64(left), Self::Float64(right)) => int_float_cmp(left, right),
             (Self::Float64(left), Self::Int64(right)) => {
                 int_float_cmp(right, left).map(Ordering::reverse)
+            }
+            (Self::UInt64(left), Self::Float64(right)) => uint_float_cmp(left, right),
+            (Self::Float64(left), Self::UInt64(right)) => {
+                uint_float_cmp(right, left).map(Ordering::reverse)
             }
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
@@ -115,10 +131,19 @@ impl ValueRef<'_> {
     fn variant_index(&self) -> u8 {
         match self {
             Self::Int64(_) => 0,
-            Self::Float64(_) => 1,
-            Self::Bool(_) => 2,
-            Self::String(_) => 3,
+            Self::UInt64(_) => 1,
+            Self::Float64(_) => 2,
+            Self::Bool(_) => 3,
+            Self::String(_) => 4,
         }
+    }
+}
+
+fn int_uint_cmp(signed: i64, unsigned: u64) -> Ordering {
+    if signed < 0 {
+        Ordering::Less
+    } else {
+        (signed as u64).cmp(&unsigned)
     }
 }
 
@@ -136,6 +161,26 @@ fn int_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
     }
 
     let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal => (truncated as f64).partial_cmp(&float),
+        ordering => Some(ordering),
+    }
+}
+
+fn uint_float_cmp(integer: u64, float: f64) -> Option<Ordering> {
+    const U64_UPPER_EXCLUSIVE: f64 = 18_446_744_073_709_551_616.0;
+
+    if float.is_nan() {
+        return None;
+    }
+    if float >= U64_UPPER_EXCLUSIVE {
+        return Some(Ordering::Less);
+    }
+    if float < 0.0 {
+        return Some(Ordering::Greater);
+    }
+
+    let truncated = float.trunc() as u64;
     match integer.cmp(&truncated) {
         Ordering::Equal => (truncated as f64).partial_cmp(&float),
         ordering => Some(ordering),
@@ -207,6 +252,7 @@ impl Ord for ValueRef<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => left.cmp(right),
+            (Self::UInt64(left), Self::UInt64(right)) => left.cmp(right),
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
             (Self::String(left), Self::String(right)) => left.cmp(right),
@@ -226,6 +272,7 @@ impl Hash for ValueRef<'_> {
         self.variant_index().hash(state);
         match self {
             Self::Int64(value) => value.hash(state),
+            Self::UInt64(value) => value.hash(state),
             Self::Float64(value) => canonical_float_bits(*value).hash(state),
             Self::Bool(value) => value.hash(state),
             Self::String(value) => value.hash(state),
@@ -270,6 +317,27 @@ mod tests {
         );
         assert_eq!(
             Value::Int64(-1).sql_cmp(&Value::Float64(-1.5)),
+            Some(Ordering::Greater)
+        );
+
+        assert_eq!(
+            Value::UInt64(0).sql_cmp(&Value::Int64(-1)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::UInt64(i64::MAX as u64).sql_cmp(&Value::Int64(i64::MAX)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::UInt64(u64::MAX).sql_cmp(&Value::Float64(18_446_744_073_709_551_616.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::UInt64(u64::MAX).sql_cmp(&Value::Float64(18_446_744_073_709_549_568.0)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::UInt64(9_007_199_254_740_993).sql_cmp(&Value::Float64(9_007_199_254_740_992.0)),
             Some(Ordering::Greater)
         );
     }

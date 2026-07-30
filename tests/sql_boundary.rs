@@ -371,7 +371,7 @@ fn invalid_grouping_and_aggregate_types_are_rejected() {
             expected,
             actual,
             ..
-        } if expected == "Int64 or Float64" && actual == "String"
+        } if expected == "Int64, UInt64, or Float64" && actual == "String"
     ));
 }
 
@@ -409,6 +409,195 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
          WHERE id < 9223372036854775808.0;",
     );
     assert_eq!(below_i64_upper_bound.rows, vec![vec![Value::Int64(4)]]);
+}
+
+#[test]
+fn uint64_insert_filter_group_order_and_aggregates_match_clickhouse_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE counters (bucket String, value UInt64);
+             INSERT INTO counters VALUES
+                ('small', 0),
+                ('small', 7),
+                ('large', 9007199254740993),
+                ('large', 18446744073709551615);",
+        )
+        .expect("UInt64 setup succeeds");
+
+    let exact_filter = execute_query(
+        &mut database,
+        "SELECT value FROM counters
+         WHERE value > 9007199254740992.0
+         ORDER BY value;",
+    );
+    assert_eq!(
+        exact_filter.rows,
+        vec![
+            vec![Value::UInt64(9_007_199_254_740_993)],
+            vec![Value::UInt64(u64::MAX)],
+        ]
+    );
+
+    let maximum_literal = execute_query(
+        &mut database,
+        "SELECT value FROM counters WHERE value = 18446744073709551615;",
+    );
+    assert_eq!(maximum_literal.rows, vec![vec![Value::UInt64(u64::MAX)]]);
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT bucket,
+                SUM(value) AS total,
+                MIN(value) AS low,
+                MAX(value) AS high,
+                AVG(value) AS mean
+         FROM counters
+         WHERE value < 18446744073709551615
+         GROUP BY bucket
+         ORDER BY total DESC;",
+    );
+    assert_eq!(
+        grouped
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::String,
+            DataType::UInt64,
+            DataType::UInt64,
+            DataType::UInt64,
+            DataType::Float64,
+        ]
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("large".to_owned()),
+                Value::UInt64(9_007_199_254_740_993),
+                Value::UInt64(9_007_199_254_740_993),
+                Value::UInt64(9_007_199_254_740_993),
+                Value::Float64(9_007_199_254_740_993_u64 as f64),
+            ],
+            vec![
+                Value::String("small".to_owned()),
+                Value::UInt64(7),
+                Value::UInt64(0),
+                Value::UInt64(7),
+                Value::Float64(3.5),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn uint64_comparisons_are_exact_against_int64_and_float64() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numeric_boundaries (signed Int64, unsigned UInt64);
+             INSERT INTO numeric_boundaries VALUES
+                (-1, 0),
+                (9007199254740992, 9007199254740993),
+                (9223372036854775807, 18446744073709551615);",
+        )
+        .expect("mixed numeric setup succeeds");
+
+    let column_comparison = execute_query(
+        &mut database,
+        "SELECT unsigned FROM numeric_boundaries
+         WHERE signed < unsigned
+         ORDER BY unsigned;",
+    );
+    assert_eq!(
+        column_comparison.rows,
+        vec![
+            vec![Value::UInt64(0)],
+            vec![Value::UInt64(9_007_199_254_740_993)],
+            vec![Value::UInt64(u64::MAX)],
+        ]
+    );
+
+    let below_uint_upper_bound = execute_query(
+        &mut database,
+        "SELECT unsigned FROM numeric_boundaries
+         WHERE unsigned < 18446744073709551616.0
+         ORDER BY unsigned DESC LIMIT 1;",
+    );
+    assert_eq!(
+        below_uint_upper_bound.rows,
+        vec![vec![Value::UInt64(u64::MAX)]]
+    );
+
+    let signed_below_unsigned_literal = execute_query(
+        &mut database,
+        "SELECT signed FROM numeric_boundaries
+         WHERE signed < 9223372036854775808
+         ORDER BY signed;",
+    );
+    assert_eq!(signed_below_unsigned_literal.rows.len(), 3);
+}
+
+#[test]
+fn uint64_rejection_and_overflow_are_atomic_and_actionable() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE unsigned_values (value UInt64, label String);")
+        .expect("create succeeds");
+
+    let error = database
+        .execute(
+            "INSERT INTO unsigned_values VALUES
+                (18446744073709551615, 'valid'),
+                (-1, 'invalid');",
+        )
+        .expect_err("negative UInt64 input is rejected");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "column 'unsigned_values.value'"
+            && expected == "UInt64"
+            && actual == "Int64"
+    ));
+    assert_eq!(
+        database
+            .catalog()
+            .table("unsigned_values")
+            .expect("table exists")
+            .row_count(),
+        0
+    );
+
+    database
+        .execute(
+            "INSERT INTO unsigned_values VALUES
+                (18446744073709551615, 'maximum'),
+                (1, 'one');",
+        )
+        .expect("valid rows insert");
+    let overflow = database
+        .execute("SELECT SUM(value) FROM unsigned_values;")
+        .expect_err("UInt64 sum is checked");
+    assert_eq!(overflow, Error::NumericOverflow("SUM(UInt64)".to_owned()));
+
+    let extrema = execute_query(
+        &mut database,
+        "SELECT MIN(value) AS low, MAX(value) AS high, AVG(value) AS mean
+         FROM unsigned_values;",
+    );
+    assert_eq!(
+        extrema.rows,
+        vec![vec![
+            Value::UInt64(1),
+            Value::UInt64(u64::MAX),
+            Value::Float64(9_223_372_036_854_775_808.0),
+        ]]
+    );
 }
 
 #[test]

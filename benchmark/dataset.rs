@@ -4,7 +4,7 @@ pub const TABLE_NAME: &str = "parity_data";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
-    pub id: i64,
+    pub id: u64,
     pub uniform_num: i64,
     pub skewed_num: i64,
     pub score: f64,
@@ -81,7 +81,7 @@ impl Dataset {
             };
 
             rows.push(Row {
-                id: index as i64,
+                id: index as u64,
                 uniform_num,
                 skewed_num,
                 score,
@@ -100,7 +100,7 @@ impl Dataset {
         let mut sql = String::with_capacity(self.rows.len().saturating_mul(150));
         writeln!(
             sql,
-            "CREATE TABLE {TABLE_NAME} (id Int64, uniform_num Int64, skewed_num Int64, score Float64, low_key String, high_key String, payload String, flag Bool, large_int Int64);"
+            "CREATE TABLE {TABLE_NAME} (id UInt64, uniform_num Int64, skewed_num Int64, score Float64, low_key String, high_key String, payload String, flag Bool, large_int Int64);"
         )
         .expect("writing to String cannot fail");
         write!(sql, "INSERT INTO {TABLE_NAME} VALUES ").expect("writing to String cannot fail");
@@ -222,6 +222,7 @@ mod tests {
         let sql = dataset.setup_sql();
         assert!(sql.contains("quote''s payload"));
         assert!(sql.starts_with("CREATE TABLE parity_data"));
+        assert!(sql.contains("id UInt64"));
         assert!(sql.ends_with(";\n"));
     }
 }

@@ -18,6 +18,7 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub enum Column {
     Int64(Vec<i64>),
+    UInt64(Vec<u64>),
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
@@ -28,6 +29,7 @@ impl Column {
     pub fn new(data_type: DataType) -> Self {
         match data_type {
             DataType::Int64 => Self::Int64(Vec::new()),
+            DataType::UInt64 => Self::UInt64(Vec::new()),
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
@@ -38,6 +40,7 @@ impl Column {
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
+            Self::UInt64(_) => DataType::UInt64,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
@@ -48,6 +51,7 @@ impl Column {
     pub fn len(&self) -> usize {
         match self {
             Self::Int64(values) => values.len(),
+            Self::UInt64(values) => values.len(),
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
@@ -67,6 +71,7 @@ impl Column {
     pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
             Self::Int64(values) => ValueRef::Int64(values[row]),
+            Self::UInt64(values) => ValueRef::UInt64(values[row]),
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
@@ -80,6 +85,10 @@ impl Column {
     fn push(&mut self, value: Value) {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(value),
+            (Self::UInt64(values), Value::UInt64(value)) => values.push(value),
+            (Self::UInt64(values), Value::Int64(value)) if value >= 0 => {
+                values.push(value as u64);
+            }
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
@@ -169,7 +178,9 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            let lossless_unsigned_literal = field.data_type == DataType::UInt64
+                && matches!(value, Value::Int64(number) if *number >= 0);
+            if field.data_type != value.data_type() && !lossless_unsigned_literal {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
@@ -228,6 +239,39 @@ mod tests {
 
         assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
         assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
+    }
+
+    #[test]
+    fn resolves_non_negative_integer_values_for_uint64_columns() {
+        let mut table = Table::new(
+            "counters".to_owned(),
+            vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::UInt64,
+            }],
+        )
+        .expect("valid schema");
+
+        table
+            .insert_row(vec![Value::Int64(0)])
+            .expect("zero resolves losslessly");
+        table
+            .insert_row(vec![Value::UInt64(u64::MAX)])
+            .expect("maximum value fits");
+
+        assert!(matches!(
+            &table.columns()[0],
+            Column::UInt64(values) if values == &[0, u64::MAX]
+        ));
+        let error = table
+            .insert_row(vec![Value::Int64(-1)])
+            .expect_err("negative values do not fit UInt64");
+        assert!(matches!(
+            error,
+            Error::TypeMismatch { expected, actual, .. }
+                if expected == "UInt64" && actual == "Int64"
+        ));
+        assert_eq!(table.row_count(), 2);
     }
 
     #[test]

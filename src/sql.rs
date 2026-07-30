@@ -401,7 +401,7 @@ impl Parser {
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected Int64, UInt64, Float64, Bool, or String"
                 ),
             })?;
             columns.push(ColumnDef {
@@ -656,12 +656,24 @@ impl Parser {
                 }
                 return Ok(Value::Float64(value));
             }
+            if negative {
+                return signed
+                    .parse::<i64>()
+                    .map(Value::Int64)
+                    .map_err(|_| Error::Sql {
+                        position: self.position(),
+                        message: format!("invalid Int64 literal '{signed}'"),
+                    });
+            }
+            if let Ok(value) = signed.parse::<i64>() {
+                return Ok(Value::Int64(value));
+            }
             return signed
-                .parse::<i64>()
-                .map(Value::Int64)
+                .parse::<u64>()
+                .map(Value::UInt64)
                 .map_err(|_| Error::Sql {
                     position: self.position(),
-                    message: format!("invalid Int64 literal '{signed}'"),
+                    message: format!("integer literal '{signed}' exceeds UInt64 range"),
                 });
         }
         if negative {
@@ -673,7 +685,7 @@ impl Parser {
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, UInt64, Float64, Bool, or String literal")
         }
     }
 
@@ -782,6 +794,30 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn resolves_integer_literals_without_losing_uint64_values() {
+        let statements = parse(
+            "INSERT INTO valueset VALUES \
+             (0), (9223372036854775807), (9223372036854775808), (18446744073709551615)",
+        )
+        .expect("valid integer literals");
+        let Statement::Insert { rows, .. } = &statements[0] else {
+            panic!("expected insert");
+        };
+
+        assert_eq!(rows[0], [Value::Int64(0)]);
+        assert_eq!(rows[1], [Value::Int64(i64::MAX)]);
+        assert_eq!(rows[2], [Value::UInt64(i64::MAX as u64 + 1)]);
+        assert_eq!(rows[3], [Value::UInt64(u64::MAX)]);
+
+        let error = parse("INSERT INTO valueset VALUES (18446744073709551616)")
+            .expect_err("value exceeds both integer types");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("exceeds UInt64 range")
+        ));
     }
 
     #[test]

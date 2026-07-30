@@ -1,10 +1,10 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<u64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`).
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, UInt64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -16,6 +16,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Integer literals are resolved losslessly across `Int64` and `UInt64`. Non-negative `Int64` literals can be inserted into `UInt64` columns, while negative values are rejected. Numeric predicates compare `Int64`, `UInt64`, and `Float64` exactly without first rounding integers to floating point. `SUM` is checked in its input integer type, and `AVG` uses a wider checked integer accumulator before producing `Float64`.
 
 ## CLI
 

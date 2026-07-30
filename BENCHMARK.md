@@ -70,7 +70,7 @@ Progress is written to stderr. Stdout is exactly one compact Burner JSON object 
 
 A dependency-free SplitMix64 generator produces deterministic typed rows. Every dataset has:
 
-- a broad uniform integer and a 90%-near-zero skewed integer;
+- a `UInt64` row identifier, a broad uniform integer, and a 90%-near-zero skewed integer;
 - eight low-cardinality string keys and unique high-cardinality keys;
 - variable-length strings, including commas and SQL quotes;
 - both Boolean values;

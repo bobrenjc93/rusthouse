@@ -66,6 +66,26 @@ fn positional_json_preserves_duplicate_alias_values() {
 }
 
 #[test]
+fn uint64_maximum_is_lossless_through_the_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE counters (value UInt64);
+             INSERT INTO counters VALUES (0), (18446744073709551615);
+             SELECT value FROM counters ORDER BY value;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"value\",\"type\":\"UInt64\"}],\"rows\":[[0],[18446744073709551615]]}]}\n"
+    );
+}
+
+#[test]
 fn stdin_and_csv_output_work_together() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(["--format", "csv"])
