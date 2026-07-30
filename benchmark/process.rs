@@ -1,11 +1,16 @@
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
 pub const CLICKHOUSE_SHA256: &str =
     "6611c5aadcfac188031fa0fdf2676ec311771f96654a62b918b146b60dd11075";
+pub const MAX_PREFLIGHT_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PREFLIGHT_STDERR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EnginePaths {
@@ -55,6 +60,18 @@ impl EnginePaths {
         })
     }
 
+    pub fn execute_preflight(
+        &self,
+        engine: Engine,
+        setup_sql: &str,
+        query_sql: &str,
+        query_repetitions: usize,
+    ) -> Result<TimedOutput, String> {
+        let batch = sql_batch(setup_sql, query_sql, query_repetitions)?;
+        let stdout = self.execute_captured_batch(engine, &batch)?;
+        Ok(TimedOutput { stdout })
+    }
+
     pub fn execute_timed(
         &self,
         engine: Engine,
@@ -77,18 +94,7 @@ impl EnginePaths {
         batch: &str,
         capture_stdout: bool,
     ) -> Result<(Duration, Option<String>), String> {
-        let mut command = match engine {
-            Engine::RustHouse => {
-                let mut command = Command::new(&self.rusthouse);
-                command.args(["--format", "csv"]);
-                command
-            }
-            Engine::ClickHouse => {
-                let mut command = Command::new(&self.clickhouse);
-                command.args(["local", "--multiquery", "--output-format", "CSVWithNames"]);
-                command
-            }
-        };
+        let mut command = self.command(engine);
         command
             .stdin(Stdio::piped())
             .stdout(if capture_stdout {
@@ -135,6 +141,152 @@ impl EnginePaths {
             };
         Ok((elapsed, stdout))
     }
+
+    fn execute_captured_batch(&self, engine: Engine, batch: &str) -> Result<String, String> {
+        let mut command = self.command(engine);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "could not start {} at '{}': {error}",
+                engine.name(),
+                engine.path(self).display()
+            )
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("{} stdout was not piped", engine.name()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("{} stderr was not piped", engine.name()))?;
+        let stdout_exceeded = Arc::new(AtomicBool::new(false));
+        let stderr_exceeded = Arc::new(AtomicBool::new(false));
+        let stdout_reader_exceeded = Arc::clone(&stdout_exceeded);
+        let stderr_reader_exceeded = Arc::clone(&stderr_exceeded);
+        let stdout_reader = thread::spawn(move || {
+            read_bounded(stdout, MAX_PREFLIGHT_CAPTURE_BYTES, stdout_reader_exceeded)
+        });
+        let stderr_reader = thread::spawn(move || {
+            read_bounded(stderr, MAX_PREFLIGHT_STDERR_BYTES, stderr_reader_exceeded)
+        });
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("{} stdin was not piped", engine.name()))?;
+        let batch = batch.as_bytes().to_vec();
+        let stdin_writer = thread::spawn(move || stdin.write_all(&batch));
+
+        let status = loop {
+            if stdout_exceeded.load(Ordering::Relaxed) || stderr_exceeded.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                break child
+                    .wait()
+                    .map_err(|error| format!("could not wait for {}: {error}", engine.name()))?;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("could not wait for {}: {error}", engine.name()))?
+            {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        let write_result = stdin_writer
+            .join()
+            .map_err(|_| format!("{} stdin writer panicked", engine.name()))?;
+        let stdout = join_capture(stdout_reader, engine, "stdout")?;
+        let stderr = join_capture(stderr_reader, engine, "stderr")?;
+
+        if stdout.exceeded_limit {
+            return Err(format!(
+                "{} preflight stdout exceeded the {} byte capture limit",
+                engine.name(),
+                MAX_PREFLIGHT_CAPTURE_BYTES
+            ));
+        }
+        if stderr.exceeded_limit {
+            return Err(format!(
+                "{} preflight stderr exceeded the {} byte capture limit",
+                engine.name(),
+                MAX_PREFLIGHT_STDERR_BYTES
+            ));
+        }
+        write_result
+            .map_err(|error| format!("could not write SQL to {}: {error}", engine.name()))?;
+        if !status.success() {
+            return Err(format!(
+                "{} exited with {}: {}",
+                engine.name(),
+                status,
+                summarize_stderr(&stderr.bytes)
+            ));
+        }
+
+        String::from_utf8(stdout.bytes)
+            .map_err(|error| format!("{} emitted non-UTF-8 output: {error}", engine.name()))
+    }
+
+    fn command(&self, engine: Engine) -> Command {
+        match engine {
+            Engine::RustHouse => {
+                let mut command = Command::new(&self.rusthouse);
+                command.args(["--format", "csv"]);
+                command
+            }
+            Engine::ClickHouse => {
+                let mut command = Command::new(&self.clickhouse);
+                command.args(["local", "--multiquery", "--output-format", "CSVWithNames"]);
+                command
+            }
+        }
+    }
+}
+
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+fn read_bounded(
+    mut reader: impl Read,
+    limit: usize,
+    exceeded: Arc<AtomicBool>,
+) -> std::io::Result<BoundedCapture> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut exceeded_limit = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        exceeded_limit |= read > remaining;
+        if exceeded_limit {
+            exceeded.store(true, Ordering::Relaxed);
+        }
+    }
+    Ok(BoundedCapture {
+        bytes,
+        exceeded_limit,
+    })
+}
+
+fn join_capture(
+    reader: thread::JoinHandle<std::io::Result<BoundedCapture>>,
+    engine: Engine,
+    stream: &str,
+) -> Result<BoundedCapture, String> {
+    reader
+        .join()
+        .map_err(|_| format!("{} {stream} reader panicked", engine.name()))?
+        .map_err(|error| format!("could not read {} {stream}: {error}", engine.name()))
 }
 
 fn sql_batch(setup_sql: &str, query_sql: &str, query_repetitions: usize) -> Result<String, String> {
@@ -269,6 +421,8 @@ fn summarize_stderr(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     #[test]
@@ -282,5 +436,16 @@ mod tests {
     #[test]
     fn amplification_must_be_positive() {
         assert!(sql_batch("", "SELECT 1;", 0).is_err());
+    }
+
+    #[test]
+    fn bounded_capture_drains_but_never_retains_more_than_the_limit() {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let capture = read_bounded(Cursor::new(b"0123456789"), 4, Arc::clone(&exceeded))
+            .expect("read succeeds");
+
+        assert_eq!(capture.bytes, b"0123");
+        assert!(capture.exceeded_limit);
+        assert!(exceeded.load(Ordering::Relaxed));
     }
 }

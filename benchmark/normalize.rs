@@ -27,19 +27,106 @@ pub fn compare_outputs(
     let rusthouse = normalize(rusthouse_csv, columns, "RustHouse")?;
     let clickhouse = normalize(clickhouse_csv, columns, "ClickHouse")?;
 
-    if rusthouse.rows.len() != clickhouse.rows.len() {
+    compare_tables(&rusthouse, &clickhouse, columns, "RustHouse", "ClickHouse")
+}
+
+pub fn compare_repeated_outputs(
+    rusthouse_expected_csv: &str,
+    clickhouse_expected_csv: &str,
+    rusthouse_repeated_csv: &str,
+    clickhouse_repeated_csv: &str,
+    columns: &[(&str, ColumnType)],
+    expected_repetitions: usize,
+) -> Result<(), String> {
+    if expected_repetitions == 0 {
+        return Err("expected repetition count must be positive".to_owned());
+    }
+
+    let rusthouse_expected = normalize(rusthouse_expected_csv, columns, "RustHouse expected")?;
+    let clickhouse_expected = normalize(clickhouse_expected_csv, columns, "ClickHouse expected")?;
+    compare_tables(
+        &rusthouse_expected,
+        &clickhouse_expected,
+        columns,
+        "RustHouse expected",
+        "ClickHouse expected",
+    )?;
+
+    let rusthouse_repetitions = normalize_repeated(
+        rusthouse_repeated_csv,
+        columns,
+        "RustHouse",
+        rusthouse_expected.rows.len(),
+    )?;
+    let clickhouse_repetitions = normalize_repeated(
+        clickhouse_repeated_csv,
+        columns,
+        "ClickHouse",
+        clickhouse_expected.rows.len(),
+    )?;
+    require_repetition_count(
+        "RustHouse",
+        rusthouse_repetitions.len(),
+        expected_repetitions,
+    )?;
+    require_repetition_count(
+        "ClickHouse",
+        clickhouse_repetitions.len(),
+        expected_repetitions,
+    )?;
+
+    for (index, (rusthouse, clickhouse)) in rusthouse_repetitions
+        .iter()
+        .zip(&clickhouse_repetitions)
+        .enumerate()
+    {
+        let repetition = index + 1;
+        compare_tables(
+            rusthouse,
+            &rusthouse_expected,
+            columns,
+            &format!("RustHouse repetition {repetition}"),
+            "RustHouse unamplified expected result",
+        )?;
+        compare_tables(
+            clickhouse,
+            &clickhouse_expected,
+            columns,
+            &format!("ClickHouse repetition {repetition}"),
+            "ClickHouse unamplified expected result",
+        )?;
+        compare_tables(
+            rusthouse,
+            clickhouse,
+            columns,
+            &format!("RustHouse repetition {repetition}"),
+            &format!("ClickHouse repetition {repetition}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_tables(
+    left: &NormalizedTable,
+    right: &NormalizedTable,
+    columns: &[(&str, ColumnType)],
+    left_name: &str,
+    right_name: &str,
+) -> Result<(), String> {
+    if left.rows.len() != right.rows.len() {
         return Err(format!(
-            "row count mismatch: RustHouse returned {}, ClickHouse returned {}",
-            rusthouse.rows.len(),
-            clickhouse.rows.len()
+            "row count mismatch: {left_name} returned {}, {right_name} returned {}",
+            left.rows.len(),
+            right.rows.len()
         ));
     }
 
-    for (row_index, (left, right)) in rusthouse.rows.iter().zip(&clickhouse.rows).enumerate() {
-        for (column_index, (left, right)) in left.iter().zip(right).enumerate() {
-            if !values_equal(left, right) {
+    for (row_index, (left_row, right_row)) in left.rows.iter().zip(&right.rows).enumerate() {
+        for (column_index, (left_value, right_value)) in left_row.iter().zip(right_row).enumerate()
+        {
+            if !values_equal(left_value, right_value) {
                 return Err(format!(
-                    "result mismatch at row {}, column '{}': RustHouse={left:?}, ClickHouse={right:?}",
+                    "result mismatch at row {}, column '{}': {left_name}={left_value:?}, {right_name}={right_value:?}",
                     row_index + 1,
                     columns[column_index].0
                 ));
@@ -58,6 +145,69 @@ fn normalize(
     let (header, rows) = records
         .split_first()
         .ok_or_else(|| format!("{engine} returned no CSV header"))?;
+    normalize_records(header, rows, columns, engine)
+}
+
+fn normalize_repeated(
+    csv: &str,
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+    expected_rows: usize,
+) -> Result<Vec<NormalizedTable>, String> {
+    let records = parse_csv(csv).map_err(|error| format!("{engine} repeated CSV: {error}"))?;
+    let mut documents = Vec::new();
+    let mut position = 0;
+
+    while position < records.len() {
+        let document_number = documents.len() + 1;
+        let header = &records[position];
+        position += 1;
+        let remaining = records.len() - position;
+        if remaining < expected_rows {
+            return Err(format!(
+                "{engine} CSV result document {document_number} has only {remaining} rows available; expected {expected_rows}"
+            ));
+        }
+        let rows = &records[position..position + expected_rows];
+        let document = normalize_records(
+            header,
+            rows,
+            columns,
+            &format!("{engine} CSV result document {document_number}"),
+        )?;
+        documents.push(document);
+        position += expected_rows;
+
+        if position < records.len() && is_blank_record(&records[position]) {
+            position += 1;
+            if position == records.len() {
+                return Err(format!("{engine} repeated CSV has a trailing blank record"));
+            }
+        }
+    }
+
+    Ok(documents)
+}
+
+fn is_blank_record(record: &[String]) -> bool {
+    record.len() == 1 && record[0].is_empty()
+}
+
+fn require_repetition_count(engine: &str, actual: usize, expected: usize) -> Result<(), String> {
+    if actual != expected {
+        return Err(format!(
+            "{engine} amplified output contained {actual} CSV result documents; expected exactly {expected}"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_records(
+    header: &[String],
+    rows: &[Vec<String>],
+    columns: &[(&str, ColumnType)],
+    engine: &str,
+) -> Result<NormalizedTable, String> {
     let expected_header = columns.iter().map(|(name, _)| *name).collect::<Vec<_>>();
     if header.iter().map(String::as_str).collect::<Vec<_>>() != expected_header {
         return Err(format!(
@@ -232,5 +382,85 @@ mod tests {
         assert!(compare_outputs("value\nleft\n", "value\nright\n", &columns).is_err());
         assert!(compare_outputs("wrong\nleft\n", "value\nleft\n", &columns).is_err());
         assert!(compare_outputs("value\n\"unfinished\n", "value\nleft\n", &columns).is_err());
+    }
+
+    #[test]
+    fn repeated_documents_match_expected_results_and_allow_engine_separators() {
+        let columns = [("n", ColumnType::Integer), ("enabled", ColumnType::Boolean)];
+        let rusthouse_expected = "n,enabled\n1,true\n";
+        let clickhouse_expected = "n,enabled\r\n1,1\r\n";
+        let rusthouse_repeated = "n,enabled\n1,true\n\nn,enabled\n1,true\n\nn,enabled\n1,true\n";
+        let clickhouse_repeated = "n,enabled\n1,1\nn,enabled\n1,1\nn,enabled\n1,1\n";
+
+        compare_repeated_outputs(
+            rusthouse_expected,
+            clickhouse_expected,
+            rusthouse_repeated,
+            clickhouse_repeated,
+            &columns,
+            3,
+        )
+        .expect("all repeated documents match");
+    }
+
+    #[test]
+    fn repeated_documents_require_the_exact_declared_count() {
+        let columns = [("n", ColumnType::Integer)];
+        let missing_error = compare_repeated_outputs(
+            "n\n1\n",
+            "n\n1\n",
+            "n\n1\nn\n1\n",
+            "n\n1\nn\n1\n",
+            &columns,
+            3,
+        )
+        .expect_err("missing repetition must fail");
+        let extra_error = compare_repeated_outputs(
+            "n\n1\n",
+            "n\n1\n",
+            "n\n1\nn\n1\n",
+            "n\n1\nn\n1\n",
+            &columns,
+            1,
+        )
+        .expect_err("extra repetition must fail");
+
+        assert!(missing_error.contains("expected exactly 3"));
+        assert!(extra_error.contains("contained 2"));
+        assert!(extra_error.contains("expected exactly 1"));
+    }
+
+    #[test]
+    fn every_repetition_must_match_the_unamplified_result() {
+        let columns = [("n", ColumnType::Integer)];
+        let error = compare_repeated_outputs(
+            "n\n1\n",
+            "n\n1\n",
+            "n\n1\n\nn\n2\n",
+            "n\n1\nn\n1\n",
+            &columns,
+            2,
+        )
+        .expect_err("changed repeated result must fail");
+
+        assert!(error.contains("RustHouse repetition 2"));
+        assert!(error.contains("unamplified expected result"));
+    }
+
+    #[test]
+    fn every_repetition_must_match_the_peer_engine() {
+        let columns = [("value", ColumnType::Float)];
+        let error = compare_repeated_outputs(
+            "value\n1.0\n",
+            "value\n1.0\n",
+            "value\n1.0000000009\n",
+            "value\n0.9999999991\n",
+            &columns,
+            1,
+        )
+        .expect_err("peer difference outside tolerance must fail");
+
+        assert!(error.contains("RustHouse repetition 1"));
+        assert!(error.contains("ClickHouse repetition 1"));
     }
 }

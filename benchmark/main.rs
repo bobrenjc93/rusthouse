@@ -15,8 +15,10 @@ use std::time::Duration;
 
 use config::{Config, ParseResult};
 use dataset::Dataset;
-use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use normalize::{ColumnType, compare_outputs, compare_repeated_outputs};
+use process::{
+    ClickHouseIdentity, Engine, EnginePaths, MAX_PREFLIGHT_CAPTURE_BYTES, TimedBatch, TimedOutput,
+};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -56,6 +58,7 @@ struct CaseResult {
     family: &'static str,
     row_count: usize,
     query_amplification: usize,
+    preflight: PreflightRecord,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
     clickhouse_primary_batch_median_ms: f64,
@@ -68,9 +71,17 @@ struct CaseResult {
     end_to_end_ratio: f64,
 }
 
+#[derive(Debug)]
+struct PreflightRecord {
+    query_repetitions: usize,
+    rusthouse_capture_bytes: usize,
+    clickhouse_capture_bytes: usize,
+}
+
 #[derive(Debug, Default)]
 struct CorrectnessGate {
-    passed: bool,
+    unamplified_passed: bool,
+    preflight_passed: bool,
 }
 
 impl CorrectnessGate {
@@ -80,9 +91,40 @@ impl CorrectnessGate {
         rusthouse: &TimedOutput,
         clickhouse: &TimedOutput,
     ) -> Result<(), String> {
+        self.unamplified_passed = false;
+        self.preflight_passed = false;
         compare_outputs(&rusthouse.stdout, &clickhouse.stdout, columns)?;
-        self.passed = true;
+        self.unamplified_passed = true;
         Ok(())
+    }
+
+    fn verify_preflight(
+        &mut self,
+        columns: &[(&str, ColumnType)],
+        rusthouse_expected: &TimedOutput,
+        clickhouse_expected: &TimedOutput,
+        rusthouse_repeated: &TimedOutput,
+        clickhouse_repeated: &TimedOutput,
+        expected_repetitions: usize,
+    ) -> Result<(), String> {
+        self.preflight_passed = false;
+        if !self.unamplified_passed {
+            return Err("amplified output preflight requires unamplified correctness".to_owned());
+        }
+        compare_repeated_outputs(
+            &rusthouse_expected.stdout,
+            &clickhouse_expected.stdout,
+            &rusthouse_repeated.stdout,
+            &clickhouse_repeated.stdout,
+            columns,
+            expected_repetitions,
+        )?;
+        self.preflight_passed = true;
+        Ok(())
+    }
+
+    fn passed(&self) -> bool {
+        self.unamplified_passed && self.preflight_passed
     }
 }
 
@@ -154,6 +196,7 @@ fn run(config: Config) -> Result<Report, String> {
     let identity = paths.validate()?;
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
+    let mut preflight_checks = 0_usize;
 
     for (row_count_index, row_count) in settings.row_counts.iter().copied().enumerate() {
         let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
@@ -184,6 +227,41 @@ fn run(config: Config) -> Result<Report, String> {
                     )
                 })?;
             correctness_checks += 1;
+
+            let (rusthouse_preflight, clickhouse_preflight) = execute_preflight_pair(
+                &paths,
+                &setup_sql,
+                &workload.sql,
+                settings.query_amplification,
+                !correctness_order,
+            )
+            .map_err(|error| {
+                format!(
+                    "amplified output preflight execution failed for '{}' at {row_count} rows: {error}",
+                    workload.name
+                )
+            })?;
+            correctness_gate
+                .verify_preflight(
+                    &workload.columns,
+                    &rusthouse_output,
+                    &clickhouse_output,
+                    &rusthouse_preflight,
+                    &clickhouse_preflight,
+                    settings.query_amplification,
+                )
+                .map_err(|error| {
+                    format!(
+                        "amplified output preflight failed for '{}' at {row_count} rows: {error}",
+                        workload.name
+                    )
+                })?;
+            let preflight = PreflightRecord {
+                query_repetitions: settings.query_amplification,
+                rusthouse_capture_bytes: rusthouse_preflight.stdout.len(),
+                clickhouse_capture_bytes: clickhouse_preflight.stdout.len(),
+            };
+            preflight_checks += 1;
 
             let mut primary = TimingSeries::default();
             let primary_iterations = settings.warmups + settings.samples;
@@ -274,6 +352,7 @@ fn run(config: Config) -> Result<Report, String> {
                 family: workload.family.name(),
                 row_count,
                 query_amplification: settings.query_amplification,
+                preflight,
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
                 clickhouse_primary_batch_median_ms: clickhouse_primary_batch_median,
@@ -302,6 +381,7 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            preflight_checks,
         );
         fs::write(path, details)
             .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
@@ -313,6 +393,10 @@ fn run(config: Config) -> Result<Report, String> {
             correctness_checks,
             cases.len(),
             settings.row_counts.len()
+        ),
+        format!(
+            "{preflight_checks} amplified output preflights passed with exactly {} captured result documents per engine",
+            settings.query_amplification
         ),
         format!(
             "primary score {:.2}; startup-inclusive end-to-end score {:.2}",
@@ -375,7 +459,7 @@ fn run(config: Config) -> Result<Report, String> {
     Ok(Report {
         score: primary_score.score,
         summary: format!(
-            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness-gated cases.",
+            "RustHouse primary sustained-work score {:.2}; startup-inclusive end-to-end score {:.2}; ClickHouse parity=100 over {} correctness- and amplified-preflight-gated cases.",
             primary_score.score,
             end_to_end_score.score,
             cases.len()
@@ -427,6 +511,28 @@ fn execute_correctness_pair(
     }
 }
 
+fn execute_preflight_pair(
+    paths: &EnginePaths,
+    setup_sql: &str,
+    query_sql: &str,
+    query_repetitions: usize,
+    rusthouse_first: bool,
+) -> Result<(TimedOutput, TimedOutput), String> {
+    if rusthouse_first {
+        let rusthouse =
+            paths.execute_preflight(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        let clickhouse =
+            paths.execute_preflight(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        Ok((rusthouse, clickhouse))
+    } else {
+        let clickhouse =
+            paths.execute_preflight(Engine::ClickHouse, setup_sql, query_sql, query_repetitions)?;
+        let rusthouse =
+            paths.execute_preflight(Engine::RustHouse, setup_sql, query_sql, query_repetitions)?;
+        Ok((rusthouse, clickhouse))
+    }
+}
+
 fn execute_timed_pair(
     paths: &EnginePaths,
     setup_sql: &str,
@@ -457,8 +563,11 @@ fn accept_timed_pair(
     record: bool,
     samples: &mut TimingSeries,
 ) -> Result<(), String> {
-    if !gate.passed {
-        return Err("timed batch was not preceded by a passing correctness run".to_owned());
+    if !gate.passed() {
+        return Err(
+            "timed batch was not preceded by passing correctness and amplified output preflight runs"
+                .to_owned(),
+        );
     }
     if rusthouse.query_repetitions != clickhouse.query_repetitions
         || rusthouse.query_repetitions != expected_repetitions
@@ -535,12 +644,13 @@ fn details_json(
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    preflight_checks: usize,
 ) -> String {
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,7 +671,7 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"amplified_output_preflight\":true,\"preflight_capture_limit_bytes\":{MAX_PREFLIGHT_CAPTURE_BYTES},\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"amplified_preflight_checks\":{preflight_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
         json_string(&config.clickhouse.display().to_string()),
@@ -578,11 +688,14 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"preflight\":{{\"passed\":true,\"query_repetitions\":{},\"capture_limit_bytes\":{MAX_PREFLIGHT_CAPTURE_BYTES},\"rusthouse_capture_bytes\":{},\"clickhouse_capture_bytes\":{}}},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
             case.query_amplification,
+            case.preflight.query_repetitions,
+            case.preflight.rusthouse_capture_bytes,
+            case.preflight.clickhouse_capture_bytes,
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
             case.rusthouse_primary_median_ms,
@@ -697,7 +810,7 @@ mod tests {
             .expect_err("mismatch must fail");
 
         assert!(error.contains("result mismatch"));
-        assert!(!gate.passed);
+        assert!(!gate.passed());
     }
 
     #[test]
@@ -719,10 +832,56 @@ mod tests {
     }
 
     #[test]
+    fn unamplified_correctness_alone_does_not_open_the_timing_gate() {
+        let mut gate = CorrectnessGate::default();
+        gate.verify(
+            &[("n", ColumnType::Integer)],
+            &output("n\n1\n"),
+            &output("n\n1\n"),
+        )
+        .expect("unamplified output matches");
+
+        assert!(!gate.passed());
+    }
+
+    #[test]
+    fn failed_revalidation_closes_a_previously_open_gate() {
+        let columns = [("n", ColumnType::Integer)];
+        let expected = output("n\n1\n");
+        let mut gate = CorrectnessGate::default();
+        gate.verify(&columns, &expected, &expected)
+            .expect("unamplified output matches");
+        gate.verify_preflight(
+            &columns,
+            &expected,
+            &expected,
+            &output("n\n1\n"),
+            &output("n\n1\n"),
+            1,
+        )
+        .expect("preflight output matches");
+        assert!(gate.passed());
+
+        gate.verify_preflight(
+            &columns,
+            &expected,
+            &expected,
+            &output("n\n2\n"),
+            &output("n\n1\n"),
+            1,
+        )
+        .expect_err("changed preflight must fail");
+        assert!(!gate.passed());
+    }
+
+    #[test]
     fn amplification_must_match_for_both_engines() {
         let mut samples = TimingSeries::default();
         let error = accept_timed_pair(
-            &CorrectnessGate { passed: true },
+            &CorrectnessGate {
+                unamplified_passed: true,
+                preflight_passed: true,
+            },
             &batch(10.0, 64),
             &batch(10.0, 63),
             64,
@@ -752,25 +911,29 @@ mod tests {
     }
 
     #[test]
-    fn normalized_match_opens_gate_and_accepts_positive_timing() {
+    fn normalized_match_and_preflight_open_gate_and_accept_positive_timing() {
         let mut gate = CorrectnessGate::default();
+        let rusthouse_expected = output("enabled\ntrue\n");
+        let clickhouse_expected = output("enabled\n1\n");
         gate.verify(
             &[("enabled", ColumnType::Boolean)],
-            &output("enabled\ntrue\n"),
-            &output("enabled\n1\n"),
+            &rusthouse_expected,
+            &clickhouse_expected,
         )
         .expect("matching output");
+        gate.verify_preflight(
+            &[("enabled", ColumnType::Boolean)],
+            &rusthouse_expected,
+            &clickhouse_expected,
+            &output("enabled\ntrue\n\nenabled\ntrue\n"),
+            &output("enabled\n1\nenabled\n1\n"),
+            2,
+        )
+        .expect("matching preflight output");
 
         let mut samples = TimingSeries::default();
-        accept_timed_pair(
-            &gate,
-            &batch(64.0, 64),
-            &batch(32.0, 64),
-            64,
-            true,
-            &mut samples,
-        )
-        .expect("gated sample");
+        accept_timed_pair(&gate, &batch(2.0, 2), &batch(1.0, 2), 2, true, &mut samples)
+            .expect("gated sample");
         assert_eq!(samples.rusthouse_per_query_ms, [1.0]);
         assert_eq!(samples.clickhouse_per_query_ms, [0.5]);
     }
@@ -782,6 +945,74 @@ mod tests {
             saturated_cases: 8,
         };
         assert!(ensure_primary_headroom(&score, 8).is_err());
+    }
+
+    #[test]
+    fn details_record_amplified_preflight_evidence() {
+        let config = Config {
+            mode: config::Mode::Quick,
+            seed: 7,
+            rusthouse: PathBuf::from("rusthouse"),
+            clickhouse: PathBuf::from("clickhouse"),
+            details: None,
+        };
+        let case = CaseResult {
+            workload: "workload",
+            family: "family",
+            row_count: 256,
+            query_amplification: 256,
+            preflight: PreflightRecord {
+                query_repetitions: 256,
+                rusthouse_capture_bytes: 1_024,
+                clickhouse_capture_bytes: 2_048,
+            },
+            primary: TimingSeries {
+                rusthouse_batch_ms: vec![2.0],
+                clickhouse_batch_ms: vec![1.0],
+                rusthouse_per_query_ms: vec![0.02],
+                clickhouse_per_query_ms: vec![0.01],
+            },
+            rusthouse_primary_batch_median_ms: 2.0,
+            clickhouse_primary_batch_median_ms: 1.0,
+            rusthouse_primary_median_ms: 0.02,
+            clickhouse_primary_median_ms: 0.01,
+            primary_ratio: 0.5,
+            end_to_end: TimingSeries {
+                rusthouse_batch_ms: vec![2.0],
+                clickhouse_batch_ms: vec![1.0],
+                rusthouse_per_query_ms: vec![2.0],
+                clickhouse_per_query_ms: vec![1.0],
+            },
+            rusthouse_end_to_end_median_ms: 2.0,
+            clickhouse_end_to_end_median_ms: 1.0,
+            end_to_end_ratio: 0.5,
+        };
+        let score = ScoreBreakdown {
+            score: 50.0,
+            saturated_cases: 0,
+        };
+
+        let details = details_json(
+            &config,
+            &ClickHouseIdentity {
+                version_output: "ClickHouse local version 26.7.1".to_owned(),
+                sha256: "hash".to_owned(),
+            },
+            &[case],
+            score,
+            score,
+            1,
+            1,
+        );
+
+        assert!(details.contains("\"schema_version\":3"));
+        assert!(details.contains("\"amplified_preflight_checks\":1"));
+        assert!(details.contains(&format!(
+            "\"preflight_capture_limit_bytes\":{MAX_PREFLIGHT_CAPTURE_BYTES}"
+        )));
+        assert!(details.contains(
+            "\"preflight\":{\"passed\":true,\"query_repetitions\":256,\"capture_limit_bytes\":16777216,\"rusthouse_capture_bytes\":1024,\"clickhouse_capture_bytes\":2048}"
+        ));
     }
 
     #[test]
