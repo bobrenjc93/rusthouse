@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
-use crate::value::{DataType, Value};
+use crate::value::{DataType, Value, ValueRef};
 
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,12 +61,20 @@ impl Column {
 
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
+        self.value_ref(row).to_owned()
+    }
+
+    pub(crate) fn value_ref(&self, row: usize) -> ValueRef<'_> {
         match self {
-            Self::Int64(values) => Value::Int64(values[row]),
-            Self::Float64(values) => Value::Float64(values[row]),
-            Self::Bool(values) => Value::Bool(values[row]),
-            Self::String(values) => Value::String(values[row].clone()),
+            Self::Int64(values) => ValueRef::Int64(values[row]),
+            Self::Float64(values) => ValueRef::Float64(values[row]),
+            Self::Bool(values) => ValueRef::Bool(values[row]),
+            Self::String(values) => ValueRef::String(&values[row]),
         }
+    }
+
+    pub(crate) fn cmp_at(&self, left: usize, right: usize) -> std::cmp::Ordering {
+        self.value_ref(left).cmp(&self.value_ref(right))
     }
 
     fn push(&mut self, value: Value) {
