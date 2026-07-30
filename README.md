@@ -85,7 +85,7 @@ assert_eq!(result.rows.len(), 1);
 
 RustHouse has no joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total predicate AST nodes. Subqueries are limited to 8 nesting levels, and `IN` results are limited to 10,000 rows before duplicate elimination. Queries over a limit return an error before the outer scan. Subqueries cannot reference columns from an outer query, and `IN` subqueries must return exactly one type-compatible column.
+To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total predicate AST nodes. Subqueries are limited to 8 nesting levels, and `IN` results and grouped subquery state are limited to 10,000 entries before duplicate elimination. Ungrouped subqueries enforce the row cap during scanning, aggregates stream their input, ordered limited subqueries retain a bounded top-k, and `EXISTS` stops at the first qualifying row. Queries over a limit return an error before the outer scan. Subqueries cannot reference columns from an outer query, and `IN` subqueries must return exactly one type-compatible column.
 
 Aggregates ignore NULL inputs. On empty or all-NULL input, COUNT and SUM retain their existing numeric-zero behavior while MIN, MAX, and AVG return NULL.
 

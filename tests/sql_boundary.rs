@@ -613,8 +613,10 @@ fn exists_subqueries_handle_empty_results_and_global_aggregates() {
         .execute(
             "CREATE TABLE candidates (id Int64);
              CREATE TABLE selected (value Int64);
+             CREATE TABLE overflowing (value Int64);
              INSERT INTO candidates VALUES (1), (2);
-             INSERT INTO selected VALUES (2);",
+             INSERT INTO selected VALUES (2);
+             INSERT INTO overflowing VALUES (9223372036854775807), (1);",
         )
         .expect("setup succeeds");
 
@@ -637,6 +639,17 @@ fn exists_subqueries_handle_empty_results_and_global_aggregates() {
     );
     assert_eq!(
         aggregate_row.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+
+    let ignored_projection = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE EXISTS (SELECT SUM(value) FROM overflowing)
+         ORDER BY id;",
+    );
+    assert_eq!(
+        ignored_projection.rows,
         vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
     );
 
@@ -711,9 +724,9 @@ fn subquery_nesting_and_materialization_are_bounded() {
     let mut database = Database::new();
     database
         .execute(&format!(
-            "CREATE TABLE candidates (id Int64);
+            "CREATE TABLE candidates (id Int64, label String);
              CREATE TABLE selected (value Int64);
-             INSERT INTO candidates VALUES (1);
+             INSERT INTO candidates VALUES (1, 'one'), (10000, 'last');
              INSERT INTO selected VALUES {values};"
         ))
         .expect("large setup succeeds");
@@ -723,4 +736,49 @@ fn subquery_nesting_and_materialization_are_bounded() {
     assert!(
         matches!(materialization, Error::InvalidQuery(message) if message.contains("materialization limit of 10000 rows"))
     );
+
+    let aggregate = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id IN (SELECT MAX(value) FROM selected);",
+    );
+    assert_eq!(aggregate.rows, vec![vec![Value::Int64(10_000)]]);
+
+    let grouped = database
+        .execute(
+            "SELECT id FROM candidates
+             WHERE id IN (SELECT value FROM selected GROUP BY value);",
+        )
+        .expect_err("grouped subquery state is bounded during the scan");
+    assert!(
+        matches!(grouped, Error::InvalidQuery(message) if message.contains("materialization limit of 10000 rows"))
+    );
+
+    let ordered_limit = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id IN (SELECT value FROM selected ORDER BY value DESC LIMIT 1);",
+    );
+    assert_eq!(ordered_limit.rows, vec![vec![Value::Int64(10_000)]]);
+
+    let width = database
+        .execute(
+            "SELECT id FROM candidates
+             WHERE id IN (SELECT value, value FROM selected);",
+        )
+        .expect_err("shape validation precedes oversized execution");
+    assert!(
+        matches!(width, Error::InvalidQuery(message) if message.contains("exactly one column"))
+    );
+
+    let mismatch = database
+        .execute(
+            "SELECT id FROM candidates
+             WHERE label IN (SELECT value FROM selected);",
+        )
+        .expect_err("type validation precedes oversized execution");
+    assert!(matches!(
+        mismatch,
+        Error::TypeMismatch { context, .. } if context == "IN subquery"
+    ));
 }

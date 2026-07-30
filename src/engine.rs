@@ -93,39 +93,63 @@ impl Database {
     }
 
     fn execute_select(&self, select: &Select) -> Result<QueryResult> {
-        self.execute_select_scoped(select, &[], None)
+        let plan = self.resolve_select(select, &[])?;
+        self.execute_resolved_select(select, &[], plan, None)
     }
 
-    fn execute_select_scoped<'a>(
+    fn resolve_select<'a>(
         &'a self,
         select: &Select,
         outer_tables: &[&'a Table],
-        output_bound: Option<OutputBound>,
-    ) -> Result<QueryResult> {
+    ) -> Result<ResolvedSelect<'a>> {
         let table = self.catalog.table(&select.table)?;
         validate_uncorrelated(table, select, outer_tables)?;
+        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let (items, result_columns, aggregate_specs) =
+            resolve_select_items(table, &select.items, &group_columns)?;
+        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        Ok(ResolvedSelect {
+            table,
+            group_columns,
+            items,
+            result_columns,
+            aggregate_specs,
+            ordering,
+        })
+    }
+
+    fn execute_resolved_select<'a>(
+        &'a self,
+        select: &Select,
+        outer_tables: &[&'a Table],
+        plan: ResolvedSelect<'a>,
+        output_bound: Option<OutputBound>,
+    ) -> Result<QueryResult> {
+        let ResolvedSelect {
+            table,
+            group_columns,
+            items,
+            result_columns,
+            aggregate_specs,
+            ordering,
+        } = plan;
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| self.compile_predicate(table, predicate, outer_tables))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row).is_true())
-            })
-            .collect::<Vec<_>>();
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
-
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let matching_rows = matching_rows(table, predicate.as_ref());
+            let group_limit = output_bound.map(|bound| bound.max_rows);
+            let grouped = execute_grouped(
+                table,
+                matching_rows,
+                &group_columns,
+                &aggregate_specs,
+                group_limit,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -134,11 +158,23 @@ impl Database {
                 &ordering,
                 select.limit,
             );
-            apply_output_bound(&mut selected_groups, output_bound)?;
+            apply_output_bound(&selected_groups, output_bound)?;
             grouped.project(&selected_groups, &items)
         } else {
+            let mut matching_rows = if let Some(bound) = output_bound {
+                collect_bounded_source_rows(
+                    table,
+                    predicate.as_ref(),
+                    &items,
+                    &ordering,
+                    select.limit,
+                    bound,
+                )?
+            } else {
+                matching_rows(table, predicate.as_ref()).collect::<Vec<_>>()
+            };
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            apply_output_bound(&mut matching_rows, output_bound)?;
+            apply_output_bound(&matching_rows, output_bound)?;
             execute_projection(table, &matching_rows, &items)
         };
 
@@ -146,6 +182,33 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+
+    fn execute_exists<'a>(
+        &'a self,
+        select: &Select,
+        outer_tables: &[&'a Table],
+        plan: ResolvedSelect<'a>,
+    ) -> Result<bool> {
+        let ResolvedSelect {
+            table,
+            group_columns,
+            aggregate_specs,
+            ..
+        } = plan;
+        let predicate = select
+            .predicate
+            .as_ref()
+            .map(|predicate| self.compile_predicate(table, predicate, outer_tables))
+            .transpose()?;
+
+        if select.limit == Some(0) {
+            return Ok(false);
+        }
+        if group_columns.is_empty() && !aggregate_specs.is_empty() {
+            return Ok(true);
+        }
+        Ok(matching_rows(table, predicate.as_ref()).next().is_some())
     }
 
     fn compile_predicate<'a>(
@@ -185,18 +248,14 @@ impl Database {
                 let operand = compile_operand(table, operand)?;
                 let mut scopes = outer_tables.to_vec();
                 scopes.push(table);
-                let result = self.execute_select_scoped(
-                    subquery,
-                    &scopes,
-                    Some(OutputBound::materialized()),
-                )?;
-                if result.columns.len() != 1 {
+                let plan = self.resolve_select(subquery, &scopes)?;
+                if plan.result_columns.len() != 1 {
                     return Err(Error::InvalidQuery(format!(
                         "IN subquery must return exactly one column; found {}",
-                        result.columns.len()
+                        plan.result_columns.len()
                     )));
                 }
-                let result_type = result.columns[0].data_type;
+                let result_type = plan.result_columns[0].data_type;
                 if operand
                     .data_type()
                     .is_some_and(|operand_type| !comparable(operand_type, result_type))
@@ -210,6 +269,12 @@ impl Database {
                         actual: result_type.to_string(),
                     });
                 }
+                let result = self.execute_resolved_select(
+                    subquery,
+                    &scopes,
+                    plan,
+                    Some(OutputBound::materialized()),
+                )?;
                 Ok(CompiledPredicate::InSubquery {
                     operand,
                     negated: *negated,
@@ -219,9 +284,8 @@ impl Database {
             Predicate::Exists { negated, subquery } => {
                 let mut scopes = outer_tables.to_vec();
                 scopes.push(table);
-                let result =
-                    self.execute_select_scoped(subquery, &scopes, Some(OutputBound::exists()))?;
-                let exists = !result.rows.is_empty();
+                let plan = self.resolve_select(subquery, &scopes)?;
+                let exists = self.execute_exists(subquery, &scopes, plan)?;
                 Ok(CompiledPredicate::Exists {
                     value: if *negated { !exists } else { exists },
                 })
@@ -241,36 +305,39 @@ impl Database {
 #[derive(Debug, Clone, Copy)]
 struct OutputBound {
     max_rows: usize,
-    reject_excess: bool,
 }
 
 impl OutputBound {
     fn materialized() -> Self {
         Self {
             max_rows: MAX_SUBQUERY_ROWS,
-            reject_excess: true,
-        }
-    }
-
-    fn exists() -> Self {
-        Self {
-            max_rows: 1,
-            reject_excess: false,
         }
     }
 }
 
-fn apply_output_bound(rows: &mut Vec<usize>, bound: Option<OutputBound>) -> Result<()> {
+fn apply_output_bound(rows: &[usize], bound: Option<OutputBound>) -> Result<()> {
     let Some(bound) = bound else {
         return Ok(());
     };
-    if rows.len() > bound.max_rows && bound.reject_excess {
-        return Err(Error::InvalidQuery(format!(
-            "subquery result exceeds materialization limit of {MAX_SUBQUERY_ROWS} rows"
-        )));
+    if rows.len() > bound.max_rows {
+        return Err(materialization_limit_error());
     }
-    rows.truncate(bound.max_rows);
     Ok(())
+}
+
+fn materialization_limit_error() -> Error {
+    Error::InvalidQuery(format!(
+        "subquery result exceeds materialization limit of {MAX_SUBQUERY_ROWS} rows"
+    ))
+}
+
+struct ResolvedSelect<'a> {
+    table: &'a Table,
+    group_columns: Vec<usize>,
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    ordering: Vec<ResolvedOrder>,
 }
 
 #[derive(Debug)]
@@ -436,6 +503,87 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
+fn matching_rows<'a>(
+    table: &'a Table,
+    predicate: Option<&'a CompiledPredicate>,
+) -> impl Iterator<Item = usize> + 'a {
+    (0..table.row_count()).filter(move |row| {
+        predicate.is_none_or(|predicate| predicate.evaluate(table, *row).is_true())
+    })
+}
+
+fn collect_bounded_source_rows(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+    limit: Option<usize>,
+    bound: OutputBound,
+) -> Result<Vec<usize>> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+
+    let output_is_bounded = limit.is_some_and(|limit| limit <= bound.max_rows);
+    if ordering.is_empty() {
+        let row_limit = if output_is_bounded {
+            limit.expect("bounded output has a LIMIT")
+        } else {
+            bound.max_rows
+        };
+        let mut rows = Vec::with_capacity(row_limit.min(1_024));
+        for row in matching_rows(table, predicate) {
+            if rows.len() == row_limit {
+                if output_is_bounded {
+                    break;
+                }
+                return Err(materialization_limit_error());
+            }
+            rows.push(row);
+        }
+        return Ok(rows);
+    }
+
+    if !output_is_bounded {
+        let mut rows = Vec::with_capacity(bound.max_rows.min(1_024));
+        for row in matching_rows(table, predicate) {
+            if rows.len() == bound.max_rows {
+                return Err(materialization_limit_error());
+            }
+            rows.push(row);
+        }
+        return Ok(rows);
+    }
+
+    let row_limit = limit.expect("bounded output has a LIMIT");
+    let prune_at = row_limit + row_limit.clamp(1, 1_024);
+    let mut rows = Vec::with_capacity(prune_at);
+    for row in matching_rows(table, predicate) {
+        rows.push(row);
+        if rows.len() == prune_at {
+            retain_best_source_rows(&mut rows, row_limit, table, items, ordering);
+        }
+    }
+    retain_best_source_rows(&mut rows, row_limit, table, items, ordering);
+    Ok(rows)
+}
+
+fn retain_best_source_rows(
+    rows: &mut Vec<usize>,
+    limit: usize,
+    table: &Table,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+) {
+    if rows.len() <= limit {
+        return;
+    }
+    rows.select_nth_unstable_by(limit, |left, right| {
+        compare_source_rows(*left, *right, table, items, ordering)
+    });
+    rows.truncate(limit);
+}
+
 fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
@@ -459,13 +607,18 @@ fn execute_projection(
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    matching_rows: impl Iterator<Item = usize>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    group_limit: Option<usize>,
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let initial_capacity = if group_columns.is_empty() {
+        1
+    } else {
+        group_limit.unwrap_or(table.row_count()).min(1_024)
+    };
+    let mut groups = GroupIndex::new(group_columns.len(), initial_capacity);
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -478,8 +631,11 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
+            if group_limit.is_some_and(|limit| group_count >= limit) {
+                return Err(materialization_limit_error());
+            }
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 states.push(AggregateState::new(spec));
@@ -487,7 +643,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -852,21 +1008,31 @@ fn order_source_rows(
     }
 
     sort_and_limit(rows, limit, |left, right| {
-        for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
-            };
-            let comparison = table.columns()[source].cmp_at(left, right);
-            if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
-            }
-        }
-        left.cmp(&right)
+        compare_source_rows(left, right, table, items, ordering)
     });
+}
+
+fn compare_source_rows(
+    left: usize,
+    right: usize,
+    table: &Table,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+) -> Ordering {
+    for order in ordering {
+        let ResolvedItem::Column { source, .. } = items[order.output] else {
+            unreachable!("ungrouped projections cannot contain aggregates")
+        };
+        let comparison = table.columns()[source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    left.cmp(&right)
 }
 
 fn order_grouped_rows(
