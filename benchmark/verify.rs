@@ -12,12 +12,13 @@ use crate::score::{RatioObservation, median, parity_score};
 use crate::workload::workloads;
 
 const SCHEMA_VERSION: u64 = 3;
+const SCORE_TOLERANCE: f64 = 1e-9;
 const LIMITATIONS: [&str; 2] = [
     "amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup",
     "synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression",
 ];
 
-pub struct VerifiedDetails {
+pub struct ConsistentDetails {
     pub mode: &'static str,
     pub seed: u64,
     pub case_count: usize,
@@ -25,20 +26,20 @@ pub struct VerifiedDetails {
     pub end_to_end_score: f64,
 }
 
-struct VerifiedCase {
+struct ConsistentCase {
     family: String,
     scale: usize,
     primary_ratio: f64,
     end_to_end_ratio: f64,
 }
 
-pub fn verify_details_file(path: &Path) -> Result<VerifiedDetails, String> {
+pub fn verify_details_file(path: &Path) -> Result<ConsistentDetails, String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("could not read '{}': {error}", path.display()))?;
     verify_details_json(&input)
 }
 
-fn verify_details_json(input: &str) -> Result<VerifiedDetails, String> {
+fn verify_details_json(input: &str) -> Result<ConsistentDetails, String> {
     let mut deserializer = serde_json::Deserializer::from_str(input);
     let value = StrictValue::deserialize(&mut deserializer)
         .map_err(|error| format!("details are not valid JSON: {error}"))?
@@ -96,7 +97,7 @@ fn verify_details_json(input: &str) -> Result<VerifiedDetails, String> {
     }
 
     let mut seen = BTreeSet::new();
-    let mut verified_cases = Vec::with_capacity(cases.len());
+    let mut checked_cases = Vec::with_capacity(cases.len());
     for (index, case) in cases.iter().enumerate() {
         let context = format!("details.cases[{index}]");
         let object = exact_object(
@@ -146,7 +147,7 @@ fn verify_details_json(input: &str) -> Result<VerifiedDetails, String> {
             settings.end_to_end_samples,
             &format!("{context}.end_to_end"),
         )?;
-        verified_cases.push(VerifiedCase {
+        checked_cases.push(ConsistentCase {
             family,
             scale: row_count,
             primary_ratio: primary,
@@ -165,8 +166,8 @@ fn verify_details_json(input: &str) -> Result<VerifiedDetails, String> {
         ));
     }
 
-    let primary = score(&verified_cases, |case| case.primary_ratio)?;
-    let end_to_end = score(&verified_cases, |case| case.end_to_end_ratio)?;
+    let primary = score(&checked_cases, |case| case.primary_ratio)?;
+    let end_to_end = score(&checked_cases, |case| case.end_to_end_ratio)?;
     if mode == Mode::Default && primary.saturated_cases == expected_cases.len() {
         return Err(
             "primary timing saturated: every case reached the parity cap; artifact is not acceptable"
@@ -185,14 +186,14 @@ fn verify_details_json(input: &str) -> Result<VerifiedDetails, String> {
         end_to_end.saturated_cases,
         "details",
     )?;
-    expect_f64(root, "primary_score", primary.score, "details")?;
-    expect_f64(root, "score", primary.score, "details")?;
-    expect_f64(root, "end_to_end_score", end_to_end.score, "details")?;
+    expect_score(root, "primary_score", primary.score, "details")?;
+    expect_score(root, "score", primary.score, "details")?;
+    expect_score(root, "end_to_end_score", end_to_end.score, "details")?;
 
-    Ok(VerifiedDetails {
+    Ok(ConsistentDetails {
         mode: mode.name(),
         seed,
-        case_count: verified_cases.len(),
+        case_count: checked_cases.len(),
         primary_score: primary.score,
         end_to_end_score: end_to_end.score,
     })
@@ -532,8 +533,8 @@ fn stable_median(samples: &[f64], context: &str) -> Result<f64, String> {
 }
 
 fn score(
-    cases: &[VerifiedCase],
-    ratio: impl Fn(&VerifiedCase) -> f64,
+    cases: &[ConsistentCase],
+    ratio: impl Fn(&ConsistentCase) -> f64,
 ) -> Result<crate::score::ScoreBreakdown, String> {
     let observations = cases
         .iter()
@@ -712,6 +713,25 @@ fn expect_f64(
     Ok(())
 }
 
+fn expect_score(
+    object: &Map<String, Value>,
+    key: &str,
+    expected: f64,
+    context: &str,
+) -> Result<(), String> {
+    let reported = f64_field(object, key, context)?;
+    if !scores_match(reported, expected) {
+        return Err(format!(
+            "{context}.{key} mismatch: reported {reported}, recomputed {expected}, tolerance {SCORE_TOLERANCE}"
+        ));
+    }
+    Ok(())
+}
+
+fn scores_match(reported: f64, expected: f64) -> bool {
+    (reported - expected).abs() <= SCORE_TOLERANCE
+}
+
 fn expect_string(
     object: &Map<String, Value>,
     key: &str,
@@ -742,4 +762,16 @@ fn expect_bool(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hierarchical_score_comparison_has_a_cross_platform_tolerance() {
+        let expected = 99.705_101_944_396_18;
+        assert!(scores_match(expected + SCORE_TOLERANCE / 2.0, expected));
+        assert!(!scores_match(expected + SCORE_TOLERANCE * 2.0, expected));
+    }
 }

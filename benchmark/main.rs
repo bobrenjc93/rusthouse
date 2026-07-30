@@ -3,6 +3,7 @@ mod dataset;
 mod normalize;
 mod process;
 mod score;
+#[cfg(feature = "benchmark-verifier")]
 mod verify;
 mod workload;
 
@@ -36,7 +37,8 @@ OPTIONS:
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
     --details <PATH>        Write detailed JSON without changing stdout
-    --verify-details <FILE> Verify saved details without running either engine
+    --verify-details <FILE> Check saved details consistency without running engines
+                            (requires feature benchmark-verifier)
     -h, --help              Print this help
 
 RUSTHOUSE_CLICKHOUSE_BIN supplies --clickhouse when the flag is absent.
@@ -112,28 +114,37 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(ParseResult::Verify(path)) => {
+            #[cfg(feature = "benchmark-verifier")]
             return match verify::verify_details_file(&path) {
-                Ok(verified) => {
+                Ok(checked) => {
                     let report = Report {
-                        score: verified.primary_score,
+                        score: checked.primary_score,
                         summary: format!(
-                            "Verified {} benchmark details: primary score {:.2}; startup-inclusive end-to-end score {:.2}; {} canonical cases.",
-                            verified.mode,
-                            verified.primary_score,
-                            verified.end_to_end_score,
-                            verified.case_count
+                            "Arithmetic-consistent {} benchmark details: primary score {:.2}; startup-inclusive end-to-end score {:.2}; {} canonical cases.",
+                            checked.mode,
+                            checked.primary_score,
+                            checked.end_to_end_score,
+                            checked.case_count
                         ),
-                        evidence: vec![format!(
-                            "Offline replay validated raw samples, stability gates, medians, ratios, saturation counts, and hierarchical scores for seed {} without executing either engine",
-                            verified.seed
-                        )],
+                        evidence: vec![
+                            format!(
+                                "Offline replay found the case matrix, configuration claims, raw samples, stability gates, medians, ratios, saturation counts, and hierarchical scores internally consistent for claimed seed {}",
+                                checked.seed
+                            ),
+                            "This check does not authenticate the claimed seed, paths, binaries, generated dataset, correctness outputs, or that either engine was executed".to_owned(),
+                        ],
                         suggestions: Vec::new(),
                     };
                     println!("{}", report.to_json());
                     ExitCode::SUCCESS
                 }
-                Err(error) => emit_failure(format!("details verification failed: {error}")),
+                Err(error) => emit_failure(format!("details consistency check failed: {error}")),
             };
+            #[cfg(not(feature = "benchmark-verifier"))]
+            return emit_failure(format!(
+                "details consistency checker is not enabled for '{}'; rebuild with --features benchmark-verifier",
+                path.display()
+            ));
         }
         Ok(ParseResult::Run(config)) => config,
         Err(error) => return emit_failure(error),

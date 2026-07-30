@@ -1,3 +1,5 @@
+#![cfg(feature = "benchmark-verifier")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -59,7 +61,7 @@ fn assert_rejected(details: &Value, expected_error: &str) {
 }
 
 #[test]
-fn checked_in_evidence_verifies_without_engine_executables() {
+fn checked_in_evidence_is_consistent_without_engine_executables() {
     let output = verifier(&evidence_path());
     assert!(
         output.status.success(),
@@ -74,7 +76,15 @@ fn checked_in_evidence_verifies_without_engine_executables() {
         report["summary"]
             .as_str()
             .expect("summary")
-            .contains("24 canonical cases")
+            .contains("Arithmetic-consistent default benchmark details")
+    );
+    assert!(
+        report["evidence"]
+            .as_array()
+            .expect("evidence")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|message| message.contains("does not authenticate"))
     );
 }
 
@@ -131,4 +141,75 @@ fn duplicate_json_fields_are_rejected() {
     fs::remove_file(path).expect("remove duplicate-field details");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("duplicate JSON object field"));
+}
+
+#[test]
+fn self_consistent_fabrication_is_not_claimed_as_authenticated() {
+    let mut details = read_details();
+    details["seed"] = Value::from(123_u64);
+    details["rusthouse_path"] = Value::from("/fabricated/rusthouse");
+    details["clickhouse_path"] = Value::from("/fabricated/clickhouse");
+    for case in details["cases"].as_array_mut().expect("cases") {
+        let primary = &mut case["primary"];
+        for field in [
+            "rusthouse_batch_median_ms",
+            "clickhouse_batch_median_ms",
+            "rusthouse_per_query_median_ms",
+            "clickhouse_per_query_median_ms",
+        ] {
+            scale_number(&mut primary[field], 2.0);
+        }
+        for field in [
+            "rusthouse_batch_samples_ms",
+            "clickhouse_batch_samples_ms",
+            "rusthouse_per_query_samples_ms",
+            "clickhouse_per_query_samples_ms",
+        ] {
+            for sample in primary[field].as_array_mut().expect("primary samples") {
+                scale_number(sample, 2.0);
+            }
+        }
+
+        let end_to_end = &mut case["end_to_end"];
+        for field in ["rusthouse_median_ms", "clickhouse_median_ms"] {
+            scale_number(&mut end_to_end[field], 2.0);
+        }
+        for field in ["rusthouse_samples_ms", "clickhouse_samples_ms"] {
+            for sample in end_to_end[field]
+                .as_array_mut()
+                .expect("end-to-end samples")
+            {
+                scale_number(sample, 2.0);
+            }
+        }
+    }
+    let path = temp_details(&details);
+    let output = verifier(&path);
+    fs::remove_file(path).expect("remove metadata test details");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 report");
+    assert!(stdout.contains("Arithmetic-consistent"));
+    assert!(stdout.contains("does not authenticate the claimed seed, paths, binaries"));
+}
+
+fn scale_number(value: &mut Value, factor: f64) {
+    *value = Value::from(value.as_f64().expect("number") * factor);
+}
+
+#[test]
+fn hierarchical_scores_allow_only_the_defined_rounding_tolerance() {
+    let mut within_tolerance = read_details();
+    for field in ["score", "primary_score", "end_to_end_score"] {
+        let value = within_tolerance[field].as_f64().expect("score");
+        within_tolerance[field] = Value::from(value + 0.000_000_000_5);
+    }
+    let path = temp_details(&within_tolerance);
+    let output = verifier(&path);
+    fs::remove_file(path).expect("remove score tolerance details");
+    assert!(output.status.success());
+
+    let mut outside_tolerance = read_details();
+    outside_tolerance["score"] =
+        Value::from(outside_tolerance["score"].as_f64().expect("score") + 0.000_000_002);
+    assert_rejected(&outside_tolerance, "details.score mismatch");
 }

@@ -7,9 +7,13 @@ description = "A small, understandable analytical database written in Rust"
 license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
+[features]
+default = []
+benchmark-verifier = ["dep:serde", "dep:serde_json"]
+
 [dependencies]
-serde = "1"
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", features = ["float_roundtrip"], optional = true }
 
 [[bin]]
 name = "clickhouse-parity-bench"

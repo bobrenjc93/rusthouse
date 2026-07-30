@@ -89,10 +89,12 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+The engine and default library build have no third-party dependencies. The optional `benchmark-verifier` feature enables the offline JSON consistency checker and its parser dependencies. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check
 cargo test
+cargo test --all-targets --features benchmark-verifier
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features benchmark-verifier -- -D warnings
 ~~~
