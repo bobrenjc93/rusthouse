@@ -754,6 +754,38 @@ fn subquery_nesting_and_materialization_are_bounded() {
         matches!(grouped, Error::InvalidQuery(message) if message.contains("materialization limit of 10000 rows"))
     );
 
+    let grouped_limit_zero = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE id IN (SELECT value FROM selected GROUP BY value LIMIT 0);",
+    );
+    assert!(grouped_limit_zero.rows.is_empty());
+
+    let exists_limit_zero = execute_query(
+        &mut database,
+        "SELECT id FROM candidates
+         WHERE EXISTS (
+             SELECT value FROM selected
+             WHERE value IN (SELECT value FROM selected)
+             LIMIT 0
+         );",
+    );
+    assert!(exists_limit_zero.rows.is_empty());
+
+    let invalid_nested_shape = database
+        .execute(
+            "SELECT id FROM candidates
+             WHERE EXISTS (
+                 SELECT value FROM selected
+                 WHERE value IN (SELECT value, value FROM selected)
+                 LIMIT 0
+             );",
+        )
+        .expect_err("LIMIT 0 still performs static nested validation");
+    assert!(
+        matches!(invalid_nested_shape, Error::InvalidQuery(message) if message.contains("exactly one column"))
+    );
+
     let ordered_limit = execute_query(
         &mut database,
         "SELECT id FROM candidates

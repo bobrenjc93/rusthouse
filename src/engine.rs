@@ -108,6 +108,9 @@ impl Database {
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        if let Some(predicate) = &select.predicate {
+            self.validate_predicate(table, predicate, outer_tables)?;
+        }
         Ok(ResolvedSelect {
             table,
             group_columns,
@@ -133,6 +136,12 @@ impl Database {
             aggregate_specs,
             ordering,
         } = plan;
+        if select.limit == Some(0) {
+            return Ok(QueryResult {
+                columns: result_columns,
+                rows: Vec::new(),
+            });
+        }
         let predicate = select
             .predicate
             .as_ref()
@@ -190,6 +199,9 @@ impl Database {
         outer_tables: &[&'a Table],
         plan: ResolvedSelect<'a>,
     ) -> Result<bool> {
+        if select.limit == Some(0) {
+            return Ok(false);
+        }
         let ResolvedSelect {
             table,
             group_columns,
@@ -202,13 +214,72 @@ impl Database {
             .map(|predicate| self.compile_predicate(table, predicate, outer_tables))
             .transpose()?;
 
-        if select.limit == Some(0) {
-            return Ok(false);
-        }
         if group_columns.is_empty() && !aggregate_specs.is_empty() {
             return Ok(true);
         }
         Ok(matching_rows(table, predicate.as_ref()).next().is_some())
+    }
+
+    fn validate_predicate<'a>(
+        &'a self,
+        table: &'a Table,
+        predicate: &Predicate,
+        outer_tables: &[&'a Table],
+    ) -> Result<()> {
+        match predicate {
+            Predicate::Comparison { left, right, .. } => {
+                let left = compile_operand(table, left)?;
+                let right = compile_operand(table, right)?;
+                if let (Some(left_type), Some(right_type)) = (left.data_type(), right.data_type())
+                    && !comparable(left_type, right_type)
+                {
+                    return Err(Error::TypeMismatch {
+                        context: "WHERE comparison".to_owned(),
+                        expected: left_type.to_string(),
+                        actual: right_type.to_string(),
+                    });
+                }
+                Ok(())
+            }
+            Predicate::InSubquery {
+                operand, subquery, ..
+            } => {
+                let operand = compile_operand(table, operand)?;
+                let mut scopes = outer_tables.to_vec();
+                scopes.push(table);
+                let plan = self.resolve_select(subquery, &scopes)?;
+                if plan.result_columns.len() != 1 {
+                    return Err(Error::InvalidQuery(format!(
+                        "IN subquery must return exactly one column; found {}",
+                        plan.result_columns.len()
+                    )));
+                }
+                let result_type = plan.result_columns[0].data_type;
+                if operand
+                    .data_type()
+                    .is_some_and(|operand_type| !comparable(operand_type, result_type))
+                {
+                    return Err(Error::TypeMismatch {
+                        context: "IN subquery".to_owned(),
+                        expected: operand
+                            .data_type()
+                            .expect("non-null operand type was checked")
+                            .to_string(),
+                        actual: result_type.to_string(),
+                    });
+                }
+                Ok(())
+            }
+            Predicate::Exists { subquery, .. } => {
+                let mut scopes = outer_tables.to_vec();
+                scopes.push(table);
+                self.resolve_select(subquery, &scopes).map(|_| ())
+            }
+            Predicate::And(left, right) | Predicate::Or(left, right) => {
+                self.validate_predicate(table, left, outer_tables)?;
+                self.validate_predicate(table, right, outer_tables)
+            }
+        }
     }
 
     fn compile_predicate<'a>(
