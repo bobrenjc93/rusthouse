@@ -652,6 +652,41 @@ fn ctas_rejects_ambiguous_names_and_source_overflow_before_catalog_mutation() {
 }
 
 #[test]
+fn ctas_requires_addressable_names_for_unaliased_aggregates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64);
+             INSERT INTO events VALUES (1), (2);",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute("CREATE TABLE unaddressable AS SELECT COUNT(*) FROM events;")
+        .expect_err("an aggregate display label is not a SQL identifier");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message.contains("COUNT(*)") && message.contains("add an AS alias")
+    ));
+    assert!(matches!(
+        database.catalog().table("unaddressable"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    database
+        .execute(
+            "CREATE TABLE event_counts AS
+             SELECT COUNT(*) AS event_count FROM events;",
+        )
+        .expect("an aliased aggregate CTAS succeeds");
+    assert_eq!(
+        execute_query(&mut database, "SELECT event_count FROM event_counts;").rows,
+        vec![vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
 fn insert_select_reorders_columns_reports_rows_and_uses_a_source_snapshot() {
     let mut database = Database::new();
     database

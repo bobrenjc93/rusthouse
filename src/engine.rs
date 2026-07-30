@@ -71,6 +71,7 @@ impl Database {
             }
             Statement::CreateTableAs { name, select } => {
                 let result = self.execute_select(select)?;
+                validate_ctas_column_names(&result.columns)?;
                 let schema = result
                     .columns
                     .into_iter()
@@ -172,6 +173,24 @@ impl Database {
             rows,
         })
     }
+}
+
+fn validate_ctas_column_names(columns: &[ResultColumn]) -> Result<()> {
+    for column in columns {
+        let mut characters = column.name.chars();
+        let valid_start = characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic() || character == '_');
+        if !valid_start
+            || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(Error::InvalidQuery(format!(
+                "CREATE TABLE AS output column '{}' is not a valid SQL identifier; add an AS alias",
+                column.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_insert_rows(
