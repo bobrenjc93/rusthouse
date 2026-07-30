@@ -524,3 +524,212 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn materialized_view_backfills_every_aggregate_and_is_queryable_as_a_table() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES
+                ('west', 10), ('east', 4), ('west', 20);
+             CREATE MATERIALIZED VIEW regional_sales AS
+                SELECT region,
+                       COUNT(*) AS orders,
+                       SUM(amount) AS total,
+                       MIN(amount) AS low,
+                       MAX(amount) AS high,
+                       AVG(amount) AS mean
+                FROM sales
+                GROUP BY region;",
+        )
+        .expect("view creation backfills existing rows");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT * FROM regional_sales ORDER BY region;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("east".to_owned()),
+                Value::Int64(1),
+                Value::Int64(4),
+                Value::Int64(4),
+                Value::Int64(4),
+                Value::Float64(4.0),
+            ],
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(2),
+                Value::Int64(30),
+                Value::Int64(10),
+                Value::Int64(20),
+                Value::Float64(15.0),
+            ],
+        ]
+    );
+    assert_eq!(
+        database
+            .catalog()
+            .table("REGIONAL_SALES")
+            .expect("view is catalog-visible")
+            .row_count(),
+        2
+    );
+}
+
+#[test]
+fn projection_views_filter_future_appends_and_reject_direct_inserts() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String, active Bool);
+             INSERT INTO events VALUES
+                (1, 'kept', true), (2, 'ignored', false);
+             CREATE MATERIALIZED VIEW active_events AS
+                SELECT id, label FROM events WHERE active = true;
+             INSERT INTO events VALUES
+                (3, 'also kept', true), (4, 'also ignored', false);",
+        )
+        .expect("projection view is maintained");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT label, id FROM active_events ORDER BY id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::String("kept".to_owned()), Value::Int64(1)],
+            vec![Value::String("also kept".to_owned()), Value::Int64(3)],
+        ]
+    );
+
+    let error = database
+        .execute("INSERT INTO active_events VALUES (5, 'not allowed');")
+        .expect_err("views are append-only through their source");
+    assert!(
+        matches!(error, Error::InvalidQuery(message) if message.contains("cannot insert into materialized view"))
+    );
+}
+
+#[test]
+fn empty_materialized_views_initialize_global_state_and_add_new_groups() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE readings (sensor String, value Int64);
+             CREATE MATERIALIZED VIEW sensor_rollup AS
+                SELECT sensor, COUNT(*) AS samples, AVG(value) AS mean
+                FROM readings GROUP BY sensor;
+             CREATE MATERIALIZED VIEW all_readings AS
+                SELECT COUNT(*) AS samples, SUM(value) AS total FROM readings;",
+        )
+        .expect("empty views can be created");
+
+    let grouped = execute_query(&mut database, "SELECT * FROM sensor_rollup;");
+    assert!(grouped.rows.is_empty());
+    let global = execute_query(&mut database, "SELECT * FROM all_readings;");
+    assert_eq!(global.rows, vec![vec![Value::Int64(0), Value::Int64(0)]]);
+
+    database
+        .execute(
+            "INSERT INTO readings VALUES
+                ('alpha', 3), ('beta', 8), ('alpha', 7);",
+        )
+        .expect("new groups update both views");
+    let grouped = execute_query(
+        &mut database,
+        "SELECT * FROM sensor_rollup ORDER BY sensor;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Int64(2),
+                Value::Float64(5.0),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Int64(1),
+                Value::Float64(8.0),
+            ],
+        ]
+    );
+    let global = execute_query(&mut database, "SELECT * FROM all_readings;");
+    assert_eq!(global.rows, vec![vec![Value::Int64(3), Value::Int64(18)]]);
+}
+
+#[test]
+fn aggregate_overflow_rolls_back_source_and_every_dependent_view() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE counters (value Int64);
+             INSERT INTO counters VALUES (9223372036854775807);
+             CREATE MATERIALIZED VIEW counter_sum AS
+                SELECT SUM(value) AS total FROM counters;
+             CREATE MATERIALIZED VIEW counter_count AS
+                SELECT COUNT(*) AS samples FROM counters;",
+        )
+        .expect("setup succeeds");
+
+    let error = database
+        .execute("INSERT INTO counters VALUES (1), (2);")
+        .expect_err("incremental sum overflows");
+    assert_eq!(error, Error::NumericOverflow("SUM(Int64)".to_owned()));
+
+    let source = execute_query(&mut database, "SELECT COUNT(*) AS samples FROM counters;");
+    assert_eq!(source.rows, vec![vec![Value::Int64(1)]]);
+    let sum = execute_query(&mut database, "SELECT * FROM counter_sum;");
+    assert_eq!(sum.rows, vec![vec![Value::Int64(i64::MAX)]]);
+    let count = execute_query(&mut database, "SELECT * FROM counter_count;");
+    assert_eq!(count.rows, vec![vec![Value::Int64(1)]]);
+
+    database
+        .execute("INSERT INTO counters VALUES (-1);")
+        .expect("state remains usable after rollback");
+    let sum = execute_query(&mut database, "SELECT * FROM counter_sum;");
+    assert_eq!(sum.rows, vec![vec![Value::Int64(i64::MAX - 1)]]);
+}
+
+#[test]
+fn batched_incremental_results_equal_a_fresh_grouped_recomputation() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (bucket String, value Int64);
+             CREATE MATERIALIZED VIEW sample_rollup AS
+                SELECT bucket,
+                       COUNT(*) AS samples,
+                       SUM(value) AS total,
+                       MIN(value) AS low,
+                       MAX(value) AS high,
+                       AVG(value) AS mean
+                FROM samples GROUP BY bucket;
+             INSERT INTO samples VALUES
+                ('a', 9007199254740993), ('b', 8), ('a', 1);
+             INSERT INTO samples VALUES
+                ('c', -3), ('a', -9007199254740993), ('b', 4), ('c', 9);",
+        )
+        .expect("batched inserts maintain the view");
+
+    let materialized = execute_query(
+        &mut database,
+        "SELECT * FROM sample_rollup ORDER BY bucket;",
+    );
+    let recomputed = execute_query(
+        &mut database,
+        "SELECT bucket,
+                COUNT(*) AS samples,
+                SUM(value) AS total,
+                MIN(value) AS low,
+                MAX(value) AS high,
+                AVG(value) AS mean
+         FROM samples GROUP BY bucket ORDER BY bucket;",
+    );
+    assert_eq!(materialized, recomputed);
+}

@@ -36,6 +36,32 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.tables.contains_key(&normalize(name))
+    }
+
+    pub(crate) fn insert_table(&mut self, table: Table) -> Result<()> {
+        let key = normalize(table.name());
+        if self.tables.contains_key(&key) {
+            return Err(Error::TableAlreadyExists(table.name().to_owned()));
+        }
+        self.tables.insert(key, table);
+        Ok(())
+    }
+
+    /// Replaces a staged set only after verifying that every relation exists.
+    pub(crate) fn replace_tables(&mut self, tables: Vec<Table>) -> Result<()> {
+        for table in &tables {
+            if !self.tables.contains_key(&normalize(table.name())) {
+                return Err(Error::TableNotFound(table.name().to_owned()));
+            }
+        }
+        for table in tables {
+            self.tables.insert(normalize(table.name()), table);
+        }
+        Ok(())
+    }
 }
 
 fn normalize(identifier: &str) -> String {

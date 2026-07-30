@@ -11,6 +11,10 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    CreateMaterializedView {
+        name: String,
+        select: Select,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -384,6 +388,15 @@ impl Parser {
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
+        if self.eat_keyword("MATERIALIZED") {
+            self.expect_keyword("VIEW")?;
+            let name = self.expect_identifier("materialized view name")?;
+            self.expect_keyword("AS")?;
+            self.expect_keyword("SELECT")?;
+            let select = self.parse_select()?;
+            return Ok(Statement::CreateMaterializedView { name, select });
+        }
+
         self.expect_keyword("TABLE")?;
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
@@ -782,6 +795,23 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_materialized_view_definition() {
+        let statements = parse(
+            "CREATE MATERIALIZED VIEW totals AS
+             SELECT region, SUM(amount) AS total FROM sales GROUP BY region",
+        )
+        .expect("valid materialized view");
+
+        let Statement::CreateMaterializedView { name, select } = &statements[0] else {
+            panic!("expected materialized view");
+        };
+        assert_eq!(name, "totals");
+        assert_eq!(select.table, "sales");
+        assert_eq!(select.group_by, ["region"]);
+        assert_eq!(select.items.len(), 2);
     }
 
     #[test]

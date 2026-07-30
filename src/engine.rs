@@ -7,13 +7,14 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    materialized_views: HashMap<String, MaterializedView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,25 +70,99 @@ impl Database {
                     affected_rows: 0,
                 })
             }
-            Statement::Insert { table, rows } => {
-                let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
-                let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+            Statement::CreateMaterializedView { name, select } => {
+                self.create_materialized_view(name, select)?;
                 Ok(StatementResult::Command {
-                    tag: "INSERT",
-                    affected_rows,
+                    tag: "CREATE MATERIALIZED VIEW",
+                    affected_rows: 0,
                 })
             }
+            Statement::Insert { table, rows } => self.execute_insert(table, rows),
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
+    }
+
+    fn create_materialized_view(&mut self, name: String, select: Select) -> Result<()> {
+        if self.catalog.contains(&name) {
+            return Err(Error::TableAlreadyExists(name));
+        }
+        if self
+            .materialized_views
+            .contains_key(&normalize_identifier(&select.table))
+        {
+            return Err(Error::InvalidQuery(
+                "a materialized view must read from a base table".to_owned(),
+            ));
+        }
+
+        let (view, table) = {
+            let source = self.catalog.table(&select.table)?;
+            MaterializedView::build(name, source, &select)?
+        };
+        let key = normalize_identifier(table.name());
+        self.catalog.insert_table(table)?;
+        self.materialized_views.insert(key, view);
+        Ok(())
+    }
+
+    fn execute_insert(&mut self, table: String, rows: Vec<Vec<Value>>) -> Result<StatementResult> {
+        if self
+            .materialized_views
+            .contains_key(&normalize_identifier(&table))
+        {
+            return Err(Error::InvalidQuery(format!(
+                "cannot insert into materialized view '{table}'; insert into its source table"
+            )));
+        }
+
+        let affected_rows = rows.len();
+        let mut staged_source = {
+            let source = self.catalog.table(&table)?;
+            for row in &rows {
+                source.validate_row(row)?;
+            }
+            source.clone()
+        };
+        let first_new_row = staged_source.row_count();
+        for row in rows {
+            staged_source.insert_row(row)?;
+        }
+
+        let source_key = normalize_identifier(staged_source.name());
+        let dependent_views = self
+            .materialized_views
+            .iter()
+            .filter(|(_, view)| view.source == source_key)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut staged_views = Vec::with_capacity(dependent_views.len());
+        for key in dependent_views {
+            let mut view = self.materialized_views[&key].clone();
+            let mut view_table = self.catalog.table(&key)?.clone();
+            view.apply_rows(
+                &staged_source,
+                first_new_row..staged_source.row_count(),
+                &mut view_table,
+            )?;
+            staged_views.push((key, view, view_table));
+        }
+
+        let mut staged_tables = Vec::with_capacity(staged_views.len() + 1);
+        let mut staged_view_states = Vec::with_capacity(staged_views.len());
+        staged_tables.push(staged_source);
+        for (key, view, table) in staged_views {
+            staged_tables.push(table);
+            staged_view_states.push((key, view));
+        }
+        self.catalog.replace_tables(staged_tables)?;
+        for (key, view) in staged_view_states {
+            self.materialized_views.insert(key, view);
+        }
+
+        Ok(StatementResult::Command {
+            tag: "INSERT",
+            affected_rows,
+        })
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
@@ -135,7 +210,222 @@ impl Database {
     }
 }
 
-#[derive(Debug)]
+fn normalize_identifier(identifier: &str) -> String {
+    identifier.to_ascii_lowercase()
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedView {
+    source: String,
+    maintenance: ViewMaintenance,
+}
+
+impl MaterializedView {
+    fn build(name: String, source: &Table, select: &Select) -> Result<(Self, Table)> {
+        if !select.order_by.is_empty() || select.limit.is_some() {
+            return Err(Error::InvalidQuery(
+                "materialized view definitions do not support ORDER BY or LIMIT".to_owned(),
+            ));
+        }
+
+        let predicate = select
+            .predicate
+            .as_ref()
+            .map(|predicate| compile_predicate(source, predicate))
+            .transpose()?;
+        let group_columns = resolve_group_columns(source, &select.group_by)?;
+        let (items, result_columns, aggregate_specs) =
+            resolve_select_items(source, &select.items, &group_columns)?;
+        let schema = result_columns
+            .into_iter()
+            .map(|column| ColumnDef {
+                name: column.name,
+                data_type: column.data_type,
+            })
+            .collect();
+        let mut table = Table::new(name, schema)?;
+
+        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        let maintenance = if grouped {
+            ViewMaintenance::Aggregate(AggregateView::new(
+                items,
+                group_columns,
+                aggregate_specs,
+                predicate,
+            ))
+        } else {
+            let columns = items
+                .into_iter()
+                .map(|item| match item {
+                    ResolvedItem::Column { source, .. } => source,
+                    ResolvedItem::Aggregate { .. } => {
+                        unreachable!("projection plan contains no aggregate")
+                    }
+                })
+                .collect();
+            ViewMaintenance::Projection { columns, predicate }
+        };
+        let mut view = Self {
+            source: normalize_identifier(source.name()),
+            maintenance,
+        };
+        view.apply_rows(source, 0..source.row_count(), &mut table)?;
+        Ok((view, table))
+    }
+
+    fn apply_rows(
+        &mut self,
+        source: &Table,
+        rows: std::ops::Range<usize>,
+        table: &mut Table,
+    ) -> Result<()> {
+        match &mut self.maintenance {
+            ViewMaintenance::Projection { columns, predicate } => {
+                for row in rows {
+                    if predicate
+                        .as_ref()
+                        .is_some_and(|predicate| !predicate.evaluate(source, row))
+                    {
+                        continue;
+                    }
+                    let projected = columns
+                        .iter()
+                        .map(|column| source.columns()[*column].value(row))
+                        .collect();
+                    table.insert_row(projected)?;
+                }
+                Ok(())
+            }
+            ViewMaintenance::Aggregate(aggregate) => aggregate.apply_rows(source, rows, table),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ViewMaintenance {
+    Projection {
+        columns: Vec<usize>,
+        predicate: Option<CompiledPredicate>,
+    },
+    Aggregate(AggregateView),
+}
+
+#[derive(Debug, Clone)]
+struct AggregateView {
+    items: Vec<ResolvedItem>,
+    group_columns: Vec<usize>,
+    aggregate_specs: Vec<AggregateSpec>,
+    predicate: Option<CompiledPredicate>,
+    groups: HashMap<Box<[Value]>, usize>,
+    keys: Vec<Box<[Value]>>,
+    states: Vec<Vec<AggregateState>>,
+}
+
+impl AggregateView {
+    fn new(
+        items: Vec<ResolvedItem>,
+        group_columns: Vec<usize>,
+        aggregate_specs: Vec<AggregateSpec>,
+        predicate: Option<CompiledPredicate>,
+    ) -> Self {
+        let mut view = Self {
+            items,
+            group_columns,
+            aggregate_specs,
+            predicate,
+            groups: HashMap::new(),
+            keys: Vec::new(),
+            states: Vec::new(),
+        };
+        if view.group_columns.is_empty() {
+            view.insert_group(Vec::new());
+        }
+        view
+    }
+
+    fn apply_rows(
+        &mut self,
+        source: &Table,
+        rows: std::ops::Range<usize>,
+        table: &mut Table,
+    ) -> Result<()> {
+        let mut touched = vec![false; self.states.len()];
+        for row in rows {
+            if self
+                .predicate
+                .as_ref()
+                .is_some_and(|predicate| !predicate.evaluate(source, row))
+            {
+                continue;
+            }
+            let key = self
+                .group_columns
+                .iter()
+                .map(|column| source.columns()[*column].value(row))
+                .collect::<Vec<_>>();
+            let group = if let Some(group) = self.groups.get(key.as_slice()) {
+                *group
+            } else {
+                let group = self.insert_group(key);
+                touched.push(false);
+                group
+            };
+            for (state, spec) in self.states[group].iter_mut().zip(&self.aggregate_specs) {
+                state.update(spec, source, row)?;
+            }
+            touched[group] = true;
+        }
+
+        if self.group_columns.is_empty() && table.row_count() == 0 {
+            touched[0] = true;
+        }
+        for (group, touched) in touched.into_iter().enumerate() {
+            if touched {
+                let row = self.render_group(group)?;
+                if group < table.row_count() {
+                    table.replace_row(group, row)?;
+                } else {
+                    debug_assert_eq!(group, table.row_count());
+                    table.insert_row(row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_group(&mut self, key: Vec<Value>) -> usize {
+        let group = self.states.len();
+        let key = key.into_boxed_slice();
+        self.groups.insert(key.clone(), group);
+        self.keys.push(key);
+        self.states.push(
+            self.aggregate_specs
+                .iter()
+                .map(AggregateState::new)
+                .collect(),
+        );
+        group
+    }
+
+    fn render_group(&self, group: usize) -> Result<Vec<Value>> {
+        self.items
+            .iter()
+            .map(|item| match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => Ok(self.keys[group][*position].clone()),
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => self.states[group][*state].finish(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 enum ResolvedItem {
     Column {
         source: usize,
@@ -359,7 +649,7 @@ fn execute_grouped<'a>(
         .map(|states| {
             states
                 .into_iter()
-                .map(AggregateState::finish)
+                .map(|state| state.finish())
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -521,7 +811,7 @@ impl GroupedData<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum AggregateState {
     Count(i64),
     SumInt(i64),
@@ -624,15 +914,15 @@ impl AggregateState {
         Ok(())
     }
 
-    fn finish(self) -> Result<Value> {
+    fn finish(&self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
-            Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
-            Self::AvgInt { sum, count } if count > 0 => {
-                Ok(Value::Float64(sum as f64 / count as f64))
+            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(*value)),
+            Self::SumFloat(value) => Ok(Value::Float64(*value)),
+            Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value.clone()),
+            Self::AvgInt { sum, count } if *count > 0 => {
+                Ok(Value::Float64(*sum as f64 / *count as f64))
             }
-            Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
+            Self::AvgFloat { sum, count } if *count > 0 => Ok(Value::Float64(*sum / *count as f64)),
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),
@@ -767,7 +1057,7 @@ fn sort_and_limit(
     indices.sort_unstable_by(|left, right| compare(*left, *right));
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompiledPredicate {
     Comparison {
         left: CompiledOperand,
@@ -806,7 +1096,7 @@ impl CompiledPredicate {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompiledOperand {
     Column { index: usize, data_type: DataType },
     Literal(Value),

@@ -86,6 +86,16 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn set(&mut self, row: usize, value: Value) {
+        match (self, value) {
+            (Self::Int64(values), Value::Int64(value)) => values[row] = value,
+            (Self::Float64(values), Value::Float64(value)) => values[row] = value,
+            (Self::Bool(values), Value::Bool(value)) => values[row] = value,
+            (Self::String(values), Value::String(value)) => values[row] = value,
+            _ => unreachable!("values are validated before replacement"),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -196,6 +206,16 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Validates a complete row before replacing its values in place.
+    pub(crate) fn replace_row(&mut self, index: usize, row: Vec<Value>) -> Result<()> {
+        self.validate_row(&row)?;
+        debug_assert!(index < self.row_count);
+        for (column, value) in self.columns.iter_mut().zip(row) {
+            column.set(index, value);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +260,21 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn replaces_a_validated_row_without_changing_column_lengths() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("old".to_owned())])
+            .expect("valid row");
+
+        table
+            .replace_row(0, vec![Value::Int64(9), Value::String("new".to_owned())])
+            .expect("valid replacement");
+
+        assert_eq!(table.row_count(), 1);
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[9]));
+        assert!(matches!(&table.columns()[1], Column::String(v) if v == &["new"]));
     }
 }
