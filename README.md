@@ -8,6 +8,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
+- bounded IN/NOT IN lists, inclusive BETWEEN/NOT BETWEEN ranges, and String LIKE/NOT LIKE
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
@@ -16,6 +17,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+`LIKE` uses `%` for any sequence and `_` for one character. Use an explicit single-character escape when a wildcard should be literal, for example `label LIKE '100!%%' ESCAPE '!'`. `IN ()` is supported and is always false; `NOT IN ()` is always true.
 
 ## CLI
 
@@ -83,7 +86,7 @@ assert_eq!(result.rows.len(), 1);
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+To keep predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total predicate/boolean AST nodes. An `IN` list accepts at most 1,024 values and a decoded `LIKE` pattern at most 4,096 UTF-8 bytes. Queries over these limits return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

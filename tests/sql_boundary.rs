@@ -524,3 +524,279 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn bounded_predicates_compose_with_grouping_ordering_and_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE items (id Int64, category String, label String);
+             INSERT INTO items VALUES
+                (1, 'a', 'alpha'),
+                (2, 'a', 'beta'),
+                (3, 'b', 'gamma'),
+                (4, 'b', 'delta'),
+                (5, 'b', 'omega');",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT category, COUNT(*) AS rows, SUM(id) AS total
+         FROM items
+         WHERE id IN (1, 1, 2) OR id BETWEEN 4 AND 5 AND label NOT LIKE 'om%'
+         GROUP BY category
+         ORDER BY total DESC
+         LIMIT 2;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("b".to_owned()),
+                Value::Int64(1),
+                Value::Int64(4),
+            ],
+            vec![
+                Value::String("a".to_owned()),
+                Value::Int64(2),
+                Value::Int64(3),
+            ],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT id FROM items
+         WHERE (id IN (1, 2) OR id BETWEEN 4 AND 5) AND label LIKE '%a'
+         ORDER BY id DESC;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![Value::Int64(5)],
+            vec![Value::Int64(4)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(1)],
+        ]
+    );
+}
+
+#[test]
+fn empty_and_duplicate_in_lists_have_bounded_set_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numbers (id Int64);
+             INSERT INTO numbers VALUES (1), (2), (3);",
+        )
+        .expect("setup succeeds");
+
+    assert!(
+        execute_query(&mut database, "SELECT id FROM numbers WHERE id IN ();")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM numbers WHERE id NOT IN () ORDER BY id;",
+        )
+        .rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id FROM numbers WHERE id IN (2, 2.0, 2, 3) ORDER BY id;",
+        )
+        .rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn in_and_between_preserve_exact_mixed_numeric_boundaries() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE exact_numbers (id Int64);
+             INSERT INTO exact_numbers VALUES
+                (-9223372036854775808),
+                (9007199254740992),
+                (9007199254740993),
+                (9223372036854775807);",
+        )
+        .expect("setup succeeds");
+
+    let in_set = execute_query(
+        &mut database,
+        "SELECT id FROM exact_numbers
+         WHERE id IN (
+            -9223372036854775808.0,
+            9007199254740992.0,
+            9223372036854775808.0
+         )
+         ORDER BY id;",
+    );
+    assert_eq!(
+        in_set.rows,
+        vec![
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Int64(9_007_199_254_740_992)],
+        ]
+    );
+
+    let singleton_range = execute_query(
+        &mut database,
+        "SELECT id FROM exact_numbers
+         WHERE id BETWEEN 9007199254740992.0 AND 9007199254740992.0;",
+    );
+    assert_eq!(
+        singleton_range.rows,
+        vec![vec![Value::Int64(9_007_199_254_740_992)]]
+    );
+
+    let inclusive_range = execute_query(
+        &mut database,
+        "SELECT id FROM exact_numbers
+         WHERE id NOT BETWEEN 9007199254740993 AND 9223372036854775807
+         ORDER BY id;",
+    );
+    assert_eq!(
+        inclusive_range.rows,
+        vec![
+            vec![Value::Int64(i64::MIN)],
+            vec![Value::Int64(9_007_199_254_740_992)],
+        ]
+    );
+}
+
+#[test]
+fn like_supports_wildcards_negation_and_explicit_escaping() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE patterns (id Int64, label String);
+             INSERT INTO patterns VALUES
+                (1, '100% done'),
+                (2, 'a_b'),
+                (3, 'a!b'),
+                (4, 'axb'),
+                (5, 'plain');",
+        )
+        .expect("setup succeeds");
+
+    let escaped = execute_query(
+        &mut database,
+        "SELECT id FROM patterns
+         WHERE label LIKE '100!%%' ESCAPE '!'
+            OR label LIKE 'a!_b' ESCAPE '!'
+            OR label LIKE 'a!!b' ESCAPE '!'
+         ORDER BY id;",
+    );
+    assert_eq!(
+        escaped.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+
+    let wildcard = execute_query(
+        &mut database,
+        "SELECT id FROM patterns WHERE label LIKE 'a_b' ORDER BY id;",
+    );
+    assert_eq!(
+        wildcard.rows,
+        vec![
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ]
+    );
+
+    let negated = execute_query(
+        &mut database,
+        "SELECT id FROM patterns
+         WHERE label NOT LIKE '%!%%' ESCAPE '!'
+         ORDER BY id LIMIT 2;",
+    );
+    assert_eq!(
+        negated.rows,
+        vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn wildcard_matching_handles_long_adversarial_inputs_iteratively() {
+    let value = format!("{}z", "a".repeat(50_000));
+    let pattern = format!("{}z", "%".repeat(4_095));
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE long_patterns (label String);")
+        .expect("create succeeds");
+    database
+        .execute(&format!("INSERT INTO long_patterns VALUES ('{value}');"))
+        .expect("insert succeeds");
+
+    let result = execute_query(
+        &mut database,
+        &format!("SELECT label FROM long_patterns WHERE label LIKE '{pattern}';"),
+    );
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn bounded_predicates_reject_invalid_types_and_escapes() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE typed_predicates (id Int64, label String);")
+        .expect("create succeeds");
+
+    for (sql, expected_context) in [
+        (
+            "SELECT id FROM typed_predicates WHERE id IN (1, 'two');",
+            "WHERE IN list value 2",
+        ),
+        (
+            "SELECT id FROM typed_predicates WHERE id BETWEEN 1 AND 'two';",
+            "WHERE BETWEEN upper bound",
+        ),
+        (
+            "SELECT id FROM typed_predicates WHERE id LIKE '%';",
+            "WHERE LIKE operand",
+        ),
+    ] {
+        let error = database.execute(sql).expect_err("types are incompatible");
+        assert!(
+            matches!(error, Error::TypeMismatch { context, .. } if context == expected_context)
+        );
+    }
+
+    let dangling_escape = database
+        .execute("SELECT id FROM typed_predicates WHERE label LIKE 'abc!' ESCAPE '!';")
+        .expect_err("escape must quote a pattern character");
+    assert!(matches!(
+        dangling_escape,
+        Error::InvalidQuery(message) if message.contains("ends with its escape character")
+    ));
+
+    for escape in ["''", "'ab'"] {
+        let error = database
+            .execute(&format!(
+                "SELECT id FROM typed_predicates WHERE label LIKE '%' ESCAPE {escape};"
+            ))
+            .expect_err("escape is not exactly one character");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("ESCAPE must be exactly one character")
+        ));
+    }
+}

@@ -774,6 +774,22 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    InList {
+        operand: CompiledOperand,
+        values: CompiledSet,
+        negated: bool,
+    },
+    Between {
+        operand: CompiledOperand,
+        lower: CompiledOperand,
+        upper: CompiledOperand,
+        negated: bool,
+    },
+    Like {
+        operand: CompiledOperand,
+        pattern: LikePattern,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -800,9 +816,152 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
+            Self::InList {
+                operand,
+                values,
+                negated,
+            } => values.contains(operand.value(table, row)) != *negated,
+            Self::Between {
+                operand,
+                lower,
+                upper,
+                negated,
+            } => {
+                let value = operand.value(table, row);
+                let in_range = lower
+                    .value(table, row)
+                    .sql_cmp(value)
+                    .is_some_and(|ordering| ordering != Ordering::Greater)
+                    && value
+                        .sql_cmp(upper.value(table, row))
+                        .is_some_and(|ordering| ordering != Ordering::Greater);
+                in_range != *negated
+            }
+            Self::Like {
+                operand,
+                pattern,
+                negated,
+            } => {
+                let ValueRef::String(value) = operand.value(table, row) else {
+                    unreachable!("LIKE operand type is validated")
+                };
+                pattern.matches(value) != *negated
+            }
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
+    }
+}
+
+#[derive(Debug)]
+struct CompiledSet {
+    values: Vec<Value>,
+}
+
+impl CompiledSet {
+    fn new(mut values: Vec<Value>) -> Self {
+        values.sort_by(|left, right| {
+            left.as_ref()
+                .sql_cmp(right.as_ref())
+                .expect("IN list value types are validated")
+        });
+        values
+            .dedup_by(|left, right| left.as_ref().sql_cmp(right.as_ref()) == Some(Ordering::Equal));
+        Self { values }
+    }
+
+    fn contains(&self, value: ValueRef<'_>) -> bool {
+        self.values
+            .binary_search_by(|candidate| {
+                candidate
+                    .as_ref()
+                    .sql_cmp(value)
+                    .expect("IN list value types are validated")
+            })
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikeToken {
+    Literal(char),
+    AnyOne,
+    AnyMany,
+}
+
+#[derive(Debug)]
+struct LikePattern {
+    tokens: Vec<LikeToken>,
+}
+
+impl LikePattern {
+    fn compile(pattern: &str, escape: Option<char>) -> Result<Self> {
+        let mut tokens = Vec::with_capacity(pattern.chars().count());
+        let mut characters = pattern.chars();
+        while let Some(character) = characters.next() {
+            if escape == Some(character) {
+                let literal = characters.next().ok_or_else(|| {
+                    Error::InvalidQuery("LIKE pattern ends with its escape character".to_owned())
+                })?;
+                tokens.push(LikeToken::Literal(literal));
+            } else {
+                match character {
+                    '%' => {
+                        if tokens.last() != Some(&LikeToken::AnyMany) {
+                            tokens.push(LikeToken::AnyMany);
+                        }
+                    }
+                    '_' => tokens.push(LikeToken::AnyOne),
+                    literal => tokens.push(LikeToken::Literal(literal)),
+                }
+            }
+        }
+        Ok(Self { tokens })
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        let mut pattern_index = 0;
+        let mut value_index = 0;
+        let mut last_wildcard = None;
+        let mut wildcard_value_index = 0;
+
+        while value_index < value.len() {
+            let character = value[value_index..]
+                .chars()
+                .next()
+                .expect("value index is at a character boundary");
+            match self.tokens.get(pattern_index) {
+                Some(LikeToken::Literal(expected)) if *expected == character => {
+                    pattern_index += 1;
+                    value_index += character.len_utf8();
+                }
+                Some(LikeToken::AnyOne) => {
+                    pattern_index += 1;
+                    value_index += character.len_utf8();
+                }
+                Some(LikeToken::AnyMany) => {
+                    last_wildcard = Some(pattern_index);
+                    pattern_index += 1;
+                    wildcard_value_index = value_index;
+                }
+                _ => {
+                    let Some(wildcard) = last_wildcard else {
+                        return false;
+                    };
+                    let consumed = value[wildcard_value_index..]
+                        .chars()
+                        .next()
+                        .expect("a wildcard retry consumes one character");
+                    wildcard_value_index += consumed.len_utf8();
+                    value_index = wildcard_value_index;
+                    pattern_index = wildcard + 1;
+                }
+            }
+        }
+
+        self.tokens[pattern_index..]
+            .iter()
+            .all(|token| *token == LikeToken::AnyMany)
     }
 }
 
@@ -850,6 +1009,65 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::InList {
+            operand,
+            values,
+            negated,
+        } => {
+            let operand = compile_operand(table, operand)?;
+            for (index, value) in values.iter().enumerate() {
+                if !comparable(operand.data_type(), value.data_type()) {
+                    return Err(Error::TypeMismatch {
+                        context: format!("WHERE IN list value {}", index + 1),
+                        expected: operand.data_type().to_string(),
+                        actual: value.data_type().to_string(),
+                    });
+                }
+            }
+            Ok(CompiledPredicate::InList {
+                operand,
+                values: CompiledSet::new(values.clone()),
+                negated: *negated,
+            })
+        }
+        Predicate::Between {
+            operand,
+            lower,
+            upper,
+            negated,
+        } => {
+            let operand = compile_operand(table, operand)?;
+            let lower = compile_operand(table, lower)?;
+            let upper = compile_operand(table, upper)?;
+            validate_predicate_types(&operand, &lower, "WHERE BETWEEN lower bound")?;
+            validate_predicate_types(&operand, &upper, "WHERE BETWEEN upper bound")?;
+            Ok(CompiledPredicate::Between {
+                operand,
+                lower,
+                upper,
+                negated: *negated,
+            })
+        }
+        Predicate::Like {
+            operand,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let operand = compile_operand(table, operand)?;
+            if operand.data_type() != DataType::String {
+                return Err(Error::TypeMismatch {
+                    context: "WHERE LIKE operand".to_owned(),
+                    expected: DataType::String.to_string(),
+                    actual: operand.data_type().to_string(),
+                });
+            }
+            Ok(CompiledPredicate::Like {
+                operand,
+                pattern: LikePattern::compile(pattern, *escape)?,
+                negated: *negated,
+            })
+        }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
@@ -858,6 +1076,22 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
         )),
+    }
+}
+
+fn validate_predicate_types(
+    operand: &CompiledOperand,
+    bound: &CompiledOperand,
+    context: &str,
+) -> Result<()> {
+    if comparable(operand.data_type(), bound.data_type()) {
+        Ok(())
+    } else {
+        Err(Error::TypeMismatch {
+            context: context.to_owned(),
+            expected: operand.data_type().to_string(),
+            actual: bound.data_type().to_string(),
+        })
     }
 }
 
@@ -945,5 +1179,37 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn compiled_sets_deduplicate_under_exact_sql_numeric_equality() {
+        let set = CompiledSet::new(vec![
+            Value::Int64(1),
+            Value::Float64(1.0),
+            Value::Int64(9_007_199_254_740_993),
+            Value::Float64(9_007_199_254_740_992.0),
+        ]);
+
+        assert_eq!(set.values.len(), 3);
+        assert!(set.contains(ValueRef::Int64(1)));
+        assert!(set.contains(ValueRef::Int64(9_007_199_254_740_993)));
+        assert!(!set.contains(ValueRef::Float64(9_007_199_254_740_994.0)));
+    }
+
+    #[test]
+    fn compiled_like_patterns_collapse_wildcards_and_match_unicode_scalars() {
+        let pattern = LikePattern::compile("%%%_!%%", Some('!')).expect("valid pattern");
+        assert_eq!(
+            pattern.tokens,
+            [
+                LikeToken::AnyMany,
+                LikeToken::AnyOne,
+                LikeToken::Literal('%'),
+                LikeToken::AnyMany,
+            ]
+        );
+        assert!(pattern.matches("data-%-tail"));
+        assert!(pattern.matches("\u{e9}%"));
+        assert!(!pattern.matches("%"));
     }
 }
