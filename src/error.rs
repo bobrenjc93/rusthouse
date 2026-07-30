@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::value::DataType;
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -27,6 +29,21 @@ pub enum Error {
         context: String,
         expected: String,
         actual: String,
+    },
+    QueryResultRowLength {
+        row: usize,
+        expected: usize,
+        actual: usize,
+    },
+    QueryResultTypeMismatch {
+        row: usize,
+        column: usize,
+        expected: DataType,
+        actual: DataType,
+    },
+    QueryResultNonFiniteFloat {
+        row: usize,
+        column: usize,
     },
     InvalidQuery(String),
     NumericOverflow(String),
@@ -68,6 +85,27 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
+            ),
+            Self::QueryResultRowLength {
+                row,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "query result row {row} has {actual} values; expected {expected}"
+            ),
+            Self::QueryResultTypeMismatch {
+                row,
+                column,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "type mismatch for query result row {row}, column {column}: expected {expected}, found {actual}"
+            ),
+            Self::QueryResultNonFiniteFloat { row, column } => write!(
+                f,
+                "query result row {row}, column {column} contains a non-finite Float64"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {

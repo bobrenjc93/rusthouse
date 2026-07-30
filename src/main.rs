@@ -168,13 +168,14 @@ mod tests {
 
     #[test]
     fn wraps_multiple_json_query_results_in_one_document() {
-        let result = QueryResult {
-            columns: vec![ResultColumn {
+        let result = QueryResult::new(
+            vec![ResultColumn {
                 name: "n".to_owned(),
                 data_type: DataType::Int64,
             }],
-            rows: vec![vec![Value::Int64(1)]],
-        };
+            vec![vec![Value::Int64(1)]],
+        )
+        .expect("valid result");
 
         assert_eq!(
             render_query_results(&[result.clone(), result], OutputFormat::Json),

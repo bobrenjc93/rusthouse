@@ -16,16 +16,71 @@ pub struct Database {
     catalog: Catalog,
 }
 
+/// The name and physical type of one query output column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
     pub name: String,
     pub data_type: DataType,
 }
 
+/// A validated query result with typed, rectangular rows.
+///
+/// Construct results with [`QueryResult::new`]. Column names do not need to be
+/// unique because positional output formats preserve duplicate aliases.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
-    pub columns: Vec<ResultColumn>,
-    pub rows: Vec<Vec<Value>>,
+    columns: Vec<ResultColumn>,
+    rows: Vec<Vec<Value>>,
+}
+
+impl QueryResult {
+    /// Validates and constructs a query result.
+    ///
+    /// Every row must match the column count and declared types, and every
+    /// `Float64` value must be finite. Duplicate column names are allowed.
+    pub fn new(columns: Vec<ResultColumn>, rows: Vec<Vec<Value>>) -> Result<Self> {
+        for (row_index, row) in rows.iter().enumerate() {
+            if row.len() != columns.len() {
+                return Err(Error::QueryResultRowLength {
+                    row: row_index,
+                    expected: columns.len(),
+                    actual: row.len(),
+                });
+            }
+
+            for (column_index, (column, value)) in columns.iter().zip(row).enumerate() {
+                let actual = value.data_type();
+                if column.data_type != actual {
+                    return Err(Error::QueryResultTypeMismatch {
+                        row: row_index,
+                        column: column_index,
+                        expected: column.data_type,
+                        actual,
+                    });
+                }
+                if matches!(value, Value::Float64(number) if !number.is_finite()) {
+                    return Err(Error::QueryResultNonFiniteFloat {
+                        row: row_index,
+                        column: column_index,
+                    });
+                }
+            }
+        }
+
+        Ok(Self { columns, rows })
+    }
+
+    /// Returns the output column metadata in positional order.
+    #[must_use]
+    pub fn columns(&self) -> &[ResultColumn] {
+        &self.columns
+    }
+
+    /// Returns the validated rows in output order.
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,10 +183,7 @@ impl Database {
             execute_projection(table, &matching_rows, &items)
         };
 
-        Ok(QueryResult {
-            columns: result_columns,
-            rows,
-        })
+        QueryResult::new(result_columns, rows)
     }
 }
 
@@ -910,7 +962,7 @@ mod tests {
              FROM sales GROUP BY region ORDER BY total DESC",
         );
         assert_eq!(
-            result.rows,
+            result.rows(),
             vec![
                 vec![
                     Value::String("west".to_owned()),
@@ -942,7 +994,7 @@ mod tests {
             "SELECT id FROM valueset WHERE id = 1 OR id >= 2 AND enabled = true",
         );
         assert_eq!(
-            result.rows,
+            result.rows(),
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
     }

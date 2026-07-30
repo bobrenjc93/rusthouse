@@ -35,7 +35,7 @@ fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let result = last_query(results);
     assert_eq!(
         result
-            .columns
+            .columns()
             .iter()
             .map(|column| (&column.name, column.data_type))
             .collect::<Vec<_>>(),
@@ -47,7 +47,7 @@ fn typed_projection_filter_order_and_limit_work_end_to_end() {
         ]
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![
                 Value::Int64(1),
@@ -84,7 +84,7 @@ fn order_by_limit_preserves_input_order_for_ties_and_accepts_zero() {
         "SELECT id, score, label FROM ranked ORDER BY score DESC LIMIT 2;",
     );
     assert_eq!(
-        top.rows,
+        top.rows(),
         vec![
             vec![
                 Value::Int64(2),
@@ -103,7 +103,7 @@ fn order_by_limit_preserves_input_order_for_ties_and_accepts_zero() {
         &mut database,
         "SELECT label, id FROM ranked ORDER BY label, id DESC LIMIT 0;",
     );
-    assert!(empty.rows.is_empty());
+    assert!(empty.rows().is_empty());
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn grouped_top_k_retains_deterministic_multi_column_ordering() {
          LIMIT 3;",
     );
     assert_eq!(
-        top.rows,
+        top.rows(),
         vec![
             vec![
                 Value::String("alpha".to_owned()),
@@ -159,7 +159,7 @@ fn grouped_top_k_retains_deterministic_multi_column_ordering() {
          FROM grouped GROUP BY label, active;",
     );
     assert_eq!(
-        all_groups.rows,
+        all_groups.rows(),
         vec![
             vec![
                 Value::String("alpha".to_owned()),
@@ -193,7 +193,7 @@ fn grouped_top_k_retains_deterministic_multi_column_ordering() {
          LIMIT 2;",
     );
     assert_eq!(
-        three_columns.rows,
+        three_columns.rows(),
         vec![
             vec![
                 Value::String("alpha".to_owned()),
@@ -237,7 +237,7 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
 
     assert_eq!(
         result
-            .columns
+            .columns()
             .iter()
             .map(|column| column.data_type)
             .collect::<Vec<_>>(),
@@ -251,7 +251,7 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
         ]
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![
                 Value::String("hardware".to_owned()),
@@ -284,7 +284,10 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(
+        empty.rows(),
+        vec![vec![Value::Int64(0), Value::Float64(0.0)]]
+    );
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -299,7 +302,7 @@ fn global_aggregates_and_empty_count_are_supported() {
          FROM measurements;",
     );
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![
             Value::Int64(3),
             Value::Float64(10.0),
@@ -330,7 +333,7 @@ fn failed_multi_row_insert_is_atomic_and_actionable() {
     ));
 
     let count = execute_query(&mut database, "SELECT COUNT(*) AS count FROM events;");
-    assert_eq!(count.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(count.rows(), vec![vec![Value::Int64(0)]]);
 
     let error = database
         .execute("INSERT INTO events VALUES (1);")
@@ -396,7 +399,7 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
          ORDER BY id;",
     );
     assert_eq!(
-        above_f64_precision.rows,
+        above_f64_precision.rows(),
         vec![
             vec![Value::Int64(9_007_199_254_740_993)],
             vec![Value::Int64(i64::MAX)],
@@ -408,7 +411,7 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
         "SELECT COUNT(*) AS count FROM boundaries
          WHERE id < 9223372036854775808.0;",
     );
-    assert_eq!(below_i64_upper_bound.rows, vec![vec![Value::Int64(4)]]);
+    assert_eq!(below_i64_upper_bound.rows(), vec![vec![Value::Int64(4)]]);
 }
 
 #[test]
@@ -469,7 +472,7 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
     );
     let one_third = 1.0 / 3.0;
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Bool(false), Value::Float64(one_third)],
             vec![Value::Bool(true), Value::Float64(one_third)],

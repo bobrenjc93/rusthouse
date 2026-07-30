@@ -63,6 +63,8 @@ Database retains an in-memory catalog across calls and returns structured result
 
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
+`QueryResult::new` validates row widths, declared value types, and finite `Float64` values. Results expose columns and rows through read-only `columns()` and `rows()` accessors; duplicate column aliases remain valid and positional.
+
 ~~~rust
 use rusthouse::{Database, StatementResult};
 
@@ -74,7 +76,7 @@ let results = database.execute("SELECT * FROM events WHERE id = 1")?;
 let StatementResult::Query(result) = &results[0] else {
     unreachable!();
 };
-assert_eq!(result.rows.len(), 1);
+assert_eq!(result.rows().len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~

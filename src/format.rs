@@ -33,12 +33,12 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
 
 fn render_table(result: &QueryResult) -> String {
     let rendered_columns = result
-        .columns
+        .columns()
         .iter()
         .map(|column| escape_table_text(&column.name))
         .collect::<Vec<_>>();
     let rendered_rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| row.iter().map(table_value).collect::<Vec<_>>())
         .collect::<Vec<_>>();
@@ -120,9 +120,9 @@ fn render_csv(result: &QueryResult) -> String {
     let mut output = String::new();
     write_csv_row(
         &mut output,
-        result.columns.iter().map(|column| column.name.as_str()),
+        result.columns().iter().map(|column| column.name.as_str()),
     );
-    for row in &result.rows {
+    for row in result.rows() {
         let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
         write_csv_row(&mut output, values.iter().map(String::as_str));
     }
@@ -150,7 +150,7 @@ fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>)
 /// Positional rows preserve every value even when output column names repeat.
 fn render_json(result: &QueryResult) -> String {
     let mut output = String::from("{\"columns\":[");
-    for (index, column) in result.columns.iter().enumerate() {
+    for (index, column) in result.columns().iter().enumerate() {
         if index > 0 {
             output.push(',');
         }
@@ -161,7 +161,7 @@ fn render_json(result: &QueryResult) -> String {
         output.push('}');
     }
     output.push_str("],\"rows\":[");
-    for (row_index, row) in result.rows.iter().enumerate() {
+    for (row_index, row) in result.rows().iter().enumerate() {
         if row_index > 0 {
             output.push(',');
         }
@@ -214,8 +214,8 @@ mod tests {
     use crate::value::DataType;
 
     fn result() -> QueryResult {
-        QueryResult {
-            columns: vec![
+        QueryResult::new(
+            vec![
                 ResultColumn {
                     name: "id".to_owned(),
                     data_type: DataType::Int64,
@@ -225,11 +225,12 @@ mod tests {
                     data_type: DataType::String,
                 },
             ],
-            rows: vec![vec![
+            vec![vec![
                 Value::Int64(1),
                 Value::String("quote: \", comma".to_owned()),
             ]],
-        }
+        )
+        .expect("valid result")
     }
 
     #[test]
@@ -250,8 +251,8 @@ mod tests {
 
     #[test]
     fn positional_json_preserves_duplicate_output_names() {
-        let result = QueryResult {
-            columns: vec![
+        let result = QueryResult::new(
+            vec![
                 ResultColumn {
                     name: "id".to_owned(),
                     data_type: DataType::Int64,
@@ -261,8 +262,9 @@ mod tests {
                     data_type: DataType::String,
                 },
             ],
-            rows: vec![vec![Value::Int64(1), Value::String("x".to_owned())]],
-        };
+            vec![vec![Value::Int64(1), Value::String("x".to_owned())]],
+        )
+        .expect("duplicate names are valid");
 
         assert_eq!(
             render(&result, OutputFormat::Json),
@@ -279,15 +281,16 @@ mod tests {
 
     #[test]
     fn table_output_escapes_terminal_control_characters() {
-        let result = QueryResult {
-            columns: vec![ResultColumn {
+        let result = QueryResult::new(
+            vec![ResultColumn {
                 name: "text".to_owned(),
                 data_type: DataType::String,
             }],
-            rows: vec![vec![Value::String(
+            vec![vec![Value::String(
                 "\u{1b}[31mred\u{07}\u{00}\u{7f}".to_owned(),
             )]],
-        };
+        )
+        .expect("valid result");
 
         let rendered = render(&result, OutputFormat::Table);
         assert!(rendered.contains(r"\u{001b}[31mred\u{0007}\u{0000}\u{007f}"));
