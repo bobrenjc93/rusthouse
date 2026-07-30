@@ -71,16 +71,8 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
                 let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                target.insert_rows(rows)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
@@ -875,9 +867,9 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
 }
 
 fn comparable(left: DataType, right: DataType) -> bool {
-    left == right
+    left.logical_type() == right.logical_type()
         || matches!(
-            (left, right),
+            (left.logical_type(), right.logical_type()),
             (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
         )
 }

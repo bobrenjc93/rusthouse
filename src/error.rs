@@ -30,6 +30,10 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    DictionaryCardinalityExceeded {
+        column: String,
+        maximum: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +77,10 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::DictionaryCardinalityExceeded { column, maximum } => write!(
+                f,
+                "LowCardinality(String) dictionary for column '{column}' exceeds its maximum cardinality of {maximum}"
+            ),
         }
     }
 }

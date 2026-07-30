@@ -62,6 +62,18 @@ On 2026-07-29, the default command above was run on the same Apple Silicon host 
 
 The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
 
+## Low-cardinality storage measurement
+
+The parity score remains based on its unchanged plain `String` schema. A separate reproducible measurement compares physical heap accounting for 100,000 repeated strings across eight values:
+
+~~~bash
+cargo run --release --example low_cardinality_memory
+~~~
+
+The program builds equivalent `String` and `LowCardinality(String)` tables, reports their `allocated_bytes` totals, dictionary cardinality, and the plain-over-dictionary ratio. The accounting includes vector capacity and owned string allocations; standard-library `HashMap` reserved storage is estimated from its reported capacity because its allocation layout is not public. Correctness tests assert at least a fourfold reduction for a 10,000-row repeated-string fixture rather than pinning allocator-specific byte totals.
+
+On 2026-07-29, the release command above on Apple Silicon with Rust 1.92.0 reported 5,895,728 bytes for plain `String`, 525,114 bytes for `LowCardinality(String)`, and an 11.23x plain-over-dictionary ratio. The fixture reported the expected cardinality of eight.
+
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
 Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.

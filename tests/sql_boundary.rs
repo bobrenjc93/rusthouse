@@ -1,3 +1,5 @@
+use rusthouse::format::{OutputFormat, render};
+use rusthouse::storage::Column;
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
@@ -523,4 +525,142 @@ fn creates_a_fifty_thousand_column_schema() {
             .len(),
         column_count
     );
+}
+
+#[test]
+fn low_cardinality_strings_preserve_string_sql_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE dimensions (
+                id Int64,
+                kind LowCardinality(String),
+                plain String,
+                amount Int64
+             );
+             INSERT INTO dimensions VALUES
+                (1, 'zeta', 'zeta', 4),
+                (2, 'alpha', 'alpha', 7),
+                (3, 'zeta', 'other', 3),
+                (4, 'beta', 'beta', 7),
+                (5, 'alpha', 'other', 1);",
+        )
+        .expect("low-cardinality setup succeeds");
+
+    let filtered = execute_query(
+        &mut database,
+        "SELECT kind, id FROM dimensions
+         WHERE kind = plain OR kind > 'zeta'
+         ORDER BY kind DESC, id;",
+    );
+    assert_eq!(
+        filtered.columns[0].data_type,
+        DataType::LowCardinalityString
+    );
+    assert_eq!(
+        filtered.rows,
+        vec![
+            vec![Value::String("zeta".to_owned()), Value::Int64(1)],
+            vec![Value::String("beta".to_owned()), Value::Int64(4)],
+            vec![Value::String("alpha".to_owned()), Value::Int64(2)],
+        ]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT kind, COUNT(*) AS rows, SUM(amount) AS total
+         FROM dimensions
+         WHERE kind >= 'alpha'
+         GROUP BY kind
+         ORDER BY kind;",
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Int64(2),
+                Value::Int64(8),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Int64(1),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::String("zeta".to_owned()),
+                Value::Int64(2),
+                Value::Int64(7),
+            ],
+        ]
+    );
+    assert_eq!(
+        render(&grouped, OutputFormat::Csv),
+        "kind,rows,total\nalpha,2,8\nbeta,1,7\nzeta,2,7\n"
+    );
+
+    let extrema = execute_query(
+        &mut database,
+        "SELECT MIN(kind) AS first, MAX(kind) AS last FROM dimensions;",
+    );
+    assert_eq!(
+        extrema
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        [
+            DataType::LowCardinalityString,
+            DataType::LowCardinalityString
+        ]
+    );
+    assert_eq!(
+        extrema.rows,
+        vec![vec![
+            Value::String("alpha".to_owned()),
+            Value::String("zeta".to_owned()),
+        ]]
+    );
+
+    let column = &database
+        .catalog()
+        .table("dimensions")
+        .expect("table exists")
+        .columns()[1];
+    let Column::LowCardinalityString(column) = column else {
+        panic!("kind uses dictionary storage");
+    };
+    assert_eq!(column.ids(), &[0, 1, 0, 2, 1]);
+    assert_eq!(column.cardinality(), 3);
+}
+
+#[test]
+fn failed_low_cardinality_insert_does_not_mutate_dictionary() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64, kind LowCardinality(String));")
+        .expect("create succeeds");
+
+    let error = database
+        .execute("INSERT INTO events VALUES (1, 'valid'), (2, false);")
+        .expect_err("second row has the wrong type");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch {
+            context,
+            expected,
+            actual,
+        } if context == "column 'events.kind'"
+            && expected == "LowCardinality(String)"
+            && actual == "Bool"
+    ));
+
+    let table = database.catalog().table("events").expect("table exists");
+    assert_eq!(table.row_count(), 0);
+    assert_eq!(table.allocated_bytes(), 0);
+    let Column::LowCardinalityString(column) = &table.columns()[1] else {
+        panic!("kind uses dictionary storage");
+    };
+    assert_eq!(column.cardinality(), 0);
+    assert!(column.ids().is_empty());
 }

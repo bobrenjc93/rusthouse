@@ -1,10 +1,10 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column. Repeated string dimensions can use checked dictionary storage with compact `u32` row IDs.
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, String, and LowCardinality(String) columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
@@ -16,6 +16,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+`LowCardinality(String)` accepts and returns ordinary string values. It preserves string filtering, grouping, ordering, aggregation, and output behavior while storing each distinct string once. `Column::allocated_bytes` and `Table::allocated_bytes` expose estimated physical-column heap usage for measurement.
 
 ## CLI
 
