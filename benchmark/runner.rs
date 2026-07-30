@@ -216,6 +216,8 @@ fn run_bounded_with_limits(
     }
 
     let status = status.expect("completed child has an exit status");
+    terminate_process_group(&child)
+        .map_err(|error| format!("could not terminate remaining processes for {label}: {error}"))?;
 
     let writer_error = join_writer(writer, label)?;
     let stdout = join_reader(stdout_reader, "stdout", label)?;
@@ -280,25 +282,38 @@ fn configure_process_group(command: &mut Command) {
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn terminate_child(child: &mut Child) {
+fn terminate_process_group(child: &Child) -> io::Result<()> {
+    const ESRCH: i32 = 3;
     const SIGKILL: i32 = 9;
 
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
 
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // The child was placed in a new process group whose ID is its PID.
-        // A negative PID asks POSIX kill(2) to signal the whole group.
-        unsafe {
-            kill(-pid, SIGKILL);
-        }
+    let pid = i32::try_from(child.id())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child PID exceeds i32"))?;
+    // The child was placed in a new process group whose ID is its PID.
+    // A negative PID asks POSIX kill(2) to signal the whole group.
+    let result = unsafe { kill(-pid, SIGKILL) };
+    if result == 0 {
+        return Ok(());
     }
-    let _ = child.kill();
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(not(unix))]
+fn terminate_process_group(_child: &Child) -> io::Result<()> {
+    Ok(())
+}
+
 fn terminate_child(child: &mut Child) {
+    let _ = terminate_process_group(child);
     let _ = child.kill();
 }
 
@@ -435,6 +450,19 @@ mod tests {
             }
         }
 
+        fn process_exists(pid: i32) -> bool {
+            const ESRCH: i32 = 3;
+
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+
+            // Signal zero performs existence and permission checks without
+            // changing the target process.
+            let result = unsafe { kill(pid, 0) };
+            result == 0 || io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+        }
+
         #[test]
         fn hanging_executable_and_its_descendant_are_killed_at_deadline() {
             let executable = FakeExecutable::new("sleep 30");
@@ -497,6 +525,36 @@ mod tests {
                 "fake exited flood parent correctness stdout exceeded the 1024-byte limit; output was truncated to the first 1024 bytes and the process result was rejected"
             );
             assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn redirected_background_child_is_terminated_before_success() {
+            let executable = FakeExecutable::new(
+                "sleep 30 </dev/null >/dev/null 2>/dev/null & printf '%s\\n' \"$!\"; exit 0",
+            );
+            let output = run_bounded_with_limits(
+                executable.command(),
+                None,
+                ExecutionPhase::Validation,
+                limits(Duration::from_secs(2), 1024, 1024),
+                true,
+                "fake redirected descendant",
+            )
+            .expect("direct child should complete successfully");
+            let descendant_pid = String::from_utf8(output.stdout.prefix)
+                .expect("PID output is UTF-8")
+                .trim()
+                .parse::<i32>()
+                .expect("background PID");
+
+            let reaping_deadline = Instant::now() + Duration::from_secs(2);
+            while process_exists(descendant_pid) && Instant::now() < reaping_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process_exists(descendant_pid),
+                "background descendant {descendant_pid} survived an accepted run"
+            );
         }
 
         #[test]
