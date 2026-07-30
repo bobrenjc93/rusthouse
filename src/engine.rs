@@ -486,9 +486,9 @@ fn execute_grouped<'a>(
     if global_group {
         enforce_growth(QueryResource::GroupCount, 0, query_limits.max_group_count)?;
     }
-    let mut groups = GroupIndex::new(group_columns.len(), query_limits.max_group_count);
+    let initial_capacity = group_allocation_capacity(table.row_count(), global_group, query_limits);
+    let mut groups = GroupIndex::new(group_columns.len(), initial_capacity);
     let mut group_count = usize::from(global_group);
-    let initial_capacity = query_limits.max_group_count.min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -542,6 +542,21 @@ fn execute_grouped<'a>(
     Ok(GroupedData { keys, aggregates })
 }
 
+fn group_allocation_capacity(
+    table_row_count: usize,
+    global_group: bool,
+    query_limits: QueryLimits,
+) -> usize {
+    if global_group {
+        1
+    } else {
+        table_row_count
+            .min(query_limits.max_scan_rows)
+            .min(query_limits.max_group_count)
+            .min(1_024)
+    }
+}
+
 #[derive(Debug)]
 enum GroupIndex<'a> {
     Global,
@@ -550,8 +565,7 @@ enum GroupIndex<'a> {
 }
 
 impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize, group_limit: usize) -> Self {
-        let initial_capacity = group_limit.min(1_024);
+    fn new(column_count: usize, initial_capacity: usize) -> Self {
         match column_count {
             0 => Self::Global,
             1 => Self::One(HashMap::with_capacity(initial_capacity)),
@@ -1124,6 +1138,20 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn group_allocation_uses_possible_groups_instead_of_configured_capacity() {
+        let limits = QueryLimits::new(7, 5, 100, 100);
+
+        assert_eq!(group_allocation_capacity(0, false, limits), 0);
+        assert_eq!(group_allocation_capacity(10, true, limits), 1);
+        assert_eq!(group_allocation_capacity(3, false, limits), 3);
+        assert_eq!(group_allocation_capacity(10, false, limits), 5);
+        assert_eq!(
+            group_allocation_capacity(10_000, false, QueryLimits::new(2, 5, 100, 100)),
+            2
         );
     }
 }
