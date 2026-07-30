@@ -572,6 +572,36 @@ fn inner_join_with_no_matches_returns_empty_rows_and_zero_count() {
 }
 
 #[test]
+fn inner_join_rejects_excessive_many_to_many_cardinality_before_limit() {
+    let left_values = std::iter::repeat_n("(1)", 1_001)
+        .collect::<Vec<_>>()
+        .join(",");
+    let right_values = std::iter::repeat_n("(1)", 1_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE fanout_left (join_key Int64);
+             CREATE TABLE fanout_right (join_key Int64);
+             INSERT INTO fanout_left VALUES {left_values};
+             INSERT INTO fanout_right VALUES {right_values};"
+        ))
+        .expect("setup succeeds");
+
+    let error = database
+        .execute(
+            "SELECT l.join_key
+             FROM fanout_left l
+             INNER JOIN fanout_right r ON l.join_key = r.join_key
+             LIMIT 0;",
+        )
+        .expect_err("the join cardinality bound applies before materialization");
+    assert!(matches!(error, Error::InvalidQuery(message)
+            if message == "INNER JOIN exceeds the limit of 1000000 matching row pairs"));
+}
+
+#[test]
 fn inner_join_rejects_ambiguous_unqualified_columns() {
     let mut database = Database::new();
     database

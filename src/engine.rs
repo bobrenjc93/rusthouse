@@ -10,6 +10,8 @@ use crate::sql::{
 use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
+const MAX_JOIN_ROW_PAIRS: usize = 1_000_000;
+
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
@@ -247,13 +249,34 @@ impl<'a> Relation<'a> {
                 .push(right_row);
         }
 
+        let mut pair_count = 0_usize;
+        for left_row in 0..left.row_count() {
+            let key = relation.key_for_physical_row(&left_keys, left_row);
+            if let Some(right_rows) = index.get(key.as_slice()) {
+                pair_count = pair_count
+                    .checked_add(right_rows.len())
+                    .filter(|count| *count <= MAX_JOIN_ROW_PAIRS)
+                    .ok_or_else(|| {
+                        Error::InvalidQuery(format!(
+                            "INNER JOIN exceeds the limit of {MAX_JOIN_ROW_PAIRS} matching row pairs"
+                        ))
+                    })?;
+            }
+        }
+
         let mut pairs = Vec::new();
+        pairs.try_reserve_exact(pair_count).map_err(|_| {
+            Error::InvalidQuery(format!(
+                "INNER JOIN could not allocate storage for {pair_count} matching row pairs"
+            ))
+        })?;
         for left_row in 0..left.row_count() {
             let key = relation.key_for_physical_row(&left_keys, left_row);
             if let Some(right_rows) = index.get(key.as_slice()) {
                 pairs.extend(right_rows.iter().map(|right_row| (left_row, *right_row)));
             }
         }
+        debug_assert_eq!(pairs.len(), pair_count);
         relation.row_pairs = Some(pairs);
         Ok(relation)
     }
