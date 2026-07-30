@@ -190,11 +190,27 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.push_validated_row(row);
+        Ok(())
+    }
+
+    /// Validates a complete batch before appending any of its rows.
+    pub(crate) fn insert_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<usize> {
+        for row in &rows {
+            self.validate_row(row)?;
+        }
+        let row_count = rows.len();
+        for row in rows {
+            self.push_validated_row(row);
+        }
+        Ok(row_count)
+    }
+
+    fn push_validated_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 }
 
