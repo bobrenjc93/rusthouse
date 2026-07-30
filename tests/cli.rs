@@ -25,6 +25,24 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
 }
 
 #[test]
+fn explain_is_available_through_structured_cli_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE numbers (n Int64); EXPLAIN SELECT n FROM numbers LIMIT 1;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"plan\",\"type\":\"String\"}],\"rows\":[[\"Limit [limit=1]\"],[\"  Projection [n=n#0]\"],[\"    Scan [table=numbers, columns=[n:Int64]]\"]]}]}\n"
+    );
+}
+
+#[test]
 fn multiple_selects_emit_one_json_document() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

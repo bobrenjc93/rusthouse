@@ -6,7 +6,9 @@
 pub mod catalog;
 pub mod engine;
 pub mod error;
+mod executor;
 pub mod format;
+pub mod plan;
 pub mod sql;
 pub mod storage;
 pub mod value;

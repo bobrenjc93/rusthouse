@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- typed logical plans with EXPLAIN and EXPLAIN ANALYZE
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -57,6 +58,20 @@ printf '%s\n' \
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
+Inspect a query without running it, or run it with per-operator metrics:
+
+~~~sql
+EXPLAIN SELECT region, SUM(amount) AS total
+FROM sales GROUP BY region ORDER BY total DESC LIMIT 10;
+
+EXPLAIN ANALYZE SELECT region, SUM(amount) AS total
+FROM sales GROUP BY region ORDER BY total DESC LIMIT 10;
+~~~
+
+Both forms return a one-column result containing a root-first plan tree. Operator names,
+details, indentation, and metric ordering are deterministic. `EXPLAIN ANALYZE` adds each
+operator's output row count and measured elapsed nanoseconds, whose values vary by run.
+
 ## Library API
 
 Database retains an in-memory catalog across calls and returns structured results:
@@ -75,6 +90,14 @@ let StatementResult::Query(result) = &results[0] else {
     unreachable!();
 };
 assert_eq!(result.rows.len(), 1);
+
+// Parsed SELECTs can also be resolved without execution.
+let statements = rusthouse::sql::parse("SELECT * FROM events")?;
+let [rusthouse::sql::Statement::Select(select)] = statements.as_slice() else {
+    unreachable!();
+};
+let plan = database.plan(select)?;
+assert!(plan.explain().last().unwrap().contains("Scan"));
 
 # Ok::<(), rusthouse::Error>(())
 ~~~

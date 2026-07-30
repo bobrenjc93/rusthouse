@@ -16,6 +16,10 @@ pub enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
+    Explain {
+        select: Select,
+        analyze: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,8 +382,13 @@ impl Parser {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
+        } else if self.eat_keyword("EXPLAIN") {
+            let analyze = self.eat_keyword("ANALYZE");
+            self.expect_keyword("SELECT")?;
+            self.parse_select()
+                .map(|select| Statement::Explain { select, analyze })
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, SELECT, or EXPLAIN")
         }
     }
 
@@ -771,6 +780,24 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_explain_and_explain_analyze() {
+        let statements = parse(
+            "EXPLAIN SELECT id FROM events; \
+             EXPLAIN ANALYZE SELECT COUNT(*) FROM events",
+        )
+        .expect("valid EXPLAIN statements");
+
+        assert!(matches!(
+            &statements[0],
+            Statement::Explain { analyze: false, select } if select.table == "events"
+        ));
+        assert!(matches!(
+            &statements[1],
+            Statement::Explain { analyze: true, select } if select.table == "events"
+        ));
     }
 
     #[test]
