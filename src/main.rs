@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
+                if matches!(tag, "INSERT" | "DELETE" | "TRUNCATE TABLE" | "DROP TABLE") {
                     eprintln!("{tag} {affected_rows}");
                 } else {
                     eprintln!("{tag}");

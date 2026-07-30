@@ -86,8 +86,55 @@ impl Database {
                     affected_rows,
                 })
             }
+            Statement::Delete { table, predicate } => {
+                self.execute_delete(&table, predicate.as_ref())
+            }
+            Statement::Truncate { table } => self.execute_truncate(&table),
+            Statement::DropTable { table, if_exists } => {
+                let affected_rows = self.catalog.drop_table(&table, if_exists)?;
+                Ok(StatementResult::Command {
+                    tag: "DROP TABLE",
+                    affected_rows,
+                })
+            }
             Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
         }
+    }
+
+    fn execute_delete(
+        &mut self,
+        table_name: &str,
+        predicate: Option<&Predicate>,
+    ) -> Result<StatementResult> {
+        let keep = {
+            let table = self.catalog.table(table_name)?;
+            let predicate = predicate
+                .map(|predicate| compile_predicate(table, predicate))
+                .transpose()?;
+            (0..table.row_count())
+                .map(|row| {
+                    predicate
+                        .as_ref()
+                        .is_some_and(|predicate| !predicate.evaluate(table, row))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let affected_rows = self.catalog.table_mut(table_name)?.retain_rows(&keep)?;
+        Ok(StatementResult::Command {
+            tag: "DELETE",
+            affected_rows,
+        })
+    }
+
+    fn execute_truncate(&mut self, table_name: &str) -> Result<StatementResult> {
+        let row_count = self.catalog.table(table_name)?.row_count();
+        let keep = vec![false; row_count];
+        let affected_rows = self.catalog.table_mut(table_name)?.retain_rows(&keep)?;
+        Ok(StatementResult::Command {
+            tag: "TRUNCATE TABLE",
+            affected_rows,
+        })
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {

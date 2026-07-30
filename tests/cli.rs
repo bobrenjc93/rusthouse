@@ -46,6 +46,27 @@ fn multiple_selects_emit_one_json_document() {
 }
 
 #[test]
+fn lifecycle_commands_emit_affected_row_counts() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--execute",
+            "CREATE TABLE items (id Int64);
+             INSERT INTO items VALUES (1), (2), (3);
+             DELETE FROM items WHERE id = 1;
+             TRUNCATE TABLE items;
+             DROP TABLE items;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("DELETE 1"));
+    assert!(stderr.contains("TRUNCATE TABLE 2"));
+    assert!(stderr.contains("DROP TABLE 0"));
+}
+
+#[test]
 fn positional_json_preserves_duplicate_alias_values() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([

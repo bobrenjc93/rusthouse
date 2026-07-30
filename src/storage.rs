@@ -86,6 +86,24 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn retain_rows(&mut self, keep: &[bool]) {
+        match self {
+            Self::Int64(values) => retain_mask(values, keep),
+            Self::Float64(values) => retain_mask(values, keep),
+            Self::Bool(values) => retain_mask(values, keep),
+            Self::String(values) => retain_mask(values, keep),
+        }
+    }
+}
+
+fn retain_mask<T>(values: &mut Vec<T>, keep: &[bool]) {
+    let mut row = 0;
+    values.retain(|_| {
+        let retain = keep[row];
+        row += 1;
+        retain
+    });
 }
 
 /// A table stores one typed vector per schema field.
@@ -196,6 +214,32 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Compacts every physical column using the same precomputed row mask.
+    ///
+    /// All invariants are checked before mutation so an invalid mask cannot
+    /// partially compact a table.
+    pub(crate) fn retain_rows(&mut self, keep: &[bool]) -> Result<usize> {
+        if keep.len() != self.row_count
+            || self
+                .columns
+                .iter()
+                .any(|column| column.len() != self.row_count)
+        {
+            return Err(Error::InvalidQuery(format!(
+                "row keep-mask does not match table '{}'",
+                self.name
+            )));
+        }
+
+        let previous_count = self.row_count;
+        let retained_count = keep.iter().filter(|retain| **retain).count();
+        for column in &mut self.columns {
+            column.retain_rows(keep);
+        }
+        self.row_count = retained_count;
+        Ok(previous_count - retained_count)
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +284,86 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn one_mask_compacts_every_typed_column_and_allows_more_inserts() {
+        let mut table = Table::new(
+            "measurements".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ColumnDef {
+                    name: "score".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ColumnDef {
+                    name: "active".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ColumnDef {
+                    name: "label".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+        )
+        .expect("valid schema");
+        for row in [
+            vec![
+                Value::Int64(1),
+                Value::Float64(1.5),
+                Value::Bool(true),
+                Value::String("one".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Float64(2.5),
+                Value::Bool(false),
+                Value::String("two".to_owned()),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Float64(3.5),
+                Value::Bool(true),
+                Value::String("three".to_owned()),
+            ],
+        ] {
+            table.insert_row(row).expect("valid row");
+        }
+
+        assert_eq!(table.retain_rows(&[true, false, true]), Ok(1));
+        table
+            .insert_row(vec![
+                Value::Int64(4),
+                Value::Float64(4.5),
+                Value::Bool(false),
+                Value::String("four".to_owned()),
+            ])
+            .expect("insert after compaction");
+
+        assert_eq!(table.row_count(), 3);
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[1, 3, 4]));
+        assert!(matches!(&table.columns()[1], Column::Float64(v) if v == &[1.5, 3.5, 4.5]));
+        assert!(matches!(&table.columns()[2], Column::Bool(v) if v == &[true, true, false]));
+        assert!(matches!(&table.columns()[3], Column::String(v) if v == &["one", "three", "four"]));
+    }
+
+    #[test]
+    fn invalid_keep_mask_leaves_table_unchanged() {
+        let mut table = test_table();
+        table
+            .insert_row(vec![Value::Int64(7), Value::String("ok".to_owned())])
+            .expect("valid row");
+
+        let error = table
+            .retain_rows(&[])
+            .expect_err("mask length must match the table");
+
+        assert!(matches!(error, Error::InvalidQuery(_)));
+        assert_eq!(table.row_count(), 1);
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[7]));
+        assert!(matches!(&table.columns()[1], Column::String(v) if v == &["ok"]));
     }
 }

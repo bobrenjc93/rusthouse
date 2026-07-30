@@ -15,6 +15,17 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
+    Delete {
+        table: String,
+        predicate: Option<Predicate>,
+    },
+    Truncate {
+        table: String,
+    },
+    DropTable {
+        table: String,
+        if_exists: bool,
+    },
     Select(Select),
 }
 
@@ -376,10 +387,16 @@ impl Parser {
             self.parse_create()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
+        } else if self.eat_keyword("DELETE") {
+            self.parse_delete()
+        } else if self.eat_keyword("TRUNCATE") {
+            self.parse_truncate()
+        } else if self.eat_keyword("DROP") {
+            self.parse_drop()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, DELETE, TRUNCATE, DROP, or SELECT")
         }
     }
 
@@ -441,6 +458,31 @@ impl Parser {
         Ok(Statement::Insert { table, rows })
     }
 
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect_keyword("FROM")?;
+        let table = self.expect_identifier("table name")?;
+        let predicate = self.parse_optional_where()?;
+        Ok(Statement::Delete { table, predicate })
+    }
+
+    fn parse_truncate(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_identifier("table name")?;
+        Ok(Statement::Truncate { table })
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let if_exists = if self.eat_keyword("IF") {
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let table = self.expect_identifier("table name")?;
+        Ok(Statement::DropTable { table, if_exists })
+    }
+
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
@@ -452,13 +494,7 @@ impl Parser {
         self.expect_keyword("FROM")?;
         let table = self.expect_identifier("table name")?;
 
-        let predicate = if self.eat_keyword("WHERE") {
-            self.predicate_depth = 0;
-            self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
-        } else {
-            None
-        };
+        let predicate = self.parse_optional_where()?;
 
         let mut group_by = Vec::new();
         if self.eat_keyword("GROUP") {
@@ -511,6 +547,15 @@ impl Parser {
             order_by,
             limit,
         })
+    }
+
+    fn parse_optional_where(&mut self) -> Result<Option<Predicate>> {
+        if !self.eat_keyword("WHERE") {
+            return Ok(None);
+        }
+        self.predicate_depth = 0;
+        self.predicate_nodes = 0;
+        self.parse_or_predicate().map(Some)
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -782,6 +827,35 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_lifecycle_statements() {
+        let statements = parse(
+            "DELETE FROM events WHERE active = false OR score < 2; \
+             TRUNCATE TABLE scratch; \
+             DROP TABLE IF EXISTS archived",
+        )
+        .expect("valid lifecycle SQL");
+
+        assert!(matches!(
+            &statements[0],
+            Statement::Delete {
+                table,
+                predicate: Some(Predicate::Or(_, _)),
+            } if table == "events"
+        ));
+        assert!(matches!(
+            &statements[1],
+            Statement::Truncate { table } if table == "scratch"
+        ));
+        assert!(matches!(
+            &statements[2],
+            Statement::DropTable {
+                table,
+                if_exists: true,
+            } if table == "archived"
+        ));
     }
 
     #[test]

@@ -346,6 +346,206 @@ fn failed_multi_row_insert_is_atomic_and_actionable() {
 }
 
 #[test]
+fn delete_compacts_all_column_types_and_reports_none_all_and_compound_counts() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String);
+             INSERT INTO events VALUES
+                (1, 1.5, true, 'one'),
+                (2, 2.5, false, 'two'),
+                (3, 3.5, true, 'three'),
+                (4, 4.5, false, 'four');",
+        )
+        .expect("setup succeeds");
+
+    let deleted = database
+        .execute(
+            "DELETE FROM events
+             WHERE (active = true AND score >= 2.0) OR label = 'four';",
+        )
+        .expect("compound delete succeeds");
+    assert_eq!(
+        deleted,
+        vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 2,
+        }]
+    );
+
+    database
+        .execute("INSERT INTO events VALUES (5, 5.5, true, 'five');")
+        .expect("insert after compaction succeeds");
+    let remaining = execute_query(&mut database, "SELECT * FROM events ORDER BY id;");
+    assert_eq!(
+        remaining.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Float64(1.5),
+                Value::Bool(true),
+                Value::String("one".to_owned()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Float64(2.5),
+                Value::Bool(false),
+                Value::String("two".to_owned()),
+            ],
+            vec![
+                Value::Int64(5),
+                Value::Float64(5.5),
+                Value::Bool(true),
+                Value::String("five".to_owned()),
+            ],
+        ]
+    );
+
+    assert_eq!(
+        database
+            .execute("DELETE FROM events WHERE id < 0;")
+            .expect("delete none succeeds"),
+        vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 0,
+        }]
+    );
+    assert_eq!(
+        database
+            .execute("DELETE FROM events;")
+            .expect("delete all succeeds"),
+        vec![StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 3,
+        }]
+    );
+
+    database
+        .execute("INSERT INTO events VALUES (6, 6.5, false, 'six');")
+        .expect("insert after delete all succeeds");
+    assert_eq!(
+        execute_query(&mut database, "SELECT id, label FROM events;").rows,
+        vec![vec![Value::Int64(6), Value::String("six".to_owned()),]]
+    );
+}
+
+#[test]
+fn truncate_preserves_schema_and_allows_subsequent_inserts() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE scratch (id Int64, label String);
+             INSERT INTO scratch VALUES (1, 'one'), (2, 'two');",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database
+            .execute("TRUNCATE TABLE scratch;")
+            .expect("truncate succeeds"),
+        vec![StatementResult::Command {
+            tag: "TRUNCATE TABLE",
+            affected_rows: 2,
+        }]
+    );
+    assert_eq!(
+        database.catalog().table("scratch").unwrap().schema().len(),
+        2
+    );
+
+    database
+        .execute("INSERT INTO scratch VALUES (3, 'three');")
+        .expect("insert after truncate succeeds");
+    assert_eq!(
+        execute_query(&mut database, "SELECT * FROM scratch;").rows,
+        vec![vec![Value::Int64(3), Value::String("three".to_owned()),]]
+    );
+}
+
+#[test]
+fn destructive_statement_failures_leave_schema_and_columns_unchanged() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE guarded (id Int64, label String);
+             INSERT INTO guarded VALUES (1, 'one'), (2, 'two');",
+        )
+        .expect("setup succeeds");
+    let schema = database
+        .catalog()
+        .table("guarded")
+        .expect("table exists")
+        .schema()
+        .to_vec();
+    let expected_rows = execute_query(&mut database, "SELECT * FROM guarded ORDER BY id;").rows;
+
+    for sql in [
+        "DELETE FROM guarded WHERE missing = 1;",
+        "DELETE FROM guarded WHERE id = 1 OR missing = 2;",
+        "DELETE FROM guarded WHERE id = 'wrong';",
+        "DELETE FROM missing;",
+        "TRUNCATE TABLE missing;",
+        "DROP TABLE missing;",
+    ] {
+        database.execute(sql).expect_err("statement must fail");
+        let table = database
+            .catalog()
+            .table("guarded")
+            .expect("unrelated table remains");
+        assert_eq!(table.schema(), schema);
+        assert_eq!(
+            execute_query(&mut database, "SELECT * FROM guarded ORDER BY id;").rows,
+            expected_rows
+        );
+    }
+}
+
+#[test]
+fn drop_if_exists_and_recreation_work() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE recyclable (id Int64);
+             INSERT INTO recyclable VALUES (1), (2);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database
+            .execute("DROP TABLE recyclable;")
+            .expect("drop succeeds"),
+        vec![StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 2,
+        }]
+    );
+    assert!(matches!(
+        database.catalog().table("recyclable"),
+        Err(Error::TableNotFound(_))
+    ));
+    assert_eq!(
+        database
+            .execute("DROP TABLE IF EXISTS recyclable;")
+            .expect("conditional drop succeeds"),
+        vec![StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }]
+    );
+
+    database
+        .execute(
+            "CREATE TABLE recyclable (label String);
+             INSERT INTO recyclable VALUES ('new');",
+        )
+        .expect("recreation succeeds");
+    assert_eq!(
+        execute_query(&mut database, "SELECT * FROM recyclable;").rows,
+        vec![vec![Value::String("new".to_owned())]]
+    );
+}
+
+#[test]
 fn invalid_grouping_and_aggregate_types_are_rejected() {
     let mut database = Database::new();
     database
