@@ -32,7 +32,7 @@ OPTIONS:
     --mode <quick|default>  Benchmark size (default: default)
     --quick                 Alias for --mode quick
     --seed <U64>            Deterministic runtime seed (default: 20260729)
-    --seed-count <N>        Derived seeds (default: 3 default, 1 quick)
+    --seed-count <1..=64>   Derived seeds (default: 3 default, 1 quick)
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
     --details <PATH>        Write detailed JSON without changing stdout

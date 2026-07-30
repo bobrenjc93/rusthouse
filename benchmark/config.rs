@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub const MAX_SEED_COUNT: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Quick,
@@ -173,19 +175,18 @@ fn parse_seed(value: &str) -> Result<u64, String> {
 fn parse_seed_count(value: &str) -> Result<usize, String> {
     let count = value
         .parse::<usize>()
-        .map_err(|_| format!("invalid seed count {value:?}; expected a positive integer"))?;
-    if count == 0 {
-        return Err("seed count must be positive".to_owned());
-    }
+        .map_err(|_| seed_count_error(value))?;
+    validate_seed_count(count).map_err(|_| seed_count_error(value))?;
     Ok(count)
 }
 
 pub fn derive_seeds(root_seed: u64, count: usize) -> Result<Vec<u64>, String> {
-    if count == 0 {
-        return Err("seed count must be positive".to_owned());
-    }
+    validate_seed_count(count)?;
 
-    let mut seeds = Vec::with_capacity(count);
+    let mut seeds = Vec::new();
+    seeds
+        .try_reserve_exact(count)
+        .map_err(|error| format!("could not allocate derived seed list: {error}"))?;
     let mut state = root_seed;
     seeds.push(root_seed);
     for _ in 1..count {
@@ -196,6 +197,19 @@ pub fn derive_seeds(root_seed: u64, count: usize) -> Result<Vec<u64>, String> {
         seeds.push(value ^ (value >> 31));
     }
     Ok(seeds)
+}
+
+fn validate_seed_count(count: usize) -> Result<(), String> {
+    if !(1..=MAX_SEED_COUNT).contains(&count) {
+        return Err(format!(
+            "seed count must be between 1 and {MAX_SEED_COUNT}, got {count}"
+        ));
+    }
+    Ok(())
+}
+
+fn seed_count_error(value: &str) -> String {
+    format!("invalid seed count {value:?}; expected an integer between 1 and {MAX_SEED_COUNT}")
 }
 
 #[cfg(test)]
@@ -289,6 +303,18 @@ mod tests {
             )
             .is_err()
         );
+
+        let oversized = format!("--seed-count={}", MAX_SEED_COUNT + 1);
+        let error = match parse(
+            [oversized, "--clickhouse=/clickhouse".to_owned()],
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        ) {
+            Ok(_) => panic!("oversized seed count should fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("between 1 and 64"));
     }
 
     #[test]
@@ -304,5 +330,12 @@ mod tests {
         );
         assert_eq!(derive_seeds(u64::MAX, 1).expect("one seed"), [u64::MAX]);
         assert!(derive_seeds(7, 0).is_err());
+        assert_eq!(
+            derive_seeds(7, MAX_SEED_COUNT)
+                .expect("maximum seed count")
+                .len(),
+            MAX_SEED_COUNT
+        );
+        assert!(derive_seeds(7, MAX_SEED_COUNT + 1).is_err());
     }
 }
