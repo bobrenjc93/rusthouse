@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::mem::size_of;
 
 /// Number of values in every sealed Int64 chunk.
@@ -88,6 +89,29 @@ impl Int64Column {
         }
     }
 
+    /// Decodes all values into a contiguous vector.
+    ///
+    /// This is primarily a migration helper for callers that used the pre-0.2
+    /// `Column::Int64(Vec<i64>)` payload directly.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<i64> {
+        self.iter().collect()
+    }
+
+    /// Scans decoded values in chunk order, stopping at the first error.
+    pub fn try_fold<B, E, F>(&self, mut accumulator: B, mut fold: F) -> std::result::Result<B, E>
+    where
+        F: FnMut(B, i64) -> std::result::Result<B, E>,
+    {
+        for chunk in &self.sealed {
+            accumulator = chunk.try_fold(0, accumulator, &mut fold)?;
+        }
+        for &value in &self.tail {
+            accumulator = fold(accumulator, value)?;
+        }
+        Ok(accumulator)
+    }
+
     #[must_use]
     pub fn storage_stats(&self) -> Int64StorageStats {
         let mut stats = Int64StorageStats {
@@ -133,6 +157,18 @@ impl FromIterator<i64> for Int64Column {
         let mut column = Self::new();
         column.extend(iter);
         column
+    }
+}
+
+impl From<Vec<i64>> for Int64Column {
+    fn from(values: Vec<i64>) -> Self {
+        values.into_iter().collect()
+    }
+}
+
+impl From<Int64Column> for Vec<i64> {
+    fn from(values: Int64Column) -> Self {
+        values.iter().collect()
     }
 }
 
@@ -244,14 +280,29 @@ impl SealedInt64Chunk {
         }
     }
 
-    fn fold<B, F>(&self, offset: usize, mut accumulator: B, fold: &mut F) -> B
+    fn fold<B, F>(&self, offset: usize, accumulator: B, fold: &mut F) -> B
     where
         F: FnMut(B, i64) -> B,
+    {
+        self.try_fold(offset, accumulator, &mut |accumulator, value| {
+            Ok::<B, Infallible>(fold(accumulator, value))
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    fn try_fold<B, E, F>(
+        &self,
+        offset: usize,
+        mut accumulator: B,
+        fold: &mut F,
+    ) -> std::result::Result<B, E>
+    where
+        F: FnMut(B, i64) -> std::result::Result<B, E>,
     {
         match self {
             Self::Constant(value) => {
                 for _ in offset..INT64_CHUNK_SIZE {
-                    accumulator = fold(accumulator, *value);
+                    accumulator = fold(accumulator, *value)?;
                 }
             }
             Self::Delta {
@@ -283,16 +334,16 @@ impl SealedInt64Chunk {
                         delta
                     };
                     let value = base.wrapping_add(delta as i64);
-                    accumulator = fold(accumulator, value);
+                    accumulator = fold(accumulator, value)?;
                 }
             }
             Self::Raw(values) => {
                 for &value in &values[offset..] {
-                    accumulator = fold(accumulator, value);
+                    accumulator = fold(accumulator, value)?;
                 }
             }
         }
-        accumulator
+        Ok(accumulator)
     }
 
     fn encoded_bytes(&self) -> usize {

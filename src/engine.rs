@@ -325,6 +325,10 @@ fn execute_grouped<'a>(
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
+    if group_columns.is_empty() && matching_rows.len() == table.row_count() {
+        return execute_full_scan_aggregates(table, aggregate_specs);
+    }
+
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
     let initial_capacity = matching_rows.len().min(1_024);
@@ -364,6 +368,63 @@ fn execute_grouped<'a>(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(GroupedData { keys, aggregates })
+}
+
+fn execute_full_scan_aggregates<'a>(
+    table: &'a Table,
+    aggregate_specs: &[AggregateSpec],
+) -> Result<GroupedData<'a>> {
+    let aggregates = aggregate_specs
+        .iter()
+        .map(|spec| scan_full_aggregate(table, spec).map(|value| vec![value]))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GroupedData {
+        keys: vec![GroupKey::Empty],
+        aggregates,
+    })
+}
+
+fn scan_full_aggregate(table: &Table, spec: &AggregateSpec) -> Result<Value> {
+    if spec.function == AggregateFunction::Count {
+        let count = i64::try_from(table.row_count())
+            .map_err(|_| Error::NumericOverflow("COUNT".to_owned()))?;
+        return Ok(Value::Int64(count));
+    }
+
+    if spec.input_type != Some(DataType::Int64) {
+        let mut state = AggregateState::new(spec);
+        for row in 0..table.row_count() {
+            state.update(spec, table, row)?;
+        }
+        return state.finish();
+    }
+
+    let Column::Int64(values) = &table.columns()[spec.argument.expect("aggregate argument")] else {
+        unreachable!("aggregate input type is resolved")
+    };
+    match spec.function {
+        AggregateFunction::Sum => values
+            .try_fold(0_i64, |sum, value| sum.checked_add(value).ok_or(()))
+            .map(Value::Int64)
+            .map_err(|()| Error::NumericOverflow("SUM(Int64)".to_owned())),
+        AggregateFunction::Min => {
+            AggregateState::Min(values.iter().min().map(Value::Int64)).finish()
+        }
+        AggregateFunction::Max => {
+            AggregateState::Max(values.iter().max().map(Value::Int64)).finish()
+        }
+        AggregateFunction::Avg => {
+            let sum = values
+                .try_fold(0_i128, |sum, value| {
+                    sum.checked_add(i128::from(value)).ok_or(())
+                })
+                .map_err(|()| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+            let count = u64::try_from(values.len())
+                .map_err(|_| Error::NumericOverflow("AVG count".to_owned()))?;
+            AggregateState::AvgInt { sum, count }.finish()
+        }
+        AggregateFunction::Count => unreachable!("COUNT returns before reading a column"),
+    }
 }
 
 #[derive(Debug)]
@@ -885,6 +946,7 @@ fn comparable(left: DataType, right: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{ColumnDef, INT64_CHUNK_SIZE};
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
@@ -945,5 +1007,67 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn full_scan_int64_aggregates_decode_chunks_sequentially() {
+        let mut table = Table::new(
+            "encoded".to_owned(),
+            ["constant", "delta", "raw"]
+                .into_iter()
+                .map(|name| ColumnDef {
+                    name: name.to_owned(),
+                    data_type: DataType::Int64,
+                })
+                .collect(),
+        )
+        .expect("valid table");
+        for index in 0..INT64_CHUNK_SIZE {
+            table
+                .insert_row(vec![
+                    Value::Int64(7),
+                    Value::Int64(index as i64),
+                    Value::Int64(if index.is_multiple_of(2) {
+                        i64::MAX
+                    } else {
+                        i64::MIN
+                    }),
+                ])
+                .expect("valid row");
+        }
+
+        let sum = |argument| AggregateSpec {
+            function: AggregateFunction::Sum,
+            argument: Some(argument),
+            input_type: Some(DataType::Int64),
+        };
+        assert_eq!(
+            scan_full_aggregate(&table, &sum(0)).expect("constant sum"),
+            Value::Int64(7 * INT64_CHUNK_SIZE as i64)
+        );
+        assert_eq!(
+            scan_full_aggregate(&table, &sum(1)).expect("delta sum"),
+            Value::Int64((INT64_CHUNK_SIZE as i64 - 1) * INT64_CHUNK_SIZE as i64 / 2)
+        );
+        assert_eq!(
+            scan_full_aggregate(&table, &sum(2)).expect("raw sum"),
+            Value::Int64(-(INT64_CHUNK_SIZE as i64 / 2))
+        );
+    }
+
+    #[test]
+    fn full_scan_int64_sum_still_reports_overflow() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE overflowing (value Int64); \
+                 INSERT INTO overflowing VALUES (9223372036854775807), (1);",
+            )
+            .expect("setup");
+
+        assert!(matches!(
+            database.execute("SELECT SUM(value) FROM overflowing"),
+            Err(Error::NumericOverflow(operation)) if operation == "SUM(Int64)"
+        ));
     }
 }

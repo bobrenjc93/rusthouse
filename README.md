@@ -79,6 +79,10 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+### 0.2 Int64 column migration
+
+Version 0.2 intentionally changes the public `Column::Int64` payload from `Vec<i64>` to `Int64Column` so tables can own compressed chunks. Code that constructed the enum directly can use `Column::int64(values)` or `Column::Int64(values.into())`. Replace payload indexing with `get` or `iter`; callers that require a contiguous vector can use `to_vec()` or `Vec::<i64>::from(column)`.
+
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.

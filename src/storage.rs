@@ -38,6 +38,14 @@ impl Column {
         }
     }
 
+    /// Builds an Int64 column from values.
+    ///
+    /// This replaces direct `Column::Int64(Vec<i64>)` construction in 0.2.
+    #[must_use]
+    pub fn int64(values: impl IntoIterator<Item = i64>) -> Self {
+        Self::Int64(values.into_iter().collect())
+    }
+
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -244,5 +252,20 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn int64_vec_migration_helpers_preserve_values() {
+        let column = Column::int64(vec![i64::MIN, -1, 0, 1, i64::MAX]);
+        let Column::Int64(values) = column else {
+            unreachable!("constructor returns an Int64 column")
+        };
+
+        assert_eq!(values.get(0), Some(i64::MIN));
+        assert_eq!(values.to_vec(), vec![i64::MIN, -1, 0, 1, i64::MAX]);
+        assert_eq!(Vec::<i64>::from(values), vec![i64::MIN, -1, 0, 1, i64::MAX]);
+
+        let direct = Column::Int64(vec![4, 5, 6].into());
+        assert!(matches!(direct, Column::Int64(values) if values.iter().eq([4, 5, 6])));
     }
 }
