@@ -5,6 +5,38 @@ use crate::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 
+/// Budgets applied while lexing and parsing a complete SQL script.
+///
+/// The defaults accept the repository's 50,000-row benchmark imports while
+/// bounding parser memory use. Set a field explicitly when an application has
+/// a tighter memory budget or intentionally supports larger SQL constructs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseLimits {
+    pub max_sql_bytes: usize,
+    pub max_tokens: usize,
+    pub max_statements: usize,
+    pub max_identifier_bytes: usize,
+    pub max_literal_bytes: usize,
+    pub max_schema_columns: usize,
+    pub max_select_items: usize,
+    pub max_values_cells: usize,
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self {
+            max_sql_bytes: 64 * 1024 * 1024,
+            max_tokens: 2_000_000,
+            max_statements: 1_024,
+            max_identifier_bytes: 128,
+            max_literal_bytes: 1024 * 1024,
+            max_schema_columns: 1_024,
+            max_select_items: 1_024,
+            max_values_cells: 1_000_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
@@ -116,8 +148,19 @@ pub struct OrderBy {
 
 /// Parse one or more semicolon-separated SQL statements.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens).parse_script()
+    parse_with_limits(input, &ParseLimits::default())
+}
+
+/// Parse a SQL script using caller-supplied resource limits.
+pub fn parse_with_limits(input: &str, limits: &ParseLimits) -> Result<Vec<Statement>> {
+    if input.len() > limits.max_sql_bytes {
+        return Err(Error::Sql {
+            position: limits.max_sql_bytes,
+            message: format!("SQL input exceeds limit of {} bytes", limits.max_sql_bytes),
+        });
+    }
+    let tokens = Lexer::new(input, limits).tokenize()?;
+    Parser::new(tokens, limits).parse_script()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,11 +192,16 @@ enum TokenKind {
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
+    limits: &'a ParseLimits,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+    fn new(input: &'a str, limits: &'a ParseLimits) -> Self {
+        Self {
+            input,
+            position: 0,
+            limits,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
@@ -168,6 +216,15 @@ impl<'a> Lexer<'a> {
                 });
                 return Ok(tokens);
             };
+            if tokens.len() >= self.limits.max_tokens {
+                return self.error(
+                    position,
+                    format!(
+                        "SQL token count exceeds limit of {}",
+                        self.limits.max_tokens
+                    ),
+                );
+            }
 
             let kind = match character {
                 ',' => {
@@ -230,9 +287,9 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '\'' => TokenKind::String(self.scan_string(position)?),
-                value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()),
+                value if value.is_ascii_digit() => TokenKind::Number(self.scan_number(position)?),
                 value if value.is_ascii_alphabetic() || value == '_' => {
-                    TokenKind::Identifier(self.scan_identifier())
+                    TokenKind::Identifier(self.scan_identifier(position)?)
                 }
                 _ => {
                     return self.error(position, format!("unexpected character '{character}'"));
@@ -267,26 +324,38 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn scan_identifier(&mut self) -> String {
+    fn scan_identifier(&mut self, position: usize) -> Result<String> {
         let start = self.position;
         while self
             .current()
             .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_')
         {
             self.advance();
+            if self.position - start > self.limits.max_identifier_bytes {
+                return self.error(
+                    position,
+                    format!(
+                        "identifier exceeds limit of {} bytes",
+                        self.limits.max_identifier_bytes
+                    ),
+                );
+            }
         }
-        self.input[start..self.position].to_owned()
+        Ok(self.input[start..self.position].to_owned())
     }
 
-    fn scan_number(&mut self) -> String {
+    fn scan_number(&mut self, position: usize) -> Result<String> {
         let start = self.position;
         while self.current().is_some_and(|value| value.is_ascii_digit()) {
             self.advance();
+            self.check_literal_length(start, position)?;
         }
         if self.current() == Some('.') {
             self.advance();
+            self.check_literal_length(start, position)?;
             while self.current().is_some_and(|value| value.is_ascii_digit()) {
                 self.advance();
+                self.check_literal_length(start, position)?;
             }
         }
         if self
@@ -294,17 +363,20 @@ impl<'a> Lexer<'a> {
             .is_some_and(|value| matches!(value, 'e' | 'E'))
         {
             self.advance();
+            self.check_literal_length(start, position)?;
             if self
                 .current()
                 .is_some_and(|value| matches!(value, '+' | '-'))
             {
                 self.advance();
+                self.check_literal_length(start, position)?;
             }
             while self.current().is_some_and(|value| value.is_ascii_digit()) {
                 self.advance();
+                self.check_literal_length(start, position)?;
             }
         }
-        self.input[start..self.position].to_owned()
+        Ok(self.input[start..self.position].to_owned())
     }
 
     fn scan_string(&mut self, start: usize) -> Result<String> {
@@ -316,6 +388,7 @@ impl<'a> Lexer<'a> {
                 Some('\'') => {
                     self.advance();
                     if self.current() == Some('\'') {
+                        self.check_string_length(value.len(), '\'', start)?;
                         value.push('\'');
                         self.advance();
                     } else {
@@ -323,11 +396,38 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(character) => {
+                    self.check_string_length(value.len(), character, start)?;
                     value.push(character);
                     self.advance();
                 }
             }
         }
+    }
+
+    fn check_literal_length(&self, start: usize, position: usize) -> Result<()> {
+        if self.position - start > self.limits.max_literal_bytes {
+            return self.error(
+                position,
+                format!(
+                    "literal exceeds limit of {} bytes",
+                    self.limits.max_literal_bytes
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn check_string_length(&self, length: usize, character: char, position: usize) -> Result<()> {
+        if length.saturating_add(character.len_utf8()) > self.limits.max_literal_bytes {
+            return self.error(
+                position,
+                format!(
+                    "literal exceeds limit of {} bytes",
+                    self.limits.max_literal_bytes
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn error<T>(&self, position: usize, message: impl Into<String>) -> Result<T> {
@@ -338,20 +438,22 @@ impl<'a> Lexer<'a> {
     }
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    limits: &'a ParseLimits,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+impl<'a> Parser<'a> {
+    fn new(tokens: Vec<Token>, limits: &'a ParseLimits) -> Self {
         Self {
             tokens,
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            limits,
         }
     }
 
@@ -359,6 +461,12 @@ impl Parser {
         let mut statements = Vec::new();
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
+            if statements.len() >= self.limits.max_statements {
+                return self.error(format!(
+                    "SQL statement count exceeds limit of {}",
+                    self.limits.max_statements
+                ));
+            }
             statements.push(self.parse_statement()?);
             if !self.eat(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("expected ';' between statements");
@@ -389,6 +497,12 @@ impl Parser {
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
+            if columns.len() >= self.limits.max_schema_columns {
+                return self.error(format!(
+                    "schema exceeds limit of {} columns",
+                    self.limits.max_schema_columns
+                ));
+            }
             let column_name = self.expect_identifier("column name")?;
             if is_reserved_column_name(&column_name) {
                 return Err(Error::ReservedIdentifier {
@@ -421,12 +535,20 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
+        let mut cell_count = 0_usize;
         loop {
             self.expect(&TokenKind::LeftParen, "'(' before row values")?;
             let mut row = Vec::new();
             if !self.at(&TokenKind::RightParen) {
                 loop {
+                    if cell_count >= self.limits.max_values_cells {
+                        return self.error(format!(
+                            "VALUES clause exceeds limit of {} cells",
+                            self.limits.max_values_cells
+                        ));
+                    }
                     row.push(self.parse_literal()?);
+                    cell_count += 1;
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -444,6 +566,12 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
+            if items.len() >= self.limits.max_select_items {
+                return self.error(format!(
+                    "SELECT list exceeds limit of {} items",
+                    self.limits.max_select_items
+                ));
+            }
             items.push(self.parse_select_item()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -641,6 +769,12 @@ impl Parser {
 
         let negative = self.eat(&TokenKind::Minus);
         if let Some(number) = self.take_number() {
+            if number.len().saturating_add(usize::from(negative)) > self.limits.max_literal_bytes {
+                return self.error(format!(
+                    "literal exceeds limit of {} bytes",
+                    self.limits.max_literal_bytes
+                ));
+            }
             let signed = if negative {
                 format!("-{number}")
             } else {
@@ -669,12 +803,24 @@ impl Parser {
         }
 
         if self.eat_keyword("TRUE") {
+            self.check_parsed_literal_length(4)?;
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
+            self.check_parsed_literal_length(5)?;
             Ok(Value::Bool(false))
         } else {
             self.error("expected an Int64, Float64, Bool, or String literal")
         }
+    }
+
+    fn check_parsed_literal_length(&self, length: usize) -> Result<()> {
+        if length > self.limits.max_literal_bytes {
+            return self.error(format!(
+                "literal exceeds limit of {} bytes",
+                self.limits.max_literal_bytes
+            ));
+        }
+        Ok(())
     }
 
     fn expect_keyword(&mut self, expected: &str) -> Result<()> {

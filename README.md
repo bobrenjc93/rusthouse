@@ -57,6 +57,12 @@ printf '%s\n' \
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
+Parser budgets can be tightened or raised with `--max-sql-bytes`, `--max-tokens`,
+`--max-statements`, `--max-identifier-bytes`, `--max-literal-bytes`,
+`--max-schema-columns`, `--max-select-items`, and `--max-values-cells`. Both
+`--option N` and `--option=N` forms are accepted. Standard input is read only
+through the configured SQL byte limit.
+
 ## Library API
 
 Database retains an in-memory catalog across calls and returns structured results:
@@ -64,9 +70,11 @@ Database retains an in-memory catalog across calls and returns structured result
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
 ~~~rust
-use rusthouse::{Database, StatementResult};
+use rusthouse::{Database, ParseLimits, StatementResult};
 
-let mut database = Database::new();
+let mut limits = ParseLimits::default();
+limits.max_statements = 32;
+let mut database = Database::with_parse_limits(limits);
 database.execute("CREATE TABLE events (id Int64, name String)")?;
 database.execute("INSERT INTO events VALUES (1, 'launch')")?;
 
@@ -84,6 +92,14 @@ assert_eq!(result.rows.len(), 1);
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+
+Default parser budgets are 64 MiB of SQL, 2,000,000 lexical tokens, 1,024
+statements, 128 bytes per identifier, 1 MiB per literal, 1,024 schema columns,
+1,024 SELECT items, and 1,000,000 cells per VALUES clause. Literal length is
+the decoded UTF-8 length for strings and includes a numeric sign. Applications
+can override every parser budget with `ParseLimits`; `sql::parse_with_limits`
+offers the same control without a `Database`. The defaults accept the shipped
+50,000-row benchmark import.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

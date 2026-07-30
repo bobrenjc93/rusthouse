@@ -283,4 +283,20 @@ mod tests {
     fn amplification_must_be_positive() {
         assert!(sql_batch("", "SELECT 1;", 0).is_err());
     }
+
+    #[test]
+    fn default_parse_limits_accept_the_largest_amplified_benchmark_batch() {
+        let setup = crate::dataset::Dataset::generate(20_260_729, 50_000).setup_sql();
+        let query = &crate::workload::workloads(50_000)[0].sql;
+        let batch = sql_batch(&setup, query, 256).expect("valid amplified batch");
+        let statements =
+            rusthouse::sql::parse(&batch).expect("default limits accept benchmark batch");
+
+        let rusthouse::sql::Statement::Insert { rows, .. } = &statements[1] else {
+            panic!("benchmark setup includes an INSERT");
+        };
+        assert_eq!(rows.len(), 50_000);
+        assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), 450_000);
+        assert_eq!(statements.len(), 258);
+    }
 }

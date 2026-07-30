@@ -154,3 +154,31 @@ fn excessive_predicates_return_cli_errors_without_aborting() {
         assert!(!stderr.contains("stack overflow"));
     }
 }
+
+#[test]
+fn stdin_sql_byte_limit_accepts_the_boundary_and_rejects_excess_input() {
+    let sql = b"CREATE TABLE bounded (id Int64);";
+
+    for (limit, succeeds) in [(sql.len(), true), (sql.len() - 1, false)] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .arg(format!("--max-sql-bytes={limit}"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn CLI");
+        child
+            .stdin
+            .take()
+            .expect("stdin pipe")
+            .write_all(sql)
+            .expect("write bounded SQL");
+
+        let output = child.wait_with_output().expect("wait for CLI");
+        assert_eq!(output.status.success(), succeeds);
+        if !succeeds {
+            let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+            assert!(stderr.contains(&format!("limit of {limit} bytes")));
+        }
+    }
+}

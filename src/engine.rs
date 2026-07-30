@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, ParseLimits,
+    Predicate, Select, SelectItem, Statement,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -14,6 +14,7 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    parse_limits: ParseLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,24 @@ impl Database {
         Self::default()
     }
 
+    /// Create an empty database with caller-supplied SQL parse budgets.
+    #[must_use]
+    pub fn with_parse_limits(parse_limits: ParseLimits) -> Self {
+        Self {
+            catalog: Catalog::default(),
+            parse_limits,
+        }
+    }
+
+    #[must_use]
+    pub fn parse_limits(&self) -> &ParseLimits {
+        &self.parse_limits
+    }
+
+    pub fn set_parse_limits(&mut self, parse_limits: ParseLimits) {
+        self.parse_limits = parse_limits;
+    }
+
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
@@ -54,7 +73,7 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
+        sql::parse_with_limits(sql, &self.parse_limits)?
             .into_iter()
             .map(|statement| self.execute_statement(statement))
             .collect()

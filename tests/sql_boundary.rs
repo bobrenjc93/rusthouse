@@ -1,4 +1,4 @@
-use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
+use rusthouse::{DataType, Database, Error, ParseLimits, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
     match results.into_iter().last().expect("statement result") {
@@ -502,13 +502,16 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
-fn creates_a_fifty_thousand_column_schema() {
+fn configured_limit_accepts_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)
         .map(|index| format!("c{index} Int64"))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut database = Database::new();
+    let mut database = Database::with_parse_limits(ParseLimits {
+        max_schema_columns: column_count,
+        ..ParseLimits::default()
+    });
 
     database
         .execute(&format!("CREATE TABLE wide ({definitions})"))

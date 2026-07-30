@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::{Database, ParseLimits, QueryResult, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -14,6 +14,14 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+    --max-sql-bytes <N>       Maximum SQL input size
+    --max-tokens <N>          Maximum lexical tokens per script
+    --max-statements <N>      Maximum statements per script
+    --max-identifier-bytes <N>  Maximum identifier length
+    --max-literal-bytes <N>   Maximum literal length
+    --max-schema-columns <N>  Maximum columns per CREATE TABLE
+    --max-select-items <N>    Maximum items per SELECT list
+    --max-values-cells <N>    Maximum cells per VALUES clause
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -40,14 +48,10 @@ fn run() -> Result<(), String> {
     let sql = if let Some(sql) = config.execute {
         sql
     } else {
-        let mut sql = String::new();
-        io::stdin()
-            .read_to_string(&mut sql)
-            .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
-        sql
+        read_sql(io::stdin(), config.parse_limits.max_sql_bytes)?
     };
 
-    let mut database = Database::new();
+    let mut database = Database::with_parse_limits(config.parse_limits);
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +98,13 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    parse_limits: ParseLimits,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut parse_limits = ParseLimits::default();
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -134,11 +140,73 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
-            _ => return Err(format!("unknown argument '{argument}'; try --help")),
+            _ if is_parse_limit_option(&argument) => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a non-negative integer"))?;
+                set_parse_limit(&mut parse_limits, &argument, &value)?;
+            }
+            _ => {
+                if let Some((option, value)) = argument.split_once('=')
+                    && set_parse_limit(&mut parse_limits, option, value)?
+                {
+                    continue;
+                }
+                return Err(format!("unknown argument '{argument}'; try --help"));
+            }
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        parse_limits,
+    }))
+}
+
+fn is_parse_limit_option(option: &str) -> bool {
+    matches!(
+        option,
+        "--max-sql-bytes"
+            | "--max-tokens"
+            | "--max-statements"
+            | "--max-identifier-bytes"
+            | "--max-literal-bytes"
+            | "--max-schema-columns"
+            | "--max-select-items"
+            | "--max-values-cells"
+    )
+}
+
+fn set_parse_limit(limits: &mut ParseLimits, option: &str, value: &str) -> Result<bool, String> {
+    let target = match option {
+        "--max-sql-bytes" => &mut limits.max_sql_bytes,
+        "--max-tokens" => &mut limits.max_tokens,
+        "--max-statements" => &mut limits.max_statements,
+        "--max-identifier-bytes" => &mut limits.max_identifier_bytes,
+        "--max-literal-bytes" => &mut limits.max_literal_bytes,
+        "--max-schema-columns" => &mut limits.max_schema_columns,
+        "--max-select-items" => &mut limits.max_select_items,
+        "--max-values-cells" => &mut limits.max_values_cells,
+        _ => return Ok(false),
+    };
+    *target = value.parse::<usize>().map_err(|_| {
+        format!("invalid value '{value}' for {option}; expected a non-negative integer")
+    })?;
+    Ok(true)
+}
+
+fn read_sql(reader: impl Read, max_sql_bytes: usize) -> Result<String, String> {
+    let read_limit = max_sql_bytes.saturating_add(1);
+    let mut bytes = Vec::new();
+    reader
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
+    if bytes.len() > max_sql_bytes {
+        return Err(format!("SQL input exceeds limit of {max_sql_bytes} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("could not read SQL from stdin: {error}"))
 }
 
 #[cfg(test)]
@@ -164,6 +232,51 @@ mod tests {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
         assert!(error.contains("table, csv, or json"));
+    }
+
+    #[test]
+    fn parses_all_parse_limit_options() {
+        let config = parse_arguments(
+            [
+                "--max-sql-bytes=1",
+                "--max-tokens",
+                "2",
+                "--max-statements=3",
+                "--max-identifier-bytes=4",
+                "--max-literal-bytes=5",
+                "--max-schema-columns=6",
+                "--max-select-items=7",
+                "--max-values-cells=8",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("valid arguments")
+        .expect("not help");
+
+        assert_eq!(
+            config.parse_limits,
+            ParseLimits {
+                max_sql_bytes: 1,
+                max_tokens: 2,
+                max_statements: 3,
+                max_identifier_bytes: 4,
+                max_literal_bytes: 5,
+                max_schema_columns: 6,
+                max_select_items: 7,
+                max_values_cells: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn stdin_reader_accepts_exact_byte_limit_and_rejects_the_next_byte() {
+        assert_eq!(
+            read_sql("SELECT".as_bytes(), 6).expect("exact boundary succeeds"),
+            "SELECT"
+        );
+        let error = read_sql("SELECT".as_bytes(), 5).expect_err("one excess byte fails");
+        assert!(error.contains("limit of 5 bytes"));
     }
 
     #[test]
