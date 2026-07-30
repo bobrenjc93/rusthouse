@@ -28,6 +28,10 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    TransactionAlreadyActive,
+    NoActiveTransaction {
+        command: &'static str,
+    },
     InvalidQuery(String),
     NumericOverflow(String),
 }
@@ -69,6 +73,13 @@ impl fmt::Display for Error {
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
             ),
+            Self::TransactionAlreadyActive => write!(
+                f,
+                "transaction already active; nested transactions are not supported"
+            ),
+            Self::NoActiveTransaction { command } => {
+                write!(f, "cannot {command}: no transaction is active")
+            }
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")

@@ -7,6 +7,9 @@ const MAX_PREDICATE_NODES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    Begin,
+    Commit,
+    Rollback,
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
@@ -372,14 +375,21 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement> {
-        if self.eat_keyword("CREATE") {
+        if self.eat_keyword("BEGIN") {
+            self.eat_keyword("TRANSACTION");
+            Ok(Statement::Begin)
+        } else if self.eat_keyword("COMMIT") {
+            Ok(Statement::Commit)
+        } else if self.eat_keyword("ROLLBACK") {
+            Ok(Statement::Rollback)
+        } else if self.eat_keyword("CREATE") {
             self.parse_create()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected BEGIN, COMMIT, ROLLBACK, CREATE, INSERT, or SELECT")
         }
     }
 
@@ -782,6 +792,14 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_transaction_commands_case_insensitively() {
+        assert_eq!(
+            parse("begin transaction; CoMmIt; rollback").expect("valid commands"),
+            vec![Statement::Begin, Statement::Commit, Statement::Rollback]
+        );
     }
 
     #[test]

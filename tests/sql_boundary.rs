@@ -445,6 +445,146 @@ fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
 }
 
 #[test]
+fn explicit_transaction_commits_across_execute_calls() {
+    let mut database = Database::new();
+
+    assert_eq!(
+        database.execute("BEGIN").expect("begin succeeds"),
+        vec![StatementResult::Command {
+            tag: "BEGIN",
+            affected_rows: 0,
+        }]
+    );
+    database
+        .execute("CREATE TABLE events (id Int64, label String)")
+        .expect("staged create succeeds");
+    assert_eq!(
+        database
+            .execute("INSERT INTO events VALUES (1, 'staged'), (2, 'visible')")
+            .expect("staged insert succeeds"),
+        vec![StatementResult::Command {
+            tag: "INSERT",
+            affected_rows: 2,
+        }]
+    );
+
+    let staged = execute_query(&mut database, "SELECT label FROM events WHERE id = 1");
+    assert_eq!(staged.rows, vec![vec![Value::String("staged".to_owned())]]);
+    assert_eq!(database.catalog().table("events").unwrap().row_count(), 2);
+
+    assert_eq!(
+        database.execute("COMMIT").expect("commit succeeds"),
+        vec![StatementResult::Command {
+            tag: "COMMIT",
+            affected_rows: 0,
+        }]
+    );
+    let committed = execute_query(&mut database, "SELECT COUNT(*) AS count FROM events");
+    assert_eq!(committed.rows, vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn rollback_discards_staged_table_and_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64);
+             INSERT INTO events VALUES (1);",
+        )
+        .expect("setup succeeds");
+
+    database
+        .execute(
+            "BEGIN;
+             INSERT INTO events VALUES (2);
+             CREATE TABLE staged_only (id Int64);",
+        )
+        .expect("transaction batch succeeds");
+    assert_eq!(database.catalog().table("events").unwrap().row_count(), 2);
+    assert!(database.catalog().table("staged_only").is_ok());
+
+    assert_eq!(
+        database.execute("ROLLBACK").expect("rollback succeeds"),
+        vec![StatementResult::Command {
+            tag: "ROLLBACK",
+            affected_rows: 0,
+        }]
+    );
+    assert_eq!(database.catalog().table("events").unwrap().row_count(), 1);
+    assert!(matches!(
+        database.catalog().table("staged_only"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
+fn transaction_statement_errors_are_atomic_and_leave_transaction_usable() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64);
+             BEGIN;
+             INSERT INTO events VALUES (1);",
+        )
+        .expect("setup and begin succeed");
+
+    let error = database
+        .execute("INSERT INTO events VALUES (2), (false)")
+        .expect_err("invalid statement fails");
+    assert!(matches!(error, Error::TypeMismatch { .. }));
+
+    let staged = execute_query(&mut database, "SELECT id FROM events ORDER BY id");
+    assert_eq!(staged.rows, vec![vec![Value::Int64(1)]]);
+    database
+        .execute("INSERT INTO events VALUES (3); COMMIT")
+        .expect("transaction remains usable");
+    let committed = execute_query(&mut database, "SELECT id FROM events ORDER BY id");
+    assert_eq!(
+        committed.rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]
+    );
+}
+
+#[test]
+fn transaction_state_and_errors_are_scoped_to_a_database_session() {
+    let mut first = Database::new();
+    let mut second = Database::new();
+
+    first
+        .execute("BEGIN; CREATE TABLE private_table (id Int64)")
+        .expect("first session begins");
+    assert!(matches!(
+        second.catalog().table("private_table"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    let nested = first.execute("BEGIN").expect_err("nested begin fails");
+    assert_eq!(nested, Error::TransactionAlreadyActive);
+    assert!(nested.to_string().contains("nested transactions"));
+
+    let commit = second
+        .execute("COMMIT")
+        .expect_err("second session has no transaction");
+    assert_eq!(commit, Error::NoActiveTransaction { command: "COMMIT" });
+    let rollback = second
+        .execute("ROLLBACK")
+        .expect_err("second session still has no transaction");
+    assert_eq!(
+        rollback,
+        Error::NoActiveTransaction {
+            command: "ROLLBACK"
+        }
+    );
+
+    first.execute("COMMIT").expect("first session commits");
+    assert!(first.catalog().table("private_table").is_ok());
+    assert!(matches!(
+        second.catalog().table("private_table"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
 fn avg_int64_accumulates_exactly_before_final_conversion() {
     let mut database = Database::new();
     database

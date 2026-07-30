@@ -14,6 +14,7 @@ use crate::value::{DataType, Value, ValueRef};
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    transaction_catalog: Option<Catalog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,14 +46,15 @@ impl Database {
 
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
-        &self.catalog
+        self.active_catalog()
     }
 
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
     /// nothing. Once parsing succeeds, statements execute in order and earlier
-    /// statements remain applied if a later execution error occurs.
+    /// statements remain applied if a later execution error occurs. Statements
+    /// inside an explicit transaction remain staged until COMMIT.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         sql::parse(sql)?
             .into_iter()
@@ -62,8 +64,40 @@ impl Database {
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
+            Statement::Begin => {
+                if self.transaction_catalog.is_some() {
+                    return Err(Error::TransactionAlreadyActive);
+                }
+                self.transaction_catalog = Some(self.catalog.clone());
+                Ok(StatementResult::Command {
+                    tag: "BEGIN",
+                    affected_rows: 0,
+                })
+            }
+            Statement::Commit => {
+                let catalog = self
+                    .transaction_catalog
+                    .take()
+                    .ok_or(Error::NoActiveTransaction { command: "COMMIT" })?;
+                self.catalog = catalog;
+                Ok(StatementResult::Command {
+                    tag: "COMMIT",
+                    affected_rows: 0,
+                })
+            }
+            Statement::Rollback => {
+                self.transaction_catalog
+                    .take()
+                    .ok_or(Error::NoActiveTransaction {
+                        command: "ROLLBACK",
+                    })?;
+                Ok(StatementResult::Command {
+                    tag: "ROLLBACK",
+                    affected_rows: 0,
+                })
+            }
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+                self.active_catalog_mut().create_table(name, columns)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -72,12 +106,12 @@ impl Database {
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
                 {
-                    let target = self.catalog.table(&table)?;
+                    let target = self.active_catalog().table(&table)?;
                     for row in &rows {
                         target.validate_row(row)?;
                     }
                 }
-                let target = self.catalog.table_mut(&table)?;
+                let target = self.active_catalog_mut().table_mut(&table)?;
                 for row in rows {
                     target.insert_row(row)?;
                 }
@@ -91,7 +125,7 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        let table = self.active_catalog().table(&select.table)?;
         let predicate = select
             .predicate
             .as_ref()
@@ -132,6 +166,16 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+
+    fn active_catalog(&self) -> &Catalog {
+        self.transaction_catalog.as_ref().unwrap_or(&self.catalog)
+    }
+
+    fn active_catalog_mut(&mut self) -> &mut Catalog {
+        self.transaction_catalog
+            .as_mut()
+            .unwrap_or(&mut self.catalog)
     }
 }
 

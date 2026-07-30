@@ -111,6 +111,32 @@ fn sql_errors_are_reported_with_nonzero_status() {
 }
 
 #[test]
+fn transaction_commands_are_reported_and_committed_in_a_cli_batch() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "BEGIN;
+             CREATE TABLE events (id Int64);
+             INSERT INTO events VALUES (1);
+             COMMIT;
+             SELECT id FROM events;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "BEGIN\nCREATE TABLE\nINSERT 1\nCOMMIT\n"
+    );
+}
+
+#[test]
 fn excessive_predicates_return_cli_errors_without_aborting() {
     let cases = [
         (
