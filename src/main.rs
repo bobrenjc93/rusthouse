@@ -1,9 +1,9 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 
-use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::format::{OutputFormat, StreamingWriter, render};
+use rusthouse::{Database, QueryResult, ResultColumn, RowSink, StatementResult, ValueRef};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -48,22 +48,69 @@ fn run() -> Result<(), String> {
     };
 
     let mut database = Database::new();
+    if matches!(config.format, OutputFormat::Csv | OutputFormat::Json) {
+        return stream_query_results(&mut database, &sql, config.format);
+    }
+
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
         match result {
             StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
-                    eprintln!("{tag} {affected_rows}");
-                } else {
-                    eprintln!("{tag}");
-                }
+                report_command(tag, affected_rows);
             }
             StatementResult::Query(result) => queries.push(result),
         }
     }
     print!("{}", render_query_results(&queries, config.format));
     Ok(())
+}
+
+fn stream_query_results(
+    database: &mut Database,
+    sql: &str,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let stdout = io::stdout();
+    let writer = StreamingWriter::new(BufWriter::new(stdout.lock()), format)
+        .map_err(|error| error.to_string())?;
+    let mut sink = CliStreamingSink { writer };
+    database
+        .execute_with_sink(sql, &mut sink)
+        .map_err(|error| error.to_string())?;
+    sink.writer.finish().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+struct CliStreamingSink<W> {
+    writer: StreamingWriter<W>,
+}
+
+impl<W: Write> RowSink for CliStreamingSink<W> {
+    fn command(&mut self, tag: &'static str, affected_rows: usize) -> rusthouse::Result<()> {
+        report_command(tag, affected_rows);
+        Ok(())
+    }
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> rusthouse::Result<()> {
+        self.writer.begin_query(columns)
+    }
+
+    fn write_row(&mut self, row: &[ValueRef<'_>]) -> rusthouse::Result<()> {
+        self.writer.write_row(row)
+    }
+
+    fn end_query(&mut self) -> rusthouse::Result<()> {
+        self.writer.end_query()
+    }
+}
+
+fn report_command(tag: &'static str, affected_rows: usize) {
+    if tag == "INSERT" {
+        eprintln!("{tag} {affected_rows}");
+    } else {
+        eprintln!("{tag}");
+    }
 }
 
 fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {

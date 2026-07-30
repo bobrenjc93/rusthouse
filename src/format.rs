@@ -1,7 +1,9 @@
 use std::fmt::Write;
+use std::io::Write as IoWrite;
 
-use crate::engine::QueryResult;
-use crate::value::Value;
+use crate::engine::{QueryResult, ResultColumn, RowSink};
+use crate::error::{Error, Result};
+use crate::value::{Value, ValueRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -20,6 +22,240 @@ impl OutputFormat {
             _ => None,
         }
     }
+}
+
+/// Streams CSV or JSON query results to an [`std::io::Write`] destination.
+///
+/// JSON is emitted as one document with a top-level `results` array. CSV
+/// result sets are separated by a blank line. Call [`Self::finish`] after a
+/// successful execution to close JSON output and flush the destination.
+#[derive(Debug)]
+pub struct StreamingWriter<W> {
+    output: W,
+    format: OutputFormat,
+    query_count: usize,
+    row_count: usize,
+    query_open: bool,
+}
+
+impl<W: IoWrite> StreamingWriter<W> {
+    /// Creates a streaming CSV or JSON writer.
+    pub fn new(output: W, format: OutputFormat) -> Result<Self> {
+        if format == OutputFormat::Table {
+            return Err(Error::InvalidQuery(
+                "streaming table output is not supported".to_owned(),
+            ));
+        }
+        Ok(Self {
+            output,
+            format,
+            query_count: 0,
+            row_count: 0,
+            query_open: false,
+        })
+    }
+
+    /// Completes the output document, flushes it, and returns the destination.
+    pub fn finish(mut self) -> Result<W> {
+        if self.query_open {
+            return Err(Error::Output(
+                "cannot finish while a query result is open".to_owned(),
+            ));
+        }
+        if self.format == OutputFormat::Json {
+            if self.query_count == 0 {
+                write_output(&mut self.output, b"{\"results\":[]}\n")?;
+            } else {
+                write_output(&mut self.output, b"]}\n")?;
+            }
+        }
+        self.output
+            .flush()
+            .map_err(|error| output_error("could not flush output", error))?;
+        Ok(self.output)
+    }
+}
+
+impl<W: IoWrite> RowSink for StreamingWriter<W> {
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> Result<()> {
+        if self.query_open {
+            return Err(Error::Output(
+                "cannot start a query while another result is open".to_owned(),
+            ));
+        }
+
+        match self.format {
+            OutputFormat::Csv => {
+                if self.query_count > 0 {
+                    write_output(&mut self.output, b"\n")?;
+                }
+                write_csv_fields(
+                    &mut self.output,
+                    columns.iter().map(|column| column.name.as_str()),
+                )?;
+            }
+            OutputFormat::Json => {
+                if self.query_count == 0 {
+                    write_output(&mut self.output, b"{\"results\":[")?;
+                } else {
+                    write_output(&mut self.output, b",")?;
+                }
+                write_output(&mut self.output, b"{\"columns\":[")?;
+                for (index, column) in columns.iter().enumerate() {
+                    if index > 0 {
+                        write_output(&mut self.output, b",")?;
+                    }
+                    write_output(&mut self.output, b"{\"name\":")?;
+                    write_json_string_io(&mut self.output, &column.name)?;
+                    write_output(&mut self.output, b",\"type\":")?;
+                    write_json_string_io(&mut self.output, &column.data_type.to_string())?;
+                    write_output(&mut self.output, b"}")?;
+                }
+                write_output(&mut self.output, b"],\"rows\":[")?;
+            }
+            OutputFormat::Table => unreachable!("table format is rejected by the constructor"),
+        }
+
+        self.row_count = 0;
+        self.query_open = true;
+        Ok(())
+    }
+
+    fn write_row(&mut self, row: &[ValueRef<'_>]) -> Result<()> {
+        if !self.query_open {
+            return Err(Error::Output(
+                "cannot write a row without an open query result".to_owned(),
+            ));
+        }
+
+        match self.format {
+            OutputFormat::Csv => write_csv_values(&mut self.output, row)?,
+            OutputFormat::Json => {
+                if self.row_count > 0 {
+                    write_output(&mut self.output, b",")?;
+                }
+                write_output(&mut self.output, b"[")?;
+                for (index, value) in row.iter().copied().enumerate() {
+                    if index > 0 {
+                        write_output(&mut self.output, b",")?;
+                    }
+                    write_json_value_io(&mut self.output, value)?;
+                }
+                write_output(&mut self.output, b"]")?;
+            }
+            OutputFormat::Table => unreachable!("table format is rejected by the constructor"),
+        }
+        self.row_count += 1;
+        Ok(())
+    }
+
+    fn end_query(&mut self) -> Result<()> {
+        if !self.query_open {
+            return Err(Error::Output(
+                "cannot end a query result that is not open".to_owned(),
+            ));
+        }
+        if self.format == OutputFormat::Json {
+            write_output(&mut self.output, b"]}")?;
+        }
+        self.query_count += 1;
+        self.query_open = false;
+        Ok(())
+    }
+}
+
+fn write_output(output: &mut impl IoWrite, bytes: &[u8]) -> Result<()> {
+    output
+        .write_all(bytes)
+        .map_err(|error| output_error("could not write output", error))
+}
+
+fn output_error(context: &str, error: std::io::Error) -> Error {
+    Error::Output(format!("{context}: {error}"))
+}
+
+fn write_csv_fields<'a>(
+    output: &mut impl IoWrite,
+    values: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            write_output(output, b",")?;
+        }
+        write_csv_field_io(output, value)?;
+    }
+    write_output(output, b"\n")
+}
+
+fn write_csv_values(output: &mut impl IoWrite, values: &[ValueRef<'_>]) -> Result<()> {
+    for (index, value) in values.iter().copied().enumerate() {
+        if index > 0 {
+            write_output(output, b",")?;
+        }
+        match value {
+            ValueRef::String(value) => write_csv_field_io(output, value)?,
+            ValueRef::Int64(value) => write_output(output, value.to_string().as_bytes())?,
+            ValueRef::Float64(value) => {
+                write_output(output, Value::Float64(value).as_display_string().as_bytes())?
+            }
+            ValueRef::Bool(value) => write_output(output, if value { b"true" } else { b"false" })?,
+        }
+    }
+    write_output(output, b"\n")
+}
+
+fn write_csv_field_io(output: &mut impl IoWrite, value: &str) -> Result<()> {
+    if !value.contains([',', '"', '\n', '\r']) {
+        return write_output(output, value.as_bytes());
+    }
+
+    write_output(output, b"\"")?;
+    let mut start = 0;
+    for (index, byte) in value.bytes().enumerate() {
+        if byte == b'"' {
+            write_output(output, &value.as_bytes()[start..index])?;
+            write_output(output, b"\"\"")?;
+            start = index + 1;
+        }
+    }
+    write_output(output, &value.as_bytes()[start..])?;
+    write_output(output, b"\"")
+}
+
+fn write_json_value_io(output: &mut impl IoWrite, value: ValueRef<'_>) -> Result<()> {
+    match value {
+        ValueRef::Int64(value) => write_output(output, value.to_string().as_bytes()),
+        ValueRef::Float64(value) => {
+            write_output(output, Value::Float64(value).as_display_string().as_bytes())
+        }
+        ValueRef::Bool(value) => write_output(output, if value { b"true" } else { b"false" }),
+        ValueRef::String(value) => write_json_string_io(output, value),
+    }
+}
+
+fn write_json_string_io(output: &mut impl IoWrite, value: &str) -> Result<()> {
+    write_output(output, b"\"")?;
+    for character in value.chars() {
+        let escaped = match character {
+            '"' => Some("\\\""),
+            '\\' => Some("\\\\"),
+            '\u{08}' => Some("\\b"),
+            '\u{0c}' => Some("\\f"),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            write_output(output, escaped.as_bytes())?;
+        } else if character.is_control() {
+            write_output(output, format!("\\u{:04x}", character as u32).as_bytes())?;
+        } else {
+            let mut encoded = [0; 4];
+            write_output(output, character.encode_utf8(&mut encoded).as_bytes())?;
+        }
+    }
+    write_output(output, b"\"")
 }
 
 #[must_use]

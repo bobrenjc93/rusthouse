@@ -59,7 +59,8 @@ JSON output is always one document with a top-level results array. Each SELECT r
 
 ## Library API
 
-Database retains an in-memory catalog across calls and returns structured results:
+Database retains an in-memory catalog across calls. `Database::execute` returns
+structured, collected results for compatibility:
 
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
@@ -78,6 +79,13 @@ assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+For large query results, implement `RowSink` and call
+`Database::execute_with_sink`. The sink receives each output schema followed by
+borrowed `ValueRef` rows, so callers can consume rows without building a
+row-major `QueryResult`. The CLI uses this path to write CSV and JSON directly
+to standard output; table formatting remains collected because column widths
+depend on every rendered row.
 
 ## Current boundaries
 

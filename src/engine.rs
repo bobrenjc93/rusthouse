@@ -37,6 +37,68 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// Receives statement metadata and query rows as they are executed.
+///
+/// Row values borrow immutable column or aggregate storage and are valid only
+/// for the duration of [`RowSink::write_row`]. If a sink method fails, query
+/// execution stops and `end_query` is not called for the open query.
+pub trait RowSink {
+    /// Receives a successfully completed non-query statement.
+    fn command(&mut self, _tag: &'static str, _affected_rows: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Starts a query result after its output schema has been resolved.
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> Result<()>;
+
+    /// Receives one positional query row.
+    fn write_row(&mut self, row: &[ValueRef<'_>]) -> Result<()>;
+
+    /// Completes the current query result.
+    fn end_query(&mut self) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct CollectingSink {
+    results: Vec<StatementResult>,
+    current_query: Option<QueryResult>,
+}
+
+impl RowSink for CollectingSink {
+    fn command(&mut self, tag: &'static str, affected_rows: usize) -> Result<()> {
+        self.results
+            .push(StatementResult::Command { tag, affected_rows });
+        Ok(())
+    }
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> Result<()> {
+        debug_assert!(self.current_query.is_none());
+        self.current_query = Some(QueryResult {
+            columns: columns.to_vec(),
+            rows: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn write_row(&mut self, row: &[ValueRef<'_>]) -> Result<()> {
+        self.current_query
+            .as_mut()
+            .expect("a collected row belongs to an open query")
+            .rows
+            .push(row.iter().copied().map(ValueRef::into_owned).collect());
+        Ok(())
+    }
+
+    fn end_query(&mut self) -> Result<()> {
+        let result = self
+            .current_query
+            .take()
+            .expect("a collected query was started");
+        self.results.push(StatementResult::Query(result));
+        Ok(())
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -54,20 +116,37 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let mut sink = CollectingSink::default();
+        self.execute_with_sink(sql, &mut sink)?;
+        Ok(sink.results)
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    /// Execute a SQL batch and send each query row to `sink` without collecting
+    /// row-major results.
+    ///
+    /// The complete batch is parsed before execution. Sink callbacks occur in
+    /// statement order, and successful earlier statements remain applied if a
+    /// later execution or sink callback fails.
+    pub fn execute_with_sink<S: RowSink + ?Sized>(
+        &mut self,
+        sql: &str,
+        sink: &mut S,
+    ) -> Result<()> {
+        for statement in sql::parse(sql)? {
+            self.execute_statement_with_sink(statement, sink)?;
+        }
+        Ok(())
+    }
+
+    fn execute_statement_with_sink<S: RowSink + ?Sized>(
+        &mut self,
+        statement: Statement,
+        sink: &mut S,
+    ) -> Result<()> {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog.create_table(name, columns)?;
-                Ok(StatementResult::Command {
-                    tag: "CREATE TABLE",
-                    affected_rows: 0,
-                })
+                sink.command("CREATE TABLE", 0)
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
@@ -81,16 +160,17 @@ impl Database {
                 for row in rows {
                     target.insert_row(row)?;
                 }
-                Ok(StatementResult::Command {
-                    tag: "INSERT",
-                    affected_rows,
-                })
+                sink.command("INSERT", affected_rows)
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select_with_sink(select, sink),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select_with_sink<S: RowSink + ?Sized>(
+        &self,
+        select: Select,
+        sink: &mut S,
+    ) -> Result<()> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -98,22 +178,15 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+        if grouped {
+            let grouped =
+                execute_grouped(table, predicate.as_ref(), &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -122,16 +195,27 @@ impl Database {
                 &ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
+            sink.begin_query(&result_columns)?;
+            stream_grouped_rows(&grouped, &selected_groups, &items, sink)?;
+            sink.end_query()
+        } else if ordering.is_empty() {
+            sink.begin_query(&result_columns)?;
+            stream_sequential_rows(table, predicate.as_ref(), &items, select.limit, sink)?;
+            sink.end_query()
         } else {
+            let mut matching_rows = Vec::new();
+            if select.limit != Some(0) {
+                matching_rows.extend((0..table.row_count()).filter(|row| {
+                    predicate
+                        .as_ref()
+                        .is_none_or(|predicate| predicate.evaluate(table, *row))
+                }));
+            }
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
-        };
-
-        Ok(QueryResult {
-            columns: result_columns,
-            rows,
-        })
+            sink.begin_query(&result_columns)?;
+            stream_source_rows(table, &matching_rows, &items, sink)?;
+            sink.end_query()
+        }
     }
 }
 
@@ -298,36 +382,72 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-fn execute_projection(
+fn stream_sequential_rows<S: RowSink + ?Sized>(
     table: &Table,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
-    matching_rows
-        .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
-                .collect()
-        })
-        .collect()
+    limit: Option<usize>,
+    sink: &mut S,
+) -> Result<()> {
+    let limit = limit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok(());
+    }
+
+    let mut values = Vec::with_capacity(items.len());
+    let mut emitted = 0;
+    for row in 0..table.row_count() {
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+        project_source_row(table, row, items, &mut values);
+        sink.write_row(&values)?;
+        emitted += 1;
+        if emitted == limit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn stream_source_rows<S: RowSink + ?Sized>(
+    table: &Table,
+    rows: &[usize],
+    items: &[ResolvedItem],
+    sink: &mut S,
+) -> Result<()> {
+    let mut values = Vec::with_capacity(items.len());
+    for row in rows {
+        project_source_row(table, *row, items, &mut values);
+        sink.write_row(&values)?;
+    }
+    Ok(())
+}
+
+fn project_source_row<'a>(
+    table: &'a Table,
+    row: usize,
+    items: &[ResolvedItem],
+    values: &mut Vec<ValueRef<'a>>,
+) {
+    values.clear();
+    values.extend(items.iter().map(|item| match item {
+        ResolvedItem::Column { source, .. } => table.columns()[*source].value_ref(row),
+        ResolvedItem::Aggregate { .. } => {
+            unreachable!("ungrouped projections do not contain aggregates")
+        }
+    }));
 }
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let mut groups = GroupIndex::new(group_columns.len(), table.row_count());
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let initial_capacity = table.row_count().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -339,8 +459,11 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in 0..table.row_count() {
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +472,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -495,30 +618,31 @@ impl GroupedData<'_> {
     fn len(&self) -> usize {
         self.keys.len()
     }
+}
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
-            .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+fn stream_grouped_rows<S: RowSink + ?Sized>(
+    data: &GroupedData<'_>,
+    selected: &[usize],
+    items: &[ResolvedItem],
+    sink: &mut S,
+) -> Result<()> {
+    let mut values = Vec::with_capacity(items.len());
+    for group in selected {
+        values.clear();
+        values.extend(items.iter().map(|item| match item {
+            ResolvedItem::Column {
+                group_position: Some(position),
+                ..
+            } => data.keys[*group].value(*position),
+            ResolvedItem::Column {
+                group_position: None,
+                ..
+            } => unreachable!("grouped columns are validated"),
+            ResolvedItem::Aggregate { state } => data.aggregates[*state][*group].as_ref(),
+        }));
+        sink.write_row(&values)?;
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -581,7 +705,7 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
                 {
-                    *current = Some(candidate.to_owned());
+                    *current = Some(candidate.into_owned());
                 }
             }
             Self::Max(current) => {
@@ -591,7 +715,7 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
                 {
-                    *current = Some(candidate.to_owned());
+                    *current = Some(candidate.into_owned());
                 }
             }
             Self::AvgInt { sum, count } => {

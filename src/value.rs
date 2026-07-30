@@ -43,9 +43,9 @@ pub enum Value {
     String(String),
 }
 
-/// A non-owning scalar used while scanning immutable column storage.
+/// A non-owning scalar passed to row sinks while scanning column storage.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ValueRef<'a> {
+pub enum ValueRef<'a> {
     Int64(i64),
     Float64(f64),
     Bool(bool),
@@ -89,7 +89,18 @@ impl Value {
 }
 
 impl ValueRef<'_> {
-    pub(crate) fn to_owned(self) -> Value {
+    #[must_use]
+    pub fn data_type(self) -> DataType {
+        match self {
+            Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
+            Self::Bool(_) => DataType::Bool,
+            Self::String(_) => DataType::String,
+        }
+    }
+
+    #[must_use]
+    pub fn into_owned(self) -> Value {
         match self {
             Self::Int64(value) => Value::Int64(value),
             Self::Float64(value) => Value::Float64(value),
