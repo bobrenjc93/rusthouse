@@ -113,7 +113,12 @@ impl Database {
             .any(|item| matches!(item, SelectItem::Aggregate { .. }));
         let grouped =
             !group_columns.is_empty() || projected_has_aggregate || select.having.is_some();
-        let (items, result_columns, mut aggregate_specs) = resolve_select_items(
+        let ResolvedProjection {
+            items,
+            result_columns,
+            mut aggregate_specs,
+            aliases,
+        } = resolve_select_items(
             table,
             &select.items,
             &group_columns,
@@ -126,7 +131,7 @@ impl Database {
             .map(|predicate| {
                 HavingCompiler {
                     table,
-                    requested_items: &select.items,
+                    aliases: &aliases,
                     items: &items,
                     result_columns: &result_columns,
                     group_columns: &group_columns,
@@ -181,6 +186,20 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
+#[derive(Debug)]
+struct ResolvedAlias {
+    name: String,
+    output: usize,
+}
+
+#[derive(Debug)]
+struct ResolvedProjection {
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    aliases: Vec<ResolvedAlias>,
+}
+
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
     for name in names {
@@ -201,7 +220,7 @@ fn resolve_select_items(
     group_columns: &[usize],
     grouped: bool,
     projected_has_aggregate: bool,
-) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+) -> Result<ResolvedProjection> {
     if projected_has_aggregate
         && requested
             .iter()
@@ -215,6 +234,7 @@ fn resolve_select_items(
     let mut items = Vec::new();
     let mut result_columns = Vec::new();
     let mut aggregate_specs = Vec::new();
+    let mut aliases = Vec::new();
 
     for requested_item in requested {
         match requested_item {
@@ -238,6 +258,7 @@ fn resolve_select_items(
                 }
             }
             SelectItem::Column { name, alias } => {
+                let output = items.len();
                 let source = table.column_index(name)?;
                 let group_position = group_columns.iter().position(|column| *column == source);
                 if grouped && group_position.is_none() {
@@ -255,12 +276,19 @@ fn resolve_select_items(
                         .unwrap_or_else(|| table.schema()[source].name.clone()),
                     data_type: table.schema()[source].data_type,
                 });
+                if let Some(alias) = alias {
+                    aliases.push(ResolvedAlias {
+                        name: alias.clone(),
+                        output,
+                    });
+                }
             }
             SelectItem::Aggregate {
                 function,
                 argument,
                 alias,
             } => {
+                let output = items.len();
                 let (spec, argument_name) = resolve_aggregate_spec(table, *function, argument)?;
                 let state = aggregate_specs.len();
                 let data_type = aggregate_output_type(spec.function, spec.input_type);
@@ -272,11 +300,22 @@ fn resolve_select_items(
                         .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
                     data_type,
                 });
+                if let Some(alias) = alias {
+                    aliases.push(ResolvedAlias {
+                        name: alias.clone(),
+                        output,
+                    });
+                }
             }
         }
     }
 
-    Ok((items, result_columns, aggregate_specs))
+    Ok(ResolvedProjection {
+        items,
+        result_columns,
+        aggregate_specs,
+        aliases,
+    })
 }
 
 fn resolve_aggregate_spec(
@@ -869,7 +908,7 @@ impl CompiledHavingOperand {
 
 struct HavingCompiler<'a> {
     table: &'a Table,
-    requested_items: &'a [SelectItem],
+    aliases: &'a [ResolvedAlias],
     items: &'a [ResolvedItem],
     result_columns: &'a [ResultColumn],
     group_columns: &'a [usize],
@@ -914,14 +953,10 @@ impl HavingCompiler<'_> {
         match operand {
             Operand::Column(name) => {
                 let aliases = self
-                    .requested_items
+                    .aliases
                     .iter()
-                    .enumerate()
-                    .filter(|(_, item)| {
-                        select_item_alias(item)
-                            .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
-                    })
-                    .map(|(index, _)| index)
+                    .filter(|alias| alias.name.eq_ignore_ascii_case(name))
+                    .map(|alias| alias.output)
                     .collect::<Vec<_>>();
                 match aliases.as_slice() {
                     [output] => {
@@ -971,13 +1006,6 @@ impl HavingCompiler<'_> {
             }
             Operand::Literal(value) => Ok(CompiledHavingOperand::Literal(value.clone())),
         }
-    }
-}
-
-fn select_item_alias(item: &SelectItem) -> Option<&str> {
-    match item {
-        SelectItem::Column { alias, .. } | SelectItem::Aggregate { alias, .. } => alias.as_deref(),
-        SelectItem::Wildcard => None,
     }
 }
 

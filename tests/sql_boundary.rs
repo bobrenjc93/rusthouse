@@ -257,7 +257,7 @@ fn having_filters_multi_column_groups_before_ordering_and_limit() {
 }
 
 #[test]
-fn having_only_aggregate_allows_fully_grouped_wildcard_projection() {
+fn having_with_wildcard_supports_hidden_aggregates_and_later_aliases() {
     let mut database = Database::new();
     database
         .execute(
@@ -278,6 +278,22 @@ fn having_only_aggregate_allows_fully_grouped_wildcard_projection() {
     assert_eq!(
         result.rows,
         vec![vec![Value::String("west".to_owned()), Value::Bool(true)]]
+    );
+
+    let aliased = execute_query(
+        &mut database,
+        "SELECT *, category AS key
+         FROM events
+         GROUP BY category, active
+         HAVING key = 'west';",
+    );
+    assert_eq!(
+        aliased.rows,
+        vec![vec![
+            Value::String("west".to_owned()),
+            Value::Bool(true),
+            Value::String("west".to_owned()),
+        ]]
     );
 }
 
