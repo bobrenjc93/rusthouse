@@ -39,7 +39,7 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
         Workload {
             name: "full_scan_aggregate",
             family: Family::FullScanAggregate,
-            sql: "SELECT COUNT(*) AS row_count, SUM(uniform_num) AS uniform_total, SUM(skewed_num) AS skewed_total, MIN(large_int) AS large_min, MAX(large_int) AS large_max, AVG(score) AS score_mean FROM parity_data;".to_owned(),
+            sql: "SELECT COUNT(*) AS row_count, SUM(uniform_num) AS uniform_total, SUM(skewed_num) AS skewed_total, MIN(large_int) AS large_min, MAX(large_int) AS large_max, AVG(score) AS score_mean, VAR_POP(large_int) AS large_var_pop, VAR_SAMP(score) AS score_var_samp, STDDEV_POP(large_int) AS large_stddev_pop, STDDEV_SAMP(score) AS score_stddev_samp FROM parity_data;".to_owned(),
             columns: vec![
                 ("row_count", ColumnType::Integer),
                 ("uniform_total", ColumnType::Integer),
@@ -47,6 +47,10 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
                 ("large_min", ColumnType::Integer),
                 ("large_max", ColumnType::Integer),
                 ("score_mean", ColumnType::Float),
+                ("large_var_pop", ColumnType::Float),
+                ("score_var_samp", ColumnType::Float),
+                ("large_stddev_pop", ColumnType::Float),
+                ("score_stddev_samp", ColumnType::Float),
             ],
         },
         Workload {
@@ -144,6 +148,13 @@ mod tests {
                 .iter()
                 .any(|workload| workload.sql.contains("AVG("))
         );
+        for function in ["VAR_POP(", "VAR_SAMP(", "STDDEV_POP(", "STDDEV_SAMP("] {
+            assert!(
+                workloads
+                    .iter()
+                    .any(|workload| workload.sql.contains(function))
+            );
+        }
         assert!(
             workloads
                 .iter()

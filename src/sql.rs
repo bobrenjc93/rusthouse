@@ -49,6 +49,10 @@ pub enum AggregateFunction {
     Min,
     Max,
     Avg,
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
 }
 
 impl AggregateFunction {
@@ -60,6 +64,10 @@ impl AggregateFunction {
             Self::Min => "MIN",
             Self::Max => "MAX",
             Self::Avg => "AVG",
+            Self::VarPop => "VAR_POP",
+            Self::VarSamp => "VAR_SAMP",
+            Self::StddevPop => "STDDEV_POP",
+            Self::StddevSamp => "STDDEV_SAMP",
         }
     }
 
@@ -70,6 +78,10 @@ impl AggregateFunction {
             "MIN" => Some(Self::Min),
             "MAX" => Some(Self::Max),
             "AVG" => Some(Self::Avg),
+            "VAR_POP" | "VARPOP" => Some(Self::VarPop),
+            "VAR_SAMP" | "VARSAMP" => Some(Self::VarSamp),
+            "STDDEV_POP" | "STDDEVPOP" => Some(Self::StddevPop),
+            "STDDEV_SAMP" | "STDDEVSAMP" => Some(Self::StddevSamp),
             _ => None,
         }
     }

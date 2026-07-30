@@ -311,6 +311,211 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn global_statistical_aggregates_support_int64_and_float64() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE statistics (integer_value Int64, float_value Float64);
+             INSERT INTO statistics VALUES
+                (2, 2.0), (4, 4.0), (4, 4.0), (4, 4.0),
+                (5, 5.0), (5, 5.0), (7, 7.0), (9, 9.0);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT VAR_POP(integer_value), VAR_SAMP(integer_value),
+                STDDEV_POP(integer_value), STDDEV_SAMP(integer_value),
+                VAR_POP(float_value), VAR_SAMP(float_value),
+                STDDEV_POP(float_value), STDDEV_SAMP(float_value)
+         FROM statistics;",
+    );
+    assert!(
+        result
+            .columns
+            .iter()
+            .all(|column| column.data_type == DataType::Float64)
+    );
+    let sample_variance = 32.0 / 7.0;
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Float64(4.0),
+            Value::Float64(sample_variance),
+            Value::Float64(2.0),
+            Value::Float64(sample_variance.sqrt()),
+            Value::Float64(4.0),
+            Value::Float64(sample_variance),
+            Value::Float64(2.0),
+            Value::Float64(sample_variance.sqrt()),
+        ]]
+    );
+}
+
+#[test]
+fn statistical_aggregates_preserve_small_spreads_at_large_magnitudes() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE large_statistics (integer_value Int64, float_value Float64);
+             INSERT INTO large_statistics VALUES
+                (9223372036854775805, 1000000000000001.0),
+                (9223372036854775806, 1000000000000002.0),
+                (9223372036854775807, 1000000000000003.0);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT VAR_POP(integer_value) AS integer_population,
+                VAR_SAMP(integer_value) AS integer_sample,
+                VAR_POP(float_value) AS float_population,
+                VAR_SAMP(float_value) AS float_sample
+         FROM large_statistics;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Float64(2.0 / 3.0),
+            Value::Float64(1.0),
+            Value::Float64(2.0 / 3.0),
+            Value::Float64(1.0),
+        ]]
+    );
+}
+
+#[test]
+fn grouped_statistical_aggregates_and_clickhouse_aliases_work() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE grouped_statistics (category String, value Int64);
+             INSERT INTO grouped_statistics VALUES
+                ('varying', 1), ('varying', 3),
+                ('constant', 10), ('constant', 10), ('constant', 10);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT category,
+                varPop(value) AS population_variance,
+                varSamp(value) AS sample_variance,
+                stddevPop(value) AS population_deviation,
+                stddevSamp(value) AS sample_deviation
+         FROM grouped_statistics
+         GROUP BY category
+         ORDER BY population_variance, category;",
+    );
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "category",
+            "population_variance",
+            "sample_variance",
+            "population_deviation",
+            "sample_deviation",
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("constant".to_owned()),
+                Value::Float64(0.0),
+                Value::Float64(0.0),
+                Value::Float64(0.0),
+                Value::Float64(0.0),
+            ],
+            vec![
+                Value::String("varying".to_owned()),
+                Value::Float64(1.0),
+                Value::Float64(2.0),
+                Value::Float64(1.0),
+                Value::Float64(2.0_f64.sqrt()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn statistical_aggregates_reject_insufficient_input_and_non_finite_results() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (value Float64);")
+        .expect("create succeeds");
+
+    for function in ["VAR_POP", "STDDEV_POP"] {
+        let error = database
+            .execute(&format!("SELECT {function}(value) FROM samples;"))
+            .expect_err("population statistic needs one row");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message)
+                if message == format!("{function} is undefined for an empty input")
+        ));
+    }
+    for function in ["VAR_SAMP", "STDDEV_SAMP"] {
+        let error = database
+            .execute(&format!("SELECT {function}(value) FROM samples;"))
+            .expect_err("sample statistic needs two rows");
+        assert!(matches!(
+            error,
+            Error::InvalidQuery(message)
+                if message == format!("{function} is undefined for fewer than two input rows")
+        ));
+    }
+
+    database
+        .execute("INSERT INTO samples VALUES (42.0);")
+        .expect("insert succeeds");
+    let population = execute_query(
+        &mut database,
+        "SELECT VAR_POP(value), STDDEV_POP(value) FROM samples;",
+    );
+    assert_eq!(
+        population.rows,
+        vec![vec![Value::Float64(0.0), Value::Float64(0.0)]]
+    );
+    for function in ["VAR_SAMP", "STDDEV_SAMP"] {
+        assert!(matches!(
+            database.execute(&format!("SELECT {function}(value) FROM samples;")),
+            Err(Error::InvalidQuery(message))
+                if message == format!("{function} is undefined for fewer than two input rows")
+        ));
+    }
+
+    database
+        .execute(
+            "CREATE TABLE singleton_group (category String, value Int64);
+             INSERT INTO singleton_group VALUES ('only', 1);",
+        )
+        .expect("group setup succeeds");
+    assert!(matches!(
+        database.execute(
+            "SELECT category, VAR_SAMP(value)
+             FROM singleton_group GROUP BY category;"
+        ),
+        Err(Error::InvalidQuery(message))
+            if message == "VAR_SAMP is undefined for fewer than two input rows"
+    ));
+
+    database
+        .execute("INSERT INTO samples VALUES (1e308), (-1e308);")
+        .expect("finite inputs are accepted");
+    for function in ["VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"] {
+        assert!(matches!(
+            database.execute(&format!("SELECT {function}(value) FROM samples;")),
+            Err(Error::NumericOverflow(operation)) if operation.contains(function)
+        ));
+    }
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
@@ -373,6 +578,22 @@ fn invalid_grouping_and_aggregate_types_are_rejected() {
             ..
         } if expected == "Int64 or Float64" && actual == "String"
     ));
+
+    for function in ["VAR_POP", "VAR_SAMP", "STDDEV_POP", "STDDEV_SAMP"] {
+        let error = database
+            .execute(&format!("SELECT {function}(label) FROM inventory;"))
+            .expect_err("statistics require numeric input");
+        assert!(matches!(
+            error,
+            Error::TypeMismatch {
+                context,
+                expected,
+                actual,
+            } if context == format!("{function} argument")
+                && expected == "Int64 or Float64"
+                && actual == "String"
+        ));
+    }
 }
 
 #[test]

@@ -275,8 +275,15 @@ fn resolve_select_items(
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
-    if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
+    if matches!(
+        function,
+        AggregateFunction::Sum
+            | AggregateFunction::Avg
+            | AggregateFunction::VarPop
+            | AggregateFunction::VarSamp
+            | AggregateFunction::StddevPop
+            | AggregateFunction::StddevSamp
+    ) && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
     {
         let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
         return Err(Error::TypeMismatch {
@@ -291,7 +298,11 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => DataType::Float64,
+        AggregateFunction::Avg
+        | AggregateFunction::VarPop
+        | AggregateFunction::VarSamp
+        | AggregateFunction::StddevPop
+        | AggregateFunction::StddevSamp => DataType::Float64,
         AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
             input_type.expect("validated column argument")
         }
@@ -528,8 +539,18 @@ enum AggregateState {
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
-    AvgInt { sum: i128, count: u64 },
-    AvgFloat { sum: f64, count: u64 },
+    AvgInt {
+        sum: i128,
+        count: u64,
+    },
+    AvgFloat {
+        sum: f64,
+        count: u64,
+    },
+    Statistical {
+        function: AggregateFunction,
+        moments: CentralMoments,
+    },
 }
 
 impl AggregateState {
@@ -544,6 +565,13 @@ impl AggregateState {
                 Self::AvgInt { sum: 0, count: 0 }
             }
             AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            function @ (AggregateFunction::VarPop
+            | AggregateFunction::VarSamp
+            | AggregateFunction::StddevPop
+            | AggregateFunction::StddevSamp) => Self::Statistical {
+                function,
+                moments: CentralMoments::new(spec.input_type.expect("validated numeric argument")),
+            },
         }
     }
 
@@ -620,6 +648,14 @@ impl AggregateState {
                     return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
                 }
             }
+            Self::Statistical { function, moments } => {
+                let argument = spec.argument.expect("statistical aggregate argument");
+                match &table.columns()[argument] {
+                    Column::Int64(values) => moments.update_int(values[row], *function)?,
+                    Column::Float64(values) => moments.update_float(values[row], *function)?,
+                    _ => unreachable!("statistical aggregate input type is resolved"),
+                }
+            }
         }
         Ok(())
     }
@@ -633,6 +669,7 @@ impl AggregateState {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
             Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
+            Self::Statistical { function, moments } => moments.finish(function),
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),
@@ -643,6 +680,115 @@ impl AggregateState {
                 "AVG is undefined for an empty input".to_owned(),
             )),
         }
+    }
+}
+
+#[derive(Debug)]
+enum MomentOrigin {
+    Int64(i64),
+    Float64(f64),
+}
+
+#[derive(Debug)]
+struct CentralMoments {
+    origin: Option<MomentOrigin>,
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl CentralMoments {
+    fn new(input_type: DataType) -> Self {
+        debug_assert!(matches!(input_type, DataType::Int64 | DataType::Float64));
+        Self {
+            origin: None,
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+        }
+    }
+
+    fn update_int(&mut self, value: i64, function: AggregateFunction) -> Result<()> {
+        let centered = match self.origin {
+            None => {
+                self.origin = Some(MomentOrigin::Int64(value));
+                0.0
+            }
+            Some(MomentOrigin::Int64(origin)) => (i128::from(value) - i128::from(origin)) as f64,
+            Some(MomentOrigin::Float64(_)) => unreachable!("aggregate input type is stable"),
+        };
+        self.update_centered(centered, function)
+    }
+
+    fn update_float(&mut self, value: f64, function: AggregateFunction) -> Result<()> {
+        let centered = match self.origin {
+            None => {
+                self.origin = Some(MomentOrigin::Float64(value));
+                0.0
+            }
+            Some(MomentOrigin::Float64(origin)) => value - origin,
+            Some(MomentOrigin::Int64(_)) => unreachable!("aggregate input type is stable"),
+        };
+        self.update_centered(centered, function)
+    }
+
+    fn update_centered(&mut self, value: f64, function: AggregateFunction) -> Result<()> {
+        let operation = || format!("{} accumulation", function.name());
+        let count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::NumericOverflow(operation()))?;
+        let delta = value - self.mean;
+        let mean = self.mean + delta / count as f64;
+        let m2 = self.m2 + delta * (value - mean);
+        if !value.is_finite() || !mean.is_finite() || !m2.is_finite() {
+            return Err(Error::NumericOverflow(operation()));
+        }
+        self.count = count;
+        self.mean = mean;
+        self.m2 = m2;
+        Ok(())
+    }
+
+    fn finish(self, function: AggregateFunction) -> Result<Value> {
+        let sample = matches!(
+            function,
+            AggregateFunction::VarSamp | AggregateFunction::StddevSamp
+        );
+        let minimum_count = if sample { 2 } else { 1 };
+        if self.count < minimum_count {
+            let input = if sample {
+                "fewer than two input rows"
+            } else {
+                "an empty input"
+            };
+            return Err(Error::InvalidQuery(format!(
+                "{} is undefined for {input}",
+                function.name()
+            )));
+        }
+
+        let divisor = if sample {
+            (self.count - 1) as f64
+        } else {
+            self.count as f64
+        };
+        let variance = self.m2 / divisor;
+        let result = if matches!(
+            function,
+            AggregateFunction::StddevPop | AggregateFunction::StddevSamp
+        ) {
+            variance.sqrt()
+        } else {
+            variance
+        };
+        if !result.is_finite() {
+            return Err(Error::NumericOverflow(format!(
+                "{} result",
+                function.name()
+            )));
+        }
+        Ok(Value::Float64(result))
     }
 }
 

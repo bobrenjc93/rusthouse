@@ -83,7 +83,7 @@ Each row count runs eight cases spanning:
 
 | Family | Coverage |
 | --- | --- |
-| Full scan | COUNT, two SUMs, MIN, MAX, and AVG |
+| Full scan | COUNT, two SUMs, MIN, MAX, AVG, and population/sample variance and standard deviation |
 | Selective filter | A single-ID point predicate with mixed projected types |
 | Compound filter | Parenthesized AND/OR, Boolean, uniform, and skewed columns |
 | Nonselective filter | A predicate expected to retain about 97.5% of rows |
