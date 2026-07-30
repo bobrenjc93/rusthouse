@@ -13,6 +13,7 @@ pub mod value;
 
 pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
 pub use error::{Error, Result};
+pub use storage::{Column, ColumnBatch};
 pub use value::{DataType, Value};
 
 /// Returns the product name.

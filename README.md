@@ -64,7 +64,7 @@ Database retains an in-memory catalog across calls and returns structured result
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
 ~~~rust
-use rusthouse::{Database, StatementResult};
+use rusthouse::{Column, ColumnBatch, Database, StatementResult};
 
 let mut database = Database::new();
 database.execute("CREATE TABLE events (id Int64, name String)")?;
@@ -75,6 +75,12 @@ let StatementResult::Query(result) = &results[0] else {
     unreachable!();
 };
 assert_eq!(result.rows.len(), 1);
+
+let batch = ColumnBatch::new(vec![
+    Column::Int64(vec![2, 3]),
+    Column::String(vec!["load".to_owned(), "finish".to_owned()]),
+]);
+assert_eq!(database.insert_batch("events", batch)?, 2);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~

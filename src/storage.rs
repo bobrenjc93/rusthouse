@@ -15,7 +15,7 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
 }
 
 /// A physical column. Each variant owns a contiguous vector of one Rust type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Column {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
@@ -59,6 +59,15 @@ impl Column {
         self.len() == 0
     }
 
+    fn with_capacity(data_type: DataType, capacity: usize) -> Self {
+        match data_type {
+            DataType::Int64 => Self::Int64(Vec::with_capacity(capacity)),
+            DataType::Float64 => Self::Float64(Vec::with_capacity(capacity)),
+            DataType::Bool => Self::Bool(Vec::with_capacity(capacity)),
+            DataType::String => Self::String(Vec::with_capacity(capacity)),
+        }
+    }
+
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
         self.value_ref(row).to_owned()
@@ -85,6 +94,63 @@ impl Column {
             (Self::String(values), Value::String(value)) => values.push(value),
             _ => unreachable!("values are validated before insertion"),
         }
+    }
+
+    fn contains_non_finite_float(&self) -> bool {
+        matches!(self, Self::Float64(values) if values.iter().any(|value| !value.is_finite()))
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::Int64(values) => values.reserve(additional),
+            Self::Float64(values) => values.reserve(additional),
+            Self::Bool(values) => values.reserve(additional),
+            Self::String(values) => values.reserve(additional),
+        }
+    }
+
+    fn append(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Int64(values), Self::Int64(mut other)) => values.append(&mut other),
+            (Self::Float64(values), Self::Float64(mut other)) => values.append(&mut other),
+            (Self::Bool(values), Self::Bool(mut other)) => values.append(&mut other),
+            (Self::String(values), Self::String(mut other)) => values.append(&mut other),
+            _ => unreachable!("column batches are validated before insertion"),
+        }
+    }
+}
+
+/// An owned collection of typed column buffers ready for bulk insertion.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColumnBatch {
+    columns: Vec<Column>,
+}
+
+impl ColumnBatch {
+    #[must_use]
+    pub fn new(columns: Vec<Column>) -> Self {
+        Self { columns }
+    }
+
+    #[must_use]
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.iter().all(Column::is_empty)
+    }
+}
+
+impl From<Vec<Column>> for ColumnBatch {
+    fn from(columns: Vec<Column>) -> Self {
+        Self::new(columns)
     }
 }
 
@@ -158,8 +224,8 @@ impl Table {
             })
     }
 
-    /// Checks a row without mutating any physical column.
-    pub(crate) fn validate_row(&self, row: &[Value]) -> Result<()> {
+    /// Validates a row and inserts it through the columnar batch path.
+    pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         if row.len() != self.schema.len() {
             return Err(Error::RowLength {
                 table: self.name.clone(),
@@ -167,34 +233,99 @@ impl Table {
                 actual: row.len(),
             });
         }
+        let columns = row
+            .into_iter()
+            .map(|value| match value {
+                Value::Int64(value) => Column::Int64(vec![value]),
+                Value::Float64(value) => Column::Float64(vec![value]),
+                Value::Bool(value) => Column::Bool(vec![value]),
+                Value::String(value) => Column::String(vec![value]),
+            })
+            .collect();
+        self.insert_batch(ColumnBatch::new(columns)).map(|_| ())
+    }
 
-        for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+    /// Validates and atomically appends an owned set of typed columns.
+    pub fn insert_batch(&mut self, batch: ColumnBatch) -> Result<usize> {
+        let batch_row_count = self.validate_batch(&batch)?;
+        let new_row_count = self.row_count.checked_add(batch_row_count).ok_or_else(|| {
+            Error::NumericOverflow(format!("row count for table '{}'", self.name))
+        })?;
+
+        for column in &mut self.columns {
+            column.reserve(batch_row_count);
+        }
+        for (column, incoming) in self.columns.iter_mut().zip(batch.columns) {
+            column.append(incoming);
+        }
+        self.row_count = new_row_count;
+        Ok(batch_row_count)
+    }
+
+    fn validate_batch(&self, batch: &ColumnBatch) -> Result<usize> {
+        if batch.columns.len() != self.schema.len() {
+            return Err(Error::BatchWidth {
+                table: self.name.clone(),
+                expected: self.schema.len(),
+                actual: batch.columns.len(),
+            });
+        }
+
+        let row_count = batch.columns.first().map_or(0, Column::len);
+        for (field, column) in self.schema.iter().zip(&batch.columns) {
+            if field.data_type != column.data_type() {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: column.data_type().to_string(),
                 });
             }
-            if matches!(value, Value::Float64(number) if !number.is_finite()) {
+            if column.len() != row_count {
+                return Err(Error::ColumnLength {
+                    table: self.name.clone(),
+                    column: field.name.clone(),
+                    expected: row_count,
+                    actual: column.len(),
+                });
+            }
+            if column.contains_non_finite_float() {
                 return Err(Error::InvalidQuery(format!(
                     "column '{}.{}' cannot store a non-finite Float64",
                     self.name, field.name
                 )));
             }
         }
-
-        Ok(())
+        Ok(row_count)
     }
 
-    /// Validates the complete row before appending one value to each column.
-    pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
-        self.validate_row(&row)?;
-        for (column, value) in self.columns.iter_mut().zip(row) {
-            column.push(value);
+    pub(crate) fn columnarize_rows(&self, rows: Vec<Vec<Value>>) -> Result<ColumnBatch> {
+        let mut columns = self
+            .schema
+            .iter()
+            .map(|field| Column::with_capacity(field.data_type, rows.len()))
+            .collect::<Vec<_>>();
+
+        for row in rows {
+            if row.len() != self.schema.len() {
+                return Err(Error::RowLength {
+                    table: self.name.clone(),
+                    expected: self.schema.len(),
+                    actual: row.len(),
+                });
+            }
+            for ((field, column), value) in self.schema.iter().zip(&mut columns).zip(row) {
+                if field.data_type != value.data_type() {
+                    return Err(Error::TypeMismatch {
+                        context: format!("column '{}.{}'", self.name, field.name),
+                        expected: field.data_type.to_string(),
+                        actual: value.data_type().to_string(),
+                    });
+                }
+                column.push(value);
+            }
         }
-        self.row_count += 1;
-        Ok(())
+
+        Ok(ColumnBatch::new(columns))
     }
 }
 
@@ -239,6 +370,25 @@ mod tests {
 
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn row_count_overflow_is_rejected_before_columns_change() {
+        let mut table = test_table();
+        table.row_count = usize::MAX;
+
+        let error = table
+            .insert_batch(ColumnBatch::new(vec![
+                Column::Int64(vec![1]),
+                Column::String(vec!["one".to_owned()]),
+            ]))
+            .expect_err("row count overflows");
+
+        assert!(
+            matches!(error, Error::NumericOverflow(operation) if operation.contains("row count"))
+        );
+        assert_eq!(table.row_count(), usize::MAX);
         assert!(table.columns().iter().all(Column::is_empty));
     }
 }

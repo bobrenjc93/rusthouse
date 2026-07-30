@@ -7,7 +7,7 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnBatch, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -48,6 +48,11 @@ impl Database {
         &self.catalog
     }
 
+    /// Atomically appends an owned columnar batch to a table.
+    pub fn insert_batch(&mut self, table: &str, batch: ColumnBatch) -> Result<usize> {
+        self.catalog.table_mut(table)?.insert_batch(batch)
+    }
+
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
@@ -70,17 +75,8 @@ impl Database {
                 })
             }
             Statement::Insert { table, rows } => {
-                let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
-                let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                let batch = self.catalog.table(&table)?.columnarize_rows(rows)?;
+                let affected_rows = self.insert_batch(&table, batch)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,

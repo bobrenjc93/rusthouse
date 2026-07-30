@@ -23,6 +23,17 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    BatchWidth {
+        table: String,
+        expected: usize,
+        actual: usize,
+    },
+    ColumnLength {
+        table: String,
+        column: String,
+        expected: usize,
+        actual: usize,
+    },
     TypeMismatch {
         context: String,
         expected: String,
@@ -60,6 +71,23 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "row for table '{table}' has {actual} values; expected {expected}"
+            ),
+            Self::BatchWidth {
+                table,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "column batch for table '{table}' has {actual} columns; expected {expected}"
+            ),
+            Self::ColumnLength {
+                table,
+                column,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "column '{table}.{column}' has {actual} values in the batch; expected {expected}"
             ),
             Self::TypeMismatch {
                 context,
