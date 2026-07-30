@@ -231,6 +231,54 @@ fn non_numeric_arithmetic_is_rejected_during_type_inference() {
 }
 
 #[test]
+fn ordered_limits_project_only_retained_rows_and_groups() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ranked (id Int64, denominator Int64, label String);
+             INSERT INTO ranked VALUES
+                (1, 2, 'retained'),
+                (2, 0, 'discarded');",
+        )
+        .expect("setup succeeds");
+
+    let rows = query(
+        &mut database,
+        "SELECT id, 10 / denominator AS ratio, label
+         FROM ranked ORDER BY id LIMIT 1;",
+    );
+    assert_eq!(
+        rows.rows,
+        vec![vec![
+            Value::Int64(1),
+            Value::Int64(5),
+            Value::String("retained".to_owned()),
+        ]]
+    );
+
+    let groups = query(
+        &mut database,
+        "SELECT id, 10 / denominator AS ratio, COUNT(*) AS rows
+         FROM ranked
+         GROUP BY id, denominator
+         ORDER BY id
+         LIMIT 1;",
+    );
+    assert_eq!(
+        groups.rows,
+        vec![vec![Value::Int64(1), Value::Int64(5), Value::Int64(1)]]
+    );
+
+    assert!(matches!(
+        database.execute(
+            "SELECT id, 10 / denominator AS ratio
+             FROM ranked ORDER BY ratio LIMIT 1;"
+        ),
+        Err(Error::InvalidQuery(message)) if message.contains("division by zero")
+    ));
+}
+
+#[test]
 fn scalar_expression_depth_and_node_budgets_are_enforced() {
     let nested = format!(
         "SELECT {}1{} FROM missing",

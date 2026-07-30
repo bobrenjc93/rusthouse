@@ -122,18 +122,15 @@ impl Database {
                 order_group_keys(&mut selected_groups, &grouped, select.limit);
                 grouped.project(&selected_groups, &items, &group_columns)?
             } else {
-                let projected = grouped.project(&selected_groups, &items, &group_columns)?;
+                let ordering_keys = grouped.ordering_keys(&items, &group_columns, &ordering)?;
                 order_grouped_rows(
                     &mut selected_groups,
                     &grouped,
-                    &projected,
+                    &ordering_keys,
                     &ordering,
                     select.limit,
                 );
-                selected_groups
-                    .into_iter()
-                    .map(|group| projected[group].clone())
-                    .collect()
+                grouped.project(&selected_groups, &items, &group_columns)?
             }
         } else if ordering.is_empty() {
             if let Some(limit) = select.limit {
@@ -141,19 +138,21 @@ impl Database {
             }
             execute_projection(table, &matching_rows, &items)?
         } else {
-            let projected = execute_projection(table, &matching_rows, &items)?;
+            let ordering_keys =
+                evaluate_source_ordering_keys(table, &matching_rows, &items, &ordering)?;
             let mut selected_rows = (0..matching_rows.len()).collect::<Vec<_>>();
             order_source_rows(
                 &mut selected_rows,
                 &matching_rows,
-                &projected,
+                &ordering_keys,
                 &ordering,
                 select.limit,
             );
-            selected_rows
+            let retained_rows = selected_rows
                 .into_iter()
-                .map(|row| projected[row].clone())
-                .collect()
+                .map(|position| matching_rows[position])
+                .collect::<Vec<_>>();
+            execute_projection(table, &retained_rows, &items)?
         };
 
         Ok(QueryResult {
@@ -342,12 +341,33 @@ fn execute_projection(
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Expression(expression) => expression.evaluate_row(table, *row),
+                    ResolvedItem::Expression(expression) => expression
+                        .evaluate_row(table, *row)
+                        .map(EvaluatedValue::into_owned),
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
                 })
                 .collect::<Result<Vec<_>>>()
+        })
+        .collect()
+}
+
+fn evaluate_source_ordering_keys<'a>(
+    table: &'a Table,
+    rows: &[usize],
+    items: &'a [ResolvedItem],
+    ordering: &[ResolvedOrder],
+) -> Result<Vec<Vec<EvaluatedValue<'a>>>> {
+    ordering
+        .iter()
+        .map(|order| {
+            let ResolvedItem::Expression(expression) = &items[order.output] else {
+                unreachable!("ungrouped projections cannot contain aggregates")
+            };
+            rows.iter()
+                .map(|row| expression.evaluate_row(table, *row))
+                .collect()
         })
         .collect()
 }
@@ -541,15 +561,9 @@ impl GroupedData<'_> {
                 items
                     .iter()
                     .map(|item| match item {
-                        ResolvedItem::Expression(expression) => {
-                            expression.evaluate_with(&|source| {
-                                let position = group_columns
-                                    .iter()
-                                    .position(|column| *column == source)
-                                    .expect("expression columns are validated as grouped");
-                                self.keys[*group].value(position).to_owned()
-                            })
-                        }
+                        ResolvedItem::Expression(expression) => self
+                            .evaluate_expression(*group, expression, group_columns)
+                            .map(EvaluatedValue::into_owned),
                         ResolvedItem::Aggregate { state } => {
                             Ok(self.aggregates[*state][*group].clone())
                         }
@@ -557,6 +571,40 @@ impl GroupedData<'_> {
                     .collect::<Result<Vec<_>>>()
             })
             .collect()
+    }
+
+    fn ordering_keys<'a>(
+        &'a self,
+        items: &'a [ResolvedItem],
+        group_columns: &[usize],
+        ordering: &[ResolvedOrder],
+    ) -> Result<Vec<Vec<EvaluatedValue<'a>>>> {
+        ordering
+            .iter()
+            .map(|order| match &items[order.output] {
+                ResolvedItem::Expression(expression) => (0..self.len())
+                    .map(|group| self.evaluate_expression(group, expression, group_columns))
+                    .collect(),
+                ResolvedItem::Aggregate { state } => Ok((0..self.len())
+                    .map(|group| EvaluatedValue::Borrowed(self.aggregates[*state][group].as_ref()))
+                    .collect()),
+            })
+            .collect()
+    }
+
+    fn evaluate_expression<'a>(
+        &'a self,
+        group: usize,
+        expression: &'a CompiledExpression,
+        group_columns: &[usize],
+    ) -> Result<EvaluatedValue<'a>> {
+        expression.evaluate_with(&|source| {
+            let position = group_columns
+                .iter()
+                .position(|column| *column == source)
+                .expect("expression columns are validated as grouped");
+            self.keys[group].value(position)
+        })
     }
 }
 
@@ -597,12 +645,12 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Value::Int64(value) = spec
+                let value = spec
                     .argument
                     .as_ref()
                     .expect("SUM argument")
-                    .evaluate_row(table, row)?
-                else {
+                    .evaluate_row(table, row)?;
+                let ValueRef::Int64(value) = value.as_ref() else {
                     unreachable!("SUM expression type is resolved")
                 };
                 *sum = sum
@@ -610,12 +658,12 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
-                let Value::Float64(value) = spec
+                let value = spec
                     .argument
                     .as_ref()
                     .expect("SUM argument")
-                    .evaluate_row(table, row)?
-                else {
+                    .evaluate_row(table, row)?;
+                let ValueRef::Float64(value) = value.as_ref() else {
                     unreachable!("SUM expression type is resolved")
                 };
                 *sum += value;
@@ -631,9 +679,9 @@ impl AggregateState {
                     .evaluate_row(table, row)?;
                 if current
                     .as_ref()
-                    .is_none_or(|existing| candidate < *existing)
+                    .is_none_or(|existing| candidate.as_ref() < existing.as_ref())
                 {
-                    *current = Some(candidate);
+                    *current = Some(candidate.into_owned());
                 }
             }
             Self::Max(current) => {
@@ -644,18 +692,18 @@ impl AggregateState {
                     .evaluate_row(table, row)?;
                 if current
                     .as_ref()
-                    .is_none_or(|existing| candidate > *existing)
+                    .is_none_or(|existing| candidate.as_ref() > existing.as_ref())
                 {
-                    *current = Some(candidate);
+                    *current = Some(candidate.into_owned());
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Value::Int64(value) = spec
+                let value = spec
                     .argument
                     .as_ref()
                     .expect("AVG argument")
-                    .evaluate_row(table, row)?
-                else {
+                    .evaluate_row(table, row)?;
+                let ValueRef::Int64(value) = value.as_ref() else {
                     unreachable!("AVG expression type is resolved")
                 };
                 *sum = sum
@@ -666,12 +714,12 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Value::Float64(value) = spec
+                let value = spec
                     .argument
                     .as_ref()
                     .expect("AVG argument")
-                    .evaluate_row(table, row)?
-                else {
+                    .evaluate_row(table, row)?;
+                let ValueRef::Float64(value) = value.as_ref() else {
                     unreachable!("AVG expression type is resolved")
                 };
                 *sum += value;
@@ -748,7 +796,7 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
 fn order_source_rows(
     rows: &mut Vec<usize>,
     source_rows: &[usize],
-    projected: &[Vec<Value>],
+    ordering_keys: &[Vec<EvaluatedValue<'_>>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) {
@@ -760,8 +808,8 @@ fn order_source_rows(
     }
 
     sort_and_limit(rows, limit, |left, right| {
-        for order in ordering {
-            let comparison = projected[left][order.output].cmp(&projected[right][order.output]);
+        for (keys, order) in ordering_keys.iter().zip(ordering) {
+            let comparison = keys[left].as_ref().cmp(&keys[right].as_ref());
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -777,13 +825,13 @@ fn order_source_rows(
 fn order_grouped_rows(
     groups: &mut Vec<usize>,
     data: &GroupedData<'_>,
-    projected: &[Vec<Value>],
+    ordering_keys: &[Vec<EvaluatedValue<'_>>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) {
     sort_and_limit(groups, limit, |left, right| {
-        for order in ordering {
-            let comparison = projected[left][order.output].cmp(&projected[right][order.output]);
+        for (keys, order) in ordering_keys.iter().zip(ordering) {
+            let comparison = keys[left].as_ref().cmp(&keys[right].as_ref());
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -870,6 +918,28 @@ impl CompiledPredicate {
     }
 }
 
+#[derive(Debug)]
+enum EvaluatedValue<'a> {
+    Borrowed(ValueRef<'a>),
+    Owned(Value),
+}
+
+impl EvaluatedValue<'_> {
+    fn as_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Borrowed(value) => *value,
+            Self::Owned(value) => value.as_ref(),
+        }
+    }
+
+    fn into_owned(self) -> Value {
+        match self {
+            Self::Borrowed(value) => value.to_owned(),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CompiledExpression {
     Column {
@@ -917,26 +987,30 @@ impl CompiledExpression {
         }
     }
 
-    fn evaluate_row(&self, table: &Table, row: usize) -> Result<Value> {
-        self.evaluate_with(&|source| table.columns()[source].value(row))
+    fn evaluate_row<'a>(&'a self, table: &'a Table, row: usize) -> Result<EvaluatedValue<'a>> {
+        self.evaluate_with(&|source| table.columns()[source].value_ref(row))
     }
 
-    fn evaluate_with(&self, column_value: &impl Fn(usize) -> Value) -> Result<Value> {
+    fn evaluate_with<'a>(
+        &'a self,
+        column_value: &impl Fn(usize) -> ValueRef<'a>,
+    ) -> Result<EvaluatedValue<'a>> {
         match self {
-            Self::Column { source, .. } => Ok(column_value(*source)),
-            Self::Literal(value) => Ok(value.clone()),
+            Self::Column { source, .. } => Ok(EvaluatedValue::Borrowed(column_value(*source))),
+            Self::Literal(value) => Ok(EvaluatedValue::Borrowed(value.as_ref())),
             Self::Negate {
                 expression,
                 data_type,
             } => {
                 let value = expression.evaluate_with(column_value)?;
-                match (data_type, value) {
-                    (DataType::Int64, Value::Int64(value)) => value
+                match (data_type, value.as_ref()) {
+                    (DataType::Int64, ValueRef::Int64(value)) => value
                         .checked_neg()
                         .map(Value::Int64)
+                        .map(EvaluatedValue::Owned)
                         .ok_or_else(|| Error::NumericOverflow("Int64 unary negation".to_owned())),
-                    (DataType::Float64, Value::Float64(value)) => {
-                        finite_float(-value, "Float64 unary negation")
+                    (DataType::Float64, ValueRef::Float64(value)) => {
+                        finite_float(-value, "Float64 unary negation").map(EvaluatedValue::Owned)
                     }
                     _ => unreachable!("negation operand type is compiled"),
                 }
@@ -949,7 +1023,8 @@ impl CompiledExpression {
             } => {
                 let left = left.evaluate_with(column_value)?;
                 let right = right.evaluate_with(column_value)?;
-                evaluate_arithmetic(left, *operator, right, *data_type)
+                evaluate_arithmetic(left.as_ref(), *operator, right.as_ref(), *data_type)
+                    .map(EvaluatedValue::Owned)
             }
         }
     }
@@ -1053,14 +1128,14 @@ fn require_numeric(data_type: DataType, context: &str) -> Result<()> {
 }
 
 fn evaluate_arithmetic(
-    left: Value,
+    left: ValueRef<'_>,
     operator: ArithmeticOperator,
-    right: Value,
+    right: ValueRef<'_>,
     data_type: DataType,
 ) -> Result<Value> {
     match data_type {
         DataType::Int64 => {
-            let (Value::Int64(left), Value::Int64(right)) = (left, right) else {
+            let (ValueRef::Int64(left), ValueRef::Int64(right)) = (left, right) else {
                 unreachable!("Int64 expression operands are compiled")
             };
             if operator == ArithmeticOperator::Divide && right == 0 {
@@ -1089,17 +1164,17 @@ fn evaluate_arithmetic(
                 ArithmeticOperator::Multiply => left * right,
                 ArithmeticOperator::Divide => left / right,
             };
-            finite_float(value, &format!("Float64 {}", arithmetic_name(operator)))
+            finite_float(value, float_arithmetic_name(operator))
         }
         DataType::Bool | DataType::String => unreachable!("arithmetic result type is numeric"),
     }
 }
 
-fn numeric_as_f64(value: Value) -> f64 {
+fn numeric_as_f64(value: ValueRef<'_>) -> f64 {
     match value {
-        Value::Int64(value) => value as f64,
-        Value::Float64(value) => value,
-        Value::Bool(_) | Value::String(_) => unreachable!("arithmetic operands are numeric"),
+        ValueRef::Int64(value) => value as f64,
+        ValueRef::Float64(value) => value,
+        ValueRef::Bool(_) | ValueRef::String(_) => unreachable!("arithmetic operands are numeric"),
     }
 }
 
@@ -1125,6 +1200,15 @@ fn arithmetic_name(operator: ArithmeticOperator) -> &'static str {
         ArithmeticOperator::Subtract => "subtraction",
         ArithmeticOperator::Multiply => "multiplication",
         ArithmeticOperator::Divide => "division",
+    }
+}
+
+fn float_arithmetic_name(operator: ArithmeticOperator) -> &'static str {
+    match operator {
+        ArithmeticOperator::Add => "Float64 addition",
+        ArithmeticOperator::Subtract => "Float64 subtraction",
+        ArithmeticOperator::Multiply => "Float64 multiplication",
+        ArithmeticOperator::Divide => "Float64 division",
     }
 }
 
@@ -1199,5 +1283,32 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn expression_leaves_borrow_strings_until_output_materialization() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE labels (name String); \
+                 INSERT INTO labels VALUES ('borrowed');",
+            )
+            .expect("setup");
+        let table = database.catalog().table("labels").expect("table");
+
+        let column = CompiledExpression::Column {
+            source: 0,
+            data_type: DataType::String,
+        };
+        assert!(matches!(
+            column.evaluate_row(table, 0).expect("evaluate column"),
+            EvaluatedValue::Borrowed(ValueRef::String("borrowed"))
+        ));
+
+        let literal = CompiledExpression::Literal(Value::String("literal".to_owned()));
+        assert!(matches!(
+            literal.evaluate_row(table, 0).expect("evaluate literal"),
+            EvaluatedValue::Borrowed(ValueRef::String("literal"))
+        ));
     }
 }
