@@ -15,7 +15,7 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
-    -d, --database <PATH>     Load and atomically update a snapshot (Unix only)
+    -d, --database <PATH>     Update a snapshot (Linux and macOS only)
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.

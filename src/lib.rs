@@ -1,5 +1,5 @@
-//! RustHouse is a compact, dependency-free analytical database with optional
-//! atomic snapshot persistence.
+//! RustHouse is a compact analytical database with optional atomic snapshot
+//! persistence.
 //!
 //! Database is the main entry point. It accepts a small SQL dialect and
 //! returns structured results that can be rendered by the format module.

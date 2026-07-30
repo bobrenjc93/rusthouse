@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`) and can persist the catalog as an atomic snapshot.
+RustHouse is a small analytical SQL engine written in Rust. It stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`) and can persist the catalog as an atomic snapshot.
 
 ## What works
 
@@ -55,7 +55,7 @@ printf '%s\n' \
   cargo run -- --format csv
 ~~~
 
-On Unix, persist data across invocations with `--database` (or `-d`):
+On Linux and macOS, persist data across invocations with `--database` (or `-d`):
 
 ~~~bash
 cargo run -- --database rusthouse.db --execute \
@@ -64,7 +64,7 @@ cargo run -- --database rusthouse.db --execute \
   "SELECT * FROM events ORDER BY id"
 ~~~
 
-The database file is loaded before SQL execution. Each successful `CREATE` or `INSERT` is written to a private same-directory temporary file, synced, atomically renamed over the previous snapshot, and followed by a parent-directory sync. Existing Unix mode, owner, and group metadata are preserved. Snapshots include a format version, declared length, and CRC-32 checksum; truncated, corrupt, and unsupported snapshots are rejected rather than partially loaded. Persistent databases are rejected on non-Unix platforms until an equivalent durable replacement protocol is available.
+The database destination is resolved once before SQL execution: relative paths remain anchored to the opening directory, and a symlink continues to target its canonical file rather than being replaced. Each successful `CREATE` or `INSERT` is written to a private same-directory temporary file, synced, atomically renamed over the previous snapshot, and followed by a parent-directory sync. Existing mode, owner, group, ACLs, and extended attributes are reproduced and verified before rename. Snapshots include a format version, declared length, and CRC-32 checksum; truncated, corrupt, and unsupported snapshots are rejected rather than partially loaded. Persistent databases are rejected on other platforms until an equivalent durable replacement and metadata protocol is available.
 
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.

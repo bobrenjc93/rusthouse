@@ -1,3 +1,5 @@
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -246,7 +248,6 @@ fn logically_identical_catalogs_have_deterministic_snapshot_bytes() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn checkpoints_create_private_files_and_preserve_existing_unix_metadata() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -259,14 +260,120 @@ fn checkpoints_create_private_files_and_preserve_existing_unix_metadata() {
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
         .expect("set database permissions");
+    #[cfg(target_os = "linux")]
+    let attribute_name = "user.rusthouse.test";
+    #[cfg(target_os = "macos")]
+    let attribute_name = "com.rusthouse.test";
+    xattr::set(&path, attribute_name, b"keep this metadata").expect("set extended attribute");
+
+    let metadata = fs::metadata(&path).expect("read database owner");
+    let mut acl = exacl::getfacl(&path, None).expect("read initial ACL");
+    acl.push(exacl::AclEntry::allow_user(
+        &metadata.uid().to_string(),
+        exacl::Perm::READ,
+        None,
+    ));
+    exacl::setfacl(&[path.as_path()], &acl, None).expect("set extended ACL");
+
     let before = fs::metadata(&path).expect("read metadata before checkpoint");
+    let before_acl = exacl::getfacl(&path, None).expect("read ACL before checkpoint");
     let mut database = Database::open(&path).expect("open existing database");
     database
         .execute("INSERT INTO samples VALUES (8, 3.5, false, 'saved securely')")
         .expect("checkpoint database");
-    let after = fs::metadata(path).expect("read metadata after checkpoint");
+    let after = fs::metadata(&path).expect("read metadata after checkpoint");
 
-    assert_eq!(after.mode() & 0o7777, 0o640);
+    assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
     assert_eq!(after.uid(), before.uid());
     assert_eq!(after.gid(), before.gid());
+    assert_eq!(
+        exacl::getfacl(&path, None).expect("read ACL after checkpoint"),
+        before_acl
+    );
+    assert_eq!(
+        xattr::get(&path, attribute_name).expect("read extended attribute"),
+        Some(b"keep this metadata".to_vec())
+    );
+}
+
+#[test]
+fn relative_database_path_remains_bound_after_working_directory_change() {
+    const HELPER_ENV: &str = "RUSTHOUSE_CWD_PATH_HELPER";
+    if let Some(root) = std::env::var_os(HELPER_ENV) {
+        let root = PathBuf::from(root);
+        let first = root.join("first");
+        let second = root.join("second");
+        std::env::set_current_dir(&first).expect("enter first directory");
+        let mut database = Database::open("catalog.rsh").expect("open relative database");
+        database
+            .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1)")
+            .expect("create database");
+        std::env::set_current_dir(&second).expect("enter second directory");
+        database
+            .execute("INSERT INTO events VALUES (2)")
+            .expect("checkpoint after cwd change");
+        drop(database);
+
+        assert!(!second.join("catalog.rsh").exists());
+        let mut reopened = Database::open(first.join("catalog.rsh")).expect("reopen database");
+        assert_eq!(
+            query(&mut reopened, "SELECT id FROM events ORDER BY id").rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+        return;
+    }
+
+    let directory = TempDirectory::new("cwd-stability");
+    fs::create_dir(directory.path.join("first")).expect("create first directory");
+    fs::create_dir(directory.path.join("second")).expect("create second directory");
+    let output = Command::new(std::env::current_exe().expect("locate persistence test binary"))
+        .args([
+            "--exact",
+            "relative_database_path_remains_bound_after_working_directory_change",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, &directory.path)
+        .output()
+        .expect("run cwd helper test");
+    assert!(
+        output.status.success(),
+        "cwd helper failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.path.join("second/catalog.rsh").exists());
+    let mut reopened =
+        Database::open(directory.path.join("first/catalog.rsh")).expect("open helper database");
+    assert_eq!(
+        query(&mut reopened, "SELECT id FROM events ORDER BY id").rows,
+        vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn symlink_database_path_updates_its_canonical_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TempDirectory::new("symlink-stability");
+    let target = directory.database("target.rsh");
+    let link = directory.database("alias.rsh");
+    create_snapshot(&target);
+    symlink(&target, &link).expect("create database symlink");
+
+    let mut database = Database::open(&link).expect("open database through symlink");
+    database
+        .execute("INSERT INTO samples VALUES (8, 3.5, false, 'through link')")
+        .expect("checkpoint symlink target");
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("read symlink metadata")
+            .file_type()
+            .is_symlink()
+    );
+
+    let mut reopened = Database::open(&target).expect("open canonical target");
+    assert_eq!(
+        query(&mut reopened, "SELECT COUNT(*) AS count FROM samples").rows,
+        vec![vec![Value::Int64(2)]]
+    );
 }

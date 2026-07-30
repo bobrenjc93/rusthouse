@@ -4,10 +4,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 use std::cell::Cell;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use xattr::FileExt;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -19,7 +21,7 @@ const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 8 + 4;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 thread_local! {
     static FAIL_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
@@ -58,14 +60,45 @@ impl From<Error> for CheckpointError {
 type CheckpointResult<T> = std::result::Result<T, CheckpointError>;
 
 pub(crate) fn ensure_supported(path: &Path) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let _ = path;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(unsupported_platform(path))
+    }
+}
+
+pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| io_error("resolve", path, error))?
+            .join(path)
+    };
+    resolve_existing_components(&absolute, path)
+}
+
+fn resolve_existing_components(path: &Path, requested_path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::canonicalize(path).map_err(|error| io_error("resolve", requested_path, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| Error::Persistence {
+                operation: "resolve".to_owned(),
+                path: requested_path.to_owned(),
+                message: "the database path has no parent directory".to_owned(),
+            })?;
+            let file_name = path.file_name().ok_or_else(|| Error::Persistence {
+                operation: "resolve".to_owned(),
+                path: requested_path.to_owned(),
+                message: "the database path must name a file".to_owned(),
+            })?;
+            Ok(resolve_existing_components(parent, requested_path)?.join(file_name))
+        }
+        Err(error) => Err(io_error("resolve", requested_path, error)),
     }
 }
 
@@ -398,15 +431,24 @@ impl TemporaryFile {
             let temporary_path = parent.join(temporary_name);
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             options.mode(0o600);
             match options.open(&temporary_path) {
                 Ok(file) => {
-                    return Ok(Self {
+                    let temporary = Self {
                         file: Some(file),
                         path: temporary_path,
                         renamed: false,
-                    });
+                    };
+                    #[cfg(target_os = "macos")]
+                    exacl::setfacl(&[temporary.path.as_path()], &[], None).map_err(|error| {
+                        io_error(
+                            "remove inherited ACL from temporary snapshot for",
+                            database_path,
+                            error,
+                        )
+                    })?;
+                    return Ok(temporary);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -420,7 +462,7 @@ impl TemporaryFile {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn preserve_security_metadata(
         &self,
         metadata: Option<SecurityMetadata>,
@@ -437,11 +479,33 @@ impl TemporaryFile {
             fchown(file, Some(metadata.uid), Some(metadata.gid))
                 .map_err(|error| io_error("preserve owner and group for", database_path, error))?;
         }
+        for (name, value) in &metadata.extended_attributes {
+            file.set_xattr(name, value).map_err(|error| {
+                io_error("preserve extended attributes for", database_path, error)
+            })?;
+        }
+        exacl::setfacl(&[self.path.as_path()], &metadata.acl, None)
+            .map_err(|error| io_error("preserve ACL for", database_path, error))?;
         file.set_permissions(fs::Permissions::from_mode(metadata.mode))
-            .map_err(|error| io_error("preserve permissions for", database_path, error))
+            .map_err(|error| io_error("preserve permissions for", database_path, error))?;
+
+        let actual = existing_security_metadata(&self.path)?.ok_or_else(|| Error::Persistence {
+            operation: "verify security metadata for".to_owned(),
+            path: database_path.to_owned(),
+            message: "temporary snapshot disappeared before replacement".to_owned(),
+        })?;
+        if actual != metadata {
+            return Err(Error::Persistence {
+                operation: "verify security metadata for".to_owned(),
+                path: database_path.to_owned(),
+                message: "the filesystem did not reproduce the existing mode, owner, group, ACL, and extended attributes"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn preserve_security_metadata(
         &self,
         _metadata: Option<SecurityMetadata>,
@@ -497,36 +561,58 @@ fn usable_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-#[cfg(unix)]
-#[derive(Clone, Copy)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(PartialEq, Eq)]
 struct SecurityMetadata {
     mode: u32,
     uid: u32,
     gid: u32,
+    acl: Vec<exacl::AclEntry>,
+    extended_attributes: Vec<(std::ffi::OsString, Vec<u8>)>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct SecurityMetadata;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn existing_security_metadata(path: &Path) -> Result<Option<SecurityMetadata>> {
     match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(SecurityMetadata {
-            mode: metadata.mode() & 0o7777,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-        })),
+        Ok(metadata) => {
+            let acl = exacl::getfacl(path, None)
+                .map_err(|error| io_error("read ACL for", path, error))?;
+            let mut extended_attributes = Vec::new();
+            for name in xattr::list(path)
+                .map_err(|error| io_error("list extended attributes for", path, error))?
+            {
+                let value = xattr::get(path, &name)
+                    .map_err(|error| io_error("read extended attributes for", path, error))?
+                    .ok_or_else(|| Error::Persistence {
+                        operation: "read extended attributes for".to_owned(),
+                        path: path.to_owned(),
+                        message: format!("attribute {name:?} disappeared while checkpointing"),
+                    })?;
+                extended_attributes.push((name, value));
+            }
+            extended_attributes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            Ok(Some(SecurityMetadata {
+                mode: metadata.mode() & 0o7777,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                acl,
+                extended_attributes,
+            }))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error("inspect security metadata for", path, error)),
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn existing_security_metadata(path: &Path) -> Result<Option<SecurityMetadata>> {
     Err(unsupported_platform(path))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sync_directory(parent: &Path, database_path: &Path) -> Result<()> {
     #[cfg(test)]
     if FAIL_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
@@ -540,12 +626,12 @@ fn sync_directory(parent: &Path, database_path: &Path) -> Result<()> {
         .map_err(|error| committed_sync_error(database_path, error))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn sync_directory(_parent: &Path, database_path: &Path) -> Result<()> {
     Err(unsupported_platform(database_path))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn fail_next_directory_sync() {
     FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
 }
@@ -558,7 +644,7 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> Error {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn committed_sync_error(path: &Path, error: io::Error) -> Error {
     Error::Persistence {
         operation: "durably sync committed".to_owned(),
@@ -569,12 +655,12 @@ fn committed_sync_error(path: &Path, error: io::Error) -> Error {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported_platform(path: &Path) -> Error {
     Error::Persistence {
         operation: "open persistent".to_owned(),
         path: path.to_owned(),
-        message: "crash-safe database snapshots are currently supported only on Unix platforms"
+        message: "crash-safe database snapshots are currently supported only on Linux and macOS"
             .to_owned(),
     }
 }

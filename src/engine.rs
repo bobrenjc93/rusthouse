@@ -48,18 +48,23 @@ impl Database {
 
     /// Open a snapshot-backed database, or create an empty catalog if the path
     /// does not exist. Every successful mutation is checkpointed before it is
-    /// returned to the caller. Snapshot persistence currently requires Unix so
-    /// the replacement's parent directory can be durably synced.
+    /// returned to the caller. The destination is resolved once, including
+    /// symlink targets, so later working-directory changes cannot redirect it.
+    /// Snapshot persistence currently requires Linux or macOS.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_owned();
-        if path.file_name().is_none_or(|name| name.is_empty()) {
+        let requested_path = path.as_ref();
+        if requested_path
+            .file_name()
+            .is_none_or(|name| name.is_empty())
+        {
             return Err(Error::Persistence {
                 operation: "open".to_owned(),
-                path,
+                path: requested_path.to_owned(),
                 message: "the database path must name a file".to_owned(),
             });
         }
-        persistence::ensure_supported(&path)?;
+        persistence::ensure_supported(requested_path)?;
+        let path = persistence::resolve_path(requested_path)?;
         let catalog = persistence::load(&path)?;
         Ok(Self {
             catalog,
@@ -949,7 +954,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn post_rename_sync_failure_keeps_the_committed_snapshot_in_memory() {
         use std::fs;
