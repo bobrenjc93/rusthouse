@@ -4,6 +4,7 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_PARAMETERS: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -13,9 +14,15 @@ pub enum Statement {
     },
     Insert {
         table: String,
-        rows: Vec<Vec<Value>>,
+        rows: Vec<Vec<ValueExpression>>,
     },
     Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueExpression {
+    Literal(Value),
+    Parameter(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +32,13 @@ pub struct Select {
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
     pub order_by: Vec<OrderBy>,
-    pub limit: Option<usize>,
+    pub limit: Option<Limit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    Literal(usize),
+    Parameter(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +109,7 @@ pub enum Predicate {
 pub enum Operand {
     Column(String),
     Literal(Value),
+    Parameter(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +151,7 @@ enum TokenKind {
     Semicolon,
     Star,
     Minus,
+    Parameter(usize),
     Equal,
     NotEqual,
     Less,
@@ -149,11 +164,16 @@ enum TokenKind {
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
+    next_parameter: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+        Self {
+            input,
+            position: 0,
+            next_parameter: 0,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
@@ -194,6 +214,8 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     TokenKind::Minus
                 }
+                '?' => TokenKind::Parameter(self.scan_parameter(position, false)?),
+                '$' => TokenKind::Parameter(self.scan_parameter(position, true)?),
                 '=' => {
                     self.advance();
                     TokenKind::Equal
@@ -330,6 +352,49 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    fn scan_parameter(&mut self, start: usize, number_required: bool) -> Result<usize> {
+        self.advance();
+        let digits_start = self.position;
+        while self.current().is_some_and(|value| value.is_ascii_digit()) {
+            self.advance();
+        }
+
+        let index = if digits_start == self.position {
+            if number_required {
+                return self.error(start, "expected a positive parameter number after '$'");
+            }
+            let index = self.next_parameter;
+            self.next_parameter = self
+                .next_parameter
+                .checked_add(1)
+                .ok_or_else(|| Error::Sql {
+                    position: start,
+                    message: "parameter number is too large".to_owned(),
+                })?;
+            index
+        } else {
+            let number = self.input[digits_start..self.position]
+                .parse::<usize>()
+                .map_err(|_| Error::Sql {
+                    position: start,
+                    message: "parameter number is too large".to_owned(),
+                })?;
+            if number == 0 {
+                return self.error(start, "parameter numbers start at 1");
+            }
+            let index = number - 1;
+            self.next_parameter = self.next_parameter.max(index + 1);
+            index
+        };
+        if index >= MAX_PARAMETERS {
+            return self.error(
+                start,
+                format!("parameter number exceeds limit of {MAX_PARAMETERS}"),
+            );
+        }
+        Ok(index)
+    }
+
     fn error<T>(&self, position: usize, message: impl Into<String>) -> Result<T> {
         Err(Error::Sql {
             position,
@@ -426,7 +491,7 @@ impl Parser {
             let mut row = Vec::new();
             if !self.at(&TokenKind::RightParen) {
                 loop {
-                    row.push(self.parse_literal()?);
+                    row.push(self.parse_value_expression()?);
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -490,15 +555,23 @@ impl Parser {
         }
 
         let limit = if self.eat_keyword("LIMIT") {
-            let position = self.position();
-            let number = self.take_number().ok_or_else(|| Error::Sql {
-                position,
-                message: "expected a non-negative integer after LIMIT".to_owned(),
-            })?;
-            Some(number.parse::<usize>().map_err(|_| Error::Sql {
-                position,
-                message: format!("invalid LIMIT '{number}'"),
-            })?)
+            if let TokenKind::Parameter(index) = self.peek() {
+                let index = *index;
+                self.current += 1;
+                Some(Limit::Parameter(index))
+            } else {
+                let position = self.position();
+                let number = self.take_number().ok_or_else(|| Error::Sql {
+                    position,
+                    message: "expected a non-negative integer or parameter after LIMIT".to_owned(),
+                })?;
+                Some(Limit::Literal(number.parse::<usize>().map_err(|_| {
+                    Error::Sql {
+                        position,
+                        message: format!("invalid LIMIT '{number}'"),
+                    }
+                })?))
+            }
         } else {
             None
         };
@@ -618,6 +691,11 @@ impl Parser {
 
     fn parse_operand(&mut self) -> Result<Operand> {
         match self.peek() {
+            TokenKind::Parameter(index) => {
+                let index = *index;
+                self.current += 1;
+                Ok(Operand::Parameter(index))
+            }
             TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -630,6 +708,16 @@ impl Parser {
                 .expect_identifier("column or literal")
                 .map(Operand::Column),
             _ => self.error("expected column or literal"),
+        }
+    }
+
+    fn parse_value_expression(&mut self) -> Result<ValueExpression> {
+        if let TokenKind::Parameter(index) = self.peek() {
+            let index = *index;
+            self.current += 1;
+            Ok(ValueExpression::Parameter(index))
+        } else {
+            self.parse_literal().map(ValueExpression::Literal)
         }
     }
 
@@ -770,7 +858,7 @@ mod tests {
         assert_eq!(select.group_by, ["region"]);
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
-        assert_eq!(select.limit, Some(3));
+        assert_eq!(select.limit, Some(Limit::Literal(3)));
     }
 
     #[test]
@@ -780,7 +868,10 @@ mod tests {
         let Statement::Insert { rows, .. } = &statements[0] else {
             panic!("expected insert");
         };
-        assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
+        assert_eq!(
+            rows[0][1],
+            ValueExpression::Literal(Value::String("it's good".to_owned()))
+        );
         assert_eq!(rows.len(), 2);
     }
 
@@ -788,6 +879,15 @@ mod tests {
     fn reports_syntax_position() {
         let error = parse("SELECT id FROM things WHERE id ! 2").expect_err("bad operator");
         assert!(matches!(error, Error::Sql { position: 31, .. }));
+    }
+
+    #[test]
+    fn rejects_parameter_numbers_that_could_force_oversized_plans() {
+        let error = parse("SELECT id FROM things WHERE id = $65537").expect_err("parameter limit");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("parameter number exceeds limit")
+        ));
     }
 
     #[test]

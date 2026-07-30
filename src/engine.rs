@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, Limit, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement, ValueExpression,
 };
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
@@ -37,6 +37,81 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// A parsed and resolved SELECT or INSERT statement.
+///
+/// Prepared statements are tied to the catalog schema generation in which
+/// they were created. Data changes do not invalidate them, but schema changes
+/// do.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    schema_generation: u64,
+    parameter_types: Vec<DataType>,
+    plan: PreparedPlan,
+}
+
+impl PreparedStatement {
+    /// Types expected for positional parameters, in binding order.
+    #[must_use]
+    pub fn parameter_types(&self) -> &[DataType] {
+        &self.parameter_types
+    }
+
+    /// Result columns for SELECT, or `None` for INSERT.
+    #[must_use]
+    pub fn result_columns(&self) -> Option<&[ResultColumn]> {
+        match &self.plan {
+            PreparedPlan::Select(select) => Some(&select.result_columns),
+            PreparedPlan::Insert(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PreparedPlan {
+    Select(PreparedSelect),
+    Insert(PreparedInsert),
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSelect {
+    table: String,
+    predicate: Option<CompiledPredicate>,
+    group_columns: Vec<usize>,
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    ordering: Vec<ResolvedOrder>,
+    limit: Option<PreparedLimit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreparedLimit {
+    Literal(usize),
+    Parameter(usize),
+}
+
+impl PreparedLimit {
+    fn resolve(self, parameters: &[Value]) -> Result<usize> {
+        match self {
+            Self::Literal(limit) => Ok(limit),
+            Self::Parameter(index) => {
+                let Value::Int64(limit) = parameters[index] else {
+                    unreachable!("LIMIT parameter type is validated")
+                };
+                usize::try_from(limit).map_err(|_| {
+                    Error::InvalidQuery("LIMIT parameter must be non-negative".to_owned())
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedInsert {
+    table: String,
+    rows: Vec<Vec<ValueExpression>>,
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -60,6 +135,56 @@ impl Database {
             .collect()
     }
 
+    /// Parse and resolve one SELECT or INSERT statement for repeated execution.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let mut statements = sql::parse(sql)?;
+        if statements.len() != 1 {
+            return Err(Error::InvalidQuery(
+                "prepare requires exactly one SELECT or INSERT statement".to_owned(),
+            ));
+        }
+
+        let mut parameters = ParameterTypes::default();
+        let plan = match statements.pop().expect("one statement") {
+            Statement::Select(select) => {
+                PreparedPlan::Select(self.compile_select(select, &mut parameters)?)
+            }
+            Statement::Insert { table, rows } => {
+                PreparedPlan::Insert(self.compile_insert(table, rows, &mut parameters)?)
+            }
+            Statement::CreateTable { .. } => {
+                return Err(Error::InvalidQuery(
+                    "only SELECT and INSERT statements can be prepared".to_owned(),
+                ));
+            }
+        };
+
+        Ok(PreparedStatement {
+            schema_generation: self.catalog.schema_generation(),
+            parameter_types: parameters.finish()?,
+            plan,
+        })
+    }
+
+    /// Execute a prepared statement with positional bindings.
+    pub fn execute_prepared(
+        &mut self,
+        statement: &PreparedStatement,
+        parameters: &[Value],
+    ) -> Result<StatementResult> {
+        if statement.schema_generation != self.catalog.schema_generation() {
+            return Err(Error::StalePreparedStatement);
+        }
+        validate_parameters(&statement.parameter_types, parameters)?;
+
+        match &statement.plan {
+            PreparedPlan::Select(select) => self
+                .execute_select_plan(select, parameters)
+                .map(StatementResult::Query),
+            PreparedPlan::Insert(insert) => self.execute_insert_plan(insert, parameters),
+        }
+    }
+
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
@@ -70,6 +195,19 @@ impl Database {
                 })
             }
             Statement::Insert { table, rows } => {
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|value| match value {
+                                ValueExpression::Literal(value) => Ok(value),
+                                ValueExpression::Parameter(_) => Err(Error::InvalidQuery(
+                                    "SQL parameters require Database::prepare".to_owned(),
+                                )),
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let affected_rows = rows.len();
                 {
                     let target = self.catalog.table(&table)?;
@@ -91,51 +229,176 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
+        let mut parameters = ParameterTypes::default();
+        let plan = self.compile_select(select, &mut parameters)?;
+        if !parameters.finish()?.is_empty() {
+            return Err(Error::InvalidQuery(
+                "SQL parameters require Database::prepare".to_owned(),
+            ));
+        }
+        self.execute_select_plan(&plan, &[])
+    }
+
+    fn compile_select(
+        &self,
+        select: Select,
+        parameters: &mut ParameterTypes,
+    ) -> Result<PreparedSelect> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| compile_predicate(table, predicate, parameters))
             .transpose()?;
-
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let limit = match select.limit {
+            Some(Limit::Literal(limit)) => Some(PreparedLimit::Literal(limit)),
+            Some(Limit::Parameter(index)) => {
+                parameters.resolve(index, DataType::Int64)?;
+                Some(PreparedLimit::Parameter(index))
+            }
+            None => None,
+        };
 
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        Ok(PreparedSelect {
+            table: select.table,
+            predicate,
+            group_columns,
+            items,
+            result_columns,
+            aggregate_specs,
+            ordering,
+            limit,
+        })
+    }
+
+    fn execute_select_plan(
+        &self,
+        select: &PreparedSelect,
+        parameters: &[Value],
+    ) -> Result<QueryResult> {
+        let table = self.catalog.table(&select.table)?;
+        let limit = select
+            .limit
+            .map(|limit| limit.resolve(parameters))
+            .transpose()?;
+
+        let mut matching_rows = (0..table.row_count())
+            .filter(|row| {
+                select
+                    .predicate
+                    .as_ref()
+                    .is_none_or(|predicate| predicate.evaluate(table, *row, parameters))
+            })
+            .collect::<Vec<_>>();
+
+        let grouped = !select.group_columns.is_empty() || !select.aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &select.group_columns,
+                &select.aggregate_specs,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
-                &items,
-                &ordering,
-                select.limit,
+                &select.items,
+                &select.ordering,
+                limit,
             );
-            grouped.project(&selected_groups, &items)
+            grouped.project(&selected_groups, &select.items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &select.items,
+                &select.ordering,
+                limit,
+            );
+            execute_projection(table, &matching_rows, &select.items)
         };
 
         Ok(QueryResult {
-            columns: result_columns,
+            columns: select.result_columns.clone(),
             rows,
+        })
+    }
+
+    fn compile_insert(
+        &self,
+        table_name: String,
+        rows: Vec<Vec<ValueExpression>>,
+        parameters: &mut ParameterTypes,
+    ) -> Result<PreparedInsert> {
+        let table = self.catalog.table(&table_name)?;
+        for row in &rows {
+            if row.len() != table.schema().len() {
+                return Err(Error::RowLength {
+                    table: table.name().to_owned(),
+                    expected: table.schema().len(),
+                    actual: row.len(),
+                });
+            }
+            for (field, value) in table.schema().iter().zip(row) {
+                match value {
+                    ValueExpression::Literal(value) => validate_typed_value(
+                        &format!("column '{}.{}'", table.name(), field.name),
+                        field.data_type,
+                        value,
+                    )?,
+                    ValueExpression::Parameter(index) => {
+                        parameters.resolve(*index, field.data_type)?;
+                    }
+                }
+            }
+        }
+        Ok(PreparedInsert {
+            table: table_name,
+            rows,
+        })
+    }
+
+    fn execute_insert_plan(
+        &mut self,
+        insert: &PreparedInsert,
+        parameters: &[Value],
+    ) -> Result<StatementResult> {
+        let rows = insert
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| match value {
+                        ValueExpression::Literal(value) => value.clone(),
+                        ValueExpression::Parameter(index) => parameters[*index].clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        {
+            let table = self.catalog.table(&insert.table)?;
+            for row in &rows {
+                table.validate_row(row)?;
+            }
+        }
+        let affected_rows = rows.len();
+        let table = self.catalog.table_mut(&insert.table)?;
+        for row in rows {
+            table.insert_row(row)?;
+        }
+        Ok(StatementResult::Command {
+            tag: "INSERT",
+            affected_rows,
         })
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ResolvedItem {
     Column {
         source: usize,
@@ -767,7 +1030,76 @@ fn sort_and_limit(
     indices.sort_unstable_by(|left, right| compare(*left, *right));
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct ParameterTypes {
+    types: Vec<Option<DataType>>,
+}
+
+impl ParameterTypes {
+    fn resolve(&mut self, index: usize, data_type: DataType) -> Result<()> {
+        if self.types.len() <= index {
+            self.types.resize(index + 1, None);
+        }
+        match self.types[index] {
+            Some(existing) if existing != data_type => Err(Error::TypeMismatch {
+                context: format!("parameter ${}", index + 1),
+                expected: existing.to_string(),
+                actual: data_type.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                self.types[index] = Some(data_type);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> Result<Vec<DataType>> {
+        self.types
+            .into_iter()
+            .enumerate()
+            .map(|(index, data_type)| {
+                data_type.ok_or_else(|| {
+                    Error::InvalidQuery(format!(
+                        "parameter ${} is not used; parameter numbers must be contiguous",
+                        index + 1
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
+fn validate_parameters(expected: &[DataType], parameters: &[Value]) -> Result<()> {
+    if expected.len() != parameters.len() {
+        return Err(Error::ParameterCount {
+            expected: expected.len(),
+            actual: parameters.len(),
+        });
+    }
+    for (index, (expected, value)) in expected.iter().zip(parameters).enumerate() {
+        validate_typed_value(&format!("parameter ${}", index + 1), *expected, value)?;
+    }
+    Ok(())
+}
+
+fn validate_typed_value(context: &str, expected: DataType, value: &Value) -> Result<()> {
+    if expected != value.data_type() {
+        return Err(Error::TypeMismatch {
+            context: context.to_owned(),
+            expected: expected.to_string(),
+            actual: value.data_type().to_string(),
+        });
+    }
+    if matches!(value, Value::Float64(number) if !number.is_finite()) {
+        return Err(Error::InvalidQuery(format!(
+            "{context} must be a finite Float64"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
 enum CompiledPredicate {
     Comparison {
         left: CompiledOperand,
@@ -779,15 +1111,15 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, table: &Table, row: usize, parameters: &[Value]) -> bool {
         match self {
             Self::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
+                let left = left.value(table, row, parameters);
+                let right = right.value(table, row, parameters);
                 let comparison = left
                     .sql_cmp(right)
                     .expect("predicate operand types are validated");
@@ -800,16 +1132,21 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::And(left, right) => {
+                left.evaluate(table, row, parameters) && right.evaluate(table, row, parameters)
+            }
+            Self::Or(left, right) => {
+                left.evaluate(table, row, parameters) || right.evaluate(table, row, parameters)
+            }
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CompiledOperand {
     Column { index: usize, data_type: DataType },
     Literal(Value),
+    Parameter { index: usize, data_type: DataType },
 }
 
 impl CompiledOperand {
@@ -817,26 +1154,31 @@ impl CompiledOperand {
         match self {
             Self::Column { data_type, .. } => *data_type,
             Self::Literal(value) => value.data_type(),
+            Self::Parameter { data_type, .. } => *data_type,
         }
     }
 
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
+    fn value<'a>(&'a self, table: &'a Table, row: usize, parameters: &'a [Value]) -> ValueRef<'a> {
         match self {
             Self::Column { index, .. } => table.columns()[*index].value_ref(row),
             Self::Literal(value) => value.as_ref(),
+            Self::Parameter { index, .. } => parameters[*index].as_ref(),
         }
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn compile_predicate(
+    table: &Table,
+    predicate: &Predicate,
+    parameters: &mut ParameterTypes,
+) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let (left, right) = compile_comparison_operands(table, left, right, parameters)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -851,17 +1193,57 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             })
         }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(table, left, parameters)?),
+            Box::new(compile_predicate(table, right, parameters)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(table, left, parameters)?),
+            Box::new(compile_predicate(table, right, parameters)?),
         )),
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_comparison_operands(
+    table: &Table,
+    left: &Operand,
+    right: &Operand,
+    parameters: &mut ParameterTypes,
+) -> Result<(CompiledOperand, CompiledOperand)> {
+    match (left, right) {
+        (Operand::Parameter(_), Operand::Parameter(_)) => Err(Error::InvalidQuery(
+            "cannot infer a type for a comparison between two parameters".to_owned(),
+        )),
+        (Operand::Parameter(index), right) => {
+            let right = compile_typed_operand(table, right)?;
+            parameters.resolve(*index, right.data_type())?;
+            Ok((
+                CompiledOperand::Parameter {
+                    index: *index,
+                    data_type: right.data_type(),
+                },
+                right,
+            ))
+        }
+        (left, Operand::Parameter(index)) => {
+            let left = compile_typed_operand(table, left)?;
+            let data_type = left.data_type();
+            parameters.resolve(*index, data_type)?;
+            Ok((
+                left,
+                CompiledOperand::Parameter {
+                    index: *index,
+                    data_type,
+                },
+            ))
+        }
+        (left, right) => Ok((
+            compile_typed_operand(table, left)?,
+            compile_typed_operand(table, right)?,
+        )),
+    }
+}
+
+fn compile_typed_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
     match operand {
         Operand::Column(name) => {
             let index = table.column_index(name)?;
@@ -871,6 +1253,7 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
             })
         }
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+        Operand::Parameter(_) => unreachable!("parameters are resolved from the other operand"),
     }
 }
 

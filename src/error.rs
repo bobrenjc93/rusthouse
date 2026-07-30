@@ -28,6 +28,11 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    ParameterCount {
+        expected: usize,
+        actual: usize,
+    },
+    StalePreparedStatement,
     InvalidQuery(String),
     NumericOverflow(String),
 }
@@ -68,6 +73,14 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
+            ),
+            Self::ParameterCount { expected, actual } => write!(
+                f,
+                "prepared statement expects {expected} parameters, found {actual}"
+            ),
+            Self::StalePreparedStatement => write!(
+                f,
+                "prepared statement is stale because the catalog schema has changed"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {

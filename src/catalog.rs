@@ -1,12 +1,25 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, Table};
 
 /// An in-memory collection of named tables.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Catalog {
     tables: HashMap<String, Table>,
+    schema_generation: u64,
+}
+
+static NEXT_SCHEMA_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            tables: HashMap::new(),
+            schema_generation: next_schema_generation(),
+        }
+    }
 }
 
 impl Catalog {
@@ -22,6 +35,7 @@ impl Catalog {
         }
         let table = Table::new(name, schema)?;
         self.tables.insert(key, table);
+        self.schema_generation = next_schema_generation();
         Ok(())
     }
 
@@ -36,6 +50,14 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    pub(crate) fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+}
+
+fn next_schema_generation() -> u64 {
+    NEXT_SCHEMA_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 fn normalize(identifier: &str) -> String {

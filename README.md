@@ -11,11 +11,14 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- typed positional parameters and reusable prepared SELECT/INSERT plans
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+Prepared statements use `?` in binding order. Numbered `?1` and `$1` forms are also accepted and may be reused. Parameter types are inferred from INSERT columns, WHERE operands, and LIMIT (`Int64`).
 
 ## CLI
 
@@ -78,6 +81,30 @@ assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+Prepare a single SELECT or INSERT once, then bind typed `Value` instances:
+
+~~~rust
+use rusthouse::{DataType, Database, StatementResult, Value};
+
+let mut database = Database::new();
+database.execute("CREATE TABLE events (id Int64, name String)")?;
+
+let insert = database.prepare("INSERT INTO events VALUES (?, ?)")?;
+assert_eq!(insert.parameter_types(), &[DataType::Int64, DataType::String]);
+database.execute_prepared(
+    &insert,
+    &[Value::Int64(1), Value::String("launch' day".to_owned())],
+)?;
+
+let select = database.prepare("SELECT name FROM events WHERE id = ?")?;
+let result = database.execute_prepared(&select, &[Value::Int64(1)])?;
+assert!(matches!(result, StatementResult::Query(_)));
+
+# Ok::<(), rusthouse::Error>(())
+~~~
+
+Bindings must exactly match the inferred count and types. INSERT validation remains atomic. Data inserts do not invalidate a prepared plan; any catalog schema change does, and the statement must then be prepared again.
 
 ## Current boundaries
 
