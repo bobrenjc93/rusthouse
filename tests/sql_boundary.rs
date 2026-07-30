@@ -244,10 +244,10 @@ fn every_aggregate_groups_and_uses_declared_result_types() {
         vec![
             DataType::String,
             DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Float64,
+            DataType::Nullable(DataType::Int64),
+            DataType::Nullable(DataType::Int64),
+            DataType::Nullable(DataType::Int64),
+            DataType::Nullable(DataType::Float64),
         ]
     );
     assert_eq!(
@@ -284,7 +284,7 @@ fn global_aggregates_and_empty_count_are_supported() {
         &mut database,
         "SELECT COUNT(*) AS count, SUM(reading) AS total FROM measurements;",
     );
-    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Float64(0.0)]]);
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Null]]);
 
     database
         .execute("INSERT INTO measurements VALUES (1.5), (2.5), (6.0);")
@@ -478,14 +478,14 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+fn literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE", "Null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
                 "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
             ))
-            .expect_err("Boolean literal names are reserved");
+            .expect_err("literal names are reserved");
 
         assert!(matches!(
             error,

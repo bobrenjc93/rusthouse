@@ -1,21 +1,23 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`). `Nullable(T)` columns keep the same typed storage plus a packed validity bitmap.
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
+- CREATE TABLE with Int64, Float64, Bool, String, and Nullable(T) columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
-- AND, OR, and parentheses in predicates (AND binds more tightly)
-- COUNT, SUM, MIN, MAX, and AVG
+- NULL literals, IS NULL, IS NOT NULL, and three-valued AND/OR predicates
+- COUNT, SUM, MIN, MAX, and AVG with SQL NULL behavior
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+Identifiers are unquoted and case-insensitive; TRUE, FALSE, and NULL are reserved literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+
+NULL values compare as unknown in ordinary comparisons and only true WHERE predicates select rows. GROUP BY collects NULL keys into one group. ORDER BY places NULL after non-NULL values in ascending order and before them in descending order. Aggregates ignore NULL; COUNT(column) returns zero when no non-NULL values exist, while SUM, MIN, MAX, and AVG return NULL.
 
 ## CLI
 
@@ -54,7 +56,7 @@ printf '%s\n' \
   cargo run -- --format csv
 ~~~
 
-Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
+Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines. Table output renders NULL as `NULL`, CSV uses `\N`, and JSON uses native `null`.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
 ## Library API
@@ -81,11 +83,11 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
-On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
+On empty input, COUNT returns numeric zero. SUM, MIN, MAX, and AVG return NULL with nullable result metadata.
 
 ## Development
 

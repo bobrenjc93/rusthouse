@@ -11,26 +11,85 @@ pub struct ColumnDef {
 }
 
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
+    name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+        || name.eq_ignore_ascii_case("NULL")
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// A compact per-row validity bitmap. A set bit represents a non-NULL value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidityBitmap {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl ValidityBitmap {
+    fn new() -> Self {
+        Self {
+            words: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, valid: bool) {
+        let bit = self.len % u64::BITS as usize;
+        if bit == 0 {
+            self.words.push(0);
+        }
+        if valid {
+            let word = self.words.last_mut().expect("current bitmap word");
+            *word |= 1_u64 << bit;
+        }
+        self.len += 1;
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, row: usize) -> bool {
+        assert!(row < self.len, "validity bitmap row is in bounds");
+        self.words[row / u64::BITS as usize] & (1_u64 << (row % u64::BITS as usize)) != 0
+    }
+}
+
+/// A column backed by one contiguous typed vector and, when nullable, a bitmap.
 #[derive(Debug, Clone)]
 pub enum Column {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
+    Nullable {
+        values: Box<Column>,
+        validity: ValidityBitmap,
+    },
 }
 
 impl Column {
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
-        match data_type {
+        let values = match data_type.physical() {
             DataType::Int64 => Self::Int64(Vec::new()),
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
+            _ => unreachable!("all physical types are covered"),
+        };
+        if data_type.is_nullable() {
+            Self::Nullable {
+                values: Box::new(values),
+                validity: ValidityBitmap::new(),
+            }
+        } else {
+            values
         }
     }
 
@@ -41,6 +100,7 @@ impl Column {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Nullable { values, .. } => DataType::Nullable(values.data_type()),
         }
     }
 
@@ -51,6 +111,7 @@ impl Column {
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
+            Self::Nullable { values, .. } => values.len(),
         }
     }
 
@@ -70,6 +131,13 @@ impl Column {
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
+            Self::Nullable { values, validity } => {
+                if validity.is_valid(row) {
+                    values.value_ref(row)
+                } else {
+                    ValueRef::Null
+                }
+            }
         }
     }
 
@@ -83,7 +151,25 @@ impl Column {
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Nullable { values, validity }, Value::Null) => {
+                values.push_default();
+                validity.push(false);
+            }
+            (Self::Nullable { values, validity }, value) => {
+                values.push(value);
+                validity.push(true);
+            }
             _ => unreachable!("values are validated before insertion"),
+        }
+    }
+
+    fn push_default(&mut self) {
+        match self {
+            Self::Int64(values) => values.push(0),
+            Self::Float64(values) => values.push(0.0),
+            Self::Bool(values) => values.push(false),
+            Self::String(values) => values.push(String::new()),
+            Self::Nullable { .. } => unreachable!("nested nullable columns are not constructed"),
         }
     }
 }
@@ -169,11 +255,23 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
-            if field.data_type != value.data_type() {
+            let actual_type = value.data_type();
+            if matches!(value, Value::Null) {
+                if field.data_type.is_nullable() {
+                    continue;
+                }
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),
                     expected: field.data_type.to_string(),
-                    actual: value.data_type().to_string(),
+                    actual: "NULL".to_owned(),
+                });
+            }
+            if actual_type != Some(field.data_type.physical()) {
+                return Err(Error::TypeMismatch {
+                    context: format!("column '{}.{}'", self.name, field.name),
+                    expected: field.data_type.to_string(),
+                    actual: actual_type
+                        .map_or_else(|| "NULL".to_owned(), |value| value.to_string()),
                 });
             }
             if matches!(value, Value::Float64(number) if !number.is_finite()) {
@@ -240,5 +338,19 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn validity_bitmap_grows_across_machine_words() {
+        let mut bitmap = ValidityBitmap::new();
+        for row in 0..130 {
+            bitmap.push(row % 3 == 0);
+        }
+
+        assert_eq!(bitmap.len(), 130);
+        assert_eq!(bitmap.words.len(), 3);
+        for row in 0..130 {
+            assert_eq!(bitmap.is_valid(row), row % 3 == 0);
+        }
     }
 }

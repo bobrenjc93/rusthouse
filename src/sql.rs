@@ -88,6 +88,10 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    IsNull {
+        operand: Operand,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -396,14 +400,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_data_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -414,6 +411,31 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_data_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        if type_name.eq_ignore_ascii_case("NULLABLE") {
+            self.expect(&TokenKind::LeftParen, "'(' after Nullable")?;
+            let inner_position = self.position();
+            let inner_name = self.expect_identifier("physical type inside Nullable")?;
+            let inner = DataType::parse(&inner_name).ok_or_else(|| Error::Sql {
+                position: inner_position,
+                message: format!(
+                    "unknown type '{inner_name}' inside Nullable; expected Int64, Float64, Bool, or String"
+                ),
+            })?;
+            self.expect(&TokenKind::RightParen, "')' after Nullable type")?;
+            Ok(DataType::Nullable(inner))
+        } else {
+            DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+                position,
+                message: format!(
+                    "unknown type '{type_name}'; expected Int64, Float64, Bool, String, or Nullable(T)"
+                ),
+            })
+        }
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -587,6 +609,15 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
+        if self.eat_keyword("IS") {
+            let negated = self.eat_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            self.record_predicate_node()?;
+            return Ok(Predicate::IsNull {
+                operand: left,
+                negated,
+            });
+        }
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -622,7 +653,9 @@ impl Parser {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
-                if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
+                if value.eq_ignore_ascii_case("TRUE")
+                    || value.eq_ignore_ascii_case("FALSE")
+                    || value.eq_ignore_ascii_case("NULL") =>
             {
                 self.parse_literal().map(Operand::Literal)
             }
@@ -672,8 +705,10 @@ impl Parser {
             Ok(Value::Bool(true))
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
+        } else if self.eat_keyword("NULL") {
+            Ok(Value::Null)
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, or NULL literal")
         }
     }
 
