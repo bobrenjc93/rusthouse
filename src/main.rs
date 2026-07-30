@@ -1,9 +1,12 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 
-use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::format::{
+    OutputFormat, render, write_csv_header, write_csv_rows, write_json_query_end,
+    write_json_query_start, write_json_rows,
+};
+use rusthouse::{Database, QueryResult, ResultColumn, ResultSink, StatementResult, Value};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -48,22 +51,118 @@ fn run() -> Result<(), String> {
     };
 
     let mut database = Database::new();
-    let results = database.execute(&sql).map_err(|error| error.to_string())?;
-    let mut queries = Vec::new();
-    for result in results {
-        match result {
-            StatementResult::Command { tag, affected_rows } => {
-                if tag == "INSERT" {
-                    eprintln!("{tag} {affected_rows}");
-                } else {
-                    eprintln!("{tag}");
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    if config.format == OutputFormat::Table {
+        let results = database.execute(&sql).map_err(|error| error.to_string())?;
+        let mut queries = Vec::new();
+        for result in results {
+            match result {
+                StatementResult::Command { tag, affected_rows } => {
+                    report_command(tag, affected_rows);
                 }
+                StatementResult::Query(result) => queries.push(result),
             }
-            StatementResult::Query(result) => queries.push(result),
+        }
+        output
+            .write_all(render_query_results(&queries, config.format).as_bytes())
+            .map_err(|error| format!("could not write query output: {error}"))?;
+    } else {
+        let mut sink = CliSink::new(&mut output, config.format);
+        database
+            .execute_into(&sql, &mut sink)
+            .map_err(|error| error.to_string())?;
+        sink.finish()
+            .map_err(|error| format!("could not write query output: {error}"))?;
+    }
+    output
+        .flush()
+        .map_err(|error| format!("could not flush query output: {error}"))?;
+    Ok(())
+}
+
+fn report_command(tag: &'static str, affected_rows: usize) {
+    if tag == "INSERT" {
+        eprintln!("{tag} {affected_rows}");
+    } else {
+        eprintln!("{tag}");
+    }
+}
+
+struct CliSink<'a, W> {
+    output: &'a mut W,
+    format: OutputFormat,
+    query_count: usize,
+    first_row: bool,
+}
+
+impl<'a, W: Write> CliSink<'a, W> {
+    fn new(output: &'a mut W, format: OutputFormat) -> Self {
+        debug_assert!(format != OutputFormat::Table);
+        Self {
+            output,
+            format,
+            query_count: 0,
+            first_row: true,
         }
     }
-    print!("{}", render_query_results(&queries, config.format));
-    Ok(())
+
+    fn finish(&mut self) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            if self.query_count == 0 {
+                self.output.write_all(b"{\"results\":[]}")?;
+            } else {
+                self.output.write_all(b"]}")?;
+            }
+            self.output.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> ResultSink for CliSink<'_, W> {
+    type Error = io::Error;
+
+    fn command(&mut self, tag: &'static str, affected_rows: usize) -> io::Result<()> {
+        report_command(tag, affected_rows);
+        Ok(())
+    }
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> io::Result<()> {
+        if self.query_count > 0 {
+            match self.format {
+                OutputFormat::Csv => self.output.write_all(b"\n")?,
+                OutputFormat::Json => self.output.write_all(b",")?,
+                OutputFormat::Table => unreachable!("table results use the collecting adapter"),
+            }
+        } else if self.format == OutputFormat::Json {
+            self.output.write_all(b"{\"results\":[")?;
+        }
+        self.query_count += 1;
+        self.first_row = true;
+
+        match self.format {
+            OutputFormat::Csv => write_csv_header(self.output, columns),
+            OutputFormat::Json => write_json_query_start(self.output, columns),
+            OutputFormat::Table => unreachable!("table results use the collecting adapter"),
+        }
+    }
+
+    fn rows(&mut self, rows: &[Vec<Value>]) -> io::Result<()> {
+        match self.format {
+            OutputFormat::Csv => write_csv_rows(self.output, rows),
+            OutputFormat::Json => write_json_rows(self.output, rows, &mut self.first_row),
+            OutputFormat::Table => unreachable!("table results use the collecting adapter"),
+        }
+    }
+
+    fn end_query(&mut self) -> io::Result<()> {
+        match self.format {
+            OutputFormat::Csv => Ok(()),
+            OutputFormat::Json => write_json_query_end(self.output),
+            OutputFormat::Table => unreachable!("table results use the collecting adapter"),
+        }
+    }
 }
 
 fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {

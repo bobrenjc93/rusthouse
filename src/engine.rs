@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::fmt;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -37,6 +39,56 @@ pub enum StatementResult {
     Query(QueryResult),
 }
 
+/// The maximum number of rows delivered in one [`ResultSink::rows`] call by
+/// [`Database::execute_into`].
+pub const DEFAULT_BATCH_SIZE: usize = 1_024;
+
+/// Receives statement results as execution progresses.
+///
+/// A query is delivered as `begin_query`, zero or more bounded `rows` calls,
+/// and `end_query`. Implementations that retain columns or rows must clone
+/// them because the slices are only valid for the duration of each call.
+pub trait ResultSink {
+    type Error;
+
+    fn command(
+        &mut self,
+        tag: &'static str,
+        affected_rows: usize,
+    ) -> std::result::Result<(), Self::Error>;
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error>;
+
+    fn rows(&mut self, rows: &[Vec<Value>]) -> std::result::Result<(), Self::Error>;
+
+    fn end_query(&mut self) -> std::result::Result<(), Self::Error>;
+}
+
+/// An execution failure from either the database or the result sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecuteError<E> {
+    Database(Error),
+    Sink(E),
+}
+
+impl<E: fmt::Display> fmt::Display for ExecuteError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database(error) => error.fmt(formatter),
+            Self::Sink(error) => write!(formatter, "result sink failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ExecuteError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            Self::Sink(error) => Some(error),
+        }
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -54,66 +106,112 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let mut sink = CollectingSink::default();
+        match self.execute_into(sql, &mut sink) {
+            Ok(()) => Ok(sink.results),
+            Err(ExecuteError::Database(error)) => Err(error),
+            Err(ExecuteError::Sink(error)) => match error {},
+        }
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    /// Execute a parsed batch and emit results incrementally in bounded chunks.
+    ///
+    /// The complete SQL batch is parsed before the first statement is executed.
+    /// Sink failures stop execution immediately; already executed statements and
+    /// mutations from the current statement are not rolled back.
+    pub fn execute_into<S: ResultSink>(
+        &mut self,
+        sql: &str,
+        sink: &mut S,
+    ) -> std::result::Result<(), ExecuteError<S::Error>> {
+        self.execute_into_with_batch_size(sql, DEFAULT_BATCH_SIZE, sink)
+    }
+
+    /// Like [`Database::execute_into`], with an explicit maximum row batch size.
+    pub fn execute_into_with_batch_size<S: ResultSink>(
+        &mut self,
+        sql: &str,
+        batch_size: usize,
+        sink: &mut S,
+    ) -> std::result::Result<(), ExecuteError<S::Error>> {
+        if batch_size == 0 {
+            return Err(ExecuteError::Database(Error::InvalidQuery(
+                "result batch size must be greater than zero".to_owned(),
+            )));
+        }
+
+        let statements = sql::parse(sql).map_err(ExecuteError::Database)?;
+        for statement in statements {
+            self.execute_statement_into(statement, batch_size, sink)?;
+        }
+        Ok(())
+    }
+
+    fn execute_statement_into<S: ResultSink>(
+        &mut self,
+        statement: Statement,
+        batch_size: usize,
+        sink: &mut S,
+    ) -> std::result::Result<(), ExecuteError<S::Error>> {
         match statement {
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
-                Ok(StatementResult::Command {
-                    tag: "CREATE TABLE",
-                    affected_rows: 0,
-                })
+                self.catalog
+                    .create_table(name, columns)
+                    .map_err(ExecuteError::Database)?;
+                sink.command("CREATE TABLE", 0).map_err(ExecuteError::Sink)
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
                 {
-                    let target = self.catalog.table(&table)?;
+                    let target = self.catalog.table(&table).map_err(ExecuteError::Database)?;
                     for row in &rows {
-                        target.validate_row(row)?;
+                        target.validate_row(row).map_err(ExecuteError::Database)?;
                     }
                 }
-                let target = self.catalog.table_mut(&table)?;
+                let target = self
+                    .catalog
+                    .table_mut(&table)
+                    .map_err(ExecuteError::Database)?;
                 for row in rows {
-                    target.insert_row(row)?;
+                    target.insert_row(row).map_err(ExecuteError::Database)?;
                 }
-                Ok(StatementResult::Command {
-                    tag: "INSERT",
-                    affected_rows,
-                })
+                sink.command("INSERT", affected_rows)
+                    .map_err(ExecuteError::Sink)
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select_into(select, batch_size, sink),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+    fn execute_select_into<S: ResultSink>(
+        &self,
+        select: Select,
+        batch_size: usize,
+        sink: &mut S,
+    ) -> std::result::Result<(), ExecuteError<S::Error>> {
+        let table = self
+            .catalog
+            .table(&select.table)
+            .map_err(ExecuteError::Database)?;
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
-            .transpose()?;
+            .transpose()
+            .map_err(ExecuteError::Database)?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let group_columns =
+            resolve_group_columns(table, &select.group_by).map_err(ExecuteError::Database)?;
         let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+            resolve_select_items(table, &select.items, &group_columns)
+                .map_err(ExecuteError::Database)?;
+        let ordering =
+            resolve_ordering(&result_columns, &select.order_by).map_err(ExecuteError::Database)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
-        let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+        if grouped {
+            let grouped =
+                execute_grouped(table, predicate.as_ref(), &group_columns, &aggregate_specs)
+                    .map_err(ExecuteError::Database)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -122,16 +220,81 @@ impl Database {
                 &ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
+            sink.begin_query(&result_columns)
+                .map_err(ExecuteError::Sink)?;
+            emit_grouped_rows(&grouped, &selected_groups, &items, batch_size, sink)
+                .map_err(ExecuteError::Sink)?;
+        } else if ordering.is_empty() {
+            sink.begin_query(&result_columns)
+                .map_err(ExecuteError::Sink)?;
+            emit_unordered_rows(
+                table,
+                predicate.as_ref(),
+                &items,
+                select.limit,
+                batch_size,
+                sink,
+            )
+            .map_err(ExecuteError::Sink)?;
         } else {
+            let mut matching_rows = (0..table.row_count())
+                .filter(|row| {
+                    predicate
+                        .as_ref()
+                        .is_none_or(|predicate| predicate.evaluate(table, *row))
+                })
+                .collect::<Vec<_>>();
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
-        };
+            sink.begin_query(&result_columns)
+                .map_err(ExecuteError::Sink)?;
+            emit_source_rows(table, &matching_rows, &items, batch_size, sink)
+                .map_err(ExecuteError::Sink)?;
+        }
+        sink.end_query().map_err(ExecuteError::Sink)
+    }
+}
 
-        Ok(QueryResult {
-            columns: result_columns,
-            rows,
-        })
+#[derive(Debug, Default)]
+struct CollectingSink {
+    results: Vec<StatementResult>,
+    current_query: Option<QueryResult>,
+}
+
+impl ResultSink for CollectingSink {
+    type Error = Infallible;
+
+    fn command(
+        &mut self,
+        tag: &'static str,
+        affected_rows: usize,
+    ) -> std::result::Result<(), Self::Error> {
+        self.results
+            .push(StatementResult::Command { tag, affected_rows });
+        Ok(())
+    }
+
+    fn begin_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
+        debug_assert!(self.current_query.is_none());
+        self.current_query = Some(QueryResult {
+            columns: columns.to_vec(),
+            rows: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn rows(&mut self, rows: &[Vec<Value>]) -> std::result::Result<(), Self::Error> {
+        self.current_query
+            .as_mut()
+            .expect("rows follow begin_query")
+            .rows
+            .extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+        let query = self.current_query.take().expect("query has begun");
+        self.results.push(StatementResult::Query(query));
+        Ok(())
     }
 }
 
@@ -298,36 +461,81 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-fn execute_projection(
-    table: &Table,
-    matching_rows: &[usize],
-    items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
-    matching_rows
+fn project_source_row(table: &Table, row: usize, items: &[ResolvedItem]) -> Vec<Value> {
+    items
         .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
-                .collect()
+        .map(|item| match item {
+            ResolvedItem::Column { source, .. } => table.columns()[*source].value(row),
+            ResolvedItem::Aggregate { .. } => {
+                unreachable!("projection does not contain aggregates")
+            }
         })
         .collect()
 }
 
+fn emit_unordered_rows<S: ResultSink>(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    items: &[ResolvedItem],
+    limit: Option<usize>,
+    batch_size: usize,
+    sink: &mut S,
+) -> std::result::Result<(), S::Error> {
+    let mut rows = Vec::with_capacity(batch_size);
+    let mut emitted = 0;
+
+    for row in 0..table.row_count() {
+        if limit.is_some_and(|limit| emitted >= limit) {
+            break;
+        }
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+
+        rows.push(project_source_row(table, row, items));
+        emitted += 1;
+        if rows.len() == batch_size {
+            sink.rows(&rows)?;
+            rows.clear();
+        }
+    }
+
+    if !rows.is_empty() {
+        sink.rows(&rows)?;
+    }
+    Ok(())
+}
+
+fn emit_source_rows<S: ResultSink>(
+    table: &Table,
+    selected: &[usize],
+    items: &[ResolvedItem],
+    batch_size: usize,
+    sink: &mut S,
+) -> std::result::Result<(), S::Error> {
+    let mut rows = Vec::with_capacity(batch_size);
+    for row in selected {
+        rows.push(project_source_row(table, *row, items));
+        if rows.len() == batch_size {
+            sink.rows(&rows)?;
+            rows.clear();
+        }
+    }
+    if !rows.is_empty() {
+        sink.rows(&rows)?;
+    }
+    Ok(())
+}
+
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let mut groups = GroupIndex::new(group_columns.len(), table.row_count());
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let initial_capacity = table.row_count().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -339,8 +547,11 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in 0..table.row_count() {
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +560,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
         }
     }
 
@@ -496,29 +707,43 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
+    fn project_row(&self, group: usize, items: &[ResolvedItem]) -> Vec<Value> {
+        items
             .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
+            .map(|item| match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => self.keys[group].value(*position).to_owned(),
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => self.aggregates[*state][group].clone(),
             })
             .collect()
     }
+}
+
+fn emit_grouped_rows<S: ResultSink>(
+    data: &GroupedData<'_>,
+    selected: &[usize],
+    items: &[ResolvedItem],
+    batch_size: usize,
+    sink: &mut S,
+) -> std::result::Result<(), S::Error> {
+    let mut rows = Vec::with_capacity(batch_size);
+    for group in selected {
+        rows.push(data.project_row(*group, items));
+        if rows.len() == batch_size {
+            sink.rows(&rows)?;
+            rows.clear();
+        }
+    }
+    if !rows.is_empty() {
+        sink.rows(&rows)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -780,6 +1005,9 @@ enum CompiledPredicate {
 
 impl CompiledPredicate {
     fn evaluate(&self, table: &Table, row: usize) -> bool {
+        #[cfg(test)]
+        PREDICATE_EVALUATIONS.with(|count| count.set(count.get() + 1));
+
         match self {
             Self::Comparison {
                 left,
@@ -804,6 +1032,11 @@ impl CompiledPredicate {
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREDICATE_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug)]
@@ -886,6 +1119,92 @@ fn comparable(left: DataType, right: DataType) -> bool {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        results: Vec<StatementResult>,
+        current: Option<QueryResult>,
+        batch_sizes: Vec<usize>,
+    }
+
+    impl ResultSink for RecordingSink {
+        type Error = Infallible;
+
+        fn command(
+            &mut self,
+            tag: &'static str,
+            affected_rows: usize,
+        ) -> std::result::Result<(), Self::Error> {
+            self.results
+                .push(StatementResult::Command { tag, affected_rows });
+            Ok(())
+        }
+
+        fn begin_query(
+            &mut self,
+            columns: &[ResultColumn],
+        ) -> std::result::Result<(), Self::Error> {
+            self.current = Some(QueryResult {
+                columns: columns.to_vec(),
+                rows: Vec::new(),
+            });
+            Ok(())
+        }
+
+        fn rows(&mut self, rows: &[Vec<Value>]) -> std::result::Result<(), Self::Error> {
+            self.batch_sizes.push(rows.len());
+            self.current
+                .as_mut()
+                .expect("query started")
+                .rows
+                .extend_from_slice(rows);
+            Ok(())
+        }
+
+        fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+            self.results.push(StatementResult::Query(
+                self.current.take().expect("query started"),
+            ));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingSink {
+        rows: usize,
+        batches: usize,
+        max_batch: usize,
+    }
+
+    impl ResultSink for CountingSink {
+        type Error = Infallible;
+
+        fn command(
+            &mut self,
+            _tag: &'static str,
+            _affected_rows: usize,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn begin_query(
+            &mut self,
+            _columns: &[ResultColumn],
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn rows(&mut self, rows: &[Vec<Value>]) -> std::result::Result<(), Self::Error> {
+            self.rows += rows.len();
+            self.batches += 1;
+            self.max_batch = self.max_batch.max(rows.len());
+            Ok(())
+        }
+
+        fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
         match results.into_iter().last().expect("one result") {
@@ -945,5 +1264,167 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn streaming_and_collecting_outputs_are_equivalent_for_every_select_path() {
+        let setup = "CREATE TABLE samples (id Int64, category String, amount Int64); \
+                     INSERT INTO samples VALUES \
+                        (1, 'a', 5), (2, 'b', 2), (3, 'a', 7), \
+                        (4, 'b', 9), (5, 'c', 1);";
+        let queries = "SELECT id, amount FROM samples WHERE amount >= 2 LIMIT 4; \
+                       SELECT id, category, amount FROM samples WHERE amount >= 2 \
+                           ORDER BY amount DESC LIMIT 3; \
+                       SELECT category, COUNT(*) AS n, SUM(amount) AS total \
+                           FROM samples GROUP BY category ORDER BY total DESC;";
+
+        let mut collecting_database = Database::new();
+        collecting_database.execute(setup).expect("setup succeeds");
+        let expected = collecting_database
+            .execute(queries)
+            .expect("queries succeed");
+
+        let mut streaming_database = Database::new();
+        streaming_database.execute(setup).expect("setup succeeds");
+        let mut sink = RecordingSink::default();
+        streaming_database
+            .execute_into_with_batch_size(queries, 2, &mut sink)
+            .expect("streaming queries succeed");
+
+        assert_eq!(sink.results, expected);
+        assert_eq!(sink.batch_sizes, vec![2, 2, 2, 1, 2, 1]);
+        assert!(sink.batch_sizes.iter().all(|size| *size <= 2));
+    }
+
+    #[test]
+    fn streaming_rejects_an_empty_row_batch() {
+        let mut database = Database::new();
+        let mut sink = RecordingSink::default();
+        let error = database
+            .execute_into_with_batch_size("CREATE TABLE skipped (n Int64)", 0, &mut sink)
+            .expect_err("zero cannot bound non-empty chunks");
+
+        assert!(matches!(
+            error,
+            ExecuteError::Database(Error::InvalidQuery(message))
+                if message == "result batch size must be greater than zero"
+        ));
+        assert!(sink.results.is_empty());
+        assert!(matches!(
+            database.catalog.table("skipped"),
+            Err(Error::TableNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn unordered_limit_stops_scanning_as_soon_as_enough_rows_match() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE numbers (n Int64); \
+                 INSERT INTO numbers VALUES (0), (1), (2), (3), (4), (5), (6), (7);",
+            )
+            .expect("setup succeeds");
+        let mut sink = CountingSink::default();
+
+        PREDICATE_EVALUATIONS.with(|count| count.set(0));
+        database
+            .execute_into("SELECT n FROM numbers WHERE n >= 0 LIMIT 3", &mut sink)
+            .expect("query succeeds");
+
+        assert_eq!(sink.rows, 3);
+        PREDICATE_EVALUATIONS.with(|count| assert_eq!(count.get(), 3));
+
+        PREDICATE_EVALUATIONS.with(|count| count.set(0));
+        database
+            .execute_into(
+                "SELECT n FROM numbers WHERE n >= 0 LIMIT 0",
+                &mut CountingSink::default(),
+            )
+            .expect("zero limit succeeds");
+        PREDICATE_EVALUATIONS.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn sink_failure_is_returned_and_stops_the_remaining_batch() {
+        struct FailingSink;
+
+        impl ResultSink for FailingSink {
+            type Error = &'static str;
+
+            fn command(
+                &mut self,
+                _tag: &'static str,
+                _affected_rows: usize,
+            ) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn begin_query(
+                &mut self,
+                _columns: &[ResultColumn],
+            ) -> std::result::Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn rows(&mut self, _rows: &[Vec<Value>]) -> std::result::Result<(), Self::Error> {
+                Err("output closed")
+            }
+
+            fn end_query(&mut self) -> std::result::Result<(), Self::Error> {
+                panic!("end_query must not follow a failed rows callback")
+            }
+        }
+
+        let mut database = Database::new();
+        let error = database
+            .execute_into(
+                "CREATE TABLE first (n Int64); \
+                 INSERT INTO first VALUES (1), (2); \
+                 SELECT n FROM first; \
+                 CREATE TABLE not_executed (n Int64);",
+                &mut FailingSink,
+            )
+            .expect_err("sink rejects the first row batch");
+
+        assert_eq!(error, ExecuteError::Sink("output closed"));
+        assert!(database.catalog.table("first").is_ok());
+        assert!(matches!(
+            database.catalog.table("not_executed"),
+            Err(Error::TableNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn streaming_scan_handles_two_million_rows_in_bounded_batches() {
+        const ROW_COUNT: usize = 2_000_000;
+        const BATCH_SIZE: usize = 4_096;
+
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE large_scan (n Int64)")
+            .expect("create succeeds");
+        let table = database
+            .catalog
+            .table_mut("large_scan")
+            .expect("table exists");
+        for value in 0..ROW_COUNT {
+            table
+                .insert_row(vec![Value::Int64(value as i64)])
+                .expect("row is valid");
+        }
+
+        let mut sink = CountingSink::default();
+        database
+            .execute_into_with_batch_size(
+                "SELECT n FROM large_scan WHERE n >= 0",
+                BATCH_SIZE,
+                &mut sink,
+            )
+            .expect("large scan succeeds");
+
+        assert_eq!(sink.rows, ROW_COUNT);
+        assert_eq!(sink.batches, ROW_COUNT.div_ceil(BATCH_SIZE));
+        assert_eq!(sink.max_batch, BATCH_SIZE);
     }
 }

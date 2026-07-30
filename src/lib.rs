@@ -11,7 +11,10 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
+pub use engine::{
+    DEFAULT_BATCH_SIZE, Database, ExecuteError, QueryResult, ResultColumn, ResultSink,
+    StatementResult,
+};
 pub use error::{Error, Result};
 pub use value::{DataType, Value};
 

@@ -1,6 +1,7 @@
-use std::fmt::Write;
+use std::fmt::Write as _;
+use std::io;
 
-use crate::engine::QueryResult;
+use crate::engine::{QueryResult, ResultColumn};
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,94 +118,161 @@ fn escape_table_text(value: &str) -> String {
 }
 
 fn render_csv(result: &QueryResult) -> String {
-    let mut output = String::new();
-    write_csv_row(
-        &mut output,
-        result.columns.iter().map(|column| column.name.as_str()),
-    );
-    for row in &result.rows {
-        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
-        write_csv_row(&mut output, values.iter().map(String::as_str));
-    }
-    output
+    let mut output = Vec::new();
+    write_csv_header(&mut output, &result.columns).expect("writing to Vec cannot fail");
+    write_csv_rows(&mut output, &result.rows).expect("writing to Vec cannot fail");
+    String::from_utf8(output).expect("CSV renderer only writes UTF-8")
 }
 
-fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>) {
+/// Write a CSV header without buffering the complete rendered result.
+pub fn write_csv_header<W: io::Write + ?Sized>(
+    output: &mut W,
+    columns: &[ResultColumn],
+) -> io::Result<()> {
+    write_csv_row(output, columns.iter().map(|column| column.name.as_str()))
+}
+
+/// Write positional CSV rows without buffering the complete rendered result.
+pub fn write_csv_rows<W: io::Write + ?Sized>(
+    output: &mut W,
+    rows: &[Vec<Value>],
+) -> io::Result<()> {
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                output.write_all(b",")?;
+            }
+            if let Value::String(value) = value {
+                write_csv_field(output, value)?;
+            } else {
+                write_csv_field(output, &value.as_display_string())?;
+            }
+        }
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_csv_row<'a, W: io::Write + ?Sized>(
+    output: &mut W,
+    values: impl Iterator<Item = &'a str>,
+) -> io::Result<()> {
     for (index, value) in values.enumerate() {
         if index > 0 {
-            output.push(',');
+            output.write_all(b",")?;
         }
-        if value.contains([',', '"', '\n', '\r']) {
-            output.push('"');
-            output.push_str(&value.replace('"', "\"\""));
-            output.push('"');
-        } else {
-            output.push_str(value);
-        }
+        write_csv_field(output, value)?;
     }
-    output.push('\n');
+    output.write_all(b"\n")
+}
+
+fn write_csv_field<W: io::Write + ?Sized>(output: &mut W, value: &str) -> io::Result<()> {
+    if !value.contains([',', '"', '\n', '\r']) {
+        return output.write_all(value.as_bytes());
+    }
+
+    output.write_all(b"\"")?;
+    let mut remaining = value;
+    while let Some(position) = remaining.find('"') {
+        output.write_all(&remaining.as_bytes()[..position])?;
+        output.write_all(b"\"\"")?;
+        remaining = &remaining[position + 1..];
+    }
+    output.write_all(remaining.as_bytes())?;
+    output.write_all(b"\"")
 }
 
 /// Render one result set with explicit column metadata and positional rows.
 ///
 /// Positional rows preserve every value even when output column names repeat.
 fn render_json(result: &QueryResult) -> String {
-    let mut output = String::from("{\"columns\":[");
-    for (index, column) in result.columns.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str("{\"name\":");
-        write_json_string(&mut output, &column.name);
-        output.push_str(",\"type\":");
-        write_json_string(&mut output, &column.data_type.to_string());
-        output.push('}');
-    }
-    output.push_str("],\"rows\":[");
-    for (row_index, row) in result.rows.iter().enumerate() {
-        if row_index > 0 {
-            output.push(',');
-        }
-        output.push('[');
-        for (column_index, value) in row.iter().enumerate() {
-            if column_index > 0 {
-                output.push(',');
-            }
-            write_json_value(&mut output, value);
-        }
-        output.push(']');
-    }
-    output.push_str("]}");
-    output
+    let mut output = Vec::new();
+    write_json_query_start(&mut output, &result.columns).expect("writing to Vec cannot fail");
+    let mut first_row = true;
+    write_json_rows(&mut output, &result.rows, &mut first_row).expect("writing to Vec cannot fail");
+    write_json_query_end(&mut output).expect("writing to Vec cannot fail");
+    String::from_utf8(output).expect("JSON renderer only writes UTF-8")
 }
 
-fn write_json_value(output: &mut String, value: &Value) {
+/// Write JSON query metadata and open its positional row array.
+pub fn write_json_query_start<W: io::Write + ?Sized>(
+    output: &mut W,
+    columns: &[ResultColumn],
+) -> io::Result<()> {
+    output.write_all(b"{\"columns\":[")?;
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        output.write_all(b"{\"name\":")?;
+        write_json_string(output, &column.name)?;
+        output.write_all(b",\"type\":")?;
+        write_json_string(output, &column.data_type.to_string())?;
+        output.write_all(b"}")?;
+    }
+    output.write_all(b"],\"rows\":[")
+}
+
+/// Write JSON rows, preserving comma state across calls.
+pub fn write_json_rows<W: io::Write + ?Sized>(
+    output: &mut W,
+    rows: &[Vec<Value>],
+    first_row: &mut bool,
+) -> io::Result<()> {
+    for row in rows {
+        if !*first_row {
+            output.write_all(b",")?;
+        }
+        *first_row = false;
+        output.write_all(b"[")?;
+        for (column_index, value) in row.iter().enumerate() {
+            if column_index > 0 {
+                output.write_all(b",")?;
+            }
+            write_json_value(output, value)?;
+        }
+        output.write_all(b"]")?;
+    }
+    Ok(())
+}
+
+/// Close the row array and query object opened by [`write_json_query_start`].
+pub fn write_json_query_end<W: io::Write + ?Sized>(output: &mut W) -> io::Result<()> {
+    output.write_all(b"]}")
+}
+
+fn write_json_value<W: io::Write + ?Sized>(output: &mut W, value: &Value) -> io::Result<()> {
     match value {
-        Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
-        Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
-        Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
+        Value::Int64(value) => write!(output, "{value}"),
+        Value::Float64(value) => {
+            output.write_all(Value::Float64(*value).as_display_string().as_bytes())
+        }
+        Value::Bool(value) => write!(output, "{value}"),
         Value::String(value) => write_json_string(output, value),
     }
 }
 
-fn write_json_string(output: &mut String, value: &str) {
-    output.push('"');
+fn write_json_string<W: io::Write + ?Sized>(output: &mut W, value: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
     for character in value.chars() {
         match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\u{08}' => output.push_str("\\b"),
-            '\u{0c}' => output.push_str("\\f"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
+            '"' => output.write_all(b"\\\"")?,
+            '\\' => output.write_all(b"\\\\")?,
+            '\u{08}' => output.write_all(b"\\b")?,
+            '\u{0c}' => output.write_all(b"\\f")?,
+            '\n' => output.write_all(b"\\n")?,
+            '\r' => output.write_all(b"\\r")?,
+            '\t' => output.write_all(b"\\t")?,
             value if value.is_control() => {
-                write!(output, "\\u{:04x}", value as u32).expect("writing to String cannot fail");
+                write!(output, "\\u{:04x}", value as u32)?;
             }
-            value => output.push(value),
+            value => {
+                let mut encoded = [0; 4];
+                output.write_all(value.encode_utf8(&mut encoded).as_bytes())?;
+            }
         }
     }
-    output.push('"');
+    output.write_all(b"\"")
 }
 
 #[cfg(test)]

@@ -79,6 +79,12 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+For bounded result handling, implement `ResultSink` and call `Database::execute_into`.
+It emits command results immediately and each query as column metadata followed by
+chunks of at most `DEFAULT_BATCH_SIZE` rows. `execute_into_with_batch_size` lets a
+sink choose a smaller or larger bound. Sink errors stop the remaining SQL batch
+and are returned separately from database errors through `ExecuteError`.
+
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
