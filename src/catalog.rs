@@ -16,11 +16,22 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
+        self.create_table_with_rows(name, schema, Vec::new())
+    }
+
+    /// Builds and validates a complete table before publishing it in the catalog.
+    pub(crate) fn create_table_with_rows(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        rows: Vec<Vec<crate::value::Value>>,
+    ) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
             return Err(Error::TableAlreadyExists(name));
         }
-        let table = Table::new(name, schema)?;
+        let mut table = Table::new(name, schema)?;
+        table.insert_rows(rows)?;
         self.tables.insert(key, table);
         Ok(())
     }

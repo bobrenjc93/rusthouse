@@ -524,3 +524,243 @@ fn creates_a_fifty_thousand_column_schema() {
         column_count
     );
 }
+
+#[test]
+fn ctas_infers_grouped_schema_and_preserves_empty_schema() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64, active Bool);
+             INSERT INTO sales VALUES
+                ('west', 10, true),
+                ('east', 4, false),
+                ('west', 7, true),
+                ('east', 3, true);",
+        )
+        .expect("setup succeeds");
+
+    let result = database
+        .execute(
+            "CREATE TABLE regional_totals AS
+             SELECT region AS market,
+                    COUNT(*) AS orders,
+                    SUM(amount) AS total,
+                    AVG(amount) AS mean
+             FROM sales
+             WHERE active = true
+             GROUP BY region
+             ORDER BY total DESC;",
+        )
+        .expect("grouped CTAS succeeds");
+    assert_eq!(
+        result,
+        vec![StatementResult::Command {
+            tag: "CREATE TABLE",
+            affected_rows: 0,
+        }]
+    );
+
+    let totals = execute_query(
+        &mut database,
+        "SELECT market, orders, total, mean FROM regional_totals ORDER BY total DESC;",
+    );
+    assert_eq!(
+        totals
+            .columns
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"market".to_owned(), DataType::String),
+            (&"orders".to_owned(), DataType::Int64),
+            (&"total".to_owned(), DataType::Int64),
+            (&"mean".to_owned(), DataType::Float64),
+        ]
+    );
+    assert_eq!(
+        totals.rows,
+        vec![
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(2),
+                Value::Int64(17),
+                Value::Float64(8.5),
+            ],
+            vec![
+                Value::String("east".to_owned()),
+                Value::Int64(1),
+                Value::Int64(3),
+                Value::Float64(3.0),
+            ],
+        ]
+    );
+
+    database
+        .execute(
+            "CREATE TABLE empty_sales AS
+             SELECT region AS market, amount FROM sales WHERE amount > 100;",
+        )
+        .expect("empty CTAS still creates a typed table");
+    let empty = database
+        .catalog()
+        .table("empty_sales")
+        .expect("empty table exists");
+    assert_eq!(empty.row_count(), 0);
+    assert_eq!(
+        empty
+            .schema()
+            .iter()
+            .map(|column| (&column.name, column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            (&"market".to_owned(), DataType::String),
+            (&"amount".to_owned(), DataType::Int64),
+        ]
+    );
+}
+
+#[test]
+fn ctas_rejects_ambiguous_names_and_source_overflow_before_catalog_mutation() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numbers (value Int64);
+             INSERT INTO numbers VALUES (9223372036854775807), (1);",
+        )
+        .expect("setup succeeds");
+
+    let duplicate = database
+        .execute(
+            "CREATE TABLE ambiguous AS
+             SELECT value AS result, value AS RESULT FROM numbers;",
+        )
+        .expect_err("CTAS names must be unambiguous");
+    assert!(matches!(duplicate, Error::DuplicateColumn(name) if name == "RESULT"));
+    assert!(matches!(
+        database.catalog().table("ambiguous"),
+        Err(Error::TableNotFound(_))
+    ));
+
+    let overflow = database
+        .execute("CREATE TABLE overflowed AS SELECT SUM(value) AS total FROM numbers;")
+        .expect_err("source must finish before the table is created");
+    assert_eq!(overflow, Error::NumericOverflow("SUM(Int64)".to_owned()));
+    assert!(matches!(
+        database.catalog().table("overflowed"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
+fn insert_select_reorders_columns_reports_rows_and_uses_a_source_snapshot() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE sales (region String, amount Int64);
+             INSERT INTO sales VALUES ('west', 10), ('east', 4), ('west', 7);
+             CREATE TABLE report (id Int64, region String, total Int64);",
+        )
+        .expect("setup succeeds");
+
+    let inserted = database
+        .execute(
+            "INSERT INTO report (region, total, id)
+             SELECT region, SUM(amount) AS total, COUNT(*) AS id
+             FROM sales GROUP BY region ORDER BY total DESC;",
+        )
+        .expect("grouped INSERT SELECT succeeds");
+    assert_eq!(
+        inserted,
+        vec![StatementResult::Command {
+            tag: "INSERT",
+            affected_rows: 2,
+        }]
+    );
+    assert_eq!(
+        execute_query(
+            &mut database,
+            "SELECT id, region, total FROM report ORDER BY total DESC;"
+        )
+        .rows,
+        vec![
+            vec![
+                Value::Int64(2),
+                Value::String("west".to_owned()),
+                Value::Int64(17),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("east".to_owned()),
+                Value::Int64(4),
+            ],
+        ]
+    );
+
+    let empty = database
+        .execute(
+            "INSERT INTO report
+             SELECT id, region, total FROM report WHERE total > 100;",
+        )
+        .expect("empty INSERT SELECT succeeds");
+    assert_eq!(
+        empty,
+        vec![StatementResult::Command {
+            tag: "INSERT",
+            affected_rows: 0,
+        }]
+    );
+
+    let snapshot = database
+        .execute("INSERT INTO report SELECT id, region, total FROM report;")
+        .expect("self-insert succeeds from one snapshot");
+    assert_eq!(
+        snapshot,
+        vec![StatementResult::Command {
+            tag: "INSERT",
+            affected_rows: 2,
+        }]
+    );
+    assert_eq!(database.catalog().table("report").unwrap().row_count(), 4);
+}
+
+#[test]
+fn insert_select_type_and_source_failures_are_atomic_even_for_empty_results() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numbers (value Int64);
+             INSERT INTO numbers VALUES (9223372036854775807), (1);
+             CREATE TABLE totals (total Int64);
+             INSERT INTO totals VALUES (7);
+             CREATE TABLE labels (label String);",
+        )
+        .expect("setup succeeds");
+
+    let overflow = database
+        .execute("INSERT INTO totals SELECT SUM(value) AS total FROM numbers;")
+        .expect_err("overflowing source fails");
+    assert_eq!(overflow, Error::NumericOverflow("SUM(Int64)".to_owned()));
+
+    let missing = database
+        .execute("INSERT INTO totals SELECT missing FROM numbers;")
+        .expect_err("invalid source fails");
+    assert!(matches!(missing, Error::ColumnNotFound { column, .. } if column == "missing"));
+
+    let empty_mismatch = database
+        .execute("INSERT INTO labels SELECT value FROM numbers WHERE value < 0;")
+        .expect_err("an empty source is still type-checked");
+    assert!(matches!(
+        empty_mismatch,
+        Error::TypeMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "String" && actual == "Int64"
+    ));
+
+    assert_eq!(
+        execute_query(&mut database, "SELECT total FROM totals;").rows,
+        vec![vec![Value::Int64(7)]]
+    );
+    assert_eq!(database.catalog().table("labels").unwrap().row_count(), 0);
+}

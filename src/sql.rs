@@ -11,9 +11,19 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    CreateTableAs {
+        name: String,
+        select: Select,
+    },
     Insert {
         table: String,
+        columns: Option<Vec<String>>,
         rows: Vec<Vec<Value>>,
+    },
+    InsertSelect {
+        table: String,
+        columns: Option<Vec<String>>,
+        select: Select,
     },
     Select(Select),
 }
@@ -386,6 +396,15 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let name = self.expect_identifier("table name")?;
+
+        if self.eat_keyword("AS") {
+            self.expect_keyword("SELECT")?;
+            return Ok(Statement::CreateTableAs {
+                name,
+                select: self.parse_select()?,
+            });
+        }
+
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
@@ -419,6 +438,29 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
+
+        let columns = if self.eat(&TokenKind::LeftParen) {
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.expect_identifier("target column name")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after target column names")?;
+            Some(columns)
+        } else {
+            None
+        };
+
+        if self.eat_keyword("SELECT") {
+            return Ok(Statement::InsertSelect {
+                table,
+                columns,
+                select: self.parse_select()?,
+            });
+        }
+
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -438,7 +480,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(Statement::Insert { table, rows })
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -782,6 +828,38 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_ctas_and_insert_select_sources() {
+        let statements = parse(
+            "CREATE TABLE totals AS
+                 SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+             INSERT INTO report (total, region)
+                 SELECT total, region FROM totals;",
+        )
+        .expect("valid transformation statements");
+
+        let Statement::CreateTableAs { name, select } = &statements[0] else {
+            panic!("expected CTAS");
+        };
+        assert_eq!(name, "totals");
+        assert_eq!(select.group_by, ["region"]);
+
+        let Statement::InsertSelect {
+            table,
+            columns,
+            select,
+        } = &statements[1]
+        else {
+            panic!("expected INSERT SELECT");
+        };
+        assert_eq!(table, "report");
+        assert_eq!(
+            columns.as_deref(),
+            Some(["total".to_owned(), "region".to_owned()].as_slice())
+        );
+        assert_eq!(select.table, "totals");
     }
 
     #[test]

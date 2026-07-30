@@ -187,14 +187,29 @@ impl Table {
         Ok(())
     }
 
+    /// Validates every row before appending any values.
+    pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<()> {
+        for row in &rows {
+            self.validate_row(row)?;
+        }
+        for row in rows {
+            self.append_validated_row(row);
+        }
+        Ok(())
+    }
+
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.append_validated_row(row);
+        Ok(())
+    }
+
+    fn append_validated_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 }
 
@@ -236,6 +251,21 @@ mod tests {
         let error = table
             .insert_row(vec![Value::Int64(7), Value::Bool(true)])
             .expect_err("wrong type");
+
+        assert!(matches!(error, Error::TypeMismatch { .. }));
+        assert_eq!(table.row_count(), 0);
+        assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejected_batches_do_not_append_valid_prefixes() {
+        let mut table = test_table();
+        let error = table
+            .insert_rows(vec![
+                vec![Value::Int64(7), Value::String("valid".to_owned())],
+                vec![Value::Int64(8), Value::Bool(false)],
+            ])
+            .expect_err("second row has the wrong type");
 
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -7,7 +7,7 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -69,18 +69,57 @@ impl Database {
                     affected_rows: 0,
                 })
             }
-            Statement::Insert { table, rows } => {
+            Statement::CreateTableAs { name, select } => {
+                let result = self.execute_select(select)?;
+                let schema = result
+                    .columns
+                    .into_iter()
+                    .map(|column| ColumnDef {
+                        name: column.name,
+                        data_type: column.data_type,
+                    })
+                    .collect();
+                self.catalog
+                    .create_table_with_rows(name, schema, result.rows)?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
                 let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
-                let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                let rows = prepare_insert_rows(
+                    self.catalog.table(&table)?,
+                    columns.as_deref(),
+                    None,
+                    rows,
+                )?;
+                self.catalog.table_mut(&table)?.insert_rows(rows)?;
+                Ok(StatementResult::Command {
+                    tag: "INSERT",
+                    affected_rows,
+                })
+            }
+            Statement::InsertSelect {
+                table,
+                columns,
+                select,
+            } => {
+                // SELECT owns its result rows, so reading from the target table itself
+                // observes one stable snapshot before any append begins.
+                let result = self.execute_select(select)?;
+                let affected_rows = result.rows.len();
+                let rows = prepare_insert_rows(
+                    self.catalog.table(&table)?,
+                    columns.as_deref(),
+                    Some(&result.columns),
+                    result.rows,
+                )?;
+                self.catalog.table_mut(&table)?.insert_rows(rows)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
@@ -133,6 +172,87 @@ impl Database {
             rows,
         })
     }
+}
+
+fn prepare_insert_rows(
+    target: &Table,
+    requested_columns: Option<&[String]>,
+    source_columns: Option<&[ResultColumn]>,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>> {
+    let mapping = resolve_insert_mapping(target, requested_columns)?;
+
+    if let Some(source_columns) = source_columns {
+        if source_columns.len() != mapping.len() {
+            return Err(Error::RowLength {
+                table: target.name().to_owned(),
+                expected: mapping.len(),
+                actual: source_columns.len(),
+            });
+        }
+        for (source, target_index) in source_columns.iter().zip(&mapping) {
+            let field = &target.schema()[*target_index];
+            if source.data_type != field.data_type {
+                return Err(Error::TypeMismatch {
+                    context: format!("column '{}.{}'", target.name(), field.name),
+                    expected: field.data_type.to_string(),
+                    actual: source.data_type.to_string(),
+                });
+            }
+        }
+    }
+
+    rows.into_iter()
+        .map(|row| reorder_insert_row(target, &mapping, row))
+        .collect()
+}
+
+fn resolve_insert_mapping(target: &Table, requested: Option<&[String]>) -> Result<Vec<usize>> {
+    let Some(requested) = requested else {
+        return Ok((0..target.schema().len()).collect());
+    };
+
+    let mut seen = HashSet::with_capacity(requested.len());
+    let mut mapping = Vec::with_capacity(requested.len());
+    for name in requested {
+        let index = target.column_index(name)?;
+        if !seen.insert(index) {
+            return Err(Error::InvalidQuery(format!(
+                "INSERT target column '{name}' is listed more than once"
+            )));
+        }
+        mapping.push(index);
+    }
+
+    if mapping.len() != target.schema().len() {
+        return Err(Error::InvalidQuery(format!(
+            "INSERT target column list must include all {} columns of table '{}'",
+            target.schema().len(),
+            target.name()
+        )));
+    }
+    Ok(mapping)
+}
+
+fn reorder_insert_row(target: &Table, mapping: &[usize], row: Vec<Value>) -> Result<Vec<Value>> {
+    if row.len() != mapping.len() {
+        return Err(Error::RowLength {
+            table: target.name().to_owned(),
+            expected: mapping.len(),
+            actual: row.len(),
+        });
+    }
+
+    let mut reordered = std::iter::repeat_with(|| None)
+        .take(target.schema().len())
+        .collect::<Vec<_>>();
+    for (value, target_index) in row.into_iter().zip(mapping) {
+        reordered[*target_index] = Some(value);
+    }
+    Ok(reordered
+        .into_iter()
+        .map(|value| value.expect("mapping covers every target column"))
+        .collect())
 }
 
 #[derive(Debug)]

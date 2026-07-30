@@ -4,8 +4,8 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 
 ## What works
 
-- CREATE TABLE with Int64, Float64, Bool, and String columns
-- multi-row INSERT INTO ... VALUES with row-width and exact type validation
+- CREATE TABLE with Int64, Float64, Bool, and String columns, including CREATE TABLE AS SELECT
+- multi-row INSERT INTO ... VALUES and INSERT INTO ... SELECT, with optional target columns
 - SELECT * and named projections, with optional AS aliases
 - WHERE comparisons using =, !=, <>, <, <=, >, and >=
 - AND, OR, and parentheses in predicates (AND binds more tightly)
@@ -81,7 +81,7 @@ assert_eq!(result.rows.len(), 1);
 
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended. INSERT SELECT materializes its source before appending, so inserting from the target table itself reads one snapshot and does not scan rows added by the same statement. CREATE TABLE AS SELECT likewise evaluates and validates the complete source before publishing the new table in the catalog.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 
