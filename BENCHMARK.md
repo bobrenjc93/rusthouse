@@ -47,6 +47,21 @@ RUSTHOUSE_CLICKHOUSE_BIN=/path/to/clickhouse \
   --details /tmp/rusthouse-parity-default.json
 ~~~
 
+## Grouping and top-k optimization measurement
+
+On 2026-07-29, the default command above was run on the same Apple Silicon host before and after replacing owned tree-based grouping and fully materialized sorting with borrowed hash grouping, columnar aggregate state, and index-based top-k execution. The baseline was commit `659c30b`; both runs used seed `20260729`, release binaries, the pinned ClickHouse build, and passed all 24 correctness gates. Times are RustHouse's seven-sample sustained per-query medians; the ratio is ClickHouse median divided by the optimized RustHouse median.
+
+| Case | Rows | Before (ms) | After (ms) | Speedup | After ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| High-cardinality group by | 10,000 | 2.652 | 0.882 | 3.01x | 1.610 |
+| High-cardinality group by | 50,000 | 15.124 | 4.317 | 3.50x | 0.952 |
+| Numeric order by limit | 10,000 | 1.077 | 0.251 | 4.29x | 5.018 |
+| Numeric order by limit | 50,000 | 6.458 | 1.096 | 5.89x | 2.935 |
+| String order by limit | 10,000 | 1.769 | 0.442 | 4.00x | 2.685 |
+| String order by limit | 50,000 | 11.596 | 1.985 | 5.84x | 1.279 |
+
+The sustained score moved from 84.74 to 99.77; the startup-inclusive score was 100.00 in both runs. A second full default run with seed `20260730` passed 24/24 gates and scored 99.87. Its 50,000-row RustHouse medians were 4.271 ms for high-cardinality grouping, 1.123 ms for numeric ordering, and 1.978 ms for string ordering.
+
 The --clickhouse flag is equivalent to RUSTHOUSE_CLICKHOUSE_BIN. The harness normally finds the prebuilt rusthouse next to itself; --rusthouse or RUSTHOUSE_BIN can override that path. A runtime --seed value deterministically changes every row count's data.
 
 Progress is written to stderr. Stdout is exactly one compact Burner JSON object with score, summary, evidence, and suggestions. Its score is the primary sustained-work score; summary and evidence also name the end-to-end score. The --details option writes schema-versioned JSON containing the timing method and limitations, amplification, correctness count, raw batch and per-query samples, medians, both ratios and scores, paths, seed, mode, and ClickHouse identity. Setup, execution, version, checksum, parse, correctness, timing-stability, or full default-suite saturation failures still emit the one object with score zero and exit nonzero.

@@ -43,6 +43,15 @@ pub enum Value {
     String(String),
 }
 
+/// A non-owning scalar used while scanning immutable column storage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueRef<'a> {
+    Int64(i64),
+    Float64(f64),
+    Bool(bool),
+    String(&'a str),
+}
+
 impl Value {
     #[must_use]
     pub fn data_type(&self) -> DataType {
@@ -64,15 +73,40 @@ impl Value {
         }
     }
 
+    pub(crate) fn as_ref(&self) -> ValueRef<'_> {
+        match self {
+            Self::Int64(value) => ValueRef::Int64(*value),
+            Self::Float64(value) => ValueRef::Float64(*value),
+            Self::Bool(value) => ValueRef::Bool(*value),
+            Self::String(value) => ValueRef::String(value),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn sql_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_ref().sql_cmp(other.as_ref())
+    }
+}
+
+impl ValueRef<'_> {
+    pub(crate) fn to_owned(self) -> Value {
+        match self {
+            Self::Int64(value) => Value::Int64(value),
+            Self::Float64(value) => Value::Float64(value),
+            Self::Bool(value) => Value::Bool(value),
+            Self::String(value) => Value::String(value.to_owned()),
+        }
+    }
+
+    pub(crate) fn sql_cmp(self, other: Self) -> Option<Ordering> {
         match (self, other) {
-            (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(right)),
-            (Self::Float64(left), Self::Float64(right)) => left.partial_cmp(right),
-            (Self::Int64(left), Self::Float64(right)) => int_float_cmp(*left, *right),
+            (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(&right)),
+            (Self::Float64(left), Self::Float64(right)) => left.partial_cmp(&right),
+            (Self::Int64(left), Self::Float64(right)) => int_float_cmp(left, right),
             (Self::Float64(left), Self::Int64(right)) => {
-                int_float_cmp(*right, *left).map(Ordering::reverse)
+                int_float_cmp(right, left).map(Ordering::reverse)
             }
-            (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(right)),
+            (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(&right)),
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             _ => None,
         }
@@ -151,6 +185,26 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
+        self.as_ref().cmp(&other.as_ref())
+    }
+}
+
+impl PartialEq for ValueRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ValueRef<'_> {}
+
+impl PartialOrd for ValueRef<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ValueRef<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::Int64(left), Self::Int64(right)) => left.cmp(right),
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
@@ -162,6 +216,12 @@ impl Ord for Value {
 }
 
 impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+impl Hash for ValueRef<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.variant_index().hash(state);
         match self {

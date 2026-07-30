@@ -66,6 +66,152 @@ fn typed_projection_filter_order_and_limit_work_end_to_end() {
 }
 
 #[test]
+fn order_by_limit_preserves_input_order_for_ties_and_accepts_zero() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE ranked (id Int64, score Int64, label String);
+             INSERT INTO ranked VALUES
+                (1, 5, 'later'),
+                (2, 9, 'first tie'),
+                (3, 9, 'second tie'),
+                (4, 1, 'last');",
+        )
+        .expect("setup succeeds");
+
+    let top = execute_query(
+        &mut database,
+        "SELECT id, score, label FROM ranked ORDER BY score DESC LIMIT 2;",
+    );
+    assert_eq!(
+        top.rows,
+        vec![
+            vec![
+                Value::Int64(2),
+                Value::Int64(9),
+                Value::String("first tie".to_owned()),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Int64(9),
+                Value::String("second tie".to_owned()),
+            ],
+        ]
+    );
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT label, id FROM ranked ORDER BY label, id DESC LIMIT 0;",
+    );
+    assert!(empty.rows.is_empty());
+}
+
+#[test]
+fn grouped_top_k_retains_deterministic_multi_column_ordering() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE grouped (label String, active Bool, amount Int64);
+             INSERT INTO grouped VALUES
+                ('zeta', true, 4),
+                ('alpha', false, 7),
+                ('zeta', true, 3),
+                ('beta', true, 7),
+                ('alpha', true, 1);",
+        )
+        .expect("setup succeeds");
+
+    let top = execute_query(
+        &mut database,
+        "SELECT label, active, COUNT(*) AS rows, SUM(amount) AS total
+         FROM grouped
+         GROUP BY label, active
+         ORDER BY total DESC
+         LIMIT 3;",
+    );
+    assert_eq!(
+        top.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Bool(false),
+                Value::Int64(1),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Bool(true),
+                Value::Int64(1),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::String("zeta".to_owned()),
+                Value::Bool(true),
+                Value::Int64(2),
+                Value::Int64(7),
+            ],
+        ]
+    );
+
+    let all_groups = execute_query(
+        &mut database,
+        "SELECT label, active, MIN(amount) AS low
+         FROM grouped GROUP BY label, active;",
+    );
+    assert_eq!(
+        all_groups.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Bool(false),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Bool(true),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Bool(true),
+                Value::Int64(7),
+            ],
+            vec![
+                Value::String("zeta".to_owned()),
+                Value::Bool(true),
+                Value::Int64(3),
+            ],
+        ]
+    );
+
+    let three_columns = execute_query(
+        &mut database,
+        "SELECT label, active, amount, COUNT(*) AS rows
+         FROM grouped
+         GROUP BY label, active, amount
+         ORDER BY label, active, amount
+         LIMIT 2;",
+    );
+    assert_eq!(
+        three_columns.rows,
+        vec![
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Bool(false),
+                Value::Int64(7),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Bool(true),
+                Value::Int64(1),
+                Value::Int64(1),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn every_aggregate_groups_and_uses_declared_result_types() {
     let mut database = Database::new();
     database
