@@ -219,6 +219,12 @@ impl StatementFramer {
         self.has_sql
     }
 
+    /// Return whether no SQL statement is currently being accumulated.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        !self.has_pending_statement()
+    }
+
     fn current(&self) -> Option<char> {
         self.buffer[self.position..].chars().next()
     }

@@ -182,6 +182,42 @@ fn interactive_mode_recovers_from_errors_and_exits_on_eof() {
 }
 
 #[test]
+fn interactive_quit_command_does_not_truncate_multiline_strings() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--interactive", "--format=json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn CLI");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(
+            b"CREATE TABLE notes (body String);\n\
+              INSERT INTO notes VALUES ('before\n\
+              .quit\n\
+              after');\n\
+              SELECT body FROM notes;\n\
+              .quit\n",
+        )
+        .expect("write interactive SQL");
+
+    let output = child.wait_with_output().expect("wait for CLI");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"body\",\"type\":\"String\"}],\"rows\":[[\"before\\n.quit\\nafter\"]]}]}\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "CREATE TABLE\nINSERT 1\n"
+    );
+}
+
+#[test]
 fn interactive_and_execute_are_mutually_exclusive() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(["--interactive", "--execute", "SELECT * FROM t"])

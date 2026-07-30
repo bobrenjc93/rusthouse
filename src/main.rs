@@ -83,10 +83,10 @@ fn run_interactive(
 
     loop {
         if show_prompts {
-            let prompt = if framer.has_pending_statement() {
-                "       ...> "
-            } else {
+            let prompt = if framer.is_idle() {
                 "rusthouse> "
+            } else {
+                "       ...> "
             };
             errors
                 .write_all(prompt.as_bytes())
@@ -98,7 +98,7 @@ fn run_interactive(
         let bytes_read = input
             .read_line(&mut line)
             .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
-        if bytes_read == 0 || line.trim() == ".quit" {
+        if bytes_read == 0 || (framer.is_idle() && line.trim() == ".quit") {
             if show_prompts && bytes_read == 0 {
                 errors
                     .write_all(b"\n")
