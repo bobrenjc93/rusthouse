@@ -338,6 +338,43 @@ fn having_rejects_invalid_and_ambiguous_references() {
 }
 
 #[test]
+fn having_rejects_alias_grouped_column_collisions() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE locations (region String, area String);
+             INSERT INTO locations VALUES ('west', 'east'), ('east', 'west');",
+        )
+        .expect("setup succeeds");
+
+    let collision = database
+        .execute(
+            "SELECT area AS region, COUNT(*) AS rows
+             FROM locations
+             GROUP BY region, area
+             HAVING region = 'west';",
+        )
+        .expect_err("alias must not shadow a different grouped column");
+    assert!(matches!(
+        collision,
+        Error::InvalidQuery(message)
+            if message.contains("ambiguous between a SELECT alias and GROUP BY column")
+    ));
+
+    let same_value = execute_query(
+        &mut database,
+        "SELECT region AS region, COUNT(*) AS rows
+         FROM locations
+         GROUP BY region, area
+         HAVING region = 'west';",
+    );
+    assert_eq!(
+        same_value.rows,
+        vec![vec![Value::String("west".to_owned()), Value::Int64(1)]]
+    );
+}
+
+#[test]
 fn every_aggregate_groups_and_uses_declared_result_types() {
     let mut database = Database::new();
     database

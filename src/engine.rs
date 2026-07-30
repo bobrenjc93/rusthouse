@@ -952,6 +952,15 @@ impl HavingCompiler<'_> {
     fn compile_operand(&mut self, operand: &Operand) -> Result<CompiledHavingOperand> {
         match operand {
             Operand::Column(name) => {
+                let grouped = self.table.column_index(name).ok().and_then(|source| {
+                    self.group_columns
+                        .iter()
+                        .position(|column| *column == source)
+                        .map(|position| CompiledHavingOperand::GroupColumn {
+                            position,
+                            data_type: self.table.schema()[source].data_type,
+                        })
+                });
                 let aliases = self
                     .aliases
                     .iter()
@@ -960,10 +969,19 @@ impl HavingCompiler<'_> {
                     .collect::<Vec<_>>();
                 match aliases.as_slice() {
                     [output] => {
-                        return resolved_item_as_having_operand(
+                        let alias = resolved_item_as_having_operand(
                             self.items[*output],
                             &self.result_columns[*output],
-                        );
+                        )?;
+                        if grouped
+                            .as_ref()
+                            .is_some_and(|grouped| !same_grouped_value(&alias, grouped))
+                        {
+                            return Err(Error::InvalidQuery(format!(
+                                "HAVING name '{name}' is ambiguous between a SELECT alias and GROUP BY column"
+                            )));
+                        }
+                        return Ok(alias);
                     }
                     [] => {}
                     _ => {
@@ -973,21 +991,10 @@ impl HavingCompiler<'_> {
                     }
                 }
 
-                let source = self.table.column_index(name).ok();
-                let group_position = source.and_then(|source| {
-                    self.group_columns
-                        .iter()
-                        .position(|column| *column == source)
-                });
-                let Some(position) = group_position else {
-                    return Err(Error::InvalidQuery(format!(
+                grouped.ok_or_else(|| {
+                    Error::InvalidQuery(format!(
                         "HAVING reference '{name}' is not a SELECT alias or GROUP BY column"
-                    )));
-                };
-                let source = source.expect("group position requires a source column");
-                Ok(CompiledHavingOperand::GroupColumn {
-                    position,
-                    data_type: self.table.schema()[source].data_type,
+                    ))
                 })
             }
             Operand::Aggregate { function, argument } => {
@@ -1007,6 +1014,20 @@ impl HavingCompiler<'_> {
             Operand::Literal(value) => Ok(CompiledHavingOperand::Literal(value.clone())),
         }
     }
+}
+
+fn same_grouped_value(left: &CompiledHavingOperand, right: &CompiledHavingOperand) -> bool {
+    matches!(
+        (left, right),
+        (
+            CompiledHavingOperand::GroupColumn {
+                position: left, ..
+            },
+            CompiledHavingOperand::GroupColumn {
+                position: right, ..
+            }
+        ) if left == right
+    )
 }
 
 fn resolved_item_as_having_operand(
