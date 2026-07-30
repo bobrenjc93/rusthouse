@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, is_reserved_column_name};
+use crate::temporal::{Date, DateTime64};
 use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
@@ -401,7 +402,7 @@ impl Parser {
             let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+                    "unknown type '{type_name}'; expected Int64, Float64, Bool, String, Date, or DateTime64"
                 ),
             })?;
             columns.push(ColumnDef {
@@ -626,6 +627,13 @@ impl Parser {
             {
                 self.parse_literal().map(Operand::Literal)
             }
+            TokenKind::Identifier(value)
+                if (value.eq_ignore_ascii_case("DATE")
+                    || value.eq_ignore_ascii_case("DATETIME64"))
+                    && matches!(self.peek_ahead(1), Some(TokenKind::String(_))) =>
+            {
+                self.parse_literal().map(Operand::Literal)
+            }
             TokenKind::Identifier(_) => self
                 .expect_identifier("column or literal")
                 .map(Operand::Column),
@@ -634,6 +642,34 @@ impl Parser {
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
+        let temporal_position = self.position();
+        if self.eat_keyword("DATE") {
+            let literal = self.take_string().ok_or_else(|| Error::Sql {
+                position: self.position(),
+                message: "expected an ISO string after DATE".to_owned(),
+            })?;
+            return literal
+                .parse::<Date>()
+                .map(Value::Date)
+                .map_err(|error| Error::Sql {
+                    position: temporal_position,
+                    message: format!("invalid Date literal '{literal}': {error}"),
+                });
+        }
+        if self.eat_keyword("DATETIME64") {
+            let literal = self.take_string().ok_or_else(|| Error::Sql {
+                position: self.position(),
+                message: "expected an ISO string after DATETIME64".to_owned(),
+            })?;
+            return literal
+                .parse::<DateTime64>()
+                .map(Value::DateTime64)
+                .map_err(|error| Error::Sql {
+                    position: temporal_position,
+                    message: format!("invalid DateTime64 literal '{literal}': {error}"),
+                });
+        }
+
         if let TokenKind::String(value) = self.peek().clone() {
             self.current += 1;
             return Ok(Value::String(value));
@@ -673,7 +709,7 @@ impl Parser {
         } else if self.eat_keyword("FALSE") {
             Ok(Value::Bool(false))
         } else {
-            self.error("expected an Int64, Float64, Bool, or String literal")
+            self.error("expected an Int64, Float64, Bool, String, Date, or DateTime64 literal")
         }
     }
 
@@ -713,6 +749,15 @@ impl Parser {
         }
     }
 
+    fn take_string(&mut self) -> Option<String> {
+        if let TokenKind::String(value) = self.peek().clone() {
+            self.current += 1;
+            Some(value)
+        } else {
+            None
+        }
+    }
+
     fn expect(&mut self, expected: &TokenKind, description: &str) -> Result<()> {
         if self.eat(expected) {
             Ok(())
@@ -736,6 +781,12 @@ impl Parser {
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.current].kind
+    }
+
+    fn peek_ahead(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| &token.kind)
     }
 
     fn position(&self) -> usize {
@@ -782,6 +833,43 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_strict_typed_temporal_literals() {
+        let statements = parse(
+            "INSERT INTO events VALUES \
+             (DATE '2024-02-29', DATETIME64 '2024-02-29T12:34:56.789Z')",
+        )
+        .expect("valid temporal literals");
+        let Statement::Insert { rows, .. } = &statements[0] else {
+            panic!("expected insert");
+        };
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Date("2024-02-29".parse().expect("date")),
+                Value::DateTime64("2024-02-29T12:34:56.789Z".parse().expect("timestamp")),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_typed_temporal_literals_at_their_sql_position() {
+        let error = parse("INSERT INTO events VALUES (DATE '2023-02-29')")
+            .expect_err("invalid calendar date");
+        assert!(matches!(
+            error,
+            Error::Sql { position: 27, message }
+                if message.contains("invalid Date literal") && message.contains("between 01 and 28")
+        ));
+
+        let error = parse("INSERT INTO events VALUES (DATETIME64 '2024-01-01 00:00:00.000Z')")
+            .expect_err("timestamp must use T");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. } if message.contains("expected YYYY-MM-DDTHH:MM:SS.sssZ")
+        ));
     }
 
     #[test]

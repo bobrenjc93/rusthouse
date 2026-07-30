@@ -184,6 +184,8 @@ fn write_json_value(output: &mut String, value: &Value) {
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::String(value) => write_json_string(output, value),
+        Value::Date(value) => write_json_string(output, &value.to_string()),
+        Value::DateTime64(value) => write_json_string(output, &value.to_string()),
     }
 }
 

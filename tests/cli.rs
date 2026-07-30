@@ -66,6 +66,27 @@ fn positional_json_preserves_duplicate_alias_values() {
 }
 
 #[test]
+fn json_renders_temporal_values_canonically_with_type_metadata() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format=json",
+            "--execute",
+            "CREATE TABLE events (day Date, at DateTime64);
+             INSERT INTO events VALUES
+                (DATE '2024-02-29', DATETIME64 '2024-02-29T01:02:03.004Z');
+             SELECT day, at FROM events;",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"day\",\"type\":\"Date\"},{\"name\":\"at\",\"type\":\"DateTime64\"}],\"rows\":[[\"2024-02-29\",\"2024-02-29T01:02:03.004Z\"]]}]}\n"
+    );
+}
+
+#[test]
 fn stdin_and_csv_output_work_together() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(["--format", "csv"])

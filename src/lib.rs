@@ -9,10 +9,12 @@ pub mod error;
 pub mod format;
 pub mod sql;
 pub mod storage;
+pub mod temporal;
 pub mod value;
 
 pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
 pub use error::{Error, Result};
+pub use temporal::{Date, DateTime64, TemporalParseError};
 pub use value::{DataType, Value};
 
 /// Returns the product name.

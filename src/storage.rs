@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
+use crate::temporal::{Date, DateTime64};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A named, typed field in a table schema.
@@ -21,6 +22,8 @@ pub enum Column {
     Float64(Vec<f64>),
     Bool(Vec<bool>),
     String(Vec<String>),
+    Date(Vec<Date>),
+    DateTime64(Vec<DateTime64>),
 }
 
 impl Column {
@@ -31,6 +34,8 @@ impl Column {
             DataType::Float64 => Self::Float64(Vec::new()),
             DataType::Bool => Self::Bool(Vec::new()),
             DataType::String => Self::String(Vec::new()),
+            DataType::Date => Self::Date(Vec::new()),
+            DataType::DateTime64 => Self::DateTime64(Vec::new()),
         }
     }
 
@@ -41,6 +46,8 @@ impl Column {
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
             Self::String(_) => DataType::String,
+            Self::Date(_) => DataType::Date,
+            Self::DateTime64(_) => DataType::DateTime64,
         }
     }
 
@@ -51,6 +58,8 @@ impl Column {
             Self::Float64(values) => values.len(),
             Self::Bool(values) => values.len(),
             Self::String(values) => values.len(),
+            Self::Date(values) => values.len(),
+            Self::DateTime64(values) => values.len(),
         }
     }
 
@@ -70,6 +79,8 @@ impl Column {
             Self::Float64(values) => ValueRef::Float64(values[row]),
             Self::Bool(values) => ValueRef::Bool(values[row]),
             Self::String(values) => ValueRef::String(&values[row]),
+            Self::Date(values) => ValueRef::Date(values[row]),
+            Self::DateTime64(values) => ValueRef::DateTime64(values[row]),
         }
     }
 
@@ -83,6 +94,8 @@ impl Column {
             (Self::Float64(values), Value::Float64(value)) => values.push(value),
             (Self::Bool(values), Value::Bool(value)) => values.push(value),
             (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Date(values), Value::Date(value)) => values.push(value),
+            (Self::DateTime64(values), Value::DateTime64(value)) => values.push(value),
             _ => unreachable!("values are validated before insertion"),
         }
     }
@@ -240,5 +253,34 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn stores_temporal_values_in_dedicated_typed_columns() {
+        let date = "2024-02-29".parse::<Date>().expect("valid Date");
+        let timestamp = "2024-02-29T23:59:59.999Z"
+            .parse::<DateTime64>()
+            .expect("valid DateTime64");
+        let mut table = Table::new(
+            "timeline".to_owned(),
+            vec![
+                ColumnDef {
+                    name: "day".to_owned(),
+                    data_type: DataType::Date,
+                },
+                ColumnDef {
+                    name: "at".to_owned(),
+                    data_type: DataType::DateTime64,
+                },
+            ],
+        )
+        .expect("valid schema");
+
+        table
+            .insert_row(vec![Value::Date(date), Value::DateTime64(timestamp)])
+            .expect("valid temporal row");
+
+        assert!(matches!(&table.columns()[0], Column::Date(v) if v == &[date]));
+        assert!(matches!(&table.columns()[1], Column::DateTime64(v) if v == &[timestamp]));
     }
 }

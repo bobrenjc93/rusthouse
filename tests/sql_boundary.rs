@@ -1,4 +1,4 @@
-use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
+use rusthouse::{DataType, Database, Date, DateTime64, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {
     match results.into_iter().last().expect("statement result") {
@@ -9,6 +9,174 @@ fn last_query(results: Vec<StatementResult>) -> QueryResult {
 
 fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
     last_query(database.execute(sql).expect("SQL succeeds"))
+}
+
+fn date(value: &str) -> Value {
+    Value::Date(value.parse::<Date>().expect("valid test Date"))
+}
+
+fn datetime64(value: &str) -> Value {
+    Value::DateTime64(value.parse::<DateTime64>().expect("valid test DateTime64"))
+}
+
+#[test]
+fn temporal_columns_filter_group_order_limit_and_aggregate_end_to_end() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (
+                event_date Date, occurred_at DateTime64, category String
+             );
+             INSERT INTO events VALUES
+                (DATE '2024-02-29', DATETIME64 '2024-02-29T00:00:00.001Z', 'deploy'),
+                (DATE '2024-02-29', DATETIME64 '2024-02-29T23:59:59.999Z', 'deploy'),
+                (DATE '2024-03-01', DATETIME64 '2024-03-01T00:00:00.000Z', 'sale'),
+                (DATE '2023-12-31', DATETIME64 '2023-12-31T23:59:59.999Z', 'archive');",
+        )
+        .expect("temporal setup succeeds");
+
+    let recent = execute_query(
+        &mut database,
+        "SELECT event_date, occurred_at, category
+         FROM events
+         WHERE event_date >= DATE '2024-02-29'
+           AND occurred_at < DATETIME64 '2024-03-01T00:00:00.000Z'
+         ORDER BY occurred_at DESC
+         LIMIT 1;",
+    );
+    assert_eq!(
+        recent
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![DataType::Date, DataType::DateTime64, DataType::String]
+    );
+    assert_eq!(
+        recent.rows,
+        vec![vec![
+            date("2024-02-29"),
+            datetime64("2024-02-29T23:59:59.999Z"),
+            Value::String("deploy".to_owned()),
+        ]]
+    );
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT event_date, MIN(occurred_at) AS first_at,
+                MAX(occurred_at) AS last_at, COUNT(*) AS count
+         FROM events
+         GROUP BY event_date
+         ORDER BY event_date;",
+    );
+    assert_eq!(
+        grouped
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Date,
+            DataType::DateTime64,
+            DataType::DateTime64,
+            DataType::Int64,
+        ]
+    );
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                date("2023-12-31"),
+                datetime64("2023-12-31T23:59:59.999Z"),
+                datetime64("2023-12-31T23:59:59.999Z"),
+                Value::Int64(1),
+            ],
+            vec![
+                date("2024-02-29"),
+                datetime64("2024-02-29T00:00:00.001Z"),
+                datetime64("2024-02-29T23:59:59.999Z"),
+                Value::Int64(2),
+            ],
+            vec![
+                date("2024-03-01"),
+                datetime64("2024-03-01T00:00:00.000Z"),
+                datetime64("2024-03-01T00:00:00.000Z"),
+                Value::Int64(1),
+            ],
+        ]
+    );
+
+    let timestamp_groups = execute_query(
+        &mut database,
+        "SELECT occurred_at, COUNT(*) AS count
+         FROM events
+         GROUP BY occurred_at
+         ORDER BY occurred_at;",
+    );
+    assert_eq!(timestamp_groups.rows.len(), 4);
+    assert_eq!(
+        timestamp_groups.rows[0],
+        vec![datetime64("2023-12-31T23:59:59.999Z"), Value::Int64(1),]
+    );
+}
+
+#[test]
+fn temporal_sql_accepts_range_boundaries_and_rejects_malformed_literals() {
+    let mut database = Database::new();
+    let boundary = execute_query(
+        &mut database,
+        "CREATE TABLE temporal_bounds (day Date, at DateTime64);
+         INSERT INTO temporal_bounds VALUES
+            (DATE '0001-01-01', DATETIME64 '0001-01-01T00:00:00.000Z'),
+            (DATE '9999-12-31', DATETIME64 '9999-12-31T23:59:59.999Z');
+         SELECT MIN(day) AS min_day, MAX(day) AS max_day,
+                MIN(at) AS min_at, MAX(at) AS max_at
+         FROM temporal_bounds;",
+    );
+    assert_eq!(
+        boundary.rows,
+        vec![vec![
+            date("0001-01-01"),
+            date("9999-12-31"),
+            datetime64("0001-01-01T00:00:00.000Z"),
+            datetime64("9999-12-31T23:59:59.999Z"),
+        ]]
+    );
+
+    let malformed = [
+        "DATE '2023-02-29'",
+        "DATE '2024-2-29'",
+        "DATE '0000-01-01'",
+        "DATETIME64 '2024-01-01 00:00:00.000Z'",
+        "DATETIME64 '2024-01-01T00:00:00Z'",
+        "DATETIME64 '2024-01-01T00:00:00.000+00:00'",
+        "DATETIME64 '2024-01-01T24:00:00.000Z'",
+    ];
+    for literal in malformed {
+        let mut database = Database::new();
+        let error = database
+            .execute(&format!(
+                "CREATE TABLE rejected (value Date); INSERT INTO rejected VALUES ({literal});"
+            ))
+            .expect_err("malformed temporal literal must fail while parsing the batch");
+        assert!(
+            matches!(error, Error::Sql { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            database.catalog().table("rejected").is_err(),
+            "a malformed literal must prevent the complete batch from executing"
+        );
+    }
+
+    let error = database
+        .execute("INSERT INTO temporal_bounds VALUES (DATE '2024-01-01', DATE '2024-01-01')")
+        .expect_err("Date cannot be inserted into DateTime64");
+    assert!(matches!(
+        error,
+        Error::TypeMismatch { expected, actual, .. }
+            if expected == "DateTime64" && actual == "Date"
+    ));
 }
 
 #[test]
