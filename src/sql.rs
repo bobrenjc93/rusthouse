@@ -24,6 +24,7 @@ pub struct Select {
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
+    pub having: Option<Box<Predicate>>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -38,6 +39,8 @@ pub enum SelectItem {
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
+        distinct: bool,
+        filter: Option<Box<Predicate>>,
         alias: Option<String>,
     },
 }
@@ -88,6 +91,7 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    Boolean(Operand),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -96,6 +100,7 @@ pub enum Predicate {
 pub enum Operand {
     Column(String),
     Literal(Value),
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,9 +458,7 @@ impl Parser {
         let table = self.expect_identifier("table name")?;
 
         let predicate = if self.eat_keyword("WHERE") {
-            self.predicate_depth = 0;
-            self.predicate_nodes = 0;
-            Some(self.parse_or_predicate()?)
+            Some(self.parse_predicate()?)
         } else {
             None
         };
@@ -470,6 +473,12 @@ impl Parser {
                 }
             }
         }
+
+        let having = if self.eat_keyword("HAVING") {
+            Some(Box::new(self.parse_predicate()?))
+        } else {
+            None
+        };
 
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
@@ -508,6 +517,7 @@ impl Parser {
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -525,16 +535,28 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
+            let distinct = self.eat_keyword("DISTINCT");
             let argument = if self.eat(&TokenKind::Star) {
                 AggregateArgument::Wildcard
             } else {
                 AggregateArgument::Column(self.expect_identifier("aggregate column")?)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
+            let filter = if self.eat_keyword("FILTER") {
+                self.expect(&TokenKind::LeftParen, "'(' after FILTER")?;
+                self.expect_keyword("WHERE")?;
+                let predicate = self.parse_predicate()?;
+                self.expect(&TokenKind::RightParen, "')' after FILTER predicate")?;
+                Some(Box::new(predicate))
+            } else {
+                None
+            };
             let alias = self.parse_alias()?;
             Ok(SelectItem::Aggregate {
                 function,
                 argument,
+                distinct,
+                filter,
                 alias,
             })
         } else {
@@ -549,6 +571,12 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_predicate(&mut self) -> Result<Predicate> {
+        self.predicate_depth = 0;
+        self.predicate_nodes = 0;
+        self.parse_or_predicate()
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {
@@ -588,13 +616,17 @@ impl Parser {
 
         let left = self.parse_operand()?;
         let operator = match self.peek() {
-            TokenKind::Equal => ComparisonOperator::Equal,
-            TokenKind::NotEqual => ComparisonOperator::NotEqual,
-            TokenKind::Less => ComparisonOperator::Less,
-            TokenKind::LessOrEqual => ComparisonOperator::LessOrEqual,
-            TokenKind::Greater => ComparisonOperator::Greater,
-            TokenKind::GreaterOrEqual => ComparisonOperator::GreaterOrEqual,
-            _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
+            TokenKind::Equal => Some(ComparisonOperator::Equal),
+            TokenKind::NotEqual => Some(ComparisonOperator::NotEqual),
+            TokenKind::Less => Some(ComparisonOperator::Less),
+            TokenKind::LessOrEqual => Some(ComparisonOperator::LessOrEqual),
+            TokenKind::Greater => Some(ComparisonOperator::Greater),
+            TokenKind::GreaterOrEqual => Some(ComparisonOperator::GreaterOrEqual),
+            _ => None,
+        };
+        let Some(operator) = operator else {
+            self.record_predicate_node()?;
+            return Ok(Predicate::Boolean(left));
         };
         self.current += 1;
         let right = self.parse_operand()?;
@@ -625,6 +657,10 @@ impl Parser {
                 if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") =>
             {
                 self.parse_literal().map(Operand::Literal)
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NULL") => {
+                self.current += 1;
+                Ok(Operand::Null)
             }
             TokenKind::Identifier(_) => self
                 .expect_identifier("column or literal")
@@ -757,9 +793,9 @@ mod tests {
     #[test]
     fn parses_complete_select_shape() {
         let statements = parse(
-            "SELECT region, SUM(amount) AS total FROM sales \
+            "SELECT region, SUM(DISTINCT amount) FILTER (WHERE active) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region HAVING total > 5 ORDER BY total DESC LIMIT 3;",
         )
         .expect("valid SQL");
 
@@ -768,6 +804,15 @@ mod tests {
         };
         assert_eq!(select.items.len(), 2);
         assert_eq!(select.group_by, ["region"]);
+        let SelectItem::Aggregate {
+            distinct, filter, ..
+        } = &select.items[1]
+        else {
+            panic!("expected aggregate");
+        };
+        assert!(*distinct);
+        assert!(filter.is_some());
+        assert!(select.having.is_some());
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));

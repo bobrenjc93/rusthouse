@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -95,14 +95,14 @@ impl Database {
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| compile_table_predicate(table, predicate, "WHERE"))
             .transpose()?;
 
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate_table(table, *row))
             })
             .collect::<Vec<_>>();
 
@@ -110,11 +110,24 @@ impl Database {
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let having = select
+            .having
+            .as_ref()
+            .map(|predicate| compile_output_predicate(&result_columns, predicate, "HAVING"))
+            .transpose()?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        if having.is_some() && !grouped {
+            return Err(Error::InvalidQuery(
+                "HAVING requires GROUP BY or an aggregate".to_owned(),
+            ));
+        }
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            if let Some(predicate) = &having {
+                selected_groups.retain(|group| predicate.evaluate_group(&grouped, &items, *group));
+            }
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -146,11 +159,13 @@ enum ResolvedItem {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+    distinct: bool,
+    filter: Option<CompiledPredicate>,
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -232,6 +247,8 @@ fn resolve_select_items(
             SelectItem::Aggregate {
                 function,
                 argument,
+                distinct,
+                filter,
                 alias,
             } => {
                 let (argument_index, input_type, argument_name) = match argument {
@@ -253,18 +270,30 @@ fn resolve_select_items(
                         )
                     }
                 };
+                if *distinct && argument_index.is_none() {
+                    return Err(Error::InvalidQuery(
+                        "COUNT(DISTINCT *) is not supported; use a column argument".to_owned(),
+                    ));
+                }
                 validate_aggregate(*function, input_type)?;
+                let filter = filter
+                    .as_ref()
+                    .map(|predicate| compile_table_predicate(table, predicate, "FILTER"))
+                    .transpose()?;
                 let state = aggregate_specs.len();
                 aggregate_specs.push(AggregateSpec {
                     function: *function,
                     argument: argument_index,
                     input_type,
+                    distinct: *distinct,
+                    filter,
                 });
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                    name: alias.clone().unwrap_or_else(|| {
+                        let distinct = if *distinct { "DISTINCT " } else { "" };
+                        format!("{}({distinct}{argument_name})", function.name())
+                    }),
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
@@ -349,7 +378,13 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            if spec
+                .filter
+                .as_ref()
+                .is_none_or(|predicate| predicate.evaluate_table(table, *row))
+            {
+                states[group].update(spec, table, *row)?;
+            }
         }
     }
 
@@ -519,10 +554,30 @@ impl GroupedData<'_> {
             })
             .collect()
     }
+
+    fn value(&self, group: usize, item: &ResolvedItem) -> ValueRef<'_> {
+        match item {
+            ResolvedItem::Column {
+                group_position: Some(position),
+                ..
+            } => self.keys[group].value(*position),
+            ResolvedItem::Column {
+                group_position: None,
+                ..
+            } => unreachable!("grouped columns are validated"),
+            ResolvedItem::Aggregate { state } => self.aggregates[*state][group].as_ref(),
+        }
+    }
 }
 
 #[derive(Debug)]
-enum AggregateState {
+struct AggregateState {
+    accumulator: AggregateAccumulator,
+    seen: Option<HashSet<Value>>,
+}
+
+#[derive(Debug)]
+enum AggregateAccumulator {
     Count(i64),
     SumInt(i64),
     SumFloat(f64),
@@ -534,19 +589,41 @@ enum AggregateState {
 
 impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
-        match spec.function {
-            AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
-            AggregateFunction::Min => Self::Min(None),
-            AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
-                Self::AvgInt { sum: 0, count: 0 }
+        let accumulator = match spec.function {
+            AggregateFunction::Count => AggregateAccumulator::Count(0),
+            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => {
+                AggregateAccumulator::SumInt(0)
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Sum => AggregateAccumulator::SumFloat(0.0),
+            AggregateFunction::Min => AggregateAccumulator::Min(None),
+            AggregateFunction::Max => AggregateAccumulator::Max(None),
+            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
+                AggregateAccumulator::AvgInt { sum: 0, count: 0 }
+            }
+            AggregateFunction::Avg => AggregateAccumulator::AvgFloat { sum: 0.0, count: 0 },
+        };
+        Self {
+            accumulator,
+            seen: spec.distinct.then(HashSet::new),
         }
     }
 
+    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        if let Some(seen) = &mut self.seen {
+            let argument = spec.argument.expect("DISTINCT has a column argument");
+            if !seen.insert(table.columns()[argument].value(row)) {
+                return Ok(());
+            }
+        }
+        self.accumulator.update(spec, table, row)
+    }
+
+    fn finish(self) -> Result<Value> {
+        self.accumulator.finish()
+    }
+}
+
+impl AggregateAccumulator {
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
@@ -774,35 +851,64 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    Boolean(CompiledOperand),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate_table(&self, table: &Table, row: usize) -> bool {
+        self.evaluate_with(&|index| table.columns()[index].value_ref(row)) == Some(true)
+    }
+
+    fn evaluate_group(&self, data: &GroupedData<'_>, items: &[ResolvedItem], group: usize) -> bool {
+        self.evaluate_with(&|index| data.value(group, &items[index])) == Some(true)
+    }
+
+    fn evaluate_with<'a>(&'a self, value: &impl Fn(usize) -> ValueRef<'a>) -> Option<bool> {
         match self {
             Self::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
+                let (Some(left), Some(right)) = (left.value(value), right.value(value)) else {
+                    return None;
+                };
                 let comparison = left
                     .sql_cmp(right)
                     .expect("predicate operand types are validated");
-                match operator {
-                    ComparisonOperator::Equal => comparison == Ordering::Equal,
-                    ComparisonOperator::NotEqual => comparison != Ordering::Equal,
-                    ComparisonOperator::Less => comparison == Ordering::Less,
-                    ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
-                    ComparisonOperator::Greater => comparison == Ordering::Greater,
-                    ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
-                }
+                Some(evaluate_comparison(comparison, *operator))
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::Boolean(operand) => match operand.value(value) {
+                Some(ValueRef::Bool(value)) => Some(value),
+                None => None,
+                Some(_) => unreachable!("Boolean predicate type is validated"),
+            },
+            Self::And(left, right) => match left.evaluate_with(value) {
+                Some(false) => Some(false),
+                Some(true) => right.evaluate_with(value),
+                None if right.evaluate_with(value) == Some(false) => Some(false),
+                None => None,
+            },
+            Self::Or(left, right) => match left.evaluate_with(value) {
+                Some(true) => Some(true),
+                Some(false) => right.evaluate_with(value),
+                None if right.evaluate_with(value) == Some(true) => Some(true),
+                None => None,
+            },
         }
+    }
+}
+
+fn evaluate_comparison(comparison: Ordering, operator: ComparisonOperator) -> bool {
+    match operator {
+        ComparisonOperator::Equal => comparison == Ordering::Equal,
+        ComparisonOperator::NotEqual => comparison != Ordering::Equal,
+        ComparisonOperator::Less => comparison == Ordering::Less,
+        ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
+        ComparisonOperator::Greater => comparison == Ordering::Greater,
+        ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
     }
 }
 
@@ -810,38 +916,81 @@ impl CompiledPredicate {
 enum CompiledOperand {
     Column { index: usize, data_type: DataType },
     Literal(Value),
+    Null,
 }
 
 impl CompiledOperand {
-    fn data_type(&self) -> DataType {
+    fn data_type(&self) -> Option<DataType> {
         match self {
-            Self::Column { data_type, .. } => *data_type,
-            Self::Literal(value) => value.data_type(),
+            Self::Column { data_type, .. } => Some(*data_type),
+            Self::Literal(value) => Some(value.data_type()),
+            Self::Null => None,
         }
     }
 
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
+    fn value<'a>(&'a self, value: &impl Fn(usize) -> ValueRef<'a>) -> Option<ValueRef<'a>> {
         match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
-            Self::Literal(value) => value.as_ref(),
+            Self::Column { index, .. } => Some(value(*index)),
+            Self::Literal(value) => Some(value.as_ref()),
+            Self::Null => None,
         }
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn compile_table_predicate(
+    table: &Table,
+    predicate: &Predicate,
+    context: &str,
+) -> Result<CompiledPredicate> {
+    compile_predicate(predicate, context, &|name| {
+        let index = table.column_index(name)?;
+        Ok((index, table.schema()[index].data_type))
+    })
+}
+
+fn compile_output_predicate(
+    columns: &[ResultColumn],
+    predicate: &Predicate,
+    context: &str,
+) -> Result<CompiledPredicate> {
+    compile_predicate(predicate, context, &|name| {
+        let matches = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [(index, column)] => Ok((*index, column.data_type)),
+            [] => Err(Error::InvalidQuery(format!(
+                "{context} column or alias '{name}' is not in the SELECT output"
+            ))),
+            _ => Err(Error::InvalidQuery(format!(
+                "{context} name '{name}' is ambiguous"
+            ))),
+        }
+    })
+}
+
+fn compile_predicate(
+    predicate: &Predicate,
+    context: &str,
+    resolve_column: &impl Fn(&str) -> Result<(usize, DataType)>,
+) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
-            if !comparable(left.data_type(), right.data_type()) {
+            let left = compile_operand(left, resolve_column)?;
+            let right = compile_operand(right, resolve_column)?;
+            if let (Some(left_type), Some(right_type)) = (left.data_type(), right.data_type())
+                && !comparable(left_type, right_type)
+            {
                 return Err(Error::TypeMismatch {
-                    context: "WHERE comparison".to_owned(),
-                    expected: left.data_type().to_string(),
-                    actual: right.data_type().to_string(),
+                    context: format!("{context} comparison"),
+                    expected: left_type.to_string(),
+                    actual: right_type.to_string(),
                 });
             }
             Ok(CompiledPredicate::Comparison {
@@ -850,27 +999,45 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::Boolean(operand) => {
+            let operand = compile_operand(operand, resolve_column)?;
+            if operand
+                .data_type()
+                .is_some_and(|data_type| data_type != DataType::Bool)
+            {
+                return Err(Error::TypeMismatch {
+                    context: format!("{context} predicate"),
+                    expected: DataType::Bool.to_string(),
+                    actual: operand
+                        .data_type()
+                        .expect("non-Bool type exists")
+                        .to_string(),
+                });
+            }
+            Ok(CompiledPredicate::Boolean(operand))
+        }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(left, context, resolve_column)?),
+            Box::new(compile_predicate(right, context, resolve_column)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(left, context, resolve_column)?),
+            Box::new(compile_predicate(right, context, resolve_column)?),
         )),
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_operand(
+    operand: &Operand,
+    resolve_column: &impl Fn(&str) -> Result<(usize, DataType)>,
+) -> Result<CompiledOperand> {
     match operand {
         Operand::Column(name) => {
-            let index = table.column_index(name)?;
-            Ok(CompiledOperand::Column {
-                index,
-                data_type: table.schema()[index].data_type,
-            })
+            let (index, data_type) = resolve_column(name)?;
+            Ok(CompiledOperand::Column { index, data_type })
         }
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+        Operand::Null => Ok(CompiledOperand::Null),
     }
 }
 

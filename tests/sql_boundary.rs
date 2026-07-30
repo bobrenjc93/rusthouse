@@ -311,6 +311,181 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn filtered_distinct_aggregates_work_globally_for_every_function() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE filtered (amount Int64, online Bool);
+             INSERT INTO filtered VALUES
+                (10, true), (10, true), (4, true), (7, false), (2, false);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT
+            COUNT(*) FILTER (WHERE online) AS matching_rows,
+            COUNT(DISTINCT amount) FILTER (WHERE online) AS unique_rows,
+            SUM(DISTINCT amount) FILTER (WHERE online) AS total,
+            MIN(DISTINCT amount) FILTER (WHERE online) AS low,
+            MAX(DISTINCT amount) FILTER (WHERE online) AS high,
+            AVG(DISTINCT amount) FILTER (WHERE online) AS mean
+         FROM filtered;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(3),
+            Value::Int64(2),
+            Value::Int64(14),
+            Value::Int64(4),
+            Value::Int64(10),
+            Value::Float64(7.0),
+        ]]
+    );
+}
+
+#[test]
+fn grouped_filters_having_and_aliases_share_one_grouped_scan() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE channels (region String, amount Int64, online Bool);
+             INSERT INTO channels VALUES
+                ('west', 10, true), ('west', 10, true), ('west', 3, false),
+                ('east', 4, false), ('east', 7, true), ('north', 8, false);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT region AS area,
+                COUNT(*) FILTER (WHERE online) AS online_rows,
+                SUM(DISTINCT amount) FILTER (WHERE online) AS online_total,
+                SUM(amount) FILTER (WHERE online = false) AS offline_total
+         FROM channels
+         GROUP BY region
+         HAVING online_total >= 7
+         ORDER BY online_total DESC;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("west".to_owned()),
+                Value::Int64(2),
+                Value::Int64(10),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::String("east".to_owned()),
+                Value::Int64(1),
+                Value::Int64(7),
+                Value::Int64(4),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn null_filter_predicates_are_unknown_and_do_not_select_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE nullable_predicates (amount Int64, online Bool);
+             INSERT INTO nullable_predicates VALUES (5, true), (9, false);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT
+            COUNT(*) FILTER (WHERE NULL) AS null_only,
+            COUNT(*) FILTER (WHERE amount = NULL) AS null_comparison,
+            COUNT(*) FILTER (WHERE NULL OR online) AS null_or_true,
+            COUNT(*) FILTER (WHERE NULL AND online = false) AS null_and_false
+         FROM nullable_predicates;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(0),
+            Value::Int64(0),
+            Value::Int64(1),
+            Value::Int64(0),
+        ]]
+    );
+}
+
+#[test]
+fn filtered_empty_inputs_and_overflow_keep_existing_behavior() {
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE guarded (amount Int64, included Bool);
+                 INSERT INTO guarded VALUES ({}, true), (1, false), ({}, true);",
+            i64::MAX,
+            i64::MAX
+        ))
+        .expect("setup succeeds");
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT COUNT(*) FILTER (WHERE NULL) AS count,
+                SUM(amount) FILTER (WHERE NULL) AS total
+         FROM guarded;",
+    );
+    assert_eq!(empty.rows, vec![vec![Value::Int64(0), Value::Int64(0)]]);
+
+    let distinct = execute_query(
+        &mut database,
+        "SELECT SUM(DISTINCT amount) FILTER (WHERE included) AS total FROM guarded;",
+    );
+    assert_eq!(distinct.rows, vec![vec![Value::Int64(i64::MAX)]]);
+
+    let overflow = database
+        .execute("SELECT SUM(amount) FILTER (WHERE included) FROM guarded;")
+        .expect_err("included duplicate overflows Int64 SUM");
+    assert!(matches!(overflow, Error::NumericOverflow(context) if context == "SUM(Int64)"));
+
+    let undefined = database
+        .execute("SELECT MIN(amount) FILTER (WHERE NULL) FROM guarded;")
+        .expect_err("filtered MIN has empty-input behavior");
+    assert!(matches!(
+        undefined,
+        Error::InvalidQuery(message) if message.contains("MIN is undefined for an empty input")
+    ));
+}
+
+#[test]
+fn invalid_aggregate_filters_and_distinct_wildcards_are_rejected() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE filter_errors (amount Int64, online Bool);")
+        .expect("setup succeeds");
+
+    let filter_type = database
+        .execute("SELECT SUM(amount) FILTER (WHERE amount) FROM filter_errors;")
+        .expect_err("FILTER requires a Boolean predicate");
+    assert!(matches!(
+        filter_type,
+        Error::TypeMismatch { context, expected, actual }
+            if context == "FILTER predicate" && expected == "Bool" && actual == "Int64"
+    ));
+
+    let distinct_wildcard = database
+        .execute("SELECT COUNT(DISTINCT *) FILTER (WHERE online) FROM filter_errors;")
+        .expect_err("DISTINCT wildcard is invalid");
+    assert!(matches!(
+        distinct_wildcard,
+        Error::InvalidQuery(message) if message.contains("COUNT(DISTINCT *)")
+    ));
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
@@ -478,14 +653,14 @@ fn avg_int64_accumulates_exactly_before_final_conversion() {
 }
 
 #[test]
-fn boolean_literals_cannot_be_ambiguous_column_names() {
-    for identifier in ["true", "FALSE"] {
+fn predicate_literals_cannot_be_ambiguous_column_names() {
+    for identifier in ["true", "FALSE", "Null"] {
         let mut database = Database::new();
         let error = database
             .execute(&format!(
                 "CREATE TABLE reserved_names ({identifier} Bool, id Int64)"
             ))
-            .expect_err("Boolean literal names are reserved");
+            .expect_err("predicate literal names are reserved");
 
         assert!(matches!(
             error,
