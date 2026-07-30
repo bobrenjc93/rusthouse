@@ -33,6 +33,9 @@ pub enum Error {
     TemporaryStorageLimit {
         limit_bytes: u64,
     },
+    TemporaryPartitionLimit {
+        limit: usize,
+    },
     Io {
         context: String,
         message: String,
@@ -83,6 +86,10 @@ impl fmt::Display for Error {
             Self::TemporaryStorageLimit { limit_bytes } => write!(
                 f,
                 "temporary storage limit of {limit_bytes} bytes exceeded while spilling groups"
+            ),
+            Self::TemporaryPartitionLimit { limit } => write!(
+                f,
+                "temporary partition limit of {limit} files exceeded while spilling groups"
             ),
             Self::Io { context, message } => write!(f, "{context}: {message}"),
         }

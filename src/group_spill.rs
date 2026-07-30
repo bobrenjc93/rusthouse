@@ -1,22 +1,29 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use crate::error::{Error, Result};
 use crate::storage::Table;
 
-const PARTITION_FANOUT: usize = 16;
+pub(crate) const PARTITION_FANOUT: usize = 16;
 const MAX_PARTITION_DEPTH: usize = 64;
+pub(crate) const MAX_LIVE_PARTITIONS: usize =
+    1 + PARTITION_FANOUT + (PARTITION_FANOUT - 1) * MAX_PARTITION_DEPTH;
 pub(crate) const ROW_INDEX_BYTES: u64 = mem::size_of::<u64>() as u64;
-static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
+// Charge sparse files by allocation blocks, not only their eight-byte payloads.
+const ALLOCATION_UNIT_BYTES: u64 = 4 * 1024;
+const WORKSPACE_CREATION_ATTEMPTS: usize = 128;
 
 #[derive(Debug)]
 pub(crate) struct Partition {
     pub(crate) path: PathBuf,
     pub(crate) bytes: u64,
+    allocated_bytes: u64,
     depth: usize,
 }
 
@@ -36,17 +43,21 @@ impl TempWorkspace {
                 error,
             )
         })?;
-        for _ in 0..1_000 {
-            let id = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
-            let path = root.join(format!("rusthouse-group-{}-{id}", std::process::id()));
-            match fs::create_dir(&path) {
+        for _ in 0..WORKSPACE_CREATION_ATTEMPTS {
+            let path = root.join(format!("rusthouse-group-{}", random_token()?));
+            match create_private_directory(&path) {
                 Ok(()) => {
-                    return Ok(Self {
+                    let mut workspace = Self {
                         path: Some(path),
                         limit_bytes,
                         used_bytes: 0,
                         next_file: 0,
-                    });
+                    };
+                    if let Err(error) = workspace.reserve(ALLOCATION_UNIT_BYTES) {
+                        let _ = workspace.cleanup();
+                        return Err(error);
+                    }
+                    return Ok(workspace);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -62,7 +73,7 @@ impl TempWorkspace {
                 "could not create a unique spill workspace in '{}'",
                 root.display()
             ),
-            message: "too many conflicting directory names".to_owned(),
+            message: "secure random names repeatedly collided".to_owned(),
         })
     }
 
@@ -92,6 +103,13 @@ impl TempWorkspace {
         Ok(())
     }
 
+    fn release(&mut self, bytes: u64) {
+        self.used_bytes = self
+            .used_bytes
+            .checked_sub(bytes)
+            .expect("released temporary storage was previously reserved");
+    }
+
     pub(crate) fn remove_partition(&mut self, partition: &Partition) -> Result<()> {
         fs::remove_file(&partition.path).map_err(|error| {
             io_error(
@@ -99,7 +117,7 @@ impl TempWorkspace {
                 error,
             )
         })?;
-        self.used_bytes = self.used_bytes.saturating_sub(partition.bytes);
+        self.release(partition.allocated_bytes);
         Ok(())
     }
 
@@ -126,6 +144,46 @@ impl TempWorkspace {
     }
 }
 
+fn random_token() -> Result<String> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| Error::Io {
+        context: "could not obtain randomness for a private spill workspace".to_owned(),
+        message: error.to_string(),
+    })?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(random.len() * 2);
+    for byte in random {
+        token.push(char::from(HEX[usize::from(byte >> 4)]));
+        token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(token)
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
 impl Drop for TempWorkspace {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
@@ -145,6 +203,7 @@ struct PartitionOutput {
     path: PathBuf,
     writer: BufWriter<File>,
     bytes: u64,
+    allocated_bytes: u64,
 }
 
 struct PartitionWriters {
@@ -169,21 +228,39 @@ impl PartitionWriters {
         row: usize,
     ) -> Result<()> {
         if self.outputs[bucket].is_none() {
+            workspace.reserve(ALLOCATION_UNIT_BYTES)?;
             let path = workspace.allocate_path(self.depth, bucket);
-            let file = File::create(&path).map_err(|error| {
-                io_error(
-                    format!("could not create spill file '{}'", path.display()),
-                    error,
-                )
-            })?;
+            let file = match create_private_file(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    workspace.release(ALLOCATION_UNIT_BYTES);
+                    return Err(io_error(
+                        format!("could not create spill file '{}'", path.display()),
+                        error,
+                    ));
+                }
+            };
             self.outputs[bucket] = Some(PartitionOutput {
                 path,
                 writer: BufWriter::new(file),
                 bytes: 0,
+                allocated_bytes: ALLOCATION_UNIT_BYTES,
             });
         }
-        workspace.reserve(ROW_INDEX_BYTES)?;
         let output = self.outputs[bucket].as_mut().expect("output was created");
+        let new_bytes = output
+            .bytes
+            .checked_add(ROW_INDEX_BYTES)
+            .expect("one partition cannot exceed the u64 storage counter");
+        let required_bytes = new_bytes
+            .div_ceil(ALLOCATION_UNIT_BYTES)
+            .checked_mul(ALLOCATION_UNIT_BYTES)
+            .expect("rounded partition allocation fits in u64");
+        if required_bytes > output.allocated_bytes {
+            let additional_bytes = required_bytes - output.allocated_bytes;
+            workspace.reserve(additional_bytes)?;
+            output.allocated_bytes = required_bytes;
+        }
         let encoded = u64::try_from(row)
             .expect("RustHouse row indices fit in the on-disk u64 representation")
             .to_le_bytes();
@@ -193,7 +270,7 @@ impl PartitionWriters {
                 error,
             )
         })?;
-        output.bytes += ROW_INDEX_BYTES;
+        output.bytes = new_bytes;
         Ok(())
     }
 
@@ -204,6 +281,7 @@ impl PartitionWriters {
                 path,
                 mut writer,
                 bytes,
+                allocated_bytes,
             } = output;
             writer.flush().map_err(|error| {
                 io_error(
@@ -214,6 +292,7 @@ impl PartitionWriters {
             partitions.push(Partition {
                 path,
                 bytes,
+                allocated_bytes,
                 depth: self.depth,
             });
         }
@@ -333,6 +412,15 @@ pub(crate) fn write_initial_partitions(
     writers.finish()
 }
 
+pub(crate) fn ensure_repartition_capacity(current_partitions: usize) -> Result<()> {
+    if current_partitions > MAX_LIVE_PARTITIONS - PARTITION_FANOUT - 1 {
+        return Err(Error::TemporaryPartitionLimit {
+            limit: MAX_LIVE_PARTITIONS,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn repartition(
     workspace: &mut TempWorkspace,
     table: &Table,
@@ -364,16 +452,98 @@ pub(crate) fn repartition(
 mod tests {
     use super::*;
 
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rusthouse-{label}-test-{}",
+            random_token().expect("operating-system randomness")
+        ));
+        fs::create_dir(&root).expect("create spill test root");
+        root
+    }
+
+    #[test]
+    fn allocation_accounting_bounds_files_and_uses_exclusive_private_creation() {
+        let root = test_root("allocation");
+        let mut workspace =
+            TempWorkspace::new(&root, ALLOCATION_UNIT_BYTES * 2).expect("create workspace");
+        assert_eq!(workspace.used_bytes, ALLOCATION_UNIT_BYTES);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(workspace.path())
+                    .expect("workspace metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        let mut writers = PartitionWriters::new(0);
+        writers
+            .write_row(&mut workspace, 0, 7)
+            .expect("one allocation unit remains");
+        assert_eq!(workspace.used_bytes, ALLOCATION_UNIT_BYTES * 2);
+        let file_path = writers.outputs[0]
+            .as_ref()
+            .expect("first partition exists")
+            .path
+            .clone();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&file_path)
+                    .expect("partition metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            create_private_file(&file_path)
+                .expect_err("partition creation is exclusive")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            writers
+                .write_row(&mut workspace, 1, 8)
+                .expect_err("a second file exceeds the physical allocation budget"),
+            Error::TemporaryStorageLimit {
+                limit_bytes: ALLOCATION_UNIT_BYTES * 2
+            }
+        );
+
+        drop(writers);
+        workspace.cleanup().expect("clean workspace");
+        fs::remove_dir(&root).expect("remove test root");
+    }
+
+    #[test]
+    fn live_partition_limit_includes_parent_and_new_fanout() {
+        ensure_repartition_capacity(MAX_LIVE_PARTITIONS - PARTITION_FANOUT - 1)
+            .expect("parent and a complete fanout fit");
+        assert_eq!(
+            ensure_repartition_capacity(MAX_LIVE_PARTITIONS - PARTITION_FANOUT)
+                .expect_err("one more queued file would exceed the invariant"),
+            Error::TemporaryPartitionLimit {
+                limit: MAX_LIVE_PARTITIONS
+            }
+        );
+    }
+
     #[test]
     fn cleanup_failures_are_reported_and_drop_retries() {
-        let id = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "rusthouse-cleanup-test-{}-{id}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).expect("create cleanup test root");
-        let mut workspace = TempWorkspace::new(&root, 1024).expect("create workspace");
+        let root = test_root("cleanup");
+        let mut workspace =
+            TempWorkspace::new(&root, ALLOCATION_UNIT_BYTES).expect("create workspace");
         let workspace_path = workspace.path().to_owned();
         let moved_path = root.join("moved-workspace");
         fs::rename(&workspace_path, &moved_path).expect("move workspace");

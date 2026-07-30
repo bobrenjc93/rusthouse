@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::group_spill::{
-    PartitionRows, ROW_INDEX_BYTES, TempWorkspace, repartition, write_initial_partitions,
+    PartitionRows, ROW_INDEX_BYTES, TempWorkspace, ensure_repartition_capacity, repartition,
+    write_initial_partitions,
 };
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
@@ -985,15 +986,16 @@ fn execute_spilled_grouped(
     let result = (|| {
         let initial =
             write_initial_partitions(&mut workspace, table, matching_rows, request.group_columns)?;
-        let mut pending = VecDeque::from(initial);
-        let bounded_limit = request.limit.filter(|_| !request.ordering.is_empty());
+        // Reversed stacks process low-numbered buckets depth-first and bound queued files.
+        let mut pending = initial.into_iter().rev().collect::<Vec<_>>();
+        let bounded_limit = request.limit;
         let mut top = Vec::new();
         let mut all = GroupedData {
             keys: Vec::new(),
             aggregates: request.aggregate_specs.iter().map(|_| Vec::new()).collect(),
         };
 
-        while let Some(partition) = pending.pop_front() {
+        while let Some(partition) = pending.pop() {
             let row_count =
                 usize::try_from(partition.bytes / ROW_INDEX_BYTES).unwrap_or(usize::MAX);
             let rows = PartitionRows::open(&partition.path)?;
@@ -1020,9 +1022,10 @@ fn execute_spilled_grouped(
                     }
                 }
                 GroupAttempt::BudgetExceeded => {
+                    ensure_repartition_capacity(pending.len())?;
                     let children =
                         repartition(&mut workspace, table, &partition, request.group_columns)?;
-                    pending.extend(children);
+                    pending.extend(children.into_iter().rev());
                 }
             }
         }

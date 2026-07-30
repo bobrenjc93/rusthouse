@@ -625,6 +625,59 @@ fn forced_group_spills_match_in_memory_results_and_tie_breaking() {
 }
 
 #[test]
+fn spilled_limit_without_order_keeps_only_the_smallest_group_keys() {
+    let rows = (0..2_000)
+        .rev()
+        .map(|key| format!("({key})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let directory = TestDirectory::new("unordered-limit");
+    let mut database = spilling_database(&directory, 64 * 1024 * 1024);
+    database
+        .execute(&format!(
+            "CREATE TABLE unordered_limit (key Int64);
+             INSERT INTO unordered_limit VALUES {rows};"
+        ))
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT key, COUNT(*) AS rows
+         FROM unordered_limit
+         GROUP BY key
+         LIMIT 1;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(0), Value::Int64(1)]]);
+    directory.assert_empty();
+}
+
+#[test]
+fn physical_partition_allocations_respect_the_temporary_limit() {
+    let rows = (0..2_000)
+        .map(|key| format!("({key})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let directory = TestDirectory::new("physical-quota");
+    let mut database = spilling_database(&directory, 32 * 1024);
+    database
+        .execute(&format!(
+            "CREATE TABLE physical_quota (key Int64);
+             INSERT INTO physical_quota VALUES {rows};"
+        ))
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database
+            .execute("SELECT key FROM physical_quota GROUP BY key;")
+            .expect_err("partition allocation units exceed 32 KiB"),
+        Error::TemporaryStorageLimit {
+            limit_bytes: 32 * 1024
+        }
+    );
+    directory.assert_empty();
+}
+
+#[test]
 fn recursively_repartitions_skewed_buckets_without_splitting_groups() {
     let mut rows = (0..96).map(|key| format!("({key}, 1)")).collect::<Vec<_>>();
     rows.extend(std::iter::repeat_n("(7, 2)".to_owned(), 300));

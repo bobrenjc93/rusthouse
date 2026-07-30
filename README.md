@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
 
 ## What works
 
@@ -47,7 +47,8 @@ cargo run -- --format json --execute \
 
 Grouped queries keep their hash keys and aggregate states under a configurable
 memory budget. If the budget is reached, RustHouse writes row indices to
-query-owned hash partitions and removes the workspace on success or error.
+query-owned hash partitions in an OS-random private workspace and removes it
+on success or error.
 The CLI accepts byte counts or KiB, MiB, and GiB suffixes:
 
 ~~~bash
@@ -62,6 +63,8 @@ The library exposes the same controls through DatabaseOptions. The defaults
 are 64 MiB of group state, the operating system temporary directory, and
 1 GiB of spill files per query. The temporary-directory limit counts only the
 active query workspace, not unrelated files under the configured root.
+Workspace and file usage is charged in conservative 4 KiB allocation units,
+including empty filesystem blocks rather than only row-index payload bytes.
 
 Or pipe a batch through standard input:
 
@@ -108,7 +111,7 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Run the complete checks with:
+The engine uses one small third-party dependency to obtain operating-system randomness for private spill workspaces. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check
