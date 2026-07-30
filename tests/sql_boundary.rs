@@ -412,6 +412,221 @@ fn mixed_numeric_predicates_are_exact_at_f64_and_i64_boundaries() {
 }
 
 #[test]
+fn rich_predicates_obey_precedence_and_support_negated_forms() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE predicate_rows (id Int64, enabled Bool);
+             INSERT INTO predicate_rows VALUES
+                (1, false), (2, true), (3, false), (4, false), (5, true);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT id FROM predicate_rows
+         WHERE NOT id IN (1, 2) AND enabled = true OR id BETWEEN 3 AND 4
+         ORDER BY id;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+            vec![Value::Int64(5)],
+        ]
+    );
+
+    let negated = execute_query(
+        &mut database,
+        "SELECT id FROM predicate_rows
+         WHERE id NOT BETWEEN 2 AND 4 AND id NOT IN (5) OR NOT enabled = true
+         ORDER BY id;",
+    );
+    assert_eq!(
+        negated.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ]
+    );
+}
+
+#[test]
+fn in_and_between_keep_exact_mixed_numeric_comparisons() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE numeric_predicates (id Int64, reading Float64);
+             INSERT INTO numeric_predicates VALUES
+                (9007199254740992, 1.0),
+                (9007199254740993, 2.0),
+                (9223372036854775807, 3.0);",
+        )
+        .expect("setup succeeds");
+
+    let membership = execute_query(
+        &mut database,
+        "SELECT id FROM numeric_predicates
+         WHERE id IN (9007199254740992.0, 9223372036854775807)
+         ORDER BY id;",
+    );
+    assert_eq!(
+        membership.rows,
+        vec![
+            vec![Value::Int64(9_007_199_254_740_992)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+
+    let range = execute_query(
+        &mut database,
+        "SELECT id FROM numeric_predicates
+         WHERE id BETWEEN 9007199254740992.0 AND 9007199254740993
+         ORDER BY id;",
+    );
+    assert_eq!(
+        range.rows,
+        vec![
+            vec![Value::Int64(9_007_199_254_740_992)],
+            vec![Value::Int64(9_007_199_254_740_993)],
+        ]
+    );
+
+    let float_membership = execute_query(
+        &mut database,
+        "SELECT id FROM numeric_predicates WHERE reading IN (2, 3);",
+    );
+    assert_eq!(
+        float_membership.rows,
+        vec![
+            vec![Value::Int64(9_007_199_254_740_993)],
+            vec![Value::Int64(i64::MAX)],
+        ]
+    );
+}
+
+#[test]
+fn like_supports_wildcards_unicode_and_explicit_escaping() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE labels (id Int64, label String);
+             INSERT INTO labels VALUES
+                (1, 'alpha'), (2, 'al_ha'), (3, 'al%ha'), (4, 'aé'),
+                (5, 'aXX'), (6, '100%'), (7, 'bang!mark');",
+        )
+        .expect("setup succeeds");
+
+    let wildcard = execute_query(
+        &mut database,
+        "SELECT id FROM labels WHERE label LIKE 'al%a' ORDER BY id;",
+    );
+    assert_eq!(
+        wildcard.rows,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+
+    let one_character = execute_query(
+        &mut database,
+        "SELECT id FROM labels WHERE label LIKE 'a_' ORDER BY id;",
+    );
+    assert_eq!(one_character.rows, vec![vec![Value::Int64(4)]]);
+
+    let escaped = execute_query(
+        &mut database,
+        "SELECT id FROM labels
+         WHERE label LIKE 'al!_ha' ESCAPE '!'
+            OR label LIKE 'al!%ha' ESCAPE '!'
+            OR label LIKE '100\\%' ESCAPE '\\'
+            OR label LIKE 'bang!!mark' ESCAPE '!'
+         ORDER BY id;",
+    );
+    assert_eq!(
+        escaped.rows,
+        vec![
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(6)],
+            vec![Value::Int64(7)],
+        ]
+    );
+
+    let negated = execute_query(
+        &mut database,
+        "SELECT id FROM labels WHERE label NOT LIKE 'a%' ORDER BY id;",
+    );
+    assert_eq!(
+        negated.rows,
+        vec![vec![Value::Int64(6)], vec![Value::Int64(7)],]
+    );
+}
+
+#[test]
+fn rich_predicates_reject_incompatible_types_and_invalid_escapes() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE typed_predicates (id Int64, label String);")
+        .expect("setup succeeds");
+
+    let cases = [
+        ("id IN ('1')", "WHERE IN list", "Int64", "String"),
+        (
+            "id BETWEEN 0 AND '2'",
+            "WHERE BETWEEN upper bound",
+            "Int64",
+            "String",
+        ),
+        ("id LIKE '1'", "WHERE LIKE operand", "String", "Int64"),
+        ("label LIKE 1", "WHERE LIKE pattern", "String", "Int64"),
+        (
+            "label LIKE 'a' ESCAPE 1",
+            "WHERE LIKE ESCAPE",
+            "String",
+            "Int64",
+        ),
+    ];
+    for (predicate, expected_context, expected_type, actual_type) in cases {
+        let error = database
+            .execute(&format!(
+                "SELECT id FROM typed_predicates WHERE {predicate}"
+            ))
+            .expect_err("incompatible predicate types are rejected");
+        assert!(matches!(
+            error,
+            Error::TypeMismatch {
+                context,
+                expected,
+                actual,
+            } if context == expected_context && expected == expected_type && actual == actual_type
+        ));
+    }
+
+    for predicate in [
+        "label LIKE 'a' ESCAPE ''",
+        "label LIKE 'a' ESCAPE '!!'",
+        "label LIKE 'a!' ESCAPE '!'",
+    ] {
+        let error = database
+            .execute(&format!(
+                "SELECT id FROM typed_predicates WHERE {predicate}"
+            ))
+            .expect_err("invalid LIKE escape is rejected");
+        assert!(matches!(error, Error::InvalidQuery(_)));
+    }
+
+    let empty_list = database
+        .execute("SELECT id FROM typed_predicates WHERE id IN ()")
+        .expect_err("empty IN list is rejected");
+    assert!(matches!(empty_list, Error::Sql { message, .. } if message.contains("at least one")));
+}
+
+#[test]
 fn batch_failure_semantics_distinguish_parse_and_execution_errors() {
     let mut database = Database::new();
 

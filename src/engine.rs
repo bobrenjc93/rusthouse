@@ -774,6 +774,23 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    In {
+        operand: CompiledOperand,
+        values: Vec<Value>,
+        negated: bool,
+    },
+    Between {
+        operand: CompiledOperand,
+        lower: CompiledOperand,
+        upper: CompiledOperand,
+        negated: bool,
+    },
+    Like {
+        operand: CompiledOperand,
+        pattern: LikePattern,
+        negated: bool,
+    },
+    Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -800,9 +817,129 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
+            Self::In {
+                operand,
+                values,
+                negated,
+            } => {
+                let operand = operand.value(table, row);
+                let found = values
+                    .iter()
+                    .any(|value| operand.sql_cmp(value.as_ref()) == Some(Ordering::Equal));
+                found != *negated
+            }
+            Self::Between {
+                operand,
+                lower,
+                upper,
+                negated,
+            } => {
+                let operand = operand.value(table, row);
+                let in_range = lower
+                    .value(table, row)
+                    .sql_cmp(operand)
+                    .is_some_and(|comparison| comparison != Ordering::Greater)
+                    && operand
+                        .sql_cmp(upper.value(table, row))
+                        .is_some_and(|comparison| comparison != Ordering::Greater);
+                in_range != *negated
+            }
+            Self::Like {
+                operand,
+                pattern,
+                negated,
+            } => {
+                let ValueRef::String(value) = operand.value(table, row) else {
+                    unreachable!("LIKE operand type is validated")
+                };
+                pattern.matches(value) != *negated
+            }
+            Self::Not(predicate) => !predicate.evaluate(table, row),
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LikeToken {
+    Literal(char),
+    AnyOne,
+    AnyMany,
+}
+
+#[derive(Debug)]
+struct LikePattern {
+    tokens: Vec<LikeToken>,
+}
+
+impl LikePattern {
+    fn compile(pattern: &str, escape: Option<char>) -> Result<Self> {
+        let mut tokens = Vec::with_capacity(pattern.chars().count());
+        let mut characters = pattern.chars();
+        while let Some(character) = characters.next() {
+            if Some(character) == escape {
+                let literal = characters.next().ok_or_else(|| {
+                    Error::InvalidQuery(
+                        "LIKE pattern cannot end with its escape character".to_owned(),
+                    )
+                })?;
+                tokens.push(LikeToken::Literal(literal));
+            } else {
+                match character {
+                    '%' => {
+                        if !matches!(tokens.last(), Some(LikeToken::AnyMany)) {
+                            tokens.push(LikeToken::AnyMany);
+                        }
+                    }
+                    '_' => tokens.push(LikeToken::AnyOne),
+                    literal => tokens.push(LikeToken::Literal(literal)),
+                }
+            }
+        }
+        Ok(Self { tokens })
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        let mut pattern_index = 0;
+        let mut value_index = 0;
+        let mut wildcard = None;
+
+        while value_index < value.len() {
+            let character = value[value_index..]
+                .chars()
+                .next()
+                .expect("value index is at a character boundary");
+            match self.tokens.get(pattern_index) {
+                Some(LikeToken::Literal(expected)) if *expected == character => {
+                    pattern_index += 1;
+                    value_index += character.len_utf8();
+                }
+                Some(LikeToken::AnyOne) => {
+                    pattern_index += 1;
+                    value_index += character.len_utf8();
+                }
+                Some(LikeToken::AnyMany) => {
+                    pattern_index += 1;
+                    wildcard = Some((pattern_index, value_index));
+                }
+                _ => {
+                    let Some((after_wildcard, matched_through)) = wildcard else {
+                        return false;
+                    };
+                    let Some(next_character) = value[matched_through..].chars().next() else {
+                        return false;
+                    };
+                    value_index = matched_through + next_character.len_utf8();
+                    wildcard = Some((after_wildcard, value_index));
+                    pattern_index = after_wildcard;
+                }
+            }
+        }
+
+        self.tokens[pattern_index..]
+            .iter()
+            .all(|token| matches!(token, LikeToken::AnyMany))
     }
 }
 
@@ -850,6 +987,69 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::In {
+            operand,
+            values,
+            negated,
+        } => {
+            let operand = compile_operand(table, operand)?;
+            for value in values {
+                validate_comparable("WHERE IN list", operand.data_type(), value.data_type())?;
+            }
+            Ok(CompiledPredicate::In {
+                operand,
+                values: values.clone(),
+                negated: *negated,
+            })
+        }
+        Predicate::Between {
+            operand,
+            lower,
+            upper,
+            negated,
+        } => {
+            let operand = compile_operand(table, operand)?;
+            let lower = compile_operand(table, lower)?;
+            let upper = compile_operand(table, upper)?;
+            validate_comparable(
+                "WHERE BETWEEN lower bound",
+                operand.data_type(),
+                lower.data_type(),
+            )?;
+            validate_comparable(
+                "WHERE BETWEEN upper bound",
+                operand.data_type(),
+                upper.data_type(),
+            )?;
+            Ok(CompiledPredicate::Between {
+                operand,
+                lower,
+                upper,
+                negated: *negated,
+            })
+        }
+        Predicate::Like {
+            operand,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let operand = compile_operand(table, operand)?;
+            validate_type("WHERE LIKE operand", DataType::String, operand.data_type())?;
+            validate_type("WHERE LIKE pattern", DataType::String, pattern.data_type())?;
+            let Value::String(pattern) = pattern else {
+                unreachable!("LIKE pattern type is validated")
+            };
+            let escape = escape.as_ref().map(compile_like_escape).transpose()?;
+            Ok(CompiledPredicate::Like {
+                operand,
+                pattern: LikePattern::compile(pattern, escape)?,
+                negated: *negated,
+            })
+        }
+        Predicate::Not(predicate) => Ok(CompiledPredicate::Not(Box::new(compile_predicate(
+            table, predicate,
+        )?))),
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
@@ -859,6 +1059,47 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             Box::new(compile_predicate(table, right)?),
         )),
     }
+}
+
+fn validate_comparable(context: &str, expected: DataType, actual: DataType) -> Result<()> {
+    if comparable(expected, actual) {
+        Ok(())
+    } else {
+        Err(Error::TypeMismatch {
+            context: context.to_owned(),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+}
+
+fn validate_type(context: &str, expected: DataType, actual: DataType) -> Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(Error::TypeMismatch {
+            context: context.to_owned(),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+}
+
+fn compile_like_escape(value: &Value) -> Result<char> {
+    validate_type("WHERE LIKE ESCAPE", DataType::String, value.data_type())?;
+    let Value::String(value) = value else {
+        unreachable!("LIKE escape type is validated")
+    };
+    let mut characters = value.chars();
+    let escape = characters.next().ok_or_else(|| {
+        Error::InvalidQuery("LIKE ESCAPE must be exactly one character".to_owned())
+    })?;
+    if characters.next().is_some() {
+        return Err(Error::InvalidQuery(
+            "LIKE ESCAPE must be exactly one character".to_owned(),
+        ));
+    }
+    Ok(escape)
 }
 
 fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {

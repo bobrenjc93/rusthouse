@@ -7,15 +7,15 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - CREATE TABLE with Int64, Float64, Bool, and String columns
 - multi-row INSERT INTO ... VALUES with row-width and exact type validation
 - SELECT * and named projections, with optional AS aliases
-- WHERE comparisons using =, !=, <>, <, <=, >, and >=
-- AND, OR, and parentheses in predicates (AND binds more tightly)
+- WHERE comparisons using =, !=, <>, <, <=, >, and >=, plus IN, BETWEEN, and String LIKE
+- NOT, AND, OR, and parentheses in predicates (NOT binds most tightly, then AND, then OR)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
+Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''. LIKE uses `%` for any sequence and `_` for one character. Use `ESCAPE` to explicitly quote wildcard characters, for example `code LIKE 'A!_%' ESCAPE '!'`.
 
 ## CLI
 
@@ -83,7 +83,7 @@ assert_eq!(result.rows.len(), 1);
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
 
-To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
+To keep predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting, 256 total expression nodes, 1,024 values per IN list, and 1,024 characters per LIKE pattern. Queries over any limit return a SQL error before execution.
 
 On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an actionable error because the current type system has no nullable result.
 

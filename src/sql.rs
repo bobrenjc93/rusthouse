@@ -4,6 +4,8 @@ use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
+const MAX_IN_LIST_ITEMS: usize = 1_024;
+const MAX_LIKE_PATTERN_CHARACTERS: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -88,6 +90,24 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    In {
+        operand: Operand,
+        values: Vec<Value>,
+        negated: bool,
+    },
+    Between {
+        operand: Operand,
+        lower: Operand,
+        upper: Operand,
+        negated: bool,
+    },
+    Like {
+        operand: Operand,
+        pattern: Value,
+        escape: Option<Value>,
+        negated: bool,
+    },
+    Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -562,11 +582,25 @@ impl Parser {
     }
 
     fn parse_and_predicate(&mut self) -> Result<Predicate> {
-        let mut predicate = self.parse_predicate_atom()?;
+        let mut predicate = self.parse_not_predicate()?;
         while self.eat_keyword("AND") {
-            let right = self.parse_predicate_atom()?;
+            let right = self.parse_not_predicate()?;
             self.record_predicate_node()?;
             predicate = Predicate::And(Box::new(predicate), Box::new(right));
+        }
+        Ok(predicate)
+    }
+
+    fn parse_not_predicate(&mut self) -> Result<Predicate> {
+        let mut not_count = 0;
+        while self.eat_keyword("NOT") {
+            self.record_predicate_node()?;
+            not_count += 1;
+        }
+
+        let mut predicate = self.parse_predicate_atom()?;
+        for _ in 0..not_count {
+            predicate = Predicate::Not(Box::new(predicate));
         }
         Ok(predicate)
     }
@@ -587,22 +621,97 @@ impl Parser {
         }
 
         let left = self.parse_operand()?;
-        let operator = match self.peek() {
-            TokenKind::Equal => ComparisonOperator::Equal,
-            TokenKind::NotEqual => ComparisonOperator::NotEqual,
-            TokenKind::Less => ComparisonOperator::Less,
-            TokenKind::LessOrEqual => ComparisonOperator::LessOrEqual,
-            TokenKind::Greater => ComparisonOperator::Greater,
-            TokenKind::GreaterOrEqual => ComparisonOperator::GreaterOrEqual,
-            _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
+        let negated = self.eat_keyword("NOT");
+
+        let predicate = if self.eat_keyword("IN") {
+            self.parse_in_predicate(left, negated)?
+        } else if self.eat_keyword("BETWEEN") {
+            let lower = self.parse_operand()?;
+            self.expect_keyword("AND")?;
+            let upper = self.parse_operand()?;
+            Predicate::Between {
+                operand: left,
+                lower,
+                upper,
+                negated,
+            }
+        } else if self.eat_keyword("LIKE") {
+            let pattern = self.parse_literal()?;
+            if let Value::String(pattern) = &pattern
+                && pattern
+                    .chars()
+                    .take(MAX_LIKE_PATTERN_CHARACTERS + 1)
+                    .count()
+                    > MAX_LIKE_PATTERN_CHARACTERS
+            {
+                return self.error(format!(
+                    "LIKE pattern is too complex; maximum {MAX_LIKE_PATTERN_CHARACTERS} characters"
+                ));
+            }
+            let escape = if self.eat_keyword("ESCAPE") {
+                Some(self.parse_literal()?)
+            } else {
+                None
+            };
+            Predicate::Like {
+                operand: left,
+                pattern,
+                escape,
+                negated,
+            }
+        } else {
+            if negated {
+                return self.error("expected IN, BETWEEN, or LIKE after NOT");
+            }
+            let operator = match self.peek() {
+                TokenKind::Equal => ComparisonOperator::Equal,
+                TokenKind::NotEqual => ComparisonOperator::NotEqual,
+                TokenKind::Less => ComparisonOperator::Less,
+                TokenKind::LessOrEqual => ComparisonOperator::LessOrEqual,
+                TokenKind::Greater => ComparisonOperator::Greater,
+                TokenKind::GreaterOrEqual => ComparisonOperator::GreaterOrEqual,
+                _ => {
+                    return self.error(
+                        "expected comparison operator, IN, BETWEEN, LIKE, or their NOT form",
+                    );
+                }
+            };
+            self.current += 1;
+            let right = self.parse_operand()?;
+            Predicate::Comparison {
+                left,
+                operator,
+                right,
+            }
         };
-        self.current += 1;
-        let right = self.parse_operand()?;
+
         self.record_predicate_node()?;
-        Ok(Predicate::Comparison {
-            left,
-            operator,
-            right,
+        Ok(predicate)
+    }
+
+    fn parse_in_predicate(&mut self, operand: Operand, negated: bool) -> Result<Predicate> {
+        self.expect(&TokenKind::LeftParen, "'(' after IN")?;
+        if self.at(&TokenKind::RightParen) {
+            return self.error("IN list must contain at least one literal");
+        }
+
+        let mut values = Vec::new();
+        loop {
+            if values.len() >= MAX_IN_LIST_ITEMS {
+                return self.error(format!(
+                    "IN list is too complex; maximum {MAX_IN_LIST_ITEMS} items"
+                ));
+            }
+            values.push(self.parse_literal()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RightParen, "')' after IN list")?;
+        Ok(Predicate::In {
+            operand,
+            values,
+            negated,
         })
     }
 
@@ -812,6 +921,40 @@ mod tests {
         let sql = format!("SELECT id FROM things WHERE {predicate}");
 
         let error = parse(&sql).expect_err("node limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn rejects_adversarial_predicate_lists_patterns_and_unary_chains() {
+        let oversized_list = vec!["1"; 50_000].join(",");
+        let error = parse(&format!(
+            "SELECT id FROM things WHERE id IN ({oversized_list})"
+        ))
+        .expect_err("IN list limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("IN list is too complex; maximum 1024 items")
+        ));
+
+        let pattern = "%_".repeat(25_000);
+        let error = parse(&format!(
+            "SELECT id FROM things WHERE label LIKE '{pattern}'"
+        ))
+        .expect_err("LIKE pattern limit should reject query");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("LIKE pattern is too complex; maximum 1024 characters")
+        ));
+
+        let unary_chain = "NOT ".repeat(50_000);
+        let error = parse(&format!("SELECT id FROM things WHERE {unary_chain}id = 1"))
+            .expect_err("predicate node limit should reject query");
         assert!(matches!(
             error,
             Error::Sql { message, .. }
