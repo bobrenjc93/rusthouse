@@ -15,7 +15,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
 
-Identifiers are unquoted and case-insensitive; TRUE, FALSE, and NULL are reserved predicate literals and cannot be column names. NULL follows SQL three-valued predicate logic, but nullable table columns are not yet supported. String literals use single quotes; write a quote inside one as ''.
+Identifiers are unquoted and case-insensitive; TRUE, FALSE, and NULL are reserved predicate literals and cannot be column names or aliases. NULL follows SQL three-valued predicate logic, but nullable table columns are not yet supported. String literals use single quotes; write a quote inside one as ''.
 
 ## CLI
 

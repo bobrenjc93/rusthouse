@@ -486,6 +486,25 @@ fn invalid_aggregate_filters_and_distinct_wildcards_are_rejected() {
 }
 
 #[test]
+fn distinct_remains_available_as_an_aggregate_column_name() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE keyword_columns (distinct Int64);
+             INSERT INTO keyword_columns VALUES (1), (1), (2);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT SUM(distinct) AS total,
+                SUM(DISTINCT distinct) AS unique_total
+         FROM keyword_columns;",
+    );
+    assert_eq!(result.rows, vec![vec![Value::Int64(4), Value::Int64(3)]]);
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
@@ -672,6 +691,33 @@ fn predicate_literals_cannot_be_ambiguous_column_names() {
         assert!(matches!(
             database.catalog().table("reserved_names"),
             Err(Error::TableNotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn predicate_literals_cannot_be_ambiguous_aliases_in_having() {
+    for alias in ["true", "FALSE", "Null"] {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE alias_values (region String, online Bool);
+                 INSERT INTO alias_values VALUES ('west', true), ('east', false);",
+            )
+            .expect("setup succeeds");
+
+        let error = database
+            .execute(&format!(
+                "SELECT region, COUNT(*) FILTER (WHERE online) AS {alias}
+                 FROM alias_values GROUP BY region HAVING {alias};"
+            ))
+            .expect_err("predicate literal aliases are reserved");
+        assert!(matches!(
+            error,
+            Error::ReservedIdentifier {
+                identifier: rejected,
+                context,
+            } if rejected.eq_ignore_ascii_case(alias) && context == "alias"
         ));
     }
 }

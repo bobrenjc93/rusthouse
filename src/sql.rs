@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::storage::{ColumnDef, is_reserved_column_name};
+use crate::storage::{ColumnDef, is_reserved_identifier};
 use crate::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
@@ -395,7 +395,7 @@ impl Parser {
         let mut columns = Vec::new();
         loop {
             let column_name = self.expect_identifier("column name")?;
-            if is_reserved_column_name(&column_name) {
+            if is_reserved_identifier(&column_name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: column_name,
                     context: "column name".to_owned(),
@@ -535,11 +535,17 @@ impl Parser {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
             })?;
-            let distinct = self.eat_keyword("DISTINCT");
-            let argument = if self.eat(&TokenKind::Star) {
-                AggregateArgument::Wildcard
+            let saw_distinct = self.eat_keyword("DISTINCT");
+            let (distinct, argument) = if saw_distinct && self.at(&TokenKind::RightParen) {
+                // A lone DISTINCT remains a valid case-insensitive column name.
+                (false, AggregateArgument::Column("DISTINCT".to_owned()))
             } else {
-                AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                let argument = if self.eat(&TokenKind::Star) {
+                    AggregateArgument::Wildcard
+                } else {
+                    AggregateArgument::Column(self.expect_identifier("aggregate column")?)
+                };
+                (saw_distinct, argument)
             };
             self.expect(&TokenKind::RightParen, "')' after aggregate argument")?;
             let filter = if self.eat_keyword("FILTER") {
@@ -567,7 +573,14 @@ impl Parser {
 
     fn parse_alias(&mut self) -> Result<Option<String>> {
         if self.eat_keyword("AS") {
-            self.expect_identifier("alias").map(Some)
+            let alias = self.expect_identifier("alias")?;
+            if is_reserved_identifier(&alias) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: alias,
+                    context: "alias".to_owned(),
+                });
+            }
+            Ok(Some(alias))
         } else {
             Ok(None)
         }

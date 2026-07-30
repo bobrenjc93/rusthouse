@@ -10,7 +10,7 @@ pub struct ColumnDef {
     pub data_type: DataType,
 }
 
-pub(crate) fn is_reserved_column_name(name: &str) -> bool {
+pub(crate) fn is_reserved_identifier(name: &str) -> bool {
     name.eq_ignore_ascii_case("TRUE")
         || name.eq_ignore_ascii_case("FALSE")
         || name.eq_ignore_ascii_case("NULL")
@@ -108,7 +108,7 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
-            if is_reserved_column_name(&field.name) {
+            if is_reserved_identifier(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
                     context: "column name".to_owned(),
