@@ -116,16 +116,19 @@ impl Database {
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected = if select.limit == Some(0) {
+            let selected = if select.limit == Some(0) {
                 Vec::new()
+            } else if let Some(direct) = resolve_direct_group_order(&items, &ordering) {
+                let mut selected = (0..grouped.len()).collect::<Vec<_>>();
+                order_direct_group_rows(&mut selected, &grouped, &direct, select.limit);
+                selected
             } else {
-                prepare_group_order(&grouped, &items, &ordering)?
+                let mut selected = prepare_group_order(&grouped, &items, &ordering)?;
+                order_prepared_rows(&mut selected, &ordering, select.limit, |left, right| {
+                    grouped.keys[left].cmp(&grouped.keys[right])
+                });
+                selected.into_iter().map(|row| row.index).collect()
             };
-            order_grouped_rows(&mut selected, &grouped, &ordering, select.limit);
-            let selected = selected
-                .into_iter()
-                .map(|row| row.index)
-                .collect::<Vec<_>>();
             grouped.project(&selected, &items)?
         } else {
             if select.limit == Some(0) {
@@ -136,9 +139,16 @@ impl Database {
                 matching_rows.truncate(limit);
             }
             if !ordering.is_empty() {
-                let mut selected = prepare_source_order(table, &matching_rows, &items, &ordering)?;
-                order_source_rows(&mut selected, &ordering, select.limit);
-                matching_rows = selected.into_iter().map(|row| row.index).collect();
+                if let Some(direct) = resolve_direct_source_order(&items, &ordering) {
+                    order_direct_source_rows(&mut matching_rows, table, &direct, select.limit);
+                } else {
+                    let mut selected =
+                        prepare_source_order(table, &matching_rows, &items, &ordering)?;
+                    order_prepared_rows(&mut selected, &ordering, select.limit, |left, right| {
+                        left.cmp(&right)
+                    });
+                    matching_rows = selected.into_iter().map(|row| row.index).collect();
+                }
             }
             execute_projection(table, &matching_rows, &items)?
         };
@@ -695,6 +705,24 @@ struct ResolvedOrder {
     descending: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DirectSourceOrder {
+    column: usize,
+    descending: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DirectGroupOrderKey {
+    GroupPosition(usize),
+    Aggregate(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectGroupOrder {
+    key: DirectGroupOrderKey,
+    descending: bool,
+}
+
 fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
@@ -726,26 +754,67 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
     Ok(ordering)
 }
 
-#[derive(Debug)]
-struct PreparedOrder {
-    index: usize,
-    keys: Vec<Value>,
-}
-
-fn prepare_source_order(
-    table: &Table,
-    rows: &[usize],
+fn resolve_direct_source_order(
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
-) -> Result<Vec<PreparedOrder>> {
+) -> Option<Vec<DirectSourceOrder>> {
+    ordering
+        .iter()
+        .map(|order| match &items[order.output] {
+            ResolvedItem::Expression(CompiledExpression::Column { index, .. }) => {
+                Some(DirectSourceOrder {
+                    column: *index,
+                    descending: order.descending,
+                })
+            }
+            ResolvedItem::Expression(_) | ResolvedItem::Aggregate { .. } => None,
+        })
+        .collect()
+}
+
+fn resolve_direct_group_order(
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+) -> Option<Vec<DirectGroupOrder>> {
+    ordering
+        .iter()
+        .map(|order| {
+            let key = match &items[order.output] {
+                ResolvedItem::Expression(CompiledExpression::Column {
+                    group_position: Some(position),
+                    ..
+                }) => DirectGroupOrderKey::GroupPosition(*position),
+                ResolvedItem::Aggregate { state } => DirectGroupOrderKey::Aggregate(*state),
+                ResolvedItem::Expression(_) => return None,
+            };
+            Some(DirectGroupOrder {
+                key,
+                descending: order.descending,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct PreparedOrder<'a> {
+    index: usize,
+    keys: Vec<Evaluated<'a>>,
+}
+
+fn prepare_source_order<'a>(
+    table: &'a Table,
+    rows: &[usize],
+    items: &'a [ResolvedItem],
+    ordering: &[ResolvedOrder],
+) -> Result<Vec<PreparedOrder<'a>>> {
     rows.iter()
         .map(|row| {
             let keys = ordering
                 .iter()
                 .map(|order| match &items[order.output] {
-                    ResolvedItem::Expression(expression) => expression
-                        .evaluate(ExpressionSource::Row(table, *row))
-                        .map(Evaluated::into_owned),
+                    ResolvedItem::Expression(expression) => {
+                        expression.evaluate(ExpressionSource::Row(table, *row))
+                    }
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("ungrouped projections do not contain aggregates")
                     }
@@ -756,20 +825,22 @@ fn prepare_source_order(
         .collect()
 }
 
-fn prepare_group_order(
-    data: &GroupedData<'_>,
-    items: &[ResolvedItem],
+fn prepare_group_order<'a>(
+    data: &'a GroupedData<'a>,
+    items: &'a [ResolvedItem],
     ordering: &[ResolvedOrder],
-) -> Result<Vec<PreparedOrder>> {
+) -> Result<Vec<PreparedOrder<'a>>> {
     (0..data.len())
         .map(|group| {
             let keys = ordering
                 .iter()
                 .map(|order| match &items[order.output] {
-                    ResolvedItem::Expression(expression) => expression
-                        .evaluate(ExpressionSource::Group(&data.keys[group]))
-                        .map(Evaluated::into_owned),
-                    ResolvedItem::Aggregate { state } => Ok(data.aggregates[*state][group].clone()),
+                    ResolvedItem::Expression(expression) => {
+                        expression.evaluate(ExpressionSource::Group(&data.keys[group]))
+                    }
+                    ResolvedItem::Aggregate { state } => {
+                        Ok(Evaluated::Ref(data.aggregates[*state][group].as_ref()))
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(PreparedOrder { index: group, keys })
@@ -777,14 +848,17 @@ fn prepare_group_order(
         .collect()
 }
 
-fn order_source_rows(
-    rows: &mut Vec<PreparedOrder>,
-    ordering: &[ResolvedOrder],
+fn order_direct_source_rows(
+    rows: &mut Vec<usize>,
+    table: &Table,
+    ordering: &[DirectSourceOrder],
     limit: Option<usize>,
 ) {
     sort_and_limit(rows, limit, |left, right| {
-        for (position, order) in ordering.iter().enumerate() {
-            let comparison = left.keys[position].cmp(&right.keys[position]);
+        for order in ordering {
+            let comparison = table.columns()[order.column]
+                .value_ref(*left)
+                .cmp(&table.columns()[order.column].value_ref(*right));
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -793,19 +867,26 @@ fn order_source_rows(
                 };
             }
         }
-        left.index.cmp(&right.index)
+        left.cmp(right)
     });
 }
 
-fn order_grouped_rows(
-    rows: &mut Vec<PreparedOrder>,
+fn order_direct_group_rows(
+    groups: &mut Vec<usize>,
     data: &GroupedData<'_>,
-    ordering: &[ResolvedOrder],
+    ordering: &[DirectGroupOrder],
     limit: Option<usize>,
 ) {
-    sort_and_limit(rows, limit, |left, right| {
-        for (position, order) in ordering.iter().enumerate() {
-            let comparison = left.keys[position].cmp(&right.keys[position]);
+    sort_and_limit(groups, limit, |left, right| {
+        for order in ordering {
+            let comparison = match order.key {
+                DirectGroupOrderKey::GroupPosition(position) => data.keys[*left]
+                    .value(position)
+                    .cmp(&data.keys[*right].value(position)),
+                DirectGroupOrderKey::Aggregate(state) => {
+                    data.aggregates[state][*left].cmp(&data.aggregates[state][*right])
+                }
+            };
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -814,7 +895,30 @@ fn order_grouped_rows(
                 };
             }
         }
-        data.keys[left.index].cmp(&data.keys[right.index])
+        data.keys[*left].cmp(&data.keys[*right])
+    });
+}
+
+fn order_prepared_rows(
+    rows: &mut Vec<PreparedOrder<'_>>,
+    ordering: &[ResolvedOrder],
+    limit: Option<usize>,
+    fallback: impl Fn(usize, usize) -> Ordering,
+) {
+    sort_and_limit(rows, limit, |left, right| {
+        for (position, order) in ordering.iter().enumerate() {
+            let comparison = left.keys[position]
+                .as_ref()
+                .cmp(&right.keys[position].as_ref());
+            if comparison != Ordering::Equal {
+                return if order.descending {
+                    comparison.reverse()
+                } else {
+                    comparison
+                };
+            }
+        }
+        fallback(left.index, right.index)
     });
 }
 

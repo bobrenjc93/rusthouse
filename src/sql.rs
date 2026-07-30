@@ -657,12 +657,6 @@ impl Parser {
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
         if self.at(&TokenKind::LeftParen) {
-            if self.predicate_depth >= MAX_PREDICATE_DEPTH {
-                return self.error(format!(
-                    "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
-                ));
-            }
-
             let start = self.current;
             let predicate_nodes = self.predicate_nodes;
             if let Ok(comparison) = self.parse_comparison() {
@@ -670,6 +664,12 @@ impl Parser {
             }
             self.current = start;
             self.predicate_nodes = predicate_nodes;
+
+            if self.predicate_depth >= MAX_PREDICATE_DEPTH {
+                return self.error(format!(
+                    "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
+                ));
+            }
 
             self.current += 1;
             self.predicate_depth += 1;
@@ -1051,6 +1051,33 @@ mod tests {
             error,
             Error::Sql { message, .. }
                 if message.contains("predicate is too complex; maximum 256 expression nodes")
+        ));
+    }
+
+    #[test]
+    fn predicate_and_scalar_parentheses_have_independent_depth_limits() {
+        for comparison in ["id = 1", "(id) = 1"] {
+            let predicate = format!(
+                "{}{}{}",
+                "(".repeat(MAX_PREDICATE_DEPTH),
+                comparison,
+                ")".repeat(MAX_PREDICATE_DEPTH)
+            );
+            parse(&format!("SELECT id FROM things WHERE {predicate}"))
+                .expect("predicate at the documented depth limit should parse");
+        }
+
+        let predicate = format!(
+            "{}(id) = 1{}",
+            "(".repeat(MAX_PREDICATE_DEPTH + 1),
+            ")".repeat(MAX_PREDICATE_DEPTH + 1)
+        );
+        let error = parse(&format!("SELECT id FROM things WHERE {predicate}"))
+            .expect_err("one additional Boolean level should be rejected");
+        assert!(matches!(
+            error,
+            Error::Sql { message, .. }
+                if message.contains("predicate nesting exceeds limit of 64")
         ));
     }
 
