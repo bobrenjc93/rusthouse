@@ -339,6 +339,11 @@ fn requires_ordered_float_replay(spec: &AggregateSpec) -> bool {
         )
 }
 
+fn may_require_ordered_replay(spec: &AggregateSpec) -> bool {
+    requires_ordered_float_replay(spec)
+        || (spec.function == AggregateFunction::Sum && spec.input_type == Some(DataType::Int64))
+}
+
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
@@ -378,10 +383,10 @@ fn execute_grouped<'a>(
     query_parallelism: NonZeroUsize,
 ) -> Result<GroupedData<'a>> {
     let ranges = scan_ranges(table.row_count());
-    // A Float64 partition total cannot reproduce row-ordered overflow after
-    // merge, so partitioned SUM/AVG retain their input order for replay.
-    let replay_float_inputs =
-        ranges.len() > 1 && aggregate_specs.iter().any(requires_ordered_float_replay);
+    // Partition summaries cannot always reproduce row-ordered overflow, so
+    // affected aggregates retain enough input order for a checked replay.
+    let record_ordered_rows =
+        ranges.len() > 1 && aggregate_specs.iter().any(may_require_ordered_replay);
     let partitions = if ranges.len() == 1 || query_parallelism.get() == 1 {
         ranges
             .into_iter()
@@ -392,7 +397,7 @@ fn execute_grouped<'a>(
                     predicate,
                     group_columns,
                     aggregate_specs,
-                    replay_float_inputs,
+                    record_ordered_rows,
                 )
             })
             .collect::<Result<Vec<_>>>()?
@@ -404,7 +409,7 @@ fn execute_grouped<'a>(
             group_columns,
             aggregate_specs,
             query_parallelism.get(),
-            replay_float_inputs,
+            record_ordered_rows,
         )?
     };
 
@@ -429,7 +434,7 @@ fn scan_grouped_partitions_parallel<'a>(
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
     query_parallelism: usize,
-    replay_float_inputs: bool,
+    record_ordered_rows: bool,
 ) -> Result<Vec<GroupedPartition<'a>>> {
     let worker_count = query_parallelism.min(ranges.len());
 
@@ -452,7 +457,7 @@ fn scan_grouped_partitions_parallel<'a>(
                             predicate,
                             group_columns,
                             aggregate_specs,
-                            replay_float_inputs,
+                            record_ordered_rows,
                         )
                     })
                     .collect::<Result<Vec<_>>>()
@@ -476,7 +481,7 @@ fn scan_grouped_partition<'a>(
     predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
-    replay_float_inputs: bool,
+    record_ordered_rows: bool,
 ) -> Result<GroupedPartition<'a>> {
     let range_len = range.len();
     let mut groups = GroupIndex::new(group_columns.len(), range_len);
@@ -492,10 +497,10 @@ fn scan_grouped_partition<'a>(
             states
         })
         .collect::<Vec<_>>();
-    let mut replay_rows = if replay_float_inputs {
-        Vec::with_capacity(range_len)
+    let mut ordered_rows = if record_ordered_rows {
+        Some(Vec::with_capacity(range_len))
     } else {
-        Vec::new()
+        None
     };
 
     for row in range {
@@ -509,23 +514,26 @@ fn scan_grouped_partition<'a>(
                 states.push(AggregateState::new(spec));
             }
         }
-        if replay_float_inputs {
-            replay_rows.push((group, row));
+        if let Some(ordered_rows) = &mut ordered_rows {
+            ordered_rows.push((group, row));
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            if replay_float_inputs && requires_ordered_float_replay(spec) {
+            if record_ordered_rows && requires_ordered_float_replay(spec) {
                 continue;
             }
-            states[group].update(spec, table, row)?;
+            if record_ordered_rows {
+                states[group].update_partition(spec, table, row)?;
+            } else {
+                states[group].update(spec, table, row)?;
+            }
         }
     }
 
     Ok(GroupedPartition {
         keys: groups.into_keys(group_count),
         aggregate_states,
-        replay_rows,
-        replays_float_inputs: replay_float_inputs,
+        ordered_rows,
     })
 }
 
@@ -552,8 +560,7 @@ fn merge_grouped_partitions<'a>(
         let GroupedPartition {
             keys,
             aggregate_states: local_aggregate_states,
-            replay_rows,
-            replays_float_inputs,
+            ordered_rows,
         } = partition;
         let mut global_groups = Vec::with_capacity(keys.len());
         for key in &keys {
@@ -567,12 +574,27 @@ fn merge_grouped_partitions<'a>(
             global_groups.push(group);
         }
 
-        for ((states, local_states), spec) in aggregate_states
+        let mut replay_aggregates = vec![false; aggregate_specs.len()];
+        for (aggregate, ((states, local_states), spec)) in aggregate_states
             .iter_mut()
             .zip(local_aggregate_states)
             .zip(aggregate_specs)
+            .enumerate()
         {
-            if replays_float_inputs && requires_ordered_float_replay(spec) {
+            let mut replay = ordered_rows.is_some() && requires_ordered_float_replay(spec);
+            if ordered_rows.is_some()
+                && spec.function == AggregateFunction::Sum
+                && spec.input_type == Some(DataType::Int64)
+            {
+                for (state, group) in local_states.iter().zip(&global_groups) {
+                    if states[*group].int_sum_merge_overflows(state)? {
+                        replay = true;
+                        break;
+                    }
+                }
+            }
+            replay_aggregates[aggregate] = replay;
+            if replay {
                 continue;
             }
             for (state, group) in local_states.into_iter().zip(&global_groups) {
@@ -580,11 +602,15 @@ fn merge_grouped_partitions<'a>(
             }
         }
 
-        for (local_group, row) in replay_rows {
-            let global_group = global_groups[local_group];
-            for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
-                if requires_ordered_float_replay(spec) {
-                    states[global_group].update(spec, table, row)?;
+        if let Some(ordered_rows) = ordered_rows {
+            for (local_group, row) in ordered_rows {
+                let global_group = global_groups[local_group];
+                for (aggregate, (states, spec)) in
+                    aggregate_states.iter_mut().zip(aggregate_specs).enumerate()
+                {
+                    if replay_aggregates[aggregate] {
+                        states[global_group].update(spec, table, row)?;
+                    }
                 }
             }
         }
@@ -609,8 +635,7 @@ fn merge_grouped_partitions<'a>(
 struct GroupedPartition<'a> {
     keys: Vec<GroupKey<'a>>,
     aggregate_states: Vec<Vec<AggregateState>>,
-    replay_rows: Vec<(usize, usize)>,
-    replays_float_inputs: bool,
+    ordered_rows: Option<Vec<(usize, usize)>>,
 }
 
 #[derive(Debug)]
@@ -815,6 +840,20 @@ impl AggregateState {
     }
 
     fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        self.update_inner(spec, table, row, true)
+    }
+
+    fn update_partition(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        self.update_inner(spec, table, row, false)
+    }
+
+    fn update_inner(
+        &mut self,
+        spec: &AggregateSpec,
+        table: &Table,
+        row: usize,
+        check_int_sum_overflow: bool,
+    ) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -826,7 +865,7 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                sum.update(values[row])?;
+                sum.update(values[row], check_int_sum_overflow)?;
             }
             Self::SumFloat(sum) => {
                 let Column::Float64(values) =
@@ -887,6 +926,13 @@ impl AggregateState {
             }
         }
         Ok(())
+    }
+
+    fn int_sum_merge_overflows(&self, other: &Self) -> Result<bool> {
+        match (self, other) {
+            (Self::SumInt(left), Self::SumInt(right)) => left.merge_overflows_i64(right),
+            _ => unreachable!("SUM(Int64) states have matching variants"),
+        }
     }
 
     fn merge(&mut self, other: Self) -> Result<()> {
@@ -992,14 +1038,29 @@ struct IntSum {
 }
 
 impl IntSum {
-    fn update(&mut self, value: i64) -> Result<()> {
+    fn update(&mut self, value: i64, check_i64_overflow: bool) -> Result<()> {
         self.total = self
             .total
             .checked_add(i128::from(value))
             .ok_or_else(sum_int_overflow)?;
         self.min_prefix = self.min_prefix.min(self.total);
         self.max_prefix = self.max_prefix.max(self.total);
+        if check_i64_overflow && self.is_i64_overflow() {
+            return Err(sum_int_overflow());
+        }
         Ok(())
+    }
+
+    fn merge_overflows_i64(&self, other: &Self) -> Result<bool> {
+        let translated_min = self
+            .total
+            .checked_add(other.min_prefix)
+            .ok_or_else(sum_int_overflow)?;
+        let translated_max = self
+            .total
+            .checked_add(other.max_prefix)
+            .ok_or_else(sum_int_overflow)?;
+        Ok(translated_min < i128::from(i64::MIN) || translated_max > i128::from(i64::MAX))
     }
 
     fn merge(&mut self, other: Self) -> Result<()> {
@@ -1021,10 +1082,14 @@ impl IntSum {
     }
 
     fn finish(self) -> Result<i64> {
-        if self.min_prefix < i128::from(i64::MIN) || self.max_prefix > i128::from(i64::MAX) {
+        if self.is_i64_overflow() {
             return Err(sum_int_overflow());
         }
         i64::try_from(self.total).map_err(|_| sum_int_overflow())
+    }
+
+    fn is_i64_overflow(&self) -> bool {
+        self.min_prefix < i128::from(i64::MIN) || self.max_prefix > i128::from(i64::MAX)
     }
 }
 

@@ -180,6 +180,27 @@ fn parallel_merge_preserves_overflow_and_empty_input_semantics() {
         }
     }
 
+    for (sql, operation) in [
+        (
+            "SELECT SUM(overflow_sum), SUM(overflow_float) FROM generated;",
+            "SUM(Int64)",
+        ),
+        (
+            "SELECT SUM(overflow_float), SUM(overflow_sum) FROM generated;",
+            "SUM(Float64)",
+        ),
+    ] {
+        for thread_count in THREAD_COUNTS {
+            database
+                .set_query_parallelism(thread_count)
+                .expect("positive parallelism");
+            let error = database
+                .execute(sql)
+                .expect_err("same-row overflow follows SELECT item order");
+            assert_eq!(error, Error::NumericOverflow(operation.to_owned()));
+        }
+    }
+
     let global_empty = assert_equivalent(
         &mut database,
         "SELECT COUNT(*) AS rows, SUM(value) AS total FROM generated WHERE id < 0;",
@@ -206,6 +227,30 @@ fn parallel_merge_preserves_overflow_and_empty_input_semantics() {
             error,
             Error::InvalidQuery("MIN is undefined for an empty input".to_owned())
         );
+    }
+}
+
+#[test]
+fn mixed_aggregate_overflow_follows_source_row_order() {
+    let mut database = Database::new();
+    let setup = format!(
+        "CREATE TABLE mixed_overflow (i Int64, f Float64); \
+         INSERT INTO mixed_overflow VALUES \
+         ({},0.0),(1,0.0),(-1,{:e}),(0,{:e});",
+        i64::MAX,
+        f64::MAX,
+        f64::MAX,
+    );
+    database.execute(&setup).expect("setup succeeds");
+
+    for sql in [
+        "SELECT SUM(i), SUM(f) FROM mixed_overflow;",
+        "SELECT SUM(f), SUM(i) FROM mixed_overflow;",
+    ] {
+        let error = database
+            .execute(sql)
+            .expect_err("Int64 sum overflows on the earlier source row");
+        assert_eq!(error, Error::NumericOverflow("SUM(Int64)".to_owned()));
     }
 }
 
