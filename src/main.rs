@@ -139,7 +139,7 @@ impl<'a, W: Write> CliSink<'a, W> {
             }
             self.output.write_all(b"\n")?;
         }
-        Ok(())
+        self.output.flush()
     }
 
     fn finish_after_database_error(&mut self) -> io::Result<()> {
@@ -175,7 +175,8 @@ impl<W: Write> ResultSink for CliSink<'_, W> {
             OutputFormat::Csv => write_csv_header(self.output, columns),
             OutputFormat::Json => write_json_query_start(self.output, columns),
             OutputFormat::Table => unreachable!("table results use the collecting adapter"),
-        }
+        }?;
+        self.output.flush()
     }
 
     fn rows(&mut self, rows: &[Vec<Value>]) -> io::Result<()> {
@@ -183,7 +184,8 @@ impl<W: Write> ResultSink for CliSink<'_, W> {
             OutputFormat::Csv => write_csv_rows(self.output, rows),
             OutputFormat::Json => write_json_rows(self.output, rows, &mut self.first_row),
             OutputFormat::Table => unreachable!("table results use the collecting adapter"),
-        }
+        }?;
+        self.output.flush()
     }
 
     fn end_query(&mut self) -> io::Result<()> {
@@ -191,7 +193,8 @@ impl<W: Write> ResultSink for CliSink<'_, W> {
             OutputFormat::Csv => Ok(()),
             OutputFormat::Json => write_json_query_end(self.output),
             OutputFormat::Table => unreachable!("table results use the collecting adapter"),
-        }
+        }?;
+        self.output.flush()
     }
 }
 
@@ -309,5 +312,49 @@ mod tests {
             render_query_results(&[result.clone(), result], OutputFormat::Json),
             "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
         );
+    }
+
+    #[test]
+    fn buffered_writer_failures_stop_later_statements() {
+        struct CloseAfterHeader {
+            writes: usize,
+        }
+
+        impl Write for CloseAfterHeader {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                if self.writes == 0 {
+                    self.writes += 1;
+                    Ok(buffer.len())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe"))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut database = Database::new();
+        let mut output = BufWriter::with_capacity(8 * 1_024, CloseAfterHeader { writes: 0 });
+        let mut sink = CliSink::new(&mut output, OutputFormat::Csv);
+        let error = database
+            .execute_into(
+                "CREATE TABLE source (n Int64); \
+                 INSERT INTO source VALUES (1); \
+                 SELECT n FROM source; \
+                 CREATE TABLE not_executed (n Int64);",
+                &mut sink,
+            )
+            .expect_err("row batch flush reaches the writer closed after its header");
+
+        assert!(matches!(
+            error,
+            ExecuteError::Sink(error) if error.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert!(matches!(
+            database.catalog().table("not_executed"),
+            Err(rusthouse::Error::TableNotFound(_))
+        ));
     }
 }
