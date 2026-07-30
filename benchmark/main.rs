@@ -1035,15 +1035,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_failure_removes_the_recognized_stale_details() {
+    fn parse_failure_before_details_removes_the_prescanned_stale_artifact() {
         let directory = test_directory("stale-parse");
         let details_path = directory.join("details.json");
         fs::write(&details_path, "stale").expect("stale details");
         let failure = match config::parse(
             [
-                format!("--details={}", details_path.display()),
                 "--seeds".to_owned(),
                 "--seed=1".to_owned(),
+                format!("--details={}", details_path.display()),
                 "--clickhouse=/clickhouse".to_owned(),
             ],
             None,

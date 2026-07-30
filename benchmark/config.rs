@@ -113,6 +113,8 @@ pub fn parse(
     rusthouse_from_env: Option<String>,
     default_rusthouse: PathBuf,
 ) -> Result<ParseResult, ParseFailure> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let failure_details = prescan_details(&arguments);
     let mut mode = Mode::Default;
     let mut seed = None;
     let mut audit_seeds = false;
@@ -209,7 +211,35 @@ pub fn parse(
         }))
     })();
 
-    result.map_err(|message| ParseFailure { message, details })
+    result.map_err(|message| ParseFailure {
+        message,
+        details: failure_details,
+    })
+}
+
+fn prescan_details(arguments: &[String]) -> Option<PathBuf> {
+    let mut details = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        match argument.as_str() {
+            "--details" => {
+                if let Some(path) = arguments.get(index + 1) {
+                    details = Some(PathBuf::from(path));
+                    index += 1;
+                }
+            }
+            "--mode" | "--seed" | "--clickhouse" | "--rusthouse" => {
+                index += usize::from(arguments.get(index + 1).is_some());
+            }
+            _ if argument.starts_with("--details=") => {
+                details = Some(PathBuf::from(&argument["--details=".len()..]));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    details
 }
 
 fn reject_seed_conflict(audit_seeds: bool) -> Result<(), String> {
@@ -312,6 +342,25 @@ mod tests {
             };
             assert!(error.to_string().contains("mutually exclusive"));
         }
+    }
+
+    #[test]
+    fn details_prescan_continues_after_errors_and_respects_option_arity() {
+        let arguments = [
+            "--seeds",
+            "--seed=1",
+            "--details",
+            "audit.json",
+            "--clickhouse=/clickhouse",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            prescan_details(&arguments),
+            Some(PathBuf::from("audit.json"))
+        );
+
+        let consumed_as_value = ["--rusthouse", "--details", "unknown"].map(str::to_owned);
+        assert_eq!(prescan_details(&consumed_as_value), None);
     }
 
     #[test]
