@@ -70,10 +70,13 @@ fn run() -> Result<(), CliError> {
             let stdout = io::stdout();
             let output = BufWriter::new(stdout.lock());
             let mut sink = CommandSink::new(JsonSink::new(output));
-            database
-                .execute_with_sink(&sql, &mut sink)
-                .map_err(map_execution_error)?;
-            sink.output.finish().map_err(CliError::Io)?;
+            let execution = database.execute_with_sink(&sql, &mut sink);
+            let finalization = sink.output.finish();
+            if let Err(error) = execution {
+                let _ = sink.output.get_mut().flush();
+                return Err(map_execution_error(error));
+            }
+            finalization.map_err(CliError::Io)?;
             write_commands(&sink.commands)?;
             sink.output.get_mut().flush().map_err(CliError::Io)
         }
