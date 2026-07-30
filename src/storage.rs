@@ -86,6 +86,119 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn converted(&self, target: DataType, table_name: &str, column_name: &str) -> Result<Self> {
+        let source = self.data_type();
+        let failure = |row: Option<usize>, reason: String| Error::ColumnConversion {
+            table: table_name.to_owned(),
+            column: column_name.to_owned(),
+            from: source,
+            to: target,
+            row,
+            reason: reason.into_boxed_str(),
+        };
+
+        match (self, target) {
+            (Self::Int64(values), DataType::Int64) => Ok(Self::Int64(values.clone())),
+            (Self::Int64(values), DataType::Float64) => Ok(Self::Float64(
+                values.iter().map(|value| *value as f64).collect(),
+            )),
+            (Self::Int64(values), DataType::String) => {
+                Ok(Self::String(values.iter().map(i64::to_string).collect()))
+            }
+            (Self::Float64(values), DataType::Int64) => {
+                const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+                let mut converted = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().copied().enumerate() {
+                    let row = Some(index + 1);
+                    if !value.is_finite() {
+                        return Err(failure(row, format!("non-finite Float64 value {value}")));
+                    }
+                    if value < i64::MIN as f64 || value >= I64_UPPER_EXCLUSIVE {
+                        return Err(failure(row, format!("Int64 overflow for value {value}")));
+                    }
+                    if value.fract() != 0.0 {
+                        return Err(failure(
+                            row,
+                            format!("Float64 value {value} is not an integer"),
+                        ));
+                    }
+                    converted.push(value as i64);
+                }
+                Ok(Self::Int64(converted))
+            }
+            (Self::Float64(values), DataType::Float64) => Ok(Self::Float64(values.clone())),
+            (Self::Float64(values), DataType::String) => Ok(Self::String(
+                values
+                    .iter()
+                    .map(|value| Value::Float64(*value).as_display_string())
+                    .collect(),
+            )),
+            (Self::Bool(values), DataType::Bool) => Ok(Self::Bool(values.clone())),
+            (Self::Bool(values), DataType::String) => {
+                Ok(Self::String(values.iter().map(bool::to_string).collect()))
+            }
+            (Self::String(values), DataType::Int64) => {
+                use std::num::IntErrorKind;
+
+                let mut converted = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    match value.parse::<i64>() {
+                        Ok(value) => converted.push(value),
+                        Err(error) => {
+                            let reason = match error.kind() {
+                                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
+                                    format!("Int64 overflow parsing {value:?}")
+                                }
+                                _ => format!("invalid Int64 value {value:?}"),
+                            };
+                            return Err(failure(Some(index + 1), reason));
+                        }
+                    }
+                }
+                Ok(Self::Int64(converted))
+            }
+            (Self::String(values), DataType::Float64) => {
+                let mut converted = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    let parsed = value.parse::<f64>().map_err(|_| {
+                        failure(Some(index + 1), format!("invalid Float64 value {value:?}"))
+                    })?;
+                    if !parsed.is_finite() {
+                        return Err(failure(
+                            Some(index + 1),
+                            format!("non-finite Float64 value parsed from {value:?}"),
+                        ));
+                    }
+                    converted.push(parsed);
+                }
+                Ok(Self::Float64(converted))
+            }
+            (Self::String(values), DataType::Bool) => {
+                let mut converted = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    if value.eq_ignore_ascii_case("true") {
+                        converted.push(true);
+                    } else if value.eq_ignore_ascii_case("false") {
+                        converted.push(false);
+                    } else {
+                        return Err(failure(
+                            Some(index + 1),
+                            format!("invalid Bool value {value:?}; expected true or false"),
+                        ));
+                    }
+                }
+                Ok(Self::Bool(converted))
+            }
+            (Self::String(values), DataType::String) => Ok(Self::String(values.clone())),
+            (Self::Int64(_), DataType::Bool)
+            | (Self::Float64(_), DataType::Bool)
+            | (Self::Bool(_), DataType::Int64 | DataType::Float64) => Err(failure(
+                None,
+                "this type conversion is not supported".to_owned(),
+            )),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -196,6 +309,18 @@ impl Table {
         self.row_count += 1;
         Ok(())
     }
+
+    /// Rebuilds a physical column and installs it only after every row converts.
+    pub fn modify_column(&mut self, name: &str, data_type: DataType) -> Result<()> {
+        let index = self.column_index(name)?;
+        let column_name = &self.schema[index].name;
+        let replacement = self.columns[index].converted(data_type, &self.name, column_name)?;
+        debug_assert_eq!(replacement.len(), self.row_count);
+
+        self.columns[index] = replacement;
+        self.schema[index].data_type = data_type;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +365,35 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn non_finite_float_narrowing_reports_its_row_without_mutation() {
+        let mut table = Table {
+            name: "readings".to_owned(),
+            schema: vec![ColumnDef {
+                name: "value".to_owned(),
+                data_type: DataType::Float64,
+            }],
+            columns: vec![Column::Float64(vec![1.0, f64::INFINITY])],
+            row_count: 2,
+        };
+
+        let error = table
+            .modify_column("value", DataType::Int64)
+            .expect_err("non-finite value is rejected");
+        assert!(matches!(
+            error,
+            Error::ColumnConversion {
+                row: Some(2),
+                reason,
+                ..
+            } if reason.contains("non-finite")
+        ));
+        assert_eq!(table.schema()[0].data_type, DataType::Float64);
+        assert!(matches!(
+            &table.columns()[0],
+            Column::Float64(values) if values[1].is_infinite()
+        ));
     }
 }

@@ -11,6 +11,11 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
     },
+    AlterTableModifyColumn {
+        table: String,
+        column: String,
+        data_type: DataType,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -374,12 +379,14 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_keyword("CREATE") {
             self.parse_create()
+        } else if self.eat_keyword("ALTER") {
+            self.parse_alter()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, ALTER, INSERT, or SELECT")
         }
     }
 
@@ -396,14 +403,7 @@ impl Parser {
                     context: "column name".to_owned(),
                 });
             }
-            let position = self.position();
-            let type_name = self.expect_identifier("column type")?;
-            let data_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                position,
-                message: format!(
-                    "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
-                ),
-            })?;
+            let data_type = self.parse_data_type()?;
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
@@ -414,6 +414,31 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("MODIFY")?;
+        self.expect_keyword("COLUMN")?;
+        let column = self.expect_identifier("column name")?;
+        let data_type = self.parse_data_type()?;
+        Ok(Statement::AlterTableModifyColumn {
+            table,
+            column,
+            data_type,
+        })
+    }
+
+    fn parse_data_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("column type")?;
+        DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown type '{type_name}'; expected Int64, Float64, Bool, or String"
+            ),
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -782,6 +807,20 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_alter_table_modify_column() {
+        let statements =
+            parse("ALTER TABLE events MODIFY COLUMN reading Float64").expect("valid ALTER TABLE");
+        assert_eq!(
+            statements,
+            vec![Statement::AlterTableModifyColumn {
+                table: "events".to_owned(),
+                column: "reading".to_owned(),
+                data_type: DataType::Float64,
+            }]
+        );
     }
 
     #[test]

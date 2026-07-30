@@ -69,6 +69,19 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::AlterTableModifyColumn {
+                table,
+                column,
+                data_type,
+            } => {
+                self.catalog
+                    .table_mut(&table)?
+                    .modify_column(&column, data_type)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
                 {

@@ -12,6 +12,269 @@ fn execute_query(database: &mut Database, sql: &str) -> QueryResult {
 }
 
 #[test]
+fn alter_modify_column_supports_the_complete_conversion_matrix() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE conversions (
+                int_identity Int64, int_float Int64, int_string Int64,
+                float_int Float64, float_identity Float64, float_string Float64,
+                bool_identity Bool, bool_string Bool,
+                string_int String, string_float String, string_bool String,
+                string_identity String
+             );
+             INSERT INTO conversions VALUES
+                (-7, 8, 9, -10.0, 11.5, 12.25, true, false,
+                 '13', '14.5', 'TRUE', 'unchanged');",
+        )
+        .expect("setup succeeds");
+
+    let alterations = [
+        "ALTER TABLE conversions MODIFY COLUMN int_identity Int64",
+        "ALTER TABLE conversions MODIFY COLUMN int_float Float64",
+        "ALTER TABLE conversions MODIFY COLUMN int_string String",
+        "ALTER TABLE conversions MODIFY COLUMN float_int Int64",
+        "ALTER TABLE conversions MODIFY COLUMN float_identity Float64",
+        "ALTER TABLE conversions MODIFY COLUMN float_string String",
+        "ALTER TABLE conversions MODIFY COLUMN bool_identity Bool",
+        "ALTER TABLE conversions MODIFY COLUMN bool_string String",
+        "ALTER TABLE conversions MODIFY COLUMN string_int Int64",
+        "ALTER TABLE conversions MODIFY COLUMN string_float Float64",
+        "ALTER TABLE conversions MODIFY COLUMN string_bool Bool",
+        "ALTER TABLE conversions MODIFY COLUMN string_identity String",
+    ];
+    for statement in alterations {
+        assert_eq!(
+            database.execute(statement).expect("conversion succeeds"),
+            vec![StatementResult::Command {
+                tag: "ALTER TABLE",
+                affected_rows: 0,
+            }]
+        );
+    }
+
+    let result = execute_query(&mut database, "SELECT * FROM conversions");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.data_type))
+            .collect::<Vec<_>>(),
+        vec![
+            ("int_identity", DataType::Int64),
+            ("int_float", DataType::Float64),
+            ("int_string", DataType::String),
+            ("float_int", DataType::Int64),
+            ("float_identity", DataType::Float64),
+            ("float_string", DataType::String),
+            ("bool_identity", DataType::Bool),
+            ("bool_string", DataType::String),
+            ("string_int", DataType::Int64),
+            ("string_float", DataType::Float64),
+            ("string_bool", DataType::Bool),
+            ("string_identity", DataType::String),
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(-7),
+            Value::Float64(8.0),
+            Value::String("9".to_owned()),
+            Value::Int64(-10),
+            Value::Float64(11.5),
+            Value::String("12.25".to_owned()),
+            Value::Bool(true),
+            Value::String("false".to_owned()),
+            Value::Int64(13),
+            Value::Float64(14.5),
+            Value::Bool(true),
+            Value::String("unchanged".to_owned()),
+        ]]
+    );
+
+    database
+        .execute(
+            "INSERT INTO conversions VALUES
+             (1, 2.5, '3', 4, 5.5, '6.0', false, 'true', 7, 8.5, false, 'new')",
+        )
+        .expect("inserts use the replacement types");
+    let inserted = execute_query(
+        &mut database,
+        "SELECT int_float, float_int, string_bool, string_identity
+         FROM conversions WHERE int_identity = 1",
+    );
+    assert_eq!(
+        inserted.rows,
+        vec![vec![
+            Value::Float64(2.5),
+            Value::Int64(4),
+            Value::Bool(false),
+            Value::String("new".to_owned()),
+        ]]
+    );
+}
+
+#[test]
+fn alter_modify_column_handles_empty_and_large_tables() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE empty_values (id Int64, value String);
+             ALTER TABLE empty_values MODIFY COLUMN value Float64;
+             INSERT INTO empty_values VALUES (1, 2.5);",
+        )
+        .expect("empty physical column converts");
+    assert_eq!(
+        execute_query(&mut database, "SELECT * FROM empty_values").rows,
+        vec![vec![Value::Int64(1), Value::Float64(2.5)]]
+    );
+
+    const ROW_COUNT: usize = 25_000;
+    let values = (0..ROW_COUNT)
+        .map(|value| format!("('{value}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    database
+        .execute("CREATE TABLE large_values (value String)")
+        .expect("large table created");
+    database
+        .execute(&format!("INSERT INTO large_values VALUES {values}"))
+        .expect("large table populated");
+    database
+        .execute("ALTER TABLE large_values MODIFY COLUMN value Int64")
+        .expect("large physical column converts");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS rows, SUM(value) AS total FROM large_values",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Int64(ROW_COUNT as i64),
+            Value::Int64(312_487_500),
+        ]]
+    );
+}
+
+#[test]
+fn alter_modify_column_failures_report_rows_and_roll_back() {
+    let cases = [
+        ("Int64", "not-an-int", "invalid Int64 value"),
+        ("Int64", "9223372036854775808", "Int64 overflow"),
+        ("Float64", "1e999", "non-finite Float64"),
+    ];
+
+    for (target, bad_value, expected_reason) in cases {
+        let mut database = Database::new();
+        database
+            .execute(&format!(
+                "CREATE TABLE raw_values (id Int64, value String);
+                 INSERT INTO raw_values VALUES (1, '10'), (2, '{bad_value}'), (3, '30')"
+            ))
+            .expect("setup succeeds");
+
+        let error = database
+            .execute(&format!(
+                "ALTER TABLE raw_values MODIFY COLUMN value {target}"
+            ))
+            .expect_err("conversion fails");
+        assert!(matches!(
+            error,
+            Error::ColumnConversion {
+                table,
+                column,
+                row: Some(2),
+                reason,
+                ..
+            } if table == "raw_values"
+                && column == "value"
+                && reason.contains(expected_reason)
+        ));
+
+        database
+            .execute("INSERT INTO raw_values VALUES (4, 'still a string')")
+            .expect("the original schema remains active");
+        let result = execute_query(
+            &mut database,
+            "SELECT id, value FROM raw_values ORDER BY id",
+        );
+        assert_eq!(result.columns[1].data_type, DataType::String);
+        assert_eq!(result.rows[1][1], Value::String(bad_value.to_owned()));
+        assert_eq!(
+            result.rows[3],
+            vec![Value::Int64(4), Value::String("still a string".to_owned())]
+        );
+    }
+
+    for (bad_value, expected_reason) in [("3.5", "not an integer"), ("1e300", "overflow")] {
+        let mut database = Database::new();
+        database
+            .execute(&format!(
+                "CREATE TABLE floats (id Int64, value Float64);
+                 INSERT INTO floats VALUES (1, 2.0), (2, {bad_value}), (3, 4.0)"
+            ))
+            .expect("setup succeeds");
+        let error = database
+            .execute("ALTER TABLE floats MODIFY COLUMN value Int64")
+            .expect_err("checked narrowing fails");
+        assert!(matches!(
+            error,
+            Error::ColumnConversion {
+                row: Some(2),
+                reason,
+                ..
+            } if reason.contains(expected_reason)
+        ));
+        let result = execute_query(&mut database, "SELECT value FROM floats");
+        assert_eq!(result.columns[0].data_type, DataType::Float64);
+        assert_eq!(result.rows[0], vec![Value::Float64(2.0)]);
+        assert_eq!(result.rows[2], vec![Value::Float64(4.0)]);
+    }
+}
+
+#[test]
+fn alter_modify_column_rejects_unsupported_conversions_atomically() {
+    for (source, value, target) in [
+        (DataType::Int64, "1", DataType::Bool),
+        (DataType::Float64, "1.0", DataType::Bool),
+        (DataType::Bool, "true", DataType::Int64),
+        (DataType::Bool, "false", DataType::Float64),
+    ] {
+        let mut database = Database::new();
+        database
+            .execute(&format!(
+                "CREATE TABLE unsupported (value {source});
+                 INSERT INTO unsupported VALUES ({value})"
+            ))
+            .expect("setup succeeds");
+        let error = database
+            .execute(&format!(
+                "ALTER TABLE unsupported MODIFY COLUMN value {target}"
+            ))
+            .expect_err("conversion is unsupported");
+        assert!(matches!(
+            error,
+            Error::ColumnConversion {
+                row: None,
+                reason,
+                ..
+            } if reason.contains("not supported")
+        ));
+        assert_eq!(
+            database
+                .catalog()
+                .table("unsupported")
+                .expect("table remains")
+                .schema()[0]
+                .data_type,
+            source
+        );
+    }
+}
+
+#[test]
 fn typed_projection_filter_order_and_limit_work_end_to_end() {
     let mut database = Database::new();
     let results = database

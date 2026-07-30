@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::value::DataType;
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -30,6 +32,15 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    ColumnConversion {
+        table: String,
+        column: String,
+        from: DataType,
+        to: DataType,
+        /// One-based physical row, or `None` when the type pair itself is unsupported.
+        row: Option<usize>,
+        reason: Box<str>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +83,23 @@ impl fmt::Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
+            }
+            Self::ColumnConversion {
+                table,
+                column,
+                from,
+                to,
+                row,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "cannot convert column '{table}.{column}' from {from} to {to}"
+                )?;
+                if let Some(row) = row {
+                    write!(f, " at row {row}")?;
+                }
+                write!(f, ": {reason}")
             }
         }
     }
