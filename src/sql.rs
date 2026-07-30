@@ -256,6 +256,22 @@ fn render_names(output: &mut String, names: &[String]) {
 }
 
 fn render_predicate(output: &mut String, predicate: &Predicate) {
+    render_predicate_with_context(output, predicate, 0, false);
+}
+
+fn render_predicate_with_context(
+    output: &mut String,
+    predicate: &Predicate,
+    parent_precedence: u8,
+    right_child: bool,
+) {
+    let precedence = predicate_precedence(predicate);
+    let parenthesized =
+        precedence < parent_precedence || (right_child && precedence == parent_precedence);
+    if parenthesized {
+        output.push('(');
+    }
+
     match predicate {
         Predicate::Comparison {
             left,
@@ -274,16 +290,26 @@ fn render_predicate(output: &mut String, predicate: &Predicate) {
             render_operand(output, right);
         }
         Predicate::And(left, right) | Predicate::Or(left, right) => {
-            output.push('(');
-            render_predicate(output, left);
+            render_predicate_with_context(output, left, precedence, false);
             output.push_str(if matches!(predicate, Predicate::And(_, _)) {
                 " AND "
             } else {
                 " OR "
             });
-            render_predicate(output, right);
-            output.push(')');
+            render_predicate_with_context(output, right, precedence, true);
         }
+    }
+
+    if parenthesized {
+        output.push(')');
+    }
+}
+
+fn predicate_precedence(predicate: &Predicate) -> u8 {
+    match predicate {
+        Predicate::Or(_, _) => 1,
+        Predicate::And(_, _) => 2,
+        Predicate::Comparison { .. } => 3,
     }
 }
 
@@ -988,6 +1014,26 @@ mod tests {
         assert_eq!(
             render(&statements[0]),
             "CREATE TABLE events (id Int64, score Float64, active Bool, label String)"
+        );
+    }
+
+    #[test]
+    fn renderer_round_trips_flat_predicates_near_the_node_limit() {
+        let predicate = (0..128)
+            .map(|value| format!("id = {value}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let statements = parse(&format!("SELECT id FROM events WHERE {predicate}"))
+            .expect("255-node flat predicate is valid");
+        let rendered = render_script(&statements);
+
+        assert!(
+            !rendered.contains('('),
+            "flat predicate was nested: {rendered}"
+        );
+        assert_eq!(
+            parse(&rendered).expect("rendered flat predicate remains within the depth limit"),
+            statements
         );
     }
 
