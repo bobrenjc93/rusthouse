@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small, dependency-free analytical SQL engine written in Rust. It stores each field in a contiguous, typed column (`Vec<i64>`, `Vec<f64>`, `Vec<bool>`, or `Vec<String>`) and can persist the catalog as an atomic snapshot.
 
 ## What works
 
@@ -14,6 +14,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
+- versioned, checksummed database snapshots with atomic mutation checkpoints
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
@@ -54,6 +55,17 @@ printf '%s\n' \
   cargo run -- --format csv
 ~~~
 
+Persist data across invocations with `--database` (or `-d`):
+
+~~~bash
+cargo run -- --database rusthouse.db --execute \
+  "CREATE TABLE events (id Int64, name String); INSERT INTO events VALUES (1, 'launch')"
+cargo run -- --database rusthouse.db --execute \
+  "SELECT * FROM events ORDER BY id"
+~~~
+
+The database file is loaded before SQL execution. Each successful `CREATE` or `INSERT` is written to a same-directory temporary file, synced, atomically renamed over the previous snapshot, and followed by a parent-directory sync. Snapshots include a format version, declared length, and CRC-32 checksum; truncated, corrupt, and unsupported snapshots are rejected rather than partially loaded.
+
 Command acknowledgements go to stderr so CSV and JSON query data on stdout remain usable in pipelines.
 JSON output is always one document with a top-level results array. Each SELECT result contains explicit column name/type metadata and positional row arrays, so multiple SELECT statements and duplicate aliases preserve every value.
 
@@ -79,9 +91,11 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+Use `Database::open("rusthouse.db")` for the same automatically checkpointed behavior as the CLI. A syntax error still applies nothing. If execution fails after earlier statements succeeded, their checkpoints remain; if writing a mutation fails, that mutation is rolled back in memory and is not reported as successful.
+
 ## Current boundaries
 
-RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
+RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, transactions spanning multiple SQL statements, HTTP API, or network protocol. Snapshot files coordinate no concurrent writers, so use one process at a time for a given database path. A multi-row INSERT is validated in full before any of its rows are appended.
 
 To keep recursive predicate processing bounded, each WHERE expression is limited to 64 levels of parenthesis nesting and 256 total comparison/boolean AST nodes. Queries over either limit return a SQL error before execution.
 

@@ -128,6 +128,50 @@ impl Table {
         })
     }
 
+    pub(crate) fn from_columns(
+        name: String,
+        schema: Vec<ColumnDef>,
+        columns: Vec<Column>,
+        row_count: usize,
+    ) -> Result<Self> {
+        let mut table = Self::new(name, schema)?;
+        if columns.len() != table.schema.len() {
+            return Err(Error::InvalidQuery(format!(
+                "table '{}' has {} physical columns; expected {}",
+                table.name,
+                columns.len(),
+                table.schema.len()
+            )));
+        }
+        for (field, column) in table.schema.iter().zip(&columns) {
+            if column.data_type() != field.data_type {
+                return Err(Error::TypeMismatch {
+                    context: format!("column '{}.{}'", table.name, field.name),
+                    expected: field.data_type.to_string(),
+                    actual: column.data_type().to_string(),
+                });
+            }
+            if column.len() != row_count {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' has {} values; expected {row_count}",
+                    table.name,
+                    field.name,
+                    column.len()
+                )));
+            }
+            if matches!(column, Column::Float64(values) if values.iter().any(|value| !value.is_finite()))
+            {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' cannot store a non-finite Float64",
+                    table.name, field.name
+                )));
+            }
+        }
+        table.columns = columns;
+        table.row_count = row_count;
+        Ok(table)
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name

@@ -1,8 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
+use crate::persistence;
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
@@ -10,10 +12,11 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
-/// A reusable in-memory SQL database.
+/// A reusable SQL database, optionally backed by an atomic snapshot file.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,21 +46,64 @@ impl Database {
         Self::default()
     }
 
+    /// Open a snapshot-backed database, or create an empty catalog if the path
+    /// does not exist. Every successful mutation is checkpointed before it is
+    /// returned to the caller.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_owned();
+        if path.file_name().is_none_or(|name| name.is_empty()) {
+            return Err(Error::Persistence {
+                operation: "open".to_owned(),
+                path,
+                message: "the database path must name a file".to_owned(),
+            });
+        }
+        let catalog = persistence::load(&path)?;
+        Ok(Self {
+            catalog,
+            path: Some(path),
+        })
+    }
+
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Durably write the current catalog when this database was opened from a
+    /// path. In-memory databases have no checkpoint destination and do nothing.
+    pub fn checkpoint(&self) -> Result<()> {
+        match &self.path {
+            Some(path) => persistence::checkpoint(&self.catalog, path),
+            None => Ok(()),
+        }
     }
 
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
     /// nothing. Once parsing succeeds, statements execute in order and earlier
-    /// statements remain applied if a later execution error occurs.
+    /// statements remain applied if a later execution error occurs. A database
+    /// opened from a path checkpoints each successful mutation before moving to
+    /// the next statement.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let statements = sql::parse(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let mutation = matches!(
+                statement,
+                Statement::CreateTable { .. } | Statement::Insert { .. }
+            );
+            let previous_catalog = (mutation && self.path.is_some()).then(|| self.catalog.clone());
+            let result = self.execute_statement(statement)?;
+            if mutation && let Err(error) = self.checkpoint() {
+                self.catalog =
+                    previous_catalog.expect("persistent mutations save a rollback catalog");
+                return Err(error);
+            }
+            results.push(result);
+        }
+        Ok(results)
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {

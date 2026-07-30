@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +31,20 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    Persistence {
+        operation: String,
+        path: PathBuf,
+        message: String,
+    },
+    InvalidSnapshot {
+        path: PathBuf,
+        message: String,
+    },
+    UnsupportedSnapshotVersion {
+        path: PathBuf,
+        version: u32,
+        supported: u32,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +88,31 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::Persistence {
+                operation,
+                path,
+                message,
+            } => write!(
+                f,
+                "could not {operation} database '{}': {message}",
+                path.display()
+            ),
+            Self::InvalidSnapshot { path, message } => {
+                write!(
+                    f,
+                    "invalid database snapshot '{}': {message}",
+                    path.display()
+                )
+            }
+            Self::UnsupportedSnapshotVersion {
+                path,
+                version,
+                supported,
+            } => write!(
+                f,
+                "unsupported database snapshot version {version} in '{}'; this build supports version {supported}",
+                path.display()
+            ),
         }
     }
 }

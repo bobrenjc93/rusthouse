@@ -1,12 +1,13 @@
 use std::env;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rusthouse::format::{OutputFormat, render};
 use rusthouse::{Database, QueryResult, StatementResult};
 
 const HELP: &str = "\
-RustHouse - an in-memory columnar SQL engine
+RustHouse - a small persistent columnar SQL engine
 
 USAGE:
     rusthouse [OPTIONS]
@@ -14,6 +15,7 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+    -d, --database <PATH>     Load and atomically update a database snapshot
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -47,7 +49,10 @@ fn run() -> Result<(), String> {
         sql
     };
 
-    let mut database = Database::new();
+    let mut database = match config.database {
+        Some(path) => Database::open(path).map_err(|error| error.to_string())?,
+        None => Database::new(),
+    };
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -94,11 +99,13 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    database: Option<PathBuf>,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut database = None;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -122,6 +129,16 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "-d" | "--database" => {
+                if database.is_some() {
+                    return Err("--database may only be supplied once".to_owned());
+                }
+                database = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| format!("{argument} requires a path"))?,
+                ));
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -134,11 +151,21 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--database=") => {
+                if database.is_some() {
+                    return Err("--database may only be supplied once".to_owned());
+                }
+                database = Some(PathBuf::from(&argument["--database=".len()..]));
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        database,
+    }))
 }
 
 #[cfg(test)]
@@ -157,6 +184,19 @@ mod tests {
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(config.database, None);
+    }
+
+    #[test]
+    fn parses_database_options() {
+        let config = parse_arguments(
+            ["--database=state.rsh", "--execute", "SELECT * FROM t"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect("valid arguments")
+        .expect("not help");
+        assert_eq!(config.database, Some(PathBuf::from("state.rsh")));
     }
 
     #[test]

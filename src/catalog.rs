@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, Table};
 
 /// An in-memory collection of named tables.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: HashMap<String, Table>,
 }
@@ -35,6 +35,19 @@ impl Catalog {
         self.tables
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
+    }
+
+    pub(crate) fn tables(&self) -> impl Iterator<Item = &Table> {
+        self.tables.values()
+    }
+
+    pub(crate) fn insert_table(&mut self, table: Table) -> Result<()> {
+        let key = normalize(table.name());
+        if self.tables.contains_key(&key) {
+            return Err(Error::TableAlreadyExists(table.name().to_owned()));
+        }
+        self.tables.insert(key, table);
+        Ok(())
     }
 }
 

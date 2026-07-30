@@ -1,4 +1,5 @@
-//! RustHouse is a compact, dependency-free, in-memory analytical database.
+//! RustHouse is a compact, dependency-free analytical database with optional
+//! atomic snapshot persistence.
 //!
 //! Database is the main entry point. It accepts a small SQL dialect and
 //! returns structured results that can be rendered by the format module.
@@ -7,6 +8,7 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod format;
+mod persistence;
 pub mod sql;
 pub mod storage;
 pub mod value;
