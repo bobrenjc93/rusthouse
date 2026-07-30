@@ -111,6 +111,38 @@ fn sql_errors_are_reported_with_nonzero_status() {
 }
 
 #[test]
+fn temporal_literal_errors_escape_terminal_control_characters() {
+    let payload = "\u{1b}]0;owned\u{07}\nforged";
+    for (data_type, literal_type) in [("Date", "DATE"), ("DateTime64(3)", "TIMESTAMP")] {
+        let sql = format!(
+            "CREATE TABLE t (value {data_type}); \
+             INSERT INTO t VALUES ({literal_type} '{payload}');"
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .args(["--execute", &sql])
+            .output()
+            .expect("run CLI");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            !stderr.contains('\u{1b}'),
+            "raw escape in stderr: {stderr:?}"
+        );
+        assert!(!stderr.contains('\u{07}'), "raw bell in stderr: {stderr:?}");
+        assert!(
+            !stderr.contains("\nforged"),
+            "raw newline in stderr: {stderr:?}"
+        );
+        assert_eq!(stderr.lines().count(), 1, "multiline stderr: {stderr:?}");
+        assert!(
+            stderr.contains(r"\u{001b}]0;owned\u{0007}\nforged"),
+            "escaped payload missing from stderr: {stderr:?}"
+        );
+    }
+}
+
+#[test]
 fn excessive_predicates_return_cli_errors_without_aborting() {
     let cases = [
         (

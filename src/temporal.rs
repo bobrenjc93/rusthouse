@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 const MILLIS_PER_SECOND: i64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MILLIS_PER_DAY: i64 = SECONDS_PER_DAY * MILLIS_PER_SECOND;
@@ -10,44 +12,50 @@ pub(crate) const MAX_DATETIME_MILLIS: i64 = 253_402_300_799_999;
 pub(crate) fn parse_date(value: &str) -> Result<i32, String> {
     let (year, month, day) = parse_civil_date(value)?;
     let days = days_from_civil(year, month, day);
-    i32::try_from(days).map_err(|_| format!("Date literal '{value}' is out of range"))
+    i32::try_from(days).map_err(|_| {
+        format!(
+            "Date literal '{}' is out of range",
+            escape_diagnostic_literal(value)
+        )
+    })
 }
 
 pub(crate) fn parse_datetime64(value: &str) -> Result<i64, String> {
     let bytes = value.as_bytes();
+    let diagnostic_value = escape_diagnostic_literal(value);
     if !value.is_ascii() || bytes.len() < 19 || bytes.get(10) != Some(&b' ') {
         return Err(format!(
-            "invalid TIMESTAMP literal '{value}'; expected YYYY-MM-DD HH:MM:SS[.fff]"
+            "invalid TIMESTAMP literal '{diagnostic_value}'; expected YYYY-MM-DD HH:MM:SS[.fff]"
         ));
     }
 
     let (year, month, day) = parse_civil_date(&value[..10]).map_err(|message| {
         if message.contains("out of range") {
             format!(
-                "TIMESTAMP literal '{value}' is out of range; supported range is 0001-01-01 through 9999-12-31"
+                "TIMESTAMP literal '{diagnostic_value}' is out of range; supported range is 0001-01-01 through 9999-12-31"
             )
         } else {
-            format!("invalid TIMESTAMP literal '{value}'")
+            format!("invalid TIMESTAMP literal '{diagnostic_value}'")
         }
     })?;
     if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
-        return Err(format!("invalid TIMESTAMP literal '{value}'"));
+        return Err(format!("invalid TIMESTAMP literal '{diagnostic_value}'"));
     }
-    let hour =
-        parse_digits(bytes, 11, 2).ok_or_else(|| format!("invalid TIMESTAMP literal '{value}'"))?;
-    let minute =
-        parse_digits(bytes, 14, 2).ok_or_else(|| format!("invalid TIMESTAMP literal '{value}'"))?;
-    let second =
-        parse_digits(bytes, 17, 2).ok_or_else(|| format!("invalid TIMESTAMP literal '{value}'"))?;
+    let hour = parse_digits(bytes, 11, 2)
+        .ok_or_else(|| format!("invalid TIMESTAMP literal '{diagnostic_value}'"))?;
+    let minute = parse_digits(bytes, 14, 2)
+        .ok_or_else(|| format!("invalid TIMESTAMP literal '{diagnostic_value}'"))?;
+    let second = parse_digits(bytes, 17, 2)
+        .ok_or_else(|| format!("invalid TIMESTAMP literal '{diagnostic_value}'"))?;
     if hour > 23 || minute > 59 || second > 59 {
-        return Err(format!("invalid TIMESTAMP literal '{value}'"));
+        return Err(format!("invalid TIMESTAMP literal '{diagnostic_value}'"));
     }
 
     let millisecond = match &bytes[19..] {
         [] => 0,
         [b'.', fraction @ ..] if (1..=3).contains(&fraction.len()) => {
             if !fraction.iter().all(u8::is_ascii_digit) {
-                return Err(format!("invalid TIMESTAMP literal '{value}'"));
+                return Err(format!("invalid TIMESTAMP literal '{diagnostic_value}'"));
             }
             let parsed = fraction.iter().fold(0_i64, |number, digit| {
                 number * 10 + i64::from(*digit - b'0')
@@ -56,10 +64,12 @@ pub(crate) fn parse_datetime64(value: &str) -> Result<i64, String> {
         }
         [b'.', ..] => {
             return Err(format!(
-                "TIMESTAMP literal '{value}' exceeds DateTime64(3) millisecond precision"
+                "TIMESTAMP literal '{diagnostic_value}' exceeds DateTime64(3) millisecond precision"
             ));
         }
-        _ => return Err(format!("invalid TIMESTAMP literal '{value}'")),
+        _ => {
+            return Err(format!("invalid TIMESTAMP literal '{diagnostic_value}'"));
+        }
     };
 
     days_from_civil(year, month, day)
@@ -69,7 +79,7 @@ pub(crate) fn parse_datetime64(value: &str) -> Result<i64, String> {
         .and_then(|value| value.checked_add(i64::from(second) * MILLIS_PER_SECOND))
         .and_then(|value| value.checked_add(millisecond))
         .filter(|value| is_valid_datetime_millis(*value))
-        .ok_or_else(|| format!("TIMESTAMP literal '{value}' is out of range"))
+        .ok_or_else(|| format!("TIMESTAMP literal '{diagnostic_value}' is out of range"))
 }
 
 pub(crate) fn is_valid_date_days(value: i32) -> bool {
@@ -101,25 +111,46 @@ pub(crate) fn format_datetime64(milliseconds: i64) -> String {
 
 fn parse_civil_date(value: &str) -> Result<(i64, u32, u32), String> {
     let bytes = value.as_bytes();
+    let diagnostic_value = escape_diagnostic_literal(value);
     if bytes.len() != 10 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
         return Err(format!(
-            "invalid DATE literal '{value}'; expected YYYY-MM-DD"
+            "invalid DATE literal '{diagnostic_value}'; expected YYYY-MM-DD"
         ));
     }
-    let year =
-        parse_digits(bytes, 0, 4).ok_or_else(|| format!("invalid DATE literal '{value}'"))?;
-    let month =
-        parse_digits(bytes, 5, 2).ok_or_else(|| format!("invalid DATE literal '{value}'"))?;
-    let day = parse_digits(bytes, 8, 2).ok_or_else(|| format!("invalid DATE literal '{value}'"))?;
+    let year = parse_digits(bytes, 0, 4)
+        .ok_or_else(|| format!("invalid DATE literal '{diagnostic_value}'"))?;
+    let month = parse_digits(bytes, 5, 2)
+        .ok_or_else(|| format!("invalid DATE literal '{diagnostic_value}'"))?;
+    let day = parse_digits(bytes, 8, 2)
+        .ok_or_else(|| format!("invalid DATE literal '{diagnostic_value}'"))?;
     if year == 0 {
         return Err(format!(
-            "DATE literal '{value}' is out of range; supported range is 0001-01-01 through 9999-12-31"
+            "DATE literal '{diagnostic_value}' is out of range; supported range is 0001-01-01 through 9999-12-31"
         ));
     }
     if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
-        return Err(format!("invalid DATE literal '{value}'"));
+        return Err(format!("invalid DATE literal '{diagnostic_value}'"));
     }
     Ok((i64::from(year), month, day))
+}
+
+fn escape_diagnostic_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("\\'"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            value if value.is_control() => {
+                write!(escaped, "\\u{{{:04x}}}", value as u32)
+                    .expect("writing to String cannot fail");
+            }
+            value => escaped.push(value),
+        }
+    }
+    escaped
 }
 
 fn parse_digits(bytes: &[u8], start: usize, length: usize) -> Option<u32> {
