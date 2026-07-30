@@ -65,7 +65,7 @@ Database retains an in-memory catalog across calls and returns structured result
 
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
-Logical views store their parsed SELECT rather than result rows. Creation validates the complete dependency chain, and each reference expands and revalidates that chain against the current catalog. Tables and views share one case-insensitive namespace; catalog callers can inspect them with `Catalog::tables`, `Catalog::views`, and `Catalog::relation_kind`.
+Logical views store their parsed SELECT rather than result rows. Creation validates the complete dependency chain, and each reference expands and revalidates that chain against the current catalog. Aggregate outputs in views require an `AS` alias so every exposed column is addressable without quoted identifiers. Tables and views share one case-insensitive namespace; catalog callers can inspect them with `Catalog::tables`, `Catalog::views`, and `Catalog::relation_kind`.
 
 ~~~rust
 use rusthouse::{Database, StatementResult};

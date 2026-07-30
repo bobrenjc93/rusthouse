@@ -72,6 +72,36 @@ fn view_creation_checks_dependencies_without_executing_the_query() {
 }
 
 #[test]
+fn aggregate_view_outputs_require_addressable_aliases() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2)")
+        .expect("setup succeeds");
+
+    let error = database
+        .execute("CREATE VIEW counts AS SELECT COUNT(*) FROM events")
+        .expect_err("generated aggregate name is not addressable");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message.contains("output column 'COUNT(*)'")
+                && message.contains("add an AS alias")
+    ));
+    assert!(matches!(
+        database.catalog().view("counts"),
+        Err(Error::ViewNotFound(_))
+    ));
+
+    database
+        .execute("CREATE VIEW counts AS SELECT COUNT(*) AS count FROM events")
+        .expect("aliased aggregate view succeeds");
+    assert_eq!(
+        query(&mut database, "SELECT count FROM counts").rows,
+        vec![vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
 fn dependent_views_revalidate_after_dependency_schema_changes() {
     let mut database = Database::new();
     database

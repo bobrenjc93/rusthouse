@@ -206,6 +206,14 @@ impl ViewExpansion {
 }
 
 fn validate_view_columns(name: &str, columns: Vec<ResultColumn>) -> Result<Vec<ColumnDef>> {
+    for column in &columns {
+        if !is_unquoted_identifier(&column.name) {
+            return Err(Error::InvalidQuery(format!(
+                "view '{name}' output column '{}' cannot be referenced as an unquoted identifier; add an AS alias",
+                column.name
+            )));
+        }
+    }
     let schema = columns
         .into_iter()
         .map(|column| ColumnDef {
@@ -214,6 +222,14 @@ fn validate_view_columns(name: &str, columns: Vec<ResultColumn>) -> Result<Vec<C
         })
         .collect::<Vec<_>>();
     Ok(Table::new(name.to_owned(), schema)?.schema().to_vec())
+}
+
+fn is_unquoted_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn materialize_view_result(name: &str, result: QueryResult) -> Result<Table> {
