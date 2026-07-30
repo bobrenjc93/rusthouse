@@ -12,8 +12,8 @@ pub mod storage;
 pub mod value;
 
 pub use engine::{
-    DEFAULT_JOIN_MAX_BYTES, DEFAULT_JOIN_MAX_ROWS, Database, JoinLimits, QueryResult, ResultColumn,
-    StatementResult,
+    DEFAULT_JOIN_MAX_BYTES, DEFAULT_JOIN_MAX_CANDIDATE_PAIRS, DEFAULT_JOIN_MAX_ROWS, Database,
+    JoinLimits, QueryResult, ResultColumn, StatementResult,
 };
 pub use error::{Error, Result};
 pub use value::{DataType, Value};

@@ -362,6 +362,7 @@ fn hash_build_row_and_byte_limits_are_configurable_and_enforced() {
     let mut row_limited = Database::with_join_limits(JoinLimits {
         max_rows: 1,
         max_bytes: usize::MAX,
+        max_candidate_pairs: usize::MAX,
     });
     row_limited.execute(setup).expect("setup succeeds");
     let error = row_limited
@@ -379,6 +380,7 @@ fn hash_build_row_and_byte_limits_are_configurable_and_enforced() {
     let mut byte_limited = Database::with_join_limits(JoinLimits {
         max_rows: 10,
         max_bytes: 0,
+        max_candidate_pairs: usize::MAX,
     });
     byte_limited.execute(setup).expect("setup succeeds");
     let error = byte_limited
@@ -399,6 +401,7 @@ fn duplicate_key_fanout_is_bounded_before_output_allocation() {
     let mut database = Database::with_join_limits(JoinLimits {
         max_rows: 100,
         max_bytes: usize::MAX,
+        max_candidate_pairs: usize::MAX,
     });
     database
         .execute(
@@ -436,6 +439,7 @@ fn fanout_row_limit_stops_at_first_excess_for_both_hash_sides() {
         let mut database = Database::with_join_limits(JoinLimits {
             max_rows: 4,
             max_bytes: usize::MAX,
+            max_candidate_pairs: usize::MAX,
         });
         let left_values = vec!["(1)"; left_count].join(",");
         let right_values = vec!["(1)"; right_count].join(",");
@@ -466,10 +470,47 @@ fn fanout_row_limit_stops_at_first_excess_for_both_hash_sides() {
 }
 
 #[test]
+fn residual_on_candidate_limit_bounds_both_hash_sides() {
+    for (left_count, right_count) in [(2, 3), (3, 2)] {
+        let mut database = Database::with_join_limits(JoinLimits {
+            max_rows: 10,
+            max_bytes: usize::MAX,
+            max_candidate_pairs: 4,
+        });
+        let left_values = vec!["(1)"; left_count].join(",");
+        let right_values = vec!["(1)"; right_count].join(",");
+        database
+            .execute(&format!(
+                "CREATE TABLE work_left (key Int64);
+                 INSERT INTO work_left VALUES {left_values};
+                 CREATE TABLE work_right (key Int64);
+                 INSERT INTO work_right VALUES {right_values};"
+            ))
+            .expect("setup succeeds");
+
+        let error = database
+            .execute(
+                "SELECT l.key FROM work_left l
+                 INNER JOIN work_right r ON l.key = r.key AND 1 = 0;",
+            )
+            .expect_err("false residual must not bypass candidate work bounds");
+        assert!(matches!(
+            error,
+            Error::JoinLimitExceeded {
+                resource: "candidate pairs",
+                limit: 4,
+                actual: 5,
+            }
+        ));
+    }
+}
+
+#[test]
 fn join_fanout_working_bytes_are_bounded_separately_from_build_bytes() {
     let mut database = Database::with_join_limits(JoinLimits {
         max_rows: 100,
         max_bytes: 512,
+        max_candidate_pairs: usize::MAX,
     });
     database
         .execute(
@@ -507,6 +548,7 @@ fn distinct_key_hash_table_allocations_count_toward_byte_limit() {
     let mut database = Database::with_join_limits(JoinLimits {
         max_rows: row_count * 2,
         max_bytes: 64 * 1024,
+        max_candidate_pairs: usize::MAX,
     });
     database
         .execute(&format!(
@@ -699,6 +741,7 @@ fn left_join_unmatched_output_obeys_operator_bounds_before_sql_limit() {
     let mut database = Database::with_join_limits(JoinLimits {
         max_rows: 2,
         max_bytes: usize::MAX,
+        max_candidate_pairs: usize::MAX,
     });
     database
         .execute(

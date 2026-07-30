@@ -82,9 +82,9 @@ assert_eq!(result.rows.len(), 1);
 
 The join hashes the smaller input and preserves left-to-right input order in its output. LEFT JOIN
 applies all ON conjuncts before adding a NULL right side, then applies WHERE to the joined rows. By
-default, both the hash build and joined output are capped at 1,000,000 rows, with an estimated
-64 MiB cap on peak bucket, entry, flat-key, row-index, retained-input, and temporary output
-allocations. Library callers can set both per-operator limits:
+default, the hash build, joined output, and hash-key candidate pairs are each capped at 1,000,000,
+with an estimated 64 MiB cap on peak bucket, entry, flat-key, row-index, retained-input, and
+temporary output allocations. Library callers can set the per-operator limits:
 
 ~~~rust
 use rusthouse::{Database, JoinLimits};
@@ -92,6 +92,7 @@ use rusthouse::{Database, JoinLimits};
 let mut database = Database::with_join_limits(JoinLimits {
     max_rows: 100_000,
     max_bytes: 16 * 1024 * 1024,
+    max_candidate_pairs: 250_000,
 });
 # let _ = &mut database;
 ~~~

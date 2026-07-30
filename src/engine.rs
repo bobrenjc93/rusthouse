@@ -14,16 +14,20 @@ use crate::value::{DataType, Value, ValueRef};
 
 pub const DEFAULT_JOIN_MAX_ROWS: usize = 1_000_000;
 pub const DEFAULT_JOIN_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_JOIN_MAX_CANDIDATE_PAIRS: usize = 1_000_000;
 
 /// Per-operator bounds for a JOIN's hash input and output working set.
 ///
-/// `max_rows` limits both hash-build rows and joined output pairs. `max_bytes`
-/// limits estimated peak allocation bytes for buckets, entries, flat hash
-/// keys, row chains, retained input rows, and temporary output pairs.
+/// `max_rows` limits both hash-build rows and joined output pairs.
+/// `max_candidate_pairs` limits hash-key matches examined before residual `ON`
+/// filtering; materialization can only revisit that bounded set. `max_bytes`
+/// limits estimated peak allocation bytes for buckets, entries, flat hash keys,
+/// row chains, retained input rows, and temporary output pairs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinLimits {
     pub max_rows: usize,
     pub max_bytes: usize,
+    pub max_candidate_pairs: usize,
 }
 
 impl Default for JoinLimits {
@@ -31,6 +35,7 @@ impl Default for JoinLimits {
         Self {
             max_rows: DEFAULT_JOIN_MAX_ROWS,
             max_bytes: DEFAULT_JOIN_MAX_BYTES,
+            max_candidate_pairs: DEFAULT_JOIN_MAX_CANDIDATE_PAIRS,
         }
     }
 }
@@ -489,6 +494,7 @@ impl<'a> QueryInput<'a> {
             } else {
                 Vec::new()
             };
+            let mut candidate_count = 0usize;
             for right_row in 0..right_row_count {
                 if !self.right_join_key(&keys, right_row, &mut scratch) {
                     continue;
@@ -496,6 +502,7 @@ impl<'a> QueryInput<'a> {
                 if let Some(entry) = hash.get(&scratch) {
                     let mut left_row = entry.first_row;
                     while left_row != NO_JOIN_INDEX {
+                        candidate_count = checked_join_candidate_count(candidate_count, 1, limits)?;
                         if self.on_matches(
                             predicate.as_ref(),
                             old_rows.as_deref(),
@@ -575,6 +582,7 @@ impl<'a> QueryInput<'a> {
                 }
             }
             let mut output_count = 0usize;
+            let mut candidate_count = 0usize;
             for left_row in 0..old_row_count {
                 let mut matched = false;
                 if self.old_join_key(
@@ -587,6 +595,7 @@ impl<'a> QueryInput<'a> {
                 {
                     let mut right_row = entry.first_row;
                     while right_row != NO_JOIN_INDEX {
+                        candidate_count = checked_join_candidate_count(candidate_count, 1, limits)?;
                         if self.on_matches(
                             predicate.as_ref(),
                             old_rows.as_deref(),
@@ -804,6 +813,29 @@ fn checked_join_match_count(
         Err(Error::JoinLimitExceeded {
             resource: "output rows",
             limit: limits.max_rows,
+            actual,
+        })
+    } else {
+        Ok(actual)
+    }
+}
+
+fn checked_join_candidate_count(
+    current: usize,
+    additional: usize,
+    limits: JoinLimits,
+) -> Result<usize> {
+    let actual = current
+        .checked_add(additional)
+        .ok_or(Error::JoinLimitExceeded {
+            resource: "candidate pairs",
+            limit: limits.max_candidate_pairs,
+            actual: usize::MAX,
+        })?;
+    if actual > limits.max_candidate_pairs {
+        Err(Error::JoinLimitExceeded {
+            resource: "candidate pairs",
+            limit: limits.max_candidate_pairs,
             actual,
         })
     } else {
