@@ -108,6 +108,13 @@ impl CompiledExpression {
         }
     }
 
+    pub(crate) fn source_column(&self) -> Option<usize> {
+        match self {
+            Self::Column { index, .. } => Some(*index),
+            Self::Literal(_) | Self::UnaryMinus { .. } | Self::Binary { .. } => None,
+        }
+    }
+
     pub(crate) fn evaluate<'a>(
         &'a self,
         table: &'a Table,

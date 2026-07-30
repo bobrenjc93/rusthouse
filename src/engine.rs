@@ -745,25 +745,37 @@ fn order_source_rows(
         return Ok(());
     }
 
-    let keys = rows
-        .iter()
-        .map(|row| {
-            ordering
-                .iter()
-                .map(|order| match &items[order.output] {
-                    ResolvedItem::Expression { expression } => {
-                        expression.evaluate(table, Some(*row))
-                    }
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("ungrouped projections cannot contain aggregates")
-                    }
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if ordering.iter().all(|order| {
+        matches!(
+            &items[order.output],
+            ResolvedItem::Expression { expression } if expression.source_column().is_some()
+        )
+    }) {
+        sort_and_limit(rows, limit, |left, right| {
+            compare_source_columns(table, items, ordering, left, right)
+                .then_with(|| left.cmp(&right))
+        });
+        return Ok(());
+    }
+
+    let key_width = ordering.len();
+    let mut keys = Vec::with_capacity(rows.len().saturating_mul(key_width));
+    for row in rows.iter() {
+        for order in ordering {
+            match &items[order.output] {
+                ResolvedItem::Expression { expression } => {
+                    keys.push(expression.evaluate(table, Some(*row))?);
+                }
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                }
+            }
+        }
+    }
     let mut positions = (0..rows.len()).collect::<Vec<_>>();
     sort_and_limit(&mut positions, limit, |left, right| {
-        compare_order_keys(&keys, ordering, left, right).then_with(|| rows[left].cmp(&rows[right]))
+        compare_order_keys(&keys, key_width, ordering, left, right)
+            .then_with(|| rows[left].cmp(&rows[right]))
     });
     *rows = positions
         .into_iter()
@@ -780,25 +792,23 @@ fn order_grouped_rows(
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
 ) -> Result<()> {
-    let keys = groups
-        .iter()
-        .map(|group| {
-            ordering
-                .iter()
-                .map(|order| match &items[order.output] {
-                    ResolvedItem::Expression { expression } => {
-                        expression.evaluate(table, data.source_rows[*group])
-                    }
-                    ResolvedItem::Aggregate { state } => Ok(Evaluated::Borrowed(
-                        data.aggregates[*state][*group].as_ref(),
-                    )),
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let key_width = ordering.len();
+    let mut keys = Vec::with_capacity(groups.len().saturating_mul(key_width));
+    for group in groups.iter() {
+        for order in ordering {
+            match &items[order.output] {
+                ResolvedItem::Expression { expression } => {
+                    keys.push(expression.evaluate(table, data.source_rows[*group])?);
+                }
+                ResolvedItem::Aggregate { state } => keys.push(Evaluated::Borrowed(
+                    data.aggregates[*state][*group].as_ref(),
+                )),
+            }
+        }
+    }
     let mut positions = (0..groups.len()).collect::<Vec<_>>();
     sort_and_limit(&mut positions, limit, |left, right| {
-        compare_order_keys(&keys, ordering, left, right)
+        compare_order_keys(&keys, key_width, ordering, left, right)
             .then_with(|| data.keys[groups[left]].cmp(&data.keys[groups[right]]))
     });
     *groups = positions
@@ -808,14 +818,43 @@ fn order_grouped_rows(
     Ok(())
 }
 
+fn compare_source_columns(
+    table: &Table,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for order in ordering {
+        let ResolvedItem::Expression { expression } = &items[order.output] else {
+            unreachable!("ungrouped projections cannot contain aggregates")
+        };
+        let column = expression
+            .source_column()
+            .expect("direct source ordering is validated");
+        let comparison = table.columns()[column].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    Ordering::Equal
+}
+
 fn compare_order_keys(
-    keys: &[Vec<Evaluated<'_>>],
+    keys: &[Evaluated<'_>],
+    key_width: usize,
     ordering: &[ResolvedOrder],
     left: usize,
     right: usize,
 ) -> Ordering {
     for (key, order) in ordering.iter().enumerate() {
-        let comparison = keys[left][key].as_ref().cmp(&keys[right][key].as_ref());
+        let comparison = keys[left * key_width + key]
+            .as_ref()
+            .cmp(&keys[right * key_width + key].as_ref());
         if comparison != Ordering::Equal {
             return if order.descending {
                 comparison.reverse()
