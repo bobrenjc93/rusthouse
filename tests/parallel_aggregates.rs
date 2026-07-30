@@ -7,10 +7,11 @@ const PARTITION_BOUNDARY: usize = 16 * 1_024;
 const THREAD_COUNTS: [usize; 4] = [1, 2, 4, 8];
 
 fn generated_database() -> Database {
-    let mut sql = String::with_capacity(ROW_COUNT * 80);
+    let mut sql = String::with_capacity(ROW_COUNT * 100);
     sql.push_str(
         "CREATE TABLE generated (id Int64, bucket String, unique_key String, value Int64, \
-         score Float64, included Bool, safe_sum Int64, overflow_sum Int64); \
+         score Float64, included Bool, safe_sum Int64, overflow_sum Int64, \
+         safe_float Float64, overflow_float Float64); \
          INSERT INTO generated VALUES ",
     );
     for id in 0..ROW_COUNT {
@@ -28,9 +29,20 @@ fn generated_database() -> Database {
             value if value == PARTITION_BOUNDARY + 1 => -1,
             _ => 0,
         };
+        let safe_float = match id {
+            value if value + 1 == PARTITION_BOUNDARY => -f64::MAX,
+            value if value == PARTITION_BOUNDARY || value == PARTITION_BOUNDARY + 1 => f64::MAX,
+            _ => 0.0,
+        };
+        let overflow_float = match id {
+            value if value + 1 == PARTITION_BOUNDARY || value == PARTITION_BOUNDARY => f64::MAX,
+            value if value == PARTITION_BOUNDARY + 1 => -f64::MAX,
+            _ => 0.0,
+        };
         write!(
             sql,
-            "({id},'bucket_{}','key_{id:05}',{},{}.{:02},{},{safe_sum},{overflow_sum})",
+            "({id},'bucket_{}','key_{id:05}',{},{}.{:02},{},{safe_sum},{overflow_sum},\
+             {safe_float:e},{overflow_float:e})",
             id % 97,
             (id as i64 % 2_003) - 1_001,
             id % 29,
@@ -122,6 +134,18 @@ fn parallel_merge_preserves_overflow_and_empty_input_semantics() {
     );
     assert_eq!(safe.rows, vec![vec![Value::Int64(i64::MAX)]]);
 
+    let safe_float = assert_equivalent(
+        &mut database,
+        "SELECT SUM(safe_float) AS total, AVG(safe_float) AS mean FROM generated;",
+    );
+    assert_eq!(
+        safe_float.rows,
+        vec![vec![
+            Value::Float64(f64::MAX),
+            Value::Float64(f64::MAX / ROW_COUNT as f64),
+        ]]
+    );
+
     let mut expected_error = None;
     for thread_count in THREAD_COUNTS {
         database
@@ -135,6 +159,24 @@ fn parallel_merge_preserves_overflow_and_empty_input_semantics() {
             assert_eq!(&error, expected_error);
         } else {
             expected_error = Some(error);
+        }
+    }
+
+    for (sql, operation) in [
+        ("SELECT SUM(overflow_float) FROM generated;", "SUM(Float64)"),
+        (
+            "SELECT AVG(overflow_float) FROM generated;",
+            "AVG(Float64) sum",
+        ),
+    ] {
+        for thread_count in THREAD_COUNTS {
+            database
+                .set_query_parallelism(thread_count)
+                .expect("positive parallelism");
+            let error = database
+                .execute(sql)
+                .expect_err("row-ordered Float64 accumulation overflows");
+            assert_eq!(error, Error::NumericOverflow(operation.to_owned()));
         }
     }
 

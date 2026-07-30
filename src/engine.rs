@@ -331,6 +331,14 @@ fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>)
     Ok(())
 }
 
+fn requires_ordered_float_replay(spec: &AggregateSpec) -> bool {
+    spec.input_type == Some(DataType::Float64)
+        && matches!(
+            spec.function,
+            AggregateFunction::Sum | AggregateFunction::Avg
+        )
+}
+
 fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
     match function {
         AggregateFunction::Count => DataType::Int64,
@@ -370,11 +378,22 @@ fn execute_grouped<'a>(
     query_parallelism: NonZeroUsize,
 ) -> Result<GroupedData<'a>> {
     let ranges = scan_ranges(table.row_count());
+    // A Float64 partition total cannot reproduce row-ordered overflow after
+    // merge, so partitioned SUM/AVG retain their input order for replay.
+    let replay_float_inputs =
+        ranges.len() > 1 && aggregate_specs.iter().any(requires_ordered_float_replay);
     let partitions = if ranges.len() == 1 || query_parallelism.get() == 1 {
         ranges
             .into_iter()
             .map(|range| {
-                scan_grouped_partition(table, range, predicate, group_columns, aggregate_specs)
+                scan_grouped_partition(
+                    table,
+                    range,
+                    predicate,
+                    group_columns,
+                    aggregate_specs,
+                    replay_float_inputs,
+                )
             })
             .collect::<Result<Vec<_>>>()?
     } else {
@@ -385,6 +404,7 @@ fn execute_grouped<'a>(
             group_columns,
             aggregate_specs,
             query_parallelism.get(),
+            replay_float_inputs,
         )?
     };
 
@@ -409,6 +429,7 @@ fn scan_grouped_partitions_parallel<'a>(
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
     query_parallelism: usize,
+    replay_float_inputs: bool,
 ) -> Result<Vec<GroupedPartition<'a>>> {
     let worker_count = query_parallelism.min(ranges.len());
 
@@ -431,6 +452,7 @@ fn scan_grouped_partitions_parallel<'a>(
                             predicate,
                             group_columns,
                             aggregate_specs,
+                            replay_float_inputs,
                         )
                     })
                     .collect::<Result<Vec<_>>>()
@@ -454,6 +476,7 @@ fn scan_grouped_partition<'a>(
     predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    replay_float_inputs: bool,
 ) -> Result<GroupedPartition<'a>> {
     let range_len = range.len();
     let mut groups = GroupIndex::new(group_columns.len(), range_len);
@@ -469,6 +492,11 @@ fn scan_grouped_partition<'a>(
             states
         })
         .collect::<Vec<_>>();
+    let mut replay_rows = if replay_float_inputs {
+        Vec::with_capacity(range_len)
+    } else {
+        Vec::new()
+    };
 
     for row in range {
         if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
@@ -481,8 +509,14 @@ fn scan_grouped_partition<'a>(
                 states.push(AggregateState::new(spec));
             }
         }
+        if replay_float_inputs {
+            replay_rows.push((group, row));
+        }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
+            if replay_float_inputs && requires_ordered_float_replay(spec) {
+                continue;
+            }
             states[group].update(spec, table, row)?;
         }
     }
@@ -490,6 +524,8 @@ fn scan_grouped_partition<'a>(
     Ok(GroupedPartition {
         keys: groups.into_keys(group_count),
         aggregate_states,
+        replay_rows,
+        replays_float_inputs: replay_float_inputs,
     })
 }
 
@@ -513,8 +549,14 @@ fn merge_grouped_partitions<'a>(
         .collect::<Vec<_>>();
 
     for partition in partitions {
-        let mut global_groups = Vec::with_capacity(partition.keys.len());
-        for key in &partition.keys {
+        let GroupedPartition {
+            keys,
+            aggregate_states: local_aggregate_states,
+            replay_rows,
+            replays_float_inputs,
+        } = partition;
+        let mut global_groups = Vec::with_capacity(keys.len());
+        for key in &keys {
             let (group, inserted) = groups.find_or_insert_key(key, group_count);
             if inserted {
                 group_count += 1;
@@ -525,9 +567,25 @@ fn merge_grouped_partitions<'a>(
             global_groups.push(group);
         }
 
-        for (states, local_states) in aggregate_states.iter_mut().zip(partition.aggregate_states) {
+        for ((states, local_states), spec) in aggregate_states
+            .iter_mut()
+            .zip(local_aggregate_states)
+            .zip(aggregate_specs)
+        {
+            if replays_float_inputs && requires_ordered_float_replay(spec) {
+                continue;
+            }
             for (state, group) in local_states.into_iter().zip(&global_groups) {
                 states[*group].merge(state)?;
+            }
+        }
+
+        for (local_group, row) in replay_rows {
+            let global_group = global_groups[local_group];
+            for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
+                if requires_ordered_float_replay(spec) {
+                    states[global_group].update(spec, table, row)?;
+                }
             }
         }
     }
@@ -551,6 +609,8 @@ fn merge_grouped_partitions<'a>(
 struct GroupedPartition<'a> {
     keys: Vec<GroupKey<'a>>,
     aggregate_states: Vec<Vec<AggregateState>>,
+    replay_rows: Vec<(usize, usize)>,
+    replays_float_inputs: bool,
 }
 
 #[derive(Debug)]
