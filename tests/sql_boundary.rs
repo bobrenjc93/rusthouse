@@ -547,7 +547,10 @@ fn materialized_view_backfills_every_aggregate_and_is_queryable_as_a_table() {
 
     let result = execute_query(
         &mut database,
-        "SELECT * FROM regional_sales ORDER BY region;",
+        "SELECT region, orders, total, low, high, mean
+         FROM regional_sales
+         WHERE orders >= 1
+         ORDER BY mean;",
     );
     assert_eq!(
         result.rows,
@@ -578,6 +581,33 @@ fn materialized_view_backfills_every_aggregate_and_is_queryable_as_a_table() {
             .row_count(),
         2
     );
+}
+
+#[test]
+fn materialized_view_aggregates_require_accessible_aliases() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE sales (region String, amount Int64);")
+        .expect("source table exists");
+
+    for (name, aggregate) in [
+        ("unnamed_sum", "SUM(amount)"),
+        ("unnamed_count", "COUNT(*)"),
+    ] {
+        let error = database
+            .execute(&format!(
+                "CREATE MATERIALIZED VIEW {name} AS
+                 SELECT region, {aggregate} FROM sales GROUP BY region;"
+            ))
+            .expect_err("aggregate output needs a SQL identifier");
+        assert!(
+            matches!(error, Error::InvalidQuery(message) if message.contains("requires an AS alias"))
+        );
+        assert!(matches!(
+            database.catalog().table(name),
+            Err(Error::TableNotFound(_))
+        ));
+    }
 }
 
 #[test]

@@ -71,7 +71,7 @@ CREATE MATERIALIZED VIEW regional_sales AS
 SELECT * FROM regional_sales ORDER BY total DESC;
 ~~~
 
-View creation backfills existing source rows. Projections, WHERE filters, GROUP BY, COUNT, SUM, MIN, MAX, and AVG are supported. A source INSERT and all of its dependent view updates commit together; an overflow leaves them all unchanged. Insert into the source table rather than directly into a view. ORDER BY and LIMIT are applied when querying a view and are not accepted inside its definition.
+View creation backfills existing source rows. Projections, WHERE filters, GROUP BY, COUNT, SUM, MIN, MAX, and AVG are supported. Aggregate expressions require `AS` aliases so every materialized column remains addressable by the SQL grammar. A source INSERT and all of its dependent view updates commit together; an overflow leaves them all unchanged. Insert into the source table rather than directly into a view. ORDER BY and LIMIT are applied when querying a view and are not accepted inside its definition.
 
 ## Library API
 

@@ -158,6 +158,19 @@ impl Table {
         self.row_count
     }
 
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            schema: self.schema.clone(),
+            columns: self
+                .schema
+                .iter()
+                .map(|field| Column::new(field.data_type))
+                .collect(),
+            row_count: 0,
+        }
+    }
+
     pub fn column_index(&self, name: &str) -> Result<usize> {
         self.schema
             .iter()
@@ -200,21 +213,32 @@ impl Table {
     /// Validates the complete row before appending one value to each column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.append_validated_row(row);
+        Ok(())
+    }
+
+    /// Appends a row that has already passed `validate_row` for this table.
+    pub(crate) fn append_validated_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 
     /// Validates a complete row before replacing its values in place.
+    #[cfg(test)]
     pub(crate) fn replace_row(&mut self, index: usize, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.replace_validated_row(index, row);
+        Ok(())
+    }
+
+    /// Replaces a row that has already passed `validate_row` for this table.
+    pub(crate) fn replace_validated_row(&mut self, index: usize, row: Vec<Value>) {
         debug_assert!(index < self.row_count);
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.set(index, value);
         }
-        Ok(())
     }
 }
 

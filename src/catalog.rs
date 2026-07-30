@@ -49,19 +49,6 @@ impl Catalog {
         self.tables.insert(key, table);
         Ok(())
     }
-
-    /// Replaces a staged set only after verifying that every relation exists.
-    pub(crate) fn replace_tables(&mut self, tables: Vec<Table>) -> Result<()> {
-        for table in &tables {
-            if !self.tables.contains_key(&normalize(table.name())) {
-                return Err(Error::TableNotFound(table.name().to_owned()));
-            }
-        }
-        for table in tables {
-            self.tables.insert(normalize(table.name()), table);
-        }
-        Ok(())
-    }
 }
 
 fn normalize(identifier: &str) -> String {
