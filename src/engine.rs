@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, JoinCondition, Operand,
+    OrderBy, Predicate, Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -91,29 +91,42 @@ impl Database {
     }
 
     fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+        let left = self.catalog.table(&select.table)?;
+        let relation = if let Some(join) = &select.join {
+            let right = self.catalog.table(&join.table)?;
+            Relation::joined(
+                left,
+                select.table_alias.as_deref(),
+                right,
+                join.table_alias.as_deref(),
+                &join.conditions,
+            )?
+        } else {
+            Relation::single(left, select.table_alias.as_deref())
+        };
         let predicate = select
             .predicate
             .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
+            .map(|predicate| compile_predicate(&relation, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
+        let mut matching_rows = (0..relation.row_count())
             .filter(|row| {
                 predicate
                     .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+                    .is_none_or(|predicate| predicate.evaluate(&relation, *row))
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let group_columns = resolve_group_columns(&relation, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+            resolve_select_items(&relation, &select.items, &group_columns)?;
+        let ordering = resolve_ordering(&relation, &items, &result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped =
+                execute_grouped(&relation, &matching_rows, &group_columns, &aggregate_specs)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -124,14 +137,268 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            order_source_rows(
+                &mut matching_rows,
+                &relation,
+                &items,
+                &ordering,
+                select.limit,
+            );
+            execute_projection(&relation, &matching_rows, &items)
         };
 
         Ok(QueryResult {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug)]
+struct Relation<'a> {
+    left: &'a Table,
+    left_qualifier: String,
+    right: Option<&'a Table>,
+    right_qualifier: Option<String>,
+    row_pairs: Option<Vec<(usize, usize)>>,
+}
+
+impl<'a> Relation<'a> {
+    fn single(table: &'a Table, alias: Option<&str>) -> Self {
+        Self {
+            left: table,
+            left_qualifier: alias.unwrap_or_else(|| table.name()).to_owned(),
+            right: None,
+            right_qualifier: None,
+            row_pairs: None,
+        }
+    }
+
+    fn joined(
+        left: &'a Table,
+        left_alias: Option<&str>,
+        right: &'a Table,
+        right_alias: Option<&str>,
+        conditions: &[JoinCondition],
+    ) -> Result<Self> {
+        let left_qualifier = left_alias.unwrap_or_else(|| left.name()).to_owned();
+        let right_qualifier = right_alias.unwrap_or_else(|| right.name()).to_owned();
+        if left_qualifier.eq_ignore_ascii_case(&right_qualifier) {
+            return Err(Error::InvalidQuery(format!(
+                "INNER JOIN table names or aliases must be distinct; both resolve to '{left_qualifier}'"
+            )));
+        }
+
+        let mut relation = Self {
+            left,
+            left_qualifier,
+            right: Some(right),
+            right_qualifier: Some(right_qualifier),
+            row_pairs: Some(Vec::new()),
+        };
+        let mut left_keys = Vec::with_capacity(conditions.len());
+        let mut right_keys = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            let first = relation.resolve_column(&condition.left)?;
+            let second = relation.resolve_column(&condition.right)?;
+            let first_side = relation.column_side(first);
+            let second_side = relation.column_side(second);
+            if first_side == second_side {
+                return Err(Error::InvalidQuery(format!(
+                    "INNER JOIN equality '{} = {}' must compare columns from opposite tables",
+                    condition.left, condition.right
+                )));
+            }
+            if relation.data_type(first) != relation.data_type(second) {
+                return Err(Error::TypeMismatch {
+                    context: format!(
+                        "INNER JOIN equality '{} = {}'",
+                        condition.left, condition.right
+                    ),
+                    expected: relation.data_type(first).to_string(),
+                    actual: relation.data_type(second).to_string(),
+                });
+            }
+            match first_side {
+                RelationSide::Left => {
+                    left_keys.push(first);
+                    right_keys.push(second);
+                }
+                RelationSide::Right => {
+                    left_keys.push(second);
+                    right_keys.push(first);
+                }
+            }
+        }
+
+        let mut index: HashMap<Box<[ValueRef<'a>]>, Vec<usize>> =
+            HashMap::with_capacity(right.row_count().min(1_024));
+        for right_row in 0..right.row_count() {
+            let key = relation.key_for_physical_row(&right_keys, right_row);
+            index
+                .entry(key.into_boxed_slice())
+                .or_default()
+                .push(right_row);
+        }
+
+        let mut pairs = Vec::new();
+        for left_row in 0..left.row_count() {
+            let key = relation.key_for_physical_row(&left_keys, left_row);
+            if let Some(right_rows) = index.get(key.as_slice()) {
+                pairs.extend(right_rows.iter().map(|right_row| (left_row, *right_row)));
+            }
+        }
+        relation.row_pairs = Some(pairs);
+        Ok(relation)
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_pairs
+            .as_ref()
+            .map_or_else(|| self.left.row_count(), Vec::len)
+    }
+
+    fn column_count(&self) -> usize {
+        self.left.schema().len() + self.right.map_or(0, |table| table.schema().len())
+    }
+
+    fn column_side(&self, column: usize) -> RelationSide {
+        if column < self.left.schema().len() {
+            RelationSide::Left
+        } else {
+            RelationSide::Right
+        }
+    }
+
+    fn column_name(&self, column: usize) -> &str {
+        match self.column_side(column) {
+            RelationSide::Left => &self.left.schema()[column].name,
+            RelationSide::Right => {
+                &self.right.expect("right column has a right table").schema()
+                    [column - self.left.schema().len()]
+                .name
+            }
+        }
+    }
+
+    fn data_type(&self, column: usize) -> DataType {
+        match self.column_side(column) {
+            RelationSide::Left => self.left.schema()[column].data_type,
+            RelationSide::Right => {
+                self.right.expect("right column has a right table").schema()
+                    [column - self.left.schema().len()]
+                .data_type
+            }
+        }
+    }
+
+    fn resolve_column(&self, reference: &str) -> Result<usize> {
+        let (qualifier, name) = reference
+            .split_once('.')
+            .map_or((None, reference), |(qualifier, name)| {
+                (Some(qualifier), name)
+            });
+        if let Some(qualifier) = qualifier {
+            let side = if qualifier.eq_ignore_ascii_case(&self.left_qualifier) {
+                RelationSide::Left
+            } else if self
+                .right_qualifier
+                .as_ref()
+                .is_some_and(|right| qualifier.eq_ignore_ascii_case(right))
+            {
+                RelationSide::Right
+            } else {
+                return Err(Error::InvalidQuery(format!(
+                    "unknown table or alias '{qualifier}' in column reference '{reference}'"
+                )));
+            };
+            return self
+                .resolve_on_side(side, name)
+                .ok_or_else(|| Error::ColumnNotFound {
+                    table: qualifier.to_owned(),
+                    column: name.to_owned(),
+                });
+        }
+
+        let left = self.resolve_on_side(RelationSide::Left, name);
+        let right = self.resolve_on_side(RelationSide::Right, name);
+        match (left, right) {
+            (Some(column), None) | (None, Some(column)) => Ok(column),
+            (Some(_), Some(_)) => Err(Error::InvalidQuery(format!(
+                "column reference '{name}' is ambiguous; qualify it with a table name or alias"
+            ))),
+            (None, None) => Err(Error::ColumnNotFound {
+                table: self.left.name().to_owned(),
+                column: name.to_owned(),
+            }),
+        }
+    }
+
+    fn resolve_on_side(&self, side: RelationSide, name: &str) -> Option<usize> {
+        let (table, offset) = match side {
+            RelationSide::Left => (self.left, 0),
+            RelationSide::Right => (self.right?, self.left.schema().len()),
+        };
+        table
+            .schema()
+            .iter()
+            .position(|field| field.name.eq_ignore_ascii_case(name))
+            .map(|column| offset + column)
+    }
+
+    fn columns_for_qualifier(&self, qualifier: &str) -> Result<std::ops::Range<usize>> {
+        if qualifier.eq_ignore_ascii_case(&self.left_qualifier) {
+            Ok(0..self.left.schema().len())
+        } else if self
+            .right_qualifier
+            .as_ref()
+            .is_some_and(|right| qualifier.eq_ignore_ascii_case(right))
+        {
+            Ok(self.left.schema().len()..self.column_count())
+        } else {
+            Err(Error::InvalidQuery(format!(
+                "unknown table or alias '{qualifier}' in qualified wildcard"
+            )))
+        }
+    }
+
+    fn key_for_physical_row(&self, columns: &[usize], row: usize) -> Vec<ValueRef<'a>> {
+        columns
+            .iter()
+            .map(|column| self.physical_value_ref(*column, row))
+            .collect()
+    }
+
+    fn physical_value_ref(&self, column: usize, row: usize) -> ValueRef<'a> {
+        match self.column_side(column) {
+            RelationSide::Left => self.left.columns()[column].value_ref(row),
+            RelationSide::Right => self
+                .right
+                .expect("right column has a right table")
+                .columns()[column - self.left.schema().len()]
+            .value_ref(row),
+        }
+    }
+
+    fn value_ref(&self, column: usize, row: usize) -> ValueRef<'a> {
+        let physical_row = match (self.column_side(column), &self.row_pairs) {
+            (RelationSide::Left, Some(pairs)) => pairs[row].0,
+            (RelationSide::Right, Some(pairs)) => pairs[row].1,
+            (RelationSide::Left, None) => row,
+            (RelationSide::Right, None) => unreachable!("a right column belongs to a join"),
+        };
+        self.physical_value_ref(column, physical_row)
+    }
+
+    fn cmp_at(&self, column: usize, left: usize, right: usize) -> Ordering {
+        self.value_ref(column, left)
+            .cmp(&self.value_ref(column, right))
     }
 }
 
@@ -153,10 +420,10 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
+fn resolve_group_columns(relation: &Relation<'_>, names: &[String]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(names.len());
     for name in names {
-        let column = table.column_index(name)?;
+        let column = relation.resolve_column(name)?;
         if columns.contains(&column) {
             return Err(Error::InvalidQuery(format!(
                 "GROUP BY column '{name}' is listed more than once"
@@ -168,7 +435,7 @@ fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> 
 }
 
 fn resolve_select_items(
-    table: &Table,
+    relation: &Relation<'_>,
     requested: &[SelectItem],
     group_columns: &[usize],
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
@@ -176,9 +443,12 @@ fn resolve_select_items(
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
     if has_aggregate
-        && requested
-            .iter()
-            .any(|item| matches!(item, SelectItem::Wildcard))
+        && requested.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard { .. }
+            )
+        })
     {
         return Err(Error::InvalidQuery(
             "'*' projection cannot be combined with aggregates".to_owned(),
@@ -192,12 +462,12 @@ fn resolve_select_items(
     for requested_item in requested {
         match requested_item {
             SelectItem::Wildcard => {
-                for (source, field) in table.schema().iter().enumerate() {
+                for source in 0..relation.column_count() {
                     let group_position = group_columns.iter().position(|column| *column == source);
                     if !group_columns.is_empty() && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
-                            field.name
+                            relation.column_name(source)
                         )));
                     }
                     items.push(ResolvedItem::Column {
@@ -205,13 +475,33 @@ fn resolve_select_items(
                         group_position,
                     });
                     result_columns.push(ResultColumn {
-                        name: field.name.clone(),
-                        data_type: field.data_type,
+                        name: relation.column_name(source).to_owned(),
+                        data_type: relation.data_type(source),
+                    });
+                }
+            }
+            SelectItem::QualifiedWildcard { qualifier } => {
+                for source in relation.columns_for_qualifier(qualifier)? {
+                    let group_position = group_columns.iter().position(|column| *column == source);
+                    if !group_columns.is_empty() && group_position.is_none() {
+                        return Err(Error::InvalidQuery(format!(
+                            "column '{}.{}' must appear in GROUP BY",
+                            qualifier,
+                            relation.column_name(source)
+                        )));
+                    }
+                    items.push(ResolvedItem::Column {
+                        source,
+                        group_position,
+                    });
+                    result_columns.push(ResultColumn {
+                        name: relation.column_name(source).to_owned(),
+                        data_type: relation.data_type(source),
                     });
                 }
             }
             SelectItem::Column { name, alias } => {
-                let source = table.column_index(name)?;
+                let source = relation.resolve_column(name)?;
                 let group_position = group_columns.iter().position(|column| *column == source);
                 if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
                     return Err(Error::InvalidQuery(format!(
@@ -225,8 +515,8 @@ fn resolve_select_items(
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
-                        .unwrap_or_else(|| table.schema()[source].name.clone()),
-                    data_type: table.schema()[source].data_type,
+                        .unwrap_or_else(|| relation.column_name(source).to_owned()),
+                    data_type: relation.data_type(source),
                 });
             }
             SelectItem::Aggregate {
@@ -245,11 +535,11 @@ fn resolve_select_items(
                         (None, None, "*".to_owned())
                     }
                     AggregateArgument::Column(name) => {
-                        let index = table.column_index(name)?;
+                        let index = relation.resolve_column(name)?;
                         (
                             Some(index),
-                            Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
+                            Some(relation.data_type(index)),
+                            relation.column_name(index).to_owned(),
                         )
                     }
                 };
@@ -299,7 +589,7 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 }
 
 fn execute_projection(
-    table: &Table,
+    relation: &Relation<'_>,
     matching_rows: &[usize],
     items: &[ResolvedItem],
 ) -> Vec<Vec<Value>> {
@@ -309,7 +599,9 @@ fn execute_projection(
             items
                 .iter()
                 .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::Column { source, .. } => {
+                        relation.value_ref(*source, *row).to_owned()
+                    }
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
@@ -320,7 +612,7 @@ fn execute_projection(
 }
 
 fn execute_grouped<'a>(
-    table: &'a Table,
+    relation: &Relation<'a>,
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
@@ -340,7 +632,7 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) = groups.find_or_insert(relation, group_columns, *row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -349,7 +641,7 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, relation, *row)?;
         }
     }
 
@@ -385,7 +677,7 @@ impl<'a> GroupIndex<'a> {
 
     fn find_or_insert(
         &mut self,
-        table: &'a Table,
+        relation: &Relation<'a>,
         columns: &[usize],
         row: usize,
         next_group: usize,
@@ -393,7 +685,7 @@ impl<'a> GroupIndex<'a> {
         match self {
             Self::Global => (0, false),
             Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
+                let key = relation.value_ref(columns[0], row);
                 if let Some(group) = groups.get(&key) {
                     (*group, false)
                 } else {
@@ -403,15 +695,15 @@ impl<'a> GroupIndex<'a> {
             }
             Self::Multiple(groups) if columns.len() == 2 => {
                 let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
+                    relation.value_ref(columns[0], row),
+                    relation.value_ref(columns[1], row),
                 ];
                 find_or_insert_group(groups, &key, next_group)
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
+                    .map(|column| relation.value_ref(*column, row))
                     .collect::<Vec<_>>();
                 find_or_insert_group(groups, &key, next_group)
             }
@@ -547,7 +839,7 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+    fn update(&mut self, spec: &AggregateSpec, relation: &Relation<'_>, row: usize) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -555,28 +847,28 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
             Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Int64(value) =
+                    relation.value_ref(spec.argument.expect("SUM argument"), row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(value)
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
+                let ValueRef::Float64(value) =
+                    relation.value_ref(spec.argument.expect("SUM argument"), row)
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 if !sum.is_finite() {
                     return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
                 }
             }
             Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
+                let candidate = relation.value_ref(spec.argument.expect("MIN argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
@@ -585,8 +877,7 @@ impl AggregateState {
                 }
             }
             Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
+                let candidate = relation.value_ref(spec.argument.expect("MAX argument"), row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
@@ -595,24 +886,25 @@ impl AggregateState {
                 }
             }
             Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Int64(value) =
+                    relation.value_ref(spec.argument.expect("AVG argument"), row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(i128::from(values[row]))
+                    .checked_add(i128::from(value))
                     .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
             }
             Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
+                let ValueRef::Float64(value) =
+                    relation.value_ref(spec.argument.expect("AVG argument"), row)
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                *sum += value;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
@@ -652,15 +944,35 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
+fn resolve_ordering(
+    relation: &Relation<'_>,
+    items: &[ResolvedItem],
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+) -> Result<Vec<ResolvedOrder>> {
     let mut ordering = Vec::with_capacity(requested.len());
     for order in requested {
-        let matches = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let matches = if order.name.contains('.') {
+            let source = relation.resolve_column(&order.name)?;
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| match item {
+                    ResolvedItem::Column {
+                        source: item_source,
+                        ..
+                    } if *item_source == source => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
         match matches.as_slice() {
             [index] => ordering.push(ResolvedOrder {
                 output: *index,
@@ -685,7 +997,7 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
 
 fn order_source_rows(
     rows: &mut Vec<usize>,
-    table: &Table,
+    relation: &Relation<'_>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
@@ -702,7 +1014,7 @@ fn order_source_rows(
             let ResolvedItem::Column { source, .. } = items[order.output] else {
                 unreachable!("ungrouped projections cannot contain aggregates")
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
+            let comparison = relation.cmp_at(source, left, right);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -779,15 +1091,15 @@ enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    fn evaluate(&self, table: &Table, row: usize) -> bool {
+    fn evaluate(&self, relation: &Relation<'_>, row: usize) -> bool {
         match self {
             Self::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                let left = left.value(table, row);
-                let right = right.value(table, row);
+                let left = left.value(relation, row);
+                let right = right.value(relation, row);
                 let comparison = left
                     .sql_cmp(right)
                     .expect("predicate operand types are validated");
@@ -800,8 +1112,8 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
-            Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
-            Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
+            Self::And(left, right) => left.evaluate(relation, row) && right.evaluate(relation, row),
+            Self::Or(left, right) => left.evaluate(relation, row) || right.evaluate(relation, row),
         }
     }
 }
@@ -820,23 +1132,23 @@ impl CompiledOperand {
         }
     }
 
-    fn value<'a>(&'a self, table: &'a Table, row: usize) -> ValueRef<'a> {
+    fn value<'a>(&'a self, relation: &'a Relation<'_>, row: usize) -> ValueRef<'a> {
         match self {
-            Self::Column { index, .. } => table.columns()[*index].value_ref(row),
+            Self::Column { index, .. } => relation.value_ref(*index, row),
             Self::Literal(value) => value.as_ref(),
         }
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn compile_predicate(relation: &Relation<'_>, predicate: &Predicate) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
             operator,
             right,
         } => {
-            let left = compile_operand(table, left)?;
-            let right = compile_operand(table, right)?;
+            let left = compile_operand(relation, left)?;
+            let right = compile_operand(relation, right)?;
             if !comparable(left.data_type(), right.data_type()) {
                 return Err(Error::TypeMismatch {
                     context: "WHERE comparison".to_owned(),
@@ -851,23 +1163,23 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             })
         }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(relation, left)?),
+            Box::new(compile_predicate(relation, right)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_predicate(relation, left)?),
+            Box::new(compile_predicate(relation, right)?),
         )),
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_operand(relation: &Relation<'_>, operand: &Operand) -> Result<CompiledOperand> {
     match operand {
         Operand::Column(name) => {
-            let index = table.column_index(name)?;
+            let index = relation.resolve_column(name)?;
             Ok(CompiledOperand::Column {
                 index,
-                data_type: table.schema()[index].data_type,
+                data_type: relation.data_type(index),
             })
         }
         Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),

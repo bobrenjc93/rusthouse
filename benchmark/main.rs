@@ -568,7 +568,7 @@ fn details_json(
         json_string(&identity.version_output),
         json_string(&identity.sha256),
         json_string("amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup"),
-        json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
+        json_string("synthetic single-process data does not model concurrency, durable storage, networking, outer or non-equality joins, nullability, or production compression")
     )
     .expect("writing to String cannot fail");
 

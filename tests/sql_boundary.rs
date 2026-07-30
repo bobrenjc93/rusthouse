@@ -502,6 +502,216 @@ fn boolean_literals_cannot_be_ambiguous_column_names() {
 }
 
 #[test]
+fn inner_join_preserves_one_to_many_matches_and_applies_the_query_pipeline() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE customers (id Int64, name String, active Bool);
+             CREATE TABLE purchases (id Int64, customer_id Int64, amount Int64);
+             INSERT INTO customers VALUES
+                (1, 'Ada', true), (2, 'Linus', true), (3, 'Grace', false);
+             INSERT INTO purchases VALUES
+                (10, 1, 5), (11, 1, 9), (12, 2, 7), (13, 3, 100);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT c.name, p.id AS purchase_id, p.amount
+         FROM customers c
+         INNER JOIN purchases p ON c.id = p.customer_id
+         WHERE c.active = true AND p.amount >= 6
+         ORDER BY p.amount DESC, c.name
+         LIMIT 2;",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("Ada".to_owned()),
+                Value::Int64(11),
+                Value::Int64(9),
+            ],
+            vec![
+                Value::String("Linus".to_owned()),
+                Value::Int64(12),
+                Value::Int64(7),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn inner_join_with_no_matches_returns_empty_rows_and_zero_count() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE left_rows (id Int64);
+             CREATE TABLE right_rows (left_id Int64);
+             INSERT INTO left_rows VALUES (1), (2);
+             INSERT INTO right_rows VALUES (3), (4);",
+        )
+        .expect("setup succeeds");
+
+    let rows = execute_query(
+        &mut database,
+        "SELECT l.id, r.left_id
+         FROM left_rows AS l
+         INNER JOIN right_rows AS r ON l.id = r.left_id;",
+    );
+    assert!(rows.rows.is_empty());
+
+    let count = execute_query(
+        &mut database,
+        "SELECT COUNT(*) AS matched
+         FROM left_rows l
+         INNER JOIN right_rows r ON l.id = r.left_id;",
+    );
+    assert_eq!(count.rows, vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn inner_join_rejects_ambiguous_unqualified_columns() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE first (id Int64); CREATE TABLE second (id Int64);")
+        .expect("setup succeeds");
+
+    let error = database
+        .execute(
+            "SELECT id
+             FROM first AS f
+             INNER JOIN second AS s ON f.id = s.id;",
+        )
+        .expect_err("unqualified id exists on both sides");
+    assert!(
+        matches!(error, Error::InvalidQuery(message) if message.contains("column reference 'id' is ambiguous"))
+    );
+}
+
+#[test]
+fn inner_join_rejects_mismatched_keys_and_same_side_equalities() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE typed_left (id Int64, label String);
+             CREATE TABLE typed_right (left_id Int64);",
+        )
+        .expect("setup succeeds");
+
+    let mismatch = database
+        .execute(
+            "SELECT l.id FROM typed_left l
+             INNER JOIN typed_right r ON l.label = r.left_id;",
+        )
+        .expect_err("hash keys must have the same type");
+    assert!(matches!(
+        mismatch,
+        Error::TypeMismatch { context, expected, actual }
+            if context.contains("INNER JOIN equality")
+                && expected == "String"
+                && actual == "Int64"
+    ));
+
+    let same_side = database
+        .execute(
+            "SELECT l.id FROM typed_left l
+             INNER JOIN typed_right r ON l.id = l.id;",
+        )
+        .expect_err("each equality must connect both tables");
+    assert!(
+        matches!(same_side, Error::InvalidQuery(message) if message.contains("opposite tables"))
+    );
+}
+
+#[test]
+fn composite_inner_join_keys_feed_grouping_and_aggregation() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE accounts (tenant String, id Int64, owner String);
+             CREATE TABLE entries (tenant String, account_id Int64, amount Int64);
+             INSERT INTO accounts VALUES
+                ('north', 1, 'A'), ('south', 1, 'B'), ('north', 2, 'C');
+             INSERT INTO entries VALUES
+                ('north', 1, 4), ('north', 1, 6),
+                ('south', 1, 9), ('south', 2, 100);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT a.owner, COUNT(*) AS entry_count, SUM(e.amount) AS total
+         FROM accounts a
+         INNER JOIN entries e
+           ON a.tenant = e.tenant AND a.id = e.account_id
+         GROUP BY a.owner
+         ORDER BY total DESC;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::String("A".to_owned()),
+                Value::Int64(2),
+                Value::Int64(10),
+            ],
+            vec![
+                Value::String("B".to_owned()),
+                Value::Int64(1),
+                Value::Int64(9),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn inner_join_matches_clickhouse_all_join_projection_semantics() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE dimensions (id Int64, label String);
+             CREATE TABLE facts (dimension_id Int64, metric Float64, enabled Bool);
+             INSERT INTO dimensions VALUES (2, 'second'), (1, 'first');
+             INSERT INTO facts VALUES
+                (1, 2.5, true), (1, 1.5, false), (2, 8.0, true);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT d.*, f.metric, f.enabled
+         FROM dimensions AS d
+         INNER JOIN facts AS f ON f.dimension_id = d.id
+         ORDER BY d.id, f.metric;",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::String("first".to_owned()),
+                Value::Float64(1.5),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("first".to_owned()),
+                Value::Float64(2.5),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("second".to_owned()),
+                Value::Float64(8.0),
+                Value::Bool(true),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn creates_a_fifty_thousand_column_schema() {
     let column_count = 50_000;
     let definitions = (0..column_count)

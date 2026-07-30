@@ -9,6 +9,7 @@ pub enum Family {
     LowCardinalityGroupBy,
     HighCardinalityGroupBy,
     OrderByLimit,
+    HashJoin,
 }
 
 impl Family {
@@ -21,6 +22,7 @@ impl Family {
             Self::LowCardinalityGroupBy => "low_cardinality_group_by",
             Self::HighCardinalityGroupBy => "high_cardinality_group_by",
             Self::OrderByLimit => "order_by_limit",
+            Self::HashJoin => "hash_join",
         }
     }
 }
@@ -121,6 +123,16 @@ pub fn workloads(row_count: usize) -> Vec<Workload> {
                 ("flag", ColumnType::Boolean),
             ],
         },
+        Workload {
+            name: "composite_hash_inner_join",
+            family: Family::HashJoin,
+            sql: "SELECT d.segment, COUNT(*) AS row_count, SUM(p.uniform_num) AS total FROM parity_data AS p INNER JOIN parity_lookup AS d ON p.low_key = d.low_key AND p.flag = d.flag GROUP BY d.segment ORDER BY d.segment;".to_owned(),
+            columns: vec![
+                ("segment", ColumnType::String),
+                ("row_count", ColumnType::Integer),
+                ("total", ColumnType::Integer),
+            ],
+        },
     ]
 }
 
@@ -138,7 +150,7 @@ mod tests {
             .map(|workload| workload.family)
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(families.len(), 7);
+        assert_eq!(families.len(), 8);
         assert!(
             workloads
                 .iter()
@@ -168,6 +180,11 @@ mod tests {
             workloads
                 .iter()
                 .any(|workload| workload.sql.contains("ORDER BY payload"))
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.sql.contains("INNER JOIN parity_lookup"))
         );
         assert!(workloads.iter().all(|workload| workload.sql.ends_with(';')));
     }

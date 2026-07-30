@@ -79,7 +79,7 @@ A dependency-free SplitMix64 generator produces deterministic typed rows. Every 
 
 The first rows force important extrema, so even quick mode cannot randomly omit negative, positive, or large values. Row-count-specific seed derivation prevents the larger sizes from merely timing the same prefix.
 
-Each row count runs eight cases spanning:
+Each row count runs nine cases spanning:
 
 | Family | Coverage |
 | --- | --- |
@@ -90,6 +90,7 @@ Each row count runs eight cases spanning:
 | Low-cardinality grouping | String plus Boolean grouping with several aggregates |
 | High-cardinality grouping | Unique string-key grouping, deterministic ordering, bounded output |
 | Ordering and limit | Numeric and string sort shapes with deterministic tie breakers |
+| Hash join | Aliased composite equality join followed by grouping and aggregation |
 
 The generated CREATE TABLE, INSERT, and query SQL bytes are identical for both engines. Only public output-format command-line options differ. All result-producing queries have explicit aliases and deterministic ordering where row order matters.
 
@@ -103,7 +104,7 @@ Tests cover generator reproducibility, runtime-seed variation, dataset-shape and
 
 ## Timing and calibration
 
-The primary sample starts one process, creates and inserts the dataset once, and executes the identical workload query 256 times against that in-memory table. Both engines receive exactly 256 repetitions; the runner rejects a mismatched count. Stdout goes to the null sink for timing processes. Total positive wall time is divided by 256, so startup and setup contribute only 1/256 to the reported per-query sample. Warmup process pairs are discarded, engine order alternates, and the median of measured samples is used.
+The primary sample starts one process, creates and inserts the dataset once, and executes the identical workload query 256 times against those in-memory tables. Both engines receive exactly 256 repetitions; the runner rejects a mismatched count. Stdout goes to the null sink for timing processes. Total positive wall time is divided by 256, so startup and setup contribute only 1/256 to the reported per-query sample. Warmup process pairs are discarded, engine order alternates, and the median of measured samples is used.
 
 The fixed 256x factor is the calibration for both quick and default modes. It was selected to make repeated analytical work the majority of ClickHouse Local batch time across the retained scales while keeping quick mode practical. A fixed shared factor avoids engine-dependent adaptive stopping and gives every case the same amortization. The harness deliberately performs no startup subtraction: subtracting independently noisy process measurements can create zero, negative, or highly unstable derived timings. Samples must remain positive, and a greater-than-10x max/min spread rejects the run.
 
@@ -125,6 +126,6 @@ The same aggregation produces primary and end-to-end scores. A ratio of one maps
 
 Amplification measures repeated work on one loaded in-memory table. It can benefit CPU caches and repeated planning paths, does not model concurrency, and still retains 1/256 of process startup and setup. The startup-inclusive score must be consulted for one-shot CLI use. Neither metric isolates only an execution kernel.
 
-OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
+OS scheduling, filesystem cache state, CPU frequency, and other local load remain uncontrolled. Synthetic data cannot represent production compression, outer or non-equality joins, nullability, durable storage, network access, or concurrent clients, and this benchmark makes no such claim.
 
 Anti-gaming properties are the fixed external ClickHouse identity, configurable runtime seeds, multiple scales, deliberately conflicting data shapes, selective and nonselective predicates, two grouping cardinalities, deterministic query ordering, alternating engine order, separate fail-closed correctness gates, identical per-engine amplification, retained raw samples, conservative per-case caps, and equal family/scale weighting. No single special-case query, favorable seed, or duplicated workload can legitimately stand in for the suite.

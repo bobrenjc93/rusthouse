@@ -1,6 +1,10 @@
 use std::fmt::Write as _;
 
 pub const TABLE_NAME: &str = "parity_data";
+pub const LOOKUP_TABLE_NAME: &str = "parity_lookup";
+const LOW_KEYS: [&str; 8] = [
+    "amber", "blue", "coral", "green", "indigo", "red", "silver", "violet",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -24,9 +28,6 @@ pub struct Dataset {
 impl Dataset {
     pub fn generate(seed: u64, row_count: usize) -> Self {
         let mut random = SplitMix64::new(seed);
-        let low_keys = [
-            "amber", "blue", "coral", "green", "indigo", "red", "silver", "violet",
-        ];
         let words = [
             "a",
             "medium",
@@ -55,7 +56,7 @@ impl Dataset {
                 (random.next() % 1_500_001) as i64 - 750_000
             };
             let score = ((random.next() % 160_001) as i64 - 80_000) as f64 / 8.0;
-            let low_key = low_keys[(random.next() as usize) % low_keys.len()].to_owned();
+            let low_key = LOW_KEYS[(random.next() as usize) % LOW_KEYS.len()].to_owned();
             let high_key = format!("entity_{index:08}");
             let word = words[(random.next() as usize) % words.len()];
             let suffix_len = (random.next() % 13) as usize;
@@ -120,6 +121,29 @@ impl Dataset {
                 escape_sql_string(&row.payload),
                 row.flag,
                 row.large_int,
+            )
+            .expect("writing to String cannot fail");
+        }
+        sql.push_str(";\n");
+        writeln!(
+            sql,
+            "CREATE TABLE {LOOKUP_TABLE_NAME} (low_key String, flag Bool, segment String);"
+        )
+        .expect("writing to String cannot fail");
+        write!(sql, "INSERT INTO {LOOKUP_TABLE_NAME} VALUES ")
+            .expect("writing to String cannot fail");
+        for (index, (low_key, flag)) in LOW_KEYS
+            .iter()
+            .flat_map(|low_key| [false, true].map(|flag| (*low_key, flag)))
+            .enumerate()
+        {
+            if index > 0 {
+                sql.push(',');
+            }
+            write!(
+                sql,
+                "('{low_key}',{flag},'{low_key}-{}')",
+                if flag { "on" } else { "off" }
             )
             .expect("writing to String cannot fail");
         }
@@ -222,6 +246,8 @@ mod tests {
         let sql = dataset.setup_sql();
         assert!(sql.contains("quote''s payload"));
         assert!(sql.starts_with("CREATE TABLE parity_data"));
+        assert!(sql.contains("CREATE TABLE parity_lookup"));
+        assert!(sql.contains("('amber',false,'amber-off')"));
         assert!(sql.ends_with(";\n"));
     }
 }
