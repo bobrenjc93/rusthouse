@@ -60,7 +60,7 @@ impl Database {
             .collect()
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    pub(crate) fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog.create_table(name, columns)?;
@@ -90,7 +90,7 @@ impl Database {
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    pub(crate) fn execute_select(&self, select: Select) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate

@@ -1,5 +1,12 @@
 use std::fmt;
 
+/// The kind of shared-database lock that could not be acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAccess {
+    Read,
+    Write,
+}
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -30,6 +37,9 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    LockPoisoned {
+        access: LockAccess,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +82,13 @@ impl fmt::Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
+            }
+            Self::LockPoisoned { access } => {
+                let access = match access {
+                    LockAccess::Read => "read",
+                    LockAccess::Write => "write",
+                };
+                write!(f, "shared database {access} lock is poisoned")
             }
         }
     }

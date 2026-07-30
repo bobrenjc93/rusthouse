@@ -79,6 +79,29 @@ assert_eq!(result.rows.len(), 1);
 # Ok::<(), rusthouse::Error>(())
 ~~~
 
+For concurrent access, `SharedDatabase` is a cloneable handle backed by the
+standard library's `Arc<RwLock<Database>>`:
+
+~~~rust
+use rusthouse::SharedDatabase;
+
+let database = SharedDatabase::new();
+database.execute("CREATE TABLE events (id Int64, name String)")?;
+
+let reader = database.clone();
+let query = std::thread::spawn(move || {
+    reader.execute("SELECT * FROM events")
+});
+query.join().expect("reader thread")?;
+
+# Ok::<(), rusthouse::Error>(())
+~~~
+
+Read-only `SELECT` batches share a read lock. A batch containing `CREATE TABLE`
+or `INSERT` holds one exclusive lock for its complete execution, so concurrent
+calls cannot observe intermediate statements. Parsing happens before lock
+acquisition, and poisoned locks are reported as `Error::LockPoisoned`.
+
 ## Current boundaries
 
 RustHouse has no NULL, joins, arithmetic expressions, updates, deletes, quoted identifiers, persistence, transactions spanning multiple SQL statements, HTTP API, or network protocol. Data exists only for the lifetime of the Database value or CLI process. A multi-row INSERT is validated in full before any of its rows are appended.
