@@ -1,3 +1,9 @@
+//! Owned syntax tree types and parsing for RustHouse's SQL subset.
+//!
+//! Parsing performs syntax validation only. It neither reads nor mutates a
+//! catalog; table, column, type, grouping, and ordering validation occurs
+//! during execution.
+
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
@@ -5,53 +11,101 @@ use crate::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 
+/// An owned SQL statement produced by [`parse`].
+///
+/// Statement values borrow neither the input SQL nor a database and retain the
+/// order in which statements appeared in a parsed batch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// Creates an empty table with an ordered schema.
     CreateTable {
+        /// Case-preserving table name from the SQL input.
         name: String,
+        /// Column definitions in declaration order.
         columns: Vec<ColumnDef>,
     },
+    /// Appends one or more literal rows to an existing table.
     Insert {
+        /// Case-preserving target table name from the SQL input.
         table: String,
+        /// Owned values in SQL row order and, within each row, value order.
         rows: Vec<Vec<Value>>,
     },
+    /// Reads, filters, groups, orders, and projects rows.
     Select(Select),
 }
 
+/// The clauses of a parsed `SELECT` statement.
+///
+/// Every field owns its syntax and can outlive the input string. Vector order
+/// is source order and determines projection, grouping, and sort-key priority.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// Projection expressions in output-column order.
     pub items: Vec<SelectItem>,
+    /// Case-preserving source table name.
     pub table: String,
+    /// Optional `WHERE` expression; `None` selects every source row.
     pub predicate: Option<Predicate>,
+    /// `GROUP BY` column names in key order.
     pub group_by: Vec<String>,
+    /// `ORDER BY` keys in decreasing sort priority.
     pub order_by: Vec<OrderBy>,
+    /// Optional maximum result-row count; zero requests no rows.
     pub limit: Option<usize>,
 }
 
+/// One expression in a `SELECT` projection list.
+///
+/// Projection list order becomes [`QueryResult::columns`](crate::QueryResult::columns)
+/// order. Names and aliases are owned and case-preserving.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
+    /// Every source column, in table schema order.
     Wildcard,
+    /// One named source column.
     Column {
+        /// Case-preserving source column name.
         name: String,
+        /// Optional case-preserving output name.
         alias: Option<String>,
     },
+    /// One aggregate calculation.
     Aggregate {
+        /// Aggregate operation to perform.
         function: AggregateFunction,
+        /// Wildcard or source-column input.
         argument: AggregateArgument,
+        /// Optional case-preserving output name.
         alias: Option<String>,
     },
 }
 
+/// A supported aggregate operation.
+///
+/// `COUNT` accepts a wildcard or any column and returns `Int64`. `SUM` and
+/// `AVG` require numeric columns; `MIN` and `MAX` accept any physical column
+/// type. On empty input, `COUNT` and `SUM` return zero while `MIN`, `MAX`, and
+/// `AVG` fail during execution because RustHouse has no null value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFunction {
+    /// Counts input rows and checks for `i64` overflow.
     Count,
+    /// Sums a numeric column with checked finite output.
     Sum,
+    /// Returns the least input value by the type's deterministic ordering.
     Min,
+    /// Returns the greatest input value by the type's deterministic ordering.
     Max,
+    /// Returns a `Float64` arithmetic mean of a numeric column.
     Avg,
 }
 
 impl AggregateFunction {
+    /// Returns the canonical uppercase SQL spelling of this function.
+    ///
+    /// This operation is infallible and returns a process-lifetime static
+    /// string without allocating or mutating state.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -75,46 +129,100 @@ impl AggregateFunction {
     }
 }
 
+/// The parsed input to an aggregate function.
+///
+/// Arguments own column names and borrow neither SQL input nor catalog data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArgument {
+    /// The `*` argument, supported during execution only by `COUNT`.
     Wildcard,
+    /// A case-preserving source-column name.
     Column(String),
 }
 
+/// A Boolean `WHERE` expression.
+///
+/// The tree explicitly records precedence: `AND` binds more tightly than
+/// `OR`, and parentheses override precedence. Parsing limits expressions to 64
+/// levels of parenthesis nesting and 256 comparison/Boolean nodes. The tree
+/// owns all operands and can outlive its SQL input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
+    /// Compares two operands with one SQL comparison operator.
     Comparison {
+        /// Left-hand operand, evaluated first.
         left: Operand,
+        /// Comparison operation.
         operator: ComparisonOperator,
+        /// Right-hand operand.
         right: Operand,
     },
+    /// Logical conjunction with short-circuit evaluation.
     And(Box<Self>, Box<Self>),
+    /// Logical disjunction with short-circuit evaluation.
     Or(Box<Self>, Box<Self>),
 }
 
+/// One side of a [`Predicate::Comparison`].
+///
+/// Operands are owned. Column resolution and comparison type checking are
+/// deferred until execution.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
+    /// A case-preserving source-column name.
     Column(String),
+    /// An owned SQL literal value.
     Literal(Value),
 }
 
+/// A supported SQL comparison operator.
+///
+/// Comparisons return a Boolean and support operands of the same type plus
+/// exact mixed `Int64`/`Float64` comparisons. Other type pairs fail validation
+/// before any rows are scanned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOperator {
+    /// SQL `=`.
     Equal,
+    /// SQL `!=` or `<>`.
     NotEqual,
+    /// SQL `<`.
     Less,
+    /// SQL `<=`.
     LessOrEqual,
+    /// SQL `>`.
     Greater,
+    /// SQL `>=`.
     GreaterOrEqual,
 }
 
+/// One output-name key in an `ORDER BY` clause.
+///
+/// Keys are applied in vector order by the execution engine. The name must
+/// resolve unambiguously to a projected column or alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBy {
+    /// Case-preserving output column name or alias.
     pub name: String,
+    /// `true` for descending order and `false` for ascending order.
     pub descending: bool,
 }
 
-/// Parse one or more semicolon-separated SQL statements.
+/// Parses one or more semicolon-separated SQL statements.
+///
+/// Statements are returned in source order, and extra semicolons between them
+/// are ignored. Keywords and unquoted identifiers are matched
+/// case-insensitively, original identifier spelling is retained, and the
+/// returned tree owns all strings and values. Parsing has no external side
+/// effects, so every failure is atomic.
+///
+/// # Errors
+///
+/// Returns [`Error::Sql`] at a zero-based UTF-8 byte position for empty input,
+/// unsupported characters, malformed literals or grammar, numeric range
+/// errors, and predicate complexity-limit violations. Returns
+/// [`Error::ReservedIdentifier`] for `TRUE` or `FALSE` column declarations.
+/// Semantic catalog and type errors are deferred until execution.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
     let tokens = Lexer::new(input).tokenize()?;
     Parser::new(tokens).parse_script()

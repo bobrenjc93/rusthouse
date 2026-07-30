@@ -1,3 +1,5 @@
+//! SQL execution against an in-memory catalog and owned result types.
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -10,49 +12,102 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
-/// A reusable in-memory SQL database.
+/// A reusable in-memory SQL database that owns a [`Catalog`].
+///
+/// Data persists across [`execute`](Self::execute) calls and lives until this
+/// value is dropped. The database performs no I/O or background work and has
+/// no transaction spanning separate calls.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
 }
 
+/// Metadata for one positional query-result column.
+///
+/// Metadata is owned and can outlive the source database. Column position is
+/// significant and duplicate names are permitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
+    /// Case-preserving source name or explicit SQL alias.
     pub name: String,
+    /// Physical type of values at this position in every result row.
     pub data_type: DataType,
 }
 
+/// An owned, positional result set produced by `SELECT`.
+///
+/// `columns[index]` describes `rows[*][index]`. Database-produced rows always
+/// match the column count, but the public fields permit callers to construct
+/// other shapes. Without `ORDER BY`, simple projections preserve table
+/// insertion order and grouped queries use ascending group-key order. With
+/// `ORDER BY`, requested keys are applied left to right; simple-row ties use
+/// insertion order and grouped ties use ascending group-key order. All data is
+/// owned and may outlive the database.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
+    /// Output metadata in `SELECT` projection order.
     pub columns: Vec<ResultColumn>,
+    /// Owned row values in query-result order.
     pub rows: Vec<Vec<Value>>,
 }
 
+/// The outcome of one successfully executed statement.
+///
+/// A batch result vector uses SQL statement order. Values are owned except for
+/// command tags, which have static lifetime.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementResult {
+    /// A successful statement that does not produce rows.
     Command {
+        /// Static command name: `"CREATE TABLE"` or `"INSERT"`.
         tag: &'static str,
+        /// Inserted row count, or zero for `CREATE TABLE`.
         affected_rows: usize,
     },
+    /// The owned result of a `SELECT` statement.
     Query(QueryResult),
 }
 
 impl Database {
+    /// Creates a database with an empty in-memory catalog.
+    ///
+    /// This operation is infallible and the database owns all data subsequently
+    /// added to it.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Borrows the database catalog for direct read-only inspection.
+    ///
+    /// This operation is infallible. The catalog and any table references
+    /// obtained from it remain valid only for the shared borrow of `self`.
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    /// Execute one or more semicolon-separated statements in order.
+    /// Executes one or more semicolon-separated statements in order.
     ///
-    /// The complete batch is parsed before execution, so a syntax error applies
-    /// nothing. Once parsing succeeds, statements execute in order and earlier
-    /// statements remain applied if a later execution error occurs.
+    /// The complete batch is parsed before execution, so a syntax error changes
+    /// nothing. Once parsing succeeds, statements execute in order; `CREATE
+    /// TABLE` and each multi-row `INSERT` are individually atomic, and `SELECT`
+    /// never mutates the database. The batch as a whole is not atomic: earlier
+    /// successful mutations remain applied if a later statement fails. Empty,
+    /// comment-only, and semicolon-only batches are syntax errors and leave the
+    /// database unchanged.
+    ///
+    /// Returned results follow statement order and own their row data, so they
+    /// can outlive both this mutable borrow and the database. Simple queries
+    /// without `ORDER BY` preserve insertion order; grouping and explicit
+    /// ordering use the deterministic rules documented by [`QueryResult`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Sql`] for lexical or syntax errors and the relevant
+    /// catalog, schema, type, query-validation, or overflow error for execution
+    /// failures. On an execution error, no result vector is returned even
+    /// though earlier successful statements remain applied as described above.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         sql::parse(sql)?
             .into_iter()

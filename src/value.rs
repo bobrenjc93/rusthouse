@@ -1,13 +1,22 @@
+//! Owned scalar values and their physical data types.
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
 /// The four physical column types supported by RustHouse.
+///
+/// Types are exact for insertion; only SQL comparisons allow mixed
+/// [`Int64`](Self::Int64) and [`Float64`](Self::Float64) operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
+    /// A signed 64-bit integer.
     Int64,
+    /// An IEEE 754 double-precision number.
     Float64,
+    /// A Boolean value.
     Bool,
+    /// An owned UTF-8 string.
     String,
 }
 
@@ -34,12 +43,26 @@ impl fmt::Display for DataType {
     }
 }
 
-/// A scalar value read from or written to a typed column.
+/// An owned scalar value read from or written to a typed column.
+///
+/// Values contain no references and may outlive the database that produced
+/// them. [`Ord`] provides a deterministic total order for storage and result
+/// ordering: variants sort `Int64`, `Float64`, `Bool`, then `String`; floats
+/// use [`f64::total_cmp`] with both signed zeroes equal. SQL predicate
+/// comparison is separate and permits exact mixed integer/float comparison.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// A signed 64-bit integer value.
     Int64(i64),
+    /// An IEEE 754 double-precision value.
+    ///
+    /// Non-finite values can be constructed through this API but table
+    /// insertion rejects them.
     Float64(f64),
+    /// A Boolean value, ordered `false` before `true`.
     Bool(bool),
+    /// An owned UTF-8 string, ordered lexicographically by Unicode scalar
+    /// values through Rust's `str` ordering.
     String(String),
 }
 
@@ -53,6 +76,10 @@ pub(crate) enum ValueRef<'a> {
 }
 
 impl Value {
+    /// Returns the physical type corresponding to this value's variant.
+    ///
+    /// This operation is infallible, does not mutate or allocate, and the
+    /// result is independent of the lifetime of `self`.
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -63,6 +90,11 @@ impl Value {
         }
     }
 
+    /// Formats this value as unquoted display text.
+    ///
+    /// Integers and Booleans use their Rust spelling. Finite integral floats
+    /// retain a `.0` suffix, and strings are cloned without escaping. The
+    /// returned allocation is owned and may outlive `self`.
     #[must_use]
     pub fn as_display_string(&self) -> String {
         match self {

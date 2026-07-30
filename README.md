@@ -93,6 +93,7 @@ The crate has no third-party dependencies. Run the complete checks with:
 
 ~~~bash
 cargo fmt --check
+cargo test --doc
 cargo test
 cargo clippy --all-targets -- -D warnings
 ~~~

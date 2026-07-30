@@ -1,16 +1,29 @@
+//! Deterministic, allocation-owning rendering of query results.
+
 use std::fmt::Write;
 
 use crate::engine::QueryResult;
 use crate::value::Value;
 
+/// A supported query-result output format.
+///
+/// Each variant selects a deterministic rendering; rendering never mutates or
+/// retains a reference to the input result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
+    /// An ASCII bordered table with control characters escaped.
     Table,
+    /// RFC 4180-style comma-separated rows with a header and `\n` line endings.
     Csv,
+    /// A compact JSON object containing positional columns and rows.
     Json,
 }
 
 impl OutputFormat {
+    /// Parses `table`, `csv`, or `json` using ASCII case-insensitive matching.
+    ///
+    /// Returns `None` for every other string. This operation is infallible,
+    /// performs no mutation, and the returned enum owns no borrowed data.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -22,6 +35,22 @@ impl OutputFormat {
     }
 }
 
+/// Renders one result set in `format`.
+///
+/// Column and row order are preserved exactly; duplicate column names remain
+/// distinct positional entries. Table output ends at its bottom border, CSV
+/// output ends every record with `\n`, and JSON output has no trailing newline.
+/// Table cells escape terminal control characters, CSV cells use doubled-quote
+/// escaping, and JSON preserves native numeric and Boolean scalar types.
+///
+/// This function returns an owned string, never mutates `result`, performs no
+/// I/O, and reports no recoverable errors. It assumes database-produced shape
+/// and finite floating-point invariants; callers constructing [`QueryResult`]
+/// directly are responsible for those invariants.
+///
+/// # Panics
+///
+/// Table rendering panics if any row has fewer values than `result.columns`.
 #[must_use]
 pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     match format {

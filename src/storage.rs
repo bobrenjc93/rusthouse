@@ -1,12 +1,19 @@
+//! Typed, contiguous column storage and table-level row validation.
+
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A named, typed field in a table schema.
+///
+/// A table preserves definitions in caller-supplied order. Names are matched
+/// case-insensitively, while the original spelling remains available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
+    /// Original, case-preserving column name.
     pub name: String,
+    /// Exact physical type required for inserted values.
     pub data_type: DataType,
 }
 
@@ -14,16 +21,28 @@ pub(crate) fn is_reserved_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
 }
 
-/// A physical column. Each variant owns a contiguous vector of one Rust type.
+/// A physical column that owns a contiguous vector of one Rust type.
+///
+/// Vector index is row insertion order. The variant fixes the physical type
+/// for the column's lifetime; all contained values are owned and remain valid
+/// until removed by consuming or directly mutating the public vector.
 #[derive(Debug, Clone)]
 pub enum Column {
+    /// Contiguous signed 64-bit integers.
     Int64(Vec<i64>),
+    /// Contiguous double-precision floating-point numbers.
     Float64(Vec<f64>),
+    /// Contiguous Boolean values.
     Bool(Vec<bool>),
+    /// Contiguous owned UTF-8 strings.
     String(Vec<String>),
 }
 
 impl Column {
+    /// Creates an empty column with the variant selected by `data_type`.
+    ///
+    /// This operation is infallible and preserves the requested physical type
+    /// for the lifetime of the returned column.
     #[must_use]
     pub fn new(data_type: DataType) -> Self {
         match data_type {
@@ -34,6 +53,10 @@ impl Column {
         }
     }
 
+    /// Returns the physical type represented by this column's variant.
+    ///
+    /// This operation is infallible, performs no allocation or mutation, and
+    /// returns an owned type marker.
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -44,6 +67,10 @@ impl Column {
         }
     }
 
+    /// Returns the number of stored row values.
+    ///
+    /// This is an infallible, constant-time query that does not borrow any
+    /// individual value.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -54,11 +81,22 @@ impl Column {
         }
     }
 
+    /// Returns whether the column contains no row values.
+    ///
+    /// This is equivalent to `self.len() == 0` and does not mutate the column.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Clones the value at zero-based row index `row` into an owned [`Value`].
+    ///
+    /// The returned value is independent of the column and may outlive it.
+    /// Row indices follow insertion order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `row >= self.len()`.
     #[must_use]
     pub fn value(&self, row: usize) -> Value {
         self.value_ref(row).to_owned()
@@ -88,7 +126,12 @@ impl Column {
     }
 }
 
-/// A table stores one typed vector per schema field.
+/// A table that stores one typed vector per schema field.
+///
+/// Schema and column order are identical and stable. Successful inserts append
+/// at the next row index, so rows remain in insertion order for the table's
+/// lifetime. A table owns its schema and data; borrows returned by its
+/// accessors cannot outlive it.
 #[derive(Debug, Clone)]
 pub struct Table {
     name: String,
@@ -98,6 +141,17 @@ pub struct Table {
 }
 
 impl Table {
+    /// Creates an empty table and one physical column per schema field.
+    ///
+    /// The supplied table name is retained verbatim. Schema order is retained,
+    /// while column uniqueness and reserved-name checks ignore ASCII case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidQuery`] for an empty schema,
+    /// [`Error::ReservedIdentifier`] for columns named `TRUE` or `FALSE`, or
+    /// [`Error::DuplicateColumn`] for a repeated case-insensitive name. Since
+    /// construction has no external side effects, every error is atomic.
     pub fn new(name: String, schema: Vec<ColumnDef>) -> Result<Self> {
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
@@ -128,26 +182,52 @@ impl Table {
         })
     }
 
+    /// Borrows the original, case-preserving table name.
+    ///
+    /// This operation is infallible and the returned string remains valid for
+    /// the shared borrow of `self`.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Borrows schema fields in physical column order.
+    ///
+    /// This operation is infallible. The slice and its owned field names remain
+    /// valid only for the shared borrow of `self`.
     #[must_use]
     pub fn schema(&self) -> &[ColumnDef] {
         &self.schema
     }
 
+    /// Borrows physical columns in schema order.
+    ///
+    /// Every column has [`Table::row_count`] values when the table has only
+    /// been changed through [`Table::insert_row`]. The slice remains valid only
+    /// for the shared borrow of `self`.
     #[must_use]
     pub fn columns(&self) -> &[Column] {
         &self.columns
     }
 
+    /// Returns the number of successfully inserted rows.
+    ///
+    /// Row indices range from zero to this value, exclusive, in insertion
+    /// order. This operation is infallible and does not mutate the table.
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 
+    /// Returns the physical index of the case-insensitively named column.
+    ///
+    /// The index follows schema order and remains stable for the table's
+    /// lifetime because schemas cannot be changed after construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ColumnNotFound`] without mutation when no field
+    /// matches `name`.
     pub fn column_index(&self, name: &str) -> Result<usize> {
         self.schema
             .iter()
@@ -187,7 +267,17 @@ impl Table {
         Ok(())
     }
 
-    /// Validates the complete row before appending one value to each column.
+    /// Validates and appends one complete row.
+    ///
+    /// Values must match the schema width and exact physical types; non-finite
+    /// `Float64` values are rejected. On success, one value is appended to each
+    /// column at the same new row index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RowLength`], [`Error::TypeMismatch`], or
+    /// [`Error::InvalidQuery`] as appropriate. Validation completes before any
+    /// column is changed, so the table is unchanged on every returned error.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
         for (column, value) in self.columns.iter_mut().zip(row) {
