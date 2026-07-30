@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -353,7 +354,7 @@ fn execute_grouped<'a>(
         }
     }
 
-    let keys = groups.into_keys(group_count);
+    let keys = groups.into_keys(table, group_columns, group_count);
     let aggregates = aggregate_states
         .into_iter()
         .map(|states| {
@@ -370,7 +371,8 @@ fn execute_grouped<'a>(
 enum GroupIndex<'a> {
     Global,
     One(HashMap<ValueRef<'a>, usize>),
-    Multiple(HashMap<Box<[ValueRef<'a>]>, usize>),
+    Pair(HashMap<Box<[ValueRef<'a>]>, usize>),
+    Wide(WideGroupIndex),
 }
 
 impl<'a> GroupIndex<'a> {
@@ -379,7 +381,8 @@ impl<'a> GroupIndex<'a> {
         match column_count {
             0 => Self::Global,
             1 => Self::One(HashMap::with_capacity(initial_capacity)),
-            _ => Self::Multiple(HashMap::with_capacity(initial_capacity)),
+            2 => Self::Pair(HashMap::with_capacity(initial_capacity)),
+            _ => Self::Wide(WideGroupIndex::with_capacity(initial_capacity)),
         }
     }
 
@@ -401,24 +404,23 @@ impl<'a> GroupIndex<'a> {
                     (next_group, true)
                 }
             }
-            Self::Multiple(groups) if columns.len() == 2 => {
+            Self::Pair(groups) => {
                 let key = [
                     table.columns()[columns[0]].value_ref(row),
                     table.columns()[columns[1]].value_ref(row),
                 ];
                 find_or_insert_group(groups, &key, next_group)
             }
-            Self::Multiple(groups) => {
-                let key = columns
-                    .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
-                    .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
-            }
+            Self::Wide(groups) => groups.find_or_insert(table, columns, row, next_group),
         }
     }
 
-    fn into_keys(self, group_count: usize) -> Vec<GroupKey<'a>> {
+    fn into_keys(
+        self,
+        table: &'a Table,
+        columns: &[usize],
+        group_count: usize,
+    ) -> Vec<GroupKey<'a>> {
         let mut ordered = std::iter::repeat_with(|| None)
             .take(group_count)
             .collect::<Vec<_>>();
@@ -432,8 +434,18 @@ impl<'a> GroupIndex<'a> {
                     ordered[group] = Some(GroupKey::One(key));
                 }
             }
-            Self::Multiple(groups) => {
+            Self::Pair(groups) => {
                 for (key, group) in groups {
+                    ordered[group] = Some(GroupKey::Multiple(key));
+                }
+            }
+            Self::Wide(groups) => {
+                debug_assert_eq!(groups.groups.len(), group_count);
+                for (group, entry) in groups.groups.into_iter().enumerate() {
+                    let key = columns
+                        .iter()
+                        .map(|column| table.columns()[*column].value_ref(entry.representative_row))
+                        .collect();
                     ordered[group] = Some(GroupKey::Multiple(key));
                 }
             }
@@ -442,6 +454,71 @@ impl<'a> GroupIndex<'a> {
             .into_iter()
             .map(|key| key.expect("every group index has a key"))
             .collect()
+    }
+}
+
+#[derive(Debug)]
+struct WideGroupIndex {
+    // Hash buckets link into insertion-ordered representative rows in `groups`.
+    buckets: HashMap<u64, usize>,
+    groups: Vec<WideGroup>,
+}
+
+#[derive(Debug)]
+struct WideGroup {
+    representative_row: usize,
+    previous_in_bucket: Option<usize>,
+}
+
+impl WideGroupIndex {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buckets: HashMap::with_capacity(capacity),
+            groups: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn find_or_insert(
+        &mut self,
+        table: &Table,
+        columns: &[usize],
+        row: usize,
+        next_group: usize,
+    ) -> (usize, bool) {
+        let mut hasher = self.buckets.hasher().build_hasher();
+        for column in columns {
+            table.columns()[*column].value_ref(row).hash(&mut hasher);
+        }
+        self.find_or_insert_hashed(table, columns, row, next_group, hasher.finish())
+    }
+
+    fn find_or_insert_hashed(
+        &mut self,
+        table: &Table,
+        columns: &[usize],
+        row: usize,
+        next_group: usize,
+        hash: u64,
+    ) -> (usize, bool) {
+        let mut candidate = self.buckets.get(&hash).copied();
+        while let Some(group) = candidate {
+            let entry = &self.groups[group];
+            if columns.iter().all(|column| {
+                let values = &table.columns()[*column];
+                values.value_ref(entry.representative_row) == values.value_ref(row)
+            }) {
+                return (group, false);
+            }
+            candidate = entry.previous_in_bucket;
+        }
+
+        debug_assert_eq!(next_group, self.groups.len());
+        let previous_in_bucket = self.buckets.insert(hash, next_group);
+        self.groups.push(WideGroup {
+            representative_row: row,
+            previous_in_bucket,
+        });
+        (next_group, true)
     }
 }
 
@@ -885,6 +962,7 @@ fn comparable(left: DataType, right: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ColumnDef;
 
     fn query(database: &mut Database, sql: &str) -> QueryResult {
         let results = database.execute(sql).expect("query succeeds");
@@ -892,6 +970,172 @@ mod tests {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
         }
+    }
+
+    fn table_with_rows(types: &[DataType], rows: Vec<Vec<Value>>) -> Table {
+        let schema = types
+            .iter()
+            .enumerate()
+            .map(|(index, data_type)| ColumnDef {
+                name: format!("c{index}"),
+                data_type: *data_type,
+            })
+            .collect();
+        let mut table = Table::new("wide_groups".to_owned(), schema).expect("valid table");
+        for row in rows {
+            table.insert_row(row).expect("valid row");
+        }
+        table
+    }
+
+    fn mixed_wide_table() -> Table {
+        table_with_rows(
+            &[
+                DataType::Int64,
+                DataType::Float64,
+                DataType::Bool,
+                DataType::String,
+            ],
+            vec![
+                vec![
+                    Value::Int64(1),
+                    Value::Float64(-0.0),
+                    Value::Bool(true),
+                    Value::String("alpha".to_owned()),
+                ],
+                vec![
+                    Value::Int64(2),
+                    Value::Float64(1.5),
+                    Value::Bool(true),
+                    Value::String("alpha".to_owned()),
+                ],
+                vec![
+                    Value::Int64(1),
+                    Value::Float64(0.0),
+                    Value::Bool(true),
+                    Value::String("alpha".to_owned()),
+                ],
+                vec![
+                    Value::Int64(1),
+                    Value::Float64(0.0),
+                    Value::Bool(false),
+                    Value::String("alpha".to_owned()),
+                ],
+                vec![
+                    Value::Int64(2),
+                    Value::Float64(1.5),
+                    Value::Bool(true),
+                    Value::String("alpha".to_owned()),
+                ],
+            ],
+        )
+    }
+
+    #[test]
+    fn wide_group_index_resolves_forced_hash_collisions() {
+        let table = mixed_wide_table();
+        let columns = [0, 1, 2, 3];
+        let mut groups = WideGroupIndex::with_capacity(0);
+        let mut next_group = 0;
+        let mut observed = Vec::new();
+
+        for row in 0..table.row_count() {
+            let result = groups.find_or_insert_hashed(&table, &columns, row, next_group, 7);
+            if result.1 {
+                next_group += 1;
+            }
+            observed.push(result);
+        }
+
+        assert_eq!(
+            observed,
+            [(0, true), (1, true), (0, false), (2, true), (1, false)]
+        );
+        assert_eq!(groups.buckets.len(), 1);
+        assert_eq!(
+            groups
+                .groups
+                .iter()
+                .map(|group| group.representative_row)
+                .collect::<Vec<_>>(),
+            [0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn wide_group_hashing_handles_mixed_value_types() {
+        let table = mixed_wide_table();
+        let columns = [0, 1, 2, 3];
+        let mut groups = WideGroupIndex::with_capacity(table.row_count());
+        let mut next_group = 0;
+
+        for (row, expected_group) in [0, 1, 0, 2, 1].into_iter().enumerate() {
+            let (group, inserted) = groups.find_or_insert(&table, &columns, row, next_group);
+            assert_eq!(group, expected_group);
+            if inserted {
+                next_group += 1;
+            }
+        }
+
+        assert_eq!(next_group, 3);
+        assert_eq!(
+            groups
+                .groups
+                .iter()
+                .map(|group| group.representative_row)
+                .collect::<Vec<_>>(),
+            [0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn group_index_materializes_very_wide_keys_from_representative_rows() {
+        const WIDTH: usize = 128;
+        let first = (0..WIDTH)
+            .map(|value| Value::Int64(value as i64))
+            .collect::<Vec<_>>();
+        let mut second = first.clone();
+        second[WIDTH - 1] = Value::Int64(-1);
+        let table = table_with_rows(
+            &[DataType::Int64; WIDTH],
+            vec![first.clone(), second, first],
+        );
+        let columns = (0..WIDTH).collect::<Vec<_>>();
+        let mut groups = GroupIndex::new(WIDTH, table.row_count());
+        let mut next_group = 0;
+
+        for (row, expected) in [(0, (0, true)), (1, (1, true)), (2, (0, false))] {
+            let result = groups.find_or_insert(&table, &columns, row, next_group);
+            assert_eq!(result, expected);
+            if result.1 {
+                next_group += 1;
+            }
+        }
+
+        let keys = groups.into_keys(&table, &columns, next_group);
+        assert!(matches!(&keys[0], GroupKey::Multiple(values) if values.len() == WIDTH));
+        assert_eq!(keys[0].value(WIDTH - 1), ValueRef::Int64(127));
+        assert_eq!(keys[1].value(WIDTH - 1), ValueRef::Int64(-1));
+    }
+
+    #[test]
+    fn wide_group_storage_growth_depends_on_groups_not_rows() {
+        let table = mixed_wide_table();
+        let columns = [0, 1, 2, 3];
+        let mut groups = WideGroupIndex::with_capacity(0);
+
+        assert_eq!(groups.find_or_insert(&table, &columns, 0, 0), (0, true));
+        assert_eq!(groups.find_or_insert(&table, &columns, 1, 1), (1, true));
+        let group_capacity = groups.groups.capacity();
+        let bucket_capacity = groups.buckets.capacity();
+
+        for row in (0..10_000).map(|index| index % 2) {
+            assert!(!groups.find_or_insert(&table, &columns, row, 2).1);
+        }
+
+        assert_eq!(groups.groups.len(), 2);
+        assert_eq!(groups.groups.capacity(), group_capacity);
+        assert_eq!(groups.buckets.capacity(), bucket_capacity);
     }
 
     #[test]
