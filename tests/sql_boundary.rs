@@ -690,3 +690,55 @@ fn checked_expressions_report_each_numeric_failure() {
         Err(Error::NonFiniteFloat(_))
     ));
 }
+
+#[test]
+fn limit_projects_only_selected_rows() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE limited_expr (id Int64, divisor Int64);
+             INSERT INTO limited_expr VALUES (1, 1), (2, 0);",
+        )
+        .expect("setup succeeds");
+
+    let unordered = execute_query(
+        &mut database,
+        "SELECT id / divisor AS value FROM limited_expr LIMIT 1;",
+    );
+    assert_eq!(unordered.rows, vec![vec![Value::Int64(1)]]);
+
+    let empty = execute_query(
+        &mut database,
+        "SELECT id / divisor AS value FROM limited_expr LIMIT 0;",
+    );
+    assert!(empty.rows.is_empty());
+
+    let ordered = execute_query(
+        &mut database,
+        "SELECT id / divisor AS value, id
+         FROM limited_expr
+         ORDER BY id
+         LIMIT 1;",
+    );
+    assert_eq!(ordered.rows, vec![vec![Value::Int64(1), Value::Int64(1)]]);
+
+    let grouped = execute_query(
+        &mut database,
+        "SELECT id / divisor AS value, id
+         FROM limited_expr
+         GROUP BY id, divisor
+         ORDER BY id
+         LIMIT 1;",
+    );
+    assert_eq!(grouped.rows, vec![vec![Value::Int64(1), Value::Int64(1)]]);
+
+    assert!(matches!(
+        database.execute(
+            "SELECT id / divisor AS value
+             FROM limited_expr
+             ORDER BY value
+             LIMIT 1;"
+        ),
+        Err(Error::DivisionByZero(_))
+    ));
+}

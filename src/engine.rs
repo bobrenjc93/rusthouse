@@ -116,29 +116,50 @@ impl Database {
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
             let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let projected = grouped.project(&items)?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_projected_rows(
-                &mut selected_groups,
-                &projected,
-                &ordering,
-                select.limit,
-                true,
-                |left, right| grouped.keys[left].cmp(&grouped.keys[right]),
-            );
-            select_projected_rows(projected, &selected_groups)
+            if ordering.is_empty() || select.limit == Some(0) {
+                sort_and_limit(&mut selected_groups, select.limit, |left, right| {
+                    grouped.keys[left].cmp(&grouped.keys[right])
+                });
+            } else {
+                let order_keys = evaluate_order_keys(grouped.len(), &ordering, |group, output| {
+                    grouped.evaluate_item(group, &items[output])
+                })?;
+                order_by_keys(
+                    &mut selected_groups,
+                    &order_keys,
+                    &ordering,
+                    select.limit,
+                    |left, right| grouped.keys[left].cmp(&grouped.keys[right]),
+                );
+            }
+            grouped.project(&selected_groups, &items)?
         } else {
-            let projected = execute_projection(table, &matching_rows, &items)?;
-            let mut selected_rows = (0..projected.len()).collect::<Vec<_>>();
-            order_projected_rows(
-                &mut selected_rows,
-                &projected,
-                &ordering,
-                select.limit,
-                false,
-                |left, right| matching_rows[left].cmp(&matching_rows[right]),
-            );
-            select_projected_rows(projected, &selected_rows)
+            if ordering.is_empty() {
+                if let Some(limit) = select.limit {
+                    matching_rows.truncate(limit);
+                }
+            } else if select.limit == Some(0) {
+                matching_rows.clear();
+            } else {
+                let order_keys =
+                    evaluate_order_keys(matching_rows.len(), &ordering, |candidate, output| {
+                        evaluate_row_item(table, matching_rows[candidate], &items[output])
+                    })?;
+                let mut selected_rows = (0..matching_rows.len()).collect::<Vec<_>>();
+                order_by_keys(
+                    &mut selected_rows,
+                    &order_keys,
+                    &ordering,
+                    select.limit,
+                    |left, right| matching_rows[left].cmp(&matching_rows[right]),
+                );
+                matching_rows = selected_rows
+                    .into_iter()
+                    .map(|candidate| matching_rows[candidate])
+                    .collect();
+            }
+            execute_projection(table, &matching_rows, &items)?
         };
 
         Ok(QueryResult {
@@ -626,17 +647,21 @@ fn execute_projection(
         .map(|row| {
             items
                 .iter()
-                .map(|item| match item {
-                    ResolvedItem::Expression(expression) => expression
-                        .evaluate_row(table, *row)
-                        .map(Evaluated::into_owned),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
+                .map(|item| evaluate_row_item(table, *row, item))
                 .collect::<Result<Vec<_>>>()
         })
         .collect()
+}
+
+fn evaluate_row_item(table: &Table, row: usize, item: &ResolvedItem) -> Result<Value> {
+    match item {
+        ResolvedItem::Expression(expression) => expression
+            .evaluate_row(table, row)
+            .map(Evaluated::into_owned),
+        ResolvedItem::Aggregate { .. } => {
+            unreachable!("ungrouped projection does not contain aggregates")
+        }
+    }
 }
 
 fn execute_grouped<'a>(
@@ -816,19 +841,22 @@ impl GroupedData<'_> {
         self.keys.len()
     }
 
-    fn project(&self, items: &[ResolvedItem]) -> Result<Vec<Vec<Value>>> {
-        (0..self.len())
+    fn evaluate_item(&self, group: usize, item: &ResolvedItem) -> Result<Value> {
+        match item {
+            ResolvedItem::Expression(expression) => expression
+                .evaluate_group(&self.keys[group])
+                .map(Evaluated::into_owned),
+            ResolvedItem::Aggregate { state } => Ok(self.aggregates[*state][group].clone()),
+        }
+    }
+
+    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Result<Vec<Vec<Value>>> {
+        selected
+            .iter()
             .map(|group| {
                 items
                     .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Expression(expression) => expression
-                            .evaluate_group(&self.keys[group])
-                            .map(Evaluated::into_owned),
-                        ResolvedItem::Aggregate { state } => {
-                            Ok(self.aggregates[*state][group].clone())
-                        }
-                    })
+                    .map(|item| self.evaluate_item(*group, item))
                     .collect::<Result<Vec<_>>>()
             })
             .collect()
@@ -1000,24 +1028,31 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
     Ok(ordering)
 }
 
-fn order_projected_rows(
+fn evaluate_order_keys(
+    candidate_count: usize,
+    ordering: &[ResolvedOrder],
+    mut evaluate: impl FnMut(usize, usize) -> Result<Value>,
+) -> Result<Vec<Vec<Value>>> {
+    (0..candidate_count)
+        .map(|candidate| {
+            ordering
+                .iter()
+                .map(|order| evaluate(candidate, order.output))
+                .collect()
+        })
+        .collect()
+}
+
+fn order_by_keys(
     indices: &mut Vec<usize>,
-    rows: &[Vec<Value>],
+    keys: &[Vec<Value>],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-    sort_when_unordered: bool,
     tie_breaker: impl Fn(usize, usize) -> Ordering,
 ) {
-    if ordering.is_empty() && !sort_when_unordered {
-        if let Some(limit) = limit {
-            indices.truncate(limit);
-        }
-        return;
-    }
-
     sort_and_limit(indices, limit, |left, right| {
-        for order in ordering {
-            let comparison = rows[left][order.output].cmp(&rows[right][order.output]);
+        for (position, order) in ordering.iter().enumerate() {
+            let comparison = keys[left][position].cmp(&keys[right][position]);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -1028,14 +1063,6 @@ fn order_projected_rows(
         }
         tie_breaker(left, right)
     });
-}
-
-fn select_projected_rows(rows: Vec<Vec<Value>>, selected: &[usize]) -> Vec<Vec<Value>> {
-    let mut rows = rows.into_iter().map(Some).collect::<Vec<_>>();
-    selected
-        .iter()
-        .map(|index| rows[*index].take().expect("selected row exists"))
-        .collect()
 }
 
 fn sort_and_limit(
