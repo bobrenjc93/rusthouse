@@ -100,6 +100,14 @@ pub trait RowBatchSink {
         Ok(())
     }
 
+    /// Finalize any output that was started before execution failed.
+    ///
+    /// Cleanup is best-effort: the execution error remains the return value if
+    /// this callback also fails.
+    fn abort(&mut self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn finish(&mut self) -> std::result::Result<(), Self::Error> {
         Ok(())
     }
@@ -163,6 +171,8 @@ impl Database {
     /// The complete SQL batch is parsed before the sink is started or any
     /// statement is applied. Unordered projections are emitted directly while
     /// scanning; grouping and ordering retain their required operator state.
+    /// If execution fails after the sink starts, its [`RowBatchSink::abort`]
+    /// callback is invoked before the original error is returned.
     pub fn execute_stream<S: RowBatchSink>(
         &mut self,
         sql: &str,
@@ -171,37 +181,47 @@ impl Database {
         let statements = sql::parse(sql).map_err(StreamError::Database)?;
         sink.start().map_err(StreamError::Sink)?;
 
-        for statement in statements {
-            match statement {
-                Statement::CreateTable { name, columns } => {
-                    self.catalog
-                        .create_table(name, columns)
-                        .map_err(StreamError::Database)?;
-                    sink.command("CREATE TABLE", 0).map_err(StreamError::Sink)?;
-                }
-                Statement::Insert { table, rows } => {
-                    let affected_rows = rows.len();
-                    {
-                        let target = self.catalog.table(&table).map_err(StreamError::Database)?;
-                        for row in &rows {
-                            target.validate_row(row).map_err(StreamError::Database)?;
+        let execution = (|| {
+            for statement in statements {
+                match statement {
+                    Statement::CreateTable { name, columns } => {
+                        self.catalog
+                            .create_table(name, columns)
+                            .map_err(StreamError::Database)?;
+                        sink.command("CREATE TABLE", 0).map_err(StreamError::Sink)?;
+                    }
+                    Statement::Insert { table, rows } => {
+                        let affected_rows = rows.len();
+                        {
+                            let target =
+                                self.catalog.table(&table).map_err(StreamError::Database)?;
+                            for row in &rows {
+                                target.validate_row(row).map_err(StreamError::Database)?;
+                            }
                         }
+                        let target = self
+                            .catalog
+                            .table_mut(&table)
+                            .map_err(StreamError::Database)?;
+                        for row in rows {
+                            target.insert_row(row).map_err(StreamError::Database)?;
+                        }
+                        sink.command("INSERT", affected_rows)
+                            .map_err(StreamError::Sink)?;
                     }
-                    let target = self
-                        .catalog
-                        .table_mut(&table)
-                        .map_err(StreamError::Database)?;
-                    for row in rows {
-                        target.insert_row(row).map_err(StreamError::Database)?;
-                    }
-                    sink.command("INSERT", affected_rows)
-                        .map_err(StreamError::Sink)?;
+                    Statement::Select(select) => self.execute_select(select, sink)?,
                 }
-                Statement::Select(select) => self.execute_select(select, sink)?,
+            }
+            Ok(())
+        })();
+
+        match execution {
+            Ok(()) => sink.finish().map_err(StreamError::Sink),
+            Err(error) => {
+                let _ = sink.abort();
+                Err(error)
             }
         }
-
-        sink.finish().map_err(StreamError::Sink)
     }
 
     fn execute_select<S: RowBatchSink>(

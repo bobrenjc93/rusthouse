@@ -162,3 +162,36 @@ fn streaming_writers_return_broken_pipe_errors() {
         StreamError::Sink(error) if error.kind() == io::ErrorKind::BrokenPipe
     ));
 }
+
+#[test]
+fn database_errors_abort_json_as_a_valid_document() {
+    let mut database = Database::new();
+    let mut json = JsonWriter::new(Vec::new());
+
+    let error = database
+        .execute_stream("SELECT * FROM missing;", &mut json)
+        .expect_err("missing table fails");
+
+    assert!(matches!(error, StreamError::Database(_)));
+    assert_eq!(
+        String::from_utf8(json.into_inner()).expect("UTF-8 JSON"),
+        "{\"results\":[]}\n"
+    );
+
+    database
+        .execute("CREATE TABLE numbers (id Int64); INSERT INTO numbers VALUES (7);")
+        .expect("setup succeeds");
+    let mut json = JsonWriter::new(Vec::new());
+    let error = database
+        .execute_stream(
+            "SELECT id FROM numbers; SELECT * FROM still_missing;",
+            &mut json,
+        )
+        .expect_err("later missing table fails");
+
+    assert!(matches!(error, StreamError::Database(_)));
+    assert_eq!(
+        String::from_utf8(json.into_inner()).expect("UTF-8 JSON"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[7]]}]}\n"
+    );
+}

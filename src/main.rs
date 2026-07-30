@@ -122,7 +122,11 @@ impl<S: RowBatchSink<Error = io::Error>> RowBatchSink for CliSink<S> {
     }
 
     fn command(&mut self, tag: &'static str, affected_rows: usize) -> io::Result<()> {
-        report_command(tag, affected_rows)?;
+        if let Err(error) = report_command(tag, affected_rows)
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
+            return Err(error);
+        }
         self.output.command(tag, affected_rows)
     }
 
@@ -136,6 +140,10 @@ impl<S: RowBatchSink<Error = io::Error>> RowBatchSink for CliSink<S> {
 
     fn finish_query(&mut self) -> io::Result<()> {
         self.output.finish_query()
+    }
+
+    fn abort(&mut self) -> io::Result<()> {
+        self.output.abort()
     }
 
     fn finish(&mut self) -> io::Result<()> {

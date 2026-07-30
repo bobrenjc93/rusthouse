@@ -185,3 +185,48 @@ fn closed_stdout_pipe_exits_cleanly() {
     let status = child.wait().expect("wait for CLI");
     assert!(status.success(), "closed stdout should not be an error");
 }
+
+#[test]
+fn json_execution_errors_leave_a_valid_document() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "json", "--execute", "SELECT * FROM missing;"])
+        .output()
+        .expect("run CLI");
+
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[]}\n"
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("table 'missing' does not exist")
+    );
+}
+
+#[test]
+fn closed_stderr_does_not_stop_streaming_stdout() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args([
+            "--format",
+            "json",
+            "--execute",
+            "CREATE TABLE numbers (id Int64); \
+             INSERT INTO numbers VALUES (1), (2); \
+             SELECT id FROM numbers ORDER BY id;",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn CLI");
+
+    drop(child.stderr.take().expect("stderr pipe"));
+    let output = child.wait_with_output().expect("wait for CLI");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "{\"results\":[{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1],[2]]}]}\n"
+    );
+}

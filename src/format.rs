@@ -87,6 +87,10 @@ impl<W: IoWrite> RowBatchSink for CsvWriter<W> {
         Ok(())
     }
 
+    fn abort(&mut self) -> std::result::Result<(), Self::Error> {
+        self.writer.flush()
+    }
+
     fn finish(&mut self) -> std::result::Result<(), Self::Error> {
         self.writer.flush()
     }
@@ -98,6 +102,8 @@ pub struct JsonWriter<W> {
     writer: W,
     query_count: usize,
     row_count: usize,
+    document_open: bool,
+    query_open: bool,
 }
 
 impl<W> JsonWriter<W> {
@@ -107,6 +113,8 @@ impl<W> JsonWriter<W> {
             writer,
             query_count: 0,
             row_count: 0,
+            document_open: false,
+            query_open: false,
         }
     }
 
@@ -116,13 +124,31 @@ impl<W> JsonWriter<W> {
     }
 }
 
+impl<W: IoWrite> JsonWriter<W> {
+    fn close_document(&mut self) -> io::Result<()> {
+        if self.query_open {
+            self.writer.write_all(b"]}")?;
+            self.query_open = false;
+        }
+        if self.document_open {
+            self.writer.write_all(b"]}\n")?;
+            self.document_open = false;
+        }
+        self.writer.flush()
+    }
+}
+
 impl<W: IoWrite> RowBatchSink for JsonWriter<W> {
     type Error = io::Error;
 
     fn start(&mut self) -> std::result::Result<(), Self::Error> {
         self.query_count = 0;
         self.row_count = 0;
-        self.writer.write_all(b"{\"results\":[")
+        self.document_open = false;
+        self.query_open = false;
+        self.writer.write_all(b"{\"results\":[")?;
+        self.document_open = true;
+        Ok(())
     }
 
     fn start_query(&mut self, columns: &[ResultColumn]) -> std::result::Result<(), Self::Error> {
@@ -142,7 +168,9 @@ impl<W: IoWrite> RowBatchSink for JsonWriter<W> {
             write_json_string_to(&mut self.writer, &column.data_type.to_string())?;
             self.writer.write_all(b"}")?;
         }
-        self.writer.write_all(b"],\"rows\":[")
+        self.writer.write_all(b"],\"rows\":[")?;
+        self.query_open = true;
+        Ok(())
     }
 
     fn write_batch(&mut self, batch: RowBatch<'_>) -> std::result::Result<(), Self::Error> {
@@ -164,12 +192,17 @@ impl<W: IoWrite> RowBatchSink for JsonWriter<W> {
     }
 
     fn finish_query(&mut self) -> std::result::Result<(), Self::Error> {
-        self.writer.write_all(b"]}")
+        self.writer.write_all(b"]}")?;
+        self.query_open = false;
+        Ok(())
+    }
+
+    fn abort(&mut self) -> std::result::Result<(), Self::Error> {
+        self.close_document()
     }
 
     fn finish(&mut self) -> std::result::Result<(), Self::Error> {
-        self.writer.write_all(b"]}\n")?;
-        self.writer.flush()
+        self.close_document()
     }
 }
 
