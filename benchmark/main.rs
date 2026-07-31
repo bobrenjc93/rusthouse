@@ -13,7 +13,7 @@ use std::io;
 #[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -26,6 +26,9 @@ use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
+const STAGED_HARNESS_ENV: &str = "RUSTHOUSE_INTERNAL_STAGED_HARNESS";
+const ORIGINAL_RUSTHOUSE_ENV: &str = "RUSTHOUSE_INTERNAL_ORIGINAL_RUSTHOUSE";
+const HARNESS_STAGING_PREFIX: &str = "rusthouse-benchmark-harness-";
 
 const HELP: &str = "\
 RustHouse / ClickHouse Local black-box parity benchmark
@@ -116,11 +119,17 @@ struct DetailsContext<'a> {
 struct HarnessIdentity {
     path: PathBuf,
     sha256: String,
+    file: fs::File,
 }
 
 fn main() -> ExitCode {
     if let Some(exit_code) = process::run_staging_cleanup_guard_if_requested() {
         return exit_code;
+    }
+    match run_staged_harness_if_needed() {
+        Ok(Some(exit_code)) => return exit_code,
+        Ok(None) => {}
+        Err(error) => return emit_failure(error),
     }
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments == ["--benchmark-attestation"] {
@@ -152,6 +161,115 @@ fn main() -> ExitCode {
         }
         Err(error) => emit_failure(error),
     }
+}
+
+fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
+    let current = env::current_exe()
+        .map_err(|error| format!("cannot locate benchmark executable: {error}"))?;
+    if let Some(expected) = env::var_os(STAGED_HARNESS_ENV) {
+        if Path::new(&expected) != current {
+            return Err("staged benchmark harness identity is inconsistent".to_owned());
+        }
+        let staging_directory = current
+            .parent()
+            .filter(|parent| {
+                parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(HARNESS_STAGING_PREFIX))
+            })
+            .ok_or_else(|| {
+                "staged benchmark harness is outside its private directory".to_owned()
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if fs::metadata(staging_directory)
+                .map_err(|error| format!("could not inspect staged harness directory: {error}"))?
+                .permissions()
+                .mode()
+                & 0o077
+                != 0
+            {
+                return Err("staged benchmark harness directory is not private".to_owned());
+            }
+        }
+        if cfg!(debug_assertions)
+            && let Some(delay) = env::var("RUSTHOUSE_TEST_STAGED_HARNESS_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+        return Ok(None);
+    }
+
+    let parent = env::temp_dir();
+    let directory = (0..100_u32)
+        .find_map(|attempt| {
+            let path = parent.join(format!(
+                "{HARNESS_STAGING_PREFIX}{}-{attempt}",
+                std::process::id()
+            ));
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
+            match builder.create(&path) {
+                Ok(()) => Some(Ok(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .ok_or_else(|| "could not reserve private benchmark harness directory".to_owned())?
+        .map_err(|error| {
+            format!("could not create private benchmark harness directory: {error}")
+        })?;
+    let staged = directory.join(format!(
+        "clickhouse-parity-bench{}",
+        env::consts::EXE_SUFFIX
+    ));
+    let result = (|| {
+        fs::copy(&current, &staged)
+            .map_err(|error| format!("could not stage benchmark harness: {error}"))?;
+        fs::File::open(&staged)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("could not sync staged benchmark harness: {error}"))?;
+        let mut permissions = fs::metadata(&staged)
+            .map_err(|error| format!("could not inspect staged benchmark harness: {error}"))?
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            permissions.set_mode(0o500);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        fs::set_permissions(&staged, permissions)
+            .map_err(|error| format!("could not protect staged benchmark harness: {error}"))?;
+        let original_rusthouse = current
+            .parent()
+            .ok_or_else(|| "benchmark executable has no parent directory".to_owned())?
+            .join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
+        Command::new(&staged)
+            .args(env::args_os().skip(1))
+            .env(STAGED_HARNESS_ENV, &staged)
+            .env(ORIGINAL_RUSTHOUSE_ENV, original_rusthouse)
+            .status()
+            .map_err(|error| format!("could not execute staged benchmark harness: {error}"))
+    })();
+    let _ = fs::remove_dir_all(&directory);
+    let status = result?;
+    let code = status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(1);
+    Ok(Some(ExitCode::from(code)))
 }
 
 fn emit_benchmark_attestation() -> ExitCode {
@@ -188,6 +306,9 @@ fn emit_failure(error: String) -> ExitCode {
 }
 
 fn default_rusthouse_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os(ORIGINAL_RUSTHOUSE_ENV) {
+        return Ok(PathBuf::from(path));
+    }
     let executable = env::current_exe()
         .map_err(|error| format!("cannot locate benchmark executable: {error}"))?;
     let directory = executable
@@ -522,12 +643,14 @@ fn ensure_default_build(mode: config::Mode, build_info: BuildInfo) -> Result<(),
 fn harness_identity() -> Result<HarnessIdentity, String> {
     let path = env::current_exe()
         .map_err(|error| format!("cannot locate benchmark executable: {error}"))?;
-    let sha256 = sha256::file_digest_hex(&path)?;
-    Ok(HarnessIdentity { path, sha256 })
+    let file = fs::File::open(&path)
+        .map_err(|error| format!("cannot open running benchmark executable: {error}"))?;
+    let sha256 = sha256::open_file_digest_hex(&file, "running benchmark executable")?;
+    Ok(HarnessIdentity { path, sha256, file })
 }
 
 fn revalidate_harness(expected: &HarnessIdentity) -> Result<(), String> {
-    let actual = sha256::file_digest_hex(&expected.path)?;
+    let actual = sha256::open_file_digest_hex(&expected.file, "running benchmark executable")?;
     if actual != expected.sha256 {
         return Err(
             "benchmark harness changed while the suite was running; no report was retained"

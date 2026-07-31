@@ -21,6 +21,7 @@ const MARKER_PREFIX: &str = "rusthouse-final-rustc-";
 const SOURCE_SNAPSHOT_PREFIX: &str = "rusthouse-attested-source-";
 const SOURCE_SNAPSHOT_ROOT: &str = "source";
 const SOURCE_CLEANUP_GUARD_ARGUMENT: &str = "--internal-source-snapshot-cleanup-guard";
+const BUILD_AUTHORIZATION_ENV: &str = "RUSTHOUSE_ATTESTED_BUILD_AUTHORIZATION";
 
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -41,7 +42,7 @@ fn main() {
 }
 
 fn build_attested_binaries() -> Result<i32, String> {
-    let wrapper = env::current_exe()
+    let builder_executable = env::current_exe()
         .map_err(|error| format!("cannot locate attestation wrapper executable: {error}"))?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let source_root = cargo_source_root(&cargo)?;
@@ -49,6 +50,9 @@ fn build_attested_binaries() -> Result<i32, String> {
     let initial_source = live_source_provenance(&source_root)?;
     let session = new_build_session()?;
     let snapshot = SourceSnapshot::create(&source_root, initial_source.as_ref(), &session)?;
+    let wrapper =
+        stage_private_artifact(&snapshot.container, &builder_executable, "attested-wrapper")?;
+    let authorization = BuildAuthorization::create(&snapshot.container, &wrapper, &session)?;
     let manifest = snapshot.root.join("Cargo.toml");
     let mut rusthouse_command = Command::new(&cargo);
     rusthouse_command
@@ -59,6 +63,8 @@ fn build_attested_binaries() -> Result<i32, String> {
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env("RUSTHOUSE_ATTESTED_BUILD", "1")
         .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", &session)
+        .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
+        .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256");
     configure_live_source_provenance(&mut rusthouse_command, initial_source.as_ref());
@@ -68,7 +74,9 @@ fn build_attested_binaries() -> Result<i32, String> {
     }
 
     let rusthouse_path = require_compiled_artifact(rusthouse_artifact, "RustHouse")?;
-    let initial_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
+    let private_rusthouse_path =
+        stage_private_artifact(&snapshot.container, &rusthouse_path, "rusthouse")?;
+    let initial_rusthouse = capture_artifact(&private_rusthouse_path, "RustHouse")?;
     let mut benchmark_command = Command::new(&cargo);
     benchmark_command
         .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
@@ -78,6 +86,8 @@ fn build_attested_binaries() -> Result<i32, String> {
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
         .env("RUSTHOUSE_ATTESTED_BUILD", "1")
         .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
+        .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
+        .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env(
             "RUSTHOUSE_ATTESTED_BINARY_SHA256",
@@ -90,8 +100,10 @@ fn build_attested_binaries() -> Result<i32, String> {
         return Ok(status);
     }
     let benchmark_path = require_compiled_artifact(benchmark_path, "benchmark")?;
-    let final_benchmark = capture_artifact(&benchmark_path, "benchmark")?;
-    let final_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
+    let private_benchmark_path =
+        stage_private_artifact(&snapshot.container, &benchmark_path, "benchmark")?;
+    let final_benchmark = capture_artifact(&private_benchmark_path, "benchmark")?;
+    let final_rusthouse = capture_artifact(&private_rusthouse_path, "RustHouse")?;
     validate_final_artifact_pair(&initial_rusthouse, &final_rusthouse, &final_benchmark)?;
     if let Some(initial_source) = initial_source.as_ref() {
         validate_live_source_after_build(
@@ -100,7 +112,170 @@ fn build_attested_binaries() -> Result<i32, String> {
             &final_rusthouse.attestation.shared,
         )?;
     }
+    publish_artifact_atomically(&private_rusthouse_path, &rusthouse_path)?;
+    publish_artifact_atomically(&private_benchmark_path, &benchmark_path)?;
     Ok(status)
+}
+
+struct BuildAuthorization {
+    path: PathBuf,
+}
+
+impl BuildAuthorization {
+    fn create(container: &Path, wrapper: &Path, session: &str) -> Result<Self, String> {
+        let path = container.join(".attested-build-authorization");
+        let wrapper_sha256 = sha256::file_digest_hex(wrapper)?;
+        let contents = format!("session={session}\nwrapper_sha256={wrapper_sha256}\n");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            format!(
+                "could not create attested-build authorization '{}': {error}",
+                path.display()
+            )
+        })?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("could not persist attested-build authorization: {error}"))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for BuildAuthorization {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn stage_private_artifact(container: &Path, source: &Path, name: &str) -> Result<PathBuf, String> {
+    let directory = container.join(format!("validated-{name}"));
+    create_private_directory(&directory)?;
+    let destination = directory.join(format!("{name}{}", env::consts::EXE_SUFFIX));
+    fs::copy(source, &destination).map_err(|error| {
+        format!(
+            "could not copy completed {name} artifact '{}' into private validation: {error}",
+            source.display()
+        )
+    })?;
+    fs::File::open(&destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync private {name} artifact: {error}"))?;
+    make_artifact_read_only(&destination)?;
+    make_directory_read_only(&directory)?;
+    Ok(destination)
+}
+
+fn publish_artifact_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "completed artifact destination '{}' has no parent",
+            destination.display()
+        )
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "completed artifact destination name is not UTF-8".to_owned())?;
+    let temporary = parent.join(format!(".{file_name}.attested-publish-{}", process::id()));
+    let _ = fs::remove_file(&temporary);
+    fs::copy(source, &temporary).map_err(|error| {
+        format!(
+            "could not prepare completed artifact '{}': {error}",
+            destination.display()
+        )
+    })?;
+    fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync completed artifact: {error}"))?;
+    make_artifact_read_only(&temporary)?;
+    replace_file_atomically(&temporary, destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!(
+            "could not atomically publish completed artifact '{}': {error}",
+            destination.display()
+        )
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("could not sync completed artifact directory: {error}"))?;
+    let published_sha256 = sha256::file_digest_hex(destination)?;
+    let source_sha256 = sha256::file_digest_hex(source)?;
+    if published_sha256 != source_sha256 {
+        return Err(format!(
+            "published artifact '{}' does not match its validated private copy",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    const REPLACE_EXISTING: u32 = 0x1;
+    const WRITE_THROUGH: u32 = 0x8;
+    let mut source = source.as_os_str().encode_wide().collect::<Vec<_>>();
+    source.push(0);
+    let mut destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    destination.push(0);
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers retained for the call.
+    let status = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            REPLACE_EXISTING | WRITE_THROUGH,
+        )
+    };
+    if status == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn make_artifact_read_only(path: &Path) -> Result<(), String> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("could not inspect private artifact: {error}"))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o500);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("could not protect private artifact: {error}"))
+}
+
+fn make_directory_read_only(path: &Path) -> Result<(), String> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("could not inspect private artifact directory: {error}"))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o500);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("could not protect private artifact directory: {error}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,12 +539,43 @@ fn cleanup_source_snapshot(
             .status();
     }
     if container.exists() {
+        make_snapshot_directories_writable(container)?;
         fs::remove_dir_all(container).map_err(|error| {
             format!(
                 "could not remove attested source snapshot '{}': {error}",
                 container.display()
             )
         })?;
+    }
+    Ok(())
+}
+
+fn make_snapshot_directories_writable(path: &Path) -> Result<(), String> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("could not inspect source snapshot directory: {error}"))?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o700);
+    }
+    #[cfg(not(unix))]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("could not unlock source snapshot directory: {error}"))?;
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("could not scan source snapshot directory: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("could not inspect source snapshot: {error}"))?;
+        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            make_snapshot_directories_writable(&entry.path())?;
+        }
     }
     Ok(())
 }
@@ -1059,6 +1265,8 @@ mod tests {
         live_source_provenance, require_compiled_artifact, validate_final_artifact_pair,
         validate_live_source_after_build,
     };
+    #[cfg(unix)]
+    use super::{make_snapshot_directories_writable, stage_private_artifact};
 
     #[test]
     fn cargo_artifact_messages_supply_the_executable_path() {
@@ -1087,6 +1295,50 @@ mod tests {
         )
         .expect_err("fresh Cargo artifact must be rejected");
         assert!(error.contains("cached artifact"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_artifact_isolated_from_concurrent_shared_target_replacement() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let container = env::temp_dir().join(format!(
+            "rusthouse-private-artifact-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&container).expect("artifact container");
+        let shared = container.join("shared-rusthouse");
+        fs::write(&shared, b"validated bytes").expect("shared artifact");
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer_shared = shared.clone();
+        let writer = std::thread::spawn(move || {
+            let candidate = writer_shared.with_extension("replacement");
+            while !writer_stop.load(Ordering::Acquire) {
+                fs::write(&candidate, b"concurrent replacement").expect("replacement candidate");
+                fs::rename(&candidate, &writer_shared).expect("replace shared artifact");
+            }
+        });
+
+        let private =
+            stage_private_artifact(&container, &shared, "rusthouse").expect("private artifact");
+        stop.store(true, Ordering::Release);
+        writer.join().expect("replacement writer");
+        let private_bytes = fs::read(&private).expect("private artifact bytes");
+        assert!(private_bytes == b"validated bytes" || private_bytes == b"concurrent replacement");
+        fs::write(&shared, b"concurrent replacement").expect("replace shared artifact");
+        assert_eq!(
+            fs::read(private).expect("private artifact bytes"),
+            private_bytes
+        );
+
+        make_snapshot_directories_writable(&container).expect("unlock artifact container");
+        fs::remove_dir_all(container).expect("cleanup artifact container");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 
 const INITIAL_STATE: [u32; 8] = [
@@ -24,14 +24,23 @@ pub fn digest_hex(bytes: &[u8]) -> String {
 }
 
 pub fn file_digest_hex(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path)
+    let file = File::open(path)
         .map_err(|error| format!("could not open '{}' for SHA-256: {error}", path.display()))?;
+    open_file_digest_hex(&file, &path.display().to_string())
+}
+
+pub fn open_file_digest_hex(file: &File, name: &str) -> Result<String, String> {
+    let mut file = file
+        .try_clone()
+        .map_err(|error| format!("could not clone {name} for SHA-256: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("could not rewind {name} for SHA-256: {error}"))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
-            .map_err(|error| format!("could not read '{}' for SHA-256: {error}", path.display()))?;
+            .map_err(|error| format!("could not read {name} for SHA-256: {error}"))?;
         if count == 0 {
             break;
         }
