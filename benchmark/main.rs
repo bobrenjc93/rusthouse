@@ -8,8 +8,10 @@ mod workload;
 
 use std::env;
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::fs;
+use std::io;
+#[cfg(any(unix, test))]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(test)]
@@ -203,16 +205,20 @@ fn run(config: Config) -> Result<Report, String> {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
     };
-    if let Some(details) = config.details.as_deref() {
-        reject_details_executable_aliases(
-            details,
-            &[
-                ("benchmark", harness.path.as_path()),
-                ("RustHouse", configured_paths.rusthouse.as_path()),
-                ("ClickHouse", configured_paths.clickhouse.as_path()),
-            ],
-        )?;
-    }
+    let details_destination = config
+        .details
+        .as_deref()
+        .map(|details| {
+            DetailsDestination::open(
+                details,
+                &[
+                    ("benchmark", harness.path.as_path()),
+                    ("RustHouse", configured_paths.rusthouse.as_path()),
+                    ("ClickHouse", configured_paths.clickhouse.as_path()),
+                ],
+            )
+        })
+        .transpose()?;
     let expected_rusthouse_sha256 =
         option_env!("RUSTHOUSE_ATTESTED_BINARY_SHA256").unwrap_or("unavailable");
     let (paths, identity, _pinned_executables) =
@@ -373,7 +379,7 @@ fn run(config: Config) -> Result<Report, String> {
         "suite manifest",
     )?;
 
-    if let Some(path) = &config.details {
+    if let Some(destination) = &details_destination {
         let details = details_json(&DetailsContext {
             config: &config,
             harness: &harness,
@@ -385,7 +391,7 @@ fn run(config: Config) -> Result<Report, String> {
             suite_manifest: &suite_manifest,
             suite_manifest_sha256: &suite_manifest_sha256,
         });
-        write_report_atomically(path, details.as_bytes())?;
+        destination.write(details.as_bytes())?;
     }
 
     let mut evidence = vec![
@@ -914,315 +920,425 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     output
 }
 
-fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?;
-    let _writer_lock = ReportWriterLock::acquire(parent)?;
-
-    let mut temporary_path = None;
-    let mut temporary_file = None;
-    for attempt in 0..100_u32 {
-        let candidate = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            attempt
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                temporary_path = Some(candidate);
-                temporary_file = Some(file);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "could not create atomic details file in '{}': {error}",
-                    parent.display()
-                ));
-            }
-        }
-    }
-
-    let temporary_path = temporary_path.ok_or_else(|| {
-        format!(
-            "could not reserve an atomic details file in '{}'",
-            parent.display()
-        )
-    })?;
-    let temporary_file = temporary_file.expect("path and file are set together");
-    let result = install_atomic_report(temporary_file, &temporary_path, path, parent, contents);
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
+struct DetailsDestination {
+    requested: PathBuf,
+    #[cfg(unix)]
+    parent: PathBuf,
+    #[cfg(unix)]
+    file_name: String,
+    #[cfg(unix)]
+    directory: fs::File,
 }
 
-struct ReportWriterLock {
-    _file: fs::File,
-}
-
-impl ReportWriterLock {
-    fn acquire(parent: &Path) -> Result<Self, String> {
+impl DetailsDestination {
+    fn open(path: &Path, executables: &[(&str, &Path)]) -> Result<Self, String> {
+        let requested = path.to_owned();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let parent = fs::canonicalize(parent).map_err(|error| {
             format!(
                 "could not resolve details directory '{}': {error}",
                 parent.display()
             )
         })?;
-        let file = fs::File::open(&parent).map_err(|error| {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?
+            .to_owned();
+        #[cfg(unix)]
+        let parent_identity = report_file_identity(&fs::metadata(&parent).map_err(|error| {
             format!(
-                "could not open details directory lock '{}': {error}",
+                "could not inspect details directory '{}': {error}",
+                parent.display()
+            )
+        })?);
+        let stable_path = parent.join(&file_name);
+        reject_details_executable_aliases(&stable_path, executables)?;
+        #[cfg(unix)]
+        let directory = fs::File::open(&parent).map_err(|error| {
+            format!(
+                "could not open details directory '{}': {error}",
                 parent.display()
             )
         })?;
-        file.lock().map_err(|error| {
+        #[cfg(unix)]
+        if report_file_identity(&directory.metadata().map_err(|error| {
+            format!(
+                "could not inspect opened details directory '{}': {error}",
+                parent.display()
+            )
+        })?) != parent_identity
+        {
+            return Err(format!(
+                "details directory '{}' changed while it was being opened",
+                parent.display()
+            ));
+        }
+        Ok(Self {
+            requested,
+            #[cfg(unix)]
+            parent,
+            #[cfg(unix)]
+            file_name,
+            #[cfg(unix)]
+            directory,
+        })
+    }
+
+    fn write(&self, contents: &[u8]) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            self.write_descriptor_relative(contents)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = contents;
+            Err(format!(
+                "descriptor-relative details installation is unavailable for '{}' on this platform",
+                self.requested.display()
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_descriptor_relative(&self, contents: &[u8]) -> Result<(), String> {
+        self.directory.lock().map_err(|error| {
             format!(
                 "could not acquire details directory lock '{}': {error}",
-                parent.display()
+                self.parent.display()
             )
         })?;
-        Ok(Self { _file: file })
-    }
-}
-
-fn install_atomic_report(
-    temporary_file: fs::File,
-    temporary_path: &Path,
-    destination: &Path,
-    parent: &Path,
-    contents: &[u8],
-) -> Result<(), String> {
-    install_atomic_report_with_sync(
-        temporary_file,
-        temporary_path,
-        destination,
-        parent,
-        contents,
-        sync_directory,
-    )
-}
-
-fn install_atomic_report_with_sync<F>(
-    mut temporary_file: fs::File,
-    temporary_path: &Path,
-    destination: &Path,
-    parent: &Path,
-    contents: &[u8],
-    mut sync_parent: F,
-) -> Result<(), String>
-where
-    F: FnMut(&Path) -> io::Result<()>,
-{
-    temporary_file.write_all(contents).map_err(|error| {
-        format!(
-            "could not write atomic details file '{}': {error}",
-            temporary_path.display()
-        )
-    })?;
-    temporary_file.sync_all().map_err(|error| {
-        format!(
-            "could not sync atomic details file '{}': {error}",
-            temporary_path.display()
-        )
-    })?;
-    let installed_identity = report_file_identity(&temporary_file.metadata().map_err(|error| {
-        format!(
-            "could not inspect atomic details file '{}': {error}",
-            temporary_path.display()
-        )
-    })?);
-    drop(temporary_file);
-    let backup = backup_existing_report(destination, parent)?;
-    if let Err(error) = fs::rename(temporary_path, destination) {
-        if let Some(backup) = backup {
-            let _ = fs::remove_file(backup);
+        let mut temporary_name = None;
+        let mut temporary_file = None;
+        for attempt in 0..100_u32 {
+            let candidate = format!(".{}.{}.{}.tmp", self.file_name, std::process::id(), attempt);
+            match descriptor_fs::create_new(&self.directory, &candidate) {
+                Ok(file) => {
+                    temporary_name = Some(candidate);
+                    temporary_file = Some(file);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not create atomic details file for '{}': {error}",
+                        self.requested.display()
+                    ));
+                }
+            }
         }
-        return Err(format!(
-            "could not atomically replace details file '{}': {error}",
-            destination.display()
-        ));
-    }
-    if let Err(error) = sync_parent(parent) {
-        let still_installed = installed_identity
-            .ok_or_else(|| {
-                format!(
-                    "could not sync details directory '{}': {error}; refused unsafe rollback because file identity is unavailable on this platform",
-                    parent.display()
-                )
-            })
-            .and_then(|installed_identity| {
-                fs::metadata(destination)
-                    .map_err(|identity_error| {
-                        format!(
-                            "could not sync details directory '{}': {error}; refused unsafe rollback because details file '{}' could not be inspected: {identity_error}",
-                            parent.display(),
-                            destination.display()
-                        )
-                    })
-                    .and_then(|metadata| {
-                        report_file_identity(&metadata)
-                            .ok_or_else(|| "details file identity became unavailable".to_owned())
-                            .map(|identity| identity == installed_identity)
-                    })
+        let temporary_name = temporary_name.ok_or_else(|| {
+            format!(
+                "could not reserve an atomic details file for '{}'",
+                self.requested.display()
+            )
+        })?;
+        let temporary_file = temporary_file.expect("path and file are set together");
+        let result =
+            self.install_descriptor_relative(temporary_file, &temporary_name, contents, || {
+                self.directory.sync_all()
             });
-        match still_installed {
-            Ok(true) => {}
-            Ok(false) => {
-                let cleanup = remove_report_backup(backup.as_deref());
-                let mut message = format!(
+        if result.is_err() {
+            let _ = descriptor_fs::remove(&self.directory, &temporary_name);
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn install_descriptor_relative<F>(
+        &self,
+        mut temporary_file: fs::File,
+        temporary_name: &str,
+        contents: &[u8],
+        mut sync_parent: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> io::Result<()>,
+    {
+        temporary_file.write_all(contents).map_err(|error| {
+            format!(
+                "could not write atomic details file for '{}': {error}",
+                self.requested.display()
+            )
+        })?;
+        temporary_file.sync_all().map_err(|error| {
+            format!(
+                "could not sync atomic details file for '{}': {error}",
+                self.requested.display()
+            )
+        })?;
+        let installed_identity =
+            report_file_identity(&temporary_file.metadata().map_err(|error| {
+                format!(
+                    "could not inspect atomic details file for '{}': {error}",
+                    self.requested.display()
+                )
+            })?);
+        drop(temporary_file);
+        let backup = self.backup_descriptor_relative()?;
+        if let Err(error) = descriptor_fs::rename(
+            &self.directory,
+            temporary_name,
+            &self.directory,
+            &self.file_name,
+        ) {
+            if let Some(backup) = backup {
+                let _ = descriptor_fs::remove(&self.directory, &backup);
+            }
+            return Err(format!(
+                "could not atomically replace details file '{}': {error}",
+                self.requested.display()
+            ));
+        }
+        if let Err(error) = sync_parent() {
+            let still_installed = descriptor_fs::open_read(&self.directory, &self.file_name)
+                .and_then(|file| file.metadata())
+                .ok()
+                .and_then(|metadata| report_file_identity(&metadata))
+                == installed_identity;
+            if !still_installed {
+                if let Some(backup) = backup.as_deref() {
+                    let _ = descriptor_fs::remove(&self.directory, backup);
+                }
+                return Err(format!(
                     "could not sync details directory '{}': {error}; details file changed concurrently, so the newer report was preserved",
-                    parent.display()
-                );
-                if let Err(cleanup_error) = cleanup {
-                    write!(
-                        message,
-                        "; could not remove obsolete report backup: {cleanup_error}"
-                    )
-                    .expect("writing to String cannot fail");
-                }
-                return Err(message);
+                    self.parent.display()
+                ));
             }
-            Err(identity_error) => {
-                let cleanup = remove_report_backup(backup.as_deref());
-                let mut message = identity_error;
-                if let Err(cleanup_error) = cleanup {
-                    write!(
-                        message,
-                        "; could not remove obsolete report backup: {cleanup_error}"
-                    )
-                    .expect("writing to String cannot fail");
+            let rollback = self.restore_descriptor_relative(backup.as_deref());
+            let rollback_sync = rollback.as_ref().ok().and_then(|_| sync_parent().err());
+            let mut message = format!(
+                "could not sync details directory '{}': {error}",
+                self.parent.display()
+            );
+            if let Err(rollback_error) = rollback {
+                write!(
+                    message,
+                    "; could not roll back rejected report: {rollback_error}"
+                )
+                .expect("writing to String cannot fail");
+            } else if let Some(rollback_sync_error) = rollback_sync {
+                write!(
+                    message,
+                    "; rolled back report but could not sync rollback: {rollback_sync_error}"
+                )
+                .expect("writing to String cannot fail");
+            }
+            return Err(message);
+        }
+        if let Some(backup) = backup {
+            let _ = descriptor_fs::remove(&self.directory, &backup);
+            let _ = sync_parent();
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn backup_descriptor_relative(&self) -> Result<Option<String>, String> {
+        for attempt in 0..100_u32 {
+            let backup = format!(
+                ".{}.{}.{}.backup",
+                self.file_name,
+                std::process::id(),
+                attempt
+            );
+            match descriptor_fs::hard_link(
+                &self.directory,
+                &self.file_name,
+                &self.directory,
+                &backup,
+            ) {
+                Ok(()) => return Ok(Some(backup)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not retain previous details file '{}': {error}",
+                        self.requested.display()
+                    ));
                 }
-                return Err(message);
             }
         }
-        let rollback = restore_previous_report(destination, backup.as_deref());
-        let rollback_sync = rollback
-            .as_ref()
-            .ok()
-            .and_then(|_| sync_parent(parent).err());
-        let mut message = format!(
-            "could not sync details directory '{}': {error}",
-            parent.display()
-        );
-        if let Err(rollback_error) = rollback {
-            write!(
-                message,
-                "; could not roll back rejected report: {rollback_error}"
-            )
-            .expect("writing to String cannot fail");
-        } else if let Some(rollback_sync_error) = rollback_sync {
-            write!(
-                message,
-                "; rolled back report but could not sync rollback: {rollback_sync_error}"
-            )
-            .expect("writing to String cannot fail");
-        }
-        return Err(message);
+        Err(format!(
+            "could not reserve a details backup for '{}'",
+            self.requested.display()
+        ))
     }
-    if let Some(backup) = backup {
-        let _ = fs::remove_file(backup);
-        let _ = sync_parent(parent);
+
+    #[cfg(unix)]
+    fn restore_descriptor_relative(&self, backup: Option<&str>) -> io::Result<()> {
+        let Some(backup) = backup else {
+            return match descriptor_fs::remove(&self.directory, &self.file_name) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
+        };
+        descriptor_fs::rename(&self.directory, backup, &self.directory, &self.file_name)
     }
-    Ok(())
 }
 
+#[cfg(unix)]
+mod descriptor_fs {
+    use std::ffi::{CString, c_char, c_int, c_uint};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    #[cfg(target_os = "macos")]
+    const O_CREAT: c_int = 0x0200;
+    #[cfg(target_os = "macos")]
+    const O_EXCL: c_int = 0x0800;
+    #[cfg(not(target_os = "macos"))]
+    const O_CREAT: c_int = 0o100;
+    #[cfg(not(target_os = "macos"))]
+    const O_EXCL: c_int = 0o200;
+    const O_WRONLY: c_int = 0x0001;
+
+    unsafe extern "C" {
+        fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        fn linkat(
+            old_directory: c_int,
+            old_path: *const c_char,
+            new_directory: c_int,
+            new_path: *const c_char,
+            flags: c_int,
+        ) -> c_int;
+        fn renameat(
+            old_directory: c_int,
+            old_path: *const c_char,
+            new_directory: c_int,
+            new_path: *const c_char,
+        ) -> c_int;
+        fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
+    }
+
+    pub fn create_new(directory: &File, name: &str) -> io::Result<File> {
+        let name = c_name(name)?;
+        // SAFETY: name is NUL-terminated and directory remains open for the call.
+        let descriptor = unsafe {
+            openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                O_WRONLY | O_CREAT | O_EXCL,
+                0o600 as c_uint,
+            )
+        };
+        descriptor_file(descriptor)
+    }
+
+    pub fn open_read(directory: &File, name: &str) -> io::Result<File> {
+        let name = c_name(name)?;
+        // SAFETY: name is NUL-terminated and directory remains open for the call.
+        let descriptor = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        descriptor_file(descriptor)
+    }
+
+    pub fn hard_link(
+        old_directory: &File,
+        old_name: &str,
+        new_directory: &File,
+        new_name: &str,
+    ) -> io::Result<()> {
+        let old_name = c_name(old_name)?;
+        let new_name = c_name(new_name)?;
+        // SAFETY: both names are NUL-terminated and both directories remain open.
+        let status = unsafe {
+            linkat(
+                old_directory.as_raw_fd(),
+                old_name.as_ptr(),
+                new_directory.as_raw_fd(),
+                new_name.as_ptr(),
+                0,
+            )
+        };
+        status_result(status)
+    }
+
+    pub fn rename(
+        old_directory: &File,
+        old_name: &str,
+        new_directory: &File,
+        new_name: &str,
+    ) -> io::Result<()> {
+        let old_name = c_name(old_name)?;
+        let new_name = c_name(new_name)?;
+        // SAFETY: both names are NUL-terminated and both directories remain open.
+        let status = unsafe {
+            renameat(
+                old_directory.as_raw_fd(),
+                old_name.as_ptr(),
+                new_directory.as_raw_fd(),
+                new_name.as_ptr(),
+            )
+        };
+        status_result(status)
+    }
+
+    pub fn remove(directory: &File, name: &str) -> io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: name is NUL-terminated and directory remains open for the call.
+        let status = unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        status_result(status)
+    }
+
+    fn c_name(name: &str) -> io::Result<CString> {
+        if name.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "descriptor-relative file name contains a path separator",
+            ));
+        }
+        CString::new(name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "descriptor-relative file name contains NUL",
+            )
+        })
+    }
+
+    fn descriptor_file(descriptor: c_int) -> io::Result<File> {
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a newly owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn status_result(status: c_int) -> io::Result<()> {
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(test)]
+fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let destination = DetailsDestination::open(path, &[])?;
+    destination.write(contents)
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReportFileIdentity {
-    #[cfg(unix)]
     device: u64,
-    #[cfg(unix)]
     inode: u64,
 }
 
+#[cfg(unix)]
 fn report_file_identity(metadata: &fs::Metadata) -> Option<ReportFileIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
-        Some(ReportFileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        None
-    }
-}
-
-fn remove_report_backup(backup: Option<&Path>) -> io::Result<()> {
-    let Some(backup) = backup else {
-        return Ok(());
-    };
-    match fs::remove_file(backup) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn backup_existing_report(destination: &Path, parent: &Path) -> Result<Option<PathBuf>, String> {
-    if !destination.exists() {
-        return Ok(None);
-    }
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("details path '{}' has no file name", destination.display()))?;
-    for attempt in 0..100_u32 {
-        let backup = parent.join(format!(
-            ".{file_name}.{}.{}.backup",
-            std::process::id(),
-            attempt
-        ));
-        match fs::hard_link(destination, &backup) {
-            Ok(()) => return Ok(Some(backup)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "could not retain previous details file '{}': {error}",
-                    destination.display()
-                ));
-            }
-        }
-    }
-    Err(format!(
-        "could not reserve a details backup in '{}'",
-        parent.display()
-    ))
-}
-
-fn restore_previous_report(destination: &Path, backup: Option<&Path>) -> io::Result<()> {
-    let Some(backup) = backup else {
-        return match fs::remove_file(destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        };
-    };
-    match fs::rename(backup, destination) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::remove_file(destination)?;
-            fs::rename(backup, destination)
-        }
-    }
-}
-
-fn sync_directory(path: &Path) -> io::Result<()> {
-    fs::File::open(path).and_then(|directory| directory.sync_all())
+    Some(ReportFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -1530,6 +1646,48 @@ mod tests {
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn details_parent_symlink_retarget_does_not_change_destination_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = env::temp_dir().join(format!(
+            "rusthouse-details-parent-retarget-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let original = root.join("original");
+        let redirected = root.join("redirected");
+        let parent_link = root.join("details-parent");
+        fs::create_dir_all(&original).expect("original details directory");
+        fs::create_dir_all(&redirected).expect("redirected details directory");
+        let protected = redirected.join("details.json");
+        fs::write(&protected, b"protected executable").expect("protected executable");
+        symlink(&original, &parent_link).expect("initial details parent symlink");
+        let requested = parent_link.join("details.json");
+        let destination =
+            DetailsDestination::open(&requested, &[("benchmark", protected.as_path())])
+                .expect("validated descriptor-relative destination");
+
+        fs::remove_file(&parent_link).expect("remove initial parent symlink");
+        symlink(&redirected, &parent_link).expect("retarget details parent symlink");
+        destination
+            .write(b"retained report\n")
+            .expect("descriptor-relative report");
+
+        assert_eq!(
+            fs::read(original.join("details.json")).expect("original destination report"),
+            b"retained report\n"
+        );
+        assert_eq!(
+            fs::read(&protected).expect("protected executable"),
+            b"protected executable"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn directory_sync_failure_rolls_back_rejected_report() {
         let directory = env::temp_dir().join(format!(
@@ -1541,30 +1699,27 @@ mod tests {
         fs::create_dir(&directory).expect("test directory");
         let destination = directory.join("details.json");
         fs::write(&destination, b"old report\n").expect("old report");
-        let temporary_path = directory.join(".details.tmp");
-        let temporary_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .expect("temporary report");
+        let target = DetailsDestination::open(&destination, &[]).expect("details destination");
+        let temporary_name = ".details.tmp";
+        let temporary_file =
+            descriptor_fs::create_new(&target.directory, temporary_name).expect("temporary report");
         let mut sync_attempt = 0_u32;
 
-        let error = install_atomic_report_with_sync(
-            temporary_file,
-            &temporary_path,
-            &destination,
-            &directory,
-            b"rejected report\n",
-            |_| {
-                sync_attempt += 1;
-                if sync_attempt == 1 {
-                    Err(io::Error::other("injected directory sync failure"))
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .expect_err("directory sync failure must reject report");
+        let error = target
+            .install_descriptor_relative(
+                temporary_file,
+                temporary_name,
+                b"rejected report\n",
+                || {
+                    sync_attempt += 1;
+                    if sync_attempt == 1 {
+                        Err(io::Error::other("injected directory sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect_err("directory sync failure must reject report");
 
         assert!(error.contains("injected directory sync failure"));
         assert_eq!(
@@ -1574,27 +1729,27 @@ mod tests {
         assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
 
         let new_destination = directory.join("new-details.json");
-        let new_temporary_path = directory.join(".new-details.tmp");
-        let new_temporary_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&new_temporary_path)
-            .expect("new temporary report");
-        let error = install_atomic_report_with_sync(
-            new_temporary_file,
-            &new_temporary_path,
-            &new_destination,
-            &directory,
-            b"rejected report\n",
-            |_| Err(io::Error::other("injected directory sync failure")),
-        )
-        .expect_err("directory sync failure must reject new report");
+        let new_target =
+            DetailsDestination::open(&new_destination, &[]).expect("new details destination");
+        let new_temporary_name = ".new-details.tmp";
+        let new_temporary_file =
+            descriptor_fs::create_new(&new_target.directory, new_temporary_name)
+                .expect("new temporary report");
+        let error = new_target
+            .install_descriptor_relative(
+                new_temporary_file,
+                new_temporary_name,
+                b"rejected report\n",
+                || Err(io::Error::other("injected directory sync failure")),
+            )
+            .expect_err("directory sync failure must reject new report");
         assert!(error.contains("injected directory sync failure"));
         assert!(!new_destination.exists());
         assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_writer_does_not_roll_back_a_concurrent_report() {
         let directory = env::temp_dir().join(format!(
@@ -1606,25 +1761,22 @@ mod tests {
         fs::create_dir(&directory).expect("test directory");
         let destination = directory.join("details.json");
         fs::write(&destination, b"old report\n").expect("old report");
-        let temporary_path = directory.join(".details.tmp");
-        let temporary_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-            .expect("temporary report");
-        let error = install_atomic_report_with_sync(
-            temporary_file,
-            &temporary_path,
-            &destination,
-            &directory,
-            b"rejected report\n",
-            |_| {
-                write_report_atomically(&destination, b"accepted concurrent report\n")
-                    .map_err(io::Error::other)?;
-                Err(io::Error::other("injected first-writer sync failure"))
-            },
-        )
-        .expect_err("first writer must reject its report");
+        let target = DetailsDestination::open(&destination, &[]).expect("details destination");
+        let temporary_name = ".details.tmp";
+        let temporary_file =
+            descriptor_fs::create_new(&target.directory, temporary_name).expect("temporary report");
+        let error = target
+            .install_descriptor_relative(
+                temporary_file,
+                temporary_name,
+                b"rejected report\n",
+                || {
+                    write_report_atomically(&destination, b"accepted concurrent report\n")
+                        .map_err(io::Error::other)?;
+                    Err(io::Error::other("injected first-writer sync failure"))
+                },
+            )
+            .expect_err("first writer must reject its report");
 
         assert!(error.contains("changed concurrently"));
         assert_eq!(
@@ -1635,6 +1787,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn report_writers_are_serialized_before_backup_and_rename() {
         use std::sync::mpsc;
@@ -1648,7 +1801,9 @@ mod tests {
         fs::create_dir(&directory).expect("test directory");
         let destination = directory.join("details.json");
         fs::write(&destination, b"old report\n").expect("old report");
-        let first_writer = ReportWriterLock::acquire(&directory)
+        let first_writer = fs::File::open(&directory).expect("first writer directory");
+        first_writer
+            .lock()
             .expect("first writer lock before predecessor backup");
         let (started_sender, started_receiver) = mpsc::channel();
         let (done_sender, done_receiver) = mpsc::channel();

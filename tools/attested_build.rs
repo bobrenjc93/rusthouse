@@ -1,4 +1,7 @@
 #[allow(dead_code)]
+#[path = "../build_provenance.rs"]
+mod build_provenance;
+#[allow(dead_code)]
 #[path = "../benchmark/sha256.rs"]
 mod sha256;
 
@@ -8,6 +11,8 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use build_provenance::{has_hidden_git_index_entries, owned_git_repository};
 
 const MARKER_PREFIX: &str = "rusthouse-final-rustc-";
 
@@ -31,6 +36,8 @@ fn build_attested_binaries() -> Result<i32, String> {
     let wrapper = env::current_exe()
         .map_err(|error| format!("cannot locate attestation wrapper executable: {error}"))?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let source_root = cargo_source_root(&cargo)?;
+    let initial_source = live_source_provenance(&source_root)?;
     let session = new_build_session()?;
     let (first_status, rusthouse_artifact) = cargo_artifact(
         Command::new(&cargo)
@@ -49,7 +56,7 @@ fn build_attested_binaries() -> Result<i32, String> {
     let rusthouse_path = require_compiled_artifact(rusthouse_artifact, "RustHouse")?;
     let initial_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
     let (status, benchmark_path) = cargo_artifact(
-        Command::new(cargo)
+        Command::new(&cargo)
             .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
             .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
             .env("RUSTHOUSE_ATTESTED_BUILD", "1")
@@ -68,7 +75,93 @@ fn build_attested_binaries() -> Result<i32, String> {
     let final_benchmark = capture_artifact(&benchmark_path, "benchmark")?;
     let final_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
     validate_final_artifact_pair(&initial_rusthouse, &final_rusthouse, &final_benchmark)?;
+    if let Some(initial_source) = initial_source.as_ref() {
+        validate_live_source_after_build(
+            &source_root,
+            initial_source,
+            &final_rusthouse.attestation.shared,
+        )?;
+    }
     Ok(status)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSourceProvenance {
+    commit: String,
+    dirty: bool,
+}
+
+fn cargo_source_root(cargo: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    let output = Command::new(cargo)
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .output()
+        .map_err(|error| format!("could not locate Cargo workspace manifest: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not locate Cargo workspace manifest: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let manifest = String::from_utf8(output.stdout)
+        .map_err(|_| "Cargo workspace manifest path was not UTF-8".to_owned())?;
+    let manifest = PathBuf::from(manifest.trim());
+    let root = manifest
+        .parent()
+        .ok_or_else(|| format!("Cargo manifest '{}' has no parent", manifest.display()))?;
+    fs_canonicalize(root, "Cargo source root")
+}
+
+fn fs_canonicalize(path: &Path, name: &str) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("could not resolve {name} '{}': {error}", path.display()))
+}
+
+fn live_source_provenance(source_root: &Path) -> Result<Option<LiveSourceProvenance>, String> {
+    let Some(repository) = owned_git_repository(source_root) else {
+        return Ok(None);
+    };
+    let status = Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ])
+        .current_dir(source_root)
+        .output()
+        .map_err(|error| format!("could not inspect source checkout: {error}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "could not inspect source checkout: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    let hidden_index_entries = has_hidden_git_index_entries(source_root)
+        .ok_or_else(|| "could not inspect source checkout index flags".to_owned())?;
+    Ok(Some(LiveSourceProvenance {
+        commit: repository.commit,
+        dirty: !status.stdout.is_empty() || hidden_index_entries,
+    }))
+}
+
+fn validate_live_source_after_build(
+    source_root: &Path,
+    initial: &LiveSourceProvenance,
+    artifact: &SharedArtifactProvenance,
+) -> Result<(), String> {
+    let final_source = live_source_provenance(source_root)?
+        .ok_or_else(|| "owned Git source checkout disappeared during attested build".to_owned())?;
+    if &final_source != initial {
+        return Err("source checkout changed while attested artifacts were being built".to_owned());
+    }
+    if artifact.source_commit != final_source.commit || artifact.source_dirty != final_source.dirty
+    {
+        return Err(
+            "final artifact source provenance does not match the revalidated source checkout"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn new_build_session() -> Result<String, String> {
@@ -579,12 +672,16 @@ fn command_status(command: &mut Command) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         ArtifactAttestation, CapturedArtifact, CargoArtifact, SharedArtifactProvenance,
-        cargo_executable_artifact, encode_arguments, final_configuration,
-        require_compiled_artifact, validate_final_artifact_pair,
+        cargo_executable_artifact, encode_arguments, final_configuration, live_source_provenance,
+        require_compiled_artifact, validate_final_artifact_pair, validate_live_source_after_build,
     };
 
     #[test]
@@ -614,6 +711,63 @@ mod tests {
         )
         .expect_err("fresh Cargo artifact must be rejected");
         assert!(error.contains("cached artifact"));
+    }
+
+    #[test]
+    fn source_mutation_after_provenance_capture_is_rejected() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "rusthouse-attested-source-race-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("temporary source root");
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "RustHouse Test"],
+            vec!["config", "user.email", "test@example.invalid"],
+        ] {
+            let status = Command::new("git")
+                .args(arguments)
+                .current_dir(&root)
+                .status()
+                .expect("run git");
+            assert!(status.success());
+        }
+        fs::write(root.join("source.rs"), "fn original() {}\n").expect("source file");
+        assert!(
+            Command::new("git")
+                .args(["add", "source.rs"])
+                .current_dir(&root)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        let commit = Command::new("git")
+            .args(["commit", "-m", "source"])
+            .current_dir(&root)
+            .output()
+            .expect("git commit");
+        assert!(commit.status.success());
+        let initial = live_source_provenance(&root)
+            .expect("initial provenance")
+            .expect("owned Git checkout");
+        let artifact = SharedArtifactProvenance {
+            source_commit: initial.commit.clone(),
+            source_dirty: initial.dirty,
+            rustc_version: "rustc test".to_owned(),
+            target: "test-target".to_owned(),
+            profile: "release".to_owned(),
+            build_configuration_sha256: "d".repeat(64),
+        };
+
+        fs::write(root.join("source.rs"), "fn mutated() {}\n").expect("mutated source");
+        let error = validate_live_source_after_build(&root, &initial, &artifact)
+            .expect_err("source mutation must reject artifacts");
+        assert!(error.contains("source checkout changed"));
+        fs::remove_dir_all(root).expect("cleanup source root");
     }
 
     #[test]
