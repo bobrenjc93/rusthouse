@@ -1,4 +1,7 @@
-use rusthouse::sql::{Select, Statement, parse};
+use rusthouse::sql::{
+    AggregateArgument, AggregateFunction, ComparisonOperator, Operand, Predicate, Select,
+    SelectItem, Statement, parse,
+};
 use rusthouse::storage::{Column, ColumnDef, Table};
 use rusthouse::{DataType, Value};
 
@@ -46,4 +49,41 @@ fn nullable_column_validity_cannot_diverge_from_values() {
     assert_eq!(column.value(0), Value::Int64(1));
     assert_eq!(column.value(1), Value::Null);
     assert_eq!(column.value(2), Value::Int64(3));
+}
+
+#[test]
+fn versioned_public_api_exposes_filtered_aggregate_and_having_ast() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+
+    let filter = Predicate::Comparison {
+        left: Operand::Column("qualified".to_owned()),
+        operator: ComparisonOperator::Equal,
+        right: Operand::Literal(Value::Bool(true)),
+    };
+    let select = Select {
+        items: vec![SelectItem::Aggregate {
+            function: AggregateFunction::Count,
+            argument: AggregateArgument::Wildcard,
+            filter: Some(filter.clone()),
+            alias: Some("qualified_count".to_owned()),
+        }],
+        table: "events".to_owned(),
+        predicate: None,
+        group_by: Vec::new(),
+        having: Some(Predicate::Comparison {
+            left: Operand::Aggregate {
+                function: AggregateFunction::Count,
+                argument: AggregateArgument::Wildcard,
+                filter: Some(Box::new(filter)),
+            },
+            operator: ComparisonOperator::Greater,
+            right: Operand::Literal(Value::Int64(0)),
+        }),
+        order_by: Vec::new(),
+        limit: None,
+    };
+
+    assert!(matches!(Statement::Select(select), Statement::Select(_)));
+    assert_eq!(Value::Null.data_type(), DataType::Null);
+    assert_eq!(Column::Null(vec![()]).value(0), Value::Null);
 }

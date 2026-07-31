@@ -579,7 +579,14 @@ impl Parser {
 
     fn parse_alias(&mut self) -> Result<Option<String>> {
         if self.eat_keyword("AS") {
-            self.expect_identifier("alias").map(Some)
+            let alias = self.expect_identifier("alias")?;
+            if is_reserved_column_name(&alias) {
+                return Err(Error::ReservedIdentifier {
+                    identifier: alias,
+                    context: "alias".to_owned(),
+                });
+            }
+            Ok(Some(alias))
         } else {
             Ok(None)
         }
@@ -947,5 +954,21 @@ mod tests {
             Error::Sql { message, .. }
                 if message.contains("aggregate functions are only allowed in HAVING predicates")
         ));
+    }
+
+    #[test]
+    fn rejects_literal_names_as_output_aliases() {
+        for alias in ["true", "FALSE", "Null"] {
+            let error = parse(&format!("SELECT COUNT(*) AS {alias} FROM things"))
+                .expect_err("literal names cannot be aliases");
+
+            assert!(matches!(
+                error,
+                Error::ReservedIdentifier {
+                    identifier,
+                    context,
+                } if identifier.eq_ignore_ascii_case(alias) && context == "alias"
+            ));
+        }
     }
 }

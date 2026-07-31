@@ -69,6 +69,10 @@ Database retains an in-memory catalog across calls and returns structured result
 `Value::data_type()` retains its `DataType` return type; `Value::Null` reports the
 non-schema `DataType::Null` marker.
 
+Version 0.2.0 is a source-breaking library release for callers that construct the
+public SQL AST or exhaustively match public value/storage enums. See
+[CHANGELOG.md](CHANGELOG.md) for the affected shapes.
+
 Database parses a complete SQL batch before execution: any syntax error leaves the catalog unchanged. After parsing succeeds, statements execute in order; if a later execution error occurs, earlier successful statements remain applied.
 
 ~~~rust
