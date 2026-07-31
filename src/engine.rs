@@ -1,10 +1,15 @@
 //! SQL execution and structured query results.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::fs::{File, OpenOptions, remove_file};
+use std::io::{ErrorKind, Read, Write};
+use std::mem::size_of;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::catalog::Catalog;
-use crate::error::{Error, Result};
+use crate::error::{Error, Resource, Result};
+use crate::execution::{ExecutionContext, ExecutionLimits, ExecutionStats, estimated_row_bytes};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
@@ -13,9 +18,23 @@ use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    limits: ExecutionLimits,
+    last_execution_stats: ExecutionStats,
+    spill_directory: PathBuf,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            catalog: Catalog::default(),
+            limits: ExecutionLimits::default(),
+            last_execution_stats: ExecutionStats::default(),
+            spill_directory: std::env::temp_dir(),
+        }
+    }
 }
 
 /// Metadata for one column in a [`QueryResult`].
@@ -57,10 +76,50 @@ impl Database {
         Self::default()
     }
 
+    /// Creates an empty database governed by `limits`.
+    #[must_use]
+    pub fn with_limits(limits: ExecutionLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Creates an empty database with configurable limits and spill location.
+    #[must_use]
+    pub fn with_limits_and_spill_directory(
+        limits: ExecutionLimits,
+        spill_directory: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            catalog: Catalog::default(),
+            limits,
+            last_execution_stats: ExecutionStats::default(),
+            spill_directory: spill_directory.into(),
+        }
+    }
+
     /// Returns the database's catalog for read-only schema and table inspection.
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Returns the resource ceilings used for subsequent batches.
+    #[must_use]
+    pub fn limits(&self) -> &ExecutionLimits {
+        &self.limits
+    }
+
+    /// Replaces the resource ceilings used for subsequent batches.
+    pub fn set_limits(&mut self, limits: ExecutionLimits) {
+        self.limits = limits;
+    }
+
+    /// Returns counters from the most recent execution attempt.
+    #[must_use]
+    pub fn last_execution_stats(&self) -> &ExecutionStats {
+        &self.last_execution_stats
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -69,15 +128,33 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let limits = self.limits.clone();
+        let mut context = ExecutionContext::new(&limits, sql.len());
+        let outcome = (|| {
+            context.check(Resource::InputBytes, sql.len())?;
+            let parsed = sql::parse_bounded(sql, &limits)?;
+            context.stats.tokens = parsed.token_count;
+            context.stats.statements = parsed.statements.len();
+            let mut results = Vec::with_capacity(parsed.statements.len());
+            for statement in parsed.statements {
+                results.push(self.execute_statement(statement, &mut context)?);
+            }
+            Ok(results)
+        })();
+        context.stats.stored_values = self.catalog.stored_values();
+        self.last_execution_stats = context.stats;
+        outcome
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    fn execute_statement(
+        &mut self,
+        statement: Statement,
+        context: &mut ExecutionContext<'_>,
+    ) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
+                context.stats.schema_width = context.stats.schema_width.max(columns.len());
+                context.check(Resource::SchemaWidth, columns.len())?;
                 self.catalog.create_table(name, columns)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
@@ -88,6 +165,9 @@ impl Database {
                 let affected_rows = rows.len();
                 {
                     let target = self.catalog.table(&table)?;
+                    let additional = rows.len().saturating_mul(target.schema().len());
+                    let stored_values = self.catalog.stored_values().saturating_add(additional);
+                    context.check(Resource::StoredValues, stored_values)?;
                     for row in &rows {
                         target.validate_row(row)?;
                     }
@@ -101,25 +181,23 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self
+                .execute_select(select, context)
+                .map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(
+        &self,
+        select: Select,
+        context: &mut ExecutionContext<'_>,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
-
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -128,19 +206,35 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
-            let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
-            order_grouped_rows(
-                &mut selected_groups,
+            let grouped = execute_grouped(
+                table,
+                predicate.as_ref(),
+                &group_columns,
+                &aggregate_specs,
+                context,
+                &self.spill_directory,
+            )?;
+            let grouped_memory = grouped.memory_bytes;
+            let projected = project_grouped_rows(
                 &grouped,
                 &items,
                 &ordering,
                 select.limit,
+                context,
+                &self.spill_directory,
             );
-            grouped.project(&selected_groups, &items)
+            context.release_memory(grouped_memory);
+            projected?
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            execute_ungrouped(
+                table,
+                predicate.as_ref(),
+                &items,
+                &ordering,
+                select.limit,
+                context,
+                &self.spill_directory,
+            )?
         };
 
         Ok(QueryResult {
@@ -313,227 +407,190 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-fn execute_projection(
-    table: &Table,
-    matching_rows: &[usize],
-    items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
-    matching_rows
+fn project_source_row(table: &Table, row: usize, items: &[ResolvedItem]) -> Vec<Value> {
+    items
         .iter()
-        .map(|row| {
-            items
-                .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
-                })
-                .collect()
+        .map(|item| match item {
+            ResolvedItem::Column { source, .. } => table.columns()[*source].value(row),
+            ResolvedItem::Aggregate { .. } => {
+                unreachable!("projection does not contain aggregates")
+            }
         })
         .collect()
 }
 
-fn execute_grouped<'a>(
-    table: &'a Table,
-    matching_rows: &[usize],
+fn execute_ungrouped(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+    limit: Option<usize>,
+    context: &mut ExecutionContext<'_>,
+    spill_directory: &Path,
+) -> Result<Vec<Vec<Value>>> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    if ordering.is_empty() {
+        for row in 0..table.row_count() {
+            if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+                context.add_intermediate_rows(1)?;
+                let projected = project_source_row(table, row, items);
+                context.add_result_row(&projected)?;
+                rows.push(projected);
+                if limit.is_some_and(|limit| rows.len() == limit) {
+                    break;
+                }
+            }
+        }
+        return Ok(rows);
+    }
+
+    let compare =
+        |left: usize, right: usize| compare_source_rows(table, items, ordering, left, right);
+    let mut sorter = IndexSorter::new(compare, context.limits().max_memory_bytes, spill_directory)?;
+    for row in 0..table.row_count() {
+        if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+            context.add_intermediate_rows(1)?;
+            sorter.add(row, context)?;
+        }
+    }
+    sorter.prepare(context)?;
+    let working_memory = sorter.working_memory_bytes();
+    context.reserve_memory(working_memory)?;
+    let outcome = sorter.drain(|row| {
+        if limit.is_some_and(|limit| rows.len() == limit) {
+            return Ok(false);
+        }
+        let projected = project_source_row(table, row, items);
+        context.add_result_row(&projected)?;
+        rows.push(projected);
+        Ok(true)
+    });
+    context.release_memory(working_memory);
+    outcome?;
+    Ok(rows)
+}
+
+fn execute_grouped(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
-) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
-    let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
-    let mut aggregate_states = aggregate_specs
-        .iter()
-        .map(|spec| {
-            let mut states = Vec::with_capacity(initial_capacity);
-            if group_columns.is_empty() {
-                states.push(AggregateState::new(spec));
-            }
-            states
-        })
-        .collect::<Vec<_>>();
-
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
-        if inserted {
-            group_count += 1;
-            for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
-                states.push(AggregateState::new(spec));
-            }
-        }
-        for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
-            debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
-        }
-    }
-
-    let keys = groups.into_keys(group_count);
-    let aggregates = aggregate_states
-        .into_iter()
-        .map(|states| {
-            states
-                .into_iter()
-                .map(AggregateState::finish)
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(GroupedData { keys, aggregates })
-}
-
-#[derive(Debug)]
-enum GroupIndex<'a> {
-    Global,
-    One(HashMap<ValueRef<'a>, usize>),
-    Multiple(HashMap<Box<[ValueRef<'a>]>, usize>),
-}
-
-impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize, row_count: usize) -> Self {
-        let initial_capacity = row_count.min(1_024);
-        match column_count {
-            0 => Self::Global,
-            1 => Self::One(HashMap::with_capacity(initial_capacity)),
-            _ => Self::Multiple(HashMap::with_capacity(initial_capacity)),
-        }
-    }
-
-    fn find_or_insert(
-        &mut self,
-        table: &'a Table,
-        columns: &[usize],
-        row: usize,
-        next_group: usize,
-    ) -> (usize, bool) {
-        match self {
-            Self::Global => (0, false),
-            Self::One(groups) => {
-                let key = table.columns()[columns[0]].value_ref(row);
-                if let Some(group) = groups.get(&key) {
-                    (*group, false)
-                } else {
-                    groups.insert(key, next_group);
-                    (next_group, true)
-                }
-            }
-            Self::Multiple(groups) if columns.len() == 2 => {
-                let key = [
-                    table.columns()[columns[0]].value_ref(row),
-                    table.columns()[columns[1]].value_ref(row),
-                ];
-                find_or_insert_group(groups, &key, next_group)
-            }
-            Self::Multiple(groups) => {
-                let key = columns
-                    .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
-                    .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
-            }
-        }
-    }
-
-    fn into_keys(self, group_count: usize) -> Vec<GroupKey<'a>> {
-        let mut ordered = std::iter::repeat_with(|| None)
-            .take(group_count)
-            .collect::<Vec<_>>();
-        match self {
-            Self::Global => {
-                debug_assert_eq!(group_count, 1);
-                ordered[0] = Some(GroupKey::Empty);
-            }
-            Self::One(groups) => {
-                for (key, group) in groups {
-                    ordered[group] = Some(GroupKey::One(key));
-                }
-            }
-            Self::Multiple(groups) => {
-                for (key, group) in groups {
-                    ordered[group] = Some(GroupKey::Multiple(key));
-                }
-            }
-        }
-        ordered
-            .into_iter()
-            .map(|key| key.expect("every group index has a key"))
-            .collect()
-    }
-}
-
-fn find_or_insert_group<'a>(
-    groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
-    key: &[ValueRef<'a>],
-    next_group: usize,
-) -> (usize, bool) {
-    if let Some(group) = groups.get(key) {
-        (*group, false)
-    } else {
-        groups.insert(key.into(), next_group);
-        (next_group, true)
-    }
-}
-
-#[derive(Debug)]
-enum GroupKey<'a> {
-    Empty,
-    One(ValueRef<'a>),
-    Multiple(Box<[ValueRef<'a>]>),
-}
-
-impl GroupKey<'_> {
-    fn value(&self, position: usize) -> ValueRef<'_> {
-        match self {
-            Self::Empty => unreachable!("a global aggregate has no grouped columns"),
-            Self::One(value) if position == 0 => *value,
-            Self::One(_) => unreachable!("single-column group position is zero"),
-            Self::Multiple(values) => values[position],
-        }
-    }
-
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::Empty, Self::Empty) => Ordering::Equal,
-            (Self::One(left), Self::One(right)) => left.cmp(right),
-            (Self::Multiple(left), Self::Multiple(right)) => left.cmp(right),
-            _ => unreachable!("all keys for a query have the same shape"),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct GroupedData<'a> {
-    keys: Vec<GroupKey<'a>>,
-    aggregates: Vec<Vec<Value>>,
-}
-
-impl GroupedData<'_> {
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    fn project(&self, selected: &[usize], items: &[ResolvedItem]) -> Vec<Vec<Value>> {
-        selected
+    context: &mut ExecutionContext<'_>,
+    spill_directory: &Path,
+) -> Result<GroupedData> {
+    let mut data = GroupedData::default();
+    if group_columns.is_empty() {
+        let mut states = aggregate_specs
             .iter()
-            .map(|group| {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        ResolvedItem::Column {
-                            group_position: Some(position),
-                            ..
-                        } => self.keys[*group].value(*position).to_owned(),
-                        ResolvedItem::Column {
-                            group_position: None,
-                            ..
-                        } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::Aggregate { state } => {
-                            self.aggregates[*state][*group].clone()
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+            .map(AggregateState::new)
+            .collect::<Vec<_>>();
+        for row in 0..table.row_count() {
+            if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+                context.add_intermediate_rows(1)?;
+                update_aggregates(&mut states, aggregate_specs, table, row)?;
+            }
+        }
+        push_group(&mut data, Vec::new(), states, context)?;
+        return Ok(data);
     }
+
+    let compare = |left: usize, right: usize| {
+        compare_group_keys(table, group_columns, left, right).then_with(|| left.cmp(&right))
+    };
+    let mut sorter = IndexSorter::new(compare, context.limits().max_memory_bytes, spill_directory)?;
+    for row in 0..table.row_count() {
+        if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+            context.add_intermediate_rows(1)?;
+            sorter.add(row, context)?;
+        }
+    }
+    sorter.prepare(context)?;
+    let sorter_memory = sorter.working_memory_bytes();
+    context.reserve_memory(sorter_memory)?;
+
+    let mut current_key_row: Option<usize> = None;
+    let mut states = aggregate_specs
+        .iter()
+        .map(AggregateState::new)
+        .collect::<Vec<_>>();
+    let outcome = sorter.drain(|row| {
+        let belongs_to_current = current_key_row.is_some_and(|key_row| {
+            compare_group_keys(table, group_columns, key_row, row) == Ordering::Equal
+        });
+        if current_key_row.is_some() && !belongs_to_current {
+            let key_row = current_key_row.take().expect("current group has a key");
+            let key = group_columns
+                .iter()
+                .map(|column| table.columns()[*column].value(key_row))
+                .collect();
+            let finished = std::mem::replace(
+                &mut states,
+                aggregate_specs.iter().map(AggregateState::new).collect(),
+            );
+            push_group(&mut data, key, finished, context)?;
+        }
+        if current_key_row.is_none() {
+            current_key_row = Some(row);
+        }
+        update_aggregates(&mut states, aggregate_specs, table, row)?;
+        Ok(true)
+    });
+    context.release_memory(sorter_memory);
+    outcome?;
+    if let Some(key_row) = current_key_row {
+        let key = group_columns
+            .iter()
+            .map(|column| table.columns()[*column].value(key_row))
+            .collect();
+        push_group(&mut data, key, states, context)?;
+    }
+    Ok(data)
+}
+
+fn update_aggregates(
+    states: &mut [AggregateState],
+    specs: &[AggregateSpec],
+    table: &Table,
+    row: usize,
+) -> Result<()> {
+    for (state, spec) in states.iter_mut().zip(specs) {
+        state.update(spec, table, row)?;
+    }
+    Ok(())
+}
+
+fn push_group(
+    data: &mut GroupedData,
+    key: Vec<Value>,
+    states: Vec<AggregateState>,
+    context: &mut ExecutionContext<'_>,
+) -> Result<()> {
+    let aggregates = states
+        .into_iter()
+        .map(AggregateState::finish)
+        .collect::<Result<Vec<_>>>()?;
+    context.add_intermediate_rows(1)?;
+    let bytes = estimated_row_bytes(&key).saturating_add(estimated_row_bytes(&aggregates));
+    context.reserve_memory(bytes)?;
+    data.memory_bytes = data.memory_bytes.saturating_add(bytes);
+    data.groups.push(GroupRow { key, aggregates });
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct GroupedData {
+    groups: Vec<GroupRow>,
+    memory_bytes: usize,
+}
+
+#[derive(Debug)]
+struct GroupRow {
+    key: Vec<Value>,
+    aggregates: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -698,88 +755,341 @@ fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<V
     Ok(ordering)
 }
 
-fn order_source_rows(
-    rows: &mut Vec<usize>,
+fn compare_source_rows(
     table: &Table,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
-    limit: Option<usize>,
-) {
-    if ordering.is_empty() {
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-        return;
-    }
-
-    sort_and_limit(rows, limit, |left, right| {
-        for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for order in ordering {
+        let ResolvedItem::Column { source, .. } = items[order.output] else {
+            unreachable!("ungrouped projections cannot contain aggregates")
+        };
+        let comparison = table.columns()[source].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
-            if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
-            }
         }
-        left.cmp(&right)
-    });
+    }
+    left.cmp(&right)
 }
 
-fn order_grouped_rows(
-    groups: &mut Vec<usize>,
-    data: &GroupedData<'_>,
+fn compare_group_keys(table: &Table, columns: &[usize], left: usize, right: usize) -> Ordering {
+    for column in columns {
+        let comparison = table.columns()[*column].cmp_at(left, right);
+        if comparison != Ordering::Equal {
+            return comparison;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_group_rows(
+    data: &GroupedData,
+    items: &[ResolvedItem],
+    ordering: &[ResolvedOrder],
+    left: usize,
+    right: usize,
+) -> Ordering {
+    for order in ordering {
+        let comparison = match items[order.output] {
+            ResolvedItem::Column {
+                group_position: Some(position),
+                ..
+            } => data.groups[left].key[position].cmp(&data.groups[right].key[position]),
+            ResolvedItem::Column {
+                group_position: None,
+                ..
+            } => unreachable!("grouped columns are validated"),
+            ResolvedItem::Aggregate { state } => {
+                data.groups[left].aggregates[state].cmp(&data.groups[right].aggregates[state])
+            }
+        };
+        if comparison != Ordering::Equal {
+            return if order.descending {
+                comparison.reverse()
+            } else {
+                comparison
+            };
+        }
+    }
+    data.groups[left]
+        .key
+        .cmp(&data.groups[right].key)
+        .then_with(|| left.cmp(&right))
+}
+
+fn project_grouped_rows(
+    data: &GroupedData,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
-) {
-    sort_and_limit(groups, limit, |left, right| {
-        for order in ordering {
-            let comparison = match items[order.output] {
+    context: &mut ExecutionContext<'_>,
+    spill_directory: &Path,
+) -> Result<Vec<Vec<Value>>> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let compare = |left, right| compare_group_rows(data, items, ordering, left, right);
+    let mut sorter = IndexSorter::new(compare, context.available_memory(), spill_directory)?;
+    for group in 0..data.groups.len() {
+        sorter.add(group, context)?;
+    }
+    sorter.prepare(context)?;
+    let working_memory = sorter.working_memory_bytes();
+    context.reserve_memory(working_memory)?;
+    let mut rows = Vec::new();
+    let outcome = sorter.drain(|group| {
+        if limit.is_some_and(|limit| rows.len() == limit) {
+            return Ok(false);
+        }
+        let values = items
+            .iter()
+            .map(|item| match item {
                 ResolvedItem::Column {
                     group_position: Some(position),
                     ..
-                } => data.keys[left]
-                    .value(position)
-                    .cmp(&data.keys[right].value(position)),
+                } => data.groups[group].key[*position].clone(),
                 ResolvedItem::Column {
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
-                ResolvedItem::Aggregate { state } => {
-                    data.aggregates[state][left].cmp(&data.aggregates[state][right])
-                }
-            };
-            if comparison != Ordering::Equal {
-                return if order.descending {
-                    comparison.reverse()
-                } else {
-                    comparison
-                };
-            }
-        }
-        data.keys[left].cmp(&data.keys[right])
+                ResolvedItem::Aggregate { state } => data.groups[group].aggregates[*state].clone(),
+            })
+            .collect::<Vec<_>>();
+        context.add_result_row(&values)?;
+        rows.push(values);
+        Ok(true)
     });
+    context.release_memory(working_memory);
+    outcome?;
+    Ok(rows)
 }
 
-fn sort_and_limit(
-    indices: &mut Vec<usize>,
-    limit: Option<usize>,
-    compare: impl Fn(usize, usize) -> Ordering,
-) {
-    if let Some(0) = limit {
-        indices.clear();
-        return;
+static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(0);
+
+struct IndexSorter<F> {
+    compare: F,
+    chunk_capacity: usize,
+    fan_in: usize,
+    chunk: Vec<usize>,
+    runs: Vec<TempRun>,
+    spill_directory: PathBuf,
+    prepared: bool,
+}
+
+impl<F> IndexSorter<F>
+where
+    F: Fn(usize, usize) -> Ordering,
+{
+    fn new(compare: F, memory_bytes: usize, spill_directory: &Path) -> Result<Self> {
+        if memory_bytes < size_of::<usize>() {
+            return Err(Error::ResourceLimitExceeded {
+                resource: Resource::MemoryBytes,
+                limit: memory_bytes,
+                actual: size_of::<usize>(),
+            });
+        }
+        Ok(Self {
+            compare,
+            chunk_capacity: (memory_bytes / (2 * size_of::<usize>())).max(1),
+            fan_in: (memory_bytes / 32).max(2),
+            chunk: Vec::new(),
+            runs: Vec::new(),
+            spill_directory: spill_directory.to_owned(),
+            prepared: false,
+        })
     }
-    if let Some(limit) = limit.filter(|limit| *limit < indices.len()) {
-        indices.select_nth_unstable_by(limit, |left, right| compare(*left, *right));
-        indices.truncate(limit);
+
+    fn add(&mut self, index: usize, context: &mut ExecutionContext<'_>) -> Result<()> {
+        self.chunk.push(index);
+        context.observe_operator_memory(self.chunk.len().saturating_mul(size_of::<usize>()))?;
+        if self.chunk.len() >= self.chunk_capacity {
+            self.flush_chunk(context)?;
+        }
+        Ok(())
     }
-    indices.sort_unstable_by(|left, right| compare(*left, *right));
+
+    fn prepare(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
+        if !self.runs.is_empty() {
+            self.flush_chunk(context)?;
+            while self.runs.len() > self.fan_in {
+                let old_runs = std::mem::take(&mut self.runs);
+                let mut pending = old_runs.into_iter();
+                while let Some(first) = pending.next() {
+                    let mut batch = vec![first];
+                    batch.extend(pending.by_ref().take(self.fan_in - 1));
+                    if batch.len() == 1 {
+                        self.runs.push(batch.pop().expect("one run"));
+                    } else {
+                        let merged = self.merge_runs(&batch, context)?;
+                        self.runs.push(merged);
+                    }
+                }
+            }
+        } else {
+            self.chunk
+                .sort_unstable_by(|left, right| (self.compare)(*left, *right));
+        }
+        self.prepared = true;
+        Ok(())
+    }
+
+    fn working_memory_bytes(&self) -> usize {
+        if self.runs.is_empty() {
+            self.chunk.capacity().saturating_mul(size_of::<usize>())
+        } else {
+            self.runs.len().saturating_mul(32)
+        }
+    }
+
+    fn drain(mut self, mut visit: impl FnMut(usize) -> Result<bool>) -> Result<()> {
+        debug_assert!(self.prepared);
+        if self.runs.is_empty() {
+            for index in self.chunk.drain(..) {
+                if !visit(index)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut readers = open_runs(&self.runs)?;
+        let mut heads = readers
+            .iter_mut()
+            .map(read_index)
+            .collect::<Result<Vec<_>>>()?;
+        while let Some(run) = smallest_head(&heads, &self.compare) {
+            let index = heads[run].expect("selected run has a head");
+            if !visit(index)? {
+                break;
+            }
+            heads[run] = read_index(&mut readers[run])?;
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
+        if self.chunk.is_empty() {
+            return Ok(());
+        }
+        let mut indices = std::mem::take(&mut self.chunk);
+        indices.sort_unstable_by(|left, right| (self.compare)(*left, *right));
+        let (run, mut file) = TempRun::create(&self.spill_directory)?;
+        for index in &indices {
+            write_index(&mut file, *index)?;
+        }
+        file.sync_data()
+            .map_err(|error| spill_error("syncing run", error))?;
+        context.record_spill(indices.len().saturating_mul(size_of::<u64>()));
+        self.runs.push(run);
+        Ok(())
+    }
+
+    fn merge_runs(&self, runs: &[TempRun], context: &mut ExecutionContext<'_>) -> Result<TempRun> {
+        context.observe_operator_memory(runs.len().saturating_mul(32))?;
+        let mut readers = open_runs(runs)?;
+        let mut heads = readers
+            .iter_mut()
+            .map(read_index)
+            .collect::<Result<Vec<_>>>()?;
+        let (output, mut file) = TempRun::create(&self.spill_directory)?;
+        let mut written = 0usize;
+        while let Some(run) = smallest_head(&heads, &self.compare) {
+            let index = heads[run].expect("selected run has a head");
+            write_index(&mut file, index)?;
+            written += 1;
+            heads[run] = read_index(&mut readers[run])?;
+        }
+        file.sync_data()
+            .map_err(|error| spill_error("syncing merged run", error))?;
+        context.record_spill(written.saturating_mul(size_of::<u64>()));
+        Ok(output)
+    }
+}
+
+struct TempRun {
+    path: PathBuf,
+}
+
+impl TempRun {
+    fn create(directory: &Path) -> Result<(Self, File)> {
+        for _ in 0..100 {
+            let id = NEXT_SPILL_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = directory.join(format!(".rusthouse-spill-{}-{id}", std::process::id()));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => return Ok((Self { path }, file)),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(spill_error("creating run", error)),
+            }
+        }
+        Err(Error::SpillIo(
+            "could not allocate a unique temporary run name".to_owned(),
+        ))
+    }
+}
+
+impl Drop for TempRun {
+    fn drop(&mut self) {
+        let _ = remove_file(&self.path);
+    }
+}
+
+fn open_runs(runs: &[TempRun]) -> Result<Vec<File>> {
+    runs.iter()
+        .map(|run| File::open(&run.path).map_err(|error| spill_error("opening run", error)))
+        .collect()
+}
+
+fn write_index(file: &mut File, index: usize) -> Result<()> {
+    let index = u64::try_from(index)
+        .map_err(|_| Error::SpillIo("row index does not fit in a spill record".to_owned()))?;
+    file.write_all(&index.to_le_bytes())
+        .map_err(|error| spill_error("writing run", error))
+}
+
+fn read_index(file: &mut File) -> Result<Option<usize>> {
+    let mut bytes = [0u8; size_of::<u64>()];
+    match file.read(&mut bytes[..1]) {
+        Ok(0) => return Ok(None),
+        Ok(1) => {}
+        Ok(_) => unreachable!("one-byte read returned more than one byte"),
+        Err(error) => return Err(spill_error("reading run", error)),
+    }
+    file.read_exact(&mut bytes[1..])
+        .map_err(|error| spill_error("reading run", error))?;
+    let index = usize::try_from(u64::from_le_bytes(bytes))
+        .map_err(|_| Error::SpillIo("spill row index exceeds this platform".to_owned()))?;
+    Ok(Some(index))
+}
+
+fn smallest_head<F>(heads: &[Option<usize>], compare: &F) -> Option<usize>
+where
+    F: Fn(usize, usize) -> Ordering,
+{
+    heads
+        .iter()
+        .enumerate()
+        .filter_map(|(run, head)| head.map(|head| (run, head)))
+        .min_by(|(left_run, left), (right_run, right)| {
+            compare(*left, *right).then_with(|| left_run.cmp(right_run))
+        })
+        .map(|(run, _)| run)
+}
+
+fn spill_error(operation: &str, error: std::io::Error) -> Error {
+    Error::SpillIo(format!("{operation}: {error}"))
 }
 
 #[derive(Debug)]

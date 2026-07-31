@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- bounded execution with spill-backed grouping and sorting
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -78,6 +79,64 @@ assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+## Resource limits
+
+`Database::with_limits` and `Database::set_limits` configure inclusive ceilings
+for every SQL batch. The defaults are:
+
+| Resource | Default |
+| --- | ---: |
+| SQL input | 16 MiB |
+| Tokens | 1,000,000 |
+| Statements | 10,000 |
+| Columns per schema | 65,536 |
+| Stored values | 100,000,000 |
+| Intermediate rows | 10,000,000 |
+| Transient execution memory | 64 MiB |
+| Result rows | 1,000,000 |
+| Rendered output | 64 MiB |
+
+~~~rust
+use rusthouse::format::{OutputFormat, render_with_limit};
+use rusthouse::{Database, ExecutionLimits};
+
+let limits = ExecutionLimits {
+    max_memory_bytes: 8 * 1024 * 1024,
+    max_result_rows: 10_000,
+    max_rendered_bytes: 4 * 1024 * 1024,
+    ..ExecutionLimits::default()
+};
+let mut database = Database::with_limits(limits.clone());
+database.execute("CREATE TABLE events (id Int64)")?;
+let results = database.execute("SELECT id FROM events ORDER BY id")?;
+let query = match &results[0] {
+    rusthouse::StatementResult::Query(query) => query,
+    rusthouse::StatementResult::Command { .. } => unreachable!(),
+};
+let output = render_with_limit(query, OutputFormat::Json, limits.max_rendered_bytes)?;
+assert!(!output.is_empty());
+
+# Ok::<(), rusthouse::Error>(())
+~~~
+
+Input, token, statement, schema, stored-value, intermediate-row, memory, and
+result-row failures return `Error::ResourceLimitExceeded` with the resource,
+configured limit, and observed value. `last_execution_stats` remains available
+after success or failure. Its row counters are cumulative across all statements
+in the batch; stored values report the database total after the attempt.
+
+Ordered scans and grouped scans write deterministic fixed-width index runs to
+the system temporary directory when their index buffer reaches the memory
+budget. Merge fan-in is also bounded. Runs use exclusive creation and are
+removed on success or error. Applications that need a controlled location can
+use `Database::with_limits_and_spill_directory`.
+
+The memory limit accounts for estimated transient executor-owned index buffers,
+grouped values, and returned values. Persistent typed columns are governed by
+`max_stored_values`; parser allocations are governed by input and token limits.
+`render_with_limit` counts the exact attempted output while retaining no more
+than its byte limit. The CLI applies the default rendered-output ceiling.
 
 ## Current boundaries
 

@@ -1,6 +1,7 @@
 //! SQL syntax tree and parser.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Resource, Result};
+use crate::execution::ExecutionLimits;
 use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
 
@@ -172,8 +173,44 @@ pub struct OrderBy {
 
 /// Parse one or more semicolon-separated SQL statements.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens).parse_script()
+    Ok(parse_bounded(
+        input,
+        &ExecutionLimits {
+            max_input_bytes: usize::MAX,
+            max_tokens: usize::MAX,
+            max_statements: usize::MAX,
+            max_schema_width: usize::MAX,
+            max_stored_values: usize::MAX,
+            max_intermediate_rows: usize::MAX,
+            max_memory_bytes: usize::MAX,
+            max_result_rows: usize::MAX,
+            max_rendered_bytes: usize::MAX,
+        },
+    )?
+    .statements)
+}
+
+pub(crate) struct ParsedBatch {
+    pub(crate) statements: Vec<Statement>,
+    pub(crate) token_count: usize,
+}
+
+pub(crate) fn parse_bounded(input: &str, limits: &ExecutionLimits) -> Result<ParsedBatch> {
+    if input.len() > limits.max_input_bytes {
+        return Err(Error::ResourceLimitExceeded {
+            resource: Resource::InputBytes,
+            limit: limits.max_input_bytes,
+            actual: input.len(),
+        });
+    }
+    let tokens = Lexer::new(input).tokenize(limits.max_tokens)?;
+    let token_count = tokens.len() - 1;
+    let statements =
+        Parser::new(tokens, limits.max_statements, limits.max_schema_width).parse_script()?;
+    Ok(ParsedBatch {
+        statements,
+        token_count,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,7 +249,7 @@ impl<'a> Lexer<'a> {
         Self { input, position: 0 }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>> {
+    fn tokenize(mut self, max_tokens: usize) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
             self.skip_ignored();
@@ -295,6 +332,13 @@ impl<'a> Lexer<'a> {
                 }
             };
             tokens.push(Token { kind, position });
+            if tokens.len() > max_tokens {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: Resource::Tokens,
+                    limit: max_tokens,
+                    actual: tokens.len(),
+                });
+            }
         }
     }
 
@@ -399,15 +443,19 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    max_statements: usize,
+    max_schema_width: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, max_statements: usize, max_schema_width: usize) -> Self {
         Self {
             tokens,
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            max_statements,
+            max_schema_width,
         }
     }
 
@@ -416,6 +464,13 @@ impl Parser {
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
             statements.push(self.parse_statement()?);
+            if statements.len() > self.max_statements {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: Resource::Statements,
+                    limit: self.max_statements,
+                    actual: statements.len(),
+                });
+            }
             if !self.eat(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("expected ';' between statements");
             }
@@ -464,6 +519,13 @@ impl Parser {
                 name: column_name,
                 data_type,
             });
+            if columns.len() > self.max_schema_width {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: Resource::SchemaWidth,
+                    limit: self.max_schema_width,
+                    actual: columns.len(),
+                });
+            }
             if !self.eat(&TokenKind::Comma) {
                 break;
             }

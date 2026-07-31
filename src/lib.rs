@@ -39,13 +39,15 @@
 pub mod catalog;
 pub mod engine;
 pub mod error;
+pub mod execution;
 pub mod format;
 pub mod sql;
 pub mod storage;
 pub mod value;
 
 pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
-pub use error::{Error, Result};
+pub use error::{Error, Resource, Result};
+pub use execution::{ExecutionLimits, ExecutionStats};
 pub use value::{DataType, Value};
 
 /// Returns the product name used by RustHouse front ends.

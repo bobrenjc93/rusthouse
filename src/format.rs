@@ -3,6 +3,7 @@
 use std::fmt::Write;
 
 use crate::engine::QueryResult;
+use crate::error::{Error, Resource, Result};
 use crate::value::Value;
 
 /// A supported query output representation.
@@ -32,14 +33,27 @@ impl OutputFormat {
 /// Renders one query result in the requested output format.
 #[must_use]
 pub fn render(result: &QueryResult, format: OutputFormat) -> String {
+    render_with_limit(result, format, usize::MAX)
+        .expect("unbounded rendering cannot exceed its limit")
+}
+
+/// Renders one query result while retaining at most `max_bytes` output bytes.
+///
+/// The returned limit error reports the exact number of bytes the complete
+/// rendering would have produced.
+pub fn render_with_limit(
+    result: &QueryResult,
+    format: OutputFormat,
+    max_bytes: usize,
+) -> Result<String> {
     match format {
-        OutputFormat::Table => render_table(result),
-        OutputFormat::Csv => render_csv(result),
-        OutputFormat::Json => render_json(result),
+        OutputFormat::Table => render_table(result, max_bytes),
+        OutputFormat::Csv => render_csv(result, max_bytes),
+        OutputFormat::Json => render_json(result, max_bytes),
     }
 }
 
-fn render_table(result: &QueryResult) -> String {
+fn render_table(result: &QueryResult, max_bytes: usize) -> Result<String> {
     let rendered_columns = result
         .columns
         .iter()
@@ -64,7 +78,7 @@ fn render_table(result: &QueryResult) -> String {
         .collect::<Vec<_>>();
 
     let border = table_border(&widths);
-    let mut output = String::new();
+    let mut output = LimitedOutput::new(max_bytes);
     output.push_str(&border);
     output.push('\n');
     table_row(
@@ -78,7 +92,7 @@ fn render_table(result: &QueryResult) -> String {
         table_row(&mut output, row.iter().map(String::as_str), &widths);
     }
     output.push_str(&border);
-    output
+    output.finish()
 }
 
 fn table_border(widths: &[usize]) -> String {
@@ -91,7 +105,11 @@ fn table_border(widths: &[usize]) -> String {
     border
 }
 
-fn table_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>, widths: &[usize]) {
+fn table_row<'a>(
+    output: &mut LimitedOutput,
+    values: impl Iterator<Item = &'a str>,
+    widths: &[usize],
+) {
     output.push('|');
     for (value, width) in values.zip(widths) {
         output.push(' ');
@@ -124,8 +142,8 @@ fn escape_table_text(value: &str) -> String {
     output
 }
 
-fn render_csv(result: &QueryResult) -> String {
-    let mut output = String::new();
+fn render_csv(result: &QueryResult, max_bytes: usize) -> Result<String> {
+    let mut output = LimitedOutput::new(max_bytes);
     write_csv_row(
         &mut output,
         result.columns.iter().map(|column| column.name.as_str()),
@@ -134,10 +152,10 @@ fn render_csv(result: &QueryResult) -> String {
         let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
         write_csv_row(&mut output, values.iter().map(String::as_str));
     }
-    output
+    output.finish()
 }
 
-fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>) {
+fn write_csv_row<'a>(output: &mut LimitedOutput, values: impl Iterator<Item = &'a str>) {
     for (index, value) in values.enumerate() {
         if index > 0 {
             output.push(',');
@@ -156,8 +174,9 @@ fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>)
 /// Render one result set with explicit column metadata and positional rows.
 ///
 /// Positional rows preserve every value even when output column names repeat.
-fn render_json(result: &QueryResult) -> String {
-    let mut output = String::from("{\"columns\":[");
+fn render_json(result: &QueryResult, max_bytes: usize) -> Result<String> {
+    let mut output = LimitedOutput::new(max_bytes);
+    output.push_str("{\"columns\":[");
     for (index, column) in result.columns.iter().enumerate() {
         if index > 0 {
             output.push(',');
@@ -183,10 +202,10 @@ fn render_json(result: &QueryResult) -> String {
         output.push(']');
     }
     output.push_str("]}");
-    output
+    output.finish()
 }
 
-fn write_json_value(output: &mut String, value: &Value) {
+fn write_json_value(output: &mut LimitedOutput, value: &Value) {
     match value {
         Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
@@ -195,7 +214,7 @@ fn write_json_value(output: &mut String, value: &Value) {
     }
 }
 
-fn write_json_string(output: &mut String, value: &str) {
+fn write_json_string(output: &mut LimitedOutput, value: &str) {
     output.push('"');
     for character in value.chars() {
         match character {
@@ -213,6 +232,54 @@ fn write_json_string(output: &mut String, value: &str) {
         }
     }
     output.push('"');
+}
+
+struct LimitedOutput {
+    value: String,
+    limit: usize,
+    attempted: usize,
+}
+
+impl LimitedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            value: String::new(),
+            limit,
+            attempted: 0,
+        }
+    }
+
+    fn push(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        self.push_str(character.encode_utf8(&mut encoded));
+    }
+
+    fn push_str(&mut self, value: &str) {
+        let previous = self.attempted;
+        self.attempted = self.attempted.saturating_add(value.len());
+        if previous <= self.limit && self.attempted <= self.limit {
+            self.value.push_str(value);
+        }
+    }
+
+    fn finish(self) -> Result<String> {
+        if self.attempted > self.limit {
+            Err(Error::ResourceLimitExceeded {
+                resource: Resource::RenderedBytes,
+                limit: self.limit,
+                actual: self.attempted,
+            })
+        } else {
+            Ok(self.value)
+        }
+    }
+}
+
+impl Write for LimitedOutput {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.push_str(value);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
