@@ -984,6 +984,12 @@ where
             temporary_path.display()
         )
     })?;
+    let installed_identity = report_file_identity(&temporary_file.metadata().map_err(|error| {
+        format!(
+            "could not inspect atomic details file '{}': {error}",
+            temporary_path.display()
+        )
+    })?);
     drop(temporary_file);
     let backup = backup_existing_report(destination, parent)?;
     if let Err(error) = fs::rename(temporary_path, destination) {
@@ -996,6 +1002,58 @@ where
         ));
     }
     if let Err(error) = sync_parent(parent) {
+        let still_installed = installed_identity
+            .ok_or_else(|| {
+                format!(
+                    "could not sync details directory '{}': {error}; refused unsafe rollback because file identity is unavailable on this platform",
+                    parent.display()
+                )
+            })
+            .and_then(|installed_identity| {
+                fs::metadata(destination)
+                    .map_err(|identity_error| {
+                        format!(
+                            "could not sync details directory '{}': {error}; refused unsafe rollback because details file '{}' could not be inspected: {identity_error}",
+                            parent.display(),
+                            destination.display()
+                        )
+                    })
+                    .and_then(|metadata| {
+                        report_file_identity(&metadata)
+                            .ok_or_else(|| "details file identity became unavailable".to_owned())
+                            .map(|identity| identity == installed_identity)
+                    })
+            });
+        match still_installed {
+            Ok(true) => {}
+            Ok(false) => {
+                let cleanup = remove_report_backup(backup.as_deref());
+                let mut message = format!(
+                    "could not sync details directory '{}': {error}; details file changed concurrently, so the newer report was preserved",
+                    parent.display()
+                );
+                if let Err(cleanup_error) = cleanup {
+                    write!(
+                        message,
+                        "; could not remove obsolete report backup: {cleanup_error}"
+                    )
+                    .expect("writing to String cannot fail");
+                }
+                return Err(message);
+            }
+            Err(identity_error) => {
+                let cleanup = remove_report_backup(backup.as_deref());
+                let mut message = identity_error;
+                if let Err(cleanup_error) = cleanup {
+                    write!(
+                        message,
+                        "; could not remove obsolete report backup: {cleanup_error}"
+                    )
+                    .expect("writing to String cannot fail");
+                }
+                return Err(message);
+            }
+        }
         let rollback = restore_previous_report(destination, backup.as_deref());
         let rollback_sync = rollback
             .as_ref()
@@ -1025,6 +1083,42 @@ where
         let _ = sync_parent(parent);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReportFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn report_file_identity(metadata: &fs::Metadata) -> Option<ReportFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Some(ReportFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn remove_report_backup(backup: Option<&Path>) -> io::Result<()> {
+    let Some(backup) = backup else {
+        return Ok(());
+    };
+    match fs::remove_file(backup) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn backup_existing_report(destination: &Path, parent: &Path) -> Result<Option<PathBuf>, String> {
@@ -1445,6 +1539,46 @@ mod tests {
         .expect_err("directory sync failure must reject new report");
         assert!(error.contains("injected directory sync failure"));
         assert!(!new_destination.exists());
+        assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_writer_does_not_roll_back_a_concurrent_report() {
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-atomic-concurrent-rollback-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("test directory");
+        let destination = directory.join("details.json");
+        fs::write(&destination, b"old report\n").expect("old report");
+        let temporary_path = directory.join(".details.tmp");
+        let temporary_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .expect("temporary report");
+        let error = install_atomic_report_with_sync(
+            temporary_file,
+            &temporary_path,
+            &destination,
+            &directory,
+            b"rejected report\n",
+            |_| {
+                write_report_atomically(&destination, b"accepted concurrent report\n")
+                    .map_err(io::Error::other)?;
+                Err(io::Error::other("injected first-writer sync failure"))
+            },
+        )
+        .expect_err("first writer must reject its report");
+
+        assert!(error.contains("changed concurrently"));
+        assert_eq!(
+            fs::read(&destination).expect("concurrent report"),
+            b"accepted concurrent report\n"
+        );
         assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
         fs::remove_dir_all(directory).expect("cleanup");
     }

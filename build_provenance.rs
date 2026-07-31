@@ -81,6 +81,23 @@ pub fn owned_git_repository(manifest_dir: &Path) -> Option<GitRepository> {
     })
 }
 
+pub fn has_hidden_git_index_entries(directory: &Path) -> Option<bool> {
+    let output = Command::new("git")
+        .args(["--no-optional-locks", "ls-files", "-v", "-z"])
+        .current_dir(directory)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(output.stdout.split(|byte| *byte == 0).any(|entry| {
+        entry
+            .first()
+            .is_some_and(|tag| *tag == b'S' || tag.is_ascii_lowercase())
+    }))
+}
+
 fn json_string_field(contents: &str, field: &str) -> Option<String> {
     let marker = format!("\"{field}\"");
     let (_, after_key) = contents.split_once(&marker)?;

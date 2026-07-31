@@ -8,7 +8,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use build_provenance::{
-    CargoVcsProvenance, cargo_vcs_provenance, owned_git_repository, parse_dirty,
+    CargoVcsProvenance, cargo_vcs_provenance, has_hidden_git_index_entries, owned_git_repository,
+    parse_dirty,
 };
 
 const ATTESTED_BUILD_TOKEN: &str =
@@ -123,6 +124,35 @@ fn live_git_provenance_ignores_untracked_packaged_metadata() {
     repository.cargo(&["build", "--quiet"]);
     assert_eq!(repository.probe_commit(), actual_commit);
     assert!(repository.probe_dirty());
+}
+
+#[test]
+fn hidden_git_index_flags_cannot_create_clean_attestations() {
+    for (set_flag, clear_flag) in [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ] {
+        let repository = TemporaryRepository::new();
+        repository.install_probe();
+        repository.git(&["add", "."]);
+        repository.git(&["commit", "-m", "clean probe"]);
+        repository.git(&["update-index", set_flag, "src/lib.rs"]);
+        repository.write(
+            "src/lib.rs",
+            "pub mod build_info;\n// hidden modification\n",
+        );
+
+        assert_eq!(
+            repository.git_output(&["status", "--porcelain=v1", "--untracked-files=normal"]),
+            ""
+        );
+        assert_eq!(has_hidden_git_index_entries(&repository.path), Some(true));
+
+        repository.cargo(&["build", "--quiet"]);
+        assert!(repository.probe_dirty());
+
+        repository.git(&["update-index", clear_flag, "src/lib.rs"]);
+    }
 }
 
 #[test]

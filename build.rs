@@ -9,7 +9,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use build_provenance::{cargo_vcs_provenance, owned_git_repository, parse_dirty};
+use build_provenance::{
+    cargo_vcs_provenance, has_hidden_git_index_entries, owned_git_repository, parse_dirty,
+};
 
 struct SourceProvenance {
     commit: String,
@@ -110,9 +112,11 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
                 "--untracked-files=normal",
             ],
         );
+        let hidden_index_entries = has_hidden_git_index_entries(manifest_dir)
+            .unwrap_or_else(|| panic!("could not inspect Git index flags"));
         return SourceProvenance {
             commit: repository.commit,
-            dirty: !status.is_empty(),
+            dirty: !status.is_empty() || hidden_index_entries,
             live_git: true,
             git_watch_paths: repository.watch_paths,
         };

@@ -1,6 +1,9 @@
 //! Build provenance embedded by `build.rs` in every shipped binary.
 
 #[allow(dead_code)]
+#[path = "../build_provenance.rs"]
+mod build_provenance;
+#[allow(dead_code)]
 #[path = "../benchmark/sha256.rs"]
 mod sha256;
 
@@ -120,7 +123,7 @@ fn live_git_dirty() -> Option<bool> {
             "--untracked-files=normal",
         ],
     )?;
-    Some(!status.is_empty())
+    Some(!status.is_empty() || build_provenance::has_hidden_git_index_entries(&source_root)?)
 }
 
 fn git_output(directory: &Path, arguments: &[&str]) -> Option<String> {

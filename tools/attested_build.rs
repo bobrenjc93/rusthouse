@@ -114,7 +114,16 @@ fn final_configuration(arguments: &[String]) -> Result<Option<(String, String)>,
         index += 1;
     }
 
-    Ok(source_path.map(|source_path| (source_path, configuration.join("\n"))))
+    Ok(source_path.map(|source_path| (source_path, encode_arguments(&configuration))))
+}
+
+fn encode_arguments(arguments: &[String]) -> String {
+    let mut encoded = format!("rustc-argv-v1:{};", arguments.len());
+    for argument in arguments {
+        write!(encoded, "{}:", argument.len()).expect("writing to String cannot fail");
+        encoded.push_str(argument);
+    }
+    encoded
 }
 
 fn record_codegen(configuration: &mut Vec<String>, value: &str) {
@@ -298,7 +307,7 @@ fn command_status(command: &mut Command) -> Result<i32, String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{cargo_executable_artifact, final_configuration};
+    use super::{cargo_executable_artifact, encode_arguments, final_configuration};
 
     #[test]
     fn cargo_artifact_messages_supply_the_executable_path() {
@@ -344,7 +353,8 @@ mod tests {
         .expect("configuration")
         .expect("source");
 
-        for value in [
+        let expected = [
+            "--crate-type=bin",
             "-l",
             "framework=Foundation",
             "-L",
@@ -353,9 +363,20 @@ mod tests {
             "dep=/tmp/libdep.rlib",
             "--sysroot",
             "/tmp/sysroot",
-        ] {
-            assert!(configuration.lines().any(|line| line == value));
-        }
+        ]
+        .map(str::to_owned);
+        assert_eq!(configuration, encode_arguments(&expected));
+    }
+
+    #[test]
+    fn argument_encoding_preserves_boundaries_around_newlines() {
+        let one_argument = ["-Ldependency=/tmp/a\n--cfg=foo".to_owned()];
+        let two_arguments = ["-Ldependency=/tmp/a".to_owned(), "--cfg=foo".to_owned()];
+
+        assert_ne!(
+            encode_arguments(&one_argument),
+            encode_arguments(&two_arguments)
+        );
     }
 
     fn arguments(extra: &[&str]) -> Vec<String> {
