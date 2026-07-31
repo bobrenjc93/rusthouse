@@ -123,7 +123,7 @@ fn live_git_provenance_ignores_untracked_packaged_metadata() {
 }
 
 #[test]
-fn build_configuration_fingerprint_changes_with_optimization_and_rustflags() {
+fn build_configuration_fingerprint_changes_with_effective_codegen_settings() {
     let repository = TemporaryRepository::new();
     repository.install_probe();
     repository.git(&["add", "."]);
@@ -144,6 +144,42 @@ fn build_configuration_fingerprint_changes_with_optimization_and_rustflags() {
     );
     let custom_rustflags = repository.probe_build_configuration("release");
     assert_ne!(normal, custom_rustflags);
+
+    repository.cargo(&[
+        "build",
+        "--release",
+        "--quiet",
+        "--config",
+        "profile.release.lto=false",
+    ]);
+    let lto_disabled = repository.probe_build_configuration("release");
+    repository.cargo(&[
+        "build",
+        "--release",
+        "--quiet",
+        "--config",
+        "profile.release.lto=\"thin\"",
+    ]);
+    let thin_lto = repository.probe_build_configuration("release");
+    assert_ne!(lto_disabled, thin_lto);
+
+    repository.cargo(&[
+        "build",
+        "--release",
+        "--quiet",
+        "--config",
+        "profile.release.codegen-units=1",
+    ]);
+    let one_codegen_unit = repository.probe_build_configuration("release");
+    repository.cargo(&[
+        "build",
+        "--release",
+        "--quiet",
+        "--config",
+        "profile.release.codegen-units=16",
+    ]);
+    let sixteen_codegen_units = repository.probe_build_configuration("release");
+    assert_ne!(one_codegen_unit, sixteen_codegen_units);
 }
 
 #[test]

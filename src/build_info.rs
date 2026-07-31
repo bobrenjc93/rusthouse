@@ -1,9 +1,15 @@
 //! Build provenance embedded by `build.rs` in every shipped binary.
 
+#[allow(dead_code)]
+#[path = "../benchmark/sha256.rs"]
+mod sha256;
+
+use std::any::TypeId;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub const ATTESTATION_VERSION: &str = "rusthouse-build-attestation-v2";
 
@@ -35,8 +41,24 @@ pub fn current() -> BuildInfo {
         rustc_version: env!("RUSTHOUSE_RUSTC_VERSION"),
         target: env!("RUSTHOUSE_BUILD_TARGET"),
         profile: env!("RUSTHOUSE_BUILD_PROFILE"),
-        build_configuration_sha256: env!("RUSTHOUSE_BUILD_CONFIGURATION_SHA256"),
+        build_configuration_sha256: build_configuration_sha256(),
     }
+}
+
+struct BuildConfigurationIdentity;
+
+fn build_configuration_sha256() -> &'static str {
+    static SHA256: OnceLock<String> = OnceLock::new();
+    SHA256
+        .get_or_init(|| {
+            let canonical = format!(
+                "seed_sha256={}\ntarget_crate_type_id={:?}\n",
+                env!("RUSTHOUSE_BUILD_CONFIGURATION_SHA256"),
+                TypeId::of::<BuildConfigurationIdentity>()
+            );
+            sha256::digest_hex(canonical.as_bytes())
+        })
+        .as_str()
 }
 
 pub fn attestation() -> String {

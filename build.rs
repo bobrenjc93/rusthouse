@@ -39,7 +39,7 @@ fn main() {
     let rustc_version = command_output(manifest_dir, &rustc, &["--version"]);
     let target = required_env("TARGET");
     let profile = required_env("PROFILE");
-    let build_configuration_sha256 = build_configuration_sha256();
+    let build_configuration_seed_sha256 = build_configuration_seed_sha256();
 
     emit(
         "RUSTHOUSE_SOURCE_COMMIT",
@@ -54,7 +54,7 @@ fn main() {
     emit("RUSTHOUSE_BUILD_PROFILE", &profile);
     emit(
         "RUSTHOUSE_BUILD_CONFIGURATION_SHA256",
-        &build_configuration_sha256,
+        &build_configuration_seed_sha256,
     );
     emit("RUSTHOUSE_SOURCE_ROOT", &manifest_dir.display().to_string());
     emit(
@@ -140,7 +140,7 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
     );
 }
 
-fn build_configuration_sha256() -> String {
+fn build_configuration_seed_sha256() -> String {
     const OPTIONAL_KEYS: &[&str] = &[
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_INCREMENTAL",
@@ -154,6 +154,10 @@ fn build_configuration_sha256() -> String {
         ("DEBUG".to_owned(), required_env("DEBUG")),
         ("TARGET".to_owned(), required_env("TARGET")),
         ("HOST".to_owned(), required_env("HOST")),
+        (
+            "CARGO_UNIT_FINGERPRINT".to_owned(),
+            cargo_unit_fingerprint(),
+        ),
     ];
     settings.extend(OPTIONAL_KEYS.iter().map(|key| {
         (
@@ -175,6 +179,20 @@ fn build_configuration_sha256() -> String {
             .expect("writing to String cannot fail");
     }
     sha256::digest_hex(canonical.as_bytes())
+}
+
+fn cargo_unit_fingerprint() -> String {
+    // Cargo does not expose every resolved profile setting to build scripts.
+    // Its unit directory binds additional resolved settings without binding to
+    // TARGET_DIR. build_info adds the target crate identity to the final hash.
+    let out_dir = required_env("OUT_DIR");
+    Path::new(&out_dir)
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| panic!("OUT_DIR does not contain a Cargo unit fingerprint: {out_dir:?}"))
+        .to_owned()
 }
 
 fn emit_source_watches(manifest_dir: &Path) {
