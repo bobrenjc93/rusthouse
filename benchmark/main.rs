@@ -117,6 +117,9 @@ struct HarnessIdentity {
 }
 
 fn main() -> ExitCode {
+    if let Some(exit_code) = process::run_staging_cleanup_guard_if_requested() {
+        return exit_code;
+    }
     let default_rusthouse = match default_rusthouse_path() {
         Ok(path) => path,
         Err(error) => return emit_failure(error),
@@ -177,6 +180,16 @@ fn run(config: Config) -> Result<Report, String> {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
     };
+    if let Some(details) = config.details.as_deref() {
+        reject_details_executable_aliases(
+            details,
+            &[
+                ("benchmark", harness.path.as_path()),
+                ("RustHouse", configured_paths.rusthouse.as_path()),
+                ("ClickHouse", configured_paths.clickhouse.as_path()),
+            ],
+        )?;
+    }
     let expected_rusthouse_sha256 =
         option_env!("RUSTHOUSE_ATTESTED_BINARY_SHA256").unwrap_or("unavailable");
     let (paths, identity, _pinned_executables) =
@@ -490,6 +503,90 @@ fn revalidate_harness(expected: &HarnessIdentity) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn reject_details_executable_aliases(
+    details: &Path,
+    executables: &[(&str, &Path)],
+) -> Result<(), String> {
+    for (name, executable) in executables {
+        if paths_refer_to_same_file(details, executable)? {
+            return Err(format!(
+                "details path '{}' aliases the {name} executable '{}'; refusing to overwrite a benchmark input",
+                details.display(),
+                executable.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> Result<bool, String> {
+    let left_resolved = resolve_existing_or_parent(left)?;
+    let right_resolved = fs::canonicalize(right).map_err(|error| {
+        format!(
+            "could not resolve executable path '{}': {error}",
+            right.display()
+        )
+    })?;
+    if left_resolved == right_resolved {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let left_metadata = match fs::metadata(left) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect details path '{}': {error}",
+                    left.display()
+                ));
+            }
+        };
+        let right_metadata = fs::metadata(right).map_err(|error| {
+            format!(
+                "could not inspect executable path '{}': {error}",
+                right.display()
+            )
+        })?;
+        if let Some(left_metadata) = left_metadata {
+            return Ok(left_metadata.dev() == right_metadata.dev()
+                && left_metadata.ino() == right_metadata.ino());
+        }
+    }
+
+    Ok(false)
+}
+
+fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?;
+            fs::canonicalize(parent)
+                .map(|parent| parent.join(file_name))
+                .map_err(|error| {
+                    format!(
+                        "could not resolve details directory '{}': {error}",
+                        parent.display()
+                    )
+                })
+        }
+        Err(error) => Err(format!(
+            "could not resolve details path '{}': {error}",
+            path.display()
+        )),
+    }
 }
 
 fn score_cases(
@@ -1243,6 +1340,47 @@ mod tests {
         write_report_atomically(&path, b"new report\n").expect("atomic report");
         assert_eq!(fs::read(&path).expect("retained report"), b"new report\n");
         assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn details_path_cannot_alias_benchmark_inputs() {
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-details-alias-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("test directory");
+        let harness = directory.join("benchmark");
+        let rusthouse = directory.join("rusthouse");
+        let clickhouse = directory.join("clickhouse");
+        fs::write(&harness, b"benchmark").expect("benchmark");
+        fs::write(&rusthouse, b"rusthouse").expect("rusthouse");
+        fs::write(&clickhouse, b"clickhouse").expect("clickhouse");
+        let executables = [
+            ("benchmark", harness.as_path()),
+            ("RustHouse", rusthouse.as_path()),
+            ("ClickHouse", clickhouse.as_path()),
+        ];
+
+        assert!(reject_details_executable_aliases(&rusthouse, &executables).is_err());
+        reject_details_executable_aliases(&directory.join("details.json"), &executables)
+            .expect("distinct details path");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_path = directory.join("details-symlink.json");
+            symlink(&clickhouse, &symlink_path).expect("details symlink");
+            assert!(reject_details_executable_aliases(&symlink_path, &executables).is_err());
+
+            let hard_link_path = directory.join("details-hard-link.json");
+            fs::hard_link(&harness, &hard_link_path).expect("details hard link");
+            assert!(reject_details_executable_aliases(&hard_link_path, &executables).is_err());
+        }
+
         fs::remove_dir_all(directory).expect("cleanup");
     }
 

@@ -1,3 +1,5 @@
+use std::env;
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -15,6 +17,36 @@ fn ordinary_binary_refuses_unattested_benchmark_identity() {
             .expect("UTF-8 stderr")
             .contains("attested build token is unavailable")
     );
+}
+
+#[test]
+fn cleanup_guard_removes_staging_directory_after_parent_disconnect() {
+    let directory = env::temp_dir().join(format!(
+        "rusthouse-benchmark-pinned-{}-cleanup-test",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir(&directory).expect("staging directory");
+    fs::write(directory.join("clickhouse-pinned"), b"abandoned artifact").expect("staged artifact");
+
+    let mut guardian = Command::new(env!("CARGO_BIN_EXE_clickhouse-parity-bench"))
+        .arg("--internal-staging-cleanup-guard")
+        .arg(&directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cleanup guardian");
+    drop(guardian.stdin.take());
+    let output = guardian
+        .wait_with_output()
+        .expect("wait for cleanup guardian");
+    assert!(
+        output.status.success(),
+        "cleanup guardian failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.exists());
 }
 
 #[test]

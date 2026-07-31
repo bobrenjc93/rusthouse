@@ -2,8 +2,8 @@ use std::env;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusthouse::build_info::{ATTESTATION_VERSION, BuildInfo};
 
@@ -15,6 +15,8 @@ pub const CLICKHOUSE_SHA256: &str =
 pub const CLICKHOUSE_ARTIFACT_URL: &str = "https://github.com/ClickHouse/ClickHouse/releases/download/v26.7.1.1315-stable/clickhouse-macos-aarch64";
 pub const CLICKHOUSE_ARTIFACT_PLATFORM: &str = "macos-aarch64";
 const CLICKHOUSE_TARGET: &str = "aarch64-apple-darwin";
+const STAGING_DIRECTORY_PREFIX: &str = "rusthouse-benchmark-pinned-";
+const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct EnginePaths {
@@ -25,6 +27,13 @@ pub struct EnginePaths {
 #[derive(Debug)]
 pub struct PinnedExecutables {
     directory: PathBuf,
+    cleanup_guard: Option<CleanupGuard>,
+}
+
+#[derive(Debug)]
+struct CleanupGuard {
+    child: Child,
+    stdin: Option<ChildStdin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,7 +225,17 @@ impl EnginePaths {
 impl PinnedExecutables {
     fn create(sources: &EnginePaths) -> Result<Self, String> {
         let directory = create_private_staging_directory()?;
-        let pinned = Self { directory };
+        let cleanup_guard = match start_cleanup_guard(&directory) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = cleanup_staging_directory(&directory);
+                return Err(error);
+            }
+        };
+        let pinned = Self {
+            directory,
+            cleanup_guard,
+        };
         copy_executable(&sources.rusthouse, &pinned.rusthouse_path())?;
         copy_executable(&sources.clickhouse, &pinned.clickhouse_path())?;
         make_staging_directory_read_only(&pinned.directory)?;
@@ -243,16 +262,19 @@ impl PinnedExecutables {
 
 impl Drop for PinnedExecutables {
     fn drop(&mut self) {
-        let _ = make_staging_directory_writable(&self.directory);
-        let _ = fs::remove_dir_all(&self.directory);
+        if let Some(mut guard) = self.cleanup_guard.take() {
+            guard.finish();
+        }
+        let _ = cleanup_staging_directory(&self.directory);
     }
 }
 
 fn create_private_staging_directory() -> Result<PathBuf, String> {
     let parent = env::temp_dir();
+    scavenge_stale_staging_directories(&parent, STALE_STAGING_AGE)?;
     for attempt in 0..100_u32 {
         let directory = parent.join(format!(
-            "rusthouse-benchmark-pinned-{}-{attempt}",
+            "{STAGING_DIRECTORY_PREFIX}{}-{attempt}",
             std::process::id()
         ));
         let mut builder = fs::DirBuilder::new();
@@ -276,6 +298,178 @@ fn create_private_staging_directory() -> Result<PathBuf, String> {
         "could not reserve a private executable staging directory in '{}'",
         parent.display()
     ))
+}
+
+#[cfg(not(test))]
+fn start_cleanup_guard(directory: &Path) -> Result<Option<CleanupGuard>, String> {
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not locate benchmark cleanup guardian: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--internal-staging-cleanup-guard")
+        .arg(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "could not start staging cleanup guardian for '{}': {error}",
+            directory.display()
+        )
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "staging cleanup guardian stdin was not piped".to_owned())?;
+    Ok(Some(CleanupGuard {
+        child,
+        stdin: Some(stdin),
+    }))
+}
+
+#[cfg(test)]
+fn start_cleanup_guard(directory: &Path) -> Result<Option<CleanupGuard>, String> {
+    if directory.as_os_str().is_empty() {
+        return Err("staging directory is empty".to_owned());
+    }
+    Ok(None)
+}
+
+impl CleanupGuard {
+    fn finish(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+pub fn run_staging_cleanup_guard_if_requested() -> Option<ExitCode> {
+    let mut arguments = env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--internal-staging-cleanup-guard"))
+    {
+        return None;
+    }
+    let result = match (arguments.next(), arguments.next()) {
+        (Some(directory), None) => {
+            cleanup_staging_directory_after_eof(std::io::stdin().lock(), Path::new(&directory))
+        }
+        _ => Err("cleanup guardian requires exactly one staging directory".to_owned()),
+    };
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("staging cleanup guardian failed: {error}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+fn cleanup_staging_directory_after_eof(
+    mut parent_pipe: impl std::io::Read,
+    directory: &Path,
+) -> Result<(), String> {
+    let mut buffer = [0_u8; 64];
+    loop {
+        match parent_pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("could not monitor benchmark parent: {error}")),
+        }
+    }
+    validate_staging_directory_path(directory)?;
+    cleanup_staging_directory(directory)
+}
+
+fn validate_staging_directory_path(directory: &Path) -> Result<(), String> {
+    let file_name = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.starts_with(STAGING_DIRECTORY_PREFIX))
+        .ok_or_else(|| {
+            format!(
+                "refusing to clean non-staging path '{}'",
+                directory.display()
+            )
+        })?;
+    if file_name.len() == STAGING_DIRECTORY_PREFIX.len() {
+        return Err(format!(
+            "refusing to clean malformed staging path '{}'",
+            directory.display()
+        ));
+    }
+    let parent = directory
+        .parent()
+        .ok_or_else(|| format!("staging path '{}' has no parent", directory.display()))?;
+    let expected_parent = fs::canonicalize(env::temp_dir())
+        .map_err(|error| format!("could not resolve temporary directory: {error}"))?;
+    let actual_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "could not resolve staging parent '{}': {error}",
+            parent.display()
+        )
+    })?;
+    if actual_parent != expected_parent {
+        return Err(format!(
+            "refusing to clean staging path outside '{}': '{}'",
+            expected_parent.display(),
+            directory.display()
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_staging_directory(directory: &Path) -> Result<(), String> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    make_staging_directory_writable(directory)?;
+    fs::remove_dir_all(directory).map_err(|error| {
+        format!(
+            "could not remove executable staging directory '{}': {error}",
+            directory.display()
+        )
+    })
+}
+
+fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> Result<(), String> {
+    let entries = fs::read_dir(parent).map_err(|error| {
+        format!(
+            "could not scan temporary directory '{}' for stale benchmark files: {error}",
+            parent.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not inspect temporary entry: {error}"))?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(STAGING_DIRECTORY_PREFIX))
+        {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| {
+            format!(
+                "could not inspect stale staging candidate '{}': {error}",
+                entry.path().display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::now());
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        if age >= minimum_age {
+            cleanup_staging_directory(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
@@ -853,6 +1047,32 @@ mod tests {
 
         drop(pinned);
         fs::remove_dir_all(source_directory).expect("cleanup sources");
+    }
+
+    #[test]
+    fn stale_staging_directories_are_scavenged() {
+        let parent = env::temp_dir().join(format!(
+            "rusthouse-staging-scavenge-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).expect("scavenge parent");
+        let abandoned = parent.join(format!("{STAGING_DIRECTORY_PREFIX}999999-0"));
+        let unrelated = parent.join("unrelated-directory");
+        fs::create_dir(&abandoned).expect("abandoned staging directory");
+        fs::write(
+            abandoned.join("clickhouse-pinned"),
+            b"large staged artifact",
+        )
+        .expect("staged artifact");
+        make_staging_directory_read_only(&abandoned).expect("read-only abandoned directory");
+        fs::create_dir(&unrelated).expect("unrelated directory");
+
+        scavenge_stale_staging_directories(&parent, Duration::ZERO).expect("scavenge staging");
+        assert!(!abandoned.exists());
+        assert!(unrelated.exists());
+        fs::remove_dir_all(parent).expect("cleanup scavenge parent");
     }
 
     #[cfg(unix)]
