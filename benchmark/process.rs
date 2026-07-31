@@ -3,7 +3,9 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(unix)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use rusthouse::build_info::{ATTESTATION_VERSION, BuildInfo};
 
@@ -311,12 +313,16 @@ fn create_private_staging_directory() -> Result<PathBuf, String> {
             "{STAGING_DIRECTORY_PREFIX}{}-{attempt}",
             std::process::id()
         ));
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
         match builder.create(&directory) {
             Ok(()) => return Ok(directory),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -470,7 +476,14 @@ fn cleanup_staging_directory(directory: &Path) -> Result<(), String> {
     })
 }
 
+#[cfg(unix)]
 fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> Result<(), String> {
+    let parent_handle = fs::File::open(parent).map_err(|error| {
+        format!(
+            "could not open temporary directory '{}' for stale benchmark cleanup: {error}",
+            parent.display()
+        )
+    })?;
     let entries = fs::read_dir(parent).map_err(|error| {
         format!(
             "could not scan temporary directory '{}' for stale benchmark files: {error}",
@@ -486,12 +499,16 @@ fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> R
         {
             continue;
         }
-        let metadata = entry.metadata().map_err(|error| {
-            format!(
-                "could not inspect stale staging candidate '{}': {error}",
-                entry.path().display()
-            )
-        })?;
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Ok(candidate) = descriptor_cleanup::open_directory_at(&parent_handle, &name) else {
+            continue;
+        };
+        let metadata = candidate
+            .metadata()
+            .map_err(|error| format!("could not inspect open stale staging candidate: {error}"))?;
         if !metadata.is_dir() {
             continue;
         }
@@ -500,31 +517,173 @@ fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> R
             .duration_since(modified)
             .unwrap_or_default();
         if age >= minimum_age {
-            let liveness_path = entry.path().join(STAGING_LIVENESS_FILE);
-            let liveness_lock = match fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&liveness_path)
-            {
-                Ok(file) => {
-                    if file.try_lock().is_err() {
-                        continue;
-                    }
-                    Some(file)
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(format!(
-                        "could not inspect staging liveness marker '{}': {error}",
-                        liveness_path.display()
-                    ));
-                }
-            };
-            cleanup_staging_directory(&entry.path())?;
-            drop(liveness_lock);
+            cleanup_open_staging_candidate(&parent_handle, &name, &candidate)?;
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn cleanup_open_staging_candidate(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    directory: &fs::File,
+) -> Result<bool, String> {
+    if !descriptor_cleanup::same_directory_at(parent, name, directory)? {
+        return Ok(false);
+    }
+    let liveness_lock = match descriptor_cleanup::open_file_at(directory, STAGING_LIVENESS_FILE) {
+        Ok(file) => {
+            if !file.metadata().is_ok_and(|metadata| metadata.is_file()) || file.try_lock().is_err()
+            {
+                return Ok(false);
+            }
+            Some(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Ok(false),
+    };
+
+    if !descriptor_cleanup::same_directory_at(parent, name, directory)? {
+        return Ok(false);
+    }
+    descriptor_cleanup::make_directory_writable(directory)
+        .map_err(|error| format!("could not make stale staging directory writable: {error}"))?;
+    for file_name in [
+        STAGING_LIVENESS_FILE.to_owned(),
+        format!("rusthouse-pinned{}", env::consts::EXE_SUFFIX),
+        format!("clickhouse-pinned{}", env::consts::EXE_SUFFIX),
+    ] {
+        match descriptor_cleanup::remove_file_at(directory, &file_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not remove stale staged executable {file_name:?}: {error}"
+                ));
+            }
+        }
+    }
+    if !descriptor_cleanup::same_directory_at(parent, name, directory)? {
+        return Ok(false);
+    }
+    if descriptor_cleanup::remove_directory_at(parent, name).is_err() {
+        return Ok(false);
+    }
+    drop(liveness_lock);
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn scavenge_stale_staging_directories(
+    _parent: &Path,
+    _minimum_age: Duration,
+) -> Result<(), String> {
+    // The benchmark is supported only on macOS. Other platforms fail closed
+    // instead of performing path-based cleanup in a shared temporary directory.
+    Ok(())
+}
+
+#[cfg(unix)]
+mod descriptor_cleanup {
+    use std::ffi::{CString, OsStr, c_char, c_int};
+    use std::fs;
+    use std::io;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[cfg(target_os = "macos")]
+    const O_DIRECTORY: c_int = 0x0010_0000;
+    #[cfg(not(target_os = "macos"))]
+    const O_DIRECTORY: c_int = 0x0001_0000;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: c_int = 0x0000_0100;
+    #[cfg(not(target_os = "macos"))]
+    const O_NOFOLLOW: c_int = 0x0002_0000;
+    #[cfg(target_os = "macos")]
+    const O_CLOEXEC: c_int = 0x0100_0000;
+    #[cfg(not(target_os = "macos"))]
+    const O_CLOEXEC: c_int = 0x0008_0000;
+    const O_RDONLY: c_int = 0;
+    const O_RDWR: c_int = 2;
+    const AT_REMOVEDIR: c_int = 0x80;
+
+    unsafe extern "C" {
+        fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
+    }
+
+    pub fn open_directory_at(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+        open_at(
+            parent,
+            name,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+        )
+    }
+
+    pub fn open_file_at(directory: &fs::File, name: &str) -> io::Result<fs::File> {
+        open_at(directory, OsStr::new(name), O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+    }
+
+    fn open_at(parent: &fs::File, name: &OsStr, flags: c_int) -> io::Result<fs::File> {
+        let name = c_name(name)?;
+        // No creation flag is present, so openat does not consume a mode argument.
+        let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a new owned descriptor.
+            Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+        }
+    }
+
+    pub fn same_directory_at(
+        parent: &fs::File,
+        name: &OsStr,
+        expected: &fs::File,
+    ) -> Result<bool, String> {
+        let expected = expected
+            .metadata()
+            .map_err(|error| format!("could not inspect open staging directory: {error}"))?;
+        let Ok(current) = open_directory_at(parent, name) else {
+            return Ok(false);
+        };
+        let current = current
+            .metadata()
+            .map_err(|error| format!("could not inspect current staging directory: {error}"))?;
+        Ok(expected.dev() == current.dev() && expected.ino() == current.ino())
+    }
+
+    pub fn make_directory_writable(directory: &fs::File) -> io::Result<()> {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))
+    }
+
+    pub fn remove_file_at(directory: &fs::File, name: &str) -> io::Result<()> {
+        unlink_at(directory, OsStr::new(name), 0)
+    }
+
+    pub fn remove_directory_at(parent: &fs::File, name: &OsStr) -> io::Result<()> {
+        unlink_at(parent, name, AT_REMOVEDIR)
+    }
+
+    fn unlink_at(parent: &fs::File, name: &OsStr, flags: c_int) -> io::Result<()> {
+        let name = c_name(name)?;
+        if unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn c_name(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory entry contains an interior NUL byte",
+            )
+        })
+    }
 }
 
 fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
@@ -1151,6 +1310,63 @@ mod tests {
         scavenge_stale_staging_directories(&parent, Duration::ZERO)
             .expect("scavenge abandoned staging");
         assert!(!active.exists());
+        fs::remove_dir_all(parent).expect("cleanup scavenge parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_does_not_follow_replaced_candidate_path() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let parent = env::temp_dir().join(format!(
+            "rusthouse-staging-replacement-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).expect("scavenge parent");
+        let candidate_name = format!("{STAGING_DIRECTORY_PREFIX}999997-0");
+        let candidate = parent.join(&candidate_name);
+        let relocated = parent.join("relocated-candidate");
+        let victim = parent.join("victim");
+        fs::create_dir(&candidate).expect("stale staging candidate");
+        fs::write(candidate.join("clickhouse-pinned"), b"staged").expect("staged file");
+        fs::create_dir(&victim).expect("victim directory");
+        fs::write(victim.join("preserved"), b"preserved").expect("victim file");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o500))
+            .expect("victim permissions");
+
+        let parent_handle = fs::File::open(&parent).expect("open parent");
+        let candidate_handle =
+            descriptor_cleanup::open_directory_at(&parent_handle, candidate_name.as_ref())
+                .expect("open candidate without following links");
+        fs::rename(&candidate, &relocated).expect("replace candidate");
+        symlink(&victim, &candidate).expect("replacement symlink");
+
+        assert!(
+            !cleanup_open_staging_candidate(
+                &parent_handle,
+                candidate_name.as_ref(),
+                &candidate_handle,
+            )
+            .expect("reject replaced candidate")
+        );
+        assert_eq!(
+            fs::metadata(&victim)
+                .expect("victim metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        assert_eq!(
+            fs::read(victim.join("preserved")).expect("preserved victim file"),
+            b"preserved"
+        );
+
+        fs::remove_file(candidate).expect("replacement symlink cleanup");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o700))
+            .expect("restore victim permissions");
         fs::remove_dir_all(parent).expect("cleanup scavenge parent");
     }
 

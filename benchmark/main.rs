@@ -10,7 +10,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

@@ -7,6 +7,7 @@ mod sha256;
 
 use std::env;
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -37,37 +38,47 @@ fn build_attested_binaries() -> Result<i32, String> {
         .map_err(|error| format!("cannot locate attestation wrapper executable: {error}"))?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let source_root = cargo_source_root(&cargo)?;
+    let target_directory = cargo_target_directory(&cargo)?;
     let initial_source = live_source_provenance(&source_root)?;
     let session = new_build_session()?;
-    let (first_status, rusthouse_artifact) = cargo_artifact(
-        Command::new(&cargo)
-            .args(["build", "--release", "--bin", "rusthouse"])
-            .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
-            .env("RUSTHOUSE_ATTESTED_BUILD", "1")
-            .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", &session)
-            .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
-            .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256"),
-        "rusthouse",
-    )?;
+    let snapshot = SourceSnapshot::create(&source_root, initial_source.as_ref(), &session)?;
+    let manifest = snapshot.root.join("Cargo.toml");
+    let mut rusthouse_command = Command::new(&cargo);
+    rusthouse_command
+        .args(["build", "--release", "--bin", "rusthouse"])
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .env("CARGO_TARGET_DIR", &target_directory)
+        .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+        .env("RUSTHOUSE_ATTESTED_BUILD", "1")
+        .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", &session)
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+        .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256");
+    configure_live_source_provenance(&mut rusthouse_command, initial_source.as_ref());
+    let (first_status, rusthouse_artifact) = cargo_artifact(&mut rusthouse_command, "rusthouse")?;
     if first_status != 0 {
         return Ok(first_status);
     }
 
     let rusthouse_path = require_compiled_artifact(rusthouse_artifact, "RustHouse")?;
     let initial_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
-    let (status, benchmark_path) = cargo_artifact(
-        Command::new(&cargo)
-            .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
-            .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
-            .env("RUSTHOUSE_ATTESTED_BUILD", "1")
-            .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
-            .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
-            .env(
-                "RUSTHOUSE_ATTESTED_BINARY_SHA256",
-                &initial_rusthouse.sha256,
-            ),
-        "clickhouse-parity-bench",
-    )?;
+    let mut benchmark_command = Command::new(&cargo);
+    benchmark_command
+        .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .env("CARGO_TARGET_DIR", &target_directory)
+        .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env("RUSTHOUSE_ATTESTED_BUILD", "1")
+        .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+        .env(
+            "RUSTHOUSE_ATTESTED_BINARY_SHA256",
+            &initial_rusthouse.sha256,
+        );
+    configure_live_source_provenance(&mut benchmark_command, initial_source.as_ref());
+    let (status, benchmark_path) =
+        cargo_artifact(&mut benchmark_command, "clickhouse-parity-bench")?;
     if status != 0 {
         return Ok(status);
     }
@@ -111,9 +122,190 @@ fn cargo_source_root(cargo: &std::ffi::OsStr) -> Result<PathBuf, String> {
     fs_canonicalize(root, "Cargo source root")
 }
 
-fn fs_canonicalize(path: &Path, name: &str) -> Result<PathBuf, String> {
-    std::fs::canonicalize(path)
+fn cargo_target_directory(cargo: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    let output = Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .map_err(|error| format!("could not resolve Cargo target directory: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not resolve Cargo target directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let metadata =
+        String::from_utf8(output.stdout).map_err(|_| "Cargo metadata was not UTF-8".to_owned())?;
+    let target_directory = json_string_field(&metadata, "target_directory")?
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "Cargo metadata omitted target_directory".to_owned())?;
+    fs_canonicalize_or_absolute(Path::new(&target_directory), "Cargo target directory")
+}
+
+fn fs_canonicalize_or_absolute(path: &Path, name: &str) -> Result<PathBuf, String> {
+    if path.exists() {
+        return fs_canonicalize(path, name);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    env::current_dir()
+        .map(|directory| directory.join(path))
         .map_err(|error| format!("could not resolve {name} '{}': {error}", path.display()))
+}
+
+fn fs_canonicalize(path: &Path, name: &str) -> Result<PathBuf, String> {
+    fs::canonicalize(path)
+        .map_err(|error| format!("could not resolve {name} '{}': {error}", path.display()))
+}
+
+struct SourceSnapshot {
+    root: PathBuf,
+    worktree_owner: Option<PathBuf>,
+}
+
+impl SourceSnapshot {
+    fn create(
+        source_root: &Path,
+        live_source: Option<&LiveSourceProvenance>,
+        session: &str,
+    ) -> Result<Self, String> {
+        let root = env::temp_dir().join(format!(
+            "rusthouse-attested-source-{}-{}",
+            process::id(),
+            &session[..16]
+        ));
+        if root.exists() {
+            return Err(format!(
+                "attested source snapshot path already exists: '{}'",
+                root.display()
+            ));
+        }
+
+        if let Some(source) = live_source.filter(|source| !source.dirty) {
+            let output = Command::new("git")
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&root)
+                .arg(&source.commit)
+                .current_dir(source_root)
+                .output()
+                .map_err(|error| format!("could not create clean source snapshot: {error}"))?;
+            if !output.status.success() {
+                let _ = fs::remove_dir_all(&root);
+                return Err(format!(
+                    "could not create clean source snapshot: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            return Ok(Self {
+                root,
+                worktree_owner: Some(source_root.to_path_buf()),
+            });
+        }
+
+        create_private_directory(&root)?;
+        if let Err(error) = copy_source_tree(source_root, &root) {
+            let _ = fs::remove_dir_all(&root);
+            return Err(error);
+        }
+        Ok(Self {
+            root,
+            worktree_owner: None,
+        })
+    }
+}
+
+impl Drop for SourceSnapshot {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.worktree_owner {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.root)
+                .current_dir(owner)
+                .status();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    builder.create(path).map_err(|error| {
+        format!(
+            "could not create source snapshot '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn copy_source_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(source).map_err(|error| {
+        format!(
+            "could not read source directory '{}': {error}",
+            source.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect source directory '{}': {error}",
+                source.display()
+            )
+        })?;
+        let name = entry.file_name();
+        if matches!(name.to_str(), Some(".git" | ".burner" | "target")) {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(&name);
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "could not inspect source entry '{}': {error}",
+                source_path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            fs::create_dir(&destination_path).map_err(|error| {
+                format!(
+                    "could not create snapshot directory '{}': {error}",
+                    destination_path.display()
+                )
+            })?;
+            copy_source_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path).map_err(|error| {
+                format!(
+                    "could not copy source '{}' to snapshot: {error}",
+                    source_path.display()
+                )
+            })?;
+        } else {
+            return Err(format!(
+                "source snapshot does not support special entry '{}'",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn configure_live_source_provenance(
+    command: &mut Command,
+    live_source: Option<&LiveSourceProvenance>,
+) {
+    if let Some(source) = live_source {
+        command
+            .env("RUSTHOUSE_BUILD_SOURCE_COMMIT", &source.commit)
+            .env("RUSTHOUSE_BUILD_SOURCE_DIRTY", source.dirty.to_string());
+    }
 }
 
 fn live_source_provenance(source_root: &Path) -> Result<Option<LiveSourceProvenance>, String> {
@@ -680,8 +872,9 @@ mod tests {
 
     use super::{
         ArtifactAttestation, CapturedArtifact, CargoArtifact, SharedArtifactProvenance,
-        cargo_executable_artifact, encode_arguments, final_configuration, live_source_provenance,
-        require_compiled_artifact, validate_final_artifact_pair, validate_live_source_after_build,
+        SourceSnapshot, cargo_executable_artifact, encode_arguments, final_configuration,
+        live_source_provenance, require_compiled_artifact, validate_final_artifact_pair,
+        validate_live_source_after_build,
     };
 
     #[test]
@@ -767,6 +960,70 @@ mod tests {
         let error = validate_live_source_after_build(&root, &initial, &artifact)
             .expect_err("source mutation must reject artifacts");
         assert!(error.contains("source checkout changed"));
+        fs::remove_dir_all(root).expect("cleanup source root");
+    }
+
+    #[test]
+    fn clean_source_snapshot_isolated_from_transient_live_mutation() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "rusthouse-attested-snapshot-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("temporary source root");
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "RustHouse Test"],
+            vec!["config", "user.email", "test@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(arguments)
+                    .current_dir(&root)
+                    .status()
+                    .expect("run git")
+                    .success()
+            );
+        }
+        fs::write(root.join("source.rs"), "fn committed() {}\n").expect("source file");
+        assert!(
+            Command::new("git")
+                .args(["add", "source.rs"])
+                .current_dir(&root)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "source"])
+                .current_dir(&root)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        let initial = live_source_provenance(&root)
+            .expect("initial provenance")
+            .expect("owned Git checkout");
+        assert!(!initial.dirty);
+        let snapshot = SourceSnapshot::create(&root, Some(&initial), &"a".repeat(64))
+            .expect("clean source snapshot");
+
+        fs::write(root.join("source.rs"), "fn transient() {}\n").expect("transient source");
+        assert_eq!(
+            fs::read_to_string(snapshot.root.join("source.rs")).expect("snapshot source"),
+            "fn committed() {}\n"
+        );
+        fs::write(root.join("source.rs"), "fn committed() {}\n").expect("restore source");
+        assert_eq!(
+            live_source_provenance(&root).expect("final provenance"),
+            Some(initial)
+        );
+
+        drop(snapshot);
         fs::remove_dir_all(root).expect("cleanup source root");
     }
 

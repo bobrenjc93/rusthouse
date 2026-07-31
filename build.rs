@@ -187,7 +187,7 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
         });
         return SourceProvenance {
             commit: provenance.commit,
-            dirty: provenance.dirty,
+            dirty: true,
             git_watch_paths: Vec::new(),
         };
     }
@@ -196,12 +196,12 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
     let explicit_dirty = env::var("RUSTHOUSE_BUILD_SOURCE_DIRTY").ok();
     match (explicit_commit, explicit_dirty) {
         (Some(commit), Some(dirty)) => {
-            let dirty = parse_dirty(&dirty).unwrap_or_else(|| {
+            let _declared_dirty = parse_dirty(&dirty).unwrap_or_else(|| {
                 panic!("RUSTHOUSE_BUILD_SOURCE_DIRTY must be true or false, got {dirty:?}")
             });
             return SourceProvenance {
                 commit,
-                dirty,
+                dirty: true,
                 git_watch_paths: Vec::new(),
             };
         }

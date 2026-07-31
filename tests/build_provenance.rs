@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use build_provenance::{
     CargoVcsProvenance, cargo_vcs_provenance, has_hidden_git_index_entries, owned_git_repository,
@@ -123,6 +123,28 @@ fn live_git_provenance_ignores_untracked_packaged_metadata() {
 
     repository.cargo(&["build", "--quiet"]);
     assert_eq!(repository.probe_commit(), actual_commit);
+    assert!(repository.probe_dirty());
+}
+
+#[test]
+fn tampered_non_git_package_cannot_claim_clean_provenance() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.write(
+        ".cargo_vcs_info.json",
+        r#"{"git":{"sha1":"0123456789abcdef0123456789abcdef01234567","dirty":false},"path_in_vcs":""}"#,
+    );
+    fs::remove_dir_all(repository.path.join(".git")).expect("remove package Git metadata");
+    repository.write(
+        "src/lib.rs",
+        "pub mod build_info;\n// tampered packaged source\n",
+    );
+
+    repository.cargo(&["build", "--quiet"]);
+    assert_eq!(
+        repository.probe_commit(),
+        "0123456789abcdef0123456789abcdef01234567"
+    );
     assert!(repository.probe_dirty());
 }
 
@@ -498,6 +520,70 @@ fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
     assert!(attestation.status.success());
 }
 
+#[test]
+fn attested_builder_isolates_compilation_from_transient_live_mutation() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "clean probe"]);
+    repository.cargo_without_wrapper(&["build", "--quiet", "--bin", "attested-build"]);
+    let builder = repository
+        .path
+        .join("target")
+        .join("debug")
+        .join(format!("attested-build{}", env::consts::EXE_SUFFIX));
+    let child = Command::new(builder)
+        .current_dir(&repository.path)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_SESSION")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+        .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start attested builder");
+
+    let snapshot_prefix = format!("rusthouse-attested-source-{}-", child.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_dir(env::temp_dir())
+        .expect("temporary directory")
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&snapshot_prefix))
+        })
+    {
+        assert!(Instant::now() < deadline, "source snapshot was not created");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let live_source = repository.path.join("src/bin/rusthouse.rs");
+    let original = fs::read(&live_source).expect("original live source");
+    fs::write(&live_source, b"this is transient invalid Rust\n").expect("transient mutation");
+    std::thread::sleep(Duration::from_millis(100));
+    fs::write(&live_source, original).expect("restore live source");
+
+    let output = child.wait_with_output().expect("wait for attested builder");
+    assert!(
+        output.status.success(),
+        "attested builder failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repository.git_output(&["status", "--porcelain=v1", "--untracked-files=normal"]),
+        ""
+    );
+    assert_eq!(
+        repository.probe_field_for("release", "rusthouse", "source_dirty"),
+        "false"
+    );
+}
+
 struct TemporaryRepository {
     path: PathBuf,
 }
@@ -564,6 +650,14 @@ impl TemporaryRepository {
         self.write(
             "src/bin/benchmark-probe.rs",
             "fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!()).expect(\"attested build\")); }\n",
+        );
+        self.write(
+            "src/bin/rusthouse.rs",
+            "fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!()).expect(\"attested build\")); }\n",
+        );
+        self.write(
+            "src/bin/clickhouse-parity-bench.rs",
+            "fn main() { print!(\"{}rusthouse_binary_sha256={}\\n\", provenance_probe::build_info::attestation(file!()).expect(\"attested build\"), option_env!(\"RUSTHOUSE_ATTESTED_BINARY_SHA256\").unwrap_or(\"unavailable\")); }\n",
         );
         self.cargo_without_wrapper(&["generate-lockfile"]);
     }
