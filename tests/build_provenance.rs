@@ -3,6 +3,8 @@ mod build_provenance;
 
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -131,6 +133,9 @@ fn build_configuration_fingerprint_changes_with_effective_codegen_settings() {
 
     repository.cargo(&["build", "--release", "--quiet"]);
     let normal = repository.probe_build_configuration("release");
+    let normal_benchmark =
+        repository.probe_field_for("release", "benchmark-probe", "build_configuration_sha256");
+    assert_eq!(normal, normal_benchmark);
     repository.cargo_with_env(
         &["build", "--release", "--quiet"],
         &[("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0")],
@@ -144,6 +149,19 @@ fn build_configuration_fingerprint_changes_with_effective_codegen_settings() {
     );
     let custom_rustflags = repository.probe_build_configuration("release");
     assert_ne!(normal, custom_rustflags);
+
+    repository.cargo(&[
+        "rustc",
+        "--release",
+        "--bin",
+        "provenance-probe",
+        "--quiet",
+        "--",
+        "-C",
+        "opt-level=0",
+    ]);
+    let target_only_opt_level = repository.probe_build_configuration("release");
+    assert_ne!(normal, target_only_opt_level);
 
     repository.cargo(&[
         "build",
@@ -245,6 +263,15 @@ impl TemporaryRepository {
             "[package]\nname = \"provenance-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
         );
         self.write(".gitignore", "/target/\n");
+        self.write(
+            ".cargo/config.toml",
+            "[build]\nrustc-workspace-wrapper = \"tools/rustc-attestation-wrapper.sh\"\n",
+        );
+        self.write(
+            "tools/rustc-attestation-wrapper.sh",
+            include_str!("../tools/rustc-attestation-wrapper.sh"),
+        );
+        make_executable(&self.path.join("tools/rustc-attestation-wrapper.sh"));
         self.write("build.rs", include_str!("../build.rs"));
         self.write(
             "build_provenance.rs",
@@ -255,9 +282,14 @@ impl TemporaryRepository {
             include_str!("../benchmark/sha256.rs"),
         );
         self.write("src/build_info.rs", include_str!("../src/build_info.rs"));
+        self.write("src/lib.rs", "pub mod build_info;\n");
         self.write(
             "src/main.rs",
-            "mod build_info; fn main() { print!(\"{}\", build_info::attestation()); }\n",
+            "#[cfg(not(rusthouse_final_rustc_attested))] compile_error!(\"missing attestation wrapper\"); fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!())); }\n",
+        );
+        self.write(
+            "src/bin/benchmark-probe.rs",
+            "#[cfg(not(rusthouse_final_rustc_attested))] compile_error!(\"missing attestation wrapper\"); fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!())); }\n",
         );
         self.cargo(&["generate-lockfile"]);
     }
@@ -351,11 +383,15 @@ impl TemporaryRepository {
     }
 
     fn probe_field(&self, profile: &str, field: &str) -> String {
+        self.probe_field_for(profile, "provenance-probe", field)
+    }
+
+    fn probe_field_for(&self, profile: &str, binary: &str, field: &str) -> String {
         let executable = self
             .path
             .join("target")
             .join(profile)
-            .join(format!("provenance-probe{}", env::consts::EXE_SUFFIX));
+            .join(format!("{binary}{}", env::consts::EXE_SUFFIX));
         let output = Command::new(executable)
             .output()
             .expect("run provenance probe");
@@ -373,4 +409,16 @@ impl Drop for TemporaryRepository {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    let mut permissions = fs::metadata(path).expect("wrapper metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("executable wrapper");
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) {
+    panic!("build provenance tests require the POSIX attestation wrapper");
 }

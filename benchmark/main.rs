@@ -23,6 +23,9 @@ use rusthouse::build_info::BuildInfo;
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
+#[cfg(all(not(rusthouse_final_rustc_attested), not(clippy)))]
+compile_error!("RustHouse must be compiled with its attestation rustc wrapper");
+
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
 
 const HELP: &str = "\
@@ -170,7 +173,7 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 
 fn run(config: Config) -> Result<Report, String> {
     let settings = config.mode.settings();
-    let build_info = rusthouse::build_info::current();
+    let build_info = rusthouse::build_info::current(file!());
     ensure_default_build(config.mode, build_info)?;
     let harness = harness_identity()?;
     let configured_paths = EnginePaths {

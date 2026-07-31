@@ -23,7 +23,7 @@ pub struct BuildInfo {
     pub build_configuration_sha256: &'static str,
 }
 
-pub fn current() -> BuildInfo {
+pub fn current(final_rustc_configuration_marker: &'static str) -> BuildInfo {
     let embedded_dirty = match env!("RUSTHOUSE_SOURCE_DIRTY") {
         "true" => true,
         "false" => false,
@@ -41,28 +41,39 @@ pub fn current() -> BuildInfo {
         rustc_version: env!("RUSTHOUSE_RUSTC_VERSION"),
         target: env!("RUSTHOUSE_BUILD_TARGET"),
         profile: env!("RUSTHOUSE_BUILD_PROFILE"),
-        build_configuration_sha256: build_configuration_sha256(),
+        build_configuration_sha256: build_configuration_sha256(final_rustc_configuration_marker),
     }
 }
 
 struct BuildConfigurationIdentity;
 
-fn build_configuration_sha256() -> &'static str {
+fn build_configuration_sha256(final_rustc_configuration_marker: &'static str) -> &'static str {
     static SHA256: OnceLock<String> = OnceLock::new();
+    let encoded_configuration = final_rustc_configuration_marker
+        .strip_prefix("rusthouse-final-rustc-")
+        .filter(|encoded| {
+            !encoded.is_empty()
+                && encoded.len() % 2 == 0
+                && encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .unwrap_or_else(|| panic!("final rustc configuration attestation is unavailable"));
     SHA256
         .get_or_init(|| {
             let canonical = format!(
-                "seed_sha256={}\ntarget_crate_type_id={:?}\n",
+                "seed_sha256={}\ntarget_crate_type_id={:?}\nfinal_rustc_configuration={}\n",
                 env!("RUSTHOUSE_BUILD_CONFIGURATION_SHA256"),
-                TypeId::of::<BuildConfigurationIdentity>()
+                TypeId::of::<BuildConfigurationIdentity>(),
+                encoded_configuration,
             );
             sha256::digest_hex(canonical.as_bytes())
         })
         .as_str()
 }
 
-pub fn attestation() -> String {
-    let info = current();
+pub fn attestation(final_rustc_configuration_marker: &'static str) -> String {
+    let info = current(final_rustc_configuration_marker);
     let mut output = String::new();
     writeln!(output, "{ATTESTATION_VERSION}").expect("writing to String cannot fail");
     writeln!(output, "source_commit={}", info.source_commit)

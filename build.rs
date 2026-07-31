@@ -19,6 +19,8 @@ struct SourceProvenance {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(rusthouse_final_rustc_attested)");
+    println!("cargo:rustc-check-cfg=cfg(clippy)");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is required");
     let manifest_dir = Path::new(&manifest_dir);
 
