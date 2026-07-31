@@ -4,7 +4,7 @@
 //! RustHouse is a compact, dependency-free, in-memory analytical database.
 //!
 //! [`Database`] is the main entry point. It accepts a small SQL dialect and
-//! returns structured results that can be rendered by the [`format`] module.
+//! returns structured results that can be rendered by the [`mod@format`] module.
 //!
 //! # End-to-end example
 //!

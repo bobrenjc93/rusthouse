@@ -27,7 +27,7 @@ pub fn median(samples: &[f64]) -> Result<f64, String> {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
     let middle = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
+    if sorted.len() % 2 == 0 {
         Ok((sorted[middle - 1] + sorted[middle]) / 2.0)
     } else {
         Ok(sorted[middle])
