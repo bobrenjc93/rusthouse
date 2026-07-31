@@ -19,6 +19,7 @@ use config::{Config, ParseResult};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs};
 use process::{Engine, EnginePaths, RunIdentity, TimedBatch, TimedOutput};
+use rusthouse::build_info::BuildInfo;
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -100,6 +101,7 @@ struct Report {
 
 struct DetailsContext<'a> {
     config: &'a Config,
+    harness: &'a HarnessIdentity,
     identity: &'a RunIdentity,
     cases: &'a [CaseResult],
     primary_score: ScoreBreakdown,
@@ -107,6 +109,11 @@ struct DetailsContext<'a> {
     correctness_checks: usize,
     suite_manifest: &'a str,
     suite_manifest_sha256: &'a str,
+}
+
+struct HarnessIdentity {
+    path: PathBuf,
+    sha256: String,
 }
 
 fn main() -> ExitCode {
@@ -163,18 +170,14 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 
 fn run(config: Config) -> Result<Report, String> {
     let settings = config.mode.settings();
+    let build_info = rusthouse::build_info::current();
+    ensure_default_build(config.mode, build_info)?;
+    let harness = harness_identity()?;
     let configured_paths = EnginePaths {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
     };
-    let build_info = rusthouse::build_info::current();
     let (paths, identity, _pinned_executables) = configured_paths.pin_and_validate(build_info)?;
-    if config.mode == config::Mode::Default && identity.rusthouse.profile != "release" {
-        return Err(format!(
-            "default mode requires release binaries, got profile {:?}",
-            identity.rusthouse.profile
-        ));
-    }
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
 
@@ -317,6 +320,7 @@ fn run(config: Config) -> Result<Report, String> {
     }
 
     paths.revalidate(build_info, &identity)?;
+    revalidate_harness(&harness)?;
     let primary_score = score_cases(&cases, |case| case.primary_ratio)?;
     if config.mode == config::Mode::Default {
         ensure_primary_headroom(&primary_score, cases.len())?;
@@ -333,6 +337,7 @@ fn run(config: Config) -> Result<Report, String> {
     if let Some(path) = &config.details {
         let details = details_json(&DetailsContext {
             config: &config,
+            harness: &harness,
             identity: &identity,
             cases: &cases,
             primary_score,
@@ -383,6 +388,11 @@ fn run(config: Config) -> Result<Report, String> {
             identity.rusthouse.rustc_version,
             identity.rusthouse.target,
             identity.rusthouse.profile,
+        ),
+        format!(
+            "benchmark harness SHA-256={} ({})",
+            harness.sha256,
+            harness.path.display()
         ),
         format!(
             "ClickHouse identity: {}; SHA-256={}; artifact={} ({})",
@@ -439,6 +449,43 @@ fn run(config: Config) -> Result<Report, String> {
         evidence,
         suggestions,
     })
+}
+
+fn ensure_default_build(mode: config::Mode, build_info: BuildInfo) -> Result<(), String> {
+    if mode != config::Mode::Default {
+        return Ok(());
+    }
+    if build_info.profile != "release" {
+        return Err(format!(
+            "default mode requires release binaries, got profile {:?}",
+            build_info.profile
+        ));
+    }
+    if build_info.source_dirty {
+        return Err(
+            "default mode requires clean sources so the embedded commit identifies one source tree"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn harness_identity() -> Result<HarnessIdentity, String> {
+    let path = env::current_exe()
+        .map_err(|error| format!("cannot locate benchmark executable: {error}"))?;
+    let sha256 = sha256::file_digest_hex(&path)?;
+    Ok(HarnessIdentity { path, sha256 })
+}
+
+fn revalidate_harness(expected: &HarnessIdentity) -> Result<(), String> {
+    let actual = sha256::file_digest_hex(&expected.path)?;
+    if actual != expected.sha256 {
+        return Err(
+            "benchmark harness changed while the suite was running; no report was retained"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn score_cases(
@@ -638,6 +685,7 @@ fn verify_digest(bytes: &[u8], expected: &str, subject: &str) -> Result<(), Stri
 fn details_json(context: &DetailsContext<'_>) -> String {
     let DetailsContext {
         config,
+        harness,
         identity,
         cases,
         primary_score,
@@ -650,7 +698,7 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":4,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -671,8 +719,10 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"sha256\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"benchmark\":{{\"path\":{},\"sha256\":{}}},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"sha256\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
+        json_string(&harness.path.display().to_string()),
+        json_string(&harness.sha256),
         json_string(&config.rusthouse.display().to_string()),
         json_string(&identity.rusthouse.sha256),
         json_string(&identity.rusthouse.source_commit),
@@ -997,6 +1047,52 @@ mod tests {
             saturated_cases: 8,
         };
         assert!(ensure_primary_headroom(&score, 8).is_err());
+    }
+
+    #[test]
+    fn default_mode_rejects_dirty_or_non_release_builds() {
+        let release = BuildInfo {
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            source_dirty: false,
+            rustc_version: "rustc test",
+            target: "aarch64-apple-darwin",
+            profile: "release",
+        };
+        ensure_default_build(config::Mode::Default, release).expect("clean release build");
+        ensure_default_build(
+            config::Mode::Quick,
+            BuildInfo {
+                source_dirty: true,
+                ..release
+            },
+        )
+        .expect("quick mode permits dirty development builds");
+
+        let dirty_error = ensure_default_build(
+            config::Mode::Default,
+            BuildInfo {
+                source_dirty: true,
+                ..release
+            },
+        )
+        .expect_err("dirty default build must fail");
+        assert!(dirty_error.contains("clean sources"));
+
+        let profile_error = ensure_default_build(
+            config::Mode::Default,
+            BuildInfo {
+                profile: "debug",
+                ..release
+            },
+        )
+        .expect_err("debug default build must fail");
+        assert!(profile_error.contains("release binaries"));
+    }
+
+    #[test]
+    fn benchmark_harness_digest_revalidates() {
+        let identity = harness_identity().expect("harness identity");
+        revalidate_harness(&identity).expect("unchanged harness");
     }
 
     #[test]

@@ -36,9 +36,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_DIRTY");
-    println!("cargo:rerun-if-changed=.");
-    if let Some(git_directory) =
-        try_command_output(manifest_dir, "git", &["rev-parse", "--absolute-git-dir"])
+    emit_source_watches(manifest_dir);
+    if !manifest_dir.join(".cargo_vcs_info.json").is_file()
+        && owned_git_commit(manifest_dir).is_some()
+        && let Some(git_directory) =
+            try_command_output(manifest_dir, "git", &["rev-parse", "--absolute-git-dir"])
     {
         println!("cargo:rerun-if-changed={git_directory}/HEAD");
         println!("cargo:rerun-if-changed={git_directory}/index");
@@ -46,11 +48,33 @@ fn main() {
 }
 
 fn source_provenance(manifest_dir: &Path) -> (String, bool) {
-    if let Some(commit) = try_command_output(manifest_dir, "git", &["rev-parse", "HEAD"]) {
+    let vcs_path = manifest_dir.join(".cargo_vcs_info.json");
+    if vcs_path.is_file() {
+        let contents = fs::read_to_string(&vcs_path).unwrap_or_else(|error| {
+            panic!(
+                "could not read packaged VCS metadata '{}': {error}",
+                vcs_path.display()
+            )
+        });
+        let commit = cargo_vcs_commit(&contents).unwrap_or_else(|| {
+            panic!(
+                "packaged VCS metadata '{}' does not contain a valid git.sha1",
+                vcs_path.display()
+            )
+        });
+        return (commit, false);
+    }
+
+    if let Some(commit) = owned_git_commit(manifest_dir) {
         let status = command_output(
             manifest_dir,
             "git",
-            &["status", "--porcelain=v1", "--untracked-files=normal"],
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=normal",
+            ],
         );
         return (commit, !status.is_empty());
     }
@@ -72,20 +96,33 @@ fn source_provenance(manifest_dir: &Path) -> (String, bool) {
         (None, None) => {}
     }
 
-    let vcs_path = manifest_dir.join(".cargo_vcs_info.json");
-    let contents = fs::read_to_string(&vcs_path).unwrap_or_else(|error| {
-        panic!(
-            "source provenance is unavailable: no Git checkout, explicit RUSTHOUSE_BUILD_SOURCE_COMMIT/RUSTHOUSE_BUILD_SOURCE_DIRTY inputs, or readable '{}': {error}",
-            vcs_path.display()
-        )
-    });
-    let commit = cargo_vcs_commit(&contents).unwrap_or_else(|| {
-        panic!(
-            "packaged VCS metadata '{}' does not contain a valid git.sha1",
-            vcs_path.display()
-        )
-    });
-    (commit, false)
+    panic!(
+        "source provenance is unavailable: no package-owned Git checkout, packaged .cargo_vcs_info.json, or explicit RUSTHOUSE_BUILD_SOURCE_COMMIT/RUSTHOUSE_BUILD_SOURCE_DIRTY inputs"
+    );
+}
+
+fn owned_git_commit(manifest_dir: &Path) -> Option<String> {
+    let top_level = try_command_output(manifest_dir, "git", &["rev-parse", "--show-toplevel"])?;
+    let top_level = fs::canonicalize(top_level).ok()?;
+    let manifest_dir = fs::canonicalize(manifest_dir).ok()?;
+    if top_level != manifest_dir {
+        return None;
+    }
+    try_command_output(&manifest_dir, "git", &["rev-parse", "HEAD"])
+}
+
+fn emit_source_watches(manifest_dir: &Path) {
+    let entries = fs::read_dir(manifest_dir)
+        .unwrap_or_else(|error| panic!("could not enumerate package sources: {error}"));
+    for entry in entries {
+        let entry =
+            entry.unwrap_or_else(|error| panic!("could not inspect package source: {error}"));
+        let file_name = entry.file_name();
+        if matches!(file_name.to_str(), Some(".git" | ".burner" | "target")) {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
 }
 
 fn parse_dirty(value: &str) -> Option<bool> {
