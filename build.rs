@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::fs;
 #[cfg(unix)]
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use build_provenance::{
@@ -25,6 +25,8 @@ const BUILD_CONFIGURATION_OPTIONAL_ENV_KEYS: &[&str] = &[
     "RUSTC_WORKSPACE_WRAPPER",
 ];
 const BUILD_AUTHORIZATION_ENV: &str = "RUSTHOUSE_ATTESTED_BUILD_AUTHORIZATION";
+const AUTHORIZED_RUSTC_PATH_FIELD: &str = "rustc_path";
+const AUTHORIZED_RUSTC_SHA256_FIELD: &str = "rustc_sha256";
 
 struct SourceProvenance {
     commit: String,
@@ -49,11 +51,21 @@ fn main() {
         );
     }
 
-    let rustc = env::var("RUSTC").expect("RUSTC is required");
-    let rustc_version = command_output(manifest_dir, &rustc, &["--version"]);
+    let rustc_command = env::var("RUSTC").expect("RUSTC is required");
+    let rustc = resolve_toolchain_rustc(manifest_dir, &rustc_command);
+    let rustc_path = rustc
+        .to_str()
+        .unwrap_or_else(|| panic!("resolved rustc path is not UTF-8: '{}'", rustc.display()));
+    let rustc_sha256 = sha256::file_digest_hex(&rustc).unwrap_or_else(|error| {
+        panic!(
+            "could not hash resolved rustc '{}': {error}",
+            rustc.display()
+        )
+    });
+    let rustc_version = command_output(manifest_dir, rustc_path, &["--version"]);
     let target = required_env("TARGET");
     let profile = required_env("PROFILE");
-    let build_configuration_seed_sha256 = build_configuration_seed_sha256();
+    let build_configuration_seed_sha256 = build_configuration_seed_sha256(&rustc_sha256);
 
     emit(
         "RUSTHOUSE_SOURCE_COMMIT",
@@ -64,6 +76,8 @@ fn main() {
         if source.dirty { "true" } else { "false" },
     );
     emit("RUSTHOUSE_RUSTC_VERSION", &rustc_version);
+    emit("RUSTHOUSE_BUILD_RUSTC_PATH", rustc_path);
+    emit("RUSTHOUSE_BUILD_RUSTC_SHA256", &rustc_sha256);
     emit("RUSTHOUSE_BUILD_TARGET", &target);
     emit("RUSTHOUSE_BUILD_PROFILE", &profile);
     emit(
@@ -76,6 +90,7 @@ fn main() {
     );
 
     println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-changed={}", rustc.display());
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD_SESSION");
     println!("cargo:rerun-if-env-changed={BUILD_AUTHORIZATION_ENV}");
@@ -142,6 +157,19 @@ fn validate_build_authorization(manifest_dir: &Path) {
         .unwrap_or_else(|error| panic!("could not hash attested workspace wrapper: {error}"));
     if actual_wrapper_sha256 != expected_wrapper_sha256 {
         panic!("attested workspace wrapper does not match builder authorization");
+    }
+    let expected_rustc_path = required_authorization_field(&contents, AUTHORIZED_RUSTC_PATH_FIELD);
+    let actual_rustc_path =
+        env::var("RUSTC").unwrap_or_else(|_| panic!("attested rustc executable is unavailable"));
+    if actual_rustc_path != expected_rustc_path {
+        panic!("attested rustc executable does not match builder authorization");
+    }
+    let expected_rustc_sha256 =
+        required_authorization_field(&contents, AUTHORIZED_RUSTC_SHA256_FIELD);
+    let actual_rustc_sha256 = sha256::file_digest_hex(Path::new(&actual_rustc_path))
+        .unwrap_or_else(|error| panic!("could not hash attested rustc executable: {error}"));
+    if actual_rustc_sha256 != expected_rustc_sha256 {
+        panic!("attested rustc digest does not match builder authorization");
     }
     let authorization_parent = authorization_path
         .parent()
@@ -281,13 +309,17 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
     );
 }
 
-fn build_configuration_seed_sha256() -> String {
+fn build_configuration_seed_sha256(rustc_sha256: &str) -> String {
     let mut settings = vec![
         ("PROFILE".to_owned(), required_env("PROFILE")),
         ("OPT_LEVEL".to_owned(), required_env("OPT_LEVEL")),
         ("DEBUG".to_owned(), required_env("DEBUG")),
         ("TARGET".to_owned(), required_env("TARGET")),
         ("HOST".to_owned(), required_env("HOST")),
+        (
+            "RUSTC_EXECUTABLE_SHA256".to_owned(),
+            rustc_sha256.to_owned(),
+        ),
         (
             "CARGO_UNIT_FINGERPRINT".to_owned(),
             cargo_unit_fingerprint(),
@@ -313,6 +345,26 @@ fn build_configuration_seed_sha256() -> String {
             .expect("writing to String cannot fail");
     }
     sha256::digest_hex(canonical.as_bytes())
+}
+
+fn resolve_toolchain_rustc(manifest_dir: &Path, rustc_command: &str) -> PathBuf {
+    let sysroot = command_output(manifest_dir, rustc_command, &["--print", "sysroot"]);
+    let candidate = Path::new(&sysroot)
+        .join("bin")
+        .join(format!("rustc{}", env::consts::EXE_SUFFIX));
+    let resolved = fs::canonicalize(&candidate).unwrap_or_else(|error| {
+        panic!(
+            "could not resolve toolchain rustc '{}': {error}",
+            candidate.display()
+        )
+    });
+    if !resolved.is_file() {
+        panic!(
+            "resolved toolchain rustc is not a file: '{}'",
+            resolved.display()
+        );
+    }
+    resolved
 }
 
 fn emit_build_configuration_env_watches() {

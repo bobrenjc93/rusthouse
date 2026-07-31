@@ -602,6 +602,55 @@ fn attested_builder_rejects_mutating_compiler_overrides_without_execution() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn path_shadowing_cannot_replace_pinned_rustc() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = TemporaryRepository::new();
+    let shim_directory = temporary.path.join("path-shim");
+    let marker = temporary.path.join("path-rustc-ran");
+    let shim = shim_directory.join("rustc");
+    let real_rustc = rustc_executable();
+    fs::create_dir(&shim_directory).expect("shim directory");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf executed > '{}'\nextra=\nfor argument in \"$@\"; do\n  case \"$argument\" in *.rs) printf 'malicious source mutation' > \"$argument\"; extra='-Copt-level=0'; break;; esac\ndone\nexec '{}' \"$@\" $extra\n",
+            marker.display(),
+            real_rustc.display()
+        ),
+    )
+    .expect("PATH rustc shim");
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).expect("shim permissions");
+    let path = env::join_paths(
+        std::iter::once(shim_directory.clone())
+            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("shadowed PATH");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_attested-build"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", temporary.path.join("target"))
+        .env_remove("RUSTC")
+        .env_remove("CARGO_BUILD_RUSTC")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .output()
+        .expect("run attested builder with shadowed rustc");
+
+    assert!(
+        output.status.success(),
+        "attested builder failed with PATH shadow: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "PATH rustc shim was executed");
+}
+
 #[test]
 fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
     let temporary = TemporaryRepository::new();
@@ -1011,6 +1060,8 @@ impl TemporaryRepository {
         }
         if attested {
             let session = sha256::digest_hex(self.path.as_os_str().as_encoded_bytes());
+            let rustc = rustc_executable();
+            let rustc_sha256 = sha256::file_digest_hex(&rustc).expect("rustc digest");
             let authorization = self
                 .path
                 .parent()
@@ -1019,7 +1070,10 @@ impl TemporaryRepository {
             let wrapper_sha256 = sha256::file_digest_hex(&wrapper).expect("wrapper digest");
             fs::write(
                 &authorization,
-                format!("session={session}\nwrapper_sha256={wrapper_sha256}\n"),
+                format!(
+                    "session={session}\nwrapper_sha256={wrapper_sha256}\nrustc_path={}\nrustc_sha256={rustc_sha256}\n",
+                    rustc.display()
+                ),
             )
             .expect("build authorization");
             #[cfg(unix)]
@@ -1029,7 +1083,10 @@ impl TemporaryRepository {
                     .expect("authorization permissions");
             }
             command
+                .env("RUSTC", &rustc)
                 .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+                .env("RUSTHOUSE_ATTESTED_RUSTC_PATH", &rustc)
+                .env("RUSTHOUSE_ATTESTED_RUSTC_SHA256", rustc_sha256)
                 .env("RUSTHOUSE_ATTESTED_BUILD", "1")
                 .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
                 .env("RUSTHOUSE_ATTESTED_BUILD_AUTHORIZATION", &authorization);
@@ -1113,6 +1170,15 @@ fn rustc_sysroot() -> String {
         .expect("UTF-8 sysroot")
         .trim()
         .to_owned()
+}
+
+fn rustc_executable() -> PathBuf {
+    fs::canonicalize(
+        PathBuf::from(rustc_sysroot())
+            .join("bin")
+            .join(format!("rustc{}", env::consts::EXE_SUFFIX)),
+    )
+    .expect("resolved rustc executable")
 }
 
 fn rustc_host() -> String {

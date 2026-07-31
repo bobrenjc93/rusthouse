@@ -23,6 +23,8 @@ const SOURCE_SNAPSHOT_ROOT: &str = "source";
 const SOURCE_CLEANUP_GUARD_ARGUMENT: &str = "--internal-source-snapshot-cleanup-guard";
 const BUILD_AUTHORIZATION_ENV: &str = "RUSTHOUSE_ATTESTED_BUILD_AUTHORIZATION";
 const OUTER_WRAPPER_ENV: &str = "RUSTHOUSE_ATTESTED_OUTER_WRAPPER";
+const PINNED_RUSTC_PATH_ENV: &str = "RUSTHOUSE_ATTESTED_RUSTC_PATH";
+const PINNED_RUSTC_SHA256_ENV: &str = "RUSTHOUSE_ATTESTED_RUSTC_SHA256";
 const WRAPPER_ENVIRONMENT: &[&str] = &[
     "RUSTC_WRAPPER",
     "CARGO_BUILD_RUSTC_WRAPPER",
@@ -56,6 +58,7 @@ fn build_attested_binaries() -> Result<i32, String> {
     let source_root = cargo_source_root(&cargo)?;
     let target_directory = cargo_target_directory(&cargo)?;
     let initial_source = live_source_provenance(&source_root)?;
+    let rustc = PinnedRustc::embedded()?;
     let session = new_build_session()?;
     let snapshot = SourceSnapshot::create(&source_root, initial_source.as_ref(), &session)?;
     reject_external_compiler_configuration(&snapshot.root)?;
@@ -78,7 +81,8 @@ fn build_attested_binaries() -> Result<i32, String> {
         &builder_executable,
         "attested-outer-wrapper",
     )?;
-    let authorization = BuildAuthorization::create(&snapshot.container, &wrapper, &session)?;
+    let authorization =
+        BuildAuthorization::create(&snapshot.container, &wrapper, &rustc, &session)?;
     let manifest = snapshot.root.join("Cargo.toml");
     let mut rusthouse_command = Command::new(&cargo);
     rusthouse_command
@@ -87,10 +91,12 @@ fn build_attested_binaries() -> Result<i32, String> {
         .arg(&manifest)
         .current_dir(&snapshot.root)
         .env("CARGO_TARGET_DIR", &target_directory)
-        .env("RUSTC", "rustc")
+        .env("RUSTC", &rustc.path)
         .env("RUSTC_WRAPPER", &outer_wrapper)
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env(OUTER_WRAPPER_ENV, &outer_wrapper)
+        .env(PINNED_RUSTC_PATH_ENV, &rustc.path)
+        .env(PINNED_RUSTC_SHA256_ENV, &rustc.sha256)
         .env("RUSTHOUSE_ATTESTED_BUILD", "1")
         .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", &session)
         .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
@@ -116,10 +122,12 @@ fn build_attested_binaries() -> Result<i32, String> {
         .arg(&manifest)
         .current_dir(&snapshot.root)
         .env("CARGO_TARGET_DIR", &target_directory)
-        .env("RUSTC", "rustc")
+        .env("RUSTC", &rustc.path)
         .env("RUSTC_WRAPPER", &outer_wrapper)
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
         .env(OUTER_WRAPPER_ENV, outer_wrapper)
+        .env(PINNED_RUSTC_PATH_ENV, &rustc.path)
+        .env(PINNED_RUSTC_SHA256_ENV, &rustc.sha256)
         .env("RUSTHOUSE_ATTESTED_BUILD", "1")
         .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
         .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
@@ -153,6 +161,47 @@ fn build_attested_binaries() -> Result<i32, String> {
     publish_artifact_atomically(&private_rusthouse_path, &rusthouse_path)?;
     publish_artifact_atomically(&private_benchmark_path, &benchmark_path)?;
     Ok(status)
+}
+
+struct PinnedRustc {
+    path: PathBuf,
+    sha256: String,
+}
+
+impl PinnedRustc {
+    fn embedded() -> Result<Self, String> {
+        let path = PathBuf::from(env!("RUSTHOUSE_BUILD_RUSTC_PATH"));
+        if !path.is_absolute() {
+            return Err("build-time rustc path is not absolute".to_owned());
+        }
+        let expected_sha256 = env!("RUSTHOUSE_BUILD_RUSTC_SHA256").to_owned();
+        require_lower_hex("build-time rustc SHA-256", &expected_sha256, 64)?;
+        let actual_sha256 = sha256::file_digest_hex(&path)?;
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "build-time rustc executable '{}' changed after the attested builder was compiled",
+                path.display()
+            ));
+        }
+        let output = Command::new(&path)
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                format!(
+                    "could not execute pinned rustc '{}': {error}",
+                    path.display()
+                )
+            })?;
+        if !output.status.success()
+            || String::from_utf8_lossy(&output.stdout).trim() != env!("RUSTHOUSE_RUSTC_VERSION")
+        {
+            return Err("pinned rustc version does not match the attested builder".to_owned());
+        }
+        Ok(Self {
+            path,
+            sha256: expected_sha256,
+        })
+    }
 }
 
 fn reject_external_compiler_configuration(source_root: &Path) -> Result<(), String> {
@@ -242,10 +291,25 @@ struct BuildAuthorization {
 }
 
 impl BuildAuthorization {
-    fn create(container: &Path, wrapper: &Path, session: &str) -> Result<Self, String> {
+    fn create(
+        container: &Path,
+        wrapper: &Path,
+        rustc: &PinnedRustc,
+        session: &str,
+    ) -> Result<Self, String> {
         let path = container.join(".attested-build-authorization");
         let wrapper_sha256 = sha256::file_digest_hex(wrapper)?;
-        let contents = format!("session={session}\nwrapper_sha256={wrapper_sha256}\n");
+        let rustc_path = rustc
+            .path
+            .to_str()
+            .ok_or_else(|| "pinned rustc path is not UTF-8".to_owned())?;
+        if rustc_path.contains(['\n', '\r']) {
+            return Err("pinned rustc path contains a newline".to_owned());
+        }
+        let contents = format!(
+            "session={session}\nwrapper_sha256={wrapper_sha256}\nrustc_path={rustc_path}\nrustc_sha256={}\n",
+            rustc.sha256
+        );
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -894,6 +958,7 @@ fn wrap_rustc(arguments: &[String]) -> Result<i32, String> {
     let rustc = arguments
         .first()
         .ok_or_else(|| "rustc path is unavailable".to_owned())?;
+    validate_pinned_rustc(rustc)?;
     let rustc_arguments = &arguments[1..];
     let mut command = Command::new(rustc);
     command.args(rustc_arguments);
@@ -907,6 +972,24 @@ fn wrap_rustc(arguments: &[String]) -> Result<i32, String> {
         ));
     }
     command_status(&mut command)
+}
+
+fn validate_pinned_rustc(rustc: &str) -> Result<(), String> {
+    let expected_path = env::var(PINNED_RUSTC_PATH_ENV)
+        .map_err(|_| "pinned rustc path is unavailable to the attestation wrapper".to_owned())?;
+    if !Path::new(&expected_path).is_absolute() || rustc != expected_path {
+        return Err(format!(
+            "rustc executable received by attestation wrapper does not match pinned compiler: {rustc:?}"
+        ));
+    }
+    let expected_sha256 = env::var(PINNED_RUSTC_SHA256_ENV)
+        .map_err(|_| "pinned rustc SHA-256 is unavailable to the attestation wrapper".to_owned())?;
+    require_lower_hex("pinned rustc SHA-256", &expected_sha256, 64)?;
+    let actual_sha256 = sha256::file_digest_hex(Path::new(rustc))?;
+    if actual_sha256 != expected_sha256 {
+        return Err("pinned rustc executable changed during attested compilation".to_owned());
+    }
+    Ok(())
 }
 
 fn final_configuration(arguments: &[String]) -> Result<Option<(String, String)>, String> {
