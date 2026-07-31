@@ -120,12 +120,16 @@ fn main() -> ExitCode {
     if let Some(exit_code) = process::run_staging_cleanup_guard_if_requested() {
         return exit_code;
     }
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments == ["--benchmark-attestation"] {
+        return emit_benchmark_attestation();
+    }
     let default_rusthouse = match default_rusthouse_path() {
         Ok(path) => path,
         Err(error) => return emit_failure(error),
     };
     let parsed = config::parse(
-        env::args().skip(1),
+        arguments,
         env::var("RUSTHOUSE_CLICKHOUSE_BIN").ok(),
         env::var("RUSTHOUSE_BIN").ok(),
         default_rusthouse,
@@ -145,6 +149,25 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => emit_failure(error),
+    }
+}
+
+fn emit_benchmark_attestation() -> ExitCode {
+    match rusthouse::build_info::attestation(file!()) {
+        Ok(mut attestation) => {
+            writeln!(
+                attestation,
+                "rusthouse_binary_sha256={}",
+                option_env!("RUSTHOUSE_ATTESTED_BINARY_SHA256").unwrap_or("unavailable")
+            )
+            .expect("writing to String cannot fail");
+            print!("{attestation}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -901,6 +924,7 @@ fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?;
+    let _writer_lock = ReportWriterLock::acquire(parent)?;
 
     let mut temporary_path = None;
     let mut temporary_file = None;
@@ -942,6 +966,34 @@ fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&temporary_path);
     }
     result
+}
+
+struct ReportWriterLock {
+    _file: fs::File,
+}
+
+impl ReportWriterLock {
+    fn acquire(parent: &Path) -> Result<Self, String> {
+        let parent = fs::canonicalize(parent).map_err(|error| {
+            format!(
+                "could not resolve details directory '{}': {error}",
+                parent.display()
+            )
+        })?;
+        let file = fs::File::open(&parent).map_err(|error| {
+            format!(
+                "could not open details directory lock '{}': {error}",
+                parent.display()
+            )
+        })?;
+        file.lock().map_err(|error| {
+            format!(
+                "could not acquire details directory lock '{}': {error}",
+                parent.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
 }
 
 fn install_atomic_report(
@@ -1580,6 +1632,49 @@ mod tests {
             b"accepted concurrent report\n"
         );
         assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn report_writers_are_serialized_before_backup_and_rename() {
+        use std::sync::mpsc;
+
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-atomic-writer-lock-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("test directory");
+        let destination = directory.join("details.json");
+        fs::write(&destination, b"old report\n").expect("old report");
+        let first_writer = ReportWriterLock::acquire(&directory)
+            .expect("first writer lock before predecessor backup");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (done_sender, done_receiver) = mpsc::channel();
+        let second_destination = destination.clone();
+        let second_writer = std::thread::spawn(move || {
+            started_sender.send(()).expect("started signal");
+            let result = write_report_atomically(&second_destination, b"second report\n");
+            done_sender.send(result).expect("done signal");
+        });
+
+        started_receiver.recv().expect("second writer started");
+        assert!(matches!(
+            done_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first_writer);
+        done_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second writer released")
+            .expect("second report");
+        second_writer.join().expect("second writer thread");
+
+        assert_eq!(
+            fs::read(&destination).expect("serialized report"),
+            b"second report\n"
+        );
         fs::remove_dir_all(directory).expect("cleanup");
     }
 }

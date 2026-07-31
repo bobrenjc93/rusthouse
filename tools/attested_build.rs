@@ -5,9 +5,8 @@ mod sha256;
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const MARKER_PREFIX: &str = "rusthouse-final-rustc-";
 
@@ -31,12 +30,12 @@ fn build_attested_binaries() -> Result<i32, String> {
     let wrapper = env::current_exe()
         .map_err(|error| format!("cannot locate attestation wrapper executable: {error}"))?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let token = new_build_token()?;
     let (first_status, rusthouse_path) = cargo_artifact(
         Command::new(&cargo)
             .args(["build", "--release", "--bin", "rusthouse"])
             .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
-            .env("RUSTHOUSE_ATTESTED_BUILD_TOKEN", &token)
+            .env("RUSTHOUSE_ATTESTED_BUILD", "1")
+            .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
             .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256"),
         "rusthouse",
     )?;
@@ -44,18 +43,38 @@ fn build_attested_binaries() -> Result<i32, String> {
         return Ok(first_status);
     }
 
-    let rusthouse_sha256 = sha256::file_digest_hex(
-        &rusthouse_path
-            .ok_or_else(|| "Cargo did not report the RustHouse executable artifact".to_owned())?,
-    )?;
-    let (status, _) = cargo_artifact(
+    let rusthouse_path = rusthouse_path
+        .ok_or_else(|| "Cargo did not report the RustHouse executable artifact".to_owned())?;
+    let rusthouse_attestation = validate_artifact(&rusthouse_path, "RustHouse")?;
+    let rusthouse_sha256 = sha256::file_digest_hex(&rusthouse_path)?;
+    let (status, benchmark_path) = cargo_artifact(
         Command::new(cargo)
             .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
             .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
-            .env("RUSTHOUSE_ATTESTED_BUILD_TOKEN", token)
-            .env("RUSTHOUSE_ATTESTED_BINARY_SHA256", rusthouse_sha256),
+            .env("RUSTHOUSE_ATTESTED_BUILD", "1")
+            .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+            .env("RUSTHOUSE_ATTESTED_BINARY_SHA256", &rusthouse_sha256),
         "clickhouse-parity-bench",
     )?;
+    if status != 0 {
+        return Ok(status);
+    }
+    let benchmark_path = benchmark_path
+        .ok_or_else(|| "Cargo did not report the benchmark executable artifact".to_owned())?;
+    let benchmark_attestation = validate_artifact(&benchmark_path, "benchmark")?;
+    if benchmark_attestation.build_configuration_sha256
+        != rusthouse_attestation.build_configuration_sha256
+    {
+        return Err(
+            "completed RustHouse and benchmark artifacts have different build configurations"
+                .to_owned(),
+        );
+    }
+    if benchmark_attestation.rusthouse_binary_sha256.as_deref() != Some(rusthouse_sha256.as_str()) {
+        return Err(
+            "completed benchmark artifact does not bind the completed RustHouse SHA-256".to_owned(),
+        );
+    }
     Ok(status)
 }
 
@@ -66,9 +85,9 @@ fn wrap_rustc(arguments: &[String]) -> Result<i32, String> {
     let rustc_arguments = &arguments[1..];
     let mut command = Command::new(rustc);
     command.args(rustc_arguments);
-    if let Some((source_path, configuration)) = final_configuration(rustc_arguments)? {
-        let token = env::var("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
-            .map_err(|_| "attested build token is unavailable to rustc wrapper".to_owned())?;
+    if let Some(token) = env::var("RUSTHOUSE_ATTESTED_BUILD_TOKEN").ok()
+        && let Some((source_path, configuration)) = final_configuration(rustc_arguments)?
+    {
         require_lower_hex("attested build token", &token, 64)?;
         command.arg(format!(
             "--remap-path-prefix={source_path}={MARKER_PREFIX}{token}-{}",
@@ -105,16 +124,66 @@ fn final_configuration(arguments: &[String]) -> Result<Option<(String, String)>,
                 record_codegen(&mut configuration, &value[2..]);
             }
             value if value.starts_with("--crate-name=") || value.starts_with("--out-dir=") => {}
+            value if option_takes_separate_value(value) => {
+                configuration.push(value.to_owned());
+                index += 1;
+                let option_value = arguments
+                    .get(index)
+                    .ok_or_else(|| format!("rustc argument {argument} is missing its value"))?;
+                configuration.push(option_value.to_owned());
+            }
             value if value.starts_with('@') => {
                 return Err("rustc response files are unsupported by build attestation".to_owned());
             }
-            value if value.ends_with(".rs") => source_path = Some(value.to_owned()),
+            value
+                if source_path.is_none()
+                    && !value.starts_with('-')
+                    && Path::new(value)
+                        .extension()
+                        .is_some_and(|extension| extension == "rs") =>
+            {
+                source_path = Some(value.to_owned());
+            }
             value => configuration.push(value.to_owned()),
         }
         index += 1;
     }
 
     Ok(source_path.map(|source_path| (source_path, encode_arguments(&configuration))))
+}
+
+fn option_takes_separate_value(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--cfg"
+            | "--check-cfg"
+            | "-L"
+            | "-l"
+            | "--crate-type"
+            | "--edition"
+            | "--emit"
+            | "--print"
+            | "-o"
+            | "--explain"
+            | "--target"
+            | "-A"
+            | "--allow"
+            | "-W"
+            | "--warn"
+            | "--force-warn"
+            | "-D"
+            | "--deny"
+            | "-F"
+            | "--forbid"
+            | "--cap-lints"
+            | "--extern"
+            | "--error-format"
+            | "--json"
+            | "--color"
+            | "--diagnostic-width"
+            | "--remap-path-prefix"
+            | "--sysroot"
+    )
 }
 
 fn encode_arguments(arguments: &[String]) -> String {
@@ -135,17 +204,63 @@ fn record_codegen(configuration: &mut Vec<String>, value: &str) {
     }
 }
 
-fn new_build_token() -> Result<String, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?;
-    let material = format!(
-        "rusthouse-attested-build-v1\nprocess={}\nseconds={}\nnanos={}\n",
-        process::id(),
-        now.as_secs(),
-        now.subsec_nanos()
-    );
-    Ok(sha256::digest_hex(material.as_bytes()))
+struct ArtifactAttestation {
+    build_configuration_sha256: String,
+    rusthouse_binary_sha256: Option<String>,
+}
+
+fn validate_artifact(path: &Path, name: &str) -> Result<ArtifactAttestation, String> {
+    let output = Command::new(path)
+        .arg("--benchmark-attestation")
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not execute completed {name} artifact '{}': {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "completed {name} artifact '{}' rejected its build attestation: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| format!("completed {name} artifact attestation was not UTF-8"))?;
+    if stdout.lines().next() != Some("rusthouse-build-attestation-v2") {
+        return Err(format!(
+            "completed {name} artifact returned an unknown build attestation"
+        ));
+    }
+    let build_configuration_sha256 = attestation_field(&stdout, "build_configuration_sha256")
+        .ok_or_else(|| {
+            format!("completed {name} artifact omitted its build configuration SHA-256")
+        })?;
+    require_lower_hex(
+        &format!("completed {name} build configuration SHA-256"),
+        &build_configuration_sha256,
+        64,
+    )?;
+    let rusthouse_binary_sha256 = attestation_field(&stdout, "rusthouse_binary_sha256");
+    if let Some(digest) = &rusthouse_binary_sha256 {
+        require_lower_hex(
+            &format!("completed {name} RustHouse binary SHA-256"),
+            digest,
+            64,
+        )?;
+    }
+    Ok(ArtifactAttestation {
+        build_configuration_sha256,
+        rusthouse_binary_sha256,
+    })
+}
+
+fn attestation_field(attestation: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    attestation
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
 }
 
 fn cargo_artifact(
@@ -377,6 +492,19 @@ mod tests {
             encode_arguments(&one_argument),
             encode_arguments(&two_arguments)
         );
+    }
+
+    #[test]
+    fn rs_suffixed_option_values_do_not_replace_the_positional_source() {
+        let joined = final_configuration(&arguments(&["-Lnative=/tmp/libs.rs"]))
+            .expect("joined search path")
+            .expect("source");
+        let split = final_configuration(&arguments(&["-L", "native=/tmp/libs.rs"]))
+            .expect("split search path")
+            .expect("source");
+
+        assert_eq!(joined.0, "src/main.rs");
+        assert_eq!(split.0, "src/main.rs");
     }
 
     fn arguments(extra: &[&str]) -> Vec<String> {
