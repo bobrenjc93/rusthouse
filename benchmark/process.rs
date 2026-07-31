@@ -12,8 +12,12 @@ use rusthouse::build_info::{ATTESTATION_VERSION, BuildInfo};
 use crate::sha256;
 
 pub const CLICKHOUSE_VERSION: &str = "26.7.1";
-pub const CLICKHOUSE_SHA256: &str =
+pub const CLICKHOUSE_ARTIFACT_SHA256: &str =
+    "6863789d74cc4007f13e040fe843b04361894be935b8ed6f4375adab763e761a";
+pub const CLICKHOUSE_ARTIFACT_SIZE_BYTES: u64 = 166_810_311;
+pub const CLICKHOUSE_EXECUTABLE_SHA256: &str =
     "6611c5aadcfac188031fa0fdf2676ec311771f96654a62b918b146b60dd11075";
+pub const CLICKHOUSE_EXECUTABLE_SIZE_BYTES: u64 = 853_099_511;
 pub const CLICKHOUSE_ARTIFACT_URL: &str = "https://github.com/ClickHouse/ClickHouse/releases/download/v26.7.1.1315-stable/clickhouse-macos-aarch64";
 pub const CLICKHOUSE_ARTIFACT_PLATFORM: &str = "macos-aarch64";
 const CLICKHOUSE_TARGET: &str = "aarch64-apple-darwin";
@@ -43,7 +47,10 @@ struct CleanupGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClickHouseIdentity {
     pub version_output: String,
-    pub sha256: String,
+    pub executable_sha256: String,
+    pub executable_size_bytes: u64,
+    pub artifact_sha256: &'static str,
+    pub artifact_size_bytes: u64,
     pub artifact_url: &'static str,
     pub artifact_platform: &'static str,
 }
@@ -97,6 +104,9 @@ impl EnginePaths {
     ) -> Result<(Self, RunIdentity, PinnedExecutables), String> {
         let pinned = PinnedExecutables::create(self)?;
         let paths = pinned.paths();
+        validate_executable_sha256(&paths.rusthouse, "RustHouse", expected_rusthouse_sha256)?;
+        prepare_clickhouse_artifact(&paths.clickhouse)?;
+        pinned.seal()?;
         let identity = paths.validate(expected, expected_rusthouse_sha256)?;
         Ok((paths, identity, pinned))
     }
@@ -108,8 +118,11 @@ impl EnginePaths {
     ) -> Result<RunIdentity, String> {
         let rusthouse_sha256 =
             validate_executable_sha256(&self.rusthouse, "RustHouse", expected_rusthouse_sha256)?;
-        let clickhouse_sha256 =
-            validate_executable_sha256(&self.clickhouse, "ClickHouse", CLICKHOUSE_SHA256)?;
+        let clickhouse_sha256 = validate_executable_sha256(
+            &self.clickhouse,
+            "ClickHouse",
+            CLICKHOUSE_EXECUTABLE_SHA256,
+        )?;
         let rusthouse = validate_rusthouse(&self.rusthouse, rusthouse_sha256)?;
         validate_rusthouse_build(&rusthouse, expected)?;
         let clickhouse = validate_clickhouse(&self.clickhouse, clickhouse_sha256)?;
@@ -251,8 +264,13 @@ impl PinnedExecutables {
         };
         copy_executable(&sources.rusthouse, &pinned.rusthouse_path())?;
         copy_executable(&sources.clickhouse, &pinned.clickhouse_path())?;
-        make_staging_directory_read_only(&pinned.directory)?;
         Ok(pinned)
+    }
+
+    fn seal(&self) -> Result<(), String> {
+        make_executable_read_only(&self.rusthouse_path())?;
+        make_executable_read_only(&self.clickhouse_path())?;
+        make_staging_directory_read_only(&self.directory)
     }
 
     fn paths(&self) -> EnginePaths {
@@ -713,11 +731,15 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
             )
         })?;
 
-    let mut permissions = fs::metadata(destination)
+    make_executable_read_only(destination)
+}
+
+fn make_executable_read_only(path: &Path) -> Result<(), String> {
+    let mut permissions = fs::metadata(path)
         .map_err(|error| {
             format!(
                 "could not inspect pinned executable '{}': {error}",
-                destination.display()
+                path.display()
             )
         })?
         .permissions();
@@ -728,10 +750,10 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     permissions.set_readonly(true);
-    fs::set_permissions(destination, permissions).map_err(|error| {
+    fs::set_permissions(path, permissions).map_err(|error| {
         format!(
             "could not make pinned executable '{}' read-only: {error}",
-            destination.display()
+            path.display()
         )
     })
 }
@@ -995,7 +1017,68 @@ fn validate_host(rusthouse: &RustHouseIdentity) -> Result<HostIdentity, String> 
     })
 }
 
+fn prepare_clickhouse_artifact(path: &Path) -> Result<(), String> {
+    prepare_clickhouse_artifact_with_identity(
+        path,
+        CLICKHOUSE_ARTIFACT_SHA256,
+        CLICKHOUSE_ARTIFACT_SIZE_BYTES,
+        CLICKHOUSE_EXECUTABLE_SHA256,
+        CLICKHOUSE_EXECUTABLE_SIZE_BYTES,
+    )
+}
+
+fn prepare_clickhouse_artifact_with_identity(
+    path: &Path,
+    artifact_sha256: &str,
+    artifact_size_bytes: u64,
+    executable_sha256: &str,
+    executable_size_bytes: u64,
+) -> Result<(), String> {
+    let initial_sha256 = sha256::file_digest_hex(path)?;
+    let initial_size = fs::metadata(path)
+        .map_err(|error| format!("could not inspect ClickHouse artifact: {error}"))?
+        .len();
+    if initial_sha256 == executable_sha256 && initial_size == executable_size_bytes {
+        return Ok(());
+    }
+    if initial_sha256 != artifact_sha256 || initial_size != artifact_size_bytes {
+        return Err(format!(
+            "ClickHouse checksum mismatch: expected downloaded artifact {artifact_sha256} ({artifact_size_bytes} bytes) or expanded executable {executable_sha256} ({executable_size_bytes} bytes), got {initial_sha256} ({initial_size} bytes)"
+        ));
+    }
+
+    // The official macOS asset is a self-expanding executable. Its artifact
+    // digest is verified above before the first launch is allowed.
+    clickhouse_version_output(path)?;
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync expanded ClickHouse executable: {error}"))?;
+    let expanded_sha256 = sha256::file_digest_hex(path)?;
+    let expanded_size = fs::metadata(path)
+        .map_err(|error| format!("could not inspect expanded ClickHouse executable: {error}"))?
+        .len();
+    if expanded_sha256 != executable_sha256 || expanded_size != executable_size_bytes {
+        return Err(format!(
+            "ClickHouse artifact expansion mismatch: expected {executable_sha256} ({executable_size_bytes} bytes), got {expanded_sha256} ({expanded_size} bytes)"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_clickhouse(path: &Path, sha256: String) -> Result<ClickHouseIdentity, String> {
+    let version_output = clickhouse_version_output(path)?;
+    Ok(ClickHouseIdentity {
+        version_output,
+        executable_sha256: sha256,
+        executable_size_bytes: CLICKHOUSE_EXECUTABLE_SIZE_BYTES,
+        artifact_sha256: CLICKHOUSE_ARTIFACT_SHA256,
+        artifact_size_bytes: CLICKHOUSE_ARTIFACT_SIZE_BYTES,
+        artifact_url: CLICKHOUSE_ARTIFACT_URL,
+        artifact_platform: CLICKHOUSE_ARTIFACT_PLATFORM,
+    })
+}
+
+fn clickhouse_version_output(path: &Path) -> Result<String, String> {
     let output = Command::new(path)
         .args(["local", "--version"])
         .output()
@@ -1021,13 +1104,7 @@ fn validate_clickhouse(path: &Path, sha256: String) -> Result<ClickHouseIdentity
             "unsupported ClickHouse version {version_output:?}; expected {CLICKHOUSE_VERSION}"
         ));
     }
-
-    Ok(ClickHouseIdentity {
-        version_output,
-        sha256,
-        artifact_url: CLICKHOUSE_ARTIFACT_URL,
-        artifact_platform: CLICKHOUSE_ARTIFACT_PLATFORM,
-    })
+    Ok(version_output)
 }
 
 fn validate_executable_sha256(path: &Path, name: &str, expected: &str) -> Result<String, String> {
@@ -1136,7 +1213,10 @@ mod tests {
             rusthouse,
             clickhouse: ClickHouseIdentity {
                 version_output: "ClickHouse 26.7.1".to_owned(),
-                sha256: CLICKHOUSE_SHA256.to_owned(),
+                executable_sha256: CLICKHOUSE_EXECUTABLE_SHA256.to_owned(),
+                executable_size_bytes: CLICKHOUSE_EXECUTABLE_SIZE_BYTES,
+                artifact_sha256: CLICKHOUSE_ARTIFACT_SHA256,
+                artifact_size_bytes: CLICKHOUSE_ARTIFACT_SIZE_BYTES,
                 artifact_url: CLICKHOUSE_ARTIFACT_URL,
                 artifact_platform: CLICKHOUSE_ARTIFACT_PLATFORM,
             },
@@ -1261,6 +1341,80 @@ mod tests {
 
         drop(pinned);
         fs::remove_dir_all(source_directory).expect("cleanup sources");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_clickhouse_artifact_expands_to_pinned_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-clickhouse-expansion-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("expansion directory");
+        let artifact = directory.join("clickhouse");
+        let expanded = directory.join("clickhouse.expanded");
+        fs::write(
+            &expanded,
+            "#!/bin/sh\nprintf 'ClickHouse local version 26.7.1.1315 (official build).\\n'\n",
+        )
+        .expect("expanded executable");
+        fs::write(
+            &artifact,
+            "#!/bin/sh\nprintf 'ClickHouse local version 26.7.1.1315 (official build).\\n'; chmod u+w \"$0\"; cp \"$0.expanded\" \"$0\"; exit 0\n",
+        )
+        .expect("self-expanding artifact");
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o500))
+            .expect("artifact permissions");
+        let artifact_sha256 = sha256::file_digest_hex(&artifact).expect("artifact digest");
+        let artifact_size = fs::metadata(&artifact).expect("artifact metadata").len();
+        let executable_sha256 = sha256::file_digest_hex(&expanded).expect("executable digest");
+        let executable_size = fs::metadata(&expanded).expect("executable metadata").len();
+
+        prepare_clickhouse_artifact_with_identity(
+            &artifact,
+            &artifact_sha256,
+            artifact_size,
+            &executable_sha256,
+            executable_size,
+        )
+        .expect("verified expansion");
+        assert_eq!(
+            sha256::file_digest_hex(&artifact).expect("expanded digest"),
+            executable_sha256
+        );
+
+        fs::remove_dir_all(directory).expect("cleanup expansion directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrecognized_clickhouse_artifact_is_not_executed() {
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-clickhouse-artifact-rejection-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("artifact directory");
+        let artifact = directory.join("clickhouse");
+        write_marker_script(&artifact);
+
+        let error = prepare_clickhouse_artifact_with_identity(
+            &artifact,
+            &"a".repeat(64),
+            1,
+            &"b".repeat(64),
+            2,
+        )
+        .expect_err("unrecognized artifact must fail");
+        assert!(error.contains("checksum mismatch"));
+        assert!(!marker_path(&artifact).exists());
+
+        fs::remove_dir_all(directory).expect("cleanup artifact directory");
     }
 
     #[test]

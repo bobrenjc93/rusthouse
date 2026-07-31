@@ -441,9 +441,12 @@ fn run(config: Config) -> Result<Report, String> {
             harness.path.display()
         ),
         format!(
-            "ClickHouse identity: {}; SHA-256={}; artifact={} ({})",
+            "ClickHouse identity: {}; executable SHA-256={} ({} bytes); artifact SHA-256={} ({} bytes); artifact={} ({})",
             identity.clickhouse.version_output,
-            identity.clickhouse.sha256,
+            identity.clickhouse.executable_sha256,
+            identity.clickhouse.executable_size_bytes,
+            identity.clickhouse.artifact_sha256,
+            identity.clickhouse.artifact_size_bytes,
             identity.clickhouse.artifact_url,
             identity.clickhouse.artifact_platform,
         ),
@@ -828,7 +831,7 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":5,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":6,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -849,7 +852,7 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"benchmark\":{{\"path\":{},\"sha256\":{}}},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{},\"build_configuration_sha256\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"sha256\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"benchmark\":{{\"path\":{},\"sha256\":{}}},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{},\"build_configuration_sha256\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"executable_sha256\":{},\"executable_size_bytes\":{},\"artifact_sha256\":{},\"artifact_size_bytes\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&harness.path.display().to_string()),
         json_string(&harness.sha256),
@@ -863,7 +866,10 @@ fn details_json(context: &DetailsContext<'_>) -> String {
         json_string(&identity.rusthouse.build_configuration_sha256),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.clickhouse.version_output),
-        json_string(&identity.clickhouse.sha256),
+        json_string(&identity.clickhouse.executable_sha256),
+        identity.clickhouse.executable_size_bytes,
+        json_string(identity.clickhouse.artifact_sha256),
+        identity.clickhouse.artifact_size_bytes,
         json_string(identity.clickhouse.artifact_url),
         json_string(identity.clickhouse.artifact_platform),
         json_string(&identity.host.platform),

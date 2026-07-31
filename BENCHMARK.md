@@ -7,19 +7,24 @@ This repository ships a neutral, black-box benchmark in the benchmark directory.
 The accepted reference is the supplied ClickHouse Local build:
 
 - Version: ClickHouse local version 26.7.1.1315 (official build).
-- SHA-256: 6611c5aadcfac188031fa0fdf2676ec311771f96654a62b918b146b60dd11075
-- Binary size used for validation: 853,099,511 bytes
+- Downloaded artifact SHA-256: 6863789d74cc4007f13e040fe843b04361894be935b8ed6f4375adab763e761a
+- Downloaded artifact size: 166,810,311 bytes
+- Expanded executable SHA-256: 6611c5aadcfac188031fa0fdf2676ec311771f96654a62b918b146b60dd11075
+- Expanded executable size: 853,099,511 bytes
 - Artifact platform: `macos-aarch64`
 - Authoritative artifact: <https://github.com/ClickHouse/ClickHouse/releases/download/v26.7.1.1315-stable/clickhouse-macos-aarch64>
 
-The harness executes the local version command, calculates SHA-256 internally, and fails before benchmarking if the 26.7.1 version, pinned checksum, artifact platform, or host platform differs. The ClickHouse executable is an external validation tool and must not be committed.
+The official macOS download is a self-expanding executable. The harness accepts either the untouched download or its expanded form. It hashes the untouched artifact before its first private staged launch, requires that launch to produce the pinned expanded executable, removes write access, and then uses only the expanded copy. It fails before benchmarking if either digest/size transition, the 26.7.1 version, artifact platform, or host platform differs. The ClickHouse executable is an external validation tool and must not be committed.
 
 Verify it independently:
 
 ~~~bash
 shasum -a 256 /path/to/clickhouse
 /path/to/clickhouse local --version
+shasum -a 256 /path/to/clickhouse
 ~~~
+
+The first checksum must match the downloaded artifact above. The version command expands it in place; the second checksum must match the expanded executable.
 
 ## Exact commands
 
@@ -72,7 +77,7 @@ Progress is written to stderr. Stdout is exactly one compact Burner JSON object 
 
 Before validation or timing, the harness records its own executable SHA-256, copies both configured executables into a private staging directory, syncs them through read-only handles, removes write access, and uses only those copies for every child process. A separate cleanup guardian owns a parent-liveness pipe and removes the staging directory on normal completion, interruption, abort, or parent-process termination. The parent also holds a liveness lock inside the staging directory; age-eligible scavenging must acquire that lock before removing an abandoned directory, so suspended or unusually long active runs are preserved. Scavenging opens candidates without following links and performs permission changes and removal relative to the verified open directory handles. The harness hashes both staged executables and compares the RustHouse digest with the exact binary bound into the benchmark and the ClickHouse digest with the pinned release before launching either file. Only then does it request RustHouse build attestation and ClickHouse version output. Every embedded RustHouse value, including the build-configuration fingerprint, must match the benchmark binary. It also records the runtime host platform and `uname` description. After all timing processes finish, the harness repeats both digest gates before re-running version/attestation checks and verifies the host identity. Replacing a configured path after staging cannot change the executable under test. Missing, malformed, changed, or inconsistent provenance rejects the entire run without retaining a new report.
 
-Details schema version 5 retains the benchmark executable path and SHA-256, the RustHouse build-configuration SHA-256, and a canonical `suite_manifest` object and its SHA-256. Canonical bytes are the compact UTF-8 JSON bytes emitted in the documented field order, with no trailing newline: manifest version, mode, seed, timing settings, row counts, then cases in execution order. Every case contains its workload, family, row count, derived dataset seed, setup SQL SHA-256, and query SQL SHA-256. The same two SQL digests are repeated beside that case's timing samples so an auditor can bind generated inputs and queries to the manifest.
+Details schema version 6 retains the benchmark executable path and SHA-256, the RustHouse build-configuration SHA-256, both ClickHouse artifact and expanded-executable digests and sizes, and a canonical `suite_manifest` object and its SHA-256. Canonical bytes are the compact UTF-8 JSON bytes emitted in the documented field order, with no trailing newline: manifest version, mode, seed, timing settings, row counts, then cases in execution order. Every case contains its workload, family, row count, derived dataset seed, setup SQL SHA-256, and query SQL SHA-256. The same two SQL digests are repeated beside that case's timing samples so an auditor can bind generated inputs and queries to the manifest.
 
 Setup, execution, version, checksum, attestation, host, parse, atomic-write, correctness, timing-stability, or full default-suite saturation failures still emit the one stdout object with score zero and exit nonzero.
 
