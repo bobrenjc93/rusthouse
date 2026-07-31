@@ -2,33 +2,19 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
-fn benchmark_attestation_exposes_embedded_build_provenance() {
+fn ordinary_binary_refuses_unattested_benchmark_identity() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .arg("--benchmark-attestation")
         .output()
         .expect("run CLI");
 
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
-    assert!(stdout.starts_with("rusthouse-build-attestation-v2\n"));
-    for field in [
-        "source_commit=",
-        "source_dirty=",
-        "rustc_version=",
-        "target=",
-        "profile=",
-        "build_configuration_sha256=",
-    ] {
-        assert_eq!(
-            stdout
-                .lines()
-                .filter(|line| line.starts_with(field))
-                .count(),
-            1,
-            "missing or duplicate {field}"
-        );
-    }
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .contains("final rustc configuration attestation is unavailable")
+    );
 }
 
 #[test]

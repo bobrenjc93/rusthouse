@@ -12,3 +12,7 @@ repository = "https://github.com/bobrenjc93/rusthouse"
 [[bin]]
 name = "clickhouse-parity-bench"
 path = "benchmark/main.rs"
+
+[[bin]]
+name = "attested-build"
+path = "tools/attested_build.rs"

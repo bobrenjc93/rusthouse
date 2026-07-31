@@ -5,9 +5,6 @@ use std::process::ExitCode;
 use rusthouse::format::{OutputFormat, render};
 use rusthouse::{Database, QueryResult, StatementResult};
 
-#[cfg(all(not(rusthouse_final_rustc_attested), not(clippy)))]
-compile_error!("RustHouse must be compiled with its attestation rustc wrapper");
-
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
 
@@ -37,7 +34,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments == ["--benchmark-attestation"] {
-        print!("{}", rusthouse::build_info::attestation(file!()));
+        print!("{}", rusthouse::build_info::attestation(file!())?);
         return Ok(());
     }
 

@@ -3,8 +3,6 @@ mod build_provenance;
 
 use std::env;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -164,6 +162,20 @@ fn build_configuration_fingerprint_changes_with_effective_codegen_settings() {
     assert_ne!(normal, target_only_opt_level);
 
     repository.cargo(&[
+        "rustc",
+        "--release",
+        "--bin",
+        "provenance-probe",
+        "--quiet",
+        "--",
+        "--codegen",
+        "opt-level=0",
+    ]);
+    let long_target_only_opt_level = repository.probe_build_configuration("release");
+    assert_ne!(normal, long_target_only_opt_level);
+    assert_eq!(target_only_opt_level, long_target_only_opt_level);
+
+    repository.cargo(&[
         "build",
         "--release",
         "--quiet",
@@ -219,6 +231,16 @@ fn new_untracked_root_entry_is_detected_without_recursive_rebuild_watch() {
     assert!(repository.probe_dirty());
 }
 
+#[test]
+fn ordinary_build_does_not_require_the_attestation_wrapper() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "probe sources"]);
+
+    repository.cargo_without_wrapper(&["build", "--quiet", "--bin", "provenance-probe"]);
+}
+
 struct TemporaryRepository {
     path: PathBuf,
 }
@@ -260,18 +282,13 @@ impl TemporaryRepository {
     fn install_probe(&self) {
         self.write(
             "Cargo.toml",
-            "[package]\nname = \"provenance-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+            "[package]\nname = \"provenance-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"attested-build\"\npath = \"tools/attested_build.rs\"\n",
         );
         self.write(".gitignore", "/target/\n");
         self.write(
-            ".cargo/config.toml",
-            "[build]\nrustc-workspace-wrapper = \"tools/rustc-attestation-wrapper.sh\"\n",
+            "tools/attested_build.rs",
+            include_str!("../tools/attested_build.rs"),
         );
-        self.write(
-            "tools/rustc-attestation-wrapper.sh",
-            include_str!("../tools/rustc-attestation-wrapper.sh"),
-        );
-        make_executable(&self.path.join("tools/rustc-attestation-wrapper.sh"));
         self.write("build.rs", include_str!("../build.rs"));
         self.write(
             "build_provenance.rs",
@@ -285,13 +302,13 @@ impl TemporaryRepository {
         self.write("src/lib.rs", "pub mod build_info;\n");
         self.write(
             "src/main.rs",
-            "#[cfg(not(rusthouse_final_rustc_attested))] compile_error!(\"missing attestation wrapper\"); fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!())); }\n",
+            "fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!()).expect(\"attested build\")); }\n",
         );
         self.write(
             "src/bin/benchmark-probe.rs",
-            "#[cfg(not(rusthouse_final_rustc_attested))] compile_error!(\"missing attestation wrapper\"); fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!())); }\n",
+            "fn main() { print!(\"{}\", provenance_probe::build_info::attestation(file!()).expect(\"attested build\")); }\n",
         );
-        self.cargo(&["generate-lockfile"]);
+        self.cargo_without_wrapper(&["generate-lockfile"]);
     }
 
     fn git(&self, arguments: &[&str]) {
@@ -338,6 +355,10 @@ impl TemporaryRepository {
         self.cargo_with_env(arguments, &[]);
     }
 
+    fn cargo_without_wrapper(&self, arguments: &[&str]) {
+        let _ = self.cargo_output_inner(arguments, &[], false);
+    }
+
     fn cargo_with_env(&self, arguments: &[&str], environment: &[(&str, &str)]) {
         let _ = self.cargo_output(arguments, environment);
     }
@@ -347,12 +368,37 @@ impl TemporaryRepository {
         arguments: &[&str],
         environment: &[(&str, &str)],
     ) -> std::process::Output {
+        self.cargo_output_inner(arguments, environment, true)
+    }
+
+    fn cargo_output_inner(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+        attested: bool,
+    ) -> std::process::Output {
+        let wrapper = self
+            .path
+            .join("target")
+            .join("debug")
+            .join(format!("attested-build{}", env::consts::EXE_SUFFIX));
+        if attested && !wrapper.is_file() {
+            let _ = self.cargo_output_inner(
+                &["build", "--quiet", "--bin", "attested-build"],
+                &[],
+                false,
+            );
+        }
         let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut command = Command::new(cargo);
         command
             .args(arguments)
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .current_dir(&self.path);
+        if attested {
+            command.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
+        }
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -409,16 +455,4 @@ impl Drop for TemporaryRepository {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
-}
-
-#[cfg(unix)]
-fn make_executable(path: &std::path::Path) {
-    let mut permissions = fs::metadata(path).expect("wrapper metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("executable wrapper");
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &std::path::Path) {
-    panic!("build provenance tests require the POSIX attestation wrapper");
 }
