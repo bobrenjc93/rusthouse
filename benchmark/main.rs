@@ -13,7 +13,9 @@ use std::io;
 #[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -27,6 +29,7 @@ use workload::workloads;
 
 const MAX_SAMPLE_SPREAD: f64 = 10.0;
 const STAGED_HARNESS_ENV: &str = "RUSTHOUSE_INTERNAL_STAGED_HARNESS";
+const HARNESS_LAUNCH_GUARD_ENV: &str = "RUSTHOUSE_INTERNAL_HARNESS_LAUNCH_GUARD";
 const ORIGINAL_RUSTHOUSE_ENV: &str = "RUSTHOUSE_INTERNAL_ORIGINAL_RUSTHOUSE";
 const HARNESS_STAGING_PREFIX: &str = "rusthouse-benchmark-harness-";
 
@@ -123,6 +126,11 @@ struct HarnessIdentity {
 }
 
 fn main() -> ExitCode {
+    match run_harness_launch_guard_if_requested() {
+        Ok(Some(exit_code)) => return exit_code,
+        Ok(None) => {}
+        Err(error) => return emit_failure(error),
+    }
     if let Some(exit_code) = process::run_staging_cleanup_guard_if_requested() {
         return exit_code;
     }
@@ -163,43 +171,149 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_harness_launch_guard_if_requested() -> Result<Option<ExitCode>, String> {
+    let Some(expected) = env::var_os(HARNESS_LAUNCH_GUARD_ENV) else {
+        return Ok(None);
+    };
+    let current = env::current_exe()
+        .map_err(|error| format!("cannot locate staged benchmark supervisor: {error}"))?;
+    let directory = validate_staged_harness(&current, Path::new(&expected))?;
+    if env::var_os(STAGED_HARNESS_ENV).is_some() {
+        return Err("staged benchmark supervisor cannot also be the benchmark child".to_owned());
+    }
+
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let monitor = Arc::clone(&disconnected);
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+        monitor.store(true, Ordering::Release);
+    });
+
+    let mut command = Command::new(&current);
+    command
+        .args(env::args_os().skip(1))
+        .env_remove(HARNESS_LAUNCH_GUARD_ENV)
+        .env(STAGED_HARNESS_ENV, &current)
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not execute staged benchmark child: {error}"))?;
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not monitor staged benchmark child: {error}"))?
+        {
+            let _ = fs::remove_dir_all(&directory);
+            return Ok(Some(exit_code_from_status(status)));
+        }
+        if disconnected.load(Ordering::Acquire) {
+            terminate_staged_child(&mut child);
+            fs::remove_dir_all(&directory).map_err(|error| {
+                format!(
+                    "could not clean cancelled benchmark staging directory '{}': {error}",
+                    directory.display()
+                )
+            })?;
+            return Ok(Some(ExitCode::FAILURE));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_staged_child(child: &mut Child) {
+    unsafe extern "C" {
+        fn kill(process: i32, signal: i32) -> i32;
+    }
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+
+    let process_group = i32::try_from(child.id()).map_or(0, |pid| -pid);
+    if process_group != 0 {
+        // SAFETY: the child was placed in a process group whose id is its positive PID.
+        let _ = unsafe { kill(process_group, SIGTERM) };
+    }
+    for _ in 0..100 {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if process_group != 0 {
+        // SAFETY: the process-group id is derived from the child PID as above.
+        let _ = unsafe { kill(process_group, SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_staged_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {
+    ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1),
+    )
+}
+
+fn validate_staged_harness(current: &Path, expected: &Path) -> Result<PathBuf, String> {
+    if expected != current {
+        return Err("staged benchmark harness identity is inconsistent".to_owned());
+    }
+    let staging_directory = current
+        .parent()
+        .filter(|parent| {
+            parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(HARNESS_STAGING_PREFIX))
+        })
+        .ok_or_else(|| "staged benchmark harness is outside its private directory".to_owned())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if fs::metadata(staging_directory)
+            .map_err(|error| format!("could not inspect staged harness directory: {error}"))?
+            .permissions()
+            .mode()
+            & 0o077
+            != 0
+        {
+            return Err("staged benchmark harness directory is not private".to_owned());
+        }
+    }
+    Ok(staging_directory.to_path_buf())
+}
+
 fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
     let current = env::current_exe()
         .map_err(|error| format!("cannot locate benchmark executable: {error}"))?;
     if let Some(expected) = env::var_os(STAGED_HARNESS_ENV) {
-        if Path::new(&expected) != current {
-            return Err("staged benchmark harness identity is inconsistent".to_owned());
-        }
-        let staging_directory = current
-            .parent()
-            .filter(|parent| {
-                parent
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(HARNESS_STAGING_PREFIX))
-            })
-            .ok_or_else(|| {
-                "staged benchmark harness is outside its private directory".to_owned()
-            })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if fs::metadata(staging_directory)
-                .map_err(|error| format!("could not inspect staged harness directory: {error}"))?
-                .permissions()
-                .mode()
-                & 0o077
-                != 0
-            {
-                return Err("staged benchmark harness directory is not private".to_owned());
+        validate_staged_harness(&current, Path::new(&expected))?;
+        if cfg!(debug_assertions) {
+            if let Some(path) = env::var_os("RUSTHOUSE_TEST_STAGED_HARNESS_READY_PATH") {
+                fs::write(path, current.as_os_str().as_encoded_bytes()).map_err(|error| {
+                    format!("could not publish test harness readiness: {error}")
+                })?;
             }
-        }
-        if cfg!(debug_assertions)
-            && let Some(delay) = env::var("RUSTHOUSE_TEST_STAGED_HARNESS_DELAY_MS")
+            if let Some(delay) = env::var("RUSTHOUSE_TEST_STAGED_HARNESS_DELAY_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-        {
-            std::thread::sleep(std::time::Duration::from_millis(delay));
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
         }
         return Ok(None);
     }
@@ -256,20 +370,31 @@ fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
             .parent()
             .ok_or_else(|| "benchmark executable has no parent directory".to_owned())?
             .join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
-        Command::new(&staged)
+        let mut command = Command::new(&staged);
+        command
             .args(env::args_os().skip(1))
-            .env(STAGED_HARNESS_ENV, &staged)
+            .env(HARNESS_LAUNCH_GUARD_ENV, &staged)
             .env(ORIGINAL_RUSTHOUSE_ENV, original_rusthouse)
-            .status()
-            .map_err(|error| format!("could not execute staged benchmark harness: {error}"))
+            .stdin(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut guardian = command
+            .spawn()
+            .map_err(|error| format!("could not execute staged benchmark supervisor: {error}"))?;
+        let _liveness = guardian
+            .stdin
+            .take()
+            .ok_or_else(|| "staged benchmark supervisor liveness pipe is unavailable".to_owned())?;
+        guardian
+            .wait()
+            .map_err(|error| format!("could not wait for staged benchmark supervisor: {error}"))
     })();
     let _ = fs::remove_dir_all(&directory);
     let status = result?;
-    let code = status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1);
-    Ok(Some(ExitCode::from(code)))
+    Ok(Some(exit_code_from_status(status)))
 }
 
 fn emit_benchmark_attestation() -> ExitCode {

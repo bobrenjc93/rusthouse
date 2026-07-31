@@ -471,6 +471,74 @@ fn caller_token_and_passthrough_wrapper_cannot_forge_attestation() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn attested_builder_rejects_cargo_configured_outer_wrapper_without_execution() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = TemporaryRepository::new();
+    let cargo_home = temporary.path.join("cargo-home");
+    let target = temporary.path.join("target");
+    let marker = temporary.path.join("outer-wrapper-ran");
+    let wrapper = temporary.path.join("mutating-wrapper.sh");
+    fs::create_dir(&cargo_home).expect("Cargo home");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf executed > '{}'\nfor argument in \"$@\"; do\n  case \"$argument\" in *.rs) printf 'malicious source mutation' > \"$argument\"; break;; esac\ndone\nexec \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .expect("malicious outer wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+        .expect("outer wrapper permissions");
+    fs::write(
+        cargo_home.join("config.toml"),
+        format!(
+            "[build]\nrustc-wrapper = {:?}\n",
+            wrapper.display().to_string()
+        ),
+    )
+    .expect("Cargo wrapper configuration");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_attested-build"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TARGET_DIR", target)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .output()
+        .expect("run attested builder with Cargo wrapper configuration");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("external compiler wrappers are not permitted"),
+        "unexpected attested builder error: {stderr}"
+    );
+    assert!(!marker.exists(), "configured outer wrapper was executed");
+
+    fs::remove_file(cargo_home.join("config.toml")).expect("remove file configuration");
+    let output = Command::new(env!("CARGO_BIN_EXE_attested-build"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("CARGO_HOME", &cargo_home)
+        .env(
+            "CARGO_TARGET_DIR",
+            temporary.path.join("environment-target"),
+        )
+        .env("CARGO_BUILD_RUSTC_WRAPPER", &wrapper)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .output()
+        .expect("run attested builder with Cargo wrapper environment");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CARGO_BUILD_RUSTC_WRAPPER"));
+    assert!(!marker.exists(), "Cargo environment wrapper was executed");
+}
+
 #[test]
 fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
     let temporary = TemporaryRepository::new();
@@ -634,13 +702,11 @@ fn interrupted_attested_builder_removes_private_clean_snapshot() {
         .join("target")
         .join("debug")
         .join(format!("attested-build{}", env::consts::EXE_SUFFIX));
-    let slow_wrapper = repository.path.with_file_name(format!(
-        "rusthouse-slow-rustc-wrapper-{}",
+    let ready = repository.path.with_file_name(format!(
+        "rusthouse-source-snapshot-ready-{}",
         std::process::id()
     ));
-    fs::write(&slow_wrapper, "#!/bin/sh\nsleep 2\nexec \"$@\"\n").expect("slow rustc wrapper");
-    fs::set_permissions(&slow_wrapper, fs::Permissions::from_mode(0o700))
-        .expect("slow wrapper permissions");
+    let _ = fs::remove_file(&ready);
     let mut child = Command::new(builder)
         .current_dir(&repository.path)
         .env_remove("CARGO_TARGET_DIR")
@@ -649,7 +715,8 @@ fn interrupted_attested_builder_removes_private_clean_snapshot() {
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_SESSION")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
-        .env("RUSTC_WRAPPER", &slow_wrapper)
+        .env("RUSTHOUSE_TEST_SOURCE_SNAPSHOT_DELAY_MS", "5000")
+        .env("RUSTHOUSE_TEST_SOURCE_SNAPSHOT_READY_PATH", &ready)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -667,6 +734,7 @@ fn interrupted_attested_builder_removes_private_clean_snapshot() {
                     .to_str()
                     .is_some_and(|name| name.starts_with(&snapshot_prefix))
                     && entry.path().join("source").is_dir()
+                    && ready.is_file()
             })
             .map(|entry| entry.path());
         if let Some(snapshot) = snapshot {
@@ -700,8 +768,7 @@ fn interrupted_attested_builder_removes_private_clean_snapshot() {
             .contains(&snapshot.display().to_string()),
         "cleanup guardian left Git worktree metadata behind"
     );
-
-    fs::remove_file(slow_wrapper).expect("cleanup slow rustc wrapper");
+    fs::remove_file(ready).expect("cleanup readiness marker");
 }
 
 struct TemporaryRepository {

@@ -107,6 +107,80 @@ fn harness_path_replacement_does_not_change_running_staged_bytes() {
     fs::remove_dir_all(directory).expect("cleanup replacement test");
 }
 
+#[cfg(unix)]
+#[test]
+fn terminating_launcher_stops_benchmark_and_suppresses_report() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = env::temp_dir().join(format!(
+        "rusthouse-harness-cancellation-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir(&directory).expect("cancellation test directory");
+    let harness = directory.join("clickhouse-parity-bench");
+    let details = directory.join("details.json");
+    let ready = directory.join("staged-harness-ready");
+    fs::copy(env!("CARGO_BIN_EXE_clickhouse-parity-bench"), &harness)
+        .expect("copy benchmark harness");
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).expect("harness permissions");
+    let mut launcher = Command::new(&harness)
+        .args([
+            "--quick",
+            "--rusthouse",
+            "/missing/rusthouse",
+            "--clickhouse",
+            "/missing/clickhouse",
+            "--details",
+        ])
+        .arg(&details)
+        .env("RUSTHOUSE_TEST_STAGED_HARNESS_DELAY_MS", "5000")
+        .env("RUSTHOUSE_TEST_STAGED_HARNESS_READY_PATH", &ready)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cancellable benchmark launcher");
+    let staging_prefix = format!("rusthouse-benchmark-harness-{}-", launcher.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let staging_directory = loop {
+        if let Some(path) = fs::read_dir(env::temp_dir())
+            .expect("temporary directory")
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&staging_prefix))
+            })
+            .map(|entry| entry.path())
+        {
+            break path;
+        }
+        assert!(Instant::now() < deadline, "harness was not staged");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    while !ready.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "staged benchmark child did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    launcher.kill().expect("terminate only benchmark launcher");
+    let _ = launcher.wait_with_output().expect("wait for launcher");
+    let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+    while staging_directory.exists() {
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "staged benchmark survived launcher termination"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!details.exists(), "cancelled benchmark installed a report");
+    fs::remove_dir_all(directory).expect("cleanup cancellation test");
+}
+
 #[test]
 fn execute_argument_emits_clean_json_and_command_statuses() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))

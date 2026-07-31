@@ -22,6 +22,13 @@ const SOURCE_SNAPSHOT_PREFIX: &str = "rusthouse-attested-source-";
 const SOURCE_SNAPSHOT_ROOT: &str = "source";
 const SOURCE_CLEANUP_GUARD_ARGUMENT: &str = "--internal-source-snapshot-cleanup-guard";
 const BUILD_AUTHORIZATION_ENV: &str = "RUSTHOUSE_ATTESTED_BUILD_AUTHORIZATION";
+const OUTER_WRAPPER_ENV: &str = "RUSTHOUSE_ATTESTED_OUTER_WRAPPER";
+const WRAPPER_ENVIRONMENT: &[&str] = &[
+    "RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+];
 
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -50,8 +57,26 @@ fn build_attested_binaries() -> Result<i32, String> {
     let initial_source = live_source_provenance(&source_root)?;
     let session = new_build_session()?;
     let snapshot = SourceSnapshot::create(&source_root, initial_source.as_ref(), &session)?;
+    reject_external_compiler_wrappers(&snapshot.root)?;
+    if cfg!(debug_assertions) {
+        if let Some(path) = env::var_os("RUSTHOUSE_TEST_SOURCE_SNAPSHOT_READY_PATH") {
+            fs::write(path, snapshot.root.as_os_str().as_encoded_bytes())
+                .map_err(|error| format!("could not publish test snapshot readiness: {error}"))?;
+        }
+        if let Some(delay) = env::var("RUSTHOUSE_TEST_SOURCE_SNAPSHOT_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
     let wrapper =
         stage_private_artifact(&snapshot.container, &builder_executable, "attested-wrapper")?;
+    let outer_wrapper = stage_private_artifact(
+        &snapshot.container,
+        &builder_executable,
+        "attested-outer-wrapper",
+    )?;
     let authorization = BuildAuthorization::create(&snapshot.container, &wrapper, &session)?;
     let manifest = snapshot.root.join("Cargo.toml");
     let mut rusthouse_command = Command::new(&cargo);
@@ -59,12 +84,16 @@ fn build_attested_binaries() -> Result<i32, String> {
         .args(["build", "--release", "--bin", "rusthouse"])
         .arg("--manifest-path")
         .arg(&manifest)
+        .current_dir(&snapshot.root)
         .env("CARGO_TARGET_DIR", &target_directory)
+        .env("RUSTC_WRAPPER", &outer_wrapper)
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+        .env(OUTER_WRAPPER_ENV, &outer_wrapper)
         .env("RUSTHOUSE_ATTESTED_BUILD", "1")
         .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", &session)
         .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
-        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256");
     configure_live_source_provenance(&mut rusthouse_command, initial_source.as_ref());
@@ -82,12 +111,16 @@ fn build_attested_binaries() -> Result<i32, String> {
         .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
         .arg("--manifest-path")
         .arg(&manifest)
+        .current_dir(&snapshot.root)
         .env("CARGO_TARGET_DIR", &target_directory)
+        .env("RUSTC_WRAPPER", &outer_wrapper)
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+        .env(OUTER_WRAPPER_ENV, outer_wrapper)
         .env("RUSTHOUSE_ATTESTED_BUILD", "1")
         .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
         .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
-        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env(
             "RUSTHOUSE_ATTESTED_BINARY_SHA256",
@@ -115,6 +148,88 @@ fn build_attested_binaries() -> Result<i32, String> {
     publish_artifact_atomically(&private_rusthouse_path, &rusthouse_path)?;
     publish_artifact_atomically(&private_benchmark_path, &benchmark_path)?;
     Ok(status)
+}
+
+fn reject_external_compiler_wrappers(source_root: &Path) -> Result<(), String> {
+    for name in WRAPPER_ENVIRONMENT {
+        if env::var_os(name).is_some_and(|value| !value.is_empty()) {
+            return Err(format!(
+                "external compiler wrapper configuration {name} is not permitted for attested builds"
+            ));
+        }
+    }
+
+    for path in cargo_configuration_paths(source_root) {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect Cargo configuration '{}': {error}",
+                    path.display()
+                ));
+            }
+        };
+        if cargo_configuration_mentions_wrapper(&contents) {
+            return Err(format!(
+                "Cargo configuration '{}' contains a compiler wrapper; external compiler wrappers are not permitted for attested builds",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cargo_configuration_paths(source_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for directory in source_root.ancestors() {
+        paths.push(directory.join(".cargo/config.toml"));
+        paths.push(directory.join(".cargo/config"));
+    }
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    if let Some(cargo_home) = cargo_home {
+        paths.push(cargo_home.join("config.toml"));
+        paths.push(cargo_home.join("config"));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn cargo_configuration_mentions_wrapper(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let mut uncommented = String::new();
+        let mut quote = None;
+        let mut escaped = false;
+        for character in line.chars() {
+            if escaped {
+                uncommented.push(character);
+                escaped = false;
+                continue;
+            }
+            if quote == Some('"') && character == '\\' {
+                uncommented.push(character);
+                escaped = true;
+                continue;
+            }
+            if matches!(character, '\'' | '"') {
+                if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(character);
+                }
+                uncommented.push(character);
+                continue;
+            }
+            if character == '#' && quote.is_none() {
+                break;
+            }
+            uncommented.push(character);
+        }
+        uncommented.contains("rustc-wrapper") || uncommented.contains("rustc-workspace-wrapper")
+    })
 }
 
 struct BuildAuthorization {
@@ -759,6 +874,18 @@ fn new_build_session() -> Result<String, String> {
 }
 
 fn wrap_rustc(arguments: &[String]) -> Result<i32, String> {
+    if let Some(outer_wrapper) = env::var_os(OUTER_WRAPPER_ENV) {
+        let current = env::current_exe()
+            .map_err(|error| format!("cannot locate attested outer wrapper: {error}"))?;
+        if current == Path::new(&outer_wrapper) {
+            let nested_wrapper = arguments
+                .first()
+                .ok_or_else(|| "attested outer wrapper command is unavailable".to_owned())?;
+            let mut command = Command::new(nested_wrapper);
+            command.args(&arguments[1..]).env_remove(OUTER_WRAPPER_ENV);
+            return command_status(&mut command);
+        }
+    }
     let rustc = arguments
         .first()
         .ok_or_else(|| "rustc path is unavailable".to_owned())?;
