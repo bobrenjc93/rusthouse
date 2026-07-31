@@ -29,6 +29,7 @@ const WRAPPER_ENVIRONMENT: &[&str] = &[
     "RUSTC_WORKSPACE_WRAPPER",
     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
 ];
+const COMPILER_ENVIRONMENT: &[&str] = &["RUSTC", "CARGO_BUILD_RUSTC"];
 
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -57,7 +58,7 @@ fn build_attested_binaries() -> Result<i32, String> {
     let initial_source = live_source_provenance(&source_root)?;
     let session = new_build_session()?;
     let snapshot = SourceSnapshot::create(&source_root, initial_source.as_ref(), &session)?;
-    reject_external_compiler_wrappers(&snapshot.root)?;
+    reject_external_compiler_configuration(&snapshot.root)?;
     if cfg!(debug_assertions) {
         if let Some(path) = env::var_os("RUSTHOUSE_TEST_SOURCE_SNAPSHOT_READY_PATH") {
             fs::write(path, snapshot.root.as_os_str().as_encoded_bytes())
@@ -86,6 +87,7 @@ fn build_attested_binaries() -> Result<i32, String> {
         .arg(&manifest)
         .current_dir(&snapshot.root)
         .env("CARGO_TARGET_DIR", &target_directory)
+        .env("RUSTC", "rustc")
         .env("RUSTC_WRAPPER", &outer_wrapper)
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env(OUTER_WRAPPER_ENV, &outer_wrapper)
@@ -94,6 +96,7 @@ fn build_attested_binaries() -> Result<i32, String> {
         .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256");
     configure_live_source_provenance(&mut rusthouse_command, initial_source.as_ref());
@@ -113,6 +116,7 @@ fn build_attested_binaries() -> Result<i32, String> {
         .arg(&manifest)
         .current_dir(&snapshot.root)
         .env("CARGO_TARGET_DIR", &target_directory)
+        .env("RUSTC", "rustc")
         .env("RUSTC_WRAPPER", &outer_wrapper)
         .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
         .env(OUTER_WRAPPER_ENV, outer_wrapper)
@@ -121,6 +125,7 @@ fn build_attested_binaries() -> Result<i32, String> {
         .env(BUILD_AUTHORIZATION_ENV, &authorization.path)
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env(
             "RUSTHOUSE_ATTESTED_BINARY_SHA256",
@@ -150,11 +155,11 @@ fn build_attested_binaries() -> Result<i32, String> {
     Ok(status)
 }
 
-fn reject_external_compiler_wrappers(source_root: &Path) -> Result<(), String> {
-    for name in WRAPPER_ENVIRONMENT {
+fn reject_external_compiler_configuration(source_root: &Path) -> Result<(), String> {
+    for name in WRAPPER_ENVIRONMENT.iter().chain(COMPILER_ENVIRONMENT) {
         if env::var_os(name).is_some_and(|value| !value.is_empty()) {
             return Err(format!(
-                "external compiler wrapper configuration {name} is not permitted for attested builds"
+                "external compiler configuration {name} is not permitted for attested builds"
             ));
         }
     }
@@ -170,9 +175,9 @@ fn reject_external_compiler_wrappers(source_root: &Path) -> Result<(), String> {
                 ));
             }
         };
-        if cargo_configuration_mentions_wrapper(&contents) {
+        if cargo_configuration_mentions_compiler_control(&contents) {
             return Err(format!(
-                "Cargo configuration '{}' contains a compiler wrapper; external compiler wrappers are not permitted for attested builds",
+                "Cargo configuration '{}' contains a compiler override or wrapper; external compiler configuration is not permitted for attested builds",
                 path.display()
             ));
         }
@@ -198,7 +203,7 @@ fn cargo_configuration_paths(source_root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn cargo_configuration_mentions_wrapper(contents: &str) -> bool {
+fn cargo_configuration_mentions_compiler_control(contents: &str) -> bool {
     contents.lines().any(|line| {
         let mut uncommented = String::new();
         let mut quote = None;
@@ -228,7 +233,7 @@ fn cargo_configuration_mentions_wrapper(contents: &str) -> bool {
             }
             uncommented.push(character);
         }
-        uncommented.contains("rustc-wrapper") || uncommented.contains("rustc-workspace-wrapper")
+        uncommented.contains("rustc")
     })
 }
 

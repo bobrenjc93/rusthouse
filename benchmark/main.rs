@@ -9,9 +9,7 @@ mod workload;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
-#[cfg(unix)]
-use std::io::Write as _;
+use std::io::{self, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
@@ -31,7 +29,12 @@ const MAX_SAMPLE_SPREAD: f64 = 10.0;
 const STAGED_HARNESS_ENV: &str = "RUSTHOUSE_INTERNAL_STAGED_HARNESS";
 const HARNESS_LAUNCH_GUARD_ENV: &str = "RUSTHOUSE_INTERNAL_HARNESS_LAUNCH_GUARD";
 const ORIGINAL_RUSTHOUSE_ENV: &str = "RUSTHOUSE_INTERNAL_ORIGINAL_RUSTHOUSE";
+const DEFERRED_DETAILS_ENV: &str = "RUSTHOUSE_INTERNAL_DEFERRED_DETAILS";
 const HARNESS_STAGING_PREFIX: &str = "rusthouse-benchmark-harness-";
+const PENDING_DETAILS_FILE: &str = ".benchmark-details.pending";
+const CHILD_STATUS_FILE: &str = ".benchmark-child.status";
+const CHILD_STATUS_TEMP_FILE: &str = ".benchmark-child.status.tmp";
+const CHILD_STDOUT_FILE: &str = ".benchmark-child.stdout";
 
 const HELP: &str = "\
 RustHouse / ClickHouse Local black-box parity benchmark
@@ -139,6 +142,11 @@ fn main() -> ExitCode {
         Ok(None) => {}
         Err(error) => return emit_failure(error),
     }
+    match run_deferred_details_test_hook() {
+        Ok(Some(exit_code)) => return exit_code,
+        Ok(None) => {}
+        Err(error) => return emit_failure(error),
+    }
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments == ["--benchmark-attestation"] {
         return emit_benchmark_attestation();
@@ -153,7 +161,7 @@ fn main() -> ExitCode {
         env::var("RUSTHOUSE_BIN").ok(),
         default_rusthouse,
     );
-    let config = match parsed {
+    let mut config = match parsed {
         Ok(ParseResult::Help) => {
             print!("{HELP}");
             return ExitCode::SUCCESS;
@@ -161,6 +169,16 @@ fn main() -> ExitCode {
         Ok(ParseResult::Run(config)) => config,
         Err(error) => return emit_failure(error),
     };
+    match deferred_details_path() {
+        Ok(Some(path)) if config.details.is_some() => config.details = Some(path),
+        Ok(Some(_)) => {
+            return emit_failure(
+                "deferred details publication is inconsistent with benchmark arguments".to_owned(),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return emit_failure(error),
+    }
 
     match run(config) {
         Ok(report) => {
@@ -209,6 +227,10 @@ fn run_harness_launch_guard_if_requested() -> Result<Option<ExitCode>, String> {
             .try_wait()
             .map_err(|error| format!("could not monitor staged benchmark child: {error}"))?
         {
+            write_child_completion(&directory, status)?;
+            while !disconnected.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let _ = fs::remove_dir_all(&directory);
             return Ok(Some(exit_code_from_status(status)));
         }
@@ -224,6 +246,25 @@ fn run_harness_launch_guard_if_requested() -> Result<Option<ExitCode>, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn write_child_completion(
+    directory: &Path,
+    status: std::process::ExitStatus,
+) -> Result<(), String> {
+    let path = directory.join(CHILD_STATUS_FILE);
+    let temporary = directory.join(CHILD_STATUS_TEMP_FILE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("could not create benchmark completion marker: {error}"))?;
+    writeln!(file, "{}", status_code(status))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not persist benchmark completion marker: {error}"))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("could not install benchmark completion marker: {error}"))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -260,12 +301,14 @@ fn terminate_staged_child(child: &mut Child) {
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {
-    ExitCode::from(
-        status
-            .code()
-            .and_then(|code| u8::try_from(code).ok())
-            .unwrap_or(1),
-    )
+    ExitCode::from(status_code(status))
+}
+
+fn status_code(status: std::process::ExitStatus) -> u8 {
+    status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(1)
 }
 
 fn validate_staged_harness(current: &Path, expected: &Path) -> Result<PathBuf, String> {
@@ -297,6 +340,87 @@ fn validate_staged_harness(current: &Path, expected: &Path) -> Result<PathBuf, S
     Ok(staging_directory.to_path_buf())
 }
 
+fn deferred_details_path() -> Result<Option<PathBuf>, String> {
+    let Some(path) = env::var_os(DEFERRED_DETAILS_ENV).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let current = env::current_exe()
+        .map_err(|error| format!("cannot locate deferred-details benchmark child: {error}"))?;
+    let staged = env::var_os(STAGED_HARNESS_ENV)
+        .ok_or_else(|| "deferred details publication is unavailable outside staging".to_owned())?;
+    let directory = validate_staged_harness(&current, Path::new(&staged))?;
+    if path != directory.join(PENDING_DETAILS_FILE) {
+        return Err("deferred details path is outside the private harness directory".to_owned());
+    }
+    Ok(Some(path))
+}
+
+fn launcher_details_destination(current: &Path) -> Result<Option<DetailsDestination>, String> {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments == ["--benchmark-attestation"] {
+        return Ok(None);
+    }
+    let default_rusthouse = current
+        .parent()
+        .ok_or_else(|| "benchmark executable has no parent directory".to_owned())?
+        .join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
+    let parsed = config::parse(
+        arguments,
+        env::var("RUSTHOUSE_CLICKHOUSE_BIN").ok(),
+        env::var("RUSTHOUSE_BIN").ok(),
+        default_rusthouse,
+    );
+    let Ok(ParseResult::Run(config)) = parsed else {
+        return Ok(None);
+    };
+    let Some(details) = config.details.as_deref() else {
+        return Ok(None);
+    };
+    DetailsDestination::open(
+        details,
+        &[
+            ("benchmark", current),
+            ("RustHouse", config.rusthouse.as_path()),
+            ("ClickHouse", config.clickhouse.as_path()),
+        ],
+    )
+    .map(Some)
+}
+
+fn run_deferred_details_test_hook() -> Result<Option<ExitCode>, String> {
+    if !cfg!(debug_assertions) {
+        return Ok(None);
+    }
+    let Some(contents) = env::var_os("RUSTHOUSE_TEST_GENERATED_DETAILS") else {
+        return Ok(None);
+    };
+    let path = deferred_details_path()?
+        .ok_or_else(|| "test details generation requires deferred publication".to_owned())?;
+    DetailsDestination::open(&path, &[])?.write(contents.as_encoded_bytes())?;
+    if let Some(ready) = env::var_os("RUSTHOUSE_TEST_GENERATED_DETAILS_READY_PATH") {
+        fs::write(ready, path.as_os_str().as_encoded_bytes())
+            .map_err(|error| format!("could not publish test details readiness: {error}"))?;
+    }
+    Ok(Some(ExitCode::SUCCESS))
+}
+
+fn delay_details_publication_for_test() -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    if let Some(ready) = env::var_os("RUSTHOUSE_TEST_DETAILS_PUBLICATION_READY_PATH") {
+        fs::write(ready, b"ready")
+            .map_err(|error| format!("could not publish test publication readiness: {error}"))?;
+    }
+    if let Some(delay) = env::var("RUSTHOUSE_TEST_DETAILS_PUBLICATION_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+    Ok(())
+}
+
 fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
     let current = env::current_exe()
         .map_err(|error| format!("cannot locate benchmark executable: {error}"))?;
@@ -318,6 +442,7 @@ fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
         return Ok(None);
     }
 
+    let details_destination = launcher_details_destination(&current)?;
     let parent = env::temp_dir();
     let directory = (0..100_u32)
         .find_map(|attempt| {
@@ -348,6 +473,9 @@ fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
         "clickhouse-parity-bench{}",
         env::consts::EXE_SUFFIX
     ));
+    let pending_details = directory.join(PENDING_DETAILS_FILE);
+    let child_status = directory.join(CHILD_STATUS_FILE);
+    let child_stdout = directory.join(CHILD_STDOUT_FILE);
     let result = (|| {
         fs::copy(&current, &staged)
             .map_err(|error| format!("could not stage benchmark harness: {error}"))?;
@@ -370,12 +498,26 @@ fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
             .parent()
             .ok_or_else(|| "benchmark executable has no parent directory".to_owned())?
             .join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
+        let mut stdout_capture = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&child_stdout)
+            .map_err(|error| format!("could not create benchmark stdout capture: {error}"))?;
+        let supervisor_stdout = stdout_capture
+            .try_clone()
+            .map_err(|error| format!("could not clone benchmark stdout capture: {error}"))?;
         let mut command = Command::new(&staged);
         command
             .args(env::args_os().skip(1))
             .env(HARNESS_LAUNCH_GUARD_ENV, &staged)
             .env(ORIGINAL_RUSTHOUSE_ENV, original_rusthouse)
-            .stdin(Stdio::piped());
+            .env_remove(DEFERRED_DETAILS_ENV)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(supervisor_stdout));
+        if details_destination.is_some() {
+            command.env(DEFERRED_DETAILS_ENV, &pending_details);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -388,13 +530,82 @@ fn run_staged_harness_if_needed() -> Result<Option<ExitCode>, String> {
             .stdin
             .take()
             .ok_or_else(|| "staged benchmark supervisor liveness pipe is unavailable".to_owned())?;
-        guardian
+        let completion = wait_for_child_completion(&mut guardian, &child_status);
+        let prepared = completion.and_then(|code| {
+            let details = if code == 0 && details_destination.is_some() {
+                Some(read_pending_details(&pending_details)?)
+            } else {
+                None
+            };
+            let mut stdout = Vec::new();
+            stdout_capture
+                .seek(std::io::SeekFrom::Start(0))
+                .and_then(|_| stdout_capture.read_to_end(&mut stdout))
+                .map_err(|error| format!("could not read completed benchmark output: {error}"))?;
+            Ok((code, details, stdout))
+        });
+        drop(_liveness);
+        let status = guardian
             .wait()
-            .map_err(|error| format!("could not wait for staged benchmark supervisor: {error}"))
+            .map_err(|error| format!("could not wait for staged benchmark supervisor: {error}"))?;
+        let (reported_code, details, stdout) = prepared?;
+        if status_code(status) != reported_code {
+            return Err("staged benchmark supervisor returned an inconsistent status".to_owned());
+        }
+        if let (Some(destination), Some(details)) = (&details_destination, details) {
+            delay_details_publication_for_test()?;
+            destination.write(&details)?;
+        }
+        io::stdout()
+            .write_all(&stdout)
+            .map_err(|error| format!("could not forward benchmark output: {error}"))?;
+        Ok(status)
     })();
     let _ = fs::remove_dir_all(&directory);
     let status = result?;
     Ok(Some(exit_code_from_status(status)))
+}
+
+fn wait_for_child_completion(guardian: &mut Child, path: &Path) -> Result<u8, String> {
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                return contents.trim().parse::<u8>().map_err(|_| {
+                    "staged benchmark returned an invalid completion status".to_owned()
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not read staged benchmark completion status: {error}"
+                ));
+            }
+        }
+        if guardian
+            .try_wait()
+            .map_err(|error| format!("could not monitor staged benchmark supervisor: {error}"))?
+            .is_some()
+        {
+            return Err("staged benchmark supervisor exited before completion".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn read_pending_details(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("completed benchmark omitted deferred details: {error}"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("could not inspect deferred details: {error}"))?
+        .is_file()
+    {
+        return Err("completed benchmark deferred details are not a regular file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read deferred benchmark details: {error}"))?;
+    Ok(bytes)
 }
 
 fn emit_benchmark_attestation() -> ExitCode {

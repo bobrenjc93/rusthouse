@@ -120,22 +120,25 @@ fn terminating_launcher_stops_benchmark_and_suppresses_report() {
     fs::create_dir(&directory).expect("cancellation test directory");
     let harness = directory.join("clickhouse-parity-bench");
     let details = directory.join("details.json");
-    let ready = directory.join("staged-harness-ready");
+    let ready = directory.join("generated-details-ready");
+    let rusthouse = directory.join("rusthouse");
+    let clickhouse = directory.join("clickhouse");
     fs::copy(env!("CARGO_BIN_EXE_clickhouse-parity-bench"), &harness)
         .expect("copy benchmark harness");
     fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).expect("harness permissions");
+    fs::write(&rusthouse, b"test RustHouse").expect("test RustHouse");
+    fs::write(&clickhouse, b"test ClickHouse").expect("test ClickHouse");
+    fs::write(&details, b"previous accepted report").expect("previous details");
     let mut launcher = Command::new(&harness)
-        .args([
-            "--quick",
-            "--rusthouse",
-            "/missing/rusthouse",
-            "--clickhouse",
-            "/missing/clickhouse",
-            "--details",
-        ])
+        .args(["--quick", "--rusthouse"])
+        .arg(&rusthouse)
+        .arg("--clickhouse")
+        .arg(&clickhouse)
+        .arg("--details")
         .arg(&details)
-        .env("RUSTHOUSE_TEST_STAGED_HARNESS_DELAY_MS", "5000")
-        .env("RUSTHOUSE_TEST_STAGED_HARNESS_READY_PATH", &ready)
+        .env("RUSTHOUSE_TEST_GENERATED_DETAILS", "{\"generated\":true}")
+        .env("RUSTHOUSE_TEST_DETAILS_PUBLICATION_READY_PATH", &ready)
+        .env("RUSTHOUSE_TEST_DETAILS_PUBLICATION_DELAY_MS", "5000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -162,7 +165,7 @@ fn terminating_launcher_stops_benchmark_and_suppresses_report() {
     while !ready.is_file() {
         assert!(
             Instant::now() < deadline,
-            "staged benchmark child did not start"
+            "launcher did not reach completed-report publication"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -177,8 +180,56 @@ fn terminating_launcher_stops_benchmark_and_suppresses_report() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(!details.exists(), "cancelled benchmark installed a report");
+    assert_eq!(
+        fs::read(&details).expect("previous details retained"),
+        b"previous accepted report",
+        "cancelled benchmark replaced the accepted report"
+    );
     fs::remove_dir_all(directory).expect("cleanup cancellation test");
+}
+
+#[cfg(unix)]
+#[test]
+fn live_launcher_publishes_completed_pending_report() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = env::temp_dir().join(format!(
+        "rusthouse-harness-publication-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir(&directory).expect("publication test directory");
+    let harness = directory.join("clickhouse-parity-bench");
+    let details = directory.join("details.json");
+    let rusthouse = directory.join("rusthouse");
+    let clickhouse = directory.join("clickhouse");
+    fs::copy(env!("CARGO_BIN_EXE_clickhouse-parity-bench"), &harness)
+        .expect("copy benchmark harness");
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).expect("harness permissions");
+    fs::write(&rusthouse, b"test RustHouse").expect("test RustHouse");
+    fs::write(&clickhouse, b"test ClickHouse").expect("test ClickHouse");
+
+    let output = Command::new(&harness)
+        .args(["--quick", "--rusthouse"])
+        .arg(&rusthouse)
+        .arg("--clickhouse")
+        .arg(&clickhouse)
+        .arg("--details")
+        .arg(&details)
+        .env("RUSTHOUSE_TEST_GENERATED_DETAILS", "{\"generated\":true}")
+        .output()
+        .expect("run benchmark with generated pending details");
+
+    assert!(
+        output.status.success(),
+        "deferred publication failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&details).expect("published details"),
+        b"{\"generated\":true}"
+    );
+    fs::remove_dir_all(directory).expect("cleanup publication test");
 }
 
 #[test]

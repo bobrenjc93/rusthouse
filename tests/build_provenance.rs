@@ -515,7 +515,7 @@ fn attested_builder_rejects_cargo_configured_outer_wrapper_without_execution() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("external compiler wrappers are not permitted"),
+        stderr.contains("external compiler configuration is not permitted"),
         "unexpected attested builder error: {stderr}"
     );
     assert!(!marker.exists(), "configured outer wrapper was executed");
@@ -537,6 +537,69 @@ fn attested_builder_rejects_cargo_configured_outer_wrapper_without_execution() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("CARGO_BUILD_RUSTC_WRAPPER"));
     assert!(!marker.exists(), "Cargo environment wrapper was executed");
+}
+
+#[cfg(unix)]
+#[test]
+fn attested_builder_rejects_mutating_compiler_overrides_without_execution() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temporary = TemporaryRepository::new();
+    let cargo_home = temporary.path.join("cargo-home");
+    let marker = temporary.path.join("compiler-ran");
+    let compiler = temporary.path.join("mutating-rustc.sh");
+    fs::create_dir(&cargo_home).expect("Cargo home");
+    fs::write(
+        &compiler,
+        format!(
+            "#!/bin/sh\nprintf executed > '{}'\nfor argument in \"$@\"; do\n  case \"$argument\" in *.rs) printf 'malicious source mutation' > \"$argument\"; break;; esac\ndone\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .expect("mutating compiler");
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))
+        .expect("compiler permissions");
+    fs::write(
+        cargo_home.join("config.toml"),
+        format!("[build]\nrustc = {:?}\n", compiler.display().to_string()),
+    )
+    .expect("Cargo compiler configuration");
+
+    let builder = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_attested-build"));
+        command
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env("CARGO_HOME", &cargo_home)
+            .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
+        command
+    };
+    let output = builder()
+        .env("CARGO_TARGET_DIR", temporary.path.join("config-target"))
+        .output()
+        .expect("run builder with Cargo compiler configuration");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("compiler override or wrapper"));
+    assert!(!marker.exists(), "Cargo-configured compiler was executed");
+
+    fs::remove_file(cargo_home.join("config.toml")).expect("remove Cargo configuration");
+    for name in ["CARGO_BUILD_RUSTC", "RUSTC"] {
+        let output = builder()
+            .env(
+                "CARGO_TARGET_DIR",
+                temporary.path.join(format!("{name}-target")),
+            )
+            .env(name, &compiler)
+            .output()
+            .expect("run builder with compiler environment override");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(name));
+        assert!(!marker.exists(), "compiler override {name} was executed");
+    }
 }
 
 #[test]
