@@ -207,7 +207,7 @@ fn sorter_success_is_monotonic_across_capacity_boundaries() {
         ))
         .expect("setup succeeds");
 
-    for memory in [320, 336, 352] {
+    for memory in [352, 368, 384] {
         database.set_limits(ExecutionLimits {
             max_memory_bytes: memory,
             ..ExecutionLimits::default()
@@ -362,6 +362,47 @@ fn grouped_string_values_are_checked_before_clone_and_group_growth() {
         }) if actual > 512
     ));
     assert!(database.last_execution_stats().peak_memory_bytes <= 512);
+}
+
+#[test]
+fn predicate_literals_are_borrowed_and_compiled_nodes_are_bounded() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE predicate_values (label String)")
+        .expect("setup succeeds");
+    query(&mut database, "SELECT label FROM predicate_values LIMIT 0");
+    let baseline_memory = database.last_execution_stats().peak_memory_bytes;
+    let memory_limit = baseline_memory.saturating_add(64);
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: memory_limit,
+        ..ExecutionLimits::default()
+    });
+
+    let large_literal = "x".repeat(2 * 1024 * 1024);
+    let result = query(
+        &mut database,
+        &format!(
+            "SELECT label FROM predicate_values
+             WHERE label = '{large_literal}' LIMIT 0"
+        ),
+    );
+    assert!(result.rows.is_empty());
+    assert!(database.last_execution_stats().peak_memory_bytes <= memory_limit);
+
+    let compound = std::iter::repeat_n("label = 'x'", 100)
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    assert!(matches!(
+        database.execute(&format!(
+            "SELECT label FROM predicate_values WHERE {compound} LIMIT 0"
+        )),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit,
+            actual
+        }) if limit == memory_limit && actual > limit
+    ));
+    assert!(database.last_execution_stats().peak_memory_bytes <= memory_limit);
 }
 
 #[test]

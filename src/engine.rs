@@ -5,10 +5,7 @@ use std::fs::{File, OpenOptions, remove_file};
 use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
-};
+use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Resource, Result};
@@ -196,6 +193,12 @@ impl Database {
         context: &mut ExecutionContext<'_>,
     ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
+        let predicate_memory = select
+            .predicate
+            .as_ref()
+            .map(predicate_heap_memory)
+            .unwrap_or(0);
+        context.reserve_memory(predicate_memory)?;
         let predicate = select
             .predicate
             .as_ref()
@@ -254,6 +257,8 @@ impl Database {
         drop(aggregate_specs);
         drop(items);
         drop(group_columns);
+        drop(predicate);
+        context.release_memory(predicate_memory);
         context.release_memory(planning_memory);
 
         Ok(QueryResult {
@@ -1104,8 +1109,6 @@ fn project_grouped_rows(
     Ok(rows)
 }
 
-static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(0);
-
 struct IndexSorter<F> {
     compare: F,
     chunk_capacity: usize,
@@ -1317,14 +1320,14 @@ where
 
 struct TempRun {
     directory: Arc<PathBuf>,
-    id: u64,
+    id: u128,
     rows: usize,
 }
 
 impl TempRun {
     fn create(directory: &Arc<PathBuf>, rows: usize) -> Result<(Self, File)> {
         for _ in 0..100 {
-            let id = NEXT_SPILL_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            let id = next_spill_id()?;
             let path = spill_path(directory, id);
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -1369,8 +1372,15 @@ fn open_runs(runs: &[TempRun]) -> Result<Vec<File>> {
         .collect()
 }
 
-fn spill_path(directory: &Path, id: u64) -> PathBuf {
-    directory.join(format!(".rusthouse-spill-{}-{id}", std::process::id()))
+fn next_spill_id() -> Result<u128> {
+    let mut bytes = [0; size_of::<u128>()];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| Error::SpillIo(format!("generating a secure run name: {error}")))?;
+    Ok(u128::from_le_bytes(bytes))
+}
+
+fn spill_path(directory: &Path, id: u128) -> PathBuf {
+    directory.join(format!(".rusthouse-spill-{id:032x}"))
 }
 
 fn write_index(file: &mut File, index: usize) -> Result<()> {
@@ -1414,17 +1424,17 @@ fn spill_error(operation: &str, error: std::io::Error) -> Error {
 }
 
 #[derive(Debug)]
-enum CompiledPredicate {
+enum CompiledPredicate<'a> {
     Comparison {
-        left: CompiledOperand,
+        left: CompiledOperand<'a>,
         operator: ComparisonOperator,
-        right: CompiledOperand,
+        right: CompiledOperand<'a>,
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
 
-impl CompiledPredicate {
+impl CompiledPredicate<'_> {
     fn evaluate(&self, table: &Table, row: usize) -> bool {
         match self {
             Self::Comparison {
@@ -1453,12 +1463,12 @@ impl CompiledPredicate {
 }
 
 #[derive(Debug)]
-enum CompiledOperand {
+enum CompiledOperand<'a> {
     Column { index: usize, data_type: DataType },
-    Literal(Value),
+    Literal(&'a Value),
 }
 
-impl CompiledOperand {
+impl CompiledOperand<'_> {
     fn data_type(&self) -> DataType {
         match self {
             Self::Column { data_type, .. } => *data_type,
@@ -1474,7 +1484,22 @@ impl CompiledOperand {
     }
 }
 
-fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+fn predicate_heap_memory(predicate: &Predicate) -> usize {
+    fn node_count(predicate: &Predicate) -> usize {
+        match predicate {
+            Predicate::Comparison { .. } => 1,
+            Predicate::And(left, right) | Predicate::Or(left, right) => 1usize
+                .saturating_add(node_count(left))
+                .saturating_add(node_count(right)),
+        }
+    }
+
+    node_count(predicate)
+        .saturating_sub(1)
+        .saturating_mul(size_of::<CompiledPredicate<'_>>())
+}
+
+fn compile_predicate<'a>(table: &Table, predicate: &'a Predicate) -> Result<CompiledPredicate<'a>> {
     match predicate {
         Predicate::Comparison {
             left,
@@ -1507,7 +1532,7 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
     }
 }
 
-fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
+fn compile_operand<'a>(table: &Table, operand: &'a Operand) -> Result<CompiledOperand<'a>> {
     match operand {
         Operand::Column(name) => {
             let index = table.column_index(name)?;
@@ -1516,7 +1541,7 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
                 data_type: table.schema()[index].data_type,
             })
         }
-        Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+        Operand::Literal(value) => Ok(CompiledOperand::Literal(value)),
     }
 }
 
@@ -1591,5 +1616,31 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn predictable_spill_entries_cannot_exhaust_name_retries() {
+        let directory = std::env::temp_dir().join(format!(
+            "rusthouse-spill-name-test-{}-{}",
+            std::process::id(),
+            next_spill_id().expect("secure test directory suffix")
+        ));
+        std::fs::create_dir(&directory).expect("create spill test directory");
+        let predictable = (0..100)
+            .map(|id| directory.join(format!(".rusthouse-spill-{}-{id}", std::process::id())))
+            .collect::<Vec<_>>();
+        for path in &predictable {
+            File::create(path).expect("pre-create old predictable spill entry");
+        }
+
+        let directory = Arc::new(directory);
+        let (run, file) = TempRun::create(&directory, 0)
+            .expect("unpredictable spill name ignores pre-created entries");
+        drop(file);
+        drop(run);
+        for path in predictable {
+            remove_file(path).expect("remove predictable entry");
+        }
+        std::fs::remove_dir(directory.as_ref()).expect("remove spill test directory");
     }
 }

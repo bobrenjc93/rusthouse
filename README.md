@@ -1,6 +1,6 @@
 # RustHouse
 
-RustHouse is a small, dependency-free analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
+RustHouse is a small analytical SQL engine written in Rust. It keeps tables in memory and stores each field in a contiguous, typed column (Vec<i64>, Vec<f64>, Vec<bool>, or Vec<String>).
 
 ## What works
 
@@ -133,8 +133,9 @@ the system temporary directory when their index buffer reaches the memory
 budget. Run metadata uses a charged, fixed-capacity vector, and the two smallest
 runs merge whenever a third run is retained. This bounds metadata and live file
 count independently of input size while keeping merges balanced. Runs use
-exclusive creation and are removed on success or error. Applications that need
-a controlled location can use `Database::with_limits_and_spill_directory`.
+keyed-random 128-bit names, exclusive creation, and owner-only permissions, and
+are removed on success or error. Applications that need a controlled location
+can use `Database::with_limits_and_spill_directory`.
 
 The memory limit accounts for transient executor-owned index buffers, grouped
 values, and every retained result allocation, including batch/result vectors,
@@ -148,6 +149,10 @@ Planning vectors for expanded projections, grouping, aggregate specifications,
 and ordering reserve their actual capacity before allocation and are released
 after execution. Group keys, aggregate-state/output vectors, string extrema,
 and grouped-row capacity follow the same pre-allocation accounting.
+
+Compiled predicate nodes reserve their boxed-node footprint before allocation.
+Literal values are borrowed from the bounded parser output rather than cloned,
+so large string predicates do not create a second copy during execution.
 
 String `MIN` and `MAX` states retain source row indices while scanning and clone
 only the final extremum, so discarded candidates do not allocate executor
@@ -169,9 +174,10 @@ On empty input, COUNT and SUM return numeric zero. MIN, MAX, and AVG return an a
 
 ## Development
 
-The crate has no third-party dependencies. Rust 1.85 is the minimum supported
-version; `rust-toolchain.toml` pins Rust 1.92.0, rustfmt, and Clippy for
-reproducible development and CI.
+The only runtime dependency is `getrandom`, used to source OS entropy for secure
+spill filenames. Rust 1.85 is the minimum supported version;
+`rust-toolchain.toml` pins Rust 1.92.0, rustfmt, and Clippy for reproducible
+development and CI.
 
 Run the complete quality gates with:
 
