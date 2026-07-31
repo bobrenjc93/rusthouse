@@ -196,6 +196,37 @@ class GenerationTests(unittest.TestCase):
             svg_path.write_text(burner_history.render_svg(history), encoding="utf-8")
             burner_history.check_artifacts(history_path, svg_path)
 
+    def test_check_cli_rejects_crlf_history_and_svg(self) -> None:
+        history = burner_history.validate_history(example_history())
+        history_lf = burner_history.encode_history(history)
+        svg_lf = burner_history.render_svg(history)
+        with tempfile.TemporaryDirectory() as directory:
+            history_path = Path(directory) / "history.json"
+            svg_path = Path(directory) / "progress.svg"
+            arguments = [
+                "check",
+                "--history",
+                str(history_path),
+                "--svg",
+                str(svg_path),
+            ]
+
+            history_path.write_bytes(history_lf.replace("\n", "\r\n").encode("utf-8"))
+            svg_path.write_bytes(svg_lf.encode("utf-8"))
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                status = burner_history.main(arguments)
+            self.assertEqual(status, 2)
+            self.assertIn("is valid but not canonical", stderr.getvalue())
+
+            history_path.write_bytes(history_lf.encode("utf-8"))
+            svg_path.write_bytes(svg_lf.replace("\n", "\r\n").encode("utf-8"))
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                status = burner_history.main(arguments)
+            self.assertEqual(status, 2)
+            self.assertIn("is stale", stderr.getvalue())
+
     def test_cli_failure_is_visible_and_nonzero(self) -> None:
         history = example_history()
         with tempfile.TemporaryDirectory() as directory:

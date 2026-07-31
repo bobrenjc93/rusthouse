@@ -16,6 +16,7 @@ from typing import Any, NoReturn
 
 SCHEMA_VERSION = 2
 MAX_FILE_BYTES = 1_048_576
+MAX_SVG_BYTES = 16_777_216
 MAX_EVALUATIONS = 100
 MAX_POINTS = 1_000
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -93,19 +94,26 @@ def parse_json(raw: str, source: str) -> Any:
         _fail(f"{source} is malformed JSON at line {error.lineno}, column {error.colno}: {error.msg}")
 
 
+def _read_utf8(path: Path, maximum_bytes: int, artifact: str) -> str:
+    """Read bounded bytes and decode UTF-8 without newline translation."""
+
+    try:
+        with path.open("rb") as source:
+            raw = source.read(maximum_bytes + 1)
+    except OSError as error:
+        _fail(f"cannot read {path}: {error}")
+    if len(raw) > maximum_bytes:
+        _fail(f"{path} exceeds the {maximum_bytes}-byte {artifact} limit")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        _fail(f"cannot decode {path} as UTF-8: {error}")
+
+
 def load_json(path: Path) -> tuple[Any, str]:
     """Read a size-bounded UTF-8 JSON document."""
 
-    try:
-        size = path.stat().st_size
-    except OSError as error:
-        _fail(f"cannot stat {path}: {error}")
-    if size > MAX_FILE_BYTES:
-        _fail(f"{path} exceeds the {MAX_FILE_BYTES}-byte history limit")
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        _fail(f"cannot read {path} as UTF-8: {error}")
+    raw = _read_utf8(path, MAX_FILE_BYTES, "JSON")
     return parse_json(raw, str(path)), raw
 
 
@@ -452,10 +460,10 @@ def _atomic_write(path: Path, contents: str) -> None:
     temporary_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="\n", dir=path.parent, delete=False
+            mode="wb", dir=path.parent, delete=False
         ) as temporary:
             temporary_name = temporary.name
-            temporary.write(contents)
+            temporary.write(contents.encode("utf-8"))
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_name, path)
@@ -477,10 +485,7 @@ def check_artifacts(history_path: Path, svg_path: Path) -> None:
     if raw_history != expected_history:
         _fail(f"{history_path} is valid but not canonical; run the render command")
     expected_svg = render_svg(validated)
-    try:
-        actual_svg = svg_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        _fail(f"cannot read {svg_path}: {error}")
+    actual_svg = _read_utf8(svg_path, MAX_SVG_BYTES, "SVG")
     if actual_svg != expected_svg:
         _fail(f"{svg_path} is stale; run the render command")
 
