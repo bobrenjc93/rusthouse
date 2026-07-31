@@ -80,17 +80,26 @@ impl EnginePaths {
     pub fn pin_and_validate(
         &self,
         expected: BuildInfo,
+        expected_rusthouse_sha256: &str,
     ) -> Result<(Self, RunIdentity, PinnedExecutables), String> {
         let pinned = PinnedExecutables::create(self)?;
         let paths = pinned.paths();
-        let identity = paths.validate(expected)?;
+        let identity = paths.validate(expected, expected_rusthouse_sha256)?;
         Ok((paths, identity, pinned))
     }
 
-    pub fn validate(&self, expected: BuildInfo) -> Result<RunIdentity, String> {
-        let rusthouse = validate_rusthouse(&self.rusthouse)?;
+    pub fn validate(
+        &self,
+        expected: BuildInfo,
+        expected_rusthouse_sha256: &str,
+    ) -> Result<RunIdentity, String> {
+        let rusthouse_sha256 =
+            validate_executable_sha256(&self.rusthouse, "RustHouse", expected_rusthouse_sha256)?;
+        let clickhouse_sha256 =
+            validate_executable_sha256(&self.clickhouse, "ClickHouse", CLICKHOUSE_SHA256)?;
+        let rusthouse = validate_rusthouse(&self.rusthouse, rusthouse_sha256)?;
         validate_rusthouse_build(&rusthouse, expected)?;
-        let clickhouse = validate_clickhouse(&self.clickhouse)?;
+        let clickhouse = validate_clickhouse(&self.clickhouse, clickhouse_sha256)?;
         let host = validate_host(&rusthouse)?;
         Ok(RunIdentity {
             rusthouse,
@@ -99,8 +108,13 @@ impl EnginePaths {
         })
     }
 
-    pub fn revalidate(&self, expected: BuildInfo, original: &RunIdentity) -> Result<(), String> {
-        let current = self.validate(expected)?;
+    pub fn revalidate(
+        &self,
+        expected: BuildInfo,
+        expected_rusthouse_sha256: &str,
+        original: &RunIdentity,
+    ) -> Result<(), String> {
+        let current = self.validate(expected, expected_rusthouse_sha256)?;
         ensure_identity_unchanged(original, &current)
     }
 
@@ -282,10 +296,7 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
         )
     })?;
 
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(destination)
+    fs::File::open(destination)
         .and_then(|file| file.sync_all())
         .map_err(|error| {
             format!(
@@ -397,8 +408,7 @@ impl Engine {
     }
 }
 
-fn validate_rusthouse(path: &Path) -> Result<RustHouseIdentity, String> {
-    let sha256 = sha256::file_digest_hex(path)?;
+fn validate_rusthouse(path: &Path, sha256: String) -> Result<RustHouseIdentity, String> {
     let output = Command::new(path)
         .arg("--benchmark-attestation")
         .output()
@@ -577,7 +587,7 @@ fn validate_host(rusthouse: &RustHouseIdentity) -> Result<HostIdentity, String> 
     })
 }
 
-fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
+fn validate_clickhouse(path: &Path, sha256: String) -> Result<ClickHouseIdentity, String> {
     let output = Command::new(path)
         .args(["local", "--version"])
         .output()
@@ -604,20 +614,31 @@ fn validate_clickhouse(path: &Path) -> Result<ClickHouseIdentity, String> {
         ));
     }
 
-    let sha256 = sha256::file_digest_hex(path)?;
-
-    if sha256 != CLICKHOUSE_SHA256 {
-        return Err(format!(
-            "ClickHouse checksum mismatch: expected {CLICKHOUSE_SHA256}, got {sha256}"
-        ));
-    }
-
     Ok(ClickHouseIdentity {
         version_output,
         sha256,
         artifact_url: CLICKHOUSE_ARTIFACT_URL,
         artifact_platform: CLICKHOUSE_ARTIFACT_PLATFORM,
     })
+}
+
+fn validate_executable_sha256(path: &Path, name: &str, expected: &str) -> Result<String, String> {
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{name} expected SHA-256 is unavailable or malformed; rebuild with `cargo run --bin attested-build`"
+        ));
+    }
+    let actual = sha256::file_digest_hex(path)?;
+    if actual != expected {
+        return Err(format!(
+            "{name} checksum mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(actual)
 }
 
 fn summarize_stderr(stderr: &[u8]) -> String {
@@ -757,5 +778,93 @@ mod tests {
         drop(pinned);
         assert!(!pinned_directory.exists());
         fs::remove_dir_all(source_directory).expect("cleanup sources");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_executables_can_be_pinned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source_directory = env::temp_dir().join(format!(
+            "rusthouse-read-only-pinning-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&source_directory);
+        fs::create_dir(&source_directory).expect("source directory");
+        let sources = EnginePaths {
+            rusthouse: source_directory.join("rusthouse"),
+            clickhouse: source_directory.join("clickhouse"),
+        };
+        fs::write(&sources.rusthouse, b"read-only rusthouse").expect("rusthouse source");
+        fs::write(&sources.clickhouse, b"read-only clickhouse").expect("clickhouse source");
+        fs::set_permissions(&sources.rusthouse, fs::Permissions::from_mode(0o555))
+            .expect("read-only rusthouse");
+        fs::set_permissions(&sources.clickhouse, fs::Permissions::from_mode(0o555))
+            .expect("read-only clickhouse");
+
+        let pinned = PinnedExecutables::create(&sources).expect("pin read-only executables");
+        let pinned_paths = pinned.paths();
+        assert_eq!(
+            fs::read(&pinned_paths.rusthouse).expect("pinned rusthouse"),
+            b"read-only rusthouse"
+        );
+        assert_eq!(
+            fs::read(&pinned_paths.clickhouse).expect("pinned clickhouse"),
+            b"read-only clickhouse"
+        );
+        drop(pinned);
+        fs::remove_dir_all(source_directory).expect("cleanup sources");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checksum_failures_do_not_execute_staged_binaries() {
+        let source_directory = env::temp_dir().join(format!(
+            "rusthouse-non-execution-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&source_directory);
+        fs::create_dir(&source_directory).expect("source directory");
+        let sources = EnginePaths {
+            rusthouse: source_directory.join("rusthouse"),
+            clickhouse: source_directory.join("clickhouse"),
+        };
+        write_marker_script(&sources.rusthouse);
+        write_marker_script(&sources.clickhouse);
+
+        let pinned = PinnedExecutables::create(&sources).expect("pinned scripts");
+        let paths = pinned.paths();
+        let expected_rusthouse = sha256::file_digest_hex(&paths.rusthouse).expect("rusthouse hash");
+        let error = paths
+            .validate(build_info(), &expected_rusthouse)
+            .expect_err("ClickHouse checksum mismatch must fail");
+        assert!(error.contains("ClickHouse checksum mismatch"));
+        assert!(!marker_path(&paths.rusthouse).exists());
+        assert!(!marker_path(&paths.clickhouse).exists());
+
+        let error = paths
+            .validate(build_info(), &"b".repeat(64))
+            .expect_err("RustHouse checksum mismatch must fail");
+        assert!(error.contains("RustHouse checksum mismatch"));
+        assert!(!marker_path(&paths.rusthouse).exists());
+        assert!(!marker_path(&paths.clickhouse).exists());
+
+        drop(pinned);
+        fs::remove_dir_all(source_directory).expect("cleanup sources");
+    }
+
+    #[cfg(unix)]
+    fn write_marker_script(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::write(path, "#!/bin/sh\ntouch \"${0}.ran\"\n").expect("marker script");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("executable script");
+    }
+
+    #[cfg(unix)]
+    fn marker_path(path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.ran", path.display()))
     }
 }
