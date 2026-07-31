@@ -117,9 +117,11 @@ truth. After each successful Burner PR merge, Burner automation passes the PR
 number, full merge SHA, merge timestamp, title, and complete enabled-evaluation
 score map to `python3 scripts/burner_history.py update`. The command validates
 the schema, upserts the merge by its `pr:<number>` key so retries cannot create
-duplicates, and deterministically regenerates this SVG. Evaluations introduced
-later declare the preceding history point in `introducedAfter`, so older points
-correctly omit those scores while the first subsequent merge requires them.
+duplicates, serializes concurrent merge hooks, and transactionally regenerates
+both tracked artifacts. Equal merge timestamps are ordered by numeric PR number.
+Evaluations introduced later declare the preceding history point in
+`introducedAfter`, so older points correctly omit those scores while the first
+subsequent merge requires them.
 
 The merge automation interface is:
 

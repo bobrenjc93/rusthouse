@@ -5,11 +5,14 @@ from __future__ import annotations
 import copy
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as element_tree
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 from scripts import burner_history
 
@@ -106,7 +109,7 @@ class SchemaTests(unittest.TestCase):
 
         unordered = example_history()
         unordered["points"][1]["recordedAt"] = "2025-12-31T00:00:00.000Z"  # type: ignore[index]
-        with self.assertRaisesRegex(burner_history.HistoryError, "later than the preceding point"):
+        with self.assertRaisesRegex(burner_history.HistoryError, "must be ordered"):
             burner_history.validate_history(unordered)
 
     def test_tracking_metadata_must_match_baseline(self) -> None:
@@ -172,6 +175,127 @@ class GenerationTests(unittest.TestCase):
             [point["key"] for point in updated["points"]],
             [f"base:{BASE_SHA}", "pr:2", "pr:1"],
         )
+
+    def test_equal_timestamps_use_pr_order_and_retry_stably(self) -> None:
+        scores = {"eval_aaaaaaaa": 92, "eval_bbbbbbbb": 91}
+        updated = burner_history.upsert_merge(
+            example_history(),
+            pr_number=2,
+            merge_sha=MERGE_TWO_SHA,
+            recorded_at="2026-01-02T00:00:00.000Z",
+            title="Second merge",
+            scores=scores,
+        )
+        retried = burner_history.upsert_merge(
+            updated,
+            pr_number=2,
+            merge_sha=MERGE_TWO_SHA,
+            recorded_at="2026-01-02T00:00:00.000Z",
+            title="Second merge",
+            scores=scores,
+        )
+        self.assertEqual(updated, retried)
+        self.assertEqual(
+            [point["key"] for point in retried["points"]],
+            [f"base:{BASE_SHA}", "pr:1", "pr:2"],
+        )
+        reversed_tie = copy.deepcopy(retried)
+        reversed_tie["points"][1:3] = reversed(reversed_tie["points"][1:3])
+        with self.assertRaisesRegex(burner_history.HistoryError, "must be ordered"):
+            burner_history.validate_history(reversed_tie)
+
+    def test_concurrent_cli_updates_preserve_every_tied_merge(self) -> None:
+        history = burner_history.validate_history(example_history())
+        scores = {"eval_aaaaaaaa": 92, "eval_bbbbbbbb": 91}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            svg_path = root / "progress.svg"
+            scores_path = root / "scores.json"
+            history_path.write_bytes(burner_history.encode_history(history).encode("utf-8"))
+            svg_path.write_bytes(burner_history.render_svg(history).encode("utf-8"))
+            scores_path.write_text(json.dumps(scores), encoding="utf-8")
+
+            commands = []
+            for pr_number in range(2, 6):
+                commands.append(
+                    [
+                        sys.executable,
+                        str(Path(burner_history.__file__).resolve()),
+                        "update",
+                        "--history",
+                        str(history_path),
+                        "--svg",
+                        str(svg_path),
+                        "--pr-number",
+                        str(pr_number),
+                        "--merge-sha",
+                        f"{pr_number:040x}",
+                        "--recorded-at",
+                        "2026-01-03T00:00:00.000Z",
+                        "--title",
+                        f"Concurrent merge {pr_number}",
+                        "--scores-file",
+                        str(scores_path),
+                    ]
+                )
+            processes = [
+                subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for command in commands
+            ]
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, f"{stdout}\n{stderr}")
+
+            retry = subprocess.run(commands[0], capture_output=True, text=True, timeout=10)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            burner_history.check_artifacts(history_path, svg_path)
+            document, _ = burner_history.load_json(history_path)
+            self.assertEqual(
+                [point["key"] for point in document["points"]],
+                [f"base:{BASE_SHA}", "pr:1", "pr:2", "pr:3", "pr:4", "pr:5"],
+            )
+            self.assertEqual(list(root.glob(".*.burner-*")), [])
+
+    def test_second_artifact_failure_rolls_back_exact_pair(self) -> None:
+        history = burner_history.validate_history(example_history())
+        updated = burner_history.upsert_merge(
+            history,
+            pr_number=2,
+            merge_sha=MERGE_TWO_SHA,
+            recorded_at="2026-01-03T00:00:00.000Z",
+            title="Second merge",
+            scores={"eval_aaaaaaaa": 92, "eval_bbbbbbbb": 91},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            svg_path = root / "progress.svg"
+            history_path.write_bytes(burner_history.encode_history(history).encode("utf-8"))
+            svg_path.write_bytes(burner_history.render_svg(history).encode("utf-8"))
+            old_pair = history_path.read_bytes(), svg_path.read_bytes()
+            real_replace = burner_history.os.replace
+            failed = False
+
+            def fail_second_target(source: object, destination: object) -> None:
+                nonlocal failed
+                if Path(destination) == svg_path and not failed:
+                    failed = True
+                    raise OSError("injected SVG replacement failure")
+                real_replace(source, destination)
+
+            with mock.patch.object(burner_history.os, "replace", side_effect=fail_second_target):
+                with self.assertRaisesRegex(burner_history.HistoryError, "rolled back"):
+                    burner_history._write_artifacts_transactionally(
+                        history_path,
+                        burner_history.encode_history(updated),
+                        svg_path,
+                        burner_history.render_svg(updated),
+                    )
+
+            self.assertEqual((history_path.read_bytes(), svg_path.read_bytes()), old_pair)
+            burner_history.check_artifacts(history_path, svg_path)
+            self.assertEqual(list(root.glob(".*.burner-*")), [])
 
     def test_svg_is_deterministic_fixed_scale_and_xml_escaped(self) -> None:
         history = burner_history.validate_history(example_history())

@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import html
 import json
 import os
 import re
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Iterator, NoReturn
 
 SCHEMA_VERSION = 2
 MAX_FILE_BYTES = 1_048_576
@@ -94,8 +97,8 @@ def parse_json(raw: str, source: str) -> Any:
         _fail(f"{source} is malformed JSON at line {error.lineno}, column {error.colno}: {error.msg}")
 
 
-def _read_utf8(path: Path, maximum_bytes: int, artifact: str) -> str:
-    """Read bounded bytes and decode UTF-8 without newline translation."""
+def _read_bytes(path: Path, maximum_bytes: int, artifact: str) -> bytes:
+    """Read a size-bounded artifact without newline translation."""
 
     try:
         with path.open("rb") as source:
@@ -104,6 +107,13 @@ def _read_utf8(path: Path, maximum_bytes: int, artifact: str) -> str:
         _fail(f"cannot read {path}: {error}")
     if len(raw) > maximum_bytes:
         _fail(f"{path} exceeds the {maximum_bytes}-byte {artifact} limit")
+    return raw
+
+
+def _read_utf8(path: Path, maximum_bytes: int, artifact: str) -> str:
+    """Read bounded bytes and decode UTF-8 without newline translation."""
+
+    raw = _read_bytes(path, maximum_bytes, artifact)
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -180,6 +190,7 @@ def validate_history(document: Any) -> dict[str, Any]:
     pr_numbers: set[int] = set()
     commit_shas: set[str] = set()
     point_times: list[datetime] = []
+    point_order_keys: list[tuple[datetime, int, int]] = []
     for index, raw_point in enumerate(points):
         location = f"history.points[{index}]"
         point = _expect_object(raw_point, location)
@@ -197,8 +208,6 @@ def validate_history(document: Any) -> dict[str, Any]:
             _fail(f"duplicate point key {key!r}")
         point_keys.add(key)
         point_time = _parse_timestamp(point["recordedAt"], f"{location}.recordedAt")
-        if point_times and point_time <= point_times[-1]:
-            _fail(f"{location}.recordedAt must be later than the preceding point")
         point_times.append(point_time)
         _expect_string(point["title"], f"{location}.title")
 
@@ -212,6 +221,7 @@ def validate_history(document: Any) -> dict[str, Any]:
                 _fail(f"{location}.key must be base:<commitSha>")
             if point["label"] != f"base {commit_sha[:7]}":
                 _fail(f"{location}.label must be base followed by the short commit SHA")
+            secondary_order = (0, 0)
         else:
             pr_number = point["prNumber"]
             if isinstance(pr_number, bool) or not isinstance(pr_number, int) or not 0 < pr_number <= 2_147_483_647:
@@ -226,6 +236,13 @@ def validate_history(document: Any) -> dict[str, Any]:
             commit_sha = _expect_string(point["mergeSha"], f"{location}.mergeSha", 40)
             if not SHA_RE.fullmatch(commit_sha):
                 _fail(f"{location}.mergeSha must be a full lowercase Git SHA")
+            secondary_order = (1, pr_number)
+        point_order_key = (point_time, *secondary_order)
+        if point_order_keys and point_order_key <= point_order_keys[-1]:
+            _fail(
+                f"{location} must be ordered by recordedAt, then by numeric PR number for ties"
+            )
+        point_order_keys.append(point_order_key)
         if commit_sha in commit_shas:
             _fail(f"duplicate commit SHA {commit_sha}")
         commit_shas.add(commit_sha)
@@ -448,25 +465,53 @@ def upsert_merge(
         existing for existing in updated["points"] if existing["key"] != point["key"]
     ]
     updated["points"].append(point)
-    updated["points"].sort(
-        key=lambda existing: _parse_timestamp(existing["recordedAt"], "point.recordedAt")
-    )
+    updated["points"].sort(key=_point_order_key)
     validate_history(updated)
     return canonicalize(updated)
 
 
-def _atomic_write(path: Path, contents: str) -> None:
+def _point_order_key(point: dict[str, Any]) -> tuple[datetime, int, int]:
+    """Return the total chronological order used by validation and updates."""
+
+    timestamp = _parse_timestamp(point["recordedAt"], "point.recordedAt")
+    if point["kind"] == "baseline":
+        return timestamp, 0, 0
+    return timestamp, 1, point["prNumber"]
+
+
+def _sidecar(path: Path, suffix: str) -> Path:
+    return path.with_name(f".{path.name}.{suffix}")
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+        os.fsync(descriptor)
+    except OSError as error:
+        _fail(f"cannot synchronize directory {directory}: {error}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_temporary(path: Path, contents: bytes) -> str:
+    """Write and synchronize a same-directory replacement file."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=path.parent, delete=False
-        ) as temporary:
+        try:
+            mode = path.stat().st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o644
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as temporary:
             temporary_name = temporary.name
-            temporary.write(contents.encode("utf-8"))
+            os.chmod(temporary_name, mode)
+            temporary.write(contents)
             temporary.flush()
             os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
+        return temporary_name
     except OSError as error:
         if temporary_name is not None:
             try:
@@ -476,9 +521,211 @@ def _atomic_write(path: Path, contents: str) -> None:
         _fail(f"cannot write {path}: {error}")
 
 
-def check_artifacts(history_path: Path, svg_path: Path) -> None:
-    """Validate source data and require both artifacts to be reproducible."""
+def _replace_bytes(path: Path, contents: bytes) -> None:
+    temporary_name = _write_temporary(path, contents)
+    try:
+        os.replace(temporary_name, path)
+        _fsync_directory(path.parent)
+    except OSError as error:
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        _fail(f"cannot replace {path}: {error}")
 
+
+def _remove_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        _fail(f"cannot remove transaction file {path}: {error}")
+
+
+def _transaction_paths(history_path: Path, svg_path: Path) -> tuple[Path, Path, Path]:
+    return (
+        _sidecar(history_path, "burner-transaction"),
+        _sidecar(history_path, "burner-backup"),
+        _sidecar(svg_path, "burner-backup"),
+    )
+
+
+def _ensure_safe_artifact_paths(history_path: Path, svg_path: Path) -> None:
+    marker, history_backup, svg_backup = _transaction_paths(history_path, svg_path)
+    paths = (history_path, svg_path, marker, history_backup, svg_backup)
+    resolved = [path.resolve() for path in paths]
+    if len(set(resolved)) != len(resolved):
+        _fail("history, SVG, and transaction sidecar paths must all be different")
+
+
+def _transaction_record(
+    state: str,
+    history_path: Path,
+    svg_path: Path,
+    history_existed: bool,
+    svg_existed: bool,
+) -> bytes:
+    return (
+        json.dumps(
+            {
+                "version": 1,
+                "state": state,
+                "history": str(history_path.resolve()),
+                "svg": str(svg_path.resolve()),
+                "historyExisted": history_existed,
+                "svgExisted": svg_existed,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _restore_target(path: Path, backup: Path, existed: bool, maximum_bytes: int) -> None:
+    if existed:
+        if not backup.is_file():
+            _fail(f"transaction backup is missing: {backup}")
+        _replace_bytes(path, _read_bytes(backup, maximum_bytes, "transaction backup"))
+    else:
+        _remove_file(path)
+        _fsync_directory(path.parent)
+
+
+def _recover_transaction(history_path: Path, svg_path: Path) -> str:
+    """Recover or finalize an interrupted artifact-pair transaction."""
+
+    _ensure_safe_artifact_paths(history_path, svg_path)
+    marker, history_backup, svg_backup = _transaction_paths(history_path, svg_path)
+    if not marker.exists():
+        _remove_file(history_backup)
+        _remove_file(svg_backup)
+        return "none"
+
+    record = _expect_object(
+        parse_json(_read_utf8(marker, 4_096, "transaction marker"), str(marker)),
+        "transaction marker",
+    )
+    _expect_keys(
+        record,
+        {"version", "state", "history", "svg", "historyExisted", "svgExisted"},
+        "transaction marker",
+    )
+    if record["version"] != 1 or record["state"] not in {"prepared", "committed"}:
+        _fail(f"invalid transaction marker state in {marker}")
+    if record["history"] != str(history_path.resolve()) or record["svg"] != str(svg_path.resolve()):
+        _fail(f"transaction marker {marker} belongs to different artifact paths")
+    if not isinstance(record["historyExisted"], bool) or not isinstance(record["svgExisted"], bool):
+        _fail(f"invalid existence flags in transaction marker {marker}")
+
+    if record["state"] == "prepared":
+        _restore_target(
+            history_path,
+            history_backup,
+            record["historyExisted"],
+            MAX_FILE_BYTES,
+        )
+        _restore_target(svg_path, svg_backup, record["svgExisted"], MAX_SVG_BYTES)
+
+    # Remove the marker first: leftover backups are harmless and cleaned on the next run.
+    _remove_file(marker)
+    _fsync_directory(marker.parent)
+    _remove_file(history_backup)
+    _remove_file(svg_backup)
+    return record["state"]
+
+
+@contextmanager
+def _artifact_lock(history_path: Path) -> Iterator[None]:
+    """Serialize operations for one history across processes."""
+
+    identity = str(history_path.resolve()).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    user_id = os.getuid() if hasattr(os, "getuid") else 0
+    lock_directory = Path(tempfile.gettempdir()) / f"burner-history-locks-{user_id}"
+    try:
+        lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_file = (lock_directory / f"{digest}.lock").open("a+b")
+    except OSError as error:
+        _fail(f"cannot open Burner history lock: {error}")
+    with lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as error:
+            _fail(f"cannot acquire Burner history lock: {error}")
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_artifacts_transactionally(
+    history_path: Path,
+    history_contents: str,
+    svg_path: Path,
+    svg_contents: str,
+) -> None:
+    """Durably replace an artifact pair or restore the previous pair."""
+
+    _ensure_safe_artifact_paths(history_path, svg_path)
+    marker, history_backup, svg_backup = _transaction_paths(history_path, svg_path)
+    _recover_transaction(history_path, svg_path)
+
+    history_existed = history_path.is_file()
+    svg_existed = svg_path.is_file()
+    old_history = (
+        _read_bytes(history_path, MAX_FILE_BYTES, "history") if history_existed else b""
+    )
+    old_svg = _read_bytes(svg_path, MAX_SVG_BYTES, "SVG") if svg_existed else b""
+    new_history = ""
+    new_svg = ""
+    committed = False
+    try:
+        new_history = _write_temporary(history_path, history_contents.encode("utf-8"))
+        new_svg = _write_temporary(svg_path, svg_contents.encode("utf-8"))
+        if history_existed:
+            _replace_bytes(history_backup, old_history)
+        if svg_existed:
+            _replace_bytes(svg_backup, old_svg)
+        _replace_bytes(
+            marker,
+            _transaction_record(
+                "prepared", history_path, svg_path, history_existed, svg_existed
+            ),
+        )
+        os.replace(new_history, history_path)
+        new_history = ""
+        _fsync_directory(history_path.parent)
+        os.replace(new_svg, svg_path)
+        new_svg = ""
+        _fsync_directory(svg_path.parent)
+        _replace_bytes(
+            marker,
+            _transaction_record(
+                "committed", history_path, svg_path, history_existed, svg_existed
+            ),
+        )
+        committed = True
+    except (HistoryError, OSError) as error:
+        try:
+            recovery_state = _recover_transaction(history_path, svg_path)
+        except HistoryError as recovery_error:
+            _fail(f"artifact transaction failed ({error}); recovery also failed: {recovery_error}")
+        if recovery_state == "committed":
+            _fail(f"artifact transaction committed but final synchronization failed: {error}")
+        _fail(f"artifact transaction failed and was rolled back: {error}")
+    finally:
+        for temporary_name in (new_history, new_svg):
+            if temporary_name:
+                try:
+                    os.unlink(temporary_name)
+                except OSError:
+                    pass
+
+    if committed:
+        _recover_transaction(history_path, svg_path)
+
+
+def _check_artifacts_unlocked(history_path: Path, svg_path: Path) -> int:
     document, raw_history = load_json(history_path)
     validated = validate_history(document)
     expected_history = encode_history(validated)
@@ -488,6 +735,15 @@ def check_artifacts(history_path: Path, svg_path: Path) -> None:
     actual_svg = _read_utf8(svg_path, MAX_SVG_BYTES, "SVG")
     if actual_svg != expected_svg:
         _fail(f"{svg_path} is stale; run the render command")
+    return len(validated["points"])
+
+
+def check_artifacts(history_path: Path, svg_path: Path) -> int:
+    """Validate source data and require both artifacts to be reproducible."""
+
+    with _artifact_lock(history_path):
+        _recover_transaction(history_path, svg_path)
+        return _check_artifacts_unlocked(history_path, svg_path)
 
 
 def _add_artifact_arguments(parser: argparse.ArgumentParser) -> None:
@@ -518,26 +774,34 @@ def main(arguments: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     try:
         if args.command == "check":
-            check_artifacts(args.history, args.svg)
-            print(f"Burner history and SVG are valid and reproducible ({len(validate_history(load_json(args.history)[0])['points'])} points)")
+            point_count = check_artifacts(args.history, args.svg)
+            print(
+                f"Burner history and SVG are valid and reproducible ({point_count} points)"
+            )
             return 0
 
-        document, _ = load_json(args.history)
-        validated = validate_history(document)
-        if args.command == "update":
-            scores, _ = load_json(args.scores_file)
-            validated = upsert_merge(
-                validated,
-                pr_number=args.pr_number,
-                merge_sha=args.merge_sha,
-                recorded_at=args.recorded_at,
-                title=args.title,
-                scores=scores,
+        with _artifact_lock(args.history):
+            _recover_transaction(args.history, args.svg)
+            document, _ = load_json(args.history)
+            validated = validate_history(document)
+            if args.command == "update":
+                scores, _ = load_json(args.scores_file)
+                validated = upsert_merge(
+                    validated,
+                    pr_number=args.pr_number,
+                    merge_sha=args.merge_sha,
+                    recorded_at=args.recorded_at,
+                    title=args.title,
+                    scores=scores,
+                )
+            history_contents = encode_history(validated)
+            svg_contents = render_svg(validated)
+            _write_artifacts_transactionally(
+                args.history,
+                history_contents,
+                args.svg,
+                svg_contents,
             )
-        history_contents = encode_history(validated)
-        svg_contents = render_svg(validated)
-        _atomic_write(args.history, history_contents)
-        _atomic_write(args.svg, svg_contents)
         print(f"wrote {args.history} and {args.svg}")
         return 0
     except HistoryError as error:
