@@ -124,13 +124,17 @@ Input, token, statement, schema, stored-value, intermediate-row, memory, and
 result-row failures return `Error::ResourceLimitExceeded` with the resource,
 configured limit, and observed value. `last_execution_stats` remains available
 after success or failure. Its row counters are cumulative across all statements
-in the batch; stored values report the database total after the attempt.
+in the batch; stored values report the database total after the attempt. Parse
+failures retain the number of recognized tokens, completed statements, and
+widest schema prefix reached before the error.
 
 Ordered scans and grouped scans write deterministic fixed-width index runs to
 the system temporary directory when their index buffer reaches the memory
-budget. Merge fan-in is also bounded. Runs use exclusive creation and are
-removed on success or error. Applications that need a controlled location can
-use `Database::with_limits_and_spill_directory`.
+budget. Run metadata uses a charged, fixed-capacity vector, and the two smallest
+runs merge whenever a third run is retained. This bounds metadata and live file
+count independently of input size while keeping merges balanced. Runs use
+exclusive creation and are removed on success or error. Applications that need
+a controlled location can use `Database::with_limits_and_spill_directory`.
 
 The memory limit accounts for transient executor-owned index buffers, grouped
 values, and every retained result allocation, including batch/result vectors,
@@ -139,6 +143,10 @@ their actual vector capacity before accepting a row and are sized from the
 batch's remaining memory after earlier results. Persistent typed columns are
 governed by `max_stored_values`; parser allocations are governed by input and
 token limits.
+
+String `MIN` and `MAX` states retain source row indices while scanning and clone
+only the final extremum, so discarded candidates do not allocate executor
+memory.
 
 `render_with_limit` counts the exact attempted output while retaining no more
 than its byte limit. Table output computes widths in one pass and streams cells

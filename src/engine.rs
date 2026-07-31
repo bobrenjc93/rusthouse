@@ -5,7 +5,10 @@ use std::fs::{File, OpenOptions, remove_file};
 use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Resource, Result};
@@ -132,11 +135,9 @@ impl Database {
         let mut context = ExecutionContext::new(&limits, sql.len());
         let outcome = (|| {
             context.check(Resource::InputBytes, sql.len())?;
-            let parsed = sql::parse_bounded(sql, &limits)?;
-            context.stats.tokens = parsed.token_count;
-            context.stats.statements = parsed.statements.len();
+            let statements = sql::parse_bounded(sql, &limits, &mut context.stats)?;
             let mut results = Vec::new();
-            for statement in parsed.statements {
+            for statement in statements {
                 reserve_vec_slot(&mut results, &mut context)?;
                 let result = self.execute_statement(statement, &mut context)?;
                 results.push(result);
@@ -550,6 +551,7 @@ fn execute_ungrouped(
     let working_memory = sorter.working_memory_bytes();
     context.reserve_memory(working_memory)?;
     let chunk_memory = sorter.chunk_memory_bytes();
+    let run_memory = sorter.run_memory_bytes();
     let outcome = sorter.drain(|row| {
         if limit.is_some_and(|limit| rows.len() == limit) {
             return Ok(false);
@@ -560,7 +562,11 @@ fn execute_ungrouped(
         rows.push(projected);
         Ok(true)
     });
-    context.release_memory(working_memory.saturating_add(chunk_memory));
+    context.release_memory(
+        working_memory
+            .saturating_add(chunk_memory)
+            .saturating_add(run_memory),
+    );
     outcome?;
     Ok(rows)
 }
@@ -585,7 +591,14 @@ fn execute_grouped(
                 update_aggregates(&mut states, aggregate_specs, table, row)?;
             }
         }
-        push_group(&mut data, Vec::new(), states, context)?;
+        push_group(
+            &mut data,
+            Vec::new(),
+            states,
+            aggregate_specs,
+            table,
+            context,
+        )?;
         return Ok(data);
     }
 
@@ -603,6 +616,7 @@ fn execute_grouped(
     let sorter_memory = sorter.working_memory_bytes();
     context.reserve_memory(sorter_memory)?;
     let chunk_memory = sorter.chunk_memory_bytes();
+    let run_memory = sorter.run_memory_bytes();
 
     let mut current_key_row: Option<usize> = None;
     let mut states = aggregate_specs
@@ -623,7 +637,7 @@ fn execute_grouped(
                 &mut states,
                 aggregate_specs.iter().map(AggregateState::new).collect(),
             );
-            push_group(&mut data, key, finished, context)?;
+            push_group(&mut data, key, finished, aggregate_specs, table, context)?;
         }
         if current_key_row.is_none() {
             current_key_row = Some(row);
@@ -631,14 +645,18 @@ fn execute_grouped(
         update_aggregates(&mut states, aggregate_specs, table, row)?;
         Ok(true)
     });
-    context.release_memory(sorter_memory.saturating_add(chunk_memory));
+    context.release_memory(
+        sorter_memory
+            .saturating_add(chunk_memory)
+            .saturating_add(run_memory),
+    );
     outcome?;
     if let Some(key_row) = current_key_row {
         let key = group_columns
             .iter()
             .map(|column| table.columns()[*column].value(key_row))
             .collect();
-        push_group(&mut data, key, states, context)?;
+        push_group(&mut data, key, states, aggregate_specs, table, context)?;
     }
     Ok(data)
 }
@@ -659,11 +677,14 @@ fn push_group(
     data: &mut GroupedData,
     key: Vec<Value>,
     states: Vec<AggregateState>,
+    specs: &[AggregateSpec],
+    table: &Table,
     context: &mut ExecutionContext<'_>,
 ) -> Result<()> {
     let aggregates = states
         .into_iter()
-        .map(AggregateState::finish)
+        .zip(specs)
+        .map(|(state, spec)| state.finish(spec, table))
         .collect::<Result<Vec<_>>>()?;
     context.add_intermediate_rows(1)?;
     let bytes = estimated_row_bytes(&key).saturating_add(estimated_row_bytes(&aggregates));
@@ -690,8 +711,8 @@ enum AggregateState {
     Count(i64),
     SumInt(i64),
     SumFloat(f64),
-    Min(Option<Value>),
-    Max(Option<Value>),
+    Min(Option<usize>),
+    Max(Option<usize>),
     AvgInt { sum: i128, count: u64 },
     AvgFloat { sum: f64, count: u64 },
 }
@@ -741,21 +762,15 @@ impl AggregateState {
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
                 let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate < existing.as_ref())
-                {
-                    *current = Some(candidate.to_owned());
+                if current.is_none_or(|existing| candidate < column.value_ref(existing)) {
+                    *current = Some(row);
                 }
             }
             Self::Max(current) => {
                 let column = &table.columns()[spec.argument.expect("MAX argument")];
                 let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate > existing.as_ref())
-                {
-                    *current = Some(candidate.to_owned());
+                if current.is_none_or(|existing| candidate > column.value_ref(existing)) {
+                    *current = Some(row);
                 }
             }
             Self::AvgInt { sum, count } => {
@@ -788,11 +803,13 @@ impl AggregateState {
         Ok(())
     }
 
-    fn finish(self) -> Result<Value> {
+    fn finish(self, spec: &AggregateSpec, table: &Table) -> Result<Value> {
         match self {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
-            Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
+            Self::Min(Some(row)) | Self::Max(Some(row)) => {
+                Ok(table.columns()[spec.argument.expect("extremum argument")].value(row))
+            }
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
@@ -935,6 +952,7 @@ fn project_grouped_rows(
     let working_memory = sorter.working_memory_bytes();
     context.reserve_memory(working_memory)?;
     let chunk_memory = sorter.chunk_memory_bytes();
+    let run_memory = sorter.run_memory_bytes();
     let mut rows = Vec::new();
     let outcome = sorter.drain(|group| {
         if limit.is_some_and(|limit| rows.len() == limit) {
@@ -960,7 +978,11 @@ fn project_grouped_rows(
         rows.push(values);
         Ok(true)
     });
-    context.release_memory(working_memory.saturating_add(chunk_memory));
+    context.release_memory(
+        working_memory
+            .saturating_add(chunk_memory)
+            .saturating_add(run_memory),
+    );
     outcome?;
     Ok(rows)
 }
@@ -971,10 +993,10 @@ struct IndexSorter<F> {
     compare: F,
     chunk_capacity: usize,
     chunk_memory_bytes: usize,
-    fan_in: usize,
+    run_memory_bytes: usize,
     chunk: Vec<usize>,
     runs: Vec<TempRun>,
-    spill_directory: PathBuf,
+    spill_directory: Arc<PathBuf>,
     prepared: bool,
 }
 
@@ -988,10 +1010,10 @@ where
             compare,
             chunk_capacity: available_memory / (2 * size_of::<usize>()),
             chunk_memory_bytes: 0,
-            fan_in: (available_memory / 32).max(2),
+            run_memory_bytes: 0,
             chunk: Vec::new(),
             runs: Vec::new(),
-            spill_directory: spill_directory.to_owned(),
+            spill_directory: Arc::new(spill_directory.to_owned()),
             prepared: false,
         }
     }
@@ -1010,20 +1032,6 @@ where
     fn prepare(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
         if !self.runs.is_empty() {
             self.flush_chunk(context)?;
-            while self.runs.len() > 2 {
-                let old_runs = std::mem::take(&mut self.runs);
-                let mut pending = old_runs.into_iter();
-                while let Some(first) = pending.next() {
-                    let mut batch = vec![first];
-                    batch.extend(pending.by_ref().take(self.fan_in - 1));
-                    if batch.len() == 1 {
-                        self.runs.push(batch.pop().expect("one run"));
-                    } else {
-                        let merged = self.merge_runs(&batch, context)?;
-                        self.runs.push(merged);
-                    }
-                }
-            }
         } else {
             self.chunk
                 .sort_unstable_by(|left, right| (self.compare)(*left, *right));
@@ -1042,6 +1050,10 @@ where
 
     fn chunk_memory_bytes(&self) -> usize {
         self.chunk_memory_bytes
+    }
+
+    fn run_memory_bytes(&self) -> usize {
+        self.run_memory_bytes
     }
 
     fn drain(mut self, mut visit: impl FnMut(usize) -> Result<bool>) -> Result<()> {
@@ -1078,19 +1090,22 @@ where
         let memory_bytes = std::mem::take(&mut self.chunk_memory_bytes);
         let outcome = (|| {
             indices.sort_unstable_by(|left, right| (self.compare)(*left, *right));
-            let (run, mut file) = TempRun::create(&self.spill_directory)?;
+            let (run, mut file) = TempRun::create(&self.spill_directory, indices.len())?;
             for index in &indices {
                 write_index(&mut file, *index)?;
             }
             file.sync_data()
                 .map_err(|error| spill_error("syncing run", error))?;
             context.record_spill(indices.len().saturating_mul(size_of::<u64>()));
-            self.runs.push(run);
-            Ok(())
+            Ok(run)
         })();
         drop(indices);
         context.release_memory(memory_bytes);
-        outcome
+        let run = outcome?;
+        self.ensure_run_storage(context)?;
+        self.runs.push(run);
+        context.observe_live_spill_runs(self.runs.len());
+        self.compact_runs(context)
     }
 
     fn allocate_chunk(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
@@ -1108,6 +1123,47 @@ where
         Ok(())
     }
 
+    fn ensure_run_storage(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
+        const MAX_LIVE_RUNS: usize = 2;
+        if self.runs.capacity() > MAX_LIVE_RUNS {
+            return Ok(());
+        }
+        let reserved = (MAX_LIVE_RUNS + 1).saturating_mul(size_of::<TempRun>());
+        context.reserve_memory(reserved)?;
+        let runs = Vec::with_capacity(MAX_LIVE_RUNS + 1);
+        let actual = runs.capacity().saturating_mul(size_of::<TempRun>());
+        if let Err(error) = context.adjust_memory_reservation(reserved, actual) {
+            context.release_memory(reserved);
+            return Err(error);
+        }
+        self.runs = runs;
+        self.run_memory_bytes = actual;
+        Ok(())
+    }
+
+    fn compact_runs(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
+        while self.runs.len() > 2 {
+            let mut smallest = [0usize, 1usize];
+            if self.runs[smallest[1]].rows < self.runs[smallest[0]].rows {
+                smallest.swap(0, 1);
+            }
+            for index in 2..self.runs.len() {
+                if self.runs[index].rows < self.runs[smallest[0]].rows {
+                    smallest[1] = smallest[0];
+                    smallest[0] = index;
+                } else if self.runs[index].rows < self.runs[smallest[1]].rows {
+                    smallest[1] = index;
+                }
+            }
+            smallest.sort_unstable();
+            let right = self.runs.remove(smallest[1]);
+            let left = self.runs.remove(smallest[0]);
+            let merged = self.merge_runs(&[left, right], context)?;
+            self.runs.push(merged);
+        }
+        Ok(())
+    }
+
     fn merge_runs(&self, runs: &[TempRun], context: &mut ExecutionContext<'_>) -> Result<TempRun> {
         let memory_bytes = runs.len().saturating_mul(32);
         context.reserve_memory(memory_bytes)?;
@@ -1117,7 +1173,14 @@ where
                 .iter_mut()
                 .map(read_index)
                 .collect::<Result<Vec<_>>>()?;
-            let (output, mut file) = TempRun::create(&self.spill_directory)?;
+            let row_count = runs
+                .iter()
+                .map(|run| run.rows)
+                .fold(0usize, usize::saturating_add);
+            let (output, mut file) = TempRun::create(&self.spill_directory, row_count)?;
+            context.observe_live_spill_runs(
+                self.runs.len().saturating_add(runs.len()).saturating_add(1),
+            );
             let mut written = 0usize;
             while let Some(run) = smallest_head(&heads, &self.compare) {
                 let index = heads[run].expect("selected run has a head");
@@ -1136,14 +1199,16 @@ where
 }
 
 struct TempRun {
-    path: PathBuf,
+    directory: Arc<PathBuf>,
+    id: u64,
+    rows: usize,
 }
 
 impl TempRun {
-    fn create(directory: &Path) -> Result<(Self, File)> {
+    fn create(directory: &Arc<PathBuf>, rows: usize) -> Result<(Self, File)> {
         for _ in 0..100 {
             let id = NEXT_SPILL_ID.fetch_add(1, AtomicOrdering::Relaxed);
-            let path = directory.join(format!(".rusthouse-spill-{}-{id}", std::process::id()));
+            let path = spill_path(directory, id);
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -1152,7 +1217,16 @@ impl TempRun {
                 options.mode(0o600);
             }
             match options.open(&path) {
-                Ok(file) => return Ok((Self { path }, file)),
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            directory: Arc::clone(directory),
+                            id,
+                            rows,
+                        },
+                        file,
+                    ));
+                }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(spill_error("creating run", error)),
             }
@@ -1165,14 +1239,21 @@ impl TempRun {
 
 impl Drop for TempRun {
     fn drop(&mut self) {
-        let _ = remove_file(&self.path);
+        let _ = remove_file(spill_path(&self.directory, self.id));
     }
 }
 
 fn open_runs(runs: &[TempRun]) -> Result<Vec<File>> {
     runs.iter()
-        .map(|run| File::open(&run.path).map_err(|error| spill_error("opening run", error)))
+        .map(|run| {
+            File::open(spill_path(&run.directory, run.id))
+                .map_err(|error| spill_error("opening run", error))
+        })
         .collect()
+}
+
+fn spill_path(directory: &Path, id: u64) -> PathBuf {
+    directory.join(format!(".rusthouse-spill-{}-{id}", std::process::id()))
 }
 
 fn write_index(file: &mut File, index: usize) -> Result<()> {

@@ -62,7 +62,7 @@ pub struct ExecutionStats {
     pub tokens: usize,
     /// Statements parsed from the batch.
     pub statements: usize,
-    /// Widest schema encountered while executing the batch.
+    /// Widest schema encountered while parsing or executing the batch.
     pub schema_width: usize,
     /// Values stored across all tables after the execution attempt.
     pub stored_values: usize,
@@ -76,6 +76,8 @@ pub struct ExecutionStats {
     pub spilled_bytes: usize,
     /// Number of temporary spill runs created.
     pub spill_runs: usize,
+    /// Highest number of temporary spill files live at once.
+    pub peak_live_spill_runs: usize,
 }
 
 #[derive(Debug)]
@@ -167,6 +169,10 @@ impl<'a> ExecutionContext<'a> {
     pub(crate) fn record_spill(&mut self, bytes: usize) {
         self.stats.spilled_bytes = self.stats.spilled_bytes.saturating_add(bytes);
         self.stats.spill_runs = self.stats.spill_runs.saturating_add(1);
+    }
+
+    pub(crate) fn observe_live_spill_runs(&mut self, count: usize) {
+        self.stats.peak_live_spill_runs = self.stats.peak_live_spill_runs.max(count);
     }
 }
 

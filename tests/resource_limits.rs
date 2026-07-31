@@ -48,6 +48,8 @@ fn input_token_and_statement_limits_fail_at_the_first_excess() {
         sql.len(),
     );
     assert_eq!(database.last_execution_stats().input_bytes, sql.len());
+    assert_eq!(database.last_execution_stats().tokens, 0);
+    assert_eq!(database.last_execution_stats().statements, 0);
 
     database.set_limits(ExecutionLimits {
         max_tokens: 3,
@@ -59,6 +61,8 @@ fn input_token_and_statement_limits_fail_at_the_first_excess() {
         3,
         4,
     );
+    assert_eq!(database.last_execution_stats().tokens, 4);
+    assert_eq!(database.last_execution_stats().statements, 0);
 
     database.set_limits(ExecutionLimits {
         max_statements: 1,
@@ -72,7 +76,17 @@ fn input_token_and_statement_limits_fail_at_the_first_excess() {
         1,
         2,
     );
+    assert_eq!(database.last_execution_stats().tokens, 9);
+    assert_eq!(database.last_execution_stats().statements, 2);
     assert!(database.catalog().table("t").is_err());
+
+    database.set_limits(ExecutionLimits::default());
+    assert!(matches!(
+        database.execute("SELECT FROM"),
+        Err(Error::Sql { .. })
+    ));
+    assert_eq!(database.last_execution_stats().tokens, 2);
+    assert_eq!(database.last_execution_stats().statements, 0);
 }
 
 #[test]
@@ -89,6 +103,8 @@ fn schema_and_stored_value_limits_leave_catalog_mutations_atomic() {
         2,
         3,
     );
+    assert_eq!(database.last_execution_stats().schema_width, 3);
+    assert_eq!(database.last_execution_stats().statements, 0);
     assert!(database.catalog().table("wide").is_err());
 
     database.set_limits(ExecutionLimits {
@@ -350,6 +366,90 @@ fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
         "temporary runs are removed after each query"
     );
     fs::remove_dir(&spill_directory).expect("remove isolated spill directory");
+}
+
+#[test]
+fn many_tiny_runs_keep_spill_metadata_and_live_files_bounded() {
+    let rows = (0..512)
+        .rev()
+        .map(|number| format!("({number})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let spill_directory = std::env::temp_dir().join(format!(
+        "rusthouse-many-runs-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&spill_directory).expect("create isolated spill directory");
+    let mut database = Database::with_limits_and_spill_directory(
+        ExecutionLimits {
+            max_memory_bytes: 384,
+            ..ExecutionLimits::default()
+        },
+        &spill_directory,
+    );
+    database
+        .execute(&format!(
+            "CREATE TABLE many (n Int64); INSERT INTO many VALUES {rows}"
+        ))
+        .expect("setup succeeds");
+
+    let result = query(&mut database, "SELECT n FROM many ORDER BY n LIMIT 1");
+    assert_eq!(result.rows, vec![vec![Value::Int64(0)]]);
+    assert!(database.last_execution_stats().spill_runs >= 40);
+    assert!(database.last_execution_stats().peak_live_spill_runs <= 4);
+    assert!(database.last_execution_stats().peak_memory_bytes <= 384);
+    assert_eq!(
+        fs::read_dir(&spill_directory)
+            .expect("read spill directory")
+            .count(),
+        0
+    );
+    fs::remove_dir(&spill_directory).expect("remove isolated spill directory");
+}
+
+#[test]
+fn string_extrema_do_not_clone_discarded_large_candidates() {
+    let large_min_candidate = "z".repeat(200_000);
+    let large_max_candidate = "a".repeat(200_000);
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE extrema (min_text String, max_text String);
+             INSERT INTO extrema VALUES
+                ('{large_min_candidate}', '{large_max_candidate}'),
+                ('a', 'z')"
+        ))
+        .expect("setup succeeds");
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: 512,
+        ..ExecutionLimits::default()
+    });
+
+    let result = query(
+        &mut database,
+        "SELECT MIN(min_text) AS low, MAX(max_text) AS high FROM extrema",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::String("a".to_owned()),
+            Value::String("z".to_owned()),
+        ]]
+    );
+    assert!(database.last_execution_stats().peak_memory_bytes <= 512);
+
+    assert!(matches!(
+        database.execute("SELECT MAX(min_text) FROM extrema"),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 512,
+            actual
+        }) if actual > 512
+    ));
 }
 
 #[test]
