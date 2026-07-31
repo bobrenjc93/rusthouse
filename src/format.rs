@@ -54,78 +54,90 @@ pub fn render_with_limit(
 }
 
 fn render_table(result: &QueryResult, max_bytes: usize) -> Result<String> {
-    let rendered_columns = result
+    let mut widths = result
         .columns
         .iter()
-        .map(|column| escape_table_text(&column.name))
+        .map(|column| escaped_table_width(&column.name))
         .collect::<Vec<_>>();
-    let rendered_rows = result
-        .rows
-        .iter()
-        .map(|row| row.iter().map(table_value).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let widths = rendered_columns
-        .iter()
-        .enumerate()
-        .map(|(column, name)| {
-            rendered_rows
-                .iter()
-                .map(|row| row[column].chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(name.chars().count())
-        })
-        .collect::<Vec<_>>();
+    for row in &result.rows {
+        for (column, value) in row.iter().enumerate().take(widths.len()) {
+            widths[column] = widths[column].max(table_value_width(value));
+        }
+    }
 
-    let border = table_border(&widths);
     let mut output = LimitedOutput::new(max_bytes);
-    output.push_str(&border);
+    write_table_border(&mut output, &widths);
     output.push('\n');
-    table_row(
-        &mut output,
-        rendered_columns.iter().map(String::as_str),
-        &widths,
-    );
-    output.push_str(&border);
-    output.push('\n');
-    for row in &rendered_rows {
-        table_row(&mut output, row.iter().map(String::as_str), &widths);
-    }
-    output.push_str(&border);
-    output.finish()
-}
-
-fn table_border(widths: &[usize]) -> String {
-    let mut border = String::new();
-    border.push('+');
-    for width in widths {
-        border.push_str(&"-".repeat(*width + 2));
-        border.push('+');
-    }
-    border
-}
-
-fn table_row<'a>(
-    output: &mut LimitedOutput,
-    values: impl Iterator<Item = &'a str>,
-    widths: &[usize],
-) {
     output.push('|');
-    for (value, width) in values.zip(widths) {
+    for (column, width) in result.columns.iter().zip(&widths) {
         output.push(' ');
-        output.push_str(value);
-        output.push_str(&" ".repeat(width.saturating_sub(value.chars().count()) + 1));
+        write_escaped_table_text(&mut output, &column.name);
+        output.push_repeated(
+            ' ',
+            width.saturating_sub(escaped_table_width(&column.name)) + 1,
+        );
         output.push('|');
     }
     output.push('\n');
+    write_table_border(&mut output, &widths);
+    output.push('\n');
+    for row in &result.rows {
+        output.push('|');
+        for (value, width) in row.iter().zip(&widths) {
+            output.push(' ');
+            write_table_value(&mut output, value);
+            output.push_repeated(' ', width.saturating_sub(table_value_width(value)) + 1);
+            output.push('|');
+        }
+        output.push('\n');
+    }
+    write_table_border(&mut output, &widths);
+    output.finish()
 }
 
-fn table_value(value: &Value) -> String {
-    escape_table_text(&value.as_display_string())
+fn write_table_border(output: &mut LimitedOutput, widths: &[usize]) {
+    output.push('+');
+    for width in widths {
+        output.push_repeated('-', width.saturating_add(2));
+        output.push('+');
+    }
 }
 
-fn escape_table_text(value: &str) -> String {
-    let mut output = String::new();
+fn table_value_width(value: &Value) -> usize {
+    match value {
+        Value::String(value) => escaped_table_width(value),
+        value => escaped_table_width(&value.as_display_string()),
+    }
+}
+
+fn write_table_value(output: &mut LimitedOutput, value: &Value) {
+    match value {
+        Value::String(value) => write_escaped_table_text(output, value),
+        value => write_escaped_table_text(output, &value.as_display_string()),
+    }
+}
+
+fn escaped_table_width(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| match character {
+            '\\' | '\n' | '\r' | '\t' => 2,
+            value if value.is_control() => 4 + hex_digits(value as u32).max(4),
+            _ => 1,
+        })
+        .sum()
+}
+
+fn hex_digits(mut value: u32) -> usize {
+    let mut digits = 1;
+    while value >= 16 {
+        value /= 16;
+        digits += 1;
+    }
+    digits
+}
+
+fn write_escaped_table_text(output: &mut LimitedOutput, value: &str) {
     for character in value.chars() {
         match character {
             '\\' => output.push_str("\\\\"),
@@ -139,36 +151,45 @@ fn escape_table_text(value: &str) -> String {
             value => output.push(value),
         }
     }
-    output
 }
 
 fn render_csv(result: &QueryResult, max_bytes: usize) -> Result<String> {
     let mut output = LimitedOutput::new(max_bytes);
-    write_csv_row(
-        &mut output,
-        result.columns.iter().map(|column| column.name.as_str()),
-    );
+    for (index, column) in result.columns.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write_csv_text(&mut output, &column.name);
+    }
+    output.push('\n');
     for row in &result.rows {
-        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
-        write_csv_row(&mut output, values.iter().map(String::as_str));
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            match value {
+                Value::String(value) => write_csv_text(&mut output, value),
+                value => write_csv_text(&mut output, &value.as_display_string()),
+            }
+        }
+        output.push('\n');
     }
     output.finish()
 }
 
-fn write_csv_row<'a>(output: &mut LimitedOutput, values: impl Iterator<Item = &'a str>) {
-    for (index, value) in values.enumerate() {
-        if index > 0 {
-            output.push(',');
+fn write_csv_text(output: &mut LimitedOutput, value: &str) {
+    if value.contains([',', '"', '\n', '\r']) {
+        output.push('"');
+        for character in value.chars() {
+            if character == '"' {
+                output.push('"');
+            }
+            output.push(character);
         }
-        if value.contains([',', '"', '\n', '\r']) {
-            output.push('"');
-            output.push_str(&value.replace('"', "\"\""));
-            output.push('"');
-        } else {
-            output.push_str(value);
-        }
+        output.push('"');
+    } else {
+        output.push_str(value);
     }
-    output.push('\n');
 }
 
 /// Render one result set with explicit column metadata and positional rows.
@@ -259,6 +280,18 @@ impl LimitedOutput {
         self.attempted = self.attempted.saturating_add(value.len());
         if previous <= self.limit && self.attempted <= self.limit {
             self.value.push_str(value);
+        }
+    }
+
+    fn push_repeated(&mut self, character: char, count: usize) {
+        let previous = self.attempted;
+        self.attempted = self
+            .attempted
+            .saturating_add(character.len_utf8().saturating_mul(count));
+        if previous <= self.limit && self.attempted <= self.limit {
+            for _ in 0..count {
+                self.value.push(character);
+            }
         }
     }
 

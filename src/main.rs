@@ -39,18 +39,15 @@ fn run() -> Result<(), String> {
         return Ok(());
     };
 
+    let mut database = Database::new();
+    let max_input_bytes = database.limits().max_input_bytes;
+    let max_rendered_bytes = database.limits().max_rendered_bytes;
     let sql = if let Some(sql) = config.execute {
         sql
     } else {
-        let mut sql = String::new();
-        io::stdin()
-            .read_to_string(&mut sql)
-            .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
-        sql
+        read_sql_bounded(io::stdin(), max_input_bytes)?
     };
 
-    let mut database = Database::new();
-    let max_rendered_bytes = database.limits().max_rendered_bytes;
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -71,6 +68,26 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?
     );
     Ok(())
+}
+
+fn read_sql_bounded(reader: impl Read, max_bytes: usize) -> Result<String, String> {
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(Error::ResourceLimitExceeded {
+            resource: Resource::InputBytes,
+            limit: max_bytes,
+            actual: bytes.len(),
+        }
+        .to_string());
+    }
+    String::from_utf8(bytes).map_err(|error| format!("SQL input is not valid UTF-8: {error}"))
 }
 
 #[cfg(test)]
@@ -180,6 +197,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
 mod tests {
     use super::*;
     use rusthouse::{DataType, ResultColumn, Value};
+    use std::io::Cursor;
 
     #[test]
     fn parses_equals_style_options() {
@@ -215,5 +233,17 @@ mod tests {
             render_query_results(&[result.clone(), result], OutputFormat::Json),
             "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
         );
+    }
+
+    #[test]
+    fn stdin_reader_stops_one_byte_past_the_input_limit() {
+        let mut input = Cursor::new(b"SELECT 1234567890".to_vec());
+        let error = read_sql_bounded(&mut input, 6).expect_err("seventh byte exceeds limit");
+
+        assert!(error.contains("limit 6, observed 7"));
+        assert_eq!(input.position(), 7);
+
+        let exact = read_sql_bounded(Cursor::new(b"SELECT"), 6).expect("exact limit succeeds");
+        assert_eq!(exact, "SELECT");
     }
 }

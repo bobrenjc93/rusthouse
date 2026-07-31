@@ -4,7 +4,10 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusthouse::format::{OutputFormat, render, render_with_limit};
-use rusthouse::{Database, Error, ExecutionLimits, QueryResult, Resource, StatementResult, Value};
+use rusthouse::{
+    DataType, Database, Error, ExecutionLimits, QueryResult, Resource, ResultColumn,
+    StatementResult, Value,
+};
 
 fn query(database: &mut Database, sql: &str) -> QueryResult {
     match database
@@ -146,6 +149,107 @@ fn intermediate_and_result_rows_have_independent_exact_limits() {
 }
 
 #[test]
+fn retained_results_reduce_sort_memory_across_statements() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE t (n Int64);
+             INSERT INTO t VALUES (9), (8), (7), (6), (5), (4), (3), (2), (1)",
+        )
+        .expect("setup succeeds");
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: 144,
+        ..ExecutionLimits::default()
+    });
+
+    let error = database
+        .execute("SELECT n FROM t LIMIT 1; SELECT n FROM t ORDER BY n LIMIT 1")
+        .expect_err("the retained first result leaves too little batch memory");
+    assert!(matches!(
+        error,
+        Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 144,
+            actual
+        } if actual > 144
+    ));
+    assert_eq!(database.last_execution_stats().result_rows, 1);
+    assert!(database.last_execution_stats().peak_memory_bytes <= 144);
+}
+
+#[test]
+fn sorter_success_is_monotonic_across_capacity_boundaries() {
+    let values = (1..=17)
+        .rev()
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE t (n Int64); INSERT INTO t VALUES {values}"
+        ))
+        .expect("setup succeeds");
+
+    for memory in [272, 288, 304] {
+        database.set_limits(ExecutionLimits {
+            max_memory_bytes: memory,
+            ..ExecutionLimits::default()
+        });
+        let result = query(&mut database, "SELECT n FROM t ORDER BY n LIMIT 1");
+        assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
+        assert!(database.last_execution_stats().peak_memory_bytes <= memory);
+    }
+}
+
+#[test]
+fn empty_and_wide_result_metadata_is_memory_accounted() {
+    let definitions = (0..64)
+        .map(|column| format!("column_{column} Int64"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!("CREATE TABLE wide ({definitions})"))
+        .expect("setup succeeds");
+
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: 0,
+        ..ExecutionLimits::default()
+    });
+    assert!(matches!(
+        database.execute("SELECT * FROM wide LIMIT 0"),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 0,
+            actual
+        }) if actual > 0
+    ));
+
+    database.set_limits(ExecutionLimits::default());
+    query(&mut database, "SELECT * FROM wide LIMIT 0");
+    let one_result_memory = database.last_execution_stats().peak_memory_bytes;
+    assert!(one_result_memory > 0);
+
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: one_result_memory,
+        ..ExecutionLimits::default()
+    });
+    let error = database
+        .execute("SELECT * FROM wide LIMIT 0; SELECT * FROM wide LIMIT 0")
+        .expect_err("second result metadata must consume additional memory");
+    assert!(matches!(
+        error,
+        Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit,
+            actual
+        } if limit == one_result_memory && actual > limit
+    ));
+    assert!(database.last_execution_stats().peak_memory_bytes <= one_result_memory);
+}
+
+#[test]
 fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
     let rows = (0..120)
         .map(|number| format!("({}, {}, '{}')", number, number % 3, 120 - number))
@@ -195,17 +299,20 @@ fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
     assert!(database.last_execution_stats().peak_memory_bytes <= 768);
 
     database.set_limits(ExecutionLimits {
-        max_memory_bytes: 40,
+        max_memory_bytes: 120,
         ..ExecutionLimits::default()
     });
-    assert_limit(
-        database
-            .execute("SELECT n FROM t ORDER BY n")
-            .expect_err("two merge heads do not fit"),
-        Resource::MemoryBytes,
-        40,
-        64,
-    );
+    let error = database
+        .execute("SELECT n FROM t ORDER BY n")
+        .expect_err("two merge heads do not fit with retained metadata");
+    assert!(matches!(
+        error,
+        Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 120,
+            actual
+        } if actual > 120
+    ));
     assert_eq!(
         fs::read_dir(&spill_directory)
             .expect("read spill directory after error")
@@ -215,7 +322,7 @@ fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
     );
 
     database.set_limits(ExecutionLimits {
-        max_memory_bytes: 768,
+        max_memory_bytes: 1_024,
         ..ExecutionLimits::default()
     });
 
@@ -234,7 +341,7 @@ fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
     assert!(database.last_execution_stats().spill_runs > 0);
     assert_eq!(database.last_execution_stats().intermediate_rows, 123);
     assert_eq!(database.last_execution_stats().result_rows, 2);
-    assert!(database.last_execution_stats().peak_memory_bytes <= 768);
+    assert!(database.last_execution_stats().peak_memory_bytes <= 1_024);
     assert_eq!(
         fs::read_dir(&spill_directory)
             .expect("read spill directory")
@@ -282,4 +389,32 @@ fn memory_and_rendered_byte_limits_report_deterministic_sizes() {
         complete.len() - 1,
         complete.len(),
     );
+}
+
+#[test]
+fn table_and_csv_render_limits_count_streamed_escaping_exactly() {
+    let result = QueryResult {
+        columns: vec![ResultColumn {
+            name: "payload".to_owned(),
+            data_type: DataType::String,
+        }],
+        rows: (0..256)
+            .map(|_| vec![Value::String("\u{0000}\u{0007},\"quoted\"\n".repeat(32))])
+            .collect(),
+    };
+
+    for format in [OutputFormat::Table, OutputFormat::Csv] {
+        let complete = render(&result, format);
+        assert_limit(
+            render_with_limit(&result, format, 0).expect_err("zero bytes rejects output"),
+            Resource::RenderedBytes,
+            0,
+            complete.len(),
+        );
+        assert_eq!(
+            render_with_limit(&result, format, complete.len())
+                .expect("exact streamed size is accepted"),
+            complete
+        );
+    }
 }

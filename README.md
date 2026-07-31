@@ -132,11 +132,19 @@ budget. Merge fan-in is also bounded. Runs use exclusive creation and are
 removed on success or error. Applications that need a controlled location can
 use `Database::with_limits_and_spill_directory`.
 
-The memory limit accounts for estimated transient executor-owned index buffers,
-grouped values, and returned values. Persistent typed columns are governed by
-`max_stored_values`; parser allocations are governed by input and token limits.
+The memory limit accounts for transient executor-owned index buffers, grouped
+values, and every retained result allocation, including batch/result vectors,
+column metadata and names, row vectors, values, and strings. Sort chunks reserve
+their actual vector capacity before accepting a row and are sized from the
+batch's remaining memory after earlier results. Persistent typed columns are
+governed by `max_stored_values`; parser allocations are governed by input and
+token limits.
+
 `render_with_limit` counts the exact attempted output while retaining no more
-than its byte limit. The CLI applies the default rendered-output ceiling.
+than its byte limit. Table output computes widths in one pass and streams cells
+in a second pass; CSV escaping is also streamed. The CLI applies the default
+rendered-output ceiling and reads at most one byte beyond the input ceiling from
+standard input before rejecting oversized piped SQL.
 
 ## Current boundaries
 

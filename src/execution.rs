@@ -97,10 +97,6 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    pub(crate) fn limits(&self) -> &ExecutionLimits {
-        self.limits
-    }
-
     pub(crate) fn available_memory(&self) -> usize {
         self.limits
             .max_memory_bytes
@@ -136,10 +132,9 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
-    pub(crate) fn add_result_row(&mut self, row: &[Value]) -> Result<()> {
+    pub(crate) fn add_result_row(&mut self) -> Result<()> {
         let rows = self.stats.result_rows.saturating_add(1);
         self.check(Resource::ResultRows, rows)?;
-        self.reserve_memory(estimated_row_bytes(row))?;
         self.stats.result_rows = rows;
         Ok(())
     }
@@ -156,11 +151,17 @@ impl<'a> ExecutionContext<'a> {
         self.memory_bytes = self.memory_bytes.saturating_sub(bytes);
     }
 
-    pub(crate) fn observe_operator_memory(&mut self, bytes: usize) -> Result<()> {
-        let actual = self.memory_bytes.saturating_add(bytes);
-        self.check(Resource::MemoryBytes, actual)?;
-        self.stats.peak_memory_bytes = self.stats.peak_memory_bytes.max(actual);
-        Ok(())
+    pub(crate) fn adjust_memory_reservation(
+        &mut self,
+        reserved: usize,
+        actual: usize,
+    ) -> Result<()> {
+        if actual > reserved {
+            self.reserve_memory(actual - reserved)
+        } else {
+            self.release_memory(reserved - actual);
+            Ok(())
+        }
     }
 
     pub(crate) fn record_spill(&mut self, bytes: usize) {

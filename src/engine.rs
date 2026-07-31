@@ -135,9 +135,11 @@ impl Database {
             let parsed = sql::parse_bounded(sql, &limits)?;
             context.stats.tokens = parsed.token_count;
             context.stats.statements = parsed.statements.len();
-            let mut results = Vec::with_capacity(parsed.statements.len());
+            let mut results = Vec::new();
             for statement in parsed.statements {
-                results.push(self.execute_statement(statement, &mut context)?);
+                reserve_vec_slot(&mut results, &mut context)?;
+                let result = self.execute_statement(statement, &mut context)?;
+                results.push(result);
             }
             Ok(results)
         })();
@@ -202,6 +204,7 @@ impl Database {
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
+        reserve_result_columns(&result_columns, result_columns.capacity(), context)?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
@@ -294,9 +297,23 @@ fn resolve_select_items(
         ));
     }
 
-    let mut items = Vec::new();
-    let mut result_columns = Vec::new();
-    let mut aggregate_specs = Vec::new();
+    let output_capacity = requested
+        .iter()
+        .map(|item| {
+            if matches!(item, SelectItem::Wildcard) {
+                table.schema().len()
+            } else {
+                1
+            }
+        })
+        .sum();
+    let aggregate_capacity = requested
+        .iter()
+        .filter(|item| matches!(item, SelectItem::Aggregate { .. }))
+        .count();
+    let mut items = Vec::with_capacity(output_capacity);
+    let mut result_columns = Vec::with_capacity(output_capacity);
+    let mut aggregate_specs = Vec::with_capacity(aggregate_capacity);
 
     for requested_item in requested {
         match requested_item {
@@ -407,16 +424,87 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-fn project_source_row(table: &Table, row: usize, items: &[ResolvedItem]) -> Vec<Value> {
-    items
-        .iter()
-        .map(|item| match item {
-            ResolvedItem::Column { source, .. } => table.columns()[*source].value(row),
-            ResolvedItem::Aggregate { .. } => {
-                unreachable!("projection does not contain aggregates")
-            }
-        })
-        .collect()
+fn reserve_result_columns(
+    columns: &[ResultColumn],
+    capacity: usize,
+    context: &mut ExecutionContext<'_>,
+) -> Result<()> {
+    let bytes = capacity
+        .saturating_mul(size_of::<ResultColumn>())
+        .saturating_add(columns.iter().map(|column| column.name.capacity()).sum());
+    context.reserve_memory(bytes)
+}
+
+fn reserve_vec_slot<T>(values: &mut Vec<T>, context: &mut ExecutionContext<'_>) -> Result<()> {
+    if values.len() < values.capacity() || size_of::<T>() == 0 {
+        return Ok(());
+    }
+    let old_capacity = values.capacity();
+    let target_capacity = old_capacity.saturating_mul(2).max(1);
+    let reserved = target_capacity
+        .saturating_sub(old_capacity)
+        .saturating_mul(size_of::<T>());
+    context.reserve_memory(reserved)?;
+    values.reserve_exact(target_capacity.saturating_sub(values.len()));
+    let actual = values
+        .capacity()
+        .saturating_sub(old_capacity)
+        .saturating_mul(size_of::<T>());
+    context.adjust_memory_reservation(reserved, actual)
+}
+
+fn tracked_vec_with_capacity<T>(
+    capacity: usize,
+    context: &mut ExecutionContext<'_>,
+) -> Result<Vec<T>> {
+    let reserved = capacity.saturating_mul(size_of::<T>());
+    context.reserve_memory(reserved)?;
+    let values = Vec::with_capacity(capacity);
+    let actual = values.capacity().saturating_mul(size_of::<T>());
+    context.adjust_memory_reservation(reserved, actual)?;
+    Ok(values)
+}
+
+fn clone_string_tracked(value: &str, context: &mut ExecutionContext<'_>) -> Result<String> {
+    context.reserve_memory(value.len())?;
+    let cloned = value.to_owned();
+    context.adjust_memory_reservation(value.len(), cloned.capacity())?;
+    Ok(cloned)
+}
+
+fn clone_value_ref_tracked(
+    value: ValueRef<'_>,
+    context: &mut ExecutionContext<'_>,
+) -> Result<Value> {
+    Ok(match value {
+        ValueRef::Int64(value) => Value::Int64(value),
+        ValueRef::Float64(value) => Value::Float64(value),
+        ValueRef::Bool(value) => Value::Bool(value),
+        ValueRef::String(value) => Value::String(clone_string_tracked(value, context)?),
+    })
+}
+
+fn clone_value_tracked(value: &Value, context: &mut ExecutionContext<'_>) -> Result<Value> {
+    clone_value_ref_tracked(value.as_ref(), context)
+}
+
+fn project_source_row(
+    table: &Table,
+    row: usize,
+    items: &[ResolvedItem],
+    context: &mut ExecutionContext<'_>,
+) -> Result<Vec<Value>> {
+    let mut values = tracked_vec_with_capacity(items.len(), context)?;
+    for item in items {
+        let ResolvedItem::Column { source, .. } = item else {
+            unreachable!("projection does not contain aggregates")
+        };
+        values.push(clone_value_ref_tracked(
+            table.columns()[*source].value_ref(row),
+            context,
+        )?);
+    }
+    Ok(values)
 }
 
 fn execute_ungrouped(
@@ -437,8 +525,9 @@ fn execute_ungrouped(
         for row in 0..table.row_count() {
             if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
                 context.add_intermediate_rows(1)?;
-                let projected = project_source_row(table, row, items);
-                context.add_result_row(&projected)?;
+                context.add_result_row()?;
+                reserve_vec_slot(&mut rows, context)?;
+                let projected = project_source_row(table, row, items, context)?;
                 rows.push(projected);
                 if limit.is_some_and(|limit| rows.len() == limit) {
                     break;
@@ -450,7 +539,7 @@ fn execute_ungrouped(
 
     let compare =
         |left: usize, right: usize| compare_source_rows(table, items, ordering, left, right);
-    let mut sorter = IndexSorter::new(compare, context.limits().max_memory_bytes, spill_directory)?;
+    let mut sorter = IndexSorter::new(compare, context, spill_directory);
     for row in 0..table.row_count() {
         if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
             context.add_intermediate_rows(1)?;
@@ -460,16 +549,18 @@ fn execute_ungrouped(
     sorter.prepare(context)?;
     let working_memory = sorter.working_memory_bytes();
     context.reserve_memory(working_memory)?;
+    let chunk_memory = sorter.chunk_memory_bytes();
     let outcome = sorter.drain(|row| {
         if limit.is_some_and(|limit| rows.len() == limit) {
             return Ok(false);
         }
-        let projected = project_source_row(table, row, items);
-        context.add_result_row(&projected)?;
+        context.add_result_row()?;
+        reserve_vec_slot(&mut rows, context)?;
+        let projected = project_source_row(table, row, items, context)?;
         rows.push(projected);
         Ok(true)
     });
-    context.release_memory(working_memory);
+    context.release_memory(working_memory.saturating_add(chunk_memory));
     outcome?;
     Ok(rows)
 }
@@ -501,7 +592,7 @@ fn execute_grouped(
     let compare = |left: usize, right: usize| {
         compare_group_keys(table, group_columns, left, right).then_with(|| left.cmp(&right))
     };
-    let mut sorter = IndexSorter::new(compare, context.limits().max_memory_bytes, spill_directory)?;
+    let mut sorter = IndexSorter::new(compare, context, spill_directory);
     for row in 0..table.row_count() {
         if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
             context.add_intermediate_rows(1)?;
@@ -511,6 +602,7 @@ fn execute_grouped(
     sorter.prepare(context)?;
     let sorter_memory = sorter.working_memory_bytes();
     context.reserve_memory(sorter_memory)?;
+    let chunk_memory = sorter.chunk_memory_bytes();
 
     let mut current_key_row: Option<usize> = None;
     let mut states = aggregate_specs
@@ -539,7 +631,7 @@ fn execute_grouped(
         update_aggregates(&mut states, aggregate_specs, table, row)?;
         Ok(true)
     });
-    context.release_memory(sorter_memory);
+    context.release_memory(sorter_memory.saturating_add(chunk_memory));
     outcome?;
     if let Some(key_row) = current_key_row {
         let key = group_columns
@@ -835,37 +927,40 @@ fn project_grouped_rows(
         return Ok(Vec::new());
     }
     let compare = |left, right| compare_group_rows(data, items, ordering, left, right);
-    let mut sorter = IndexSorter::new(compare, context.available_memory(), spill_directory)?;
+    let mut sorter = IndexSorter::new(compare, context, spill_directory);
     for group in 0..data.groups.len() {
         sorter.add(group, context)?;
     }
     sorter.prepare(context)?;
     let working_memory = sorter.working_memory_bytes();
     context.reserve_memory(working_memory)?;
+    let chunk_memory = sorter.chunk_memory_bytes();
     let mut rows = Vec::new();
     let outcome = sorter.drain(|group| {
         if limit.is_some_and(|limit| rows.len() == limit) {
             return Ok(false);
         }
-        let values = items
-            .iter()
-            .map(|item| match item {
+        context.add_result_row()?;
+        reserve_vec_slot(&mut rows, context)?;
+        let mut values = tracked_vec_with_capacity(items.len(), context)?;
+        for item in items {
+            let value = match item {
                 ResolvedItem::Column {
                     group_position: Some(position),
                     ..
-                } => data.groups[group].key[*position].clone(),
+                } => &data.groups[group].key[*position],
                 ResolvedItem::Column {
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
-                ResolvedItem::Aggregate { state } => data.groups[group].aggregates[*state].clone(),
-            })
-            .collect::<Vec<_>>();
-        context.add_result_row(&values)?;
+                ResolvedItem::Aggregate { state } => &data.groups[group].aggregates[*state],
+            };
+            values.push(clone_value_tracked(value, context)?);
+        }
         rows.push(values);
         Ok(true)
     });
-    context.release_memory(working_memory);
+    context.release_memory(working_memory.saturating_add(chunk_memory));
     outcome?;
     Ok(rows)
 }
@@ -875,6 +970,7 @@ static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(0);
 struct IndexSorter<F> {
     compare: F,
     chunk_capacity: usize,
+    chunk_memory_bytes: usize,
     fan_in: usize,
     chunk: Vec<usize>,
     runs: Vec<TempRun>,
@@ -886,38 +982,35 @@ impl<F> IndexSorter<F>
 where
     F: Fn(usize, usize) -> Ordering,
 {
-    fn new(compare: F, memory_bytes: usize, spill_directory: &Path) -> Result<Self> {
-        if memory_bytes < size_of::<usize>() {
-            return Err(Error::ResourceLimitExceeded {
-                resource: Resource::MemoryBytes,
-                limit: memory_bytes,
-                actual: size_of::<usize>(),
-            });
-        }
-        Ok(Self {
+    fn new(compare: F, context: &ExecutionContext<'_>, spill_directory: &Path) -> Self {
+        let available_memory = context.available_memory();
+        Self {
             compare,
-            chunk_capacity: (memory_bytes / (2 * size_of::<usize>())).max(1),
-            fan_in: (memory_bytes / 32).max(2),
+            chunk_capacity: available_memory / (2 * size_of::<usize>()),
+            chunk_memory_bytes: 0,
+            fan_in: (available_memory / 32).max(2),
             chunk: Vec::new(),
             runs: Vec::new(),
             spill_directory: spill_directory.to_owned(),
             prepared: false,
-        })
+        }
     }
 
     fn add(&mut self, index: usize, context: &mut ExecutionContext<'_>) -> Result<()> {
-        self.chunk.push(index);
-        context.observe_operator_memory(self.chunk.len().saturating_mul(size_of::<usize>()))?;
-        if self.chunk.len() >= self.chunk_capacity {
-            self.flush_chunk(context)?;
+        if self.chunk.len() == self.chunk.capacity() {
+            if !self.chunk.is_empty() {
+                self.flush_chunk(context)?;
+            }
+            self.allocate_chunk(context)?;
         }
+        self.chunk.push(index);
         Ok(())
     }
 
     fn prepare(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
         if !self.runs.is_empty() {
             self.flush_chunk(context)?;
-            while self.runs.len() > self.fan_in {
+            while self.runs.len() > 2 {
                 let old_runs = std::mem::take(&mut self.runs);
                 let mut pending = old_runs.into_iter();
                 while let Some(first) = pending.next() {
@@ -941,10 +1034,14 @@ where
 
     fn working_memory_bytes(&self) -> usize {
         if self.runs.is_empty() {
-            self.chunk.capacity().saturating_mul(size_of::<usize>())
+            0
         } else {
             self.runs.len().saturating_mul(32)
         }
+    }
+
+    fn chunk_memory_bytes(&self) -> usize {
+        self.chunk_memory_bytes
     }
 
     fn drain(mut self, mut visit: impl FnMut(usize) -> Result<bool>) -> Result<()> {
@@ -978,37 +1075,63 @@ where
             return Ok(());
         }
         let mut indices = std::mem::take(&mut self.chunk);
-        indices.sort_unstable_by(|left, right| (self.compare)(*left, *right));
-        let (run, mut file) = TempRun::create(&self.spill_directory)?;
-        for index in &indices {
-            write_index(&mut file, *index)?;
+        let memory_bytes = std::mem::take(&mut self.chunk_memory_bytes);
+        let outcome = (|| {
+            indices.sort_unstable_by(|left, right| (self.compare)(*left, *right));
+            let (run, mut file) = TempRun::create(&self.spill_directory)?;
+            for index in &indices {
+                write_index(&mut file, *index)?;
+            }
+            file.sync_data()
+                .map_err(|error| spill_error("syncing run", error))?;
+            context.record_spill(indices.len().saturating_mul(size_of::<u64>()));
+            self.runs.push(run);
+            Ok(())
+        })();
+        drop(indices);
+        context.release_memory(memory_bytes);
+        outcome
+    }
+
+    fn allocate_chunk(&mut self, context: &mut ExecutionContext<'_>) -> Result<()> {
+        let capacity = self.chunk_capacity.max(1);
+        let reserved = capacity.saturating_mul(size_of::<usize>());
+        context.reserve_memory(reserved)?;
+        let chunk = Vec::with_capacity(capacity);
+        let actual = chunk.capacity().saturating_mul(size_of::<usize>());
+        if let Err(error) = context.adjust_memory_reservation(reserved, actual) {
+            context.release_memory(reserved);
+            return Err(error);
         }
-        file.sync_data()
-            .map_err(|error| spill_error("syncing run", error))?;
-        context.record_spill(indices.len().saturating_mul(size_of::<u64>()));
-        self.runs.push(run);
+        self.chunk = chunk;
+        self.chunk_memory_bytes = actual;
         Ok(())
     }
 
     fn merge_runs(&self, runs: &[TempRun], context: &mut ExecutionContext<'_>) -> Result<TempRun> {
-        context.observe_operator_memory(runs.len().saturating_mul(32))?;
-        let mut readers = open_runs(runs)?;
-        let mut heads = readers
-            .iter_mut()
-            .map(read_index)
-            .collect::<Result<Vec<_>>>()?;
-        let (output, mut file) = TempRun::create(&self.spill_directory)?;
-        let mut written = 0usize;
-        while let Some(run) = smallest_head(&heads, &self.compare) {
-            let index = heads[run].expect("selected run has a head");
-            write_index(&mut file, index)?;
-            written += 1;
-            heads[run] = read_index(&mut readers[run])?;
-        }
-        file.sync_data()
-            .map_err(|error| spill_error("syncing merged run", error))?;
-        context.record_spill(written.saturating_mul(size_of::<u64>()));
-        Ok(output)
+        let memory_bytes = runs.len().saturating_mul(32);
+        context.reserve_memory(memory_bytes)?;
+        let outcome = (|| {
+            let mut readers = open_runs(runs)?;
+            let mut heads = readers
+                .iter_mut()
+                .map(read_index)
+                .collect::<Result<Vec<_>>>()?;
+            let (output, mut file) = TempRun::create(&self.spill_directory)?;
+            let mut written = 0usize;
+            while let Some(run) = smallest_head(&heads, &self.compare) {
+                let index = heads[run].expect("selected run has a head");
+                write_index(&mut file, index)?;
+                written += 1;
+                heads[run] = read_index(&mut readers[run])?;
+            }
+            file.sync_data()
+                .map_err(|error| spill_error("syncing merged run", error))?;
+            context.record_spill(written.saturating_mul(size_of::<u64>()));
+            Ok(output)
+        })();
+        context.release_memory(memory_bytes);
+        outcome
     }
 }
 
