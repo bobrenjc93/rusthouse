@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, Iterator, NoReturn
 
 SCHEMA_VERSION = 2
-MAX_FILE_BYTES = 1_048_576
+MAX_HISTORY_BYTES = 8_388_608
+MAX_SCORE_INPUT_BYTES = 1_048_576
 MAX_SVG_BYTES = 16_777_216
 MAX_EVALUATIONS = 100
 MAX_POINTS = 1_000
@@ -120,10 +121,14 @@ def _read_utf8(path: Path, maximum_bytes: int, artifact: str) -> str:
         _fail(f"cannot decode {path} as UTF-8: {error}")
 
 
-def load_json(path: Path) -> tuple[Any, str]:
+def load_json(
+    path: Path,
+    maximum_bytes: int = MAX_HISTORY_BYTES,
+    artifact: str = "JSON",
+) -> tuple[Any, str]:
     """Read a size-bounded UTF-8 JSON document."""
 
-    raw = _read_utf8(path, MAX_FILE_BYTES, "JSON")
+    raw = _read_utf8(path, maximum_bytes, artifact)
     return parse_json(raw, str(path)), raw
 
 
@@ -622,7 +627,7 @@ def _recover_transaction(history_path: Path, svg_path: Path) -> str:
             history_path,
             history_backup,
             record["historyExisted"],
-            MAX_FILE_BYTES,
+            MAX_HISTORY_BYTES,
         )
         _restore_target(svg_path, svg_backup, record["svgExisted"], MAX_SVG_BYTES)
 
@@ -658,6 +663,15 @@ def _artifact_lock(history_path: Path) -> Iterator[None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _encode_bounded_output(contents: str, maximum_bytes: int, artifact: str) -> bytes:
+    encoded = contents.encode("utf-8")
+    if len(encoded) > maximum_bytes:
+        _fail(
+            f"generated {artifact} is {len(encoded)} bytes; limit is {maximum_bytes} bytes"
+        )
+    return encoded
+
+
 def _write_artifacts_transactionally(
     history_path: Path,
     history_contents: str,
@@ -666,6 +680,10 @@ def _write_artifacts_transactionally(
 ) -> None:
     """Durably replace an artifact pair or restore the previous pair."""
 
+    history_bytes = _encode_bounded_output(
+        history_contents, MAX_HISTORY_BYTES, "history JSON"
+    )
+    svg_bytes = _encode_bounded_output(svg_contents, MAX_SVG_BYTES, "SVG")
     _ensure_safe_artifact_paths(history_path, svg_path)
     marker, history_backup, svg_backup = _transaction_paths(history_path, svg_path)
     _recover_transaction(history_path, svg_path)
@@ -673,15 +691,17 @@ def _write_artifacts_transactionally(
     history_existed = history_path.is_file()
     svg_existed = svg_path.is_file()
     old_history = (
-        _read_bytes(history_path, MAX_FILE_BYTES, "history") if history_existed else b""
+        _read_bytes(history_path, MAX_HISTORY_BYTES, "history")
+        if history_existed
+        else b""
     )
     old_svg = _read_bytes(svg_path, MAX_SVG_BYTES, "SVG") if svg_existed else b""
     new_history = ""
     new_svg = ""
     committed = False
     try:
-        new_history = _write_temporary(history_path, history_contents.encode("utf-8"))
-        new_svg = _write_temporary(svg_path, svg_contents.encode("utf-8"))
+        new_history = _write_temporary(history_path, history_bytes)
+        new_svg = _write_temporary(svg_path, svg_bytes)
         if history_existed:
             _replace_bytes(history_backup, old_history)
         if svg_existed:
@@ -785,7 +805,11 @@ def main(arguments: list[str] | None = None) -> int:
             document, _ = load_json(args.history)
             validated = validate_history(document)
             if args.command == "update":
-                scores, _ = load_json(args.scores_file)
+                scores, _ = load_json(
+                    args.scores_file,
+                    MAX_SCORE_INPUT_BYTES,
+                    "score JSON",
+                )
                 validated = upsert_merge(
                     validated,
                     pr_number=args.pr_number,

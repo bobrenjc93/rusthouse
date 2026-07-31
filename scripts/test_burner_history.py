@@ -71,6 +71,61 @@ def example_history() -> dict[str, object]:
     }
 
 
+def maximum_shape_history() -> dict[str, object]:
+    """Build the maximum registered-evaluation and point counts."""
+
+    evaluations = {
+        f"eval_{index:08x}": {
+            "name": "\U0001f600" * 100,
+            "color": f"#{index:06x}",
+            "introducedAfter": None,
+        }
+        for index in range(burner_history.MAX_EVALUATIONS)
+    }
+    scores = {
+        evaluation_id: index % 101
+        for index, evaluation_id in enumerate(evaluations)
+    }
+    baseline_key = f"base:{BASE_SHA}"
+    points = [
+        {
+            "key": baseline_key,
+            "recordedAt": "2026-01-01T00:00:00.000Z",
+            "label": "base 1111111",
+            "kind": "baseline",
+            "commitSha": BASE_SHA,
+            "title": "main",
+            "scores": dict(scores),
+        }
+    ]
+    for pr_number in range(1, burner_history.MAX_POINTS):
+        points.append(
+            {
+                "key": f"pr:{pr_number}",
+                "recordedAt": "2026-01-02T00:00:00.000Z",
+                "label": f"PR #{pr_number}",
+                "kind": "merge",
+                "prNumber": pr_number,
+                "mergeSha": f"{pr_number:040x}",
+                "title": "\U0001f600" * 300,
+                "scores": dict(scores),
+            }
+        )
+    return {
+        "version": 2,
+        "tracking": {
+            "baseline": {
+                "key": baseline_key,
+                "commitSha": BASE_SHA,
+                "recordedAt": "2026-01-01T00:00:00.000Z",
+            },
+            "updatePolicy": "automatic merge " + "\U0001f600" * 480,
+        },
+        "evaluations": evaluations,
+        "points": points,
+    }
+
+
 class SchemaTests(unittest.TestCase):
     def test_validates_introduction_boundary_and_score_bounds(self) -> None:
         history = example_history()
@@ -120,6 +175,66 @@ class SchemaTests(unittest.TestCase):
 
 
 class GenerationTests(unittest.TestCase):
+    def test_maximum_schema_shape_round_trips_within_output_limits(self) -> None:
+        history = burner_history.validate_history(maximum_shape_history())
+        history_contents = burner_history.encode_history(history)
+        svg_contents = burner_history.render_svg(history)
+        self.assertGreater(len(history_contents.encode("utf-8")), 1_048_576)
+        self.assertLessEqual(
+            len(history_contents.encode("utf-8")), burner_history.MAX_HISTORY_BYTES
+        )
+        self.assertLessEqual(
+            len(svg_contents.encode("utf-8")), burner_history.MAX_SVG_BYTES
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            history_path = Path(directory) / "history.json"
+            svg_path = Path(directory) / "progress.svg"
+            burner_history._write_artifacts_transactionally(
+                history_path,
+                history_contents,
+                svg_path,
+                svg_contents,
+            )
+            self.assertEqual(
+                burner_history.check_artifacts(history_path, svg_path),
+                burner_history.MAX_POINTS,
+            )
+
+    def test_oversized_output_is_rejected_before_transaction(self) -> None:
+        history = burner_history.validate_history(example_history())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_path = root / "history.json"
+            svg_path = root / "progress.svg"
+            history_path.write_bytes(burner_history.encode_history(history).encode("utf-8"))
+            svg_path.write_bytes(burner_history.render_svg(history).encode("utf-8"))
+            old_pair = history_path.read_bytes(), svg_path.read_bytes()
+
+            at_limit = "x" * burner_history.MAX_HISTORY_BYTES
+            self.assertEqual(
+                len(
+                    burner_history._encode_bounded_output(
+                        at_limit,
+                        burner_history.MAX_HISTORY_BYTES,
+                        "history JSON",
+                    )
+                ),
+                burner_history.MAX_HISTORY_BYTES,
+            )
+            with self.assertRaisesRegex(
+                burner_history.HistoryError, "generated history JSON.*limit"
+            ):
+                burner_history._write_artifacts_transactionally(
+                    history_path,
+                    at_limit + "x",
+                    svg_path,
+                    burner_history.render_svg(history),
+                )
+
+            self.assertEqual((history_path.read_bytes(), svg_path.read_bytes()), old_pair)
+            self.assertEqual(list(root.glob(".*.burner-*")), [])
+
     def test_upsert_is_keyed_by_pr_and_deterministic(self) -> None:
         history = example_history()
         scores = {"eval_bbbbbbbb": 91, "eval_aaaaaaaa": 92}
