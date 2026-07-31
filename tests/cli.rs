@@ -1,3 +1,5 @@
+//! End-to-end tests for the RustHouse command-line interface.
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 

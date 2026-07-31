@@ -1,37 +1,62 @@
+//! Error types shared by parsing, storage, and execution.
+
 use std::fmt;
 
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// SQL could not be tokenized or parsed.
     Sql {
+        /// Zero-based byte offset at which the error was detected.
         position: usize,
+        /// Human-readable description of the syntax problem.
         message: String,
     },
+    /// A table creation request reused an existing name.
     TableAlreadyExists(String),
+    /// A requested table does not exist.
     TableNotFound(String),
+    /// A schema contains the same column name more than once.
     DuplicateColumn(String),
+    /// An identifier uses a reserved SQL literal.
     ReservedIdentifier {
+        /// The rejected identifier.
         identifier: String,
+        /// The syntactic role in which the identifier appeared.
         context: String,
     },
+    /// A requested column does not exist in a table.
     ColumnNotFound {
+        /// Name of the table that was searched.
         table: String,
+        /// Name of the requested column.
         column: String,
     },
+    /// An inserted row has the wrong number of values.
     RowLength {
+        /// Name of the target table.
         table: String,
+        /// Number of values required by the schema.
         expected: usize,
+        /// Number of values supplied by the row.
         actual: usize,
     },
+    /// A value or expression has an incompatible logical type.
     TypeMismatch {
+        /// Operation or field for which the value was checked.
         context: String,
+        /// Type or set of types accepted by the operation.
         expected: String,
+        /// Type that was actually supplied.
         actual: String,
     },
+    /// A syntactically valid query violates an execution rule.
     InvalidQuery(String),
+    /// An integer aggregate exceeded its representable range.
     NumericOverflow(String),
 }
 
+/// A RustHouse operation result using [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl fmt::Display for Error {

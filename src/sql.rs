@@ -1,3 +1,5 @@
+//! SQL syntax tree and parser.
+
 use crate::error::{Error, Result};
 use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
@@ -5,53 +7,84 @@ use crate::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 
+/// A parsed SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// Creates a named table with the supplied schema.
     CreateTable {
+        /// Table name as written in SQL.
         name: String,
+        /// Ordered column definitions.
         columns: Vec<ColumnDef>,
     },
+    /// Inserts one or more rows into a table.
     Insert {
+        /// Target table name.
         table: String,
+        /// Fully parsed rows to insert.
         rows: Vec<Vec<Value>>,
     },
+    /// Selects rows or aggregates from a table.
     Select(Select),
 }
 
+/// A parsed `SELECT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// Ordered result expressions.
     pub items: Vec<SelectItem>,
+    /// Source table name.
     pub table: String,
+    /// Optional row filter.
     pub predicate: Option<Predicate>,
+    /// Column names that form each group key.
     pub group_by: Vec<String>,
+    /// Ordered output sorting specifications.
     pub order_by: Vec<OrderBy>,
+    /// Optional maximum number of rows to return.
     pub limit: Option<usize>,
 }
 
+/// An expression in a `SELECT` result list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
+    /// All source columns in schema order.
     Wildcard,
+    /// One source column, optionally renamed.
     Column {
+        /// Source column name.
         name: String,
+        /// Optional result-column alias.
         alias: Option<String>,
     },
+    /// An aggregate call, optionally renamed.
     Aggregate {
+        /// Aggregate operation to apply.
         function: AggregateFunction,
+        /// Column or wildcard argument.
         argument: AggregateArgument,
+        /// Optional result-column alias.
         alias: Option<String>,
     },
 }
 
+/// A supported SQL aggregate operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFunction {
+    /// Counts matching input rows.
     Count,
+    /// Sums numeric values.
     Sum,
+    /// Returns the least ordered value.
     Min,
+    /// Returns the greatest ordered value.
     Max,
+    /// Computes the arithmetic mean of numeric values.
     Avg,
 }
 
 impl AggregateFunction {
+    /// Returns the canonical uppercase SQL function name.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -75,42 +108,65 @@ impl AggregateFunction {
     }
 }
 
+/// The argument accepted by an aggregate call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArgument {
+    /// A `*` argument, supported by `COUNT`.
     Wildcard,
+    /// A named source column.
     Column(String),
 }
 
+/// A Boolean expression used to filter source rows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
+    /// A comparison between two operands.
     Comparison {
+        /// Operand on the left of the comparison operator.
         left: Operand,
+        /// Comparison operation.
         operator: ComparisonOperator,
+        /// Operand on the right of the comparison operator.
         right: Operand,
     },
+    /// Both nested predicates must be true.
     And(Box<Self>, Box<Self>),
+    /// At least one nested predicate must be true.
     Or(Box<Self>, Box<Self>),
 }
 
+/// One side of a predicate comparison.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
+    /// A named source column.
     Column(String),
+    /// A typed SQL literal.
     Literal(Value),
 }
 
+/// A supported binary comparison operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOperator {
+    /// Equality (`=`).
     Equal,
+    /// Inequality (`!=` or `<>`).
     NotEqual,
+    /// Strictly less than (`<`).
     Less,
+    /// Less than or equal (`<=`).
     LessOrEqual,
+    /// Strictly greater than (`>`).
     Greater,
+    /// Greater than or equal (`>=`).
     GreaterOrEqual,
 }
 
+/// One output-column sorting specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBy {
+    /// Output column name or alias to sort by.
     pub name: String,
+    /// Whether to sort in descending rather than ascending order.
     pub descending: bool,
 }
 

@@ -1,16 +1,23 @@
+//! Renderers for structured query results.
+
 use std::fmt::Write;
 
 use crate::engine::QueryResult;
 use crate::value::Value;
 
+/// A supported query output representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
+    /// A bordered, human-readable table.
     Table,
+    /// Comma-separated values with a header row.
     Csv,
+    /// A JSON object containing column metadata and positional rows.
     Json,
 }
 
 impl OutputFormat {
+    /// Parses `table`, `csv`, or `json` without regard to ASCII case.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -22,6 +29,7 @@ impl OutputFormat {
     }
 }
 
+/// Renders one query result in the requested output format.
 #[must_use]
 pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     match format {

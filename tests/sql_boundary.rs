@@ -1,3 +1,5 @@
+//! End-to-end tests at the public SQL execution boundary.
+
 use rusthouse::{DataType, Database, Error, QueryResult, StatementResult, Value};
 
 fn last_query(results: Vec<StatementResult>) -> QueryResult {

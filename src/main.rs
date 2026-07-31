@@ -1,3 +1,5 @@
+//! Command-line front end for RustHouse.
+
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;

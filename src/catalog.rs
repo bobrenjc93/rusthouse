@@ -1,3 +1,5 @@
+//! In-memory table catalog.
+
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
@@ -10,11 +12,15 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Creates an empty catalog.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates a table with a case-insensitively unique name.
+    ///
+    /// Returns an error if the table already exists or its schema is invalid.
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
@@ -25,12 +31,14 @@ impl Catalog {
         Ok(())
     }
 
+    /// Returns a table by case-insensitive name.
     pub fn table(&self, name: &str) -> Result<&Table> {
         self.tables
             .get(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    /// Returns a mutable table by case-insensitive name.
     pub fn table_mut(&mut self, name: &str) -> Result<&mut Table> {
         self.tables
             .get_mut(&normalize(name))
