@@ -9,7 +9,7 @@ mod workload;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(test)]
@@ -868,12 +868,33 @@ fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
 }
 
 fn install_atomic_report(
-    mut temporary_file: fs::File,
+    temporary_file: fs::File,
     temporary_path: &Path,
     destination: &Path,
     parent: &Path,
     contents: &[u8],
 ) -> Result<(), String> {
+    install_atomic_report_with_sync(
+        temporary_file,
+        temporary_path,
+        destination,
+        parent,
+        contents,
+        sync_directory,
+    )
+}
+
+fn install_atomic_report_with_sync<F>(
+    mut temporary_file: fs::File,
+    temporary_path: &Path,
+    destination: &Path,
+    parent: &Path,
+    contents: &[u8],
+    mut sync_parent: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> io::Result<()>,
+{
     temporary_file.write_all(contents).map_err(|error| {
         format!(
             "could not write atomic details file '{}': {error}",
@@ -887,21 +908,98 @@ fn install_atomic_report(
         )
     })?;
     drop(temporary_file);
-    fs::rename(temporary_path, destination).map_err(|error| {
-        format!(
+    let backup = backup_existing_report(destination, parent)?;
+    if let Err(error) = fs::rename(temporary_path, destination) {
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+        return Err(format!(
             "could not atomically replace details file '{}': {error}",
             destination.display()
-        )
-    })?;
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| {
-            format!(
-                "could not sync details directory '{}': {error}",
-                parent.display()
+        ));
+    }
+    if let Err(error) = sync_parent(parent) {
+        let rollback = restore_previous_report(destination, backup.as_deref());
+        let rollback_sync = rollback
+            .as_ref()
+            .ok()
+            .and_then(|_| sync_parent(parent).err());
+        let mut message = format!(
+            "could not sync details directory '{}': {error}",
+            parent.display()
+        );
+        if let Err(rollback_error) = rollback {
+            write!(
+                message,
+                "; could not roll back rejected report: {rollback_error}"
             )
-        })?;
+            .expect("writing to String cannot fail");
+        } else if let Some(rollback_sync_error) = rollback_sync {
+            write!(
+                message,
+                "; rolled back report but could not sync rollback: {rollback_sync_error}"
+            )
+            .expect("writing to String cannot fail");
+        }
+        return Err(message);
+    }
+    if let Some(backup) = backup {
+        let _ = fs::remove_file(backup);
+        let _ = sync_parent(parent);
+    }
     Ok(())
+}
+
+fn backup_existing_report(destination: &Path, parent: &Path) -> Result<Option<PathBuf>, String> {
+    if !destination.exists() {
+        return Ok(None);
+    }
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("details path '{}' has no file name", destination.display()))?;
+    for attempt in 0..100_u32 {
+        let backup = parent.join(format!(
+            ".{file_name}.{}.{}.backup",
+            std::process::id(),
+            attempt
+        ));
+        match fs::hard_link(destination, &backup) {
+            Ok(()) => return Ok(Some(backup)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not retain previous details file '{}': {error}",
+                    destination.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "could not reserve a details backup in '{}'",
+        parent.display()
+    ))
+}
+
+fn restore_previous_report(destination: &Path, backup: Option<&Path>) -> io::Result<()> {
+    let Some(backup) = backup else {
+        return match fs::remove_file(destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+    };
+    match fs::rename(backup, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::remove_file(destination)?;
+            fs::rename(backup, destination)
+        }
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path).and_then(|directory| directory.sync_all())
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -1172,6 +1270,71 @@ mod tests {
 
         write_report_atomically(&path, b"new report\n").expect("atomic report");
         assert_eq!(fs::read(&path).expect("retained report"), b"new report\n");
+        assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn directory_sync_failure_rolls_back_rejected_report() {
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-atomic-rollback-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("test directory");
+        let destination = directory.join("details.json");
+        fs::write(&destination, b"old report\n").expect("old report");
+        let temporary_path = directory.join(".details.tmp");
+        let temporary_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .expect("temporary report");
+        let mut sync_attempt = 0_u32;
+
+        let error = install_atomic_report_with_sync(
+            temporary_file,
+            &temporary_path,
+            &destination,
+            &directory,
+            b"rejected report\n",
+            |_| {
+                sync_attempt += 1;
+                if sync_attempt == 1 {
+                    Err(io::Error::other("injected directory sync failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("directory sync failure must reject report");
+
+        assert!(error.contains("injected directory sync failure"));
+        assert_eq!(
+            fs::read(&destination).expect("restored report"),
+            b"old report\n"
+        );
+        assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+
+        let new_destination = directory.join("new-details.json");
+        let new_temporary_path = directory.join(".new-details.tmp");
+        let new_temporary_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&new_temporary_path)
+            .expect("new temporary report");
+        let error = install_atomic_report_with_sync(
+            new_temporary_file,
+            &new_temporary_path,
+            &new_destination,
+            &directory,
+            b"rejected report\n",
+            |_| Err(io::Error::other("injected directory sync failure")),
+        )
+        .expect_err("directory sync failure must reject new report");
+        assert!(error.contains("injected directory sync failure"));
+        assert!(!new_destination.exists());
         assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
         fs::remove_dir_all(directory).expect("cleanup");
     }

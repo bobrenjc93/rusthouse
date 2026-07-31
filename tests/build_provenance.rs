@@ -308,6 +308,43 @@ fn forged_path_remap_cannot_create_build_attestation() {
     );
 }
 
+#[test]
+fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
+    let temporary = TemporaryRepository::new();
+    let target_dir = temporary.path.join("artifact-target");
+    let host = rustc_host();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO_BIN_EXE_attested-build"))
+        .current_dir(manifest_dir.join("src"))
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_BUILD_TARGET", &host)
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+        .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
+        .output()
+        .expect("run attested builder from nested directory");
+    assert!(
+        output.status.success(),
+        "attested builder failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let release_dir = target_dir.join(host).join("release");
+    let rusthouse = release_dir.join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
+    let benchmark = release_dir.join(format!(
+        "clickhouse-parity-bench{}",
+        env::consts::EXE_SUFFIX
+    ));
+    assert!(rusthouse.is_file());
+    assert!(benchmark.is_file());
+    let attestation = Command::new(rusthouse)
+        .arg("--benchmark-attestation")
+        .output()
+        .expect("run attested RustHouse");
+    assert!(attestation.status.success());
+}
+
 struct TemporaryRepository {
     path: PathBuf,
 }
@@ -546,5 +583,20 @@ fn rustc_sysroot() -> String {
     String::from_utf8(output.stdout)
         .expect("UTF-8 sysroot")
         .trim()
+        .to_owned()
+}
+
+fn rustc_host() -> String {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .expect("query rustc host");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 rustc version")
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc host line")
         .to_owned()
 }

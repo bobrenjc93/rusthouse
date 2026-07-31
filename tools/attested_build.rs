@@ -4,6 +4,7 @@ mod sha256;
 
 use std::env;
 use std::fmt::Write as _;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::{self, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,25 +32,31 @@ fn build_attested_binaries() -> Result<i32, String> {
         .map_err(|error| format!("cannot locate attestation wrapper executable: {error}"))?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let token = new_build_token()?;
-    let first_status = command_status(
+    let (first_status, rusthouse_path) = cargo_artifact(
         Command::new(&cargo)
             .args(["build", "--release", "--bin", "rusthouse"])
             .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
             .env("RUSTHOUSE_ATTESTED_BUILD_TOKEN", &token)
             .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256"),
+        "rusthouse",
     )?;
     if first_status != 0 {
         return Ok(first_status);
     }
 
-    let rusthouse_sha256 = sha256::file_digest_hex(&rusthouse_binary_path())?;
-    command_status(
+    let rusthouse_sha256 = sha256::file_digest_hex(
+        &rusthouse_path
+            .ok_or_else(|| "Cargo did not report the RustHouse executable artifact".to_owned())?,
+    )?;
+    let (status, _) = cargo_artifact(
         Command::new(cargo)
             .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
             .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
             .env("RUSTHOUSE_ATTESTED_BUILD_TOKEN", token)
             .env("RUSTHOUSE_ATTESTED_BINARY_SHA256", rusthouse_sha256),
-    )
+        "clickhouse-parity-bench",
+    )?;
+    Ok(status)
 }
 
 fn wrap_rustc(arguments: &[String]) -> Result<i32, String> {
@@ -132,13 +139,129 @@ fn new_build_token() -> Result<String, String> {
     Ok(sha256::digest_hex(material.as_bytes()))
 }
 
-fn rusthouse_binary_path() -> PathBuf {
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"));
-    target_dir
-        .join("release")
-        .join(format!("rusthouse{}", env::consts::EXE_SUFFIX))
+fn cargo_artifact(
+    command: &mut Command,
+    target_name: &str,
+) -> Result<(i32, Option<PathBuf>), String> {
+    command.arg("--message-format=json-render-diagnostics");
+    let display = format!("{command:?}");
+    let output = command
+        .output()
+        .map_err(|error| format!("could not execute {display}: {error}"))?;
+    io::stderr()
+        .write_all(&output.stderr)
+        .map_err(|error| format!("could not forward Cargo stderr: {error}"))?;
+    if !output.status.success() {
+        io::stderr()
+            .write_all(&output.stdout)
+            .map_err(|error| format!("could not forward Cargo output: {error}"))?;
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Cargo artifact output was not UTF-8: {error}"))?;
+    let artifact = cargo_executable_artifact(&stdout, target_name)?;
+    Ok((output.status.code().unwrap_or(1), artifact))
+}
+
+fn cargo_executable_artifact(messages: &str, target_name: &str) -> Result<Option<PathBuf>, String> {
+    let mut artifact = None;
+    for message in messages.lines() {
+        if json_string_field(message, "reason")?.as_deref() != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(target) = json_object_field(message, "target") else {
+            continue;
+        };
+        if json_string_field(target, "name")?.as_deref() != Some(target_name) {
+            continue;
+        }
+        if let Some(executable) = json_string_field(message, "executable")? {
+            artifact = Some(PathBuf::from(executable));
+        }
+    }
+    Ok(artifact)
+}
+
+fn json_object_field<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("\"{name}\":{{");
+    let start = input.find(&marker)? + marker.len() - 1;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in input[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&input[start..start + offset + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn json_string_field(input: &str, name: &str) -> Result<Option<String>, String> {
+    let marker = format!("\"{name}\":");
+    let Some(start) = input.find(&marker).map(|index| index + marker.len()) else {
+        return Ok(None);
+    };
+    if !input[start..].starts_with('"') {
+        return Ok(None);
+    }
+    decode_json_string(&input[start..]).map(Some)
+}
+
+fn decode_json_string(input: &str) -> Result<String, String> {
+    let mut characters = input
+        .strip_prefix('"')
+        .ok_or_else(|| "JSON string is missing an opening quote".to_owned())?
+        .chars();
+    let mut decoded = String::new();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return Ok(decoded),
+            '\\' => {
+                match characters.next() {
+                    Some('"') => decoded.push('"'),
+                    Some('\\') => decoded.push('\\'),
+                    Some('/') => decoded.push('/'),
+                    Some('b') => decoded.push('\u{0008}'),
+                    Some('f') => decoded.push('\u{000c}'),
+                    Some('n') => decoded.push('\n'),
+                    Some('r') => decoded.push('\r'),
+                    Some('t') => decoded.push('\t'),
+                    Some('u') => {
+                        let digits = characters.by_ref().take(4).collect::<String>();
+                        let value = u32::from_str_radix(&digits, 16)
+                            .map_err(|_| format!("invalid JSON Unicode escape {digits:?}"))?;
+                        decoded.push(char::from_u32(value).ok_or_else(|| {
+                            format!("invalid JSON Unicode scalar value {value:#x}")
+                        })?);
+                    }
+                    Some(escape) => return Err(format!("invalid JSON escape \\{escape}")),
+                    None => return Err("unterminated JSON escape".to_owned()),
+                }
+            }
+            character if character.is_control() => {
+                return Err("unescaped control character in JSON string".to_owned());
+            }
+            character => decoded.push(character),
+        }
+    }
+    Err("unterminated JSON string".to_owned())
 }
 
 fn require_lower_hex(name: &str, value: &str, length: usize) -> Result<(), String> {
@@ -173,7 +296,23 @@ fn command_status(command: &mut Command) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::final_configuration;
+    use std::path::PathBuf;
+
+    use super::{cargo_executable_artifact, final_configuration};
+
+    #[test]
+    fn cargo_artifact_messages_supply_the_executable_path() {
+        let messages = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"dependency\"},\"executable\":null}\n",
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"rusthouse\"},\"executable\":\"C:\\\\work\\\\target\\\\triple\\\\release\\\\rusthouse.exe\"}\n"
+        );
+        assert_eq!(
+            cargo_executable_artifact(messages, "rusthouse").expect("artifact messages"),
+            Some(PathBuf::from(
+                "C:\\work\\target\\triple\\release\\rusthouse.exe"
+            ))
+        );
+    }
 
     #[test]
     fn short_and_long_codegen_spellings_are_equivalent() {
