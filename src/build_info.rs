@@ -51,8 +51,18 @@ fn build_configuration_sha256(
     final_rustc_configuration_marker: &'static str,
 ) -> Result<&'static str, String> {
     static SHA256: OnceLock<String> = OnceLock::new();
+    let expected_token = option_env!("RUSTHOUSE_ATTESTED_BUILD_TOKEN").unwrap_or("unavailable");
+    if expected_token.len() != 64
+        || !expected_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("attested build token is unavailable".to_owned());
+    }
     let encoded_configuration = final_rustc_configuration_marker
         .strip_prefix("rusthouse-final-rustc-")
+        .and_then(|marker| marker.strip_prefix(expected_token))
+        .and_then(|marker| marker.strip_prefix('-'))
         .filter(|encoded| {
             !encoded.is_empty()
                 && encoded.len() % 2 == 0

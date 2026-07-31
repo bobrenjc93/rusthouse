@@ -13,7 +13,7 @@ fn ordinary_binary_refuses_unattested_benchmark_identity() {
     assert!(
         String::from_utf8(output.stderr)
             .expect("UTF-8 stderr")
-            .contains("final rustc configuration attestation is unavailable")
+            .contains("attested build token is unavailable")
     );
 }
 

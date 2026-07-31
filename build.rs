@@ -52,6 +52,7 @@ fn main() {
     emit("RUSTHOUSE_RUSTC_VERSION", &rustc_version);
     emit("RUSTHOUSE_BUILD_TARGET", &target);
     emit("RUSTHOUSE_BUILD_PROFILE", &profile);
+    emit("RUSTHOUSE_ATTESTED_BUILD_TOKEN", &attested_build_token());
     emit(
         "RUSTHOUSE_BUILD_CONFIGURATION_SHA256",
         &build_configuration_seed_sha256,
@@ -63,11 +64,37 @@ fn main() {
     );
 
     println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-env-changed=RUSTC_WORKSPACE_WRAPPER");
+    println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD_TOKEN");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_DIRTY");
     emit_source_watches(manifest_dir);
     for path in source.git_watch_paths {
         println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn attested_build_token() -> String {
+    let token = env::var("RUSTHOUSE_ATTESTED_BUILD_TOKEN").ok();
+    let wrapper = env::var("RUSTC_WORKSPACE_WRAPPER").ok();
+    match (token, wrapper) {
+        (Some(token), Some(wrapper)) if !wrapper.trim().is_empty() => {
+            require_lower_hex("RUSTHOUSE_ATTESTED_BUILD_TOKEN", &token, 64);
+            token
+        }
+        (None, None) | (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
+            "unavailable".to_owned()
+        }
+    }
+}
+
+fn require_lower_hex(name: &str, value: &str, length: usize) {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        panic!("{name} must contain exactly {length} lowercase hexadecimal characters");
     }
 }
 

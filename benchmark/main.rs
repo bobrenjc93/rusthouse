@@ -178,6 +178,10 @@ fn run(config: Config) -> Result<Report, String> {
         clickhouse: config.clickhouse.clone(),
     };
     let (paths, identity, _pinned_executables) = configured_paths.pin_and_validate(build_info)?;
+    validate_attested_rusthouse_sha256(
+        option_env!("RUSTHOUSE_ATTESTED_BINARY_SHA256").unwrap_or("unavailable"),
+        &identity.rusthouse.sha256,
+    )?;
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
 
@@ -450,6 +454,25 @@ fn run(config: Config) -> Result<Report, String> {
         evidence,
         suggestions,
     })
+}
+
+fn validate_attested_rusthouse_sha256(expected: &str, actual: &str) -> Result<(), String> {
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "benchmark executable is not bound to an attested RustHouse binary; rebuild with `cargo run --bin attested-build`"
+                .to_owned(),
+        );
+    }
+    if actual != expected {
+        return Err(format!(
+            "RustHouse executable SHA-256 does not match the binary bound into the benchmark: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_default_build(mode: config::Mode, build_info: BuildInfo) -> Result<(), String> {
@@ -1090,6 +1113,14 @@ mod tests {
         )
         .expect_err("debug default build must fail");
         assert!(profile_error.contains("release binaries"));
+    }
+
+    #[test]
+    fn benchmark_is_bound_to_the_exact_rusthouse_executable() {
+        let sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        validate_attested_rusthouse_sha256(sha256, sha256).expect("matching binary");
+        assert!(validate_attested_rusthouse_sha256("unavailable", sha256).is_err());
+        assert!(validate_attested_rusthouse_sha256(sha256, &"b".repeat(64)).is_err());
     }
 
     #[test]

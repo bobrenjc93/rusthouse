@@ -11,6 +11,9 @@ use build_provenance::{
     CargoVcsProvenance, cargo_vcs_provenance, owned_git_repository, parse_dirty,
 };
 
+const ATTESTED_BUILD_TOKEN: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 #[test]
 fn cargo_vcs_metadata_preserves_dirty_package_state() {
     let clean = r#"{"git":{"sha1":"0123456789abcdef0123456789abcdef01234567"},"path_in_vcs":""}"#;
@@ -210,6 +213,50 @@ fn build_configuration_fingerprint_changes_with_effective_codegen_settings() {
     ]);
     let sixteen_codegen_units = repository.probe_build_configuration("release");
     assert_ne!(one_codegen_unit, sixteen_codegen_units);
+
+    let native_search = format!("native={}", repository.path.display());
+    repository.cargo(&[
+        "rustc",
+        "--release",
+        "--bin",
+        "provenance-probe",
+        "--quiet",
+        "--",
+        "-L",
+        &native_search,
+    ]);
+    let custom_link_search = repository.probe_build_configuration("release");
+    assert_ne!(normal, custom_link_search);
+
+    let sysroot = rustc_sysroot();
+    repository.cargo(&[
+        "rustc",
+        "--release",
+        "--bin",
+        "provenance-probe",
+        "--quiet",
+        "--",
+        "--sysroot",
+        &sysroot,
+    ]);
+    let explicit_sysroot = repository.probe_build_configuration("release");
+    assert_ne!(normal, explicit_sysroot);
+
+    #[cfg(target_os = "macos")]
+    {
+        repository.cargo(&[
+            "rustc",
+            "--release",
+            "--bin",
+            "provenance-probe",
+            "--quiet",
+            "--",
+            "-l",
+            "framework=Foundation",
+        ]);
+        let linked_framework = repository.probe_build_configuration("release");
+        assert_ne!(normal, linked_framework);
+    }
 }
 
 #[test]
@@ -239,6 +286,26 @@ fn ordinary_build_does_not_require_the_attestation_wrapper() {
     repository.git(&["commit", "-m", "probe sources"]);
 
     repository.cargo_without_wrapper(&["build", "--quiet", "--bin", "provenance-probe"]);
+}
+
+#[test]
+fn forged_path_remap_cannot_create_build_attestation() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "probe sources"]);
+    let forged_marker =
+        format!("--remap-path-prefix=src/main.rs=rusthouse-final-rustc-{ATTESTED_BUILD_TOKEN}-00");
+
+    repository.cargo_without_wrapper_with_env(
+        &["build", "--quiet", "--bin", "provenance-probe"],
+        &[("RUSTFLAGS", &forged_marker)],
+    );
+    let output = repository.probe_output("debug", "provenance-probe");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("attested build token is unavailable")
+    );
 }
 
 struct TemporaryRepository {
@@ -359,6 +426,10 @@ impl TemporaryRepository {
         let _ = self.cargo_output_inner(arguments, &[], false);
     }
 
+    fn cargo_without_wrapper_with_env(&self, arguments: &[&str], environment: &[(&str, &str)]) {
+        let _ = self.cargo_output_inner(arguments, environment, false);
+    }
+
     fn cargo_with_env(&self, arguments: &[&str], environment: &[(&str, &str)]) {
         let _ = self.cargo_output(arguments, environment);
     }
@@ -395,9 +466,13 @@ impl TemporaryRepository {
             .args(arguments)
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+            .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
             .current_dir(&self.path);
         if attested {
-            command.env("RUSTC_WORKSPACE_WRAPPER", wrapper);
+            command
+                .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+                .env("RUSTHOUSE_ATTESTED_BUILD_TOKEN", ATTESTED_BUILD_TOKEN);
         }
         for (key, value) in environment {
             command.env(key, value);
@@ -433,14 +508,7 @@ impl TemporaryRepository {
     }
 
     fn probe_field_for(&self, profile: &str, binary: &str, field: &str) -> String {
-        let executable = self
-            .path
-            .join("target")
-            .join(profile)
-            .join(format!("{binary}{}", env::consts::EXE_SUFFIX));
-        let output = Command::new(executable)
-            .output()
-            .expect("run provenance probe");
+        let output = self.probe_output(profile, binary);
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).expect("UTF-8 probe output");
         stdout
@@ -449,10 +517,34 @@ impl TemporaryRepository {
             .unwrap_or_else(|| panic!("missing probe field {field:?} in {stdout:?}"))
             .to_owned()
     }
+
+    fn probe_output(&self, profile: &str, binary: &str) -> std::process::Output {
+        let executable = self
+            .path
+            .join("target")
+            .join(profile)
+            .join(format!("{binary}{}", env::consts::EXE_SUFFIX));
+        Command::new(executable)
+            .output()
+            .expect("run provenance probe")
+    }
 }
 
 impl Drop for TemporaryRepository {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn rustc_sysroot() -> String {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("query rustc sysroot");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 sysroot")
+        .trim()
+        .to_owned()
 }
