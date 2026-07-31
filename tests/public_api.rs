@@ -1,9 +1,10 @@
+use rusthouse::catalog::Catalog;
 use rusthouse::sql::{
     AggregateArgument, AggregateFunction, ComparisonOperator, Operand, Predicate, Select,
     SelectItem, Statement, parse,
 };
 use rusthouse::storage::{Column, ColumnDef, Table};
-use rusthouse::{DataType, Value};
+use rusthouse::{DataType, Error, Value};
 
 #[test]
 fn legacy_public_value_statement_and_column_shapes_remain_usable() {
@@ -86,4 +87,30 @@ fn versioned_public_api_exposes_filtered_aggregate_and_having_ast() {
     assert!(matches!(Statement::Select(select), Statement::Select(_)));
     assert_eq!(Value::Null.data_type(), DataType::Null);
     assert_eq!(Column::Null(vec![()]).value(0), Value::Null);
+}
+
+#[test]
+fn null_type_marker_is_rejected_in_public_schemas() {
+    let schema = vec![ColumnDef {
+        name: "value".to_owned(),
+        data_type: DataType::Null,
+    }];
+
+    let table_error = Table::new("invalid".to_owned(), schema.clone())
+        .expect_err("Null is not a physical schema type");
+    assert!(matches!(
+        &table_error,
+        Error::InvalidQuery(message)
+            if message.contains("cannot use Null as a schema type")
+    ));
+
+    let mut catalog = Catalog::new();
+    let catalog_error = catalog
+        .create_table("invalid".to_owned(), schema)
+        .expect_err("catalog delegates schema validation to Table");
+    assert_eq!(catalog_error, table_error);
+    assert!(matches!(
+        catalog.table("invalid"),
+        Err(Error::TableNotFound(name)) if name == "invalid"
+    ));
 }

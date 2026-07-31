@@ -219,6 +219,12 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
+            if field.data_type == DataType::Null {
+                return Err(Error::InvalidQuery(format!(
+                    "column '{}.{}' cannot use Null as a schema type",
+                    name, field.name
+                )));
+            }
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),
