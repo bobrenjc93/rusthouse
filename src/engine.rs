@@ -23,7 +23,7 @@ pub struct Database {
     catalog: Catalog,
     limits: ExecutionLimits,
     last_execution_stats: ExecutionStats,
-    spill_directory: PathBuf,
+    spill_directory: Arc<PathBuf>,
 }
 
 impl Default for Database {
@@ -32,7 +32,7 @@ impl Default for Database {
             catalog: Catalog::default(),
             limits: ExecutionLimits::default(),
             last_execution_stats: ExecutionStats::default(),
-            spill_directory: std::env::temp_dir(),
+            spill_directory: Arc::new(std::env::temp_dir()),
         }
     }
 }
@@ -95,7 +95,7 @@ impl Database {
             catalog: Catalog::default(),
             limits,
             last_execution_stats: ExecutionStats::default(),
-            spill_directory: spill_directory.into(),
+            spill_directory: Arc::new(spill_directory.into()),
         }
     }
 
@@ -624,7 +624,7 @@ fn execute_ungrouped(
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
     context: &mut ExecutionContext<'_>,
-    spill_directory: &Path,
+    spill_directory: &Arc<PathBuf>,
 ) -> Result<Vec<Vec<Value>>> {
     if limit == Some(0) {
         return Ok(Vec::new());
@@ -686,7 +686,7 @@ fn execute_grouped(
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
     context: &mut ExecutionContext<'_>,
-    spill_directory: &Path,
+    spill_directory: &Arc<PathBuf>,
 ) -> Result<GroupedData> {
     let mut data = GroupedData::default();
     if group_columns.is_empty() {
@@ -1060,7 +1060,7 @@ fn project_grouped_rows(
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
     context: &mut ExecutionContext<'_>,
-    spill_directory: &Path,
+    spill_directory: &Arc<PathBuf>,
 ) -> Result<Vec<Vec<Value>>> {
     if limit == Some(0) {
         return Ok(Vec::new());
@@ -1124,7 +1124,7 @@ impl<F> IndexSorter<F>
 where
     F: Fn(usize, usize) -> Ordering,
 {
-    fn new(compare: F, context: &ExecutionContext<'_>, spill_directory: &Path) -> Self {
+    fn new(compare: F, context: &ExecutionContext<'_>, spill_directory: &Arc<PathBuf>) -> Self {
         let available_memory = context.available_memory();
         Self {
             compare,
@@ -1133,7 +1133,7 @@ where
             run_memory_bytes: 0,
             chunk: Vec::new(),
             runs: Vec::new(),
-            spill_directory: Arc::new(spill_directory.to_owned()),
+            spill_directory: Arc::clone(spill_directory),
             prepared: false,
         }
     }
@@ -1616,6 +1616,29 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn sorter_shares_the_database_spill_directory_allocation() {
+        let database = Database::with_limits_and_spill_directory(
+            ExecutionLimits {
+                max_memory_bytes: 4_096,
+                ..ExecutionLimits::default()
+            },
+            PathBuf::from("x".repeat(1024 * 1024)),
+        );
+        let context = ExecutionContext::new(&database.limits, 0);
+        let sorter = IndexSorter::new(
+            |left: usize, right: usize| left.cmp(&right),
+            &context,
+            &database.spill_directory,
+        );
+
+        assert!(std::ptr::eq(
+            database.spill_directory.as_ref().as_path(),
+            sorter.spill_directory.as_ref().as_path(),
+        ));
+        assert_eq!(context.stats.peak_memory_bytes, 0);
     }
 
     #[test]
