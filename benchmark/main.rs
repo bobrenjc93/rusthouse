@@ -98,6 +98,17 @@ struct Report {
     suggestions: Vec<String>,
 }
 
+struct DetailsContext<'a> {
+    config: &'a Config,
+    identity: &'a RunIdentity,
+    cases: &'a [CaseResult],
+    primary_score: ScoreBreakdown,
+    end_to_end_score: ScoreBreakdown,
+    correctness_checks: usize,
+    suite_manifest: &'a str,
+    suite_manifest_sha256: &'a str,
+}
+
 fn main() -> ExitCode {
     let default_rusthouse = match default_rusthouse_path() {
         Ok(path) => path,
@@ -152,12 +163,12 @@ fn default_rusthouse_path() -> Result<PathBuf, String> {
 
 fn run(config: Config) -> Result<Report, String> {
     let settings = config.mode.settings();
-    let paths = EnginePaths {
+    let configured_paths = EnginePaths {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
     };
     let build_info = rusthouse::build_info::current();
-    let identity = paths.validate(build_info)?;
+    let (paths, identity, _pinned_executables) = configured_paths.pin_and_validate(build_info)?;
     if config.mode == config::Mode::Default && identity.rusthouse.profile != "release" {
         return Err(format!(
             "default mode requires release binaries, got profile {:?}",
@@ -320,16 +331,16 @@ fn run(config: Config) -> Result<Report, String> {
     )?;
 
     if let Some(path) = &config.details {
-        let details = details_json(
-            &config,
-            &identity,
-            &cases,
+        let details = details_json(&DetailsContext {
+            config: &config,
+            identity: &identity,
+            cases: &cases,
             primary_score,
             end_to_end_score,
             correctness_checks,
-            &suite_manifest,
-            &suite_manifest_sha256,
-        );
+            suite_manifest: &suite_manifest,
+            suite_manifest_sha256: &suite_manifest_sha256,
+        });
         write_report_atomically(path, details.as_bytes())?;
     }
 
@@ -624,16 +635,17 @@ fn verify_digest(bytes: &[u8], expected: &str, subject: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn details_json(
-    config: &Config,
-    identity: &RunIdentity,
-    cases: &[CaseResult],
-    primary_score: ScoreBreakdown,
-    end_to_end_score: ScoreBreakdown,
-    correctness_checks: usize,
-    suite_manifest: &str,
-    suite_manifest_sha256: &str,
-) -> String {
+fn details_json(context: &DetailsContext<'_>) -> String {
+    let DetailsContext {
+        config,
+        identity,
+        cases,
+        primary_score,
+        end_to_end_score,
+        correctness_checks,
+        suite_manifest,
+        suite_manifest_sha256,
+    } = context;
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(

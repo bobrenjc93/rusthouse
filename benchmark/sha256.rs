@@ -71,6 +71,8 @@ impl Sha256 {
             if self.buffered == 64 {
                 compress(&mut self.state, &self.buffer);
                 self.buffered = 0;
+            } else {
+                return;
             }
         }
 
@@ -185,5 +187,31 @@ mod tests {
             digest_hex(&million_as),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+    }
+
+    #[test]
+    fn chunk_boundaries_preserve_pending_bytes() {
+        let expected = digest_hex(b"abc");
+        for chunks in [
+            vec![b"a".as_slice(), b"bc".as_slice()],
+            vec![b"ab".as_slice(), b"c".as_slice()],
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()],
+        ] {
+            let mut hasher = Sha256::new();
+            for chunk in chunks {
+                hasher.update(chunk);
+            }
+            assert_eq!(hex(hasher.finish()), expected);
+        }
+
+        let input = (0_u8..=200).collect::<Vec<_>>();
+        let expected = digest_hex(&input);
+        for chunk_size in [1, 2, 7, 31, 63, 64, 65, 127] {
+            let mut hasher = Sha256::new();
+            for chunk in input.chunks(chunk_size) {
+                hasher.update(chunk);
+            }
+            assert_eq!(hex(hasher.finish()), expected, "chunk size {chunk_size}");
+        }
     }
 }

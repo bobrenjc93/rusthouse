@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,6 +20,11 @@ const CLICKHOUSE_TARGET: &str = "aarch64-apple-darwin";
 pub struct EnginePaths {
     pub rusthouse: PathBuf,
     pub clickhouse: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct PinnedExecutables {
+    directory: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +76,16 @@ pub struct TimedBatch {
 }
 
 impl EnginePaths {
+    pub fn pin_and_validate(
+        &self,
+        expected: BuildInfo,
+    ) -> Result<(Self, RunIdentity, PinnedExecutables), String> {
+        let pinned = PinnedExecutables::create(self)?;
+        let paths = pinned.paths();
+        let identity = paths.validate(expected)?;
+        Ok((paths, identity, pinned))
+    }
+
     pub fn validate(&self, expected: BuildInfo) -> Result<RunIdentity, String> {
         let rusthouse = validate_rusthouse(&self.rusthouse)?;
         validate_rusthouse_build(&rusthouse, expected)?;
@@ -180,6 +196,156 @@ impl EnginePaths {
             };
         Ok((elapsed, stdout))
     }
+}
+
+impl PinnedExecutables {
+    fn create(sources: &EnginePaths) -> Result<Self, String> {
+        let directory = create_private_staging_directory()?;
+        let pinned = Self { directory };
+        copy_executable(&sources.rusthouse, &pinned.rusthouse_path())?;
+        copy_executable(&sources.clickhouse, &pinned.clickhouse_path())?;
+        make_staging_directory_read_only(&pinned.directory)?;
+        Ok(pinned)
+    }
+
+    fn paths(&self) -> EnginePaths {
+        EnginePaths {
+            rusthouse: self.rusthouse_path(),
+            clickhouse: self.clickhouse_path(),
+        }
+    }
+
+    fn rusthouse_path(&self) -> PathBuf {
+        self.directory
+            .join(format!("rusthouse-pinned{}", env::consts::EXE_SUFFIX))
+    }
+
+    fn clickhouse_path(&self) -> PathBuf {
+        self.directory
+            .join(format!("clickhouse-pinned{}", env::consts::EXE_SUFFIX))
+    }
+}
+
+impl Drop for PinnedExecutables {
+    fn drop(&mut self) {
+        let _ = make_staging_directory_writable(&self.directory);
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn create_private_staging_directory() -> Result<PathBuf, String> {
+    let parent = env::temp_dir();
+    for attempt in 0..100_u32 {
+        let directory = parent.join(format!(
+            "rusthouse-benchmark-pinned-{}-{attempt}",
+            std::process::id()
+        ));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create private executable staging directory in '{}': {error}",
+                    parent.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "could not reserve a private executable staging directory in '{}'",
+        parent.display()
+    ))
+}
+
+fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(source).map_err(|error| {
+        format!(
+            "could not inspect executable '{}': {error}",
+            source.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!("executable '{}' is not a file", source.display()));
+    }
+    fs::copy(source, destination).map_err(|error| {
+        format!(
+            "could not pin executable '{}' as '{}': {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "could not sync pinned executable '{}': {error}",
+                destination.display()
+            )
+        })?;
+
+    let mut permissions = fs::metadata(destination)
+        .map_err(|error| {
+            format!(
+                "could not inspect pinned executable '{}': {error}",
+                destination.display()
+            )
+        })?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o500);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    fs::set_permissions(destination, permissions).map_err(|error| {
+        format!(
+            "could not make pinned executable '{}' read-only: {error}",
+            destination.display()
+        )
+    })
+}
+
+fn make_staging_directory_read_only(path: &Path) -> Result<(), String> {
+    set_staging_directory_permissions(path, true)
+}
+
+fn make_staging_directory_writable(path: &Path) -> Result<(), String> {
+    set_staging_directory_permissions(path, false)
+}
+
+fn set_staging_directory_permissions(path: &Path, read_only: bool) -> Result<(), String> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| {
+            format!(
+                "could not inspect executable staging directory '{}': {error}",
+                path.display()
+            )
+        })?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(if read_only { 0o500 } else { 0o700 });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(read_only);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        format!(
+            "could not update executable staging directory '{}': {error}",
+            path.display()
+        )
+    })
 }
 
 fn ensure_identity_unchanged(original: &RunIdentity, current: &RunIdentity) -> Result<(), String> {
@@ -525,5 +691,40 @@ mod tests {
         let error = ensure_identity_unchanged(&original, &tampered)
             .expect_err("changed binary digest must fail");
         assert!(error.contains("provenance changed"));
+    }
+
+    #[test]
+    fn pinned_executables_do_not_follow_source_replacements() {
+        let source_directory = env::temp_dir().join(format!(
+            "rusthouse-pinning-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&source_directory);
+        fs::create_dir(&source_directory).expect("source directory");
+        let sources = EnginePaths {
+            rusthouse: source_directory.join("rusthouse"),
+            clickhouse: source_directory.join("clickhouse"),
+        };
+        fs::write(&sources.rusthouse, b"rusthouse original").expect("rusthouse source");
+        fs::write(&sources.clickhouse, b"clickhouse original").expect("clickhouse source");
+
+        let pinned = PinnedExecutables::create(&sources).expect("pinned copies");
+        let pinned_paths = pinned.paths();
+        fs::write(&sources.rusthouse, b"rusthouse replacement").expect("replace rusthouse");
+        fs::write(&sources.clickhouse, b"clickhouse replacement").expect("replace clickhouse");
+
+        assert_eq!(
+            fs::read(&pinned_paths.rusthouse).expect("pinned rusthouse"),
+            b"rusthouse original"
+        );
+        assert_eq!(
+            fs::read(&pinned_paths.clickhouse).expect("pinned clickhouse"),
+            b"clickhouse original"
+        );
+        let pinned_directory = pinned.directory.clone();
+        drop(pinned);
+        assert!(!pinned_directory.exists());
+        fs::remove_dir_all(source_directory).expect("cleanup sources");
     }
 }
