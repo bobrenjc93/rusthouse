@@ -15,6 +15,16 @@ use build_provenance::{
     cargo_vcs_provenance, has_hidden_git_index_entries, owned_git_repository, parse_dirty,
 };
 
+const BUILD_CONFIGURATION_REQUIRED_ENV_KEYS: &[&str] =
+    &["PROFILE", "OPT_LEVEL", "DEBUG", "TARGET", "HOST", "OUT_DIR"];
+const BUILD_CONFIGURATION_OPTIONAL_ENV_KEYS: &[&str] = &[
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_INCREMENTAL",
+    "RUSTFLAGS",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+];
+
 struct SourceProvenance {
     commit: String,
     dirty: bool,
@@ -68,11 +78,11 @@ fn main() {
     );
 
     println!("cargo:rerun-if-env-changed=RUSTC");
-    println!("cargo:rerun-if-env-changed=RUSTC_WORKSPACE_WRAPPER");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD_TOKEN");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_DIRTY");
+    emit_build_configuration_env_watches();
     emit_source_watches(manifest_dir);
     for path in source.git_watch_paths {
         println!("cargo:rerun-if-changed={}", path.display());
@@ -217,13 +227,6 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
 }
 
 fn build_configuration_seed_sha256() -> String {
-    const OPTIONAL_KEYS: &[&str] = &[
-        "CARGO_ENCODED_RUSTFLAGS",
-        "CARGO_INCREMENTAL",
-        "RUSTFLAGS",
-        "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER",
-    ];
     let mut settings = vec![
         ("PROFILE".to_owned(), required_env("PROFILE")),
         ("OPT_LEVEL".to_owned(), required_env("OPT_LEVEL")),
@@ -235,7 +238,7 @@ fn build_configuration_seed_sha256() -> String {
             cargo_unit_fingerprint(),
         ),
     ];
-    settings.extend(OPTIONAL_KEYS.iter().map(|key| {
+    settings.extend(BUILD_CONFIGURATION_OPTIONAL_ENV_KEYS.iter().map(|key| {
         (
             (*key).to_owned(),
             env::var(key).unwrap_or_else(|_| "<unset>".to_owned()),
@@ -255,6 +258,28 @@ fn build_configuration_seed_sha256() -> String {
             .expect("writing to String cannot fail");
     }
     sha256::digest_hex(canonical.as_bytes())
+}
+
+fn emit_build_configuration_env_watches() {
+    for key in BUILD_CONFIGURATION_REQUIRED_ENV_KEYS
+        .iter()
+        .chain(BUILD_CONFIGURATION_OPTIONAL_ENV_KEYS)
+    {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    let mut cargo_keys = env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            key.starts_with("CARGO_CFG_")
+                || key.starts_with("CARGO_FEATURE_")
+                || key.starts_with("CARGO_PROFILE_")
+        })
+        .collect::<Vec<_>>();
+    cargo_keys.sort();
+    cargo_keys.dedup();
+    for key in cargo_keys {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
 }
 
 fn cargo_unit_fingerprint() -> String {

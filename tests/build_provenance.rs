@@ -289,6 +289,29 @@ fn build_configuration_fingerprint_changes_with_effective_codegen_settings() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn warm_cache_rebuild_tracks_rustc_wrapper_changes() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "probe sources"]);
+
+    repository.cargo(&["build", "--release", "--quiet"]);
+    let without_outer_wrapper = repository.probe_build_configuration("release");
+    for binary in ["provenance-probe", "benchmark-probe"] {
+        fs::remove_file(repository.path.join("target").join("release").join(binary))
+            .expect("remove cached executable artifact");
+    }
+
+    repository.cargo_with_env(
+        &["build", "--release", "--quiet"],
+        &[("RUSTC_WRAPPER", "/usr/bin/env")],
+    );
+    let with_outer_wrapper = repository.probe_build_configuration("release");
+    assert_ne!(without_outer_wrapper, with_outer_wrapper);
+}
+
 #[test]
 fn new_untracked_root_entry_is_detected_without_recursive_rebuild_watch() {
     let repository = TemporaryRepository::new();

@@ -16,6 +16,7 @@ pub const CLICKHOUSE_ARTIFACT_URL: &str = "https://github.com/ClickHouse/ClickHo
 pub const CLICKHOUSE_ARTIFACT_PLATFORM: &str = "macos-aarch64";
 const CLICKHOUSE_TARGET: &str = "aarch64-apple-darwin";
 const STAGING_DIRECTORY_PREFIX: &str = "rusthouse-benchmark-pinned-";
+const STAGING_LIVENESS_FILE: &str = ".active.lock";
 const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub struct EnginePaths {
 pub struct PinnedExecutables {
     directory: PathBuf,
     cleanup_guard: Option<CleanupGuard>,
+    liveness_lock: Option<fs::File>,
 }
 
 #[derive(Debug)]
@@ -225,9 +227,17 @@ impl EnginePaths {
 impl PinnedExecutables {
     fn create(sources: &EnginePaths) -> Result<Self, String> {
         let directory = create_private_staging_directory()?;
+        let liveness_lock = match create_staging_liveness_lock(&directory) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = cleanup_staging_directory(&directory);
+                return Err(error);
+            }
+        };
         let cleanup_guard = match start_cleanup_guard(&directory) {
             Ok(guard) => guard,
             Err(error) => {
+                drop(liveness_lock);
                 let _ = cleanup_staging_directory(&directory);
                 return Err(error);
             }
@@ -235,6 +245,7 @@ impl PinnedExecutables {
         let pinned = Self {
             directory,
             cleanup_guard,
+            liveness_lock: Some(liveness_lock),
         };
         copy_executable(&sources.rusthouse, &pinned.rusthouse_path())?;
         copy_executable(&sources.clickhouse, &pinned.clickhouse_path())?;
@@ -262,11 +273,34 @@ impl PinnedExecutables {
 
 impl Drop for PinnedExecutables {
     fn drop(&mut self) {
+        drop(self.liveness_lock.take());
         if let Some(mut guard) = self.cleanup_guard.take() {
             guard.finish();
         }
         let _ = cleanup_staging_directory(&self.directory);
     }
+}
+
+fn create_staging_liveness_lock(directory: &Path) -> Result<fs::File, String> {
+    let path = directory.join(STAGING_LIVENESS_FILE);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "could not create staging liveness marker '{}': {error}",
+                path.display()
+            )
+        })?;
+    file.lock().map_err(|error| {
+        format!(
+            "could not lock staging liveness marker '{}': {error}",
+            path.display()
+        )
+    })?;
+    Ok(file)
 }
 
 fn create_private_staging_directory() -> Result<PathBuf, String> {
@@ -466,7 +500,28 @@ fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> R
             .duration_since(modified)
             .unwrap_or_default();
         if age >= minimum_age {
+            let liveness_path = entry.path().join(STAGING_LIVENESS_FILE);
+            let liveness_lock = match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&liveness_path)
+            {
+                Ok(file) => {
+                    if file.try_lock().is_err() {
+                        continue;
+                    }
+                    Some(file)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(format!(
+                        "could not inspect staging liveness marker '{}': {error}",
+                        liveness_path.display()
+                    ));
+                }
+            };
             cleanup_staging_directory(&entry.path())?;
+            drop(liveness_lock);
         }
     }
     Ok(())
@@ -1072,6 +1127,30 @@ mod tests {
         scavenge_stale_staging_directories(&parent, Duration::ZERO).expect("scavenge staging");
         assert!(!abandoned.exists());
         assert!(unrelated.exists());
+        fs::remove_dir_all(parent).expect("cleanup scavenge parent");
+    }
+
+    #[test]
+    fn active_staging_directory_is_not_scavenged_at_any_age() {
+        let parent = env::temp_dir().join(format!(
+            "rusthouse-staging-liveness-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).expect("scavenge parent");
+        let active = parent.join(format!("{STAGING_DIRECTORY_PREFIX}999998-0"));
+        fs::create_dir(&active).expect("active staging directory");
+        let liveness_lock = create_staging_liveness_lock(&active).expect("active liveness lock");
+        make_staging_directory_read_only(&active).expect("read-only active directory");
+
+        scavenge_stale_staging_directories(&parent, Duration::ZERO).expect("scavenge staging");
+        assert!(active.exists());
+
+        drop(liveness_lock);
+        scavenge_stale_staging_directories(&parent, Duration::ZERO)
+            .expect("scavenge abandoned staging");
+        assert!(!active.exists());
         fs::remove_dir_all(parent).expect("cleanup scavenge parent");
     }
 

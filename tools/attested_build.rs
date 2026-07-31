@@ -45,15 +45,17 @@ fn build_attested_binaries() -> Result<i32, String> {
 
     let rusthouse_path = rusthouse_path
         .ok_or_else(|| "Cargo did not report the RustHouse executable artifact".to_owned())?;
-    let rusthouse_attestation = validate_artifact(&rusthouse_path, "RustHouse")?;
-    let rusthouse_sha256 = sha256::file_digest_hex(&rusthouse_path)?;
+    let initial_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
     let (status, benchmark_path) = cargo_artifact(
         Command::new(cargo)
             .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
             .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
             .env("RUSTHOUSE_ATTESTED_BUILD", "1")
             .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
-            .env("RUSTHOUSE_ATTESTED_BINARY_SHA256", &rusthouse_sha256),
+            .env(
+                "RUSTHOUSE_ATTESTED_BINARY_SHA256",
+                &initial_rusthouse.sha256,
+            ),
         "clickhouse-parity-bench",
     )?;
     if status != 0 {
@@ -61,20 +63,9 @@ fn build_attested_binaries() -> Result<i32, String> {
     }
     let benchmark_path = benchmark_path
         .ok_or_else(|| "Cargo did not report the benchmark executable artifact".to_owned())?;
-    let benchmark_attestation = validate_artifact(&benchmark_path, "benchmark")?;
-    if benchmark_attestation.build_configuration_sha256
-        != rusthouse_attestation.build_configuration_sha256
-    {
-        return Err(
-            "completed RustHouse and benchmark artifacts have different build configurations"
-                .to_owned(),
-        );
-    }
-    if benchmark_attestation.rusthouse_binary_sha256.as_deref() != Some(rusthouse_sha256.as_str()) {
-        return Err(
-            "completed benchmark artifact does not bind the completed RustHouse SHA-256".to_owned(),
-        );
-    }
+    let final_benchmark = capture_artifact(&benchmark_path, "benchmark")?;
+    let final_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
+    validate_final_artifact_pair(&initial_rusthouse, &final_rusthouse, &final_benchmark)?;
     Ok(status)
 }
 
@@ -204,9 +195,78 @@ fn record_codegen(configuration: &mut Vec<String>, value: &str) {
     }
 }
 
-struct ArtifactAttestation {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedArtifactProvenance {
+    source_commit: String,
+    source_dirty: bool,
+    rustc_version: String,
+    target: String,
+    profile: String,
     build_configuration_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactAttestation {
+    shared: SharedArtifactProvenance,
     rusthouse_binary_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedArtifact {
+    sha256: String,
+    attestation: ArtifactAttestation,
+}
+
+fn capture_artifact(path: &Path, name: &str) -> Result<CapturedArtifact, String> {
+    let before = sha256::file_digest_hex(path)?;
+    let attestation = validate_artifact(path, name)?;
+    let after = sha256::file_digest_hex(path)?;
+    if after != before {
+        return Err(format!(
+            "completed {name} artifact '{}' changed while its attestation was being read",
+            path.display()
+        ));
+    }
+    Ok(CapturedArtifact {
+        sha256: after,
+        attestation,
+    })
+}
+
+fn validate_final_artifact_pair(
+    initial_rusthouse: &CapturedArtifact,
+    final_rusthouse: &CapturedArtifact,
+    final_benchmark: &CapturedArtifact,
+) -> Result<(), String> {
+    if final_rusthouse.sha256 != initial_rusthouse.sha256 {
+        return Err(
+            "completed RustHouse artifact changed after the benchmark binding was created"
+                .to_owned(),
+        );
+    }
+    if final_rusthouse.attestation.shared != initial_rusthouse.attestation.shared {
+        return Err(
+            "completed RustHouse provenance changed after the benchmark binding was created"
+                .to_owned(),
+        );
+    }
+    if final_benchmark.attestation.shared != final_rusthouse.attestation.shared {
+        return Err(
+            "completed RustHouse and benchmark artifacts have different source, compiler, target, profile, or build-configuration provenance"
+                .to_owned(),
+        );
+    }
+    if final_benchmark
+        .attestation
+        .rusthouse_binary_sha256
+        .as_deref()
+        != Some(final_rusthouse.sha256.as_str())
+    {
+        return Err(
+            "completed benchmark artifact does not bind the final RustHouse SHA-256".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_artifact(path: &Path, name: &str) -> Result<ArtifactAttestation, String> {
@@ -233,10 +293,30 @@ fn validate_artifact(path: &Path, name: &str) -> Result<ArtifactAttestation, Str
             "completed {name} artifact returned an unknown build attestation"
         ));
     }
-    let build_configuration_sha256 = attestation_field(&stdout, "build_configuration_sha256")
-        .ok_or_else(|| {
-            format!("completed {name} artifact omitted its build configuration SHA-256")
-        })?;
+    let source_commit = required_attestation_field(&stdout, name, "source_commit")?;
+    if !matches!(source_commit.len(), 40 | 64)
+        || !source_commit
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "completed {name} artifact returned an invalid source commit"
+        ));
+    }
+    let source_dirty = match required_attestation_field(&stdout, name, "source_dirty")?.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(format!(
+                "completed {name} artifact returned an invalid source dirty state"
+            ));
+        }
+    };
+    let rustc_version = required_attestation_field(&stdout, name, "rustc_version")?;
+    let target = required_attestation_field(&stdout, name, "target")?;
+    let profile = required_attestation_field(&stdout, name, "profile")?;
+    let build_configuration_sha256 =
+        required_attestation_field(&stdout, name, "build_configuration_sha256")?;
     require_lower_hex(
         &format!("completed {name} build configuration SHA-256"),
         &build_configuration_sha256,
@@ -251,9 +331,28 @@ fn validate_artifact(path: &Path, name: &str) -> Result<ArtifactAttestation, Str
         )?;
     }
     Ok(ArtifactAttestation {
-        build_configuration_sha256,
+        shared: SharedArtifactProvenance {
+            source_commit,
+            source_dirty,
+            rustc_version,
+            target,
+            profile,
+            build_configuration_sha256,
+        },
         rusthouse_binary_sha256,
     })
+}
+
+fn required_attestation_field(
+    attestation: &str,
+    artifact_name: &str,
+    field_name: &str,
+) -> Result<String, String> {
+    attestation_field(attestation, field_name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!("completed {artifact_name} artifact omitted attestation field {field_name}")
+        })
 }
 
 fn attestation_field(attestation: &str, name: &str) -> Option<String> {
@@ -422,7 +521,10 @@ fn command_status(command: &mut Command) -> Result<i32, String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{cargo_executable_artifact, encode_arguments, final_configuration};
+    use super::{
+        ArtifactAttestation, CapturedArtifact, SharedArtifactProvenance, cargo_executable_artifact,
+        encode_arguments, final_configuration, validate_final_artifact_pair,
+    };
 
     #[test]
     fn cargo_artifact_messages_supply_the_executable_path() {
@@ -505,6 +607,46 @@ mod tests {
 
         assert_eq!(joined.0, "src/main.rs");
         assert_eq!(split.0, "src/main.rs");
+    }
+
+    #[test]
+    fn final_artifact_pair_rejects_replacement_and_shared_provenance_mismatch() {
+        let digest = "a".repeat(64);
+        let initial = captured_artifact(&digest, "1".repeat(40), None);
+        let replaced = captured_artifact(&"b".repeat(64), "1".repeat(40), None);
+        let benchmark = captured_artifact(&"c".repeat(64), "1".repeat(40), Some(&digest));
+        assert!(validate_final_artifact_pair(&initial, &replaced, &benchmark).is_err());
+
+        let final_rusthouse = initial.clone();
+        let mismatched_benchmark =
+            captured_artifact(&"c".repeat(64), "2".repeat(40), Some(&digest));
+        assert!(
+            validate_final_artifact_pair(&initial, &final_rusthouse, &mismatched_benchmark)
+                .is_err()
+        );
+        validate_final_artifact_pair(&initial, &final_rusthouse, &benchmark)
+            .expect("consistent final pair");
+    }
+
+    fn captured_artifact(
+        digest: &str,
+        source_commit: String,
+        bound_rusthouse: Option<&str>,
+    ) -> CapturedArtifact {
+        CapturedArtifact {
+            sha256: digest.to_owned(),
+            attestation: ArtifactAttestation {
+                shared: SharedArtifactProvenance {
+                    source_commit,
+                    source_dirty: false,
+                    rustc_version: "rustc test".to_owned(),
+                    target: "test-target".to_owned(),
+                    profile: "release".to_owned(),
+                    build_configuration_sha256: "d".repeat(64),
+                },
+                rusthouse_binary_sha256: bound_rusthouse.map(str::to_owned),
+            },
+        }
     }
 
     fn arguments(extra: &[&str]) -> Vec<String> {
