@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
@@ -494,7 +494,7 @@ fn cleanup_staging_directory(directory: &Path) -> Result<(), String> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> Result<(), String> {
     let parent_handle = fs::File::open(parent).map_err(|error| {
         format!(
@@ -541,7 +541,7 @@ fn scavenge_stale_staging_directories(parent: &Path, minimum_age: Duration) -> R
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cleanup_open_staging_candidate(
     parent: &fs::File,
     name: &std::ffi::OsStr,
@@ -592,7 +592,7 @@ fn cleanup_open_staging_candidate(
     Ok(true)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn scavenge_stale_staging_directories(
     _parent: &Path,
     _minimum_age: Duration,
@@ -602,7 +602,7 @@ fn scavenge_stale_staging_directories(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod descriptor_cleanup {
     use std::ffi::{CString, OsStr, c_char, c_int};
     use std::fs;
@@ -1420,7 +1420,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("cleanup artifact directory");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn stale_staging_directories_are_scavenged() {
         let parent = env::temp_dir().join(format!(
@@ -1447,7 +1447,7 @@ mod tests {
         fs::remove_dir_all(parent).expect("cleanup scavenge parent");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn active_staging_directory_is_not_scavenged_at_any_age() {
         let parent = env::temp_dir().join(format!(
@@ -1472,7 +1472,7 @@ mod tests {
         fs::remove_dir_all(parent).expect("cleanup scavenge parent");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn stale_cleanup_does_not_follow_replaced_candidate_path() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};

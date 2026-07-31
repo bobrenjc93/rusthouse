@@ -584,6 +584,91 @@ fn attested_builder_isolates_compilation_from_transient_live_mutation() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn interrupted_attested_builder_removes_private_clean_snapshot() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "clean probe"]);
+    repository.cargo_without_wrapper(&["build", "--quiet", "--bin", "attested-build"]);
+    let builder = repository
+        .path
+        .join("target")
+        .join("debug")
+        .join(format!("attested-build{}", env::consts::EXE_SUFFIX));
+    let slow_wrapper = repository.path.with_file_name(format!(
+        "rusthouse-slow-rustc-wrapper-{}",
+        std::process::id()
+    ));
+    fs::write(&slow_wrapper, "#!/bin/sh\nsleep 2\nexec \"$@\"\n").expect("slow rustc wrapper");
+    fs::set_permissions(&slow_wrapper, fs::Permissions::from_mode(0o700))
+        .expect("slow wrapper permissions");
+    let mut child = Command::new(builder)
+        .current_dir(&repository.path)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_SESSION")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+        .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
+        .env("RUSTC_WRAPPER", &slow_wrapper)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start interruptible attested builder");
+
+    let snapshot_prefix = format!("rusthouse-attested-source-{}-", child.id());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot = loop {
+        let snapshot = fs::read_dir(env::temp_dir())
+            .expect("temporary directory")
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&snapshot_prefix))
+                    && entry.path().join("source").is_dir()
+            })
+            .map(|entry| entry.path());
+        if let Some(snapshot) = snapshot {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "source snapshot was not created");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        fs::metadata(&snapshot)
+            .expect("snapshot metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    child.kill().expect("interrupt attested builder");
+    child.wait().expect("wait for interrupted builder");
+    let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+    while snapshot.exists() {
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "cleanup guardian left the source snapshot behind"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !repository
+            .git_output(&["worktree", "list", "--porcelain"])
+            .contains(&snapshot.display().to_string()),
+        "cleanup guardian left Git worktree metadata behind"
+    );
+
+    fs::remove_file(slow_wrapper).expect("cleanup slow rustc wrapper");
+}
+
 struct TemporaryRepository {
     path: PathBuf,
 }

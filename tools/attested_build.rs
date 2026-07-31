@@ -11,15 +11,22 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+#[cfg(not(test))]
+use std::process::{Child, ChildStdin, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use build_provenance::{has_hidden_git_index_entries, owned_git_repository};
 
 const MARKER_PREFIX: &str = "rusthouse-final-rustc-";
+const SOURCE_SNAPSHOT_PREFIX: &str = "rusthouse-attested-source-";
+const SOURCE_SNAPSHOT_ROOT: &str = "source";
+const SOURCE_CLEANUP_GUARD_ARGUMENT: &str = "--internal-source-snapshot-cleanup-guard";
 
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    let result = if arguments.is_empty() {
+    let result = if arguments.first().map(String::as_str) == Some(SOURCE_CLEANUP_GUARD_ARGUMENT) {
+        run_source_cleanup_guard(&arguments[1..])
+    } else if arguments.is_empty() {
         build_attested_binaries()
     } else {
         wrap_rustc(&arguments)
@@ -160,7 +167,9 @@ fn fs_canonicalize(path: &Path, name: &str) -> Result<PathBuf, String> {
 
 struct SourceSnapshot {
     root: PathBuf,
+    container: PathBuf,
     worktree_owner: Option<PathBuf>,
+    cleanup_guard: Option<SourceCleanupGuard>,
 }
 
 impl SourceSnapshot {
@@ -169,62 +178,236 @@ impl SourceSnapshot {
         live_source: Option<&LiveSourceProvenance>,
         session: &str,
     ) -> Result<Self, String> {
-        let root = env::temp_dir().join(format!(
-            "rusthouse-attested-source-{}-{}",
+        let container = env::temp_dir().join(format!(
+            "{SOURCE_SNAPSHOT_PREFIX}{}-{}",
             process::id(),
             &session[..16]
         ));
-        if root.exists() {
+        if container.exists() {
             return Err(format!(
                 "attested source snapshot path already exists: '{}'",
-                root.display()
+                container.display()
             ));
         }
+        create_private_directory(&container)?;
+        let root = container.join(SOURCE_SNAPSHOT_ROOT);
+        let worktree_owner = live_source
+            .filter(|source| !source.dirty)
+            .map(|_| source_root.to_path_buf());
+        let mut cleanup_guard =
+            match start_source_cleanup_guard(&container, &root, worktree_owner.as_deref()) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = cleanup_source_snapshot(&container, &root, worktree_owner.as_deref());
+                    return Err(error);
+                }
+            };
 
-        if let Some(source) = live_source.filter(|source| !source.dirty) {
+        let creation = if let Some(source) = live_source.filter(|source| !source.dirty) {
             let output = Command::new("git")
                 .args(["worktree", "add", "--detach", "--quiet"])
                 .arg(&root)
                 .arg(&source.commit)
                 .current_dir(source_root)
                 .output()
-                .map_err(|error| format!("could not create clean source snapshot: {error}"))?;
+                .map_err(|error| format!("could not create clean source snapshot: {error}"));
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    cleanup_guard.finish();
+                    let _ = cleanup_source_snapshot(&container, &root, worktree_owner.as_deref());
+                    return Err(error);
+                }
+            };
             if !output.status.success() {
-                let _ = fs::remove_dir_all(&root);
-                return Err(format!(
+                Err(format!(
                     "could not create clean source snapshot: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
-                ));
+                ))
+            } else {
+                Ok(())
             }
-            return Ok(Self {
-                root,
-                worktree_owner: Some(source_root.to_path_buf()),
-            });
-        }
+        } else {
+            create_private_directory(&root).and_then(|()| copy_source_tree(source_root, &root))
+        };
 
-        create_private_directory(&root)?;
-        if let Err(error) = copy_source_tree(source_root, &root) {
-            let _ = fs::remove_dir_all(&root);
+        if let Err(error) = creation {
+            cleanup_guard.finish();
+            let _ = cleanup_source_snapshot(&container, &root, worktree_owner.as_deref());
             return Err(error);
         }
         Ok(Self {
             root,
-            worktree_owner: None,
+            container,
+            worktree_owner,
+            cleanup_guard: Some(cleanup_guard),
         })
     }
 }
 
 impl Drop for SourceSnapshot {
     fn drop(&mut self) {
-        if let Some(owner) = &self.worktree_owner {
-            let _ = Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.root)
-                .current_dir(owner)
-                .status();
+        if let Some(mut guard) = self.cleanup_guard.take() {
+            guard.finish();
         }
-        let _ = fs::remove_dir_all(&self.root);
+        let _ =
+            cleanup_source_snapshot(&self.container, &self.root, self.worktree_owner.as_deref());
     }
+}
+
+#[cfg(not(test))]
+struct SourceCleanupGuard {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+#[cfg(test)]
+struct SourceCleanupGuard;
+
+#[cfg(not(test))]
+fn start_source_cleanup_guard(
+    container: &Path,
+    root: &Path,
+    worktree_owner: Option<&Path>,
+) -> Result<SourceCleanupGuard, String> {
+    let executable = env::current_exe()
+        .map_err(|error| format!("could not locate source cleanup guardian: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg(SOURCE_CLEANUP_GUARD_ARGUMENT)
+        .arg(container)
+        .arg(root);
+    if let Some(owner) = worktree_owner {
+        command.arg(owner);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start source cleanup guardian: {error}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "source cleanup guardian stdin was not piped".to_owned())?;
+    Ok(SourceCleanupGuard {
+        child,
+        stdin: Some(stdin),
+    })
+}
+
+#[cfg(test)]
+fn start_source_cleanup_guard(
+    container: &Path,
+    root: &Path,
+    _worktree_owner: Option<&Path>,
+) -> Result<SourceCleanupGuard, String> {
+    if root.parent() != Some(container) {
+        return Err("source cleanup guardian paths are inconsistent".to_owned());
+    }
+    Ok(SourceCleanupGuard)
+}
+
+#[cfg(not(test))]
+impl SourceCleanupGuard {
+    fn finish(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+impl SourceCleanupGuard {
+    fn finish(&mut self) {}
+}
+
+fn run_source_cleanup_guard(arguments: &[String]) -> Result<i32, String> {
+    let (container, root, owner) = match arguments {
+        [container, root] => (Path::new(container), Path::new(root), None),
+        [container, root, owner] => (
+            Path::new(container),
+            Path::new(root),
+            Some(Path::new(owner)),
+        ),
+        _ => {
+            return Err(
+                "source cleanup guardian requires a container, source root, and optional worktree owner"
+                    .to_owned(),
+            );
+        }
+    };
+    io::copy(&mut io::stdin().lock(), &mut io::sink())
+        .map_err(|error| format!("could not monitor attested-build parent: {error}"))?;
+    cleanup_source_snapshot(container, root, owner)?;
+    Ok(0)
+}
+
+fn cleanup_source_snapshot(
+    container: &Path,
+    root: &Path,
+    worktree_owner: Option<&Path>,
+) -> Result<(), String> {
+    validate_source_snapshot_paths(container, root)?;
+    if let Some(owner) = worktree_owner {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(root)
+            .current_dir(owner)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    if container.exists() {
+        fs::remove_dir_all(container).map_err(|error| {
+            format!(
+                "could not remove attested source snapshot '{}': {error}",
+                container.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_source_snapshot_paths(container: &Path, root: &Path) -> Result<(), String> {
+    container
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            name.starts_with(SOURCE_SNAPSHOT_PREFIX) && name.len() > SOURCE_SNAPSHOT_PREFIX.len()
+        })
+        .ok_or_else(|| {
+            format!(
+                "refusing to clean malformed source snapshot '{}'",
+                container.display()
+            )
+        })?;
+    if root != container.join(SOURCE_SNAPSHOT_ROOT) {
+        return Err("refusing to clean an inconsistent source snapshot root".to_owned());
+    }
+    let expected_parent = fs::canonicalize(env::temp_dir())
+        .map_err(|error| format!("could not resolve temporary directory: {error}"))?;
+    let parent = container
+        .parent()
+        .ok_or_else(|| "source snapshot container has no parent".to_owned())?;
+    let actual_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "could not resolve source snapshot parent '{}': {error}",
+            parent.display()
+        )
+    })?;
+    if actual_parent != expected_parent {
+        return Err(format!(
+            "refusing to clean source snapshot outside '{}'",
+            expected_parent.display()
+        ));
+    }
+    Ok(())
 }
 
 fn create_private_directory(path: &Path) -> Result<(), String> {
@@ -1011,6 +1194,20 @@ mod tests {
         assert!(!initial.dirty);
         let snapshot = SourceSnapshot::create(&root, Some(&initial), &"a".repeat(64))
             .expect("clean source snapshot");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                fs::metadata(&snapshot.container)
+                    .expect("snapshot container metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let snapshot_container = snapshot.container.clone();
 
         fs::write(root.join("source.rs"), "fn transient() {}\n").expect("transient source");
         assert_eq!(
@@ -1024,6 +1221,7 @@ mod tests {
         );
 
         drop(snapshot);
+        assert!(!snapshot_container.exists());
         fs::remove_dir_all(root).expect("cleanup source root");
     }
 
