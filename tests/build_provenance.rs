@@ -91,21 +91,7 @@ fn packed_symbolic_head_watches_existing_ref_sources_only() {
 #[test]
 fn cargo_rebuilds_attestation_when_symbolic_head_advances_without_source_changes() {
     let repository = TemporaryRepository::new();
-    repository.write(
-        "Cargo.toml",
-        "[package]\nname = \"provenance-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
-    );
-    repository.write(".gitignore", "/target/\n");
-    repository.write("build.rs", include_str!("../build.rs"));
-    repository.write(
-        "build_provenance.rs",
-        include_str!("../build_provenance.rs"),
-    );
-    repository.write(
-        "src/main.rs",
-        "fn main() { println!(\"{}\", env!(\"RUSTHOUSE_SOURCE_COMMIT\")); }\n",
-    );
-    repository.cargo(&["generate-lockfile"]);
+    repository.install_probe();
     repository.git(&["add", "."]);
     repository.git(&["commit", "-m", "first"]);
     let first_commit = repository.git_output(&["rev-parse", "HEAD"]);
@@ -117,6 +103,23 @@ fn cargo_rebuilds_attestation_when_symbolic_head_advances_without_source_changes
     assert_ne!(first_commit, second_commit);
     repository.cargo(&["build", "--quiet"]);
     assert_eq!(repository.probe_commit(), second_commit);
+}
+
+#[test]
+fn live_git_provenance_ignores_untracked_packaged_metadata() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "tracked sources"]);
+    let actual_commit = repository.git_output(&["rev-parse", "HEAD"]);
+    repository.write(
+        ".cargo_vcs_info.json",
+        r#"{"git":{"sha1":"ffffffffffffffffffffffffffffffffffffffff","dirty":false},"path_in_vcs":""}"#,
+    );
+
+    repository.cargo(&["build", "--quiet"]);
+    assert_eq!(repository.probe_commit(), actual_commit);
+    assert!(repository.probe_dirty());
 }
 
 struct TemporaryRepository {
@@ -147,6 +150,24 @@ impl TemporaryRepository {
             fs::create_dir_all(parent).expect("repository file parent");
         }
         fs::write(path, contents).expect("write repository file");
+    }
+
+    fn install_probe(&self) {
+        self.write(
+            "Cargo.toml",
+            "[package]\nname = \"provenance-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        );
+        self.write(".gitignore", "/target/\n");
+        self.write("build.rs", include_str!("../build.rs"));
+        self.write(
+            "build_provenance.rs",
+            include_str!("../build_provenance.rs"),
+        );
+        self.write(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", env!(\"RUSTHOUSE_SOURCE_COMMIT\")); println!(\"{}\", env!(\"RUSTHOUSE_SOURCE_DIRTY\")); }\n",
+        );
+        self.cargo(&["generate-lockfile"]);
     }
 
     fn git(&self, arguments: &[&str]) {
@@ -206,6 +227,22 @@ impl TemporaryRepository {
     }
 
     fn probe_commit(&self) -> String {
+        self.probe_output()
+            .lines()
+            .next()
+            .expect("probe commit")
+            .to_owned()
+    }
+
+    fn probe_dirty(&self) -> bool {
+        match self.probe_output().lines().nth(1) {
+            Some("true") => true,
+            Some("false") => false,
+            value => panic!("unexpected probe dirty state: {value:?}"),
+        }
+    }
+
+    fn probe_output(&self) -> String {
         let executable = self
             .path
             .join("target/debug")
@@ -214,10 +251,7 @@ impl TemporaryRepository {
             .output()
             .expect("run provenance probe");
         assert!(output.status.success());
-        String::from_utf8(output.stdout)
-            .expect("UTF-8 probe output")
-            .trim()
-            .to_owned()
+        String::from_utf8(output.stdout).expect("UTF-8 probe output")
     }
 }
 

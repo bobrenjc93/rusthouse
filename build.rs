@@ -57,6 +57,24 @@ fn main() {
 }
 
 fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
+    if let Some(repository) = owned_git_repository(manifest_dir) {
+        let status = command_output(
+            manifest_dir,
+            "git",
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=normal",
+            ],
+        );
+        return SourceProvenance {
+            commit: repository.commit,
+            dirty: !status.is_empty(),
+            git_watch_paths: repository.watch_paths,
+        };
+    }
+
     let vcs_path = manifest_dir.join(".cargo_vcs_info.json");
     if vcs_path.is_file() {
         let contents = fs::read_to_string(&vcs_path).unwrap_or_else(|error| {
@@ -75,24 +93,6 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
             commit: provenance.commit,
             dirty: provenance.dirty,
             git_watch_paths: Vec::new(),
-        };
-    }
-
-    if let Some(repository) = owned_git_repository(manifest_dir) {
-        let status = command_output(
-            manifest_dir,
-            "git",
-            &[
-                "--no-optional-locks",
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=normal",
-            ],
-        );
-        return SourceProvenance {
-            commit: repository.commit,
-            dirty: !status.is_empty(),
-            git_watch_paths: repository.watch_paths,
         };
     }
 
