@@ -1324,7 +1324,7 @@ mod descriptor_fs {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
     let destination = DetailsDestination::open(path, &[])?;
     destination.write(contents)
@@ -1593,6 +1593,7 @@ mod tests {
         assert!(error.contains("mismatch"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn details_report_replaces_existing_file_atomically() {
         let directory = env::temp_dir().join(format!(

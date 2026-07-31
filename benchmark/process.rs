@@ -625,7 +625,10 @@ mod descriptor_cleanup {
     const O_CLOEXEC: c_int = 0x0008_0000;
     const O_RDONLY: c_int = 0;
     const O_RDWR: c_int = 2;
+    #[cfg(target_os = "macos")]
     const AT_REMOVEDIR: c_int = 0x80;
+    #[cfg(target_os = "linux")]
+    const AT_REMOVEDIR: c_int = 0x200;
 
     unsafe extern "C" {
         fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
@@ -1417,6 +1420,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("cleanup artifact directory");
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_staging_directories_are_scavenged() {
         let parent = env::temp_dir().join(format!(
@@ -1443,6 +1447,7 @@ mod tests {
         fs::remove_dir_all(parent).expect("cleanup scavenge parent");
     }
 
+    #[cfg(unix)]
     #[test]
     fn active_staging_directory_is_not_scavenged_at_any_age() {
         let parent = env::temp_dir().join(format!(
