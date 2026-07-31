@@ -371,6 +371,45 @@ fn filtered_aggregates_handle_groups_aliases_nulls_having_and_ordering() {
 }
 
 #[test]
+fn wildcard_projection_allows_filtered_having_only_aggregates() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE repeated_ids (id Int64);
+             INSERT INTO repeated_ids VALUES (1), (1), (2);",
+        )
+        .expect("setup succeeds");
+
+    let result = execute_query(
+        &mut database,
+        "SELECT *
+         FROM repeated_ids
+         GROUP BY id
+         HAVING COUNT(*) FILTER (WHERE id = 1) > 1
+         ORDER BY id;",
+    );
+
+    assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
+
+    let ungrouped = database
+        .execute("SELECT * FROM repeated_ids HAVING COUNT(*) > 1;")
+        .expect_err("global HAVING cannot project an ungrouped wildcard");
+    assert!(matches!(
+        ungrouped,
+        Error::InvalidQuery(message) if message.contains("must appear in GROUP BY")
+    ));
+
+    let projected = database
+        .execute("SELECT *, COUNT(*) FROM repeated_ids GROUP BY id;")
+        .expect_err("wildcard cannot combine with a projected aggregate");
+    assert!(matches!(
+        projected,
+        Error::InvalidQuery(message)
+            if message.contains("'*' projection cannot be combined with aggregates")
+    ));
+}
+
+#[test]
 fn filtered_aggregates_return_standard_empty_values() {
     let mut database = Database::new();
     database

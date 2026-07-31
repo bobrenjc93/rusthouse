@@ -193,11 +193,11 @@ fn resolve_select_items(
     group_columns: &[usize],
     having_has_aggregate: bool,
 ) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
-    let has_aggregate = having_has_aggregate
-        || requested
-            .iter()
-            .any(|item| matches!(item, SelectItem::Aggregate { .. }));
-    if has_aggregate
+    let has_projected_aggregate = requested
+        .iter()
+        .any(|item| matches!(item, SelectItem::Aggregate { .. }));
+    let has_aggregate = having_has_aggregate || has_projected_aggregate;
+    if has_projected_aggregate
         && requested
             .iter()
             .any(|item| matches!(item, SelectItem::Wildcard))
@@ -216,7 +216,7 @@ fn resolve_select_items(
             SelectItem::Wildcard => {
                 for (source, field) in table.schema().iter().enumerate() {
                     let group_position = group_columns.iter().position(|column| *column == source);
-                    if !group_columns.is_empty() && group_position.is_none() {
+                    if (has_aggregate || !group_columns.is_empty()) && group_position.is_none() {
                         return Err(Error::InvalidQuery(format!(
                             "column '{}' must appear in GROUP BY",
                             field.name
