@@ -1,9 +1,6 @@
 //! Configurable execution budgets and accounting.
 
-use std::mem::size_of;
-
 use crate::error::{Error, Resource, Result};
-use crate::value::Value;
 
 /// Resource ceilings applied to one [`Database::execute`](crate::Database::execute) batch.
 ///
@@ -174,16 +171,4 @@ impl<'a> ExecutionContext<'a> {
     pub(crate) fn observe_live_spill_runs(&mut self, count: usize) {
         self.stats.peak_live_spill_runs = self.stats.peak_live_spill_runs.max(count);
     }
-}
-
-pub(crate) fn estimated_value_bytes(value: &Value) -> usize {
-    size_of::<Value>()
-        + match value {
-            Value::String(value) => value.len(),
-            Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => 0,
-        }
-}
-
-pub(crate) fn estimated_row_bytes(row: &[Value]) -> usize {
-    size_of::<Vec<Value>>() + row.iter().map(estimated_value_bytes).sum::<usize>()
 }

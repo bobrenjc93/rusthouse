@@ -144,6 +144,11 @@ batch's remaining memory after earlier results. Persistent typed columns are
 governed by `max_stored_values`; parser allocations are governed by input and
 token limits.
 
+Planning vectors for expanded projections, grouping, aggregate specifications,
+and ordering reserve their actual capacity before allocation and are released
+after execution. Group keys, aggregate-state/output vectors, string extrema,
+and grouped-row capacity follow the same pre-allocation accounting.
+
 String `MIN` and `MAX` states retain source row indices while scanning and clone
 only the final extremum, so discarded candidates do not allocate executor
 memory.

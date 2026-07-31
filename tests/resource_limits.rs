@@ -207,7 +207,7 @@ fn sorter_success_is_monotonic_across_capacity_boundaries() {
         ))
         .expect("setup succeeds");
 
-    for memory in [272, 288, 304] {
+    for memory in [320, 336, 352] {
         database.set_limits(ExecutionLimits {
             max_memory_bytes: memory,
             ..ExecutionLimits::default()
@@ -263,6 +263,105 @@ fn empty_and_wide_result_metadata_is_memory_accounted() {
         } if limit == one_result_memory && actual > limit
     ));
     assert!(database.last_execution_stats().peak_memory_bytes <= one_result_memory);
+}
+
+#[test]
+fn amplified_projection_and_ordering_plans_are_bounded_before_allocation() {
+    let definitions = (0..128)
+        .map(|column| format!("c{column} Int64"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE ordered (n Int64); CREATE TABLE wide ({definitions})"
+        ))
+        .expect("setup succeeds");
+
+    query(&mut database, "SELECT n FROM ordered LIMIT 0");
+    let baseline_memory = database.last_execution_stats().peak_memory_bytes;
+    let ordering_limit = baseline_memory.saturating_add(128);
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: ordering_limit,
+        ..ExecutionLimits::default()
+    });
+    let ordering = std::iter::repeat_n("n", 100_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(matches!(
+        database.execute(&format!(
+            "SELECT n FROM ordered ORDER BY {ordering} LIMIT 0"
+        )),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit,
+            actual
+        }) if limit == ordering_limit && actual > limit
+    ));
+    assert!(database.last_execution_stats().peak_memory_bytes <= ordering_limit);
+
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: 4_096,
+        ..ExecutionLimits::default()
+    });
+    let projections = std::iter::repeat_n("*", 1_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(matches!(
+        database.execute(&format!(
+            "SELECT {projections} FROM wide LIMIT 0"
+        )),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 4_096,
+            actual
+        }) if actual > 4_096
+    ));
+    assert!(database.last_execution_stats().peak_memory_bytes <= 4_096);
+}
+
+#[test]
+fn grouped_string_values_are_checked_before_clone_and_group_growth() {
+    let large_key = "!".repeat(200_000);
+    let mut rows = vec![format!("('{large_key}', 0)")];
+    rows.extend((1..=16).map(|value| format!("('g{value}', {value})")));
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE grouped_values (label String, n Int64);
+             INSERT INTO grouped_values VALUES {}",
+            rows.join(",")
+        ))
+        .expect("setup succeeds");
+    database.set_limits(ExecutionLimits {
+        max_memory_bytes: 512,
+        ..ExecutionLimits::default()
+    });
+
+    assert!(matches!(
+        database.execute(
+            "SELECT label, COUNT(*) FROM grouped_values GROUP BY label LIMIT 0"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 512,
+            actual
+        }) if actual > 512
+    ));
+    assert!(database.last_execution_stats().peak_memory_bytes <= 512);
+
+    assert!(matches!(
+        database.execute(
+            "SELECT label, COUNT(*) FROM grouped_values
+             WHERE label >= 'g' GROUP BY label LIMIT 0"
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: Resource::MemoryBytes,
+            limit: 512,
+            actual
+        }) if actual > 512
+    ));
+    assert!(database.last_execution_stats().peak_memory_bytes <= 512);
 }
 
 #[test]
@@ -338,7 +437,7 @@ fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
     );
 
     database.set_limits(ExecutionLimits {
-        max_memory_bytes: 1_024,
+        max_memory_bytes: 1_280,
         ..ExecutionLimits::default()
     });
 
@@ -357,7 +456,7 @@ fn sorting_and_grouping_spill_with_deterministic_results_and_cleanup() {
     assert!(database.last_execution_stats().spill_runs > 0);
     assert_eq!(database.last_execution_stats().intermediate_rows, 123);
     assert_eq!(database.last_execution_stats().result_rows, 2);
-    assert!(database.last_execution_stats().peak_memory_bytes <= 1_024);
+    assert!(database.last_execution_stats().peak_memory_bytes <= 1_280);
     assert_eq!(
         fs::read_dir(&spill_directory)
             .expect("read spill directory")

@@ -12,7 +12,7 @@ use std::sync::{
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Resource, Result};
-use crate::execution::{ExecutionContext, ExecutionLimits, ExecutionStats, estimated_row_bytes};
+use crate::execution::{ExecutionContext, ExecutionLimits, ExecutionStats};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
@@ -202,11 +202,19 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        reserve_result_columns(&result_columns, result_columns.capacity(), context)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        let (group_columns, group_memory) =
+            resolve_group_columns(table, &select.group_by, context)?;
+        let ResolvedSelect {
+            items,
+            result_columns,
+            aggregate_specs,
+            planning_memory: select_memory,
+        } = resolve_select_items(table, &select.items, &group_columns, context)?;
+        let (ordering, ordering_memory) =
+            resolve_ordering(&result_columns, &select.order_by, context)?;
+        let planning_memory = group_memory
+            .saturating_add(select_memory)
+            .saturating_add(ordering_memory);
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -227,6 +235,7 @@ impl Database {
                 context,
                 &self.spill_directory,
             );
+            drop(grouped);
             context.release_memory(grouped_memory);
             projected?
         } else {
@@ -240,6 +249,12 @@ impl Database {
                 &self.spill_directory,
             )?
         };
+
+        drop(ordering);
+        drop(aggregate_specs);
+        drop(items);
+        drop(group_columns);
+        context.release_memory(planning_memory);
 
         Ok(QueryResult {
             columns: result_columns,
@@ -266,8 +281,19 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
-fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
-    let mut columns = Vec::with_capacity(names.len());
+struct ResolvedSelect {
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    planning_memory: usize,
+}
+
+fn resolve_group_columns(
+    table: &Table,
+    names: &[String],
+    context: &mut ExecutionContext<'_>,
+) -> Result<(Vec<usize>, usize)> {
+    let (mut columns, memory_bytes) = tracked_vec_with_capacity_and_memory(names.len(), context)?;
     for name in names {
         let column = table.column_index(name)?;
         if columns.contains(&column) {
@@ -277,14 +303,15 @@ fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> 
         }
         columns.push(column);
     }
-    Ok(columns)
+    Ok((columns, memory_bytes))
 }
 
 fn resolve_select_items(
     table: &Table,
     requested: &[SelectItem],
     group_columns: &[usize],
-) -> Result<(Vec<ResolvedItem>, Vec<ResultColumn>, Vec<AggregateSpec>)> {
+    context: &mut ExecutionContext<'_>,
+) -> Result<ResolvedSelect> {
     let has_aggregate = requested
         .iter()
         .any(|item| matches!(item, SelectItem::Aggregate { .. }));
@@ -298,23 +325,21 @@ fn resolve_select_items(
         ));
     }
 
-    let output_capacity = requested
-        .iter()
-        .map(|item| {
-            if matches!(item, SelectItem::Wildcard) {
-                table.schema().len()
-            } else {
-                1
-            }
+    let output_capacity = requested.iter().fold(0usize, |capacity, item| {
+        capacity.saturating_add(if matches!(item, SelectItem::Wildcard) {
+            table.schema().len()
+        } else {
+            1
         })
-        .sum();
+    });
     let aggregate_capacity = requested
         .iter()
         .filter(|item| matches!(item, SelectItem::Aggregate { .. }))
         .count();
-    let mut items = Vec::with_capacity(output_capacity);
-    let mut result_columns = Vec::with_capacity(output_capacity);
-    let mut aggregate_specs = Vec::with_capacity(aggregate_capacity);
+    let (mut items, item_memory) = tracked_vec_with_capacity_and_memory(output_capacity, context)?;
+    let mut result_columns = tracked_vec_with_capacity(output_capacity, context)?;
+    let (mut aggregate_specs, aggregate_memory) =
+        tracked_vec_with_capacity_and_memory(aggregate_capacity, context)?;
 
     for requested_item in requested {
         match requested_item {
@@ -332,7 +357,7 @@ fn resolve_select_items(
                         group_position,
                     });
                     result_columns.push(ResultColumn {
-                        name: field.name.clone(),
+                        name: clone_string_tracked(&field.name, context)?,
                         data_type: field.data_type,
                     });
                 }
@@ -349,10 +374,12 @@ fn resolve_select_items(
                     source,
                     group_position,
                 });
+                let output_name = match alias {
+                    Some(alias) => clone_string_tracked(alias, context)?,
+                    None => clone_string_tracked(&table.schema()[source].name, context)?,
+                };
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| table.schema()[source].name.clone()),
+                    name: output_name,
                     data_type: table.schema()[source].data_type,
                 });
             }
@@ -369,14 +396,14 @@ fn resolve_select_items(
                                 function.name()
                             )));
                         }
-                        (None, None, "*".to_owned())
+                        (None, None, "*")
                     }
                     AggregateArgument::Column(name) => {
                         let index = table.column_index(name)?;
                         (
                             Some(index),
                             Some(table.schema()[index].data_type),
-                            table.schema()[index].name.clone(),
+                            table.schema()[index].name.as_str(),
                         )
                     }
                 };
@@ -388,17 +415,24 @@ fn resolve_select_items(
                     input_type,
                 });
                 items.push(ResolvedItem::Aggregate { state });
+                let output_name = match alias {
+                    Some(alias) => clone_string_tracked(alias, context)?,
+                    None => aggregate_name_tracked(function.name(), argument_name, context)?,
+                };
                 result_columns.push(ResultColumn {
-                    name: alias
-                        .clone()
-                        .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
+                    name: output_name,
                     data_type: aggregate_output_type(*function, input_type),
                 });
             }
         }
     }
 
-    Ok((items, result_columns, aggregate_specs))
+    Ok(ResolvedSelect {
+        items,
+        result_columns,
+        aggregate_specs,
+        planning_memory: item_memory.saturating_add(aggregate_memory),
+    })
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -425,20 +459,9 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
     }
 }
 
-fn reserve_result_columns(
-    columns: &[ResultColumn],
-    capacity: usize,
-    context: &mut ExecutionContext<'_>,
-) -> Result<()> {
-    let bytes = capacity
-        .saturating_mul(size_of::<ResultColumn>())
-        .saturating_add(columns.iter().map(|column| column.name.capacity()).sum());
-    context.reserve_memory(bytes)
-}
-
-fn reserve_vec_slot<T>(values: &mut Vec<T>, context: &mut ExecutionContext<'_>) -> Result<()> {
+fn reserve_vec_slot<T>(values: &mut Vec<T>, context: &mut ExecutionContext<'_>) -> Result<usize> {
     if values.len() < values.capacity() || size_of::<T>() == 0 {
-        return Ok(());
+        return Ok(0);
     }
     let old_capacity = values.capacity();
     let target_capacity = old_capacity.saturating_mul(2).max(1);
@@ -451,26 +474,54 @@ fn reserve_vec_slot<T>(values: &mut Vec<T>, context: &mut ExecutionContext<'_>) 
         .capacity()
         .saturating_sub(old_capacity)
         .saturating_mul(size_of::<T>());
-    context.adjust_memory_reservation(reserved, actual)
+    context.adjust_memory_reservation(reserved, actual)?;
+    Ok(actual)
 }
 
 fn tracked_vec_with_capacity<T>(
     capacity: usize,
     context: &mut ExecutionContext<'_>,
 ) -> Result<Vec<T>> {
+    tracked_vec_with_capacity_and_memory(capacity, context).map(|(values, _)| values)
+}
+
+fn tracked_vec_with_capacity_and_memory<T>(
+    capacity: usize,
+    context: &mut ExecutionContext<'_>,
+) -> Result<(Vec<T>, usize)> {
     let reserved = capacity.saturating_mul(size_of::<T>());
     context.reserve_memory(reserved)?;
     let values = Vec::with_capacity(capacity);
     let actual = values.capacity().saturating_mul(size_of::<T>());
     context.adjust_memory_reservation(reserved, actual)?;
-    Ok(values)
+    Ok((values, actual))
 }
 
 fn clone_string_tracked(value: &str, context: &mut ExecutionContext<'_>) -> Result<String> {
     context.reserve_memory(value.len())?;
-    let cloned = value.to_owned();
+    let mut cloned = String::with_capacity(value.len());
     context.adjust_memory_reservation(value.len(), cloned.capacity())?;
+    cloned.push_str(value);
     Ok(cloned)
+}
+
+fn aggregate_name_tracked(
+    function: &str,
+    argument: &str,
+    context: &mut ExecutionContext<'_>,
+) -> Result<String> {
+    let reserved = function
+        .len()
+        .saturating_add(argument.len())
+        .saturating_add(2);
+    context.reserve_memory(reserved)?;
+    let mut name = String::with_capacity(reserved);
+    context.adjust_memory_reservation(reserved, name.capacity())?;
+    name.push_str(function);
+    name.push('(');
+    name.push_str(argument);
+    name.push(')');
+    Ok(name)
 }
 
 fn clone_value_ref_tracked(
@@ -487,6 +538,59 @@ fn clone_value_ref_tracked(
 
 fn clone_value_tracked(value: &Value, context: &mut ExecutionContext<'_>) -> Result<Value> {
     clone_value_ref_tracked(value.as_ref(), context)
+}
+
+fn value_string_memory(values: &[Value]) -> usize {
+    values
+        .iter()
+        .map(|value| match value {
+            Value::String(value) => value.capacity(),
+            Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => 0,
+        })
+        .sum()
+}
+
+struct TrackedValues {
+    values: Vec<Value>,
+    memory_bytes: usize,
+}
+
+#[derive(Default)]
+struct TrackedAggregateStates {
+    values: Vec<AggregateState>,
+    memory_bytes: usize,
+}
+
+fn clone_group_key(
+    table: &Table,
+    columns: &[usize],
+    row: usize,
+    context: &mut ExecutionContext<'_>,
+) -> Result<TrackedValues> {
+    let (mut key, vector_memory) = tracked_vec_with_capacity_and_memory(columns.len(), context)?;
+    for column in columns {
+        key.push(clone_value_ref_tracked(
+            table.columns()[*column].value_ref(row),
+            context,
+        )?);
+    }
+    let memory_bytes = vector_memory.saturating_add(value_string_memory(&key));
+    Ok(TrackedValues {
+        values: key,
+        memory_bytes,
+    })
+}
+
+fn new_aggregate_states(
+    specs: &[AggregateSpec],
+    context: &mut ExecutionContext<'_>,
+) -> Result<TrackedAggregateStates> {
+    let (mut states, memory_bytes) = tracked_vec_with_capacity_and_memory(specs.len(), context)?;
+    states.extend(specs.iter().map(AggregateState::new));
+    Ok(TrackedAggregateStates {
+        values: states,
+        memory_bytes,
+    })
 }
 
 fn project_source_row(
@@ -581,19 +685,19 @@ fn execute_grouped(
 ) -> Result<GroupedData> {
     let mut data = GroupedData::default();
     if group_columns.is_empty() {
-        let mut states = aggregate_specs
-            .iter()
-            .map(AggregateState::new)
-            .collect::<Vec<_>>();
+        let mut states = new_aggregate_states(aggregate_specs, context)?;
         for row in 0..table.row_count() {
             if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
                 context.add_intermediate_rows(1)?;
-                update_aggregates(&mut states, aggregate_specs, table, row)?;
+                update_aggregates(&mut states.values, aggregate_specs, table, row)?;
             }
         }
         push_group(
             &mut data,
-            Vec::new(),
+            TrackedValues {
+                values: Vec::new(),
+                memory_bytes: 0,
+            },
             states,
             aggregate_specs,
             table,
@@ -619,30 +723,22 @@ fn execute_grouped(
     let run_memory = sorter.run_memory_bytes();
 
     let mut current_key_row: Option<usize> = None;
-    let mut states = aggregate_specs
-        .iter()
-        .map(AggregateState::new)
-        .collect::<Vec<_>>();
+    let mut states = new_aggregate_states(aggregate_specs, context)?;
     let outcome = sorter.drain(|row| {
         let belongs_to_current = current_key_row.is_some_and(|key_row| {
             compare_group_keys(table, group_columns, key_row, row) == Ordering::Equal
         });
         if current_key_row.is_some() && !belongs_to_current {
             let key_row = current_key_row.take().expect("current group has a key");
-            let key = group_columns
-                .iter()
-                .map(|column| table.columns()[*column].value(key_row))
-                .collect();
-            let finished = std::mem::replace(
-                &mut states,
-                aggregate_specs.iter().map(AggregateState::new).collect(),
-            );
+            let key = clone_group_key(table, group_columns, key_row, context)?;
+            let finished = std::mem::take(&mut states);
             push_group(&mut data, key, finished, aggregate_specs, table, context)?;
+            states = new_aggregate_states(aggregate_specs, context)?;
         }
         if current_key_row.is_none() {
             current_key_row = Some(row);
         }
-        update_aggregates(&mut states, aggregate_specs, table, row)?;
+        update_aggregates(&mut states.values, aggregate_specs, table, row)?;
         Ok(true)
     });
     context.release_memory(
@@ -652,11 +748,12 @@ fn execute_grouped(
     );
     outcome?;
     if let Some(key_row) = current_key_row {
-        let key = group_columns
-            .iter()
-            .map(|column| table.columns()[*column].value(key_row))
-            .collect();
+        let key = clone_group_key(table, group_columns, key_row, context)?;
         push_group(&mut data, key, states, aggregate_specs, table, context)?;
+    } else {
+        let memory_bytes = states.memory_bytes;
+        drop(states);
+        context.release_memory(memory_bytes);
     }
     Ok(data)
 }
@@ -675,22 +772,30 @@ fn update_aggregates(
 
 fn push_group(
     data: &mut GroupedData,
-    key: Vec<Value>,
-    states: Vec<AggregateState>,
+    key: TrackedValues,
+    states: TrackedAggregateStates,
     specs: &[AggregateSpec],
     table: &Table,
     context: &mut ExecutionContext<'_>,
 ) -> Result<()> {
-    let aggregates = states
-        .into_iter()
-        .zip(specs)
-        .map(|(state, spec)| state.finish(spec, table))
-        .collect::<Result<Vec<_>>>()?;
     context.add_intermediate_rows(1)?;
-    let bytes = estimated_row_bytes(&key).saturating_add(estimated_row_bytes(&aggregates));
-    context.reserve_memory(bytes)?;
-    data.memory_bytes = data.memory_bytes.saturating_add(bytes);
-    data.groups.push(GroupRow { key, aggregates });
+    let (mut aggregates, aggregate_vector_memory) =
+        tracked_vec_with_capacity_and_memory(specs.len(), context)?;
+    for (state, spec) in states.values.into_iter().zip(specs) {
+        aggregates.push(state.finish(spec, table, context)?);
+    }
+    context.release_memory(states.memory_bytes);
+    let aggregate_memory = aggregate_vector_memory.saturating_add(value_string_memory(&aggregates));
+    let group_vector_memory = reserve_vec_slot(&mut data.groups, context)?;
+    data.memory_bytes = data
+        .memory_bytes
+        .saturating_add(key.memory_bytes)
+        .saturating_add(aggregate_memory)
+        .saturating_add(group_vector_memory);
+    data.groups.push(GroupRow {
+        key: key.values,
+        aggregates,
+    });
     Ok(())
 }
 
@@ -803,13 +908,19 @@ impl AggregateState {
         Ok(())
     }
 
-    fn finish(self, spec: &AggregateSpec, table: &Table) -> Result<Value> {
+    fn finish(
+        self,
+        spec: &AggregateSpec,
+        table: &Table,
+        context: &mut ExecutionContext<'_>,
+    ) -> Result<Value> {
         match self {
             Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
-            Self::Min(Some(row)) | Self::Max(Some(row)) => {
-                Ok(table.columns()[spec.argument.expect("extremum argument")].value(row))
-            }
+            Self::Min(Some(row)) | Self::Max(Some(row)) => clone_value_ref_tracked(
+                table.columns()[spec.argument.expect("extremum argument")].value_ref(row),
+                context,
+            ),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
@@ -833,35 +944,41 @@ struct ResolvedOrder {
     descending: bool,
 }
 
-fn resolve_ordering(columns: &[ResultColumn], requested: &[OrderBy]) -> Result<Vec<ResolvedOrder>> {
-    let mut ordering = Vec::with_capacity(requested.len());
+fn resolve_ordering(
+    columns: &[ResultColumn],
+    requested: &[OrderBy],
+    context: &mut ExecutionContext<'_>,
+) -> Result<(Vec<ResolvedOrder>, usize)> {
+    let (mut ordering, memory_bytes) =
+        tracked_vec_with_capacity_and_memory(requested.len(), context)?;
     for order in requested {
-        let matches = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.name.eq_ignore_ascii_case(&order.name))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [index] => ordering.push(ResolvedOrder {
-                output: *index,
-                descending: order.descending,
-            }),
-            [] => {
-                return Err(Error::InvalidQuery(format!(
-                    "ORDER BY column or alias '{}' is not in the SELECT output",
-                    order.name
-                )));
+        let mut matched = None;
+        for (index, column) in columns.iter().enumerate() {
+            if !column.name.eq_ignore_ascii_case(&order.name) {
+                continue;
             }
-            _ => {
+            if matched.is_some() {
                 return Err(Error::InvalidQuery(format!(
                     "ORDER BY name '{}' is ambiguous",
                     order.name
                 )));
             }
+            matched = Some(index);
+        }
+        match matched {
+            Some(index) => ordering.push(ResolvedOrder {
+                output: index,
+                descending: order.descending,
+            }),
+            None => {
+                return Err(Error::InvalidQuery(format!(
+                    "ORDER BY column or alias '{}' is not in the SELECT output",
+                    order.name
+                )));
+            }
         }
     }
-    Ok(ordering)
+    Ok((ordering, memory_bytes))
 }
 
 fn compare_source_rows(
