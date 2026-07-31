@@ -1,3 +1,5 @@
+//! Logical data types and scalar values.
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -5,9 +7,13 @@ use std::hash::{Hash, Hasher};
 /// The four physical column types supported by RustHouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
+    /// Signed 64-bit integer.
     Int64,
+    /// IEEE 754 double-precision floating-point number.
     Float64,
+    /// Boolean value.
     Bool,
+    /// Owned UTF-8 string.
     String,
 }
 
@@ -37,9 +43,13 @@ impl fmt::Display for DataType {
 /// A scalar value read from or written to a typed column.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// Signed 64-bit integer value.
     Int64(i64),
+    /// IEEE 754 double-precision floating-point value.
     Float64(f64),
+    /// Boolean value.
     Bool(bool),
+    /// Owned UTF-8 string value.
     String(String),
 }
 
@@ -53,6 +63,7 @@ pub(crate) enum ValueRef<'a> {
 }
 
 impl Value {
+    /// Returns the value's logical data type.
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -63,6 +74,7 @@ impl Value {
         }
     }
 
+    /// Converts the value to the unquoted text used by table and CSV output.
     #[must_use]
     pub fn as_display_string(&self) -> String {
         match self {

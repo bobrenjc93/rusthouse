@@ -1,3 +1,5 @@
+//! Deterministic RustHouse and ClickHouse Local parity benchmark.
+
 mod config;
 mod dataset;
 mod normalize;

@@ -1,3 +1,5 @@
+//! SQL execution and structured query results.
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -16,33 +18,46 @@ pub struct Database {
     catalog: Catalog,
 }
 
+/// Metadata for one column in a [`QueryResult`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
+    /// The output name, including an alias when one was supplied.
     pub name: String,
+    /// The logical type of values in this result column.
     pub data_type: DataType,
 }
 
+/// Structured rows and column metadata produced by a `SELECT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
+    /// Ordered metadata for the result columns.
     pub columns: Vec<ResultColumn>,
+    /// Positional result rows in the same order as [`Self::columns`].
     pub rows: Vec<Vec<Value>>,
 }
 
+/// The outcome of one successfully executed SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementResult {
+    /// A data definition or data modification acknowledgement.
     Command {
+        /// Stable uppercase command name, such as `CREATE TABLE` or `INSERT`.
         tag: &'static str,
+        /// Number of rows affected by the command.
         affected_rows: usize,
     },
+    /// Rows and metadata returned by a `SELECT` statement.
     Query(QueryResult),
 }
 
 impl Database {
+    /// Creates an empty database.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the database's catalog for read-only schema and table inspection.
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
