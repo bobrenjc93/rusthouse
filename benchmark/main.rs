@@ -381,13 +381,14 @@ fn run(config: Config) -> Result<Report, String> {
             suite_manifest_sha256
         ),
         format!(
-            "RustHouse SHA-256={}; source commit={} dirty={}; rustc={}; target={}; profile={}",
+            "RustHouse SHA-256={}; source commit={} dirty={}; rustc={}; target={}; profile={}; build configuration SHA-256={}",
             identity.rusthouse.sha256,
             identity.rusthouse.source_commit,
             identity.rusthouse.source_dirty,
             identity.rusthouse.rustc_version,
             identity.rusthouse.target,
             identity.rusthouse.profile,
+            identity.rusthouse.build_configuration_sha256,
         ),
         format!(
             "benchmark harness SHA-256={} ({})",
@@ -698,7 +699,7 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":4,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":5,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -719,7 +720,7 @@ fn details_json(context: &DetailsContext<'_>) -> String {
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"benchmark\":{{\"path\":{},\"sha256\":{}}},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"sha256\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"benchmark\":{{\"path\":{},\"sha256\":{}}},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{},\"build_configuration_sha256\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"sha256\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&harness.path.display().to_string()),
         json_string(&harness.sha256),
@@ -730,6 +731,7 @@ fn details_json(context: &DetailsContext<'_>) -> String {
         json_string(&identity.rusthouse.rustc_version),
         json_string(&identity.rusthouse.target),
         json_string(&identity.rusthouse.profile),
+        json_string(&identity.rusthouse.build_configuration_sha256),
         json_string(&config.clickhouse.display().to_string()),
         json_string(&identity.clickhouse.version_output),
         json_string(&identity.clickhouse.sha256),
@@ -1057,6 +1059,7 @@ mod tests {
             rustc_version: "rustc test",
             target: "aarch64-apple-darwin",
             profile: "release",
+            build_configuration_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         };
         ensure_default_build(config::Mode::Default, release).expect("clean release build");
         ensure_default_build(

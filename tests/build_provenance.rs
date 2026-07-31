@@ -122,6 +122,49 @@ fn live_git_provenance_ignores_untracked_packaged_metadata() {
     assert!(repository.probe_dirty());
 }
 
+#[test]
+fn build_configuration_fingerprint_changes_with_optimization_and_rustflags() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "probe sources"]);
+
+    repository.cargo(&["build", "--release", "--quiet"]);
+    let normal = repository.probe_build_configuration("release");
+    repository.cargo_with_env(
+        &["build", "--release", "--quiet"],
+        &[("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0")],
+    );
+    let unoptimized = repository.probe_build_configuration("release");
+    assert_ne!(normal, unoptimized);
+
+    repository.cargo_with_env(
+        &["build", "--release", "--quiet"],
+        &[("RUSTFLAGS", "-Cdebuginfo=1")],
+    );
+    let custom_rustflags = repository.probe_build_configuration("release");
+    assert_ne!(normal, custom_rustflags);
+}
+
+#[test]
+fn new_untracked_root_entry_is_detected_without_recursive_rebuild_watch() {
+    let repository = TemporaryRepository::new();
+    repository.install_probe();
+    repository.git(&["add", "."]);
+    repository.git(&["commit", "-m", "clean probe"]);
+    repository.cargo(&["build", "--quiet"]);
+    assert!(!repository.probe_dirty());
+
+    repository.write("new-root-entry.txt", "untracked\n");
+    let output = repository.cargo_output(&["build", "--verbose"], &[]);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Fresh provenance-probe"),
+        "unexpected Cargo output: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repository.probe_dirty());
+}
+
 struct TemporaryRepository {
     path: PathBuf,
 }
@@ -132,11 +175,19 @@ impl TemporaryRepository {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "rusthouse-build-provenance-test-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).expect("temporary repository");
+        let path = (0..100_u32)
+            .find_map(|attempt| {
+                let path = env::temp_dir().join(format!(
+                    "rusthouse-build-provenance-test-{}-{nonce}-{attempt}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => Some(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => panic!("temporary repository: {error}"),
+                }
+            })
+            .expect("unique temporary repository");
         let repository = Self { path };
         repository.git(&["init", "--quiet"]);
         repository.git(&["config", "user.name", "RustHouse Test"]);
@@ -164,8 +215,13 @@ impl TemporaryRepository {
             include_str!("../build_provenance.rs"),
         );
         self.write(
+            "benchmark/sha256.rs",
+            include_str!("../benchmark/sha256.rs"),
+        );
+        self.write("src/build_info.rs", include_str!("../src/build_info.rs"));
+        self.write(
             "src/main.rs",
-            "fn main() { println!(\"{}\", env!(\"RUSTHOUSE_SOURCE_COMMIT\")); println!(\"{}\", env!(\"RUSTHOUSE_SOURCE_DIRTY\")); }\n",
+            "mod build_info; fn main() { print!(\"{}\", build_info::attestation()); }\n",
         );
         self.cargo(&["generate-lockfile"]);
     }
@@ -211,47 +267,69 @@ impl TemporaryRepository {
     }
 
     fn cargo(&self, arguments: &[&str]) {
+        self.cargo_with_env(arguments, &[]);
+    }
+
+    fn cargo_with_env(&self, arguments: &[&str], environment: &[(&str, &str)]) {
+        let _ = self.cargo_output(arguments, environment);
+    }
+
+    fn cargo_output(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> std::process::Output {
         let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = Command::new(cargo)
+        let mut command = Command::new(cargo);
+        command
             .args(arguments)
             .env_remove("CARGO_TARGET_DIR")
-            .current_dir(&self.path)
-            .output()
-            .expect("run cargo");
+            .current_dir(&self.path);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run cargo");
         assert!(
             output.status.success(),
             "cargo {} failed: {}",
             arguments.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+        output
     }
 
     fn probe_commit(&self) -> String {
-        self.probe_output()
-            .lines()
-            .next()
-            .expect("probe commit")
-            .to_owned()
+        self.probe_field("debug", "source_commit")
     }
 
     fn probe_dirty(&self) -> bool {
-        match self.probe_output().lines().nth(1) {
-            Some("true") => true,
-            Some("false") => false,
+        match self.probe_field("debug", "source_dirty").as_str() {
+            "true" => true,
+            "false" => false,
             value => panic!("unexpected probe dirty state: {value:?}"),
         }
     }
 
-    fn probe_output(&self) -> String {
+    fn probe_build_configuration(&self, profile: &str) -> String {
+        self.probe_field(profile, "build_configuration_sha256")
+    }
+
+    fn probe_field(&self, profile: &str, field: &str) -> String {
         let executable = self
             .path
-            .join("target/debug")
+            .join("target")
+            .join(profile)
             .join(format!("provenance-probe{}", env::consts::EXE_SUFFIX));
         let output = Command::new(executable)
             .output()
             .expect("run provenance probe");
         assert!(output.status.success());
-        String::from_utf8(output.stdout).expect("UTF-8 probe output")
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 probe output");
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}=")))
+            .unwrap_or_else(|| panic!("missing probe field {field:?} in {stdout:?}"))
+            .to_owned()
     }
 }
 

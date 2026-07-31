@@ -43,6 +43,7 @@ pub struct RustHouseIdentity {
     pub rustc_version: String,
     pub target: String,
     pub profile: String,
+    pub build_configuration_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +436,7 @@ fn parse_rusthouse_attestation(
     let mut rustc_version = None;
     let mut target = None;
     let mut profile = None;
+    let mut build_configuration_sha256 = None;
     for line in lines {
         let (key, value) = line
             .split_once('=')
@@ -445,6 +447,7 @@ fn parse_rusthouse_attestation(
             "rustc_version" => &mut rustc_version,
             "target" => &mut target,
             "profile" => &mut profile,
+            "build_configuration_sha256" => &mut build_configuration_sha256,
             _ => return Err(format!("unknown RustHouse attestation field {key:?}")),
         };
         if destination.replace(value.to_owned()).is_some() {
@@ -471,8 +474,19 @@ fn parse_rusthouse_attestation(
     }
     let target = required_attestation_field(target, "target")?;
     let profile = required_attestation_field(profile, "profile")?;
+    let build_configuration_sha256 =
+        required_attestation_field(build_configuration_sha256, "build_configuration_sha256")?;
     if target.chars().any(char::is_whitespace) || profile.chars().any(char::is_whitespace) {
         return Err("RustHouse target and profile must not contain whitespace".to_owned());
+    }
+    if build_configuration_sha256.len() != 64
+        || !build_configuration_sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        return Err(
+            "RustHouse attestation contains an invalid build_configuration_sha256".to_owned(),
+        );
     }
 
     Ok(RustHouseIdentity {
@@ -482,6 +496,7 @@ fn parse_rusthouse_attestation(
         rustc_version,
         target,
         profile,
+        build_configuration_sha256,
     })
 }
 
@@ -497,19 +512,22 @@ fn validate_rusthouse_build(actual: &RustHouseIdentity, expected: BuildInfo) -> 
         || actual.rustc_version != expected.rustc_version
         || actual.target != expected.target
         || actual.profile != expected.profile
+        || actual.build_configuration_sha256 != expected.build_configuration_sha256
     {
         return Err(format!(
-            "RustHouse build attestation is inconsistent with the benchmark binary: RustHouse commit={} dirty={} rustc={:?} target={} profile={}; benchmark commit={} dirty={} rustc={:?} target={} profile={}",
+            "RustHouse build attestation is inconsistent with the benchmark binary: RustHouse commit={} dirty={} rustc={:?} target={} profile={} build_configuration_sha256={}; benchmark commit={} dirty={} rustc={:?} target={} profile={} build_configuration_sha256={}",
             actual.source_commit,
             actual.source_dirty,
             actual.rustc_version,
             actual.target,
             actual.profile,
+            actual.build_configuration_sha256,
             expected.source_commit,
             expected.source_dirty,
             expected.rustc_version,
             expected.target,
             expected.profile,
+            expected.build_configuration_sha256,
         ));
     }
     Ok(())
@@ -620,6 +638,8 @@ mod tests {
     use super::*;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const BUILD_CONFIGURATION: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn build_info() -> BuildInfo {
         BuildInfo {
@@ -628,12 +648,13 @@ mod tests {
             rustc_version: "rustc 1.88.0 (test)",
             target: CLICKHOUSE_TARGET,
             profile: "release",
+            build_configuration_sha256: BUILD_CONFIGURATION,
         }
     }
 
     fn attestation() -> String {
         format!(
-            "{ATTESTATION_VERSION}\nsource_commit={COMMIT}\nsource_dirty=false\nrustc_version=rustc 1.88.0 (test)\ntarget={CLICKHOUSE_TARGET}\nprofile=release\n"
+            "{ATTESTATION_VERSION}\nsource_commit={COMMIT}\nsource_dirty=false\nrustc_version=rustc 1.88.0 (test)\ntarget={CLICKHOUSE_TARGET}\nprofile=release\nbuild_configuration_sha256={BUILD_CONFIGURATION}\n"
         )
     }
 
@@ -666,6 +687,16 @@ mod tests {
         let error = validate_rusthouse_build(&identity, build_info())
             .expect_err("tampered metadata must fail");
         assert!(error.contains("inconsistent"));
+    }
+
+    #[test]
+    fn mismatched_build_configuration_is_rejected() {
+        let tampered = attestation().replace(BUILD_CONFIGURATION, &"b".repeat(64));
+        let identity = parse_rusthouse_attestation(&tampered, "a".repeat(64))
+            .expect("well-formed attestation");
+        let error = validate_rusthouse_build(&identity, build_info())
+            .expect_err("different build configuration must fail");
+        assert!(error.contains("build_configuration_sha256"));
     }
 
     #[test]

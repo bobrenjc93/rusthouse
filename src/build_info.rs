@@ -1,8 +1,11 @@
 //! Build provenance embedded by `build.rs` in every shipped binary.
 
 use std::fmt::Write as _;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
 
-pub const ATTESTATION_VERSION: &str = "rusthouse-build-attestation-v1";
+pub const ATTESTATION_VERSION: &str = "rusthouse-build-attestation-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildInfo {
@@ -11,19 +14,28 @@ pub struct BuildInfo {
     pub rustc_version: &'static str,
     pub target: &'static str,
     pub profile: &'static str,
+    pub build_configuration_sha256: &'static str,
 }
 
 pub fn current() -> BuildInfo {
+    let embedded_dirty = match env!("RUSTHOUSE_SOURCE_DIRTY") {
+        "true" => true,
+        "false" => false,
+        _ => panic!("invalid embedded dirty state"),
+    };
+    let source_dirty = embedded_dirty
+        || match env!("RUSTHOUSE_LIVE_GIT_SOURCE") {
+            "true" => live_git_dirty().unwrap_or(true),
+            "false" => false,
+            _ => panic!("invalid embedded source kind"),
+        };
     BuildInfo {
         source_commit: env!("RUSTHOUSE_SOURCE_COMMIT"),
-        source_dirty: match env!("RUSTHOUSE_SOURCE_DIRTY") {
-            "true" => true,
-            "false" => false,
-            _ => panic!("invalid embedded dirty state"),
-        },
+        source_dirty,
         rustc_version: env!("RUSTHOUSE_RUSTC_VERSION"),
         target: env!("RUSTHOUSE_BUILD_TARGET"),
         profile: env!("RUSTHOUSE_BUILD_PROFILE"),
+        build_configuration_sha256: env!("RUSTHOUSE_BUILD_CONFIGURATION_SHA256"),
     }
 }
 
@@ -38,5 +50,44 @@ pub fn attestation() -> String {
         .expect("writing to String cannot fail");
     writeln!(output, "target={}", info.target).expect("writing to String cannot fail");
     writeln!(output, "profile={}", info.profile).expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "build_configuration_sha256={}",
+        info.build_configuration_sha256
+    )
+    .expect("writing to String cannot fail");
     output
+}
+
+fn live_git_dirty() -> Option<bool> {
+    let source_root = Path::new(env!("RUSTHOUSE_SOURCE_ROOT"));
+    let source_root = fs::canonicalize(source_root).ok()?;
+    let top_level = git_output(&source_root, &["rev-parse", "--show-toplevel"])?;
+    if fs::canonicalize(top_level).ok()? != source_root {
+        return None;
+    }
+    let status = git_output(
+        &source_root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ],
+    )?;
+    Some(!status.is_empty())
+}
+
+fn git_output(directory: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(directory)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
 }

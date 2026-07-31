@@ -1,6 +1,10 @@
 mod build_provenance;
+#[allow(dead_code)]
+#[path = "benchmark/sha256.rs"]
+mod sha256;
 
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -10,6 +14,7 @@ use build_provenance::{cargo_vcs_provenance, owned_git_repository, parse_dirty};
 struct SourceProvenance {
     commit: String,
     dirty: bool,
+    live_git: bool,
     git_watch_paths: Vec<std::path::PathBuf>,
 }
 
@@ -34,6 +39,7 @@ fn main() {
     let rustc_version = command_output(manifest_dir, &rustc, &["--version"]);
     let target = required_env("TARGET");
     let profile = required_env("PROFILE");
+    let build_configuration_sha256 = build_configuration_sha256();
 
     emit(
         "RUSTHOUSE_SOURCE_COMMIT",
@@ -46,6 +52,15 @@ fn main() {
     emit("RUSTHOUSE_RUSTC_VERSION", &rustc_version);
     emit("RUSTHOUSE_BUILD_TARGET", &target);
     emit("RUSTHOUSE_BUILD_PROFILE", &profile);
+    emit(
+        "RUSTHOUSE_BUILD_CONFIGURATION_SHA256",
+        &build_configuration_sha256,
+    );
+    emit("RUSTHOUSE_SOURCE_ROOT", &manifest_dir.display().to_string());
+    emit(
+        "RUSTHOUSE_LIVE_GIT_SOURCE",
+        if source.live_git { "true" } else { "false" },
+    );
 
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_COMMIT");
@@ -71,6 +86,7 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
         return SourceProvenance {
             commit: repository.commit,
             dirty: !status.is_empty(),
+            live_git: true,
             git_watch_paths: repository.watch_paths,
         };
     }
@@ -92,6 +108,7 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
         return SourceProvenance {
             commit: provenance.commit,
             dirty: provenance.dirty,
+            live_git: false,
             git_watch_paths: Vec::new(),
         };
     }
@@ -106,6 +123,7 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
             return SourceProvenance {
                 commit,
                 dirty,
+                live_git: false,
                 git_watch_paths: Vec::new(),
             };
         }
@@ -120,6 +138,43 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
     panic!(
         "source provenance is unavailable: no package-owned Git checkout, packaged .cargo_vcs_info.json, or explicit RUSTHOUSE_BUILD_SOURCE_COMMIT/RUSTHOUSE_BUILD_SOURCE_DIRTY inputs"
     );
+}
+
+fn build_configuration_sha256() -> String {
+    const OPTIONAL_KEYS: &[&str] = &[
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_INCREMENTAL",
+        "RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ];
+    let mut settings = vec![
+        ("PROFILE".to_owned(), required_env("PROFILE")),
+        ("OPT_LEVEL".to_owned(), required_env("OPT_LEVEL")),
+        ("DEBUG".to_owned(), required_env("DEBUG")),
+        ("TARGET".to_owned(), required_env("TARGET")),
+        ("HOST".to_owned(), required_env("HOST")),
+    ];
+    settings.extend(OPTIONAL_KEYS.iter().map(|key| {
+        (
+            (*key).to_owned(),
+            env::var(key).unwrap_or_else(|_| "<unset>".to_owned()),
+        )
+    }));
+    settings.extend(env::vars().filter(|(key, _)| {
+        key.starts_with("CARGO_CFG_")
+            || key.starts_with("CARGO_FEATURE_")
+            || key.starts_with("CARGO_PROFILE_")
+    }));
+    settings.sort();
+    settings.dedup_by(|left, right| left.0 == right.0);
+
+    let mut canonical = String::new();
+    for (key, value) in settings {
+        write!(canonical, "{}:{key}{}:{value}", key.len(), value.len())
+            .expect("writing to String cannot fail");
+    }
+    sha256::digest_hex(canonical.as_bytes())
 }
 
 fn emit_source_watches(manifest_dir: &Path) {
