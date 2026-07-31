@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "evaluations": {
+    "eval_49c9c208": {
+      "name": "Analytical database capability",
+      "color": "#ff6b35"
+    },
+    "eval_9bd39996": {
+      "name": "Rust engineering quality",
+      "color": "#7c5cff"
+    },
+    "eval_6a53952e": {
+      "name": "ClickHouse sustained parity",
+      "color": "#00a7a5"
+    },
+    "eval_2ede6e63": {
+      "name": "Benchmark integrity and anti-gaming",
+      "color": "#e6a700"
+    },
+    "eval_a8f77ece": {
+      "name": "ClickHouse feature comprehensiveness",
+      "color": "#d94f8a"
+    },
+    "eval_77460940": {
+      "name": "Evaluation progress accounting",
+      "color": "#2589bd"
+    }
+  },
+  "points": [
+    {
+      "key": "base:91c1a47d2d58daebdef572cf38fd92f2049a51e4",
+      "recordedAt": "2026-07-31T16:39:51.289Z",
+      "label": "base 91c1a47",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_6a53952e": 100,
+        "eval_49c9c208": 40,
+        "eval_9bd39996": 75,
+        "eval_2ede6e63": 85
+      }
+    },
+    {
+      "key": "pr:135",
+      "recordedAt": "2026-07-31T17:56:54.000Z",
+      "label": "PR #135",
+      "kind": "leaf",
+      "prNumber": 135,
+      "title": "Establish pinned Rust quality gates",
+      "scores": {
+        "eval_6a53952e": 100,
+        "eval_49c9c208": 45,
+        "eval_9bd39996": 85,
+        "eval_2ede6e63": 70
+      }
+    }
+  ]
+}

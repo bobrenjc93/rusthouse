@@ -106,3 +106,11 @@ cargo +1.85.0 check --all-targets --locked
 ~~~
 
 RustHouse is distributed under the [MIT License](LICENSE).
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->
