@@ -131,6 +131,12 @@ pub fn parse(
     let clickhouse = clickhouse.ok_or_else(|| {
         "ClickHouse path is required; use --clickhouse PATH or RUSTHOUSE_CLICKHOUSE_BIN".to_owned()
     })?;
+    if mode == Mode::Default && details.is_none() {
+        return Err(
+            "default mode requires --details PATH so the benchmark attestation is retained"
+                .to_owned(),
+        );
+    }
     Ok(ParseResult::Run(Config {
         mode,
         seed,
@@ -204,5 +210,33 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("RUSTHOUSE_CLICKHOUSE_BIN"));
+    }
+
+    #[test]
+    fn default_mode_requires_retained_details() {
+        let error = match parse(
+            ["--clickhouse=/clickhouse"].into_iter().map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        ) {
+            Ok(_) => panic!("default mode without details should fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires --details"));
+
+        let ParseResult::Run(config) = parse(
+            ["--quick", "--clickhouse=/clickhouse"]
+                .into_iter()
+                .map(str::to_owned),
+            None,
+            None,
+            PathBuf::from("rusthouse"),
+        )
+        .expect("quick mode may omit retained details") else {
+            panic!("expected run");
+        };
+        assert_eq!(config.mode, Mode::Quick);
+        assert!(config.details.is_none());
     }
 }

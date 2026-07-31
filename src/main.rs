@@ -32,7 +32,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let Some(config) = parse_arguments(env::args().skip(1))? else {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments == ["--benchmark-attestation"] {
+        print!("{}", rusthouse::build_info::attestation());
+        return Ok(());
+    }
+
+    let Some(config) = parse_arguments(arguments.into_iter())? else {
         print!("{HELP}");
         return Ok(());
     };

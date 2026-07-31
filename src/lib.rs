@@ -3,6 +3,7 @@
 //! Database is the main entry point. It accepts a small SQL dialect and
 //! returns structured results that can be rendered by the format module.
 
+pub mod build_info;
 pub mod catalog;
 pub mod engine;
 pub mod error;

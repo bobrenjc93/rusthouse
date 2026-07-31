@@ -3,12 +3,14 @@ mod dataset;
 mod normalize;
 mod process;
 mod score;
+mod sha256;
 mod workload;
 
 use std::env;
 use std::fmt::Write as _;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(test)]
 use std::time::Duration;
@@ -16,7 +18,7 @@ use std::time::Duration;
 use config::{Config, ParseResult};
 use dataset::Dataset;
 use normalize::{ColumnType, compare_outputs};
-use process::{ClickHouseIdentity, Engine, EnginePaths, TimedBatch, TimedOutput};
+use process::{Engine, EnginePaths, RunIdentity, TimedBatch, TimedOutput};
 use score::{RatioObservation, ScoreBreakdown, median, parity_score};
 use workload::workloads;
 
@@ -34,7 +36,7 @@ OPTIONS:
     --seed <U64>            Deterministic runtime seed (default: 20260729)
     --clickhouse <PATH>     ClickHouse 26.7.1 binary
     --rusthouse <PATH>      Prebuilt rusthouse CLI (default: sibling binary)
-    --details <PATH>        Write detailed JSON without changing stdout
+    --details <PATH>        Atomically retain attested JSON (required for default)
     -h, --help              Print this help
 
 RUSTHOUSE_CLICKHOUSE_BIN supplies --clickhouse when the flag is absent.
@@ -55,6 +57,9 @@ struct CaseResult {
     workload: &'static str,
     family: &'static str,
     row_count: usize,
+    dataset_seed: u64,
+    setup_sql_sha256: String,
+    query_sql_sha256: String,
     query_amplification: usize,
     primary: TimingSeries,
     rusthouse_primary_batch_median_ms: f64,
@@ -151,7 +156,14 @@ fn run(config: Config) -> Result<Report, String> {
         rusthouse: config.rusthouse.clone(),
         clickhouse: config.clickhouse.clone(),
     };
-    let identity = paths.validate()?;
+    let build_info = rusthouse::build_info::current();
+    let identity = paths.validate(build_info)?;
+    if config.mode == config::Mode::Default && identity.rusthouse.profile != "release" {
+        return Err(format!(
+            "default mode requires release binaries, got profile {:?}",
+            identity.rusthouse.profile
+        ));
+    }
     let mut cases = Vec::new();
     let mut correctness_checks = 0_usize;
 
@@ -159,8 +171,10 @@ fn run(config: Config) -> Result<Report, String> {
         let dataset_seed = config.seed ^ (row_count as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
         let dataset = Dataset::generate(dataset_seed, row_count);
         let setup_sql = dataset.setup_sql();
+        let setup_sql_sha256 = sha256::digest_hex(setup_sql.as_bytes());
 
         for (workload_index, workload) in workloads(row_count).into_iter().enumerate() {
+            let query_sql_sha256 = sha256::digest_hex(workload.sql.as_bytes());
             eprintln!(
                 "benchmarking {} at {} rows ({}x amplification, {} warmups, {} primary samples, {} end-to-end samples)",
                 workload.name,
@@ -273,6 +287,9 @@ fn run(config: Config) -> Result<Report, String> {
                 workload: workload.name,
                 family: workload.family.name(),
                 row_count,
+                dataset_seed,
+                setup_sql_sha256: setup_sql_sha256.clone(),
+                query_sql_sha256,
                 query_amplification: settings.query_amplification,
                 primary,
                 rusthouse_primary_batch_median_ms: rusthouse_primary_batch_median,
@@ -288,11 +305,19 @@ fn run(config: Config) -> Result<Report, String> {
         }
     }
 
+    paths.revalidate(build_info, &identity)?;
     let primary_score = score_cases(&cases, |case| case.primary_ratio)?;
     if config.mode == config::Mode::Default {
         ensure_primary_headroom(&primary_score, cases.len())?;
     }
     let end_to_end_score = score_cases(&cases, |case| case.end_to_end_ratio)?;
+    let suite_manifest = suite_manifest_json(&config, &cases);
+    let suite_manifest_sha256 = sha256::digest_hex(suite_manifest.as_bytes());
+    verify_digest(
+        suite_manifest.as_bytes(),
+        &suite_manifest_sha256,
+        "suite manifest",
+    )?;
 
     if let Some(path) = &config.details {
         let details = details_json(
@@ -302,9 +327,10 @@ fn run(config: Config) -> Result<Report, String> {
             primary_score,
             end_to_end_score,
             correctness_checks,
+            &suite_manifest,
+            &suite_manifest_sha256,
         );
-        fs::write(path, details)
-            .map_err(|error| format!("could not write details to '{}': {error}", path.display()))?;
+        write_report_atomically(path, details.as_bytes())?;
     }
 
     let mut evidence = vec![
@@ -330,15 +356,34 @@ fn run(config: Config) -> Result<Report, String> {
             cases.len()
         ),
         format!(
-            "mode={}, seed={}, warmups={}, primary_samples={}, end_to_end_samples={}; ClickHouse SHA-256={}",
+            "mode={}, seed={}, warmups={}, primary_samples={}, end_to_end_samples={}; suite manifest SHA-256={}",
             config.mode.name(),
             config.seed,
             settings.warmups,
             settings.samples,
             settings.end_to_end_samples,
-            identity.sha256
+            suite_manifest_sha256
         ),
-        format!("ClickHouse identity: {}", identity.version_output),
+        format!(
+            "RustHouse SHA-256={}; source commit={} dirty={}; rustc={}; target={}; profile={}",
+            identity.rusthouse.sha256,
+            identity.rusthouse.source_commit,
+            identity.rusthouse.source_dirty,
+            identity.rusthouse.rustc_version,
+            identity.rusthouse.target,
+            identity.rusthouse.profile,
+        ),
+        format!(
+            "ClickHouse identity: {}; SHA-256={}; artifact={} ({})",
+            identity.clickhouse.version_output,
+            identity.clickhouse.sha256,
+            identity.clickhouse.artifact_url,
+            identity.clickhouse.artifact_platform,
+        ),
+        format!(
+            "host platform: {} ({})",
+            identity.host.platform, identity.host.description
+        ),
         format!(
             "limitation: amplification measures repeated warm in-process work, retains 1/{} of startup/setup, and does not model concurrency, durable storage, or network access",
             settings.query_amplification
@@ -528,19 +573,72 @@ fn stable_median(
     Ok(value)
 }
 
+fn suite_manifest_json(config: &Config, cases: &[CaseResult]) -> String {
+    let settings = config.mode.settings();
+    let mut output = String::new();
+    write!(
+        output,
+        "{{\"manifest_version\":1,\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"query_amplification\":{},\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1},\"row_counts\":[",
+        json_string(config.mode.name()),
+        config.seed,
+        settings.warmups,
+        settings.samples,
+        settings.end_to_end_samples,
+        settings.query_amplification,
+    )
+    .expect("writing to String cannot fail");
+    for (index, row_count) in settings.row_counts.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(output, "{row_count}").expect("writing to String cannot fail");
+    }
+    output.push_str("],\"cases\":[");
+    for (index, case) in cases.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write!(
+            output,
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"dataset_seed\":{},\"setup_sql_sha256\":{},\"query_sql_sha256\":{}}}",
+            json_string(case.workload),
+            json_string(case.family),
+            case.row_count,
+            case.dataset_seed,
+            json_string(&case.setup_sql_sha256),
+            json_string(&case.query_sql_sha256),
+        )
+        .expect("writing to String cannot fail");
+    }
+    output.push_str("]}");
+    output
+}
+
+fn verify_digest(bytes: &[u8], expected: &str, subject: &str) -> Result<(), String> {
+    let actual = sha256::digest_hex(bytes);
+    if actual != expected {
+        return Err(format!(
+            "{subject} SHA-256 mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
 fn details_json(
     config: &Config,
-    identity: &ClickHouseIdentity,
+    identity: &RunIdentity,
     cases: &[CaseResult],
     primary_score: ScoreBreakdown,
     end_to_end_score: ScoreBreakdown,
     correctness_checks: usize,
+    suite_manifest: &str,
+    suite_manifest_sha256: &str,
 ) -> String {
     let settings = config.mode.settings();
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":2,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -561,12 +659,24 @@ fn details_json(
     }
     write!(
         output,
-        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_shared_repetitions\",\"query_amplification\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse\":{{\"path\":{},\"sha256\":{},\"source_commit\":{},\"source_dirty\":{},\"rustc_version\":{},\"target\":{},\"profile\":{}}},\"clickhouse\":{{\"path\":{},\"version\":{},\"sha256\":{},\"artifact_url\":{},\"artifact_platform\":{}}},\"host\":{{\"platform\":{},\"description\":{}}},\"suite_manifest_sha256\":{},\"suite_manifest\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.query_amplification,
         json_string(&config.rusthouse.display().to_string()),
+        json_string(&identity.rusthouse.sha256),
+        json_string(&identity.rusthouse.source_commit),
+        identity.rusthouse.source_dirty,
+        json_string(&identity.rusthouse.rustc_version),
+        json_string(&identity.rusthouse.target),
+        json_string(&identity.rusthouse.profile),
         json_string(&config.clickhouse.display().to_string()),
-        json_string(&identity.version_output),
-        json_string(&identity.sha256),
+        json_string(&identity.clickhouse.version_output),
+        json_string(&identity.clickhouse.sha256),
+        json_string(identity.clickhouse.artifact_url),
+        json_string(identity.clickhouse.artifact_platform),
+        json_string(&identity.host.platform),
+        json_string(&identity.host.description),
+        json_string(suite_manifest_sha256),
+        suite_manifest,
         json_string("amplification measures repeated warm in-process work and retains one divided by the amplification factor of startup and setup"),
         json_string("synthetic single-process data does not model concurrency, durable storage, networking, joins, nullability, or production compression")
     )
@@ -578,10 +688,13 @@ fn details_json(
         }
         write!(
             output,
-            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
+            "{{\"workload\":{},\"family\":{},\"row_count\":{},\"dataset_seed\":{},\"setup_sql_sha256\":{},\"query_sql_sha256\":{},\"query_amplification\":{},\"primary\":{{\"rusthouse_batch_median_ms\":{:.6},\"clickhouse_batch_median_ms\":{:.6},\"rusthouse_per_query_median_ms\":{:.6},\"clickhouse_per_query_median_ms\":{:.6},\"clickhouse_rusthouse_ratio\":{:.9},\"rusthouse_batch_samples_ms\":",
             json_string(case.workload),
             json_string(case.family),
             case.row_count,
+            case.dataset_seed,
+            json_string(&case.setup_sql_sha256),
+            json_string(&case.query_sql_sha256),
             case.query_amplification,
             case.rusthouse_primary_batch_median_ms,
             case.clickhouse_primary_batch_median_ms,
@@ -612,6 +725,96 @@ fn details_json(
     }
     output.push_str("]}\n");
     output
+}
+
+fn write_report_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("details path '{}' has no file name", path.display()))?;
+
+    let mut temporary_path = None;
+    let mut temporary_file = None;
+    for attempt in 0..100_u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            attempt
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary_path = Some(candidate);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create atomic details file in '{}': {error}",
+                    parent.display()
+                ));
+            }
+        }
+    }
+
+    let temporary_path = temporary_path.ok_or_else(|| {
+        format!(
+            "could not reserve an atomic details file in '{}'",
+            parent.display()
+        )
+    })?;
+    let temporary_file = temporary_file.expect("path and file are set together");
+    let result = install_atomic_report(temporary_file, &temporary_path, path, parent, contents);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn install_atomic_report(
+    mut temporary_file: fs::File,
+    temporary_path: &Path,
+    destination: &Path,
+    parent: &Path,
+    contents: &[u8],
+) -> Result<(), String> {
+    temporary_file.write_all(contents).map_err(|error| {
+        format!(
+            "could not write atomic details file '{}': {error}",
+            temporary_path.display()
+        )
+    })?;
+    temporary_file.sync_all().map_err(|error| {
+        format!(
+            "could not sync atomic details file '{}': {error}",
+            temporary_path.display()
+        )
+    })?;
+    drop(temporary_file);
+    fs::rename(temporary_path, destination).map_err(|error| {
+        format!(
+            "could not atomically replace details file '{}': {error}",
+            destination.display()
+        )
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "could not sync details directory '{}': {error}",
+                parent.display()
+            )
+        })?;
+    Ok(())
 }
 
 fn write_number_array(output: &mut String, values: &[f64]) {
@@ -799,5 +1002,35 @@ mod tests {
             "{\"score\":10.000000,\"summary\":\"summary\",\"evidence\":[\"evidence\"],\"suggestions\":[\"suggestion\"]}"
         );
         assert!(!report.contains('\n'));
+    }
+
+    #[test]
+    fn suite_manifest_digest_rejects_tampering() {
+        let manifest = br#"{"manifest_version":1,"cases":[]}"#;
+        let digest = sha256::digest_hex(manifest);
+        verify_digest(manifest, &digest, "suite manifest").expect("original manifest");
+
+        let tampered = br#"{"manifest_version":1,"cases":[{}]}"#;
+        let error = verify_digest(tampered, &digest, "suite manifest")
+            .expect_err("tampered manifest must fail");
+        assert!(error.contains("mismatch"));
+    }
+
+    #[test]
+    fn details_report_replaces_existing_file_atomically() {
+        let directory = env::temp_dir().join(format!(
+            "rusthouse-atomic-report-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("test directory");
+        let path = directory.join("details.json");
+        fs::write(&path, b"old").expect("old report");
+
+        write_report_atomically(&path, b"new report\n").expect("atomic report");
+        assert_eq!(fs::read(&path).expect("retained report"), b"new report\n");
+        assert_eq!(fs::read_dir(&directory).expect("directory").count(), 1);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 }
