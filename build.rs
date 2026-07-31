@@ -1,19 +1,33 @@
+mod build_provenance;
+
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use build_provenance::{cargo_vcs_provenance, owned_git_repository, parse_dirty};
+
+struct SourceProvenance {
+    commit: String,
+    dirty: bool,
+    git_watch_paths: Vec<std::path::PathBuf>,
+}
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is required");
     let manifest_dir = Path::new(&manifest_dir);
 
-    let (source_commit, source_dirty) = source_provenance(manifest_dir);
-    if !matches!(source_commit.len(), 40 | 64)
-        || !source_commit
+    let source = source_provenance(manifest_dir);
+    if !matches!(source.commit.len(), 40 | 64)
+        || !source
+            .commit
             .chars()
             .all(|character| character.is_ascii_hexdigit())
     {
-        panic!("git returned an invalid source commit: {source_commit:?}");
+        panic!(
+            "source provenance contains an invalid commit: {:?}",
+            source.commit
+        );
     }
 
     let rustc = env::var("RUSTC").expect("RUSTC is required");
@@ -23,11 +37,11 @@ fn main() {
 
     emit(
         "RUSTHOUSE_SOURCE_COMMIT",
-        &source_commit.to_ascii_lowercase(),
+        &source.commit.to_ascii_lowercase(),
     );
     emit(
         "RUSTHOUSE_SOURCE_DIRTY",
-        if source_dirty { "true" } else { "false" },
+        if source.dirty { "true" } else { "false" },
     );
     emit("RUSTHOUSE_RUSTC_VERSION", &rustc_version);
     emit("RUSTHOUSE_BUILD_TARGET", &target);
@@ -37,17 +51,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_DIRTY");
     emit_source_watches(manifest_dir);
-    if !manifest_dir.join(".cargo_vcs_info.json").is_file()
-        && owned_git_commit(manifest_dir).is_some()
-        && let Some(git_directory) =
-            try_command_output(manifest_dir, "git", &["rev-parse", "--absolute-git-dir"])
-    {
-        println!("cargo:rerun-if-changed={git_directory}/HEAD");
-        println!("cargo:rerun-if-changed={git_directory}/index");
+    for path in source.git_watch_paths {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 
-fn source_provenance(manifest_dir: &Path) -> (String, bool) {
+fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
     let vcs_path = manifest_dir.join(".cargo_vcs_info.json");
     if vcs_path.is_file() {
         let contents = fs::read_to_string(&vcs_path).unwrap_or_else(|error| {
@@ -56,16 +65,20 @@ fn source_provenance(manifest_dir: &Path) -> (String, bool) {
                 vcs_path.display()
             )
         });
-        let commit = cargo_vcs_commit(&contents).unwrap_or_else(|| {
+        let provenance = cargo_vcs_provenance(&contents).unwrap_or_else(|| {
             panic!(
-                "packaged VCS metadata '{}' does not contain a valid git.sha1",
+                "packaged VCS metadata '{}' does not contain valid git.sha1/dirty fields",
                 vcs_path.display()
             )
         });
-        return (commit, false);
+        return SourceProvenance {
+            commit: provenance.commit,
+            dirty: provenance.dirty,
+            git_watch_paths: Vec::new(),
+        };
     }
 
-    if let Some(commit) = owned_git_commit(manifest_dir) {
+    if let Some(repository) = owned_git_repository(manifest_dir) {
         let status = command_output(
             manifest_dir,
             "git",
@@ -76,7 +89,11 @@ fn source_provenance(manifest_dir: &Path) -> (String, bool) {
                 "--untracked-files=normal",
             ],
         );
-        return (commit, !status.is_empty());
+        return SourceProvenance {
+            commit: repository.commit,
+            dirty: !status.is_empty(),
+            git_watch_paths: repository.watch_paths,
+        };
     }
 
     let explicit_commit = env::var("RUSTHOUSE_BUILD_SOURCE_COMMIT").ok();
@@ -86,7 +103,11 @@ fn source_provenance(manifest_dir: &Path) -> (String, bool) {
             let dirty = parse_dirty(&dirty).unwrap_or_else(|| {
                 panic!("RUSTHOUSE_BUILD_SOURCE_DIRTY must be true or false, got {dirty:?}")
             });
-            return (commit, dirty);
+            return SourceProvenance {
+                commit,
+                dirty,
+                git_watch_paths: Vec::new(),
+            };
         }
         (Some(_), None) | (None, Some(_)) => {
             panic!(
@@ -101,16 +122,6 @@ fn source_provenance(manifest_dir: &Path) -> (String, bool) {
     );
 }
 
-fn owned_git_commit(manifest_dir: &Path) -> Option<String> {
-    let top_level = try_command_output(manifest_dir, "git", &["rev-parse", "--show-toplevel"])?;
-    let top_level = fs::canonicalize(top_level).ok()?;
-    let manifest_dir = fs::canonicalize(manifest_dir).ok()?;
-    if top_level != manifest_dir {
-        return None;
-    }
-    try_command_output(&manifest_dir, "git", &["rev-parse", "HEAD"])
-}
-
 fn emit_source_watches(manifest_dir: &Path) {
     let entries = fs::read_dir(manifest_dir)
         .unwrap_or_else(|error| panic!("could not enumerate package sources: {error}"));
@@ -122,30 +133,6 @@ fn emit_source_watches(manifest_dir: &Path) {
             continue;
         }
         println!("cargo:rerun-if-changed={}", entry.path().display());
-    }
-}
-
-fn parse_dirty(value: &str) -> Option<bool> {
-    match value {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-fn cargo_vcs_commit(contents: &str) -> Option<String> {
-    let (_, after_key) = contents.split_once("\"sha1\"")?;
-    let (_, after_colon) = after_key.split_once(':')?;
-    let quoted = after_colon.trim_start().strip_prefix('"')?;
-    let (commit, _) = quoted.split_once('"')?;
-    if commit.len() == 40
-        && commit
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        Some(commit.to_ascii_lowercase())
-    } else {
-        None
     }
 }
 
@@ -182,18 +169,4 @@ fn command_output(directory: &Path, program: &str, arguments: &[&str]) -> String
         .unwrap_or_else(|error| panic!("{program} output was not UTF-8: {error}"))
         .trim()
         .to_owned()
-}
-
-fn try_command_output(directory: &Path, program: &str, arguments: &[&str]) -> Option<String> {
-    let output = Command::new(program)
-        .args(arguments)
-        .current_dir(directory)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_owned())
 }
