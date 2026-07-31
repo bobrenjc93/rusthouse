@@ -28,7 +28,6 @@ const BUILD_CONFIGURATION_OPTIONAL_ENV_KEYS: &[&str] = &[
 struct SourceProvenance {
     commit: String,
     dirty: bool,
-    live_git: bool,
     git_watch_paths: Vec<std::path::PathBuf>,
 }
 
@@ -71,14 +70,10 @@ fn main() {
         "RUSTHOUSE_BUILD_CONFIGURATION_SHA256",
         &build_configuration_seed_sha256,
     );
-    emit("RUSTHOUSE_SOURCE_ROOT", &manifest_dir.display().to_string());
-    emit(
-        "RUSTHOUSE_LIVE_GIT_SOURCE",
-        if source.live_git { "true" } else { "false" },
-    );
 
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD");
+    println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD_SESSION");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_ATTESTED_BUILD_TOKEN");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=RUSTHOUSE_BUILD_SOURCE_DIRTY");
@@ -172,7 +167,6 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
         return SourceProvenance {
             commit: repository.commit,
             dirty: !status.is_empty() || hidden_index_entries,
-            live_git: true,
             git_watch_paths: repository.watch_paths,
         };
     }
@@ -194,7 +188,6 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
         return SourceProvenance {
             commit: provenance.commit,
             dirty: provenance.dirty,
-            live_git: false,
             git_watch_paths: Vec::new(),
         };
     }
@@ -209,7 +202,6 @@ fn source_provenance(manifest_dir: &Path) -> SourceProvenance {
             return SourceProvenance {
                 commit,
                 dirty,
-                live_git: false,
                 git_watch_paths: Vec::new(),
             };
         }

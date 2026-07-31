@@ -313,7 +313,7 @@ fn warm_cache_rebuild_tracks_rustc_wrapper_changes() {
 }
 
 #[test]
-fn new_untracked_root_entry_is_detected_without_recursive_rebuild_watch() {
+fn build_attestation_is_self_contained_after_checkout_removal() {
     let repository = TemporaryRepository::new();
     repository.install_probe();
     repository.git(&["add", "."]);
@@ -321,14 +321,34 @@ fn new_untracked_root_entry_is_detected_without_recursive_rebuild_watch() {
     repository.cargo(&["build", "--quiet"]);
     assert!(!repository.probe_dirty());
 
-    repository.write("new-root-entry.txt", "untracked\n");
-    let output = repository.cargo_output(&["build", "--verbose"], &[]);
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Fresh provenance-probe"),
-        "unexpected Cargo output: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(repository.probe_dirty());
+    let source = repository
+        .path
+        .join("target")
+        .join("debug")
+        .join(format!("provenance-probe{}", env::consts::EXE_SUFFIX));
+    let detached = repository.path.with_file_name(format!(
+        "{}-detached-probe{}",
+        repository
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temporary repository file name"),
+        env::consts::EXE_SUFFIX
+    ));
+    fs::copy(&source, &detached).expect("copy detached probe");
+    let before = Command::new(&detached)
+        .output()
+        .expect("run attached probe");
+    assert!(before.status.success());
+
+    fs::remove_dir_all(&repository.path).expect("remove build checkout");
+    let after = Command::new(&detached)
+        .env("PATH", "")
+        .output()
+        .expect("run detached probe without Git");
+    assert!(after.status.success());
+    assert_eq!(after.stdout, before.stdout);
+    fs::remove_file(detached).expect("remove detached probe");
 }
 
 #[test]
@@ -420,6 +440,7 @@ fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
         .env("CARGO_BUILD_TARGET", &host)
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_SESSION")
         .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
         .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
         .env("RUSTFLAGS", "-Lnative=/tmp/libs.rs")
@@ -432,7 +453,7 @@ fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let release_dir = target_dir.join(host).join("release");
+    let release_dir = target_dir.join(&host).join("release");
     let rusthouse = release_dir.join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
     let benchmark = release_dir.join(format!(
         "clickhouse-parity-bench{}",
@@ -444,6 +465,36 @@ fn attested_builder_uses_cargo_artifacts_from_nested_cwd_and_target_triple() {
         .arg("--benchmark-attestation")
         .output()
         .expect("run attested RustHouse");
+    assert!(attestation.status.success());
+
+    let rusthouse = release_dir.join(format!("rusthouse{}", env::consts::EXE_SUFFIX));
+    fs::write(&rusthouse, b"tampered cached executable").expect("tamper cached RustHouse");
+    let rebuilt = Command::new(env!("CARGO_BIN_EXE_attested-build"))
+        .current_dir(manifest_dir.join("src"))
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_BUILD_TARGET", &host)
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_SESSION")
+        .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
+        .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
+        .env("RUSTFLAGS", "-Lnative=/tmp/libs.rs")
+        .output()
+        .expect("rebuild tampered cached artifact");
+    assert!(
+        rebuilt.status.success(),
+        "attested rebuild failed: {}{}",
+        String::from_utf8_lossy(&rebuilt.stdout),
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert_ne!(
+        fs::read(&rusthouse).expect("rebuilt RustHouse"),
+        b"tampered cached executable"
+    );
+    let attestation = Command::new(rusthouse)
+        .arg("--benchmark-attestation")
+        .output()
+        .expect("run rebuilt RustHouse");
     assert!(attestation.status.success());
 }
 
@@ -606,6 +657,7 @@ impl TemporaryRepository {
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("RUSTHOUSE_ATTESTED_BUILD")
+            .env_remove("RUSTHOUSE_ATTESTED_BUILD_SESSION")
             .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
             .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256")
             .current_dir(&self.path);

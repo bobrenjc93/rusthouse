@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MARKER_PREFIX: &str = "rusthouse-final-rustc-";
 
@@ -30,11 +31,13 @@ fn build_attested_binaries() -> Result<i32, String> {
     let wrapper = env::current_exe()
         .map_err(|error| format!("cannot locate attestation wrapper executable: {error}"))?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let (first_status, rusthouse_path) = cargo_artifact(
+    let session = new_build_session()?;
+    let (first_status, rusthouse_artifact) = cargo_artifact(
         Command::new(&cargo)
             .args(["build", "--release", "--bin", "rusthouse"])
             .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
             .env("RUSTHOUSE_ATTESTED_BUILD", "1")
+            .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", &session)
             .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
             .env_remove("RUSTHOUSE_ATTESTED_BINARY_SHA256"),
         "rusthouse",
@@ -43,14 +46,14 @@ fn build_attested_binaries() -> Result<i32, String> {
         return Ok(first_status);
     }
 
-    let rusthouse_path = rusthouse_path
-        .ok_or_else(|| "Cargo did not report the RustHouse executable artifact".to_owned())?;
+    let rusthouse_path = require_compiled_artifact(rusthouse_artifact, "RustHouse")?;
     let initial_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
     let (status, benchmark_path) = cargo_artifact(
         Command::new(cargo)
             .args(["build", "--release", "--bin", "clickhouse-parity-bench"])
             .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
             .env("RUSTHOUSE_ATTESTED_BUILD", "1")
+            .env("RUSTHOUSE_ATTESTED_BUILD_SESSION", session)
             .env_remove("RUSTHOUSE_ATTESTED_BUILD_TOKEN")
             .env(
                 "RUSTHOUSE_ATTESTED_BINARY_SHA256",
@@ -61,12 +64,24 @@ fn build_attested_binaries() -> Result<i32, String> {
     if status != 0 {
         return Ok(status);
     }
-    let benchmark_path = benchmark_path
-        .ok_or_else(|| "Cargo did not report the benchmark executable artifact".to_owned())?;
+    let benchmark_path = require_compiled_artifact(benchmark_path, "benchmark")?;
     let final_benchmark = capture_artifact(&benchmark_path, "benchmark")?;
     let final_rusthouse = capture_artifact(&rusthouse_path, "RustHouse")?;
     validate_final_artifact_pair(&initial_rusthouse, &final_rusthouse, &final_benchmark)?;
     Ok(status)
+}
+
+fn new_build_session() -> Result<String, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?;
+    let material = format!(
+        "rusthouse-attested-session-v1\nprocess={}\nseconds={}\nnanos={}\n",
+        process::id(),
+        now.as_secs(),
+        now.subsec_nanos()
+    );
+    Ok(sha256::digest_hex(material.as_bytes()))
 }
 
 fn wrap_rustc(arguments: &[String]) -> Result<i32, String> {
@@ -217,6 +232,25 @@ struct CapturedArtifact {
     attestation: ArtifactAttestation,
 }
 
+struct CargoArtifact {
+    path: PathBuf,
+    fresh: bool,
+}
+
+fn require_compiled_artifact(
+    artifact: Option<CargoArtifact>,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let artifact =
+        artifact.ok_or_else(|| format!("Cargo did not report the {name} executable artifact"))?;
+    if artifact.fresh {
+        return Err(format!(
+            "Cargo reported the {name} executable as fresh; refusing to attest a cached artifact"
+        ));
+    }
+    Ok(artifact.path)
+}
+
 fn capture_artifact(path: &Path, name: &str) -> Result<CapturedArtifact, String> {
     let before = sha256::file_digest_hex(path)?;
     let attestation = validate_artifact(path, name)?;
@@ -365,7 +399,7 @@ fn attestation_field(attestation: &str, name: &str) -> Option<String> {
 fn cargo_artifact(
     command: &mut Command,
     target_name: &str,
-) -> Result<(i32, Option<PathBuf>), String> {
+) -> Result<(i32, Option<CargoArtifact>), String> {
     command.arg("--message-format=json-render-diagnostics");
     let display = format!("{command:?}");
     let output = command
@@ -385,7 +419,10 @@ fn cargo_artifact(
     Ok((output.status.code().unwrap_or(1), artifact))
 }
 
-fn cargo_executable_artifact(messages: &str, target_name: &str) -> Result<Option<PathBuf>, String> {
+fn cargo_executable_artifact(
+    messages: &str,
+    target_name: &str,
+) -> Result<Option<CargoArtifact>, String> {
     let mut artifact = None;
     for message in messages.lines() {
         if json_string_field(message, "reason")?.as_deref() != Some("compiler-artifact") {
@@ -398,10 +435,33 @@ fn cargo_executable_artifact(messages: &str, target_name: &str) -> Result<Option
             continue;
         }
         if let Some(executable) = json_string_field(message, "executable")? {
-            artifact = Some(PathBuf::from(executable));
+            let fresh = json_bool_field(message, "fresh")?.ok_or_else(|| {
+                format!("Cargo artifact for {target_name} omitted its fresh state")
+            })?;
+            artifact = Some(CargoArtifact {
+                path: PathBuf::from(executable),
+                fresh,
+            });
         }
     }
     Ok(artifact)
+}
+
+fn json_bool_field(input: &str, name: &str) -> Result<Option<bool>, String> {
+    let marker = format!("\"{name}\":");
+    let Some(value) = input
+        .find(&marker)
+        .map(|index| input[index + marker.len()..].trim_start())
+    else {
+        return Ok(None);
+    };
+    if value.starts_with("true") {
+        Ok(Some(true))
+    } else if value.starts_with("false") {
+        Ok(Some(false))
+    } else {
+        Err(format!("Cargo JSON field {name} was not a boolean"))
+    }
 }
 
 fn json_object_field<'a>(input: &'a str, name: &str) -> Option<&'a str> {
@@ -522,22 +582,38 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        ArtifactAttestation, CapturedArtifact, SharedArtifactProvenance, cargo_executable_artifact,
-        encode_arguments, final_configuration, validate_final_artifact_pair,
+        ArtifactAttestation, CapturedArtifact, CargoArtifact, SharedArtifactProvenance,
+        cargo_executable_artifact, encode_arguments, final_configuration,
+        require_compiled_artifact, validate_final_artifact_pair,
     };
 
     #[test]
     fn cargo_artifact_messages_supply_the_executable_path() {
         let messages = concat!(
-            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"dependency\"},\"executable\":null}\n",
-            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"rusthouse\"},\"executable\":\"C:\\\\work\\\\target\\\\triple\\\\release\\\\rusthouse.exe\"}\n"
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"dependency\"},\"executable\":null,\"fresh\":true}\n",
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"rusthouse\"},\"executable\":\"C:\\\\work\\\\target\\\\triple\\\\release\\\\rusthouse.exe\",\"fresh\":false}\n"
         );
+        let artifact = cargo_executable_artifact(messages, "rusthouse")
+            .expect("artifact messages")
+            .expect("RustHouse artifact");
         assert_eq!(
-            cargo_executable_artifact(messages, "rusthouse").expect("artifact messages"),
-            Some(PathBuf::from(
-                "C:\\work\\target\\triple\\release\\rusthouse.exe"
-            ))
+            artifact.path,
+            PathBuf::from("C:\\work\\target\\triple\\release\\rusthouse.exe")
         );
+        assert!(!artifact.fresh);
+    }
+
+    #[test]
+    fn cached_executable_artifact_is_rejected() {
+        let error = require_compiled_artifact(
+            Some(CargoArtifact {
+                path: PathBuf::from("rusthouse"),
+                fresh: true,
+            }),
+            "RustHouse",
+        )
+        .expect_err("fresh Cargo artifact must be rejected");
+        assert!(error.contains("cached artifact"));
     }
 
     #[test]
