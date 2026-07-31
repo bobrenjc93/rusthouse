@@ -112,5 +112,35 @@ RustHouse is distributed under the [MIT License](LICENSE).
 
 ![Burner evaluation progress](docs/burner-evaluation-progress.svg)
 
-_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+The versioned [raw history](docs/burner-evaluation-history.json) is the source of
+truth. After each successful Burner PR merge, Burner automation passes the PR
+number, full merge SHA, merge timestamp, title, and complete enabled-evaluation
+score map to `python3 scripts/burner_history.py update`. The command validates
+the schema, upserts the merge by its `pr:<number>` key so retries cannot create
+duplicates, and deterministically regenerates this SVG. Evaluations introduced
+later declare the preceding history point in `introducedAfter`, so older points
+correctly omit those scores while the first subsequent merge requires them.
+
+The merge automation interface is:
+
+~~~bash
+python3 scripts/burner_history.py update \
+  --pr-number "$PR_NUMBER" \
+  --merge-sha "$MERGE_SHA" \
+  --recorded-at "$MERGED_AT" \
+  --title "$PR_TITLE" \
+  --scores-file burner-scores.json
+~~~
+
+`burner-scores.json` must be a flat JSON object mapping every evaluation ID
+enabled for that merge to an integer score from 0 through 100. `MERGE_SHA` is a
+full lowercase Git SHA and `MERGED_AT` is an RFC 3339 UTC timestamp ending in
+`Z`. The command writes both tracked artifacts only after the complete update
+validates.
+
+CI runs `python3 -m unittest scripts.test_burner_history` and
+`python3 scripts/burner_history.py check`; it fails on missing or malformed
+scores, invalid provenance or chronology, noncanonical JSON, and a stale SVG.
+CI verifies artifacts from the merge-coupled automatic update but does not
+synthesize scores.
 <!-- burner-progress:end -->

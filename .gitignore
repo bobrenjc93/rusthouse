@@ -1,3 +1,5 @@
 /target/
 /.burner/
+__pycache__/
+*.py[cod]
 *.rhdb

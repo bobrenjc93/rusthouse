@@ -19,6 +19,10 @@ jobs:
         with:
           toolchain: 1.92.0
           components: clippy,rustfmt
+      - name: Test Burner history generator
+        run: python3 -m unittest scripts.test_burner_history
+      - name: Validate Burner history artifacts
+        run: python3 scripts/burner_history.py check
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Build all targets

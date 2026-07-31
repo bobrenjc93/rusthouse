@@ -1,29 +1,43 @@
 {
-  "version": 1,
+  "version": 2,
+  "tracking": {
+    "baseline": {
+      "key": "base:91c1a47d2d58daebdef572cf38fd92f2049a51e4",
+      "commitSha": "91c1a47d2d58daebdef572cf38fd92f2049a51e4",
+      "recordedAt": "2026-07-31T16:39:51.289Z"
+    },
+    "updatePolicy": "Burner automation automatically upserts one score point for each merged PR, keyed by PR number and stamped with its merge SHA."
+  },
   "evaluations": {
     "eval_49c9c208": {
       "name": "Analytical database capability",
-      "color": "#ff6b35"
+      "color": "#ff6b35",
+      "introducedAfter": null
     },
     "eval_9bd39996": {
       "name": "Rust engineering quality",
-      "color": "#7c5cff"
+      "color": "#7c5cff",
+      "introducedAfter": null
     },
     "eval_6a53952e": {
       "name": "ClickHouse sustained parity",
-      "color": "#00a7a5"
+      "color": "#00a7a5",
+      "introducedAfter": null
     },
     "eval_2ede6e63": {
       "name": "Benchmark integrity and anti-gaming",
-      "color": "#e6a700"
+      "color": "#e6a700",
+      "introducedAfter": null
     },
     "eval_a8f77ece": {
       "name": "ClickHouse feature comprehensiveness",
-      "color": "#d94f8a"
+      "color": "#d94f8a",
+      "introducedAfter": "pr:135"
     },
     "eval_77460940": {
       "name": "Evaluation progress accounting",
-      "color": "#2589bd"
+      "color": "#2589bd",
+      "introducedAfter": "pr:135"
     }
   },
   "points": [
@@ -32,11 +46,12 @@
       "recordedAt": "2026-07-31T16:39:51.289Z",
       "label": "base 91c1a47",
       "kind": "baseline",
+      "commitSha": "91c1a47d2d58daebdef572cf38fd92f2049a51e4",
       "title": "main",
       "scores": {
-        "eval_6a53952e": 100,
         "eval_49c9c208": 40,
         "eval_9bd39996": 75,
+        "eval_6a53952e": 100,
         "eval_2ede6e63": 85
       }
     },
@@ -44,13 +59,14 @@
       "key": "pr:135",
       "recordedAt": "2026-07-31T17:56:54.000Z",
       "label": "PR #135",
-      "kind": "leaf",
+      "kind": "merge",
       "prNumber": 135,
+      "mergeSha": "77613899617930f962d24e7dacf0015f3ef27eb0",
       "title": "Establish pinned Rust quality gates",
       "scores": {
-        "eval_6a53952e": 100,
         "eval_49c9c208": 45,
         "eval_9bd39996": 85,
+        "eval_6a53952e": 100,
         "eval_2ede6e63": 70
       }
     }
