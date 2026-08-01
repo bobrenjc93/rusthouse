@@ -94,6 +94,8 @@ pub enum Error {
     InvalidQuery(String),
     /// Database execution settings are invalid.
     InvalidConfiguration(String),
+    /// A parallel scan worker could not be created.
+    WorkerSpawn(String),
     /// An integer aggregate exceeded its representable range.
     NumericOverflow(String),
     /// A configured execution or rendering ceiling was exceeded.
@@ -151,6 +153,7 @@ impl fmt::Display for Error {
             Self::InvalidConfiguration(message) => {
                 write!(f, "invalid configuration: {message}")
             }
+            Self::WorkerSpawn(message) => write!(f, "could not spawn scan worker: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }

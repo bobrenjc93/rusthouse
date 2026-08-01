@@ -6,7 +6,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -21,6 +21,9 @@ use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
 const SCAN_MORSEL_ROWS: usize = 4_096;
+const MAX_SCAN_WORKERS: usize = 16;
+const SCAN_WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+const SCAN_WORKER_CONTROL_BYTES: usize = 128;
 
 /// A reusable in-memory SQL database.
 #[derive(Debug)]
@@ -39,7 +42,7 @@ impl Default for Database {
             limits: ExecutionLimits::default(),
             last_execution_stats: ExecutionStats::default(),
             spill_directory: Arc::new(std::env::temp_dir()),
-            worker_count: thread::available_parallelism().map_or(1, usize::from),
+            worker_count: default_worker_count(),
         }
     }
 }
@@ -103,14 +106,14 @@ impl Database {
             limits,
             last_execution_stats: ExecutionStats::default(),
             spill_directory: Arc::new(spill_directory.into()),
-            worker_count: thread::available_parallelism().map_or(1, usize::from),
+            worker_count: default_worker_count(),
         }
     }
 
     /// Creates an empty database that uses at most `worker_count` scan workers.
     ///
-    /// A worker count of zero is rejected. The engine may use fewer workers
-    /// when a query contains fewer fixed-size scan morsels than workers.
+    /// The worker count must be from 1 through 16. The engine may use fewer
+    /// workers when a query contains fewer fixed-size scan morsels than workers.
     pub fn with_worker_count(worker_count: usize) -> Result<Self> {
         validate_worker_count(worker_count)?;
         Ok(Self {
@@ -127,7 +130,8 @@ impl Database {
 
     /// Changes the maximum number of scan workers used by subsequent queries.
     ///
-    /// A worker count of zero is rejected without changing the current value.
+    /// Counts outside 1 through 16 are rejected without changing the current
+    /// value.
     pub fn set_worker_count(&mut self, worker_count: usize) -> Result<()> {
         validate_worker_count(worker_count)?;
         self.worker_count = worker_count;
@@ -318,7 +322,18 @@ fn validate_worker_count(worker_count: usize) -> Result<()> {
             "worker count must be at least 1".to_owned(),
         ));
     }
+    if worker_count > MAX_SCAN_WORKERS {
+        return Err(Error::InvalidConfiguration(format!(
+            "worker count must not exceed {MAX_SCAN_WORKERS}"
+        )));
+    }
     Ok(())
+}
+
+fn default_worker_count() -> usize {
+    thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_SCAN_WORKERS)
 }
 
 #[derive(Debug)]
@@ -695,51 +710,90 @@ fn execute_morsels<T>(
     row_count: usize,
     worker_count: usize,
     execute: impl Fn(Range<usize>) -> T + Sync,
-) -> Vec<T>
+) -> Result<Vec<T>>
+where
+    T: Send,
+{
+    execute_morsels_with_spawn_guard(row_count, worker_count, |_| Ok(()), execute)
+}
+
+fn execute_morsels_with_spawn_guard<T>(
+    row_count: usize,
+    worker_count: usize,
+    before_spawn: impl Fn(usize) -> std::io::Result<()>,
+    execute: impl Fn(Range<usize>) -> T + Sync,
+) -> Result<Vec<T>>
 where
     T: Send,
 {
     let morsel_count = row_count.div_ceil(SCAN_MORSEL_ROWS);
-    let active_workers = worker_count.min(morsel_count);
+    let active_workers = active_worker_count(row_count, worker_count);
     if active_workers <= 1 {
-        return (0..morsel_count)
+        return Ok((0..morsel_count)
             .map(|morsel| execute(morsel_range(morsel, row_count)))
-            .collect();
+            .collect());
     }
 
     let next_morsel = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
     let completed = Mutex::new(
         std::iter::repeat_with(|| None)
             .take(morsel_count)
             .collect::<Vec<_>>(),
     );
-    thread::scope(|scope| {
+    let spawn_result = thread::scope(|scope| {
         let mut handles = Vec::with_capacity(active_workers);
-        for _ in 0..active_workers {
-            handles.push(scope.spawn(|| {
-                loop {
-                    let morsel = next_morsel.fetch_add(1, AtomicOrdering::Relaxed);
-                    if morsel >= morsel_count {
-                        break;
-                    }
-                    let result = execute(morsel_range(morsel, row_count));
-                    completed.lock().expect("morsel result lock poisoned")[morsel] = Some(result);
+        let mut spawn_error = None;
+        for worker in 0..active_workers {
+            let result = before_spawn(worker).and_then(|()| {
+                thread::Builder::new()
+                    .name(format!("rusthouse-scan-{worker}"))
+                    .stack_size(SCAN_WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, || {
+                        loop {
+                            if cancelled.load(AtomicOrdering::Relaxed) {
+                                break;
+                            }
+                            let morsel = next_morsel.fetch_add(1, AtomicOrdering::Relaxed);
+                            if morsel >= morsel_count {
+                                break;
+                            }
+                            let result = execute(morsel_range(morsel, row_count));
+                            completed.lock().expect("morsel result lock poisoned")[morsel] =
+                                Some(result);
+                        }
+                    })
+            });
+            match result {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    cancelled.store(true, AtomicOrdering::Relaxed);
+                    spawn_error = Some(error);
+                    break;
                 }
-            }));
+            }
         }
         for handle in handles {
             handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
+        spawn_error.map_or(Ok(()), Err)
     });
+    spawn_result.map_err(|error| Error::WorkerSpawn(error.to_string()))?;
 
-    completed
+    Ok(completed
         .into_inner()
         .expect("morsel result lock poisoned")
         .into_iter()
         .map(|result| result.expect("every morsel is completed by one worker"))
-        .collect()
+        .collect())
+}
+
+fn active_worker_count(row_count: usize, worker_count: usize) -> usize {
+    worker_count
+        .min(MAX_SCAN_WORKERS)
+        .min(row_count.div_ceil(SCAN_MORSEL_ROWS))
 }
 
 fn morsel_range(morsel: usize, row_count: usize) -> Range<usize> {
@@ -749,10 +803,13 @@ fn morsel_range(morsel: usize, row_count: usize) -> Range<usize> {
 
 fn morsel_execution_memory<T>(row_count: usize, worker_count: usize) -> usize {
     let morsels = row_count.div_ceil(SCAN_MORSEL_ROWS);
-    let workers = worker_count.min(morsels);
+    let workers = active_worker_count(row_count, worker_count);
     morsels
         .saturating_mul(size_of::<Option<T>>())
-        .saturating_add(workers.saturating_mul(128))
+        .saturating_add(
+            workers
+                .saturating_mul(SCAN_WORKER_STACK_BYTES.saturating_add(SCAN_WORKER_CONTROL_BYTES)),
+        )
 }
 
 fn scan_matching_rows(
@@ -788,6 +845,13 @@ fn scan_matching_rows(
         }
         mask
     });
+    let masks = match masks {
+        Ok(masks) => masks,
+        Err(error) => {
+            context.release_memory(reservation);
+            return Err(error);
+        }
+    };
     let outcome = (|| {
         for (morsel, mask) in masks.iter().enumerate() {
             let range = morsel_range(morsel, table.row_count());
@@ -1042,7 +1106,7 @@ fn execute_grouped_parallel(
 ) -> Result<GroupedData> {
     let partials = execute_morsels(table.row_count(), worker_count, |rows| {
         aggregate_morsel(table, rows, predicate, group_columns, aggregate_specs)
-    });
+    })?;
     let mut groups = Vec::new();
     for partial in partials {
         let partial = partial?;
@@ -2459,7 +2523,8 @@ mod tests {
     #[test]
     fn small_scans_stay_on_the_calling_thread_and_worker_counts_are_validated() {
         let caller = thread::current().id();
-        let threads = execute_morsels(SCAN_MORSEL_ROWS, 8, |_| thread::current().id());
+        let threads = execute_morsels(SCAN_MORSEL_ROWS, 8, |_| thread::current().id())
+            .expect("single-threaded scan succeeds");
         assert_eq!(threads, vec![caller]);
 
         let mut database = Database::with_worker_count(2).expect("valid worker count");
@@ -2470,6 +2535,47 @@ mod tests {
                 if message == "worker count must be at least 1"
         ));
         assert_eq!(database.worker_count(), 2);
+
+        assert!(matches!(
+            Database::with_worker_count(MAX_SCAN_WORKERS + 1),
+            Err(Error::InvalidConfiguration(message))
+                if message == format!("worker count must not exceed {MAX_SCAN_WORKERS}")
+        ));
+        assert!(matches!(
+            database.set_worker_count(usize::MAX),
+            Err(Error::InvalidConfiguration(message))
+                if message == format!("worker count must not exceed {MAX_SCAN_WORKERS}")
+        ));
+        assert_eq!(database.worker_count(), 2);
+        assert_eq!(
+            active_worker_count(usize::MAX, usize::MAX),
+            MAX_SCAN_WORKERS
+        );
+        assert!(
+            morsel_execution_memory::<()>(SCAN_MORSEL_ROWS * 2, 2) >= SCAN_WORKER_STACK_BYTES * 2
+        );
+    }
+
+    #[test]
+    fn worker_spawn_failures_are_returned_without_panicking() {
+        let error = execute_morsels_with_spawn_guard(
+            SCAN_MORSEL_ROWS * 2,
+            2,
+            |worker| {
+                if worker == 1 {
+                    Err(std::io::Error::other("synthetic worker exhaustion"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| (),
+        )
+        .expect_err("second worker fails to spawn");
+
+        assert_eq!(
+            error,
+            Error::WorkerSpawn("synthetic worker exhaustion".to_owned())
+        );
     }
 
     #[test]

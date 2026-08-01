@@ -175,9 +175,11 @@ rendered-output ceiling and reads at most one byte beyond the input ceiling from
 standard input before rejecting oversized piped SQL.
 
 `Database::new()` uses the available parallelism reported by the operating
-system. `Database::with_worker_count` and `Database::set_worker_count` select an
-explicit positive maximum. Scans use fixed 4,096-row morsels; eligible
-per-morsel aggregate states are merged in source order, so results are
+system, capped at 16 workers. `Database::with_worker_count` and
+`Database::set_worker_count` select an explicit maximum from 1 through 16. Scans
+use fixed 4,096-row morsels and explicitly sized worker stacks charged to the
+transient memory budget. Eligible per-morsel aggregate states are merged in
+source order, so results are
 reproducible across worker counts. A scan that fits in one morsel does not create
 worker threads. Parallel aggregation falls back to the spill-backed path when
 its conservative transient-memory reservation would exceed the configured
