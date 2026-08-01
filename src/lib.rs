@@ -5,7 +5,7 @@ mod database;
 mod error;
 mod persistence;
 mod sql;
-mod storage;
+pub mod storage;
 
 pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};
