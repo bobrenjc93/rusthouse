@@ -3,13 +3,14 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::aggregate::{self, AggregateSpec, AggregateState};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::Table;
 use crate::value::{DataType, Value, ValueRef};
 
 /// A reusable in-memory SQL database.
@@ -113,6 +114,20 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
+        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let (items, result_columns, aggregate_specs) =
+            resolve_select_items(table, &select.items, &group_columns)?;
+        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+
+        if predicate.is_none() && group_columns.is_empty() && !aggregate_specs.is_empty() {
+            let aggregates = aggregate::execute_global(table, &aggregate_specs)?;
+            let rows = project_global_aggregates(&aggregates, &items, select.limit);
+            return Ok(QueryResult {
+                columns: result_columns,
+                rows,
+            });
+        }
+
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
@@ -120,11 +135,6 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
-
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -159,13 +169,6 @@ enum ResolvedItem {
     Aggregate {
         state: usize,
     },
-}
-
-#[derive(Debug, Clone)]
-struct AggregateSpec {
-    function: AggregateFunction,
-    argument: Option<usize>,
-    input_type: Option<DataType>,
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -268,49 +271,21 @@ fn resolve_select_items(
                         )
                     }
                 };
-                validate_aggregate(*function, input_type)?;
                 let state = aggregate_specs.len();
-                aggregate_specs.push(AggregateSpec {
-                    function: *function,
-                    argument: argument_index,
-                    input_type,
-                });
+                let spec = AggregateSpec::new(*function, argument_index, input_type)?;
                 items.push(ResolvedItem::Aggregate { state });
                 result_columns.push(ResultColumn {
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("{}({argument_name})", function.name())),
-                    data_type: aggregate_output_type(*function, input_type),
+                    data_type: spec.output_type(),
                 });
+                aggregate_specs.push(spec);
             }
         }
     }
 
     Ok((items, result_columns, aggregate_specs))
-}
-
-fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
-    if matches!(function, AggregateFunction::Sum | AggregateFunction::Avg)
-        && !matches!(input_type, Some(DataType::Int64 | DataType::Float64))
-    {
-        let actual = input_type.map_or_else(|| "*".to_owned(), |value| value.to_string());
-        return Err(Error::TypeMismatch {
-            context: format!("{} argument", function.name()),
-            expected: "Int64 or Float64".to_owned(),
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataType>) -> DataType {
-    match function {
-        AggregateFunction::Count => DataType::Int64,
-        AggregateFunction::Avg => DataType::Float64,
-        AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => {
-            input_type.expect("validated column argument")
-        }
-    }
 }
 
 fn execute_projection(
@@ -332,6 +307,27 @@ fn execute_projection(
                 .collect()
         })
         .collect()
+}
+
+fn project_global_aggregates(
+    aggregates: &[Value],
+    items: &[ResolvedItem],
+    limit: Option<usize>,
+) -> Vec<Vec<Value>> {
+    if limit == Some(0) {
+        return Vec::new();
+    }
+    vec![
+        items
+            .iter()
+            .map(|item| match item {
+                ResolvedItem::Aggregate { state } => aggregates[*state].clone(),
+                ResolvedItem::Column { .. } => {
+                    unreachable!("global aggregate projections contain only aggregates")
+                }
+            })
+            .collect(),
+    ]
 }
 
 fn execute_grouped<'a>(
@@ -533,131 +529,6 @@ impl GroupedData<'_> {
                     .collect()
             })
             .collect()
-    }
-}
-
-#[derive(Debug)]
-enum AggregateState {
-    Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
-    Min(Option<Value>),
-    Max(Option<Value>),
-    AvgInt { sum: i128, count: u64 },
-    AvgFloat { sum: f64, count: u64 },
-}
-
-impl AggregateState {
-    fn new(spec: &AggregateSpec) -> Self {
-        match spec.function {
-            AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
-            AggregateFunction::Min => Self::Min(None),
-            AggregateFunction::Max => Self::Max(None),
-            AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
-                Self::AvgInt { sum: 0, count: 0 }
-            }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
-        }
-    }
-
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
-        match self {
-            Self::Count(count) => {
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
-            }
-            Self::SumInt(sum) => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
-                };
-                *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
-            }
-            Self::SumFloat(sum) => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("SUM argument")]
-                else {
-                    unreachable!("SUM input type is resolved")
-                };
-                *sum += values[row];
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
-                }
-            }
-            Self::Min(current) => {
-                let column = &table.columns()[spec.argument.expect("MIN argument")];
-                let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate < existing.as_ref())
-                {
-                    *current = Some(candidate.to_owned());
-                }
-            }
-            Self::Max(current) => {
-                let column = &table.columns()[spec.argument.expect("MAX argument")];
-                let candidate = column.value_ref(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| candidate > existing.as_ref())
-                {
-                    *current = Some(candidate.to_owned());
-                }
-            }
-            Self::AvgInt { sum, count } => {
-                let Column::Int64(values) = &table.columns()[spec.argument.expect("AVG argument")]
-                else {
-                    unreachable!("AVG input type is resolved")
-                };
-                *sum = sum
-                    .checked_add(i128::from(values[row]))
-                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
-            }
-            Self::AvgFloat { sum, count } => {
-                let Column::Float64(values) =
-                    &table.columns()[spec.argument.expect("AVG argument")]
-                else {
-                    unreachable!("AVG input type is resolved")
-                };
-                *sum += values[row];
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Result<Value> {
-        match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
-            Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
-            Self::AvgInt { sum, count } if count > 0 => {
-                Ok(Value::Float64(sum as f64 / count as f64))
-            }
-            Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
-            )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
-        }
     }
 }
 

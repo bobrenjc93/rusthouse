@@ -313,6 +313,105 @@ fn global_aggregates_and_empty_count_are_supported() {
 }
 
 #[test]
+fn predicate_free_global_kernels_match_the_filtered_fallback() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE aggregate_inputs (
+                integer_value Int64,
+                float_value Float64,
+                flag Bool,
+                label String
+             );
+             INSERT INTO aggregate_inputs VALUES
+                (9007199254740993, 1.25, true, 'beta'),
+                (1, -4.5, false, 'alpha'),
+                (-9007199254740993, 8.0, true, 'gamma');",
+        )
+        .expect("setup succeeds");
+
+    let projection = "COUNT(*) AS rows,
+                      COUNT(integer_value) AS values,
+                      SUM(integer_value) AS integer_sum,
+                      MIN(integer_value) AS integer_min,
+                      MAX(integer_value) AS integer_max,
+                      AVG(integer_value) AS integer_avg,
+                      SUM(float_value) AS float_sum,
+                      MIN(float_value) AS float_min,
+                      MAX(float_value) AS float_max,
+                      AVG(float_value) AS float_avg,
+                      MIN(flag) AS flag_min,
+                      MAX(flag) AS flag_max,
+                      MIN(label) AS label_min,
+                      MAX(label) AS label_max";
+    let vectorized = execute_query(
+        &mut database,
+        &format!("SELECT {projection} FROM aggregate_inputs"),
+    );
+    let filtered = execute_query(
+        &mut database,
+        &format!(
+            "SELECT {projection} FROM aggregate_inputs \
+             WHERE integer_value >= -9007199254740993"
+        ),
+    );
+
+    assert_eq!(vectorized, filtered);
+    assert_eq!(
+        vectorized.rows,
+        vec![vec![
+            Value::Int64(3),
+            Value::Int64(3),
+            Value::Int64(1),
+            Value::Int64(-9_007_199_254_740_993),
+            Value::Int64(9_007_199_254_740_993),
+            Value::Float64(1.0 / 3.0),
+            Value::Float64(4.75),
+            Value::Float64(-4.5),
+            Value::Float64(8.0),
+            Value::Float64(4.75 / 3.0),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::String("alpha".to_owned()),
+            Value::String("gamma".to_owned()),
+        ]]
+    );
+}
+
+#[test]
+fn global_numeric_overflow_matches_the_filtered_fallback() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE integer_overflow (value Int64);
+             INSERT INTO integer_overflow VALUES (9223372036854775807), (1);
+             CREATE TABLE float_overflow (value Float64);
+             INSERT INTO float_overflow VALUES (1.7976931348623157e308),
+                                               (1.7976931348623157e308);",
+        )
+        .expect("setup succeeds");
+
+    for sql in [
+        "SELECT SUM(value) FROM integer_overflow",
+        "SELECT SUM(value) FROM integer_overflow WHERE value > 0",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::NumericOverflow("SUM(Int64)".to_owned()))
+        );
+    }
+    for sql in [
+        "SELECT AVG(value) FROM float_overflow",
+        "SELECT AVG(value) FROM float_overflow WHERE value > 0.0",
+    ] {
+        assert_eq!(
+            database.execute(sql),
+            Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()))
+        );
+    }
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
