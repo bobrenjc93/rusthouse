@@ -52,6 +52,12 @@ returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are d
 Writer-side validation guarantees every committed catalog satisfies the decoder's
 table, column, row, string, file-size, and total-allocation bounds.
 
+Snapshot temporary files start owner-only and are synced before publication. Existing
+Unix modes and ACLs are copied before the atomic rename (ACLs on macOS, Linux, and
+FreeBSD), followed by a parent-directory sync. Windows uses `ReplaceFileW` for existing
+snapshots so ACL/security metadata is retained, and write-through `MoveFileExW` for
+first publication; it never attempts POSIX directory syncing.
+
 `Database::execute` is only for one-shot autocommit DDL, DML, and queries. Transaction
 control requires a persistent session returned by `Database::session`.
 

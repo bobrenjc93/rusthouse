@@ -143,21 +143,159 @@ fn write_and_replace(
     parent: &Path,
     bytes: &[u8],
 ) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let destination_permissions = match fs::metadata(destination) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::io("inspect snapshot permissions", error)),
+    };
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    let destination_acl = if destination_permissions.is_some() {
+        match exacl::getfacl(destination, None) {
+            Ok(acl) => Some(acl),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+            Err(error) => return Err(Error::io("inspect snapshot ACL", error)),
+        }
+    } else {
+        None
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.share_mode(FILE_SHARE_DELETE);
+    }
+    let mut file = options
         .open(temporary)
-        .map_err(|error| Error::io("create temporary snapshot", error))?;
+        .map_err(|error| Error::io("create private temporary snapshot", error))?;
     file.write_all(bytes)
         .map_err(|error| Error::io("write temporary snapshot", error))?;
     file.sync_all()
         .map_err(|error| Error::io("sync temporary snapshot", error))?;
-    drop(file);
+    if let Some(permissions) = destination_permissions {
+        file.set_permissions(permissions)
+            .map_err(|error| Error::io("preserve snapshot permissions", error))?;
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+        if let Some(acl) = &destination_acl {
+            exacl::setfacl(&[temporary], acl, None)
+                .map_err(|error| Error::io("preserve snapshot ACL", error))?;
+        }
+        file.sync_all()
+            .map_err(|error| Error::io("sync snapshot permissions", error))?;
+    }
+    #[cfg(not(windows))]
+    {
+        drop(file);
+        replace_snapshot(temporary, destination, parent)
+    }
+    #[cfg(windows)]
+    {
+        let result = replace_snapshot(temporary, destination, parent);
+        drop(file);
+        result
+    }
+}
+
+#[cfg(unix)]
+fn replace_snapshot(temporary: &Path, destination: &Path, parent: &Path) -> Result<()> {
     fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))?;
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| Error::io("sync snapshot directory", error))?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<()> {
+    windows::replace_snapshot(temporary, destination)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<()> {
+    fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    use crate::error::{Error, Result};
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        fn ReplaceFileW(
+            replaced: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut c_void,
+            reserved: *mut c_void,
+        ) -> i32;
+    }
+
+    pub(super) fn replace_snapshot(temporary: &Path, destination: &Path) -> Result<()> {
+        let destination_exists = destination.exists();
+        let temporary = wide_path(temporary)?;
+        let destination = wide_path(destination)?;
+        if destination_exists {
+            // ReplaceFileW retains the replaced file's ACL and other security metadata.
+            let replaced = unsafe {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    temporary.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            if replaced != 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(Error::io("replace snapshot", error));
+            }
+        }
+
+        let moved = unsafe {
+            MoveFileExW(
+                temporary.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(Error::io("replace snapshot", io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>> {
+        let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if path.contains(&0) {
+            return Err(Error::Io {
+                operation: "encode Windows snapshot path",
+                message: "path contains a NUL character".to_owned(),
+            });
+        }
+        path.push(0);
+        Ok(path)
+    }
 }
 
 fn encode_snapshot(generation: &CatalogGeneration) -> Result<Vec<u8>> {

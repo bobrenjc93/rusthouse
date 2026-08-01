@@ -132,3 +132,82 @@ fn writer_rejects_catalog_shape_that_reopen_would_reject() {
     drop(reopened);
     remove_database(&path);
 }
+
+#[cfg(unix)]
+#[test]
+fn replacement_is_private_and_preserves_existing_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temporary_path("permissions");
+    let database = Database::open(&path).unwrap();
+    database
+        .execute("CREATE TABLE private_data (id Int64)")
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    database
+        .execute("INSERT INTO private_data VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    if let Ok(user) = std::env::var("USER") {
+        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+        use exacl::AclEntryKind;
+        use exacl::{AclEntry, Perm};
+
+        let mut acl = exacl::getfacl(&path, None).unwrap();
+        acl.push(AclEntry::allow_user(&user, Perm::empty(), None));
+        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+        if !acl.iter().any(|entry| entry.kind == AclEntryKind::Mask) {
+            acl.push(AclEntry::allow_mask(Perm::empty(), None));
+        }
+        exacl::setfacl(&[&path], &acl, None).unwrap();
+        let mut expected_acl = exacl::getfacl(&path, None).unwrap();
+        expected_acl.sort();
+        let expected_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        database
+            .execute("INSERT INTO private_data VALUES (2)")
+            .unwrap();
+        let mut actual_acl = exacl::getfacl(&path, None).unwrap();
+        actual_acl.sort();
+        assert_eq!(actual_acl, expected_acl);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            expected_mode
+        );
+    }
+    drop(database);
+    remove_database(&path);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_native_replacement_publishes_repeated_commits() {
+    let path = temporary_path("windows-replace");
+    let database = Database::open(&path).unwrap();
+    database
+        .execute("CREATE TABLE windows_data (id Int64)")
+        .unwrap();
+    database
+        .execute("INSERT INTO windows_data VALUES (1)")
+        .unwrap();
+    drop(database);
+
+    let reopened = Database::open(&path).unwrap();
+    let StatementResult::Query(result) = reopened.execute("SELECT * FROM windows_data").unwrap()
+    else {
+        panic!("expected query result");
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int64(1)]]);
+    drop(reopened);
+    remove_database(&path);
+}

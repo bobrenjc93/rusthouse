@@ -24,5 +24,10 @@ processes. Encoding validates the same table, column, row, string, and total-all
 bounds that decoding enforces. The decoder charges raw bytes, catalog/map nodes, table
 and `Arc` storage, schema and column vectors, strings, column values, and conservative
 allocator overhead before reserving them, and it rejects unknown or malformed data.
+Temporary snapshots are owner-only while written. Unix publication restores the prior
+mode and supported ACLs before rename and syncs the parent directory. Windows uses
+native replacement calls: `ReplaceFileW` retains security metadata for existing files,
+while `MoveFileExW` provides write-through first publication without an invalid
+directory-sync step.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.
