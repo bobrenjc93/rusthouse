@@ -38,7 +38,8 @@ SQL parser or service:
 
 ```rust,no_run
 use rusthouse::{
-    CatalogImage, ColumnData, ColumnImage, SchemaImage, SnapshotStore, TableImage,
+    CatalogImage, ColumnData, ColumnImage, SchemaImage, SnapshotCommitOutcome,
+    SnapshotStore, TableImage,
 };
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,7 +49,7 @@ let schema = SchemaImage::new("analytics", vec![table])?;
 let image = CatalogImage::new(1, vec![schema])?;
 
 let store = SnapshotStore::open("catalog.rhcat")?;
-store.commit(&image)?;
+assert_eq!(store.commit(&image)?, SnapshotCommitOutcome::Durable);
 assert_eq!(store.load()?, Some(image));
 # std::fs::remove_file("catalog.rhcat")?;
 # std::fs::remove_file("catalog.rhcat.rusthouse-lock")?;
@@ -156,6 +157,9 @@ syncs the parent directory after rename. Windows
 publishes with `MoveFileExW` using `MOVEFILE_REPLACE_EXISTING` and
 `MOVEFILE_WRITE_THROUGH`, which makes the metadata update durable without opening
 the directory. A failure before rename leaves the previous snapshot unchanged.
+`SnapshotCommitOutcome::Durable` confirms the directory update; if the Unix
+directory sync fails after rename, `PublishedUncertain` reports that the new image
+is already visible and must not be retried as an unpublished write.
 A crash after rename exposes either the old or new complete file according to
 filesystem recovery; reopening validates the selected file.
 Reopening while holding the writer lock recursively removes an orphan `.tmp`

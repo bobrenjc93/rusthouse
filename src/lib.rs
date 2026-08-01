@@ -22,7 +22,7 @@ mod value;
 pub use aggregate::{Aggregate, AggregateFunction};
 pub use catalog::{
     CatalogImage, ColumnData, ColumnImage, Corruption, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC,
-    SchemaImage, SnapshotError, SnapshotLimits, SnapshotStore, TableImage,
+    SchemaImage, SnapshotCommitOutcome, SnapshotError, SnapshotLimits, SnapshotStore, TableImage,
 };
 pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};

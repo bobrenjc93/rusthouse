@@ -437,6 +437,15 @@ impl From<io::Error> for SnapshotError {
     }
 }
 
+/// Result of publishing a versioned catalog snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotCommitOutcome {
+    /// The snapshot and its directory entry were durably published.
+    Durable,
+    /// The snapshot is visible, but directory durability could not be confirmed.
+    PublishedUncertain { message: String },
+}
+
 /// An exclusively locked handle for one snapshot path.
 ///
 /// `open` removes a temp file left by a crashed previous writer. [`load`](Self::load)
@@ -618,13 +627,15 @@ impl SnapshotStore {
         decode_snapshot(&bytes, &self.limits).map(Some)
     }
 
-    /// Atomically and durably replaces the current snapshot.
+    /// Atomically replaces the current snapshot.
     ///
     /// The encoded image is written inside a private staging directory on the
     /// destination filesystem, synced, and renamed over the destination. Unix
-    /// then syncs the parent directory; Windows uses a write-through rename. A
-    /// failure before rename leaves the previous snapshot untouched.
-    pub fn commit(&self, image: &CatalogImage) -> Result<(), SnapshotError> {
+    /// then syncs the parent directory; Windows uses a write-through rename. The
+    /// returned outcome distinguishes confirmed durability from a sync failure
+    /// after the new image became visible. A failure before rename leaves the
+    /// previous snapshot untouched.
+    pub fn commit(&self, image: &CatalogImage) -> Result<SnapshotCommitOutcome, SnapshotError> {
         self.commit_inner(image, None)
     }
 
@@ -632,7 +643,7 @@ impl SnapshotStore {
         &self,
         image: &CatalogImage,
         #[cfg_attr(not(test), allow(unused_variables))] failpoint: Option<Failpoint>,
-    ) -> Result<(), SnapshotError> {
+    ) -> Result<SnapshotCommitOutcome, SnapshotError> {
         validate_image_against_limits(image, &self.limits)?;
         let bytes = encode_snapshot(image, &self.limits)?;
         let _commit_guard = self
@@ -680,11 +691,6 @@ impl SnapshotStore {
         #[cfg(windows)]
         self.publish_staged()?;
 
-        #[cfg(test)]
-        if failpoint == Some(Failpoint::Renamed) {
-            return Err(SnapshotError::InjectedFailure("after rename"));
-        }
-
         #[cfg(unix)]
         {
             drop(staging_dir);
@@ -693,13 +699,19 @@ impl SnapshotStore {
                 &self.temp_name,
                 rustix::fs::AtFlags::REMOVEDIR,
             );
-            self.parent_dir.sync_all()?;
-            Ok(())
+            let sync_result = if failpoint == Some(Failpoint::DirectorySync) {
+                Err(SnapshotError::Io(io::Error::other(
+                    "injected snapshot directory sync failure",
+                )))
+            } else {
+                self.parent_dir.sync_all().map_err(SnapshotError::Io)
+            };
+            Ok(snapshot_commit_outcome(sync_result))
         }
         #[cfg(windows)]
         {
             let _ = fs::remove_dir(&self.temp_dir);
-            sync_parent(&self.path)
+            Ok(snapshot_commit_outcome(sync_parent(&self.path)))
         }
     }
 
@@ -723,6 +735,15 @@ impl SnapshotStore {
     #[cfg(windows)]
     fn publish_staged(&self) -> Result<(), SnapshotError> {
         publish_temp(&self.temp_path, &self.path)
+    }
+}
+
+fn snapshot_commit_outcome(sync_result: Result<(), SnapshotError>) -> SnapshotCommitOutcome {
+    match sync_result {
+        Ok(()) => SnapshotCommitOutcome::Durable,
+        Err(error) => SnapshotCommitOutcome::PublishedUncertain {
+            message: format!("snapshot was published, but parent directory sync failed: {error}"),
+        },
     }
 }
 
@@ -2212,7 +2233,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 enum Failpoint {
     TempSynced,
     SecurityPrepared,
-    Renamed,
+    DirectorySync,
 }
 
 #[cfg(test)]
@@ -2386,7 +2407,10 @@ mod tests {
 
         let store = SnapshotStore::open(&path).expect("open new store");
         assert_eq!(store.load().expect("load empty store"), None);
-        store.commit(&image).expect("commit image");
+        assert_eq!(
+            store.commit(&image).expect("commit image"),
+            SnapshotCommitOutcome::Durable
+        );
         assert_eq!(
             store.load().expect("load committed image"),
             Some(image.clone())
@@ -3113,9 +3137,9 @@ mod tests {
         assert_eq!(recovered.load().expect("load recovered image"), Some(old));
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn failure_after_rename_still_reopens_a_complete_new_snapshot() {
+    fn directory_sync_failure_reports_published_uncertain_outcome() {
         let directory = TestDirectory::new();
         let path = directory.snapshot();
         let store = SnapshotStore::open(&path).expect("open store");
@@ -3124,11 +3148,16 @@ mod tests {
             .expect("commit original image");
         let new = sample_image(21);
 
+        let outcome = store
+            .commit_inner(&new, Some(Failpoint::DirectorySync))
+            .expect("post-publication sync failure is an outcome");
         assert!(matches!(
-            store.commit_inner(&new, Some(Failpoint::Renamed)),
-            Err(SnapshotError::InjectedFailure("after rename"))
+            outcome,
+            SnapshotCommitOutcome::PublishedUncertain { message }
+                if message.contains("injected snapshot directory sync failure")
         ));
         assert_eq!(store.load().expect("load renamed image"), Some(new.clone()));
+        assert!(!store.temp_dir.exists());
         drop(store);
 
         let recovered = SnapshotStore::open(&path).expect("reopen renamed image");
