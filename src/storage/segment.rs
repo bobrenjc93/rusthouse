@@ -16,6 +16,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 /// The segment format version emitted by this module.
 pub const FORMAT_VERSION: u16 = 1;
 
@@ -702,7 +705,7 @@ impl Segment {
             )?;
             enforce_limit(
                 "decoded block size",
-                estimated_decoded_bytes(field.data_type, block_rows, logical_len)?,
+                decoded_allocation_bound(field.data_type, block_rows, logical_len)?,
                 limits.max_decoded_block_bytes,
             )?;
             if field.data_type == DataType::String {
@@ -901,8 +904,7 @@ impl Segment {
     fn validate_block_statistics(&self) -> Result<(), SegmentError> {
         for meta in &self.blocks {
             let column = self.decode_block(meta)?;
-            let actual = statistics_from_column(&column, meta.row_start)?;
-            if actual != meta.stats {
+            if !statistics_match_column(&column, &meta.stats)? {
                 return Err(SegmentError::Corrupt(format!(
                     "zone map does not match column {} row group {}",
                     meta.column, meta.row_group
@@ -1057,8 +1059,8 @@ pub fn encode_segment(
 /// Atomically publishes a new segment and refuses to replace an existing path.
 ///
 /// The complete segment is written and synced through a temporary file in the
-/// destination directory. A no-replace hard link publishes the final name,
-/// after which the directory is synced before this function returns success.
+/// destination directory. A platform-specific no-replace operation publishes
+/// the final name durably before this function returns success.
 pub fn write_segment(
     path: impl AsRef<Path>,
     schema: &Schema,
@@ -1089,8 +1091,19 @@ fn publish_segment_bytes(
     drop(file);
     before_publish();
 
-    std::fs::hard_link(&temporary_path, path)?;
-    let cleanup_result = std::fs::remove_file(&temporary_path);
+    publish_temporary_file(&temporary_path, path, parent, &mut cleanup)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publish_temporary_file(
+    temporary_path: &Path,
+    path: &Path,
+    parent: &Path,
+    cleanup: &mut RemoveOnDrop,
+) -> io::Result<()> {
+    std::fs::hard_link(temporary_path, path)?;
+    let cleanup_result = std::fs::remove_file(temporary_path);
     if cleanup_result.is_ok() {
         cleanup.disarm();
     }
@@ -1098,6 +1111,69 @@ fn publish_segment_bytes(
     cleanup_result?;
     sync_result?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn publish_temporary_file(
+    temporary_path: &Path,
+    path: &Path,
+    _parent: &Path,
+    cleanup: &mut RemoveOnDrop,
+) -> io::Result<()> {
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let temporary_path = nul_terminated_wide_path(temporary_path)?;
+    let path = nul_terminated_wide_path(path)?;
+    // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that remain
+    // alive for the call. Not setting MOVEFILE_REPLACE_EXISTING preserves the
+    // immutable no-replace contract.
+    let moved = unsafe {
+        MoveFileExW(
+            temporary_path.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    cleanup.disarm();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn nul_terminated_wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows path contains an interior NUL",
+        ));
+    }
+    encoded.push(0);
+    Ok(encoded)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_temporary_file(
+    _temporary_path: &Path,
+    _path: &Path,
+    _parent: &Path,
+    _cleanup: &mut RemoveOnDrop,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable atomic segment publication is unsupported on this platform",
+    ))
 }
 
 fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBuf, File)> {
@@ -1126,6 +1202,7 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
     ))
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -1502,7 +1579,11 @@ fn decode_int_delta(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentE
     let (bitmap, encoded) = split_at_checked(payload, bitmap_length, "integer null bitmap")?;
     validate_bitmap_padding(bitmap, row_count)?;
     let value_count = row_count - u32_to_usize(meta.stats.null_count)?;
-    let expected_logical = usize_to_u64(value_count.saturating_mul(8))?;
+    let expected_logical = usize_to_u64(
+        value_count
+            .checked_mul(8)
+            .ok_or_else(|| SegmentError::Corrupt("integer logical length overflow".into()))?,
+    )?;
     if meta.logical_len != expected_logical {
         return Err(SegmentError::Corrupt(
             "integer logical length does not match value count".into(),
@@ -1519,7 +1600,7 @@ fn decode_int_delta(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentE
                 "all-null integer block contains values".into(),
             ));
         }
-        return Ok(Column::Int64(vec![None; row_count]));
+        return Ok(Column::Int64(allocate_none_column(row_count)?));
     }
     if encoded.len() < 9 {
         return Err(SegmentError::Corrupt(
@@ -1540,20 +1621,26 @@ fn decode_int_delta(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentE
         ));
     }
     validate_packed_padding(&encoded[9..], value_count - 1, bit_width)?;
-    let deltas = unpack_bits(&encoded[9..], value_count - 1, bit_width)?;
-    let mut values = Vec::with_capacity(value_count);
-    values.push(first);
-    for encoded_delta in deltas {
-        let delta = zigzag_decode(encoded_delta);
-        let next = values
-            .last()
-            .copied()
-            .unwrap()
-            .checked_add(delta)
-            .ok_or_else(|| SegmentError::Corrupt("integer delta overflow".into()))?;
-        values.push(next);
+    let mut deltas = PackedBitReader::new(&encoded[9..]);
+    let mut output = try_vec_with_capacity(row_count, "integer block allocation")?;
+    let mut current = first;
+    let mut decoded_values = 0_usize;
+    for index in 0..row_count {
+        if bit_is_set(bitmap, index) {
+            if decoded_values != 0 {
+                let delta = zigzag_decode(deltas.read(bit_width)?);
+                current = current
+                    .checked_add(delta)
+                    .ok_or_else(|| SegmentError::Corrupt("integer delta overflow".into()))?;
+            }
+            output.push(Some(current));
+            decoded_values += 1;
+        } else {
+            output.push(None);
+        }
     }
-    Ok(Column::Int64(restore_nulls(bitmap, row_count, values)?))
+    debug_assert_eq!(decoded_values, value_count);
+    Ok(Column::Int64(output))
 }
 
 fn decode_int_plain(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentError> {
@@ -1575,11 +1662,24 @@ fn decode_int_plain(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentE
             "integer null bitmap does not match null count".into(),
         ));
     }
-    let values = encoded
-        .chunks_exact(8)
-        .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
-        .collect();
-    Ok(Column::Int64(restore_nulls(bitmap, row_count, values)?))
+    let mut values = encoded.chunks_exact(8);
+    let mut output = try_vec_with_capacity(row_count, "integer block allocation")?;
+    for index in 0..row_count {
+        output.push(if bit_is_set(bitmap, index) {
+            let bytes = values.next().ok_or_else(|| {
+                SegmentError::Corrupt("integer null bitmap references a missing value".into())
+            })?;
+            Some(i64::from_le_bytes(bytes.try_into().unwrap()))
+        } else {
+            None
+        });
+    }
+    if values.next().is_some() {
+        return Err(SegmentError::Corrupt(
+            "integer block contains unreferenced values".into(),
+        ));
+    }
+    Ok(Column::Int64(output))
 }
 
 fn decode_bool(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentError> {
@@ -1600,9 +1700,10 @@ fn decode_bool(payload: &[u8], meta: &BlockMeta) -> Result<Column, SegmentError>
             "boolean null bitmap does not match null count".into(),
         ));
     }
-    let output = (0..row_count)
-        .map(|index| bit_is_set(nulls, index).then(|| bit_is_set(values, index)))
-        .collect();
+    let mut output = try_vec_with_capacity(row_count, "boolean block allocation")?;
+    output.extend(
+        (0..row_count).map(|index| bit_is_set(nulls, index).then(|| bit_is_set(values, index))),
+    );
     Ok(Column::Bool(output))
 }
 
@@ -1639,12 +1740,21 @@ fn decode_strings(
     }
 
     let mut cursor = Cursor::new(&remaining[8..]);
-    let mut decoded = Vec::with_capacity(non_null_count);
-    let mut previous = Vec::<u8>::new();
+    let mut output: Vec<Option<String>> =
+        try_vec_with_capacity(row_count, "string block allocation")?;
+    let mut previous_index: Option<usize> = None;
     let mut total = 0_u64;
-    for _ in 0..non_null_count {
+    let mut decoded_values = 0_usize;
+    for row in 0..row_count {
+        if !bit_is_set(bitmap, row) {
+            output.push(None);
+            continue;
+        }
         let prefix = u64_to_usize(cursor.read_varint()?)?;
         let suffix_len = u64_to_usize(cursor.read_varint()?)?;
+        let previous = previous_index
+            .and_then(|index| output[index].as_ref())
+            .map_or(&[][..], |value| value.as_bytes());
         if prefix > previous.len() {
             return Err(SegmentError::Corrupt(
                 "string prefix exceeds previous value".into(),
@@ -1667,81 +1777,87 @@ fn decode_strings(
             ));
         }
         let suffix = cursor.read_bytes(suffix_len, "string suffix")?;
-        let mut value = Vec::with_capacity(value_len);
+        let mut value = try_vec_with_capacity(value_len, "string value allocation")?;
         value.extend_from_slice(&previous[..prefix]);
         value.extend_from_slice(suffix);
         let value = String::from_utf8(value)
             .map_err(|_| SegmentError::Corrupt("string block contains invalid UTF-8".into()))?;
-        previous = value.as_bytes().to_vec();
-        decoded.push(value);
+        output.push(Some(value));
+        previous_index = Some(row);
+        decoded_values += 1;
     }
-    if total != declared_total || !cursor.is_empty() {
+    if decoded_values != non_null_count || total != declared_total || !cursor.is_empty() {
         return Err(SegmentError::Corrupt(
             "string payload length is inconsistent".into(),
         ));
     }
-    Ok(Column::String(restore_nulls(bitmap, row_count, decoded)?))
+    Ok(Column::String(output))
 }
 
-fn statistics_from_column(
+fn statistics_match_column(
     column: &Column,
-    row_start: u64,
-) -> Result<BlockStatistics, SegmentError> {
-    let row_count = usize_to_u32(column.len(), "decoded block row count")?;
-    let (null_count, min, max) = match column {
-        Column::Int64(values) => (
-            values.iter().filter(|value| value.is_none()).count(),
-            values
-                .iter()
-                .flatten()
-                .min()
-                .copied()
-                .map(ScalarValue::Int64),
-            values
-                .iter()
-                .flatten()
-                .max()
-                .copied()
-                .map(ScalarValue::Int64),
-        ),
-        Column::Bool(values) => (
-            values.iter().filter(|value| value.is_none()).count(),
-            values
-                .iter()
-                .flatten()
-                .min()
-                .copied()
-                .map(ScalarValue::Bool),
-            values
-                .iter()
-                .flatten()
-                .max()
-                .copied()
-                .map(ScalarValue::Bool),
-        ),
-        Column::String(values) => (
-            values.iter().filter(|value| value.is_none()).count(),
-            values
-                .iter()
-                .flatten()
-                .min()
-                .cloned()
-                .map(ScalarValue::String),
-            values
-                .iter()
-                .flatten()
-                .max()
-                .cloned()
-                .map(ScalarValue::String),
-        ),
-    };
-    Ok(BlockStatistics {
-        row_start,
-        row_count,
-        null_count: usize_to_u32(null_count, "decoded block null count")?,
-        min,
-        max,
+    expected: &BlockStatistics,
+) -> Result<bool, SegmentError> {
+    if usize_to_u32(column.len(), "decoded block row count")? != expected.row_count {
+        return Ok(false);
+    }
+    let null_count = column_null_count(column);
+    if usize_to_u32(null_count, "decoded block null count")? != expected.null_count {
+        return Ok(false);
+    }
+
+    Ok(match column {
+        Column::Int64(values) => {
+            let min = values.iter().flatten().min().copied();
+            let max = values.iter().flatten().max().copied();
+            optional_int_stat_matches(min, expected.min.as_ref())
+                && optional_int_stat_matches(max, expected.max.as_ref())
+        }
+        Column::Bool(values) => {
+            let min = values.iter().flatten().min().copied();
+            let max = values.iter().flatten().max().copied();
+            optional_bool_stat_matches(min, expected.min.as_ref())
+                && optional_bool_stat_matches(max, expected.max.as_ref())
+        }
+        Column::String(values) => {
+            let min = values.iter().flatten().min();
+            let max = values.iter().flatten().max();
+            optional_string_stat_matches(min, expected.min.as_ref())
+                && optional_string_stat_matches(max, expected.max.as_ref())
+        }
     })
+}
+
+fn column_null_count(column: &Column) -> usize {
+    match column {
+        Column::Int64(values) => values.iter().filter(|value| value.is_none()).count(),
+        Column::Bool(values) => values.iter().filter(|value| value.is_none()).count(),
+        Column::String(values) => values.iter().filter(|value| value.is_none()).count(),
+    }
+}
+
+fn optional_int_stat_matches(actual: Option<i64>, expected: Option<&ScalarValue>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(ScalarValue::Int64(expected))) => actual == *expected,
+        _ => false,
+    }
+}
+
+fn optional_bool_stat_matches(actual: Option<bool>, expected: Option<&ScalarValue>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(ScalarValue::Bool(expected))) => actual == *expected,
+        _ => false,
+    }
+}
+
+fn optional_string_stat_matches(actual: Option<&String>, expected: Option<&ScalarValue>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(ScalarValue::String(expected))) => actual == expected,
+        _ => false,
+    }
 }
 
 fn predicate_can_skip(predicate: &Predicate, stats: &BlockStatistics) -> bool {
@@ -1835,18 +1951,22 @@ fn compare(ordering: Ordering, operation: ComparisonOp) -> bool {
     }
 }
 
-fn estimated_decoded_bytes(
+/// Upper bound on heap bytes requested concurrently by a block decoder.
+///
+/// Payload bytes are borrowed from the segment. Decoders stream directly into
+/// the final nullable vector, and string capacities sum to `logical_len`.
+fn decoded_allocation_bound(
     data_type: DataType,
     rows: u32,
     logical_len: u64,
 ) -> Result<u64, SegmentError> {
-    let row_overhead = match data_type {
-        DataType::Int64 => 16,
-        DataType::Bool => 2,
-        DataType::String => 32,
+    let row_width = match data_type {
+        DataType::Int64 => std::mem::size_of::<Option<i64>>(),
+        DataType::Bool => std::mem::size_of::<Option<bool>>(),
+        DataType::String => std::mem::size_of::<Option<String>>(),
     };
     u64::from(rows)
-        .checked_mul(row_overhead)
+        .checked_mul(usize_to_u64(row_width)?)
         .and_then(|bytes| {
             if data_type == DataType::String {
                 bytes.checked_add(logical_len)
@@ -1870,27 +1990,28 @@ fn reserve_column(column: &mut Column, additional: usize) -> Result<(), SegmentE
     })
 }
 
-fn restore_nulls<T>(
-    bitmap: &[u8],
-    row_count: usize,
-    values: Vec<T>,
-) -> Result<Vec<Option<T>>, SegmentError> {
-    let mut values = values.into_iter();
-    let mut output = Vec::with_capacity(row_count);
-    for index in 0..row_count {
-        output.push(if bit_is_set(bitmap, index) {
-            Some(values.next().ok_or_else(|| {
-                SegmentError::Corrupt("null bitmap references a missing value".into())
-            })?)
-        } else {
-            None
-        });
-    }
-    if values.next().is_some() {
-        return Err(SegmentError::Corrupt(
-            "block contains values not referenced by null bitmap".into(),
-        ));
-    }
+fn try_vec_with_capacity<T>(
+    capacity: usize,
+    resource: &'static str,
+) -> Result<Vec<T>, SegmentError> {
+    let requested_bytes = capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| SegmentError::LimitExceeded {
+            resource,
+            actual: requested_bytes,
+            limit: usize_to_u64(isize::MAX as usize).unwrap_or(u64::MAX),
+        })?;
+    Ok(output)
+}
+
+fn allocate_none_column(row_count: usize) -> Result<Vec<Option<i64>>, SegmentError> {
+    let mut output = try_vec_with_capacity(row_count, "integer block allocation")?;
+    output.resize(row_count, None);
     Ok(output)
 }
 
@@ -1936,30 +2057,50 @@ fn pack_bits(values: &[u64], bit_width: u8) -> Vec<u8> {
     output
 }
 
-fn unpack_bits(payload: &[u8], count: usize, bit_width: u8) -> Result<Vec<u64>, SegmentError> {
-    if bit_width == 0 {
-        return Ok(vec![0; count]);
+struct PackedBitReader<'a> {
+    bytes: std::slice::Iter<'a, u8>,
+    buffer: u128,
+    buffered_bits: u32,
+}
+
+impl<'a> PackedBitReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self {
+            bytes: payload.iter(),
+            buffer: 0,
+            buffered_bits: 0,
+        }
     }
-    let mask = if bit_width == 64 {
-        u128::from(u64::MAX)
-    } else {
-        (1_u128 << bit_width) - 1
-    };
-    let mut output = Vec::with_capacity(count);
-    let mut buffer = 0_u128;
-    let mut buffered_bits = 0_u32;
-    let mut bytes = payload.iter().copied();
-    for _ in 0..count {
-        while buffered_bits < u32::from(bit_width) {
-            let byte = bytes.next().ok_or_else(|| {
+
+    fn read(&mut self, bit_width: u8) -> Result<u64, SegmentError> {
+        if bit_width == 0 {
+            return Ok(0);
+        }
+        while self.buffered_bits < u32::from(bit_width) {
+            let byte = self.bytes.next().ok_or_else(|| {
                 SegmentError::Corrupt("truncated bit-packed integer payload".into())
             })?;
-            buffer |= u128::from(byte) << buffered_bits;
-            buffered_bits += 8;
+            self.buffer |= u128::from(*byte) << self.buffered_bits;
+            self.buffered_bits += 8;
         }
-        output.push((buffer & mask) as u64);
-        buffer >>= bit_width;
-        buffered_bits -= u32::from(bit_width);
+        let mask = if bit_width == 64 {
+            u128::from(u64::MAX)
+        } else {
+            (1_u128 << bit_width) - 1
+        };
+        let value = (self.buffer & mask) as u64;
+        self.buffer >>= bit_width;
+        self.buffered_bits -= u32::from(bit_width);
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+fn unpack_bits(payload: &[u8], count: usize, bit_width: u8) -> Result<Vec<u64>, SegmentError> {
+    let mut reader = PackedBitReader::new(payload);
+    let mut output = Vec::with_capacity(count);
+    for _ in 0..count {
+        output.push(reader.read(bit_width)?);
     }
     Ok(output)
 }
@@ -2516,6 +2657,77 @@ mod tests {
     }
 
     #[test]
+    fn decoded_block_limit_matches_streaming_allocation_boundaries() {
+        let integer_schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]).unwrap();
+        let integers = vec![Column::Int64(vec![
+            Some(10),
+            Some(11),
+            None,
+            Some(12),
+            Some(13),
+        ])];
+        let integer_bytes =
+            encode_segment(&integer_schema, &integers, &WriteOptions::default()).unwrap();
+        let integer_peak = decoded_allocation_bound(DataType::Int64, 5, 32).unwrap();
+        Segment::from_bytes(
+            integer_bytes.clone(),
+            DecodeLimits {
+                max_decoded_block_bytes: integer_peak,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            Segment::from_bytes(
+                integer_bytes,
+                DecodeLimits {
+                    max_decoded_block_bytes: integer_peak - 1,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(SegmentError::LimitExceeded {
+                resource: "decoded block size",
+                actual,
+                limit,
+            }) if actual == integer_peak && limit == integer_peak - 1
+        ));
+
+        let string_schema = Schema::new(vec![Field::new("value", DataType::String, true)]).unwrap();
+        let strings = vec![Column::String(vec![
+            Some("account/alpha".into()),
+            None,
+            Some("account/alpine".into()),
+        ])];
+        let logical_string_bytes = "account/alpha".len() + "account/alpine".len();
+        let string_bytes =
+            encode_segment(&string_schema, &strings, &WriteOptions::default()).unwrap();
+        let string_peak =
+            decoded_allocation_bound(DataType::String, 3, logical_string_bytes as u64).unwrap();
+        Segment::from_bytes(
+            string_bytes.clone(),
+            DecodeLimits {
+                max_decoded_block_bytes: string_peak,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            Segment::from_bytes(
+                string_bytes,
+                DecodeLimits {
+                    max_decoded_block_bytes: string_peak - 1,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(SegmentError::LimitExceeded {
+                resource: "decoded block size",
+                actual,
+                limit,
+            }) if actual == string_peak && limit == string_peak - 1
+        ));
+    }
+
+    #[test]
     fn verified_zone_maps_prune_unneeded_blocks() {
         let schema = Schema::new(vec![
             Field::new("number", DataType::Int64, false),
@@ -2627,6 +2839,27 @@ mod tests {
         ));
         let reopened = Segment::open(&path, DecodeLimits::default()).unwrap();
         assert_eq!(reopened.read_all().unwrap(), columns);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_through_publication_returns_success_after_commit() {
+        let directory = test_directory("windows-publication");
+        let path = directory.join("segment.rhs");
+        let schema = test_schema();
+        let columns = test_columns();
+
+        write_segment(&path, &schema, &columns, &WriteOptions::default()).unwrap();
+        assert_eq!(
+            Segment::open(&path, DecodeLimits::default())
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            columns
+        );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
 
         std::fs::remove_dir_all(directory).unwrap();

@@ -25,7 +25,9 @@ The early implementation should favor Rust's standard library and a small depend
 
 Readers verify header metadata before allocating and enforce configurable limits for files, metadata, rows, columns, blocks, decoded buffers, and strings. Opening a segment verifies every block checksum and recomputes every zone map from decoded values; persisted statistics are never trusted until that integrity pass succeeds. Later predicate scans consult the verified zone maps first and do not decode pruned blocks during the scan.
 
-`write_segment` writes and syncs a uniquely named temporary file in the destination directory, atomically publishes it with a no-replace hard link, removes the temporary name, and syncs the parent directory. The final path is therefore never visible with partial contents, an existing segment is never replaced, and success is not reported before the directory entry is durable.
+Block decoders stream packed integers and front-coded strings directly into their final nullable vectors. The decoded-block limit covers the nullable vector plus the cumulative string capacity, rather than relying on transient intermediate buffers outside the accounting.
+
+`write_segment` writes and syncs a uniquely named temporary file in the destination directory, then publishes it with platform-specific no-replace durability. Unix uses a hard link followed by temporary-name removal and a parent-directory sync; Windows uses an atomic `MOVEFILE_WRITE_THROUGH` move without the replace flag. The final path is therefore never visible with partial contents, an existing segment is never replaced, and success is not reported before publication is durable.
 
 The format is intentionally self-contained and little-endian. Readers reject unknown versions, unknown encodings, non-canonical or overlapping block extents, invalid UTF-8, inconsistent null maps or statistics, non-zero padding, trailing data, and arithmetic overflow.
 
