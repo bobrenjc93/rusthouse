@@ -9,7 +9,9 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -145,7 +147,9 @@ impl Column {
         }
     }
 
-    fn append_selected(&mut self, source: &Self, selected: &[bool]) {
+    fn append_selected(&mut self, source: &Self, selected: &[bool]) -> Result<(), SegmentError> {
+        let selected_count = selected.iter().filter(|keep| **keep).count();
+        reserve_column(self, selected_count)?;
         match (self, source) {
             (Self::Int64(output), Self::Int64(input)) => {
                 output.extend(
@@ -164,15 +168,15 @@ impl Column {
                 );
             }
             (Self::String(output), Self::String(input)) => {
-                output.extend(
-                    input
-                        .iter()
-                        .zip(selected)
-                        .filter_map(|(value, keep)| keep.then_some(value.clone())),
-                );
+                for (value, keep) in input.iter().zip(selected) {
+                    if *keep {
+                        output.push(value.as_deref().map(try_clone_string).transpose()?);
+                    }
+                }
             }
             _ => unreachable!("validated schema and block types must agree"),
         }
+        Ok(())
     }
 
     fn append_all(&mut self, source: Self) {
@@ -261,6 +265,7 @@ pub struct DecodeLimits {
     pub max_rows_per_block: u32,
     pub max_block_bytes: u64,
     pub max_decoded_block_bytes: u64,
+    pub max_decoded_result_bytes: u64,
     pub max_string_bytes: u64,
 }
 
@@ -276,6 +281,7 @@ impl Default for DecodeLimits {
             max_rows_per_block: 1_000_000,
             max_block_bytes: 128 * 1024 * 1024,
             max_decoded_block_bytes: 256 * 1024 * 1024,
+            max_decoded_result_bytes: 512 * 1024 * 1024,
             max_string_bytes: 64 * 1024 * 1024,
         }
     }
@@ -319,6 +325,15 @@ pub struct ScanResult {
     pub columns: Vec<Column>,
     pub row_count: u64,
     pub metrics: ScanMetrics,
+}
+
+/// Result of publishing an immutable segment file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SegmentWriteOutcome {
+    /// The final path was published and its directory update was synced.
+    Durable,
+    /// The final path is visible, but cleanup or durability confirmation failed.
+    PublishedUncertain { message: String },
 }
 
 /// Errors produced while validating, reading, or writing a segment.
@@ -794,6 +809,16 @@ impl Segment {
 
     /// Decodes and checksums every block in one column.
     pub fn read_column(&self, column: usize) -> Result<Column, SegmentError> {
+        let result_bytes = self.column_result_bytes(column)?;
+        enforce_limit(
+            "decoded result size",
+            result_bytes,
+            self.limits.max_decoded_result_bytes,
+        )?;
+        self.read_column_after_limit(column)
+    }
+
+    fn read_column_after_limit(&self, column: usize) -> Result<Column, SegmentError> {
         let field = self.field(column)?;
         let capacity = u64_to_usize(self.row_count)?;
         let mut output = Column::empty(field.data_type);
@@ -806,9 +831,22 @@ impl Segment {
 
     /// Decodes and checksums the complete segment.
     pub fn read_all(&self) -> Result<Vec<Column>, SegmentError> {
-        (0..self.schema.len())
-            .map(|column| self.read_column(column))
-            .collect()
+        let mut result_bytes = 0_u64;
+        for column in 0..self.schema.len() {
+            result_bytes = result_bytes
+                .checked_add(self.column_result_bytes(column)?)
+                .ok_or_else(|| SegmentError::Corrupt("decoded result size overflow".into()))?;
+        }
+        enforce_limit(
+            "decoded result size",
+            result_bytes,
+            self.limits.max_decoded_result_bytes,
+        )?;
+        let mut output = try_vec_with_capacity(self.schema.len(), "decoded column allocation")?;
+        for column in 0..self.schema.len() {
+            output.push(self.read_column_after_limit(column)?);
+        }
+        Ok(output)
     }
 
     /// Scans selected columns, using the predicate's zone map before decoding.
@@ -824,12 +862,13 @@ impl Segment {
             self.validate_predicate(predicate)?;
         }
 
-        let mut output: Vec<Column> = projection
-            .iter()
-            .map(|&column| Column::empty(self.schema.fields[column].data_type))
-            .collect();
+        let mut output = try_vec_with_capacity(projection.len(), "scan projection allocation")?;
+        for &column in projection {
+            output.push(Column::empty(self.schema.fields[column].data_type));
+        }
         let mut metrics = ScanMetrics::default();
         let mut output_rows = 0_u64;
+        let mut result_bytes = 0_u64;
 
         for group in 0..self.row_group_count {
             metrics.row_groups_considered += 1;
@@ -847,8 +886,8 @@ impl Segment {
                 None
             };
             let selected = match (predicate, predicate_column.as_ref()) {
-                (Some(predicate), Some(column)) => evaluate_predicate(column, predicate),
-                (None, _) => vec![true; u32_to_usize(self.block(group, 0).row_count)?],
+                (Some(predicate), Some(column)) => evaluate_predicate(column, predicate)?,
+                (None, _) => all_selected(u32_to_usize(self.block(group, 0).row_count)?)?,
                 _ => unreachable!(),
             };
             let selected_count = selected.iter().filter(|value| **value).count();
@@ -859,12 +898,24 @@ impl Segment {
             for (output_column, &column_index) in output.iter_mut().zip(projection) {
                 match (&predicate_column, predicate) {
                     (Some(decoded), Some(predicate)) if predicate.column() == column_index => {
-                        output_column.append_selected(decoded, &selected);
+                        charge_selected_result(
+                            &mut result_bytes,
+                            decoded,
+                            &selected,
+                            self.limits.max_decoded_result_bytes,
+                        )?;
+                        output_column.append_selected(decoded, &selected)?;
                     }
                     _ => {
                         metrics.column_blocks_decoded += 1;
                         let decoded = self.decode_block(self.block(group, column_index))?;
-                        output_column.append_selected(&decoded, &selected);
+                        charge_selected_result(
+                            &mut result_bytes,
+                            &decoded,
+                            &selected,
+                            self.limits.max_decoded_result_bytes,
+                        )?;
+                        output_column.append_selected(&decoded, &selected)?;
                     }
                 }
             }
@@ -899,6 +950,18 @@ impl Segment {
             )));
         }
         Ok(())
+    }
+
+    fn column_result_bytes(&self, column: usize) -> Result<u64, SegmentError> {
+        let field = self.field(column)?;
+        (0..self.row_group_count).try_fold(0_u64, |total, group| {
+            let block = self.block(group, column);
+            let bytes =
+                decoded_allocation_bound(field.data_type, block.row_count, block.logical_len)?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| SegmentError::Corrupt("decoded result size overflow".into()))
+        })
     }
 
     fn validate_block_statistics(&self) -> Result<(), SegmentError> {
@@ -1060,13 +1123,14 @@ pub fn encode_segment(
 ///
 /// The complete segment is written and synced through a temporary file in the
 /// destination directory. A platform-specific no-replace operation publishes
-/// the final name durably before this function returns success.
+/// the final name. The returned outcome distinguishes confirmed durability from
+/// cleanup or directory-sync failure after the final path became visible.
 pub fn write_segment(
     path: impl AsRef<Path>,
     schema: &Schema,
     columns: &[Column],
     options: &WriteOptions,
-) -> Result<(), SegmentError> {
+) -> Result<SegmentWriteOutcome, SegmentError> {
     let bytes = encode_segment(schema, columns, options)?;
     publish_segment_bytes(path.as_ref(), &bytes, || {})
 }
@@ -1075,7 +1139,34 @@ fn publish_segment_bytes(
     path: &Path,
     bytes: &[u8],
     before_publish: impl FnOnce(),
-) -> Result<(), SegmentError> {
+) -> Result<SegmentWriteOutcome, SegmentError> {
+    publish_segment_bytes_inner(path, bytes, before_publish, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationFailure {
+    #[cfg(unix)]
+    TemporaryCleanup,
+    #[cfg(unix)]
+    DirectorySync,
+}
+
+#[cfg(all(test, unix))]
+fn publish_segment_bytes_with_failure(
+    path: &Path,
+    bytes: &[u8],
+    failure: PublicationFailure,
+) -> Result<SegmentWriteOutcome, SegmentError> {
+    publish_segment_bytes_inner(path, bytes, || {}, Some(failure))
+}
+
+fn publish_segment_bytes_inner(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(),
+    failure: Option<PublicationFailure>,
+) -> Result<SegmentWriteOutcome, SegmentError> {
     let file_name = path.file_name().ok_or_else(|| {
         SegmentError::InvalidInput("segment path must include a file name".into())
     })?;
@@ -1091,8 +1182,7 @@ fn publish_segment_bytes(
     drop(file);
     before_publish();
 
-    publish_temporary_file(&temporary_path, path, parent, &mut cleanup)?;
-    Ok(())
+    publish_temporary_file(&temporary_path, path, parent, &mut cleanup, failure)
 }
 
 #[cfg(unix)]
@@ -1101,16 +1191,49 @@ fn publish_temporary_file(
     path: &Path,
     parent: &Path,
     cleanup: &mut RemoveOnDrop,
-) -> io::Result<()> {
+    failure: Option<PublicationFailure>,
+) -> Result<SegmentWriteOutcome, SegmentError> {
     std::fs::hard_link(temporary_path, path)?;
-    let cleanup_result = std::fs::remove_file(temporary_path);
+    let cleanup_result = if failure == Some(PublicationFailure::TemporaryCleanup) {
+        Err(io::Error::other("injected temporary cleanup failure"))
+    } else {
+        std::fs::remove_file(temporary_path)
+    };
     if cleanup_result.is_ok() {
         cleanup.disarm();
     }
-    let sync_result = sync_directory(parent);
-    cleanup_result?;
-    sync_result?;
-    Ok(())
+    let sync_result = if failure == Some(PublicationFailure::DirectorySync) {
+        Err(io::Error::other("injected segment directory sync failure"))
+    } else {
+        sync_directory(parent)
+    };
+    let cleanup_error = cleanup_result.err();
+    let sync_error = sync_result.err();
+    match (cleanup_error, sync_error) {
+        (None, None) => Ok(SegmentWriteOutcome::Durable),
+        (cleanup_error, sync_error) => Ok(SegmentWriteOutcome::PublishedUncertain {
+            message: publication_uncertainty_message(cleanup_error, sync_error),
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn publication_uncertainty_message(
+    cleanup_error: Option<io::Error>,
+    sync_error: Option<io::Error>,
+) -> String {
+    match (cleanup_error, sync_error) {
+        (Some(cleanup), Some(sync)) => format!(
+            "segment was published, but temporary cleanup failed ({cleanup}) and directory sync failed ({sync})"
+        ),
+        (Some(cleanup), None) => {
+            format!("segment was published, but temporary cleanup failed: {cleanup}")
+        }
+        (None, Some(sync)) => {
+            format!("segment was published, but directory sync failed: {sync}")
+        }
+        (None, None) => unreachable!(),
+    }
 }
 
 #[cfg(windows)]
@@ -1119,7 +1242,8 @@ fn publish_temporary_file(
     path: &Path,
     _parent: &Path,
     cleanup: &mut RemoveOnDrop,
-) -> io::Result<()> {
+    _failure: Option<PublicationFailure>,
+) -> Result<SegmentWriteOutcome, SegmentError> {
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
     #[link(name = "kernel32")]
@@ -1144,10 +1268,10 @@ fn publish_temporary_file(
         )
     };
     if moved == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::last_os_error().into());
     }
     cleanup.disarm();
-    Ok(())
+    Ok(SegmentWriteOutcome::Durable)
 }
 
 #[cfg(windows)]
@@ -1169,11 +1293,13 @@ fn publish_temporary_file(
     _path: &Path,
     _parent: &Path,
     _cleanup: &mut RemoveOnDrop,
-) -> io::Result<()> {
+    _failure: Option<PublicationFailure>,
+) -> Result<SegmentWriteOutcome, SegmentError> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "durable atomic segment publication is unsupported on this platform",
-    ))
+    )
+    .into())
 }
 
 fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBuf, File)> {
@@ -1190,7 +1316,7 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
             std::process::id()
         ));
         let path = parent.join(temporary_name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match create_private_segment_file(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -1200,6 +1326,29 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
         io::ErrorKind::AlreadyExists,
         "could not allocate a unique temporary segment name",
     ))
+}
+
+#[cfg(unix)]
+fn create_private_segment_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    crate::catalog::protect_temp_security(&file).map_err(io::Error::other)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_private_segment_file(path: &Path) -> io::Result<File> {
+    crate::catalog::create_secure_temp(path).map_err(io::Error::other)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_segment_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(unix)]
@@ -1886,58 +2035,122 @@ fn predicate_can_skip(predicate: &Predicate, stats: &BlockStatistics) -> bool {
     }
 }
 
-fn evaluate_predicate(column: &Column, predicate: &Predicate) -> Vec<bool> {
+fn evaluate_predicate(column: &Column, predicate: &Predicate) -> Result<Vec<bool>, SegmentError> {
+    let mut selected = try_vec_with_capacity(column.len(), "scan selection allocation")?;
     match (column, predicate) {
         (Column::Int64(values), Predicate::Compare { op, value, .. }) => {
             let ScalarValue::Int64(target) = value else {
                 unreachable!()
             };
-            values
-                .iter()
-                .map(|value| value.is_some_and(|value| compare(value.cmp(target), *op)))
-                .collect()
+            selected.extend(
+                values
+                    .iter()
+                    .map(|value| value.is_some_and(|value| compare(value.cmp(target), *op))),
+            );
         }
         (Column::Bool(values), Predicate::Compare { op, value, .. }) => {
             let ScalarValue::Bool(target) = value else {
                 unreachable!()
             };
-            values
-                .iter()
-                .map(|value| value.is_some_and(|value| compare(value.cmp(target), *op)))
-                .collect()
+            selected.extend(
+                values
+                    .iter()
+                    .map(|value| value.is_some_and(|value| compare(value.cmp(target), *op))),
+            );
         }
         (Column::String(values), Predicate::Compare { op, value, .. }) => {
             let ScalarValue::String(target) = value else {
                 unreachable!()
             };
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_ref()
-                        .is_some_and(|value| compare(value.cmp(target), *op))
-                })
-                .collect()
+            selected.extend(values.iter().map(|value| {
+                value
+                    .as_ref()
+                    .is_some_and(|value| compare(value.cmp(target), *op))
+            }));
         }
         (Column::Int64(values), Predicate::IsNull { .. }) => {
-            values.iter().map(Option::is_none).collect()
+            selected.extend(values.iter().map(Option::is_none));
         }
         (Column::Bool(values), Predicate::IsNull { .. }) => {
-            values.iter().map(Option::is_none).collect()
+            selected.extend(values.iter().map(Option::is_none));
         }
         (Column::String(values), Predicate::IsNull { .. }) => {
-            values.iter().map(Option::is_none).collect()
+            selected.extend(values.iter().map(Option::is_none));
         }
         (Column::Int64(values), Predicate::IsNotNull { .. }) => {
-            values.iter().map(Option::is_some).collect()
+            selected.extend(values.iter().map(Option::is_some));
         }
         (Column::Bool(values), Predicate::IsNotNull { .. }) => {
-            values.iter().map(Option::is_some).collect()
+            selected.extend(values.iter().map(Option::is_some));
         }
         (Column::String(values), Predicate::IsNotNull { .. }) => {
-            values.iter().map(Option::is_some).collect()
+            selected.extend(values.iter().map(Option::is_some));
         }
     }
+    Ok(selected)
+}
+
+fn all_selected(row_count: usize) -> Result<Vec<bool>, SegmentError> {
+    let mut selected = try_vec_with_capacity(row_count, "scan selection allocation")?;
+    selected.resize(row_count, true);
+    Ok(selected)
+}
+
+fn charge_selected_result(
+    retained_bytes: &mut u64,
+    column: &Column,
+    selected: &[bool],
+    limit: u64,
+) -> Result<(), SegmentError> {
+    let selected_rows = selected.iter().filter(|keep| **keep).count();
+    let row_width = match column {
+        Column::Int64(_) => std::mem::size_of::<Option<i64>>(),
+        Column::Bool(_) => std::mem::size_of::<Option<bool>>(),
+        Column::String(_) => std::mem::size_of::<Option<String>>(),
+    };
+    let row_bytes = selected_rows
+        .checked_mul(row_width)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| SegmentError::Corrupt("decoded result size overflow".into()))?;
+    let string_bytes = match column {
+        Column::String(values) => {
+            values
+                .iter()
+                .zip(selected)
+                .try_fold(0_u64, |total, (value, keep)| {
+                    if !*keep {
+                        return Ok(total);
+                    }
+                    let length = value.as_ref().map_or(0, String::len);
+                    total
+                        .checked_add(usize_to_u64(length)?)
+                        .ok_or_else(|| SegmentError::Corrupt("decoded result size overflow".into()))
+                })?
+        }
+        _ => 0,
+    };
+    let additional = row_bytes
+        .checked_add(string_bytes)
+        .ok_or_else(|| SegmentError::Corrupt("decoded result size overflow".into()))?;
+    let actual = retained_bytes
+        .checked_add(additional)
+        .ok_or_else(|| SegmentError::Corrupt("decoded result size overflow".into()))?;
+    enforce_limit("decoded result size", actual, limit)?;
+    *retained_bytes = actual;
+    Ok(())
+}
+
+fn try_clone_string(value: &str) -> Result<String, SegmentError> {
+    let mut output = String::new();
+    output
+        .try_reserve_exact(value.len())
+        .map_err(|_| SegmentError::LimitExceeded {
+            resource: "string result allocation",
+            actual: usize_to_u64(value.len()).unwrap_or(u64::MAX),
+            limit: usize_to_u64(isize::MAX as usize).unwrap_or(u64::MAX),
+        })?;
+    output.push_str(value);
+    Ok(output)
 }
 
 fn compare(ordering: Ordering, operation: ComparisonOp) -> bool {
@@ -1978,14 +2191,22 @@ fn decoded_allocation_bound(
 }
 
 fn reserve_column(column: &mut Column, additional: usize) -> Result<(), SegmentError> {
+    let element_size = match column {
+        Column::Int64(_) => std::mem::size_of::<Option<i64>>(),
+        Column::Bool(_) => std::mem::size_of::<Option<bool>>(),
+        Column::String(_) => std::mem::size_of::<Option<String>>(),
+    };
     let result = match column {
-        Column::Int64(values) => values.try_reserve(additional),
-        Column::Bool(values) => values.try_reserve(additional),
-        Column::String(values) => values.try_reserve(additional),
+        Column::Int64(values) => values.try_reserve_exact(additional),
+        Column::Bool(values) => values.try_reserve_exact(additional),
+        Column::String(values) => values.try_reserve_exact(additional),
     };
     result.map_err(|_| SegmentError::LimitExceeded {
         resource: "column allocation",
-        actual: usize_to_u64(additional).unwrap_or(u64::MAX),
+        actual: additional
+            .checked_mul(element_size)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX),
         limit: usize_to_u64(isize::MAX as usize).unwrap_or(u64::MAX),
     })
 }
@@ -2437,6 +2658,86 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "macos")]
+    fn install_inheritable_test_acl(path: &Path) {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let acl = [AclEntry::allow_user(
+            "nobody",
+            Perm::READ | Perm::EXECUTE,
+            Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT,
+        )];
+        exacl::setfacl(&[path], &acl, None).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_inheritable_test_acl(path: &Path) {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let mut acl = exacl::getfacl(path, None).unwrap();
+        acl.extend([
+            AclEntry::allow_user("", Perm::READ | Perm::WRITE | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_user("nobody", Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_group("", Perm::empty(), Flag::DEFAULT),
+            AclEntry::allow_mask(Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_other(Perm::empty(), Flag::DEFAULT),
+        ]);
+        exacl::setfacl(&[path], &acl, None).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn acl_allows_nobody(path: &Path) -> bool {
+        exacl::getfacl(path, None)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name.ends_with("nobody") && entry.perms.contains(exacl::Perm::READ))
+    }
+
+    #[cfg(windows)]
+    fn dacl_is_protected(path: &Path) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, GetSecurityDescriptorControl,
+            PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        };
+
+        let file = File::open(path).unwrap();
+        let mut needed = 0_u32;
+        unsafe {
+            GetKernelObjectSecurity(
+                file.as_raw_handle() as HANDLE,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        assert!(needed > 0);
+        let mut descriptor = vec![0_u8; needed as usize];
+        let descriptor_ptr: PSECURITY_DESCRIPTOR = descriptor.as_mut_ptr().cast();
+        assert_ne!(
+            unsafe {
+                GetKernelObjectSecurity(
+                    file.as_raw_handle() as HANDLE,
+                    DACL_SECURITY_INFORMATION,
+                    descriptor_ptr,
+                    needed,
+                    &mut needed,
+                )
+            },
+            0
+        );
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor_ptr, &mut control, &mut revision) },
+            0
+        );
+        control & SE_DACL_PROTECTED != 0
+    }
+
     #[test]
     fn round_trips_multiple_typed_blocks_and_statistics() {
         let schema = test_schema();
@@ -2728,6 +3029,81 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_decode_limit_bounds_columns_scans_and_complete_reads() {
+        const ROWS: usize = 2_048;
+        let repeated = "warehouse/customer/account/00000000".repeat(32);
+        let strings = vec![Column::String(
+            (0..ROWS).map(|_| Some(repeated.clone())).collect(),
+        )];
+        let string_schema =
+            Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
+        let bytes = encode_segment(
+            &string_schema,
+            &strings,
+            &WriteOptions {
+                rows_per_block: 128,
+            },
+        )
+        .unwrap();
+        let result_bytes = decoded_allocation_bound(
+            DataType::String,
+            ROWS as u32,
+            (repeated.len() * ROWS) as u64,
+        )
+        .unwrap();
+        assert!((bytes.len() as u64) < result_bytes);
+        let limited = Segment::from_bytes(
+            bytes,
+            DecodeLimits {
+                max_decoded_result_bytes: result_bytes - 1,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap();
+        for result in [
+            limited.read_column(0).map(|_| ()),
+            limited.scan(&[0], None).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(SegmentError::LimitExceeded {
+                    resource: "decoded result size",
+                    actual,
+                    limit,
+                }) if actual == result_bytes && limit == result_bytes - 1
+            ));
+        }
+
+        let int_schema = Schema::new(vec![
+            Field::new("left", DataType::Int64, false),
+            Field::new("right", DataType::Int64, false),
+        ])
+        .unwrap();
+        let integers = vec![
+            Column::Int64(vec![Some(1), Some(2), Some(3), Some(4)]),
+            Column::Int64(vec![Some(5), Some(6), Some(7), Some(8)]),
+        ];
+        let one_column_bytes = decoded_allocation_bound(DataType::Int64, 4, 32).unwrap();
+        let segment = Segment::from_bytes(
+            encode_segment(&int_schema, &integers, &WriteOptions::default()).unwrap(),
+            DecodeLimits {
+                max_decoded_result_bytes: one_column_bytes,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(segment.read_column(0).unwrap(), integers[0]);
+        assert!(matches!(
+            segment.read_all(),
+            Err(SegmentError::LimitExceeded {
+                resource: "decoded result size",
+                actual,
+                limit,
+            }) if actual == one_column_bytes * 2 && limit == one_column_bytes
+        ));
+    }
+
+    #[test]
     fn verified_zone_maps_prune_unneeded_blocks() {
         let schema = Schema::new(vec![
             Field::new("number", DataType::Int64, false),
@@ -2824,7 +3200,10 @@ mod tests {
         let schema = test_schema();
         let columns = test_columns();
 
-        write_segment(&path, &schema, &columns, &WriteOptions::default()).unwrap();
+        assert_eq!(
+            write_segment(&path, &schema, &columns, &WriteOptions::default()).unwrap(),
+            SegmentWriteOutcome::Durable
+        );
         let reopened = Segment::open(&path, DecodeLimits::default()).unwrap();
         assert_eq!(reopened.read_all().unwrap(), columns);
 
@@ -2841,6 +3220,101 @@ mod tests {
         assert_eq!(reopened.read_all().unwrap(), columns);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_segment_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("private-segment");
+        let path = directory.join("segment.rhs");
+        write_segment(
+            &path,
+            &test_schema(),
+            &test_columns(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn inherited_acl_does_not_reach_segment_candidate_or_final_file() {
+        let directory = test_directory("private-segment-acl");
+        install_inheritable_test_acl(&directory);
+        let probe = directory.join("probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        assert!(acl_allows_nobody(&probe));
+        std::fs::remove_file(probe).unwrap();
+
+        let path = directory.join("segment.rhs");
+        write_segment(
+            &path,
+            &test_schema(),
+            &test_columns(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(!acl_allows_nobody(&path));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn immutable_segment_file_has_a_protected_dacl() {
+        let directory = test_directory("private-segment-dacl");
+        let path = directory.join("segment.rhs");
+        write_segment(
+            &path,
+            &test_schema(),
+            &test_columns(),
+            &WriteOptions::default(),
+        )
+        .unwrap();
+        assert!(dacl_is_protected(&path));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_publication_failures_return_an_uncertain_outcome() {
+        let directory = test_directory("publication-uncertainty");
+        let bytes =
+            encode_segment(&test_schema(), &test_columns(), &WriteOptions::default()).unwrap();
+
+        for (index, failure, expected_message) in [
+            (
+                0,
+                PublicationFailure::TemporaryCleanup,
+                "temporary cleanup failed",
+            ),
+            (
+                1,
+                PublicationFailure::DirectorySync,
+                "directory sync failed",
+            ),
+        ] {
+            let path = directory.join(format!("segment-{index}.rhs"));
+            let outcome = publish_segment_bytes_with_failure(&path, &bytes, failure).unwrap();
+            assert!(matches!(
+                outcome,
+                SegmentWriteOutcome::PublishedUncertain { message }
+                    if message.contains(expected_message)
+            ));
+            assert!(Segment::open(&path, DecodeLimits::default()).is_ok());
+            assert!(matches!(
+                publish_segment_bytes(&path, &bytes, || {}),
+                Err(SegmentError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+            ));
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

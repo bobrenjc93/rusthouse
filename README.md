@@ -23,11 +23,11 @@ The early implementation should favor Rust's standard library and a small depend
 
 `storage::segment` provides the first durable columnar format. Version 1 files contain a checksummed fixed header, schema, and block directory followed by contiguous column blocks. Blocks are grouped by row range and carry null counts and exact min/max zone maps. Integer blocks use delta bit packing with a plain fallback for extreme deltas, booleans use validity and value bitmaps, and strings use a front-coded UTF-8 buffer.
 
-Readers verify header metadata before allocating and enforce configurable limits for files, metadata, rows, columns, blocks, decoded buffers, and strings. Opening a segment verifies every block checksum and recomputes every zone map from decoded values; persisted statistics are never trusted until that integrity pass succeeds. Later predicate scans consult the verified zone maps first and do not decode pruned blocks during the scan.
+Readers verify header metadata before allocating and enforce configurable limits for files, metadata, rows, columns, blocks, per-block decoded buffers, cumulative decoded results, and strings. Full reads preflight retained output from block metadata; scans charge selected values as they append and use fallible reservations. Opening a segment verifies every block checksum and recomputes every zone map from decoded values; persisted statistics are never trusted until that integrity pass succeeds. Later predicate scans consult the verified zone maps first and do not decode pruned blocks during the scan.
 
 Block decoders stream packed integers and front-coded strings directly into their final nullable vectors. The decoded-block limit covers the nullable vector plus the cumulative string capacity, rather than relying on transient intermediate buffers outside the accounting.
 
-`write_segment` writes and syncs a uniquely named temporary file in the destination directory, then publishes it with platform-specific no-replace durability. Unix uses a hard link followed by temporary-name removal and a parent-directory sync; Windows uses an atomic `MOVEFILE_WRITE_THROUGH` move without the replace flag. The final path is therefore never visible with partial contents, an existing segment is never replaced, and success is not reported before publication is durable.
+`write_segment` creates its temporary file owner-only before writing, clearing inherited Unix ACLs or applying a protected Windows DACL, then syncs and publishes it with platform-specific no-replace durability. Unix uses a hard link followed by temporary-name removal and a parent-directory sync; Windows uses an atomic `MOVEFILE_WRITE_THROUGH` move without the replace flag. The final path is therefore never visible with partial contents and an existing segment is never replaced. `SegmentWriteOutcome::Durable` confirms publication durability; `PublishedUncertain` means the final path is already visible but cleanup or directory syncing failed, so callers must not retry as a new write.
 
 The format is intentionally self-contained and little-endian. Readers reject unknown versions, unknown encodings, non-canonical or overlapping block extents, invalid UTF-8, inconsistent null maps or statistics, non-zero padding, trailing data, and arithmetic overflow.
 
@@ -361,7 +361,9 @@ and publication use an atomic handoff: cancellation before publication prevents 
 commit, while a timeout after publication starts returns `query_outcome_unknown`
 instead of claiming that the mutation failed. Once execution confirms publication,
 an encoding limit or encoding deadline falls back to a bounded `204 No Content`
-success response rather than reporting a failed mutation.
+success response rather than reporting a failed mutation. A database durability
+error after publication returns HTTP `202` with code
+`mutation_published_durability_uncertain`, distinguishing it from a retryable failure.
 Query implementations should observe the supplied `QueryCancellation` while doing
 expensive work. It is signaled when a request is dropped, its deadline expires, or
 forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown

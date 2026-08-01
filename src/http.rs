@@ -1313,6 +1313,7 @@ impl ApiError {
             QueryErrorKind::Conflict => StatusCode::CONFLICT,
             QueryErrorKind::ResourceLimit => StatusCode::TOO_MANY_REQUESTS,
             QueryErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            QueryErrorKind::PublishedUncertain => StatusCode::ACCEPTED,
             QueryErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, error.kind.code(), error.message)

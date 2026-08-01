@@ -288,6 +288,8 @@ pub enum QueryErrorKind {
     ResourceLimit,
     /// The query service is temporarily unavailable.
     Unavailable,
+    /// A mutation was published, but its durability could not be confirmed.
+    PublishedUncertain,
     /// The service failed unexpectedly.
     Internal,
 }
@@ -301,6 +303,7 @@ impl QueryErrorKind {
             Self::Conflict => "conflict",
             Self::ResourceLimit => "resource_limit",
             Self::Unavailable => "unavailable",
+            Self::PublishedUncertain => "mutation_published_durability_uncertain",
             Self::Internal => "internal",
         }
     }
@@ -347,6 +350,11 @@ impl QueryError {
     /// Creates a temporary-unavailability error.
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(QueryErrorKind::Unavailable, message)
+    }
+
+    /// Creates an outcome for a published mutation with uncertain durability.
+    pub fn published_uncertain(message: impl Into<String>) -> Self {
+        Self::new(QueryErrorKind::PublishedUncertain, message)
     }
 
     /// Creates an internal service error.
@@ -406,9 +414,9 @@ impl From<Error> for QueryError {
                 QueryErrorKind::Unavailable
             }
             Error::QueryCancelled => QueryErrorKind::Unavailable,
+            Error::CommitDurabilityUncertain { .. } => QueryErrorKind::PublishedUncertain,
             Error::ReservedDatabasePath(_)
             | Error::UnsafeLockPath(_)
-            | Error::CommitDurabilityUncertain { .. }
             | Error::GenerationOverflow
             | Error::CorruptSnapshot(_)
             | Error::Io { .. }
@@ -473,5 +481,17 @@ mod tests {
             publishing.cancel(),
             CancellationOutcome::PublicationInProgress
         );
+    }
+
+    #[test]
+    fn published_database_commit_has_a_distinct_transport_outcome() {
+        let error = QueryError::from(Error::CommitDurabilityUncertain {
+            generation: 7,
+            message: "directory sync failed".into(),
+        });
+
+        assert_eq!(error.kind, QueryErrorKind::PublishedUncertain);
+        assert_eq!(error.kind.code(), "mutation_published_durability_uncertain");
+        assert!(error.message.contains("generation 7 was published"));
     }
 }

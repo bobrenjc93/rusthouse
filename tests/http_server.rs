@@ -115,6 +115,12 @@ impl QueryService for TestService {
                     rows_result()
                 }
                 "bad sql" => Err(QueryError::invalid_query("test syntax error")),
+                "published uncertain" => Err(QueryError::from(
+                    rusthouse::Error::CommitDurabilityUncertain {
+                        generation: 9,
+                        message: "directory sync failed".into(),
+                    },
+                )),
                 _ => rows_result(),
             }
         })
@@ -329,6 +335,32 @@ async fn published_mutation_remains_successful_when_response_cannot_fit() {
     assert_eq!(
         repeated.json::<Value>().await.unwrap()["error"]["code"],
         "conflict"
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn published_uncertain_mutation_has_a_machine_readable_http_outcome() {
+    let (server, url) = start(Arc::new(TestService::new()), ServerConfig::default()).await;
+    let response = Client::new()
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("published uncertain")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(
+        body["error"]["code"],
+        "mutation_published_durability_uncertain"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("generation 9 was published")
     );
     server.shutdown().await.unwrap();
 }
