@@ -197,6 +197,18 @@ The conversion rules are deliberately explicit:
 
 `FormatLimits` independently bounds total input bytes, rows, fields per record, decoded field bytes, JSON nesting depth, decoded string bytes, record bytes, and rows per batch. JSON depth is capped at the stack-safe `MAX_JSON_NESTING_DEPTH`, and larger configurations are rejected. Batch columns allocate lazily as rows arrive, so a large batch limit does not reserve memory for an empty or short input. Parsing retains one bounded record and one typed batch. The `ingest_csv` and `ingest_ndjson` helpers write validated batches to a private temporary spool first, then replay them into the table; a parse, limit, staging, or replay error leaves the destination at its original row count. Applications that consume the batch iterators directly own any already-consumed batches themselves.
 
+## Vector kernel layer
+
+`rusthouse::batch` provides query-independent fixed-capacity `Int64`, `Float64`, bit-packed Boolean, and dictionary-encoded String arrays. A `RecordBatch` validates its schema, equal column shape, nullability, and byte ceiling before it can be used. `retained_bytes()` is the sum of owned heap payloads, including fixed buffers, bitmap words, dictionary slots and UTF-8 bytes, schema metadata, and column containers; allocator bookkeeping is intentionally excluded.
+
+`rusthouse::kernels` provides selection-aware comparisons, `IS NULL`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and bounded hash grouping. Predicates use SQL-style NULL filtering and IEEE comparisons. Floating extrema use `f64::total_cmp`; grouping coalesces signed zeroes and groups all NaNs together. Hash grouping has independent `max_groups` and retained-byte limits and reports both final and peak retained bytes.
+
+The deterministic benchmark uses fixed generated input and fixed iteration counts:
+
+```bash
+cargo bench --bench vector_kernels
+```
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.

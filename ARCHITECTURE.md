@@ -48,3 +48,9 @@ and a write-ahead log without introducing those concerns into block encoding.
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.
 
 Bulk formats are a query-independent exception to the future SQL boundary: schema-driven readers emit bounded typed column batches. Transactional ingestion stages those batches in a private binary temporary file and only mutates a destination after the entire source validates; replay rolls back to the original row count on failure. The staging encoding is internal and is not a persistence format.
+
+## Batch execution boundary
+
+The `batch` module is deliberately independent of SQL syntax and scalar expression values. It owns typed, fixed-capacity buffers, validity bitmaps, a selection mask, and dictionary strings. The `kernels` module consumes that boundary directly, so a later planner can compose scans and aggregation without changing storage representation or materializing each row.
+
+Operator memory limits use exact retained payload bytes rather than allocator-specific estimates. Batch limits cover all allocations owned by the batch. Hash-group limits cover the fixed hash table, group slots, key/state slices, and owned string bytes; borrowed input buffers and allocator metadata are outside that total.

@@ -1,9 +1,11 @@
 //! RustHouse is a compact analytical database with snapshot-isolated sessions.
 
+pub mod batch;
 pub mod catalog;
 mod database;
-mod error;
+pub mod error;
 pub mod formats;
+pub mod kernels;
 mod persistence;
 mod sql;
 pub mod storage;
