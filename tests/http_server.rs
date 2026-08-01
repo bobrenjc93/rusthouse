@@ -284,6 +284,61 @@ async fn executes_sql_against_the_database_engine() {
 }
 
 #[tokio::test]
+async fn imports_csv_and_ndjson_atomically_by_content_type() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE imports (id Int64, active Bool, note String NULL)")
+        .unwrap();
+    let (server, url) = start(Arc::new(database.clone()), ServerConfig::default()).await;
+    let client = Client::new();
+
+    let csv = client
+        .post(format!("{url}/import/imports"))
+        .header("content-type", "text/csv; charset=utf-8")
+        .body("id,active,note\n1,true,first\n2,false,\\N\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(csv.status(), StatusCode::OK);
+    assert_eq!(
+        csv.json::<Value>().await.unwrap(),
+        json!([{"rows_affected": 2}])
+    );
+
+    let ndjson = client
+        .post(format!("{url}/import/imports"))
+        .header("content-type", "application/x-ndjson")
+        .body("{\"note\":\"third\",\"id\":3,\"active\":true}\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ndjson.status(), StatusCode::OK);
+
+    let malformed = client
+        .post(format!("{url}/import/imports"))
+        .header("content-type", "text/csv")
+        .body("id,active,note\n4,true,valid\ninvalid,false,late\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        malformed.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_query"
+    );
+
+    let selected = database.execute("SELECT * FROM imports").unwrap();
+    let rows = match selected {
+        rusthouse::StatementResult::Query(result) => result.rows,
+        _ => unreachable!(),
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2][0], rusthouse::Value::Int64(3));
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn production_database_bounds_result_materialization() {
     let database = Database::new();
     database

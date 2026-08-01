@@ -30,8 +30,8 @@ pub use expression::{
     BinaryOperator, EvaluationContext, Expr, MAX_EXPRESSION_DEPTH, UnaryOperator, evaluate, parse,
 };
 pub use query::{
-    QueryCancellation, QueryError, QueryErrorKind, QueryFuture, QueryRequest, QueryResult,
-    QueryService, QueryValue, ServiceHealth,
+    IngestFormat, IngestRequest, QueryCancellation, QueryError, QueryErrorKind, QueryFuture,
+    QueryRequest, QueryResult, QueryService, QueryValue, ServiceHealth,
 };
 pub use storage::{Column, ColumnBatch, ColumnDef, DataType, Field, Schema, Table, Value};
 

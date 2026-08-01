@@ -10,6 +10,7 @@ pub use ndjson::{
     NdjsonBatchReader, NdjsonOptions, export_ndjson, ingest_ndjson, write_ndjson_batch,
 };
 
+use crate::Error as DatabaseError;
 use crate::storage::{Column, ColumnBatch, DataType, Schema, StorageError, Table};
 use std::error::Error;
 use std::fmt;
@@ -168,6 +169,7 @@ pub enum FormatError {
         value: String,
     },
     Storage(StorageError),
+    Database(DatabaseError),
     Staging(String),
 }
 
@@ -224,6 +226,7 @@ impl fmt::Display for FormatError {
                 "cannot convert {value:?} to {data_type} for column {column:?} at row {row}"
             ),
             Self::Storage(error) => write!(f, "columnar storage rejected data: {error}"),
+            Self::Database(error) => write!(f, "database ingestion failed: {error}"),
             Self::Staging(message) => write!(f, "staged ingestion failed: {message}"),
         }
     }
@@ -234,6 +237,7 @@ impl Error for FormatError {
         match self {
             Self::Io(error) => Some(error),
             Self::Storage(error) => Some(error),
+            Self::Database(error) => Some(error),
             _ => None,
         }
     }
@@ -248,6 +252,12 @@ impl From<io::Error> for FormatError {
 impl From<StorageError> for FormatError {
     fn from(value: StorageError) -> Self {
         Self::Storage(value)
+    }
+}
+
+impl From<DatabaseError> for FormatError {
+    fn from(value: DatabaseError) -> Self {
+        Self::Database(value)
     }
 }
 

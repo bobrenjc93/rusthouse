@@ -12,7 +12,11 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{Database, Error, ResultSet, StatementResult, Value, database::ExecutionCancellation};
+use crate::{
+    Database, Error, ResultSet, StatementResult, Value,
+    database::ExecutionCancellation,
+    formats::{CsvOptions, FormatError, NdjsonOptions},
+};
 
 const EXECUTION_ACTIVE: u8 = 0;
 const EXECUTION_CANCELLED: u8 = 1;
@@ -38,6 +42,15 @@ pub trait QueryService: Send + Sync + 'static {
     /// observe cancellation; otherwise they retain their execution slot until the
     /// poll returns.
     fn execute(&self, request: QueryRequest) -> QueryFuture<'_>;
+
+    /// Atomically appends a CSV or NDJSON body to an existing SQL table.
+    fn ingest(&self, _request: IngestRequest) -> QueryFuture<'_> {
+        Box::pin(async {
+            Err(QueryError::invalid_query(
+                "this query service does not support ingestion",
+            ))
+        })
+    }
 
     /// Returns current readiness. This method must not block.
     fn health(&self) -> ServiceHealth {
@@ -65,6 +78,31 @@ impl QueryService for Database {
             Ok(statement_result(result))
         })
     }
+
+    fn ingest(&self, request: IngestRequest) -> QueryFuture<'_> {
+        Box::pin(async move {
+            if request.cancellation.is_cancelled() {
+                return Err(QueryError::unavailable("ingestion was cancelled"));
+            }
+            let input = std::io::Cursor::new(request.body);
+            let rows = match request.format {
+                IngestFormat::Csv => self.ingest_csv_controlled(
+                    &request.table,
+                    input,
+                    CsvOptions::default(),
+                    &request.cancellation,
+                ),
+                IngestFormat::Ndjson => self.ingest_ndjson_controlled(
+                    &request.table,
+                    input,
+                    NdjsonOptions::default(),
+                    &request.cancellation,
+                ),
+            }
+            .map_err(QueryError::from)?;
+            Ok(rows_affected_result(rows))
+        })
+    }
 }
 
 fn statement_result(result: StatementResult) -> QueryResult {
@@ -72,12 +110,9 @@ fn statement_result(result: StatementResult) -> QueryResult {
         StatementResult::Query(result) => result.into(),
         StatementResult::TableCreated => command_result("CREATE TABLE"),
         StatementResult::TableDropped => command_result("DROP TABLE"),
-        StatementResult::RowsInserted { rows } => QueryResult::new(
-            vec!["rows_affected".into()],
-            vec![vec![QueryValue::Int64(
-                i64::try_from(rows).expect("a row vector length fits in i64"),
-            )]],
-        ),
+        StatementResult::RowsInserted { rows } => {
+            rows_affected_result(u64::try_from(rows).expect("a row vector length fits in u64"))
+        }
         StatementResult::TransactionStarted { generation } => {
             transaction_result("BEGIN", generation)
         }
@@ -86,6 +121,15 @@ fn statement_result(result: StatementResult) -> QueryResult {
         }
         StatementResult::TransactionRolledBack => command_result("ROLLBACK"),
     }
+}
+
+fn rows_affected_result(rows: u64) -> QueryResult {
+    QueryResult::new(
+        vec!["rows_affected".into()],
+        vec![vec![QueryValue::Int64(
+            i64::try_from(rows).expect("configured ingestion limits fit in i64"),
+        )]],
+    )
 }
 
 fn command_result(command: &str) -> QueryResult {
@@ -116,6 +160,23 @@ pub struct QueryRequest {
     pub cancellation: QueryCancellation,
     /// Maximum retained bytes the engine may materialize for this result.
     pub max_result_bytes: usize,
+}
+
+/// Input format for a durable table ingestion request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestFormat {
+    Csv,
+    Ndjson,
+}
+
+/// One atomic table ingestion submitted by a transport.
+#[derive(Debug, Clone)]
+pub struct IngestRequest {
+    pub table: String,
+    pub format: IngestFormat,
+    pub body: Vec<u8>,
+    pub request_id: u64,
+    pub cancellation: QueryCancellation,
 }
 
 /// A cooperative cancellation signal scoped to one query.
@@ -437,6 +498,19 @@ impl From<Error> for QueryError {
             | Error::LockPoisoned => QueryErrorKind::Internal,
         };
         Self::new(kind, error.to_string())
+    }
+}
+
+impl From<FormatError> for QueryError {
+    fn from(error: FormatError) -> Self {
+        match error {
+            FormatError::Database(error) => Self::from(error),
+            error @ FormatError::LimitExceeded { .. } => Self::resource_limit(error.to_string()),
+            error @ (FormatError::UnsupportedPlatform(_)
+            | FormatError::Io(_)
+            | FormatError::Staging(_)) => Self::internal(error.to_string()),
+            error => Self::invalid_query(error.to_string()),
+        }
     }
 }
 

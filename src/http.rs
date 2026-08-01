@@ -16,7 +16,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -36,8 +36,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::query::{
-    CancellationOutcome, QueryCancellation, QueryError, QueryErrorKind, QueryRequest, QueryResult,
-    QueryService, QueryValue,
+    CancellationOutcome, IngestFormat, IngestRequest, QueryCancellation, QueryError,
+    QueryErrorKind, QueryRequest, QueryResult, QueryService, QueryValue,
 };
 
 const FORCE_CANCELLATION_WAIT: Duration = Duration::from_millis(250);
@@ -318,6 +318,7 @@ pub fn spawn_on_listener(
 
     let app = Router::new()
         .route("/query", post(query))
+        .route("/import/{table}", post(ingest))
         .route("/health", get(readiness))
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
@@ -605,6 +606,27 @@ async fn query(State(state): State<Arc<HttpState>>, request: Request) -> Respons
     response
 }
 
+async fn ingest(
+    State(state): State<Arc<HttpState>>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = state.next_request_id();
+    let request_permit = match state.request_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::request_overloaded(state.config.max_concurrent_requests)
+                .into_response(request_id);
+        }
+    };
+    let response = match handle_ingest(&state, request_id, table, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(request_id),
+    };
+    drop(request_permit);
+    response
+}
+
 async fn handle_query(
     state: &Arc<HttpState>,
     request_id: u64,
@@ -645,6 +667,75 @@ async fn handle_query(
     .map_err(|_| ApiError::request_too_large(state.config.max_request_bytes))?;
     let sql = parse_query_body(&body, body_format)?;
 
+    execute_operation(state, request_id, format, ServiceOperation::Query(sql)).await
+}
+
+async fn handle_ingest(
+    state: &Arc<HttpState>,
+    request_id: u64,
+    table: String,
+    request: Request,
+) -> Result<Response, ApiError> {
+    if request.headers().contains_key(header::ORIGIN) {
+        return Err(ApiError::origin_not_allowed());
+    }
+    if table.is_empty() {
+        return Err(ApiError::bad_request("import table must not be empty"));
+    }
+    let response_format = ResponseFormat::negotiate(request.uri().query(), request.headers())?;
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .ok_or_else(ApiError::content_type_required)?
+        .to_str()
+        .map_err(|_| ApiError::unsupported_media_type("non-UTF-8 Content-Type"))?;
+    let ingest_format = ingest_format(content_type)?;
+
+    if let Some(length) = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        && length > state.config.max_request_bytes
+    {
+        return Err(ApiError::request_too_large(state.config.max_request_bytes));
+    }
+    let body = tokio::time::timeout(
+        state.config.request_body_timeout,
+        to_bytes(request.into_body(), state.config.max_request_bytes),
+    )
+    .await
+    .map_err(|_| ApiError::request_timeout(state.config.request_body_timeout))?
+    .map_err(|_| ApiError::request_too_large(state.config.max_request_bytes))?;
+
+    execute_operation(
+        state,
+        request_id,
+        response_format,
+        ServiceOperation::Ingest {
+            table,
+            format: ingest_format,
+            body: body.to_vec(),
+        },
+    )
+    .await
+}
+
+enum ServiceOperation {
+    Query(String),
+    Ingest {
+        table: String,
+        format: IngestFormat,
+        body: Vec<u8>,
+    },
+}
+
+async fn execute_operation(
+    state: &Arc<HttpState>,
+    request_id: u64,
+    format: ResponseFormat,
+    operation: ServiceOperation,
+) -> Result<Response, ApiError> {
     let permit = state
         .query_permits
         .clone()
@@ -654,12 +745,8 @@ async fn handle_query(
     let token = state.force_cancellation.child_token();
     let cancellation = QueryCancellation::new(token.clone());
     let mut cancel_on_drop = CancelOnDrop(Some(cancellation.clone()));
-    let query_request = QueryRequest {
-        sql,
-        request_id,
-        cancellation: cancellation.clone(),
-        max_result_bytes: state.config.max_response_bytes,
-    };
+    let execution_cancellation = cancellation.clone();
+    let max_result_bytes = state.config.max_response_bytes;
     let service = state.service.clone();
     let query_admission = state.query_admission.clone();
     let runtime = tokio::runtime::Handle::current();
@@ -668,10 +755,28 @@ async fn handle_query(
         let Some(admission) = query_admission.enter() else {
             return EngineTaskOutput::AdmissionClosed(permit);
         };
-        if query_request.cancellation.is_cancelled() {
+        if execution_cancellation.is_cancelled() {
             return EngineTaskOutput::Cancelled(permit);
         }
-        let execution = service.execute(query_request);
+        let execution = match operation {
+            ServiceOperation::Query(sql) => service.execute(QueryRequest {
+                sql,
+                request_id,
+                cancellation: execution_cancellation.clone(),
+                max_result_bytes,
+            }),
+            ServiceOperation::Ingest {
+                table,
+                format,
+                body,
+            } => service.ingest(IngestRequest {
+                table,
+                format,
+                body,
+                request_id,
+                cancellation: execution_cancellation.clone(),
+            }),
+        };
         drop(admission);
         EngineTaskOutput::Finished(permit, runtime.block_on(execution))
     });
@@ -840,6 +945,20 @@ fn parse_query_body(body: &[u8], format: QueryBodyFormat) -> Result<String, ApiE
         return Err(ApiError::bad_request("query must not be empty"));
     }
     Ok(query)
+}
+
+fn ingest_format(content_type: &str) -> Result<IngestFormat, ApiError> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "text/csv" => Ok(IngestFormat::Csv),
+        "application/x-ndjson" | "application/ndjson" => Ok(IngestFormat::Ndjson),
+        _ => Err(ApiError::unsupported_media_type(&media_type)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1233,7 +1352,7 @@ impl ApiError {
         Self::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "content_type_required",
-            "query requests require Content-Type application/sql or application/json",
+            "requests require a supported Content-Type",
         )
         .close_connection()
     }

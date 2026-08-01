@@ -1,7 +1,8 @@
 use std::{
     env,
     error::Error,
-    io::{self, BufRead},
+    fs::File,
+    io::{self, BufRead, BufReader},
     net::SocketAddr,
     path::PathBuf,
     process::ExitCode,
@@ -11,6 +12,7 @@ use std::{
 
 use rusthouse::{
     Database, ResultSet, StatementResult, Value,
+    formats::{CsvOptions, NdjsonOptions},
     http::{ServerConfig, spawn_http_server},
 };
 
@@ -19,6 +21,7 @@ RustHouse analytical database
 
 Usage:
   rusthouse [--database FILE] [-e SQL]...
+  rusthouse import <csv|ndjson> [OPTIONS] TABLE [FILE]
   rusthouse serve [OPTIONS]
 
 Query options:
@@ -27,6 +30,12 @@ Query options:
   -h, --help                     Print help
 
 Without --execute, one SQL statement is read from each input line.
+
+Import options:
+  -d, --database FILE            Persist data in FILE
+  --format FORMAT                Input format when omitted positionally
+  --table TABLE                  Destination table when omitted positionally
+  --input FILE                   Input file [default: standard input]
 
 Server options:
   -d, --database FILE            Persist data in FILE
@@ -58,6 +67,17 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         }
+    } else if arguments
+        .first()
+        .is_some_and(|argument| argument == "import")
+    {
+        match run_import(arguments.into_iter().skip(1)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("rusthouse: {error}");
+                ExitCode::FAILURE
+            }
+        }
     } else {
         match run_cli(arguments.into_iter()) {
             Ok(()) => ExitCode::SUCCESS,
@@ -66,6 +86,39 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+fn run_import(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let Some(options) = ImportOptions::parse(arguments)? else {
+        print!("{HELP}");
+        return Ok(());
+    };
+    let database = open_database(options.database)?;
+    let mut session = database.session();
+    let rows = match options.input {
+        Some(path) if path.as_os_str() != "-" => {
+            let input = BufReader::new(File::open(path)?);
+            ingest_cli(&mut session, &options.table, options.format, input)?
+        }
+        _ => {
+            let stdin = io::stdin();
+            ingest_cli(&mut session, &options.table, options.format, stdin.lock())?
+        }
+    };
+    println!("IMPORT {rows}");
+    Ok(())
+}
+
+fn ingest_cli<R: BufRead>(
+    session: &mut rusthouse::Session,
+    table: &str,
+    format: CliImportFormat,
+    input: R,
+) -> Result<u64, rusthouse::formats::FormatError> {
+    match format {
+        CliImportFormat::Csv => session.ingest_csv(table, input, CsvOptions::default()),
+        CliImportFormat::Ndjson => session.ingest_ndjson(table, input, NdjsonOptions::default()),
     }
 }
 
@@ -101,6 +154,104 @@ fn open_database(path: Option<PathBuf>) -> rusthouse::Result<Database> {
 struct CliOptions {
     database: Option<PathBuf>,
     statements: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum CliImportFormat {
+    Csv,
+    Ndjson,
+}
+
+impl CliImportFormat {
+    fn parse(value: &str) -> io::Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "csv" => Ok(Self::Csv),
+            "ndjson" => Ok(Self::Ndjson),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported import format {value:?}; expected csv or ndjson"),
+            )),
+        }
+    }
+}
+
+struct ImportOptions {
+    database: Option<PathBuf>,
+    format: CliImportFormat,
+    table: String,
+    input: Option<PathBuf>,
+}
+
+impl ImportOptions {
+    fn parse(mut arguments: impl Iterator<Item = String>) -> io::Result<Option<Self>> {
+        let mut database = None;
+        let mut format = None;
+        let mut table = None;
+        let mut input = None;
+        let mut positional = Vec::new();
+
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "-h" | "--help" => return Ok(None),
+                "-d" | "--database" => {
+                    database = Some(PathBuf::from(required_argument(
+                        &mut arguments,
+                        "--database requires a file path",
+                    )?));
+                }
+                "--format" => {
+                    format = Some(CliImportFormat::parse(&required_argument(
+                        &mut arguments,
+                        "--format requires csv or ndjson",
+                    )?)?);
+                }
+                "--table" => {
+                    table = Some(required_argument(
+                        &mut arguments,
+                        "--table requires a table name",
+                    )?);
+                }
+                "--input" => {
+                    input = Some(PathBuf::from(required_argument(
+                        &mut arguments,
+                        "--input requires a file path",
+                    )?));
+                }
+                "-" => positional.push(argument),
+                _ if argument.starts_with('-') => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown import argument {argument:?}"),
+                    ));
+                }
+                _ => positional.push(argument),
+            }
+        }
+
+        let mut positional = positional.into_iter();
+        let format = match format {
+            Some(format) => format,
+            None => CliImportFormat::parse(&positional.next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "import requires csv or ndjson")
+            })?)?,
+        };
+        let table = table.or_else(|| positional.next()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "import requires a table")
+        })?;
+        let input = input.or_else(|| positional.next().map(PathBuf::from));
+        if let Some(extra) = positional.next() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unexpected import argument {extra:?}"),
+            ));
+        }
+        Ok(Some(Self {
+            database,
+            format,
+            table,
+            input,
+        }))
+    }
 }
 
 impl CliOptions {

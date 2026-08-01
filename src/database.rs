@@ -1,13 +1,15 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::catalog::CatalogGeneration;
 use crate::error::{Error, LimitKind, Result};
+use crate::formats::{CsvBatchReader, CsvOptions, FormatError, NdjsonBatchReader, NdjsonOptions};
 use crate::persistence::{Persistence, StoreStatus};
 use crate::sql::{Comparison, Predicate, Statement, parse};
-use crate::storage::{ColumnDef, EngineTable as Table, Value};
+use crate::storage::{Column, ColumnBatch, ColumnDef, EngineTable as Table, Schema, Value};
 use crate::value::compare_int_float;
 
 pub(crate) trait ExecutionCancellation {
@@ -161,6 +163,42 @@ impl Database {
             sql,
             Some(ExecutionControl {
                 max_result_bytes,
+                cancellation,
+            }),
+        )
+    }
+
+    pub(crate) fn ingest_csv_controlled<R: BufRead>(
+        &self,
+        table: &str,
+        input: R,
+        options: CsvOptions,
+        cancellation: &dyn ExecutionCancellation,
+    ) -> std::result::Result<u64, FormatError> {
+        self.session().ingest_csv_inner(
+            table,
+            input,
+            options,
+            Some(ExecutionControl {
+                max_result_bytes: usize::MAX,
+                cancellation,
+            }),
+        )
+    }
+
+    pub(crate) fn ingest_ndjson_controlled<R: BufRead>(
+        &self,
+        table: &str,
+        input: R,
+        options: NdjsonOptions,
+        cancellation: &dyn ExecutionCancellation,
+    ) -> std::result::Result<u64, FormatError> {
+        self.session().ingest_ndjson_inner(
+            table,
+            input,
+            options,
+            Some(ExecutionControl {
+                max_result_bytes: usize::MAX,
                 cancellation,
             }),
         )
@@ -333,6 +371,95 @@ impl Session {
         self.execute_statement(parse(sql)?, None)
     }
 
+    /// Atomically appends a bounded CSV stream to a durable SQL table.
+    pub fn ingest_csv<R: BufRead>(
+        &mut self,
+        table: &str,
+        input: R,
+        options: CsvOptions,
+    ) -> std::result::Result<u64, FormatError> {
+        self.ingest_csv_inner(table, input, options, None)
+    }
+
+    fn ingest_csv_inner<R: BufRead>(
+        &mut self,
+        table: &str,
+        input: R,
+        options: CsvOptions,
+        control: Option<ExecutionControl<'_>>,
+    ) -> std::result::Result<u64, FormatError> {
+        let schema = self.ingestion_schema(table)?;
+        let batches = CsvBatchReader::new(input, &schema, options)?;
+        self.ingest_batches(table, batches, control)
+    }
+
+    /// Atomically appends a bounded NDJSON stream to a durable SQL table.
+    pub fn ingest_ndjson<R: BufRead>(
+        &mut self,
+        table: &str,
+        input: R,
+        options: NdjsonOptions,
+    ) -> std::result::Result<u64, FormatError> {
+        self.ingest_ndjson_inner(table, input, options, None)
+    }
+
+    fn ingest_ndjson_inner<R: BufRead>(
+        &mut self,
+        table: &str,
+        input: R,
+        options: NdjsonOptions,
+        control: Option<ExecutionControl<'_>>,
+    ) -> std::result::Result<u64, FormatError> {
+        let schema = self.ingestion_schema(table)?;
+        let batches = NdjsonBatchReader::new(input, &schema, options)?;
+        self.ingest_batches(table, batches, control)
+    }
+
+    fn ingestion_schema(&self, table: &str) -> std::result::Result<Schema, FormatError> {
+        let schema = if let Some(transaction) = &self.transaction {
+            transaction
+                .tables
+                .get(table)
+                .ok_or_else(|| Error::TableNotFound(table.to_owned()))?
+                .schema()
+        } else {
+            let snapshot = self.database.inner.snapshot()?;
+            return Schema::try_from(
+                snapshot
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| Error::TableNotFound(table.to_owned()))?
+                    .schema(),
+            )
+            .map_err(FormatError::Storage);
+        };
+        Schema::try_from(schema).map_err(FormatError::Storage)
+    }
+
+    fn ingest_batches<I>(
+        &mut self,
+        table: &str,
+        batches: I,
+        control: Option<ExecutionControl<'_>>,
+    ) -> std::result::Result<u64, FormatError>
+    where
+        I: IntoIterator<Item = std::result::Result<ColumnBatch, FormatError>>,
+    {
+        if let Some(transaction) = &mut self.transaction {
+            return ingest_transaction_batches(transaction, table, batches, control);
+        }
+
+        let snapshot = self.database.inner.snapshot()?;
+        let mut transaction = Transaction::new(snapshot, self.limits);
+        let rows = ingest_transaction_batches(&mut transaction, table, batches, control)?;
+        if rows == 0 {
+            return Ok(0);
+        }
+        check_cancellation(control)?;
+        self.database.inner.commit(&transaction, control)?;
+        Ok(rows)
+    }
+
     fn execute_statement(
         &mut self,
         statement: Statement,
@@ -432,6 +559,72 @@ impl Session {
         self.limits = limits;
         Ok(())
     }
+}
+
+fn ingest_transaction_batches<I>(
+    transaction: &mut Transaction,
+    table: &str,
+    batches: I,
+    control: Option<ExecutionControl<'_>>,
+) -> std::result::Result<u64, FormatError>
+where
+    I: IntoIterator<Item = std::result::Result<ColumnBatch, FormatError>>,
+{
+    let existing = transaction
+        .tables
+        .get(table)
+        .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
+    let mut replacement = existing.as_ref().clone();
+    let mut rows = 0_usize;
+    let mut bytes = table.len().saturating_add(8);
+    let mut final_charge = None;
+
+    for batch in batches {
+        check_cancellation(control)?;
+        let batch = batch?;
+        rows = rows
+            .checked_add(batch.rows())
+            .ok_or_else(|| Error::InvalidRow("import row count overflowed".to_owned()))?;
+        bytes = bytes.saturating_add(estimate_batch_bytes(&batch));
+        final_charge = Some(transaction.prospective_charge(rows, bytes)?);
+        replacement.append_batch(&batch)?;
+    }
+    check_cancellation(control)?;
+
+    if rows == 0 {
+        return Ok(0);
+    }
+    transaction
+        .tables
+        .insert(table.to_owned(), Arc::new(replacement));
+    transaction.touched_tables.insert(table.to_owned());
+    transaction.finish_charge(final_charge.expect("a non-empty import has a charge"));
+    u64::try_from(rows)
+        .map_err(|_| Error::InvalidRow("import row count is not representable".to_owned()).into())
+}
+
+fn estimate_batch_bytes(batch: &ColumnBatch) -> usize {
+    batch.columns().iter().fold(0_usize, |total, column| {
+        let column_bytes = match column {
+            Column::Int64(values) => values.iter().fold(0_usize, |total, value| {
+                total.saturating_add(if value.is_some() { 9 } else { 1 })
+            }),
+            Column::Float64(values) => values.iter().fold(0_usize, |total, value| {
+                total.saturating_add(if value.is_some() { 9 } else { 1 })
+            }),
+            Column::Bool(values) => values.iter().fold(0_usize, |total, value| {
+                total.saturating_add(if value.is_some() { 2 } else { 1 })
+            }),
+            Column::String(values) => values.iter().fold(0_usize, |total, value| {
+                total.saturating_add(
+                    value
+                        .as_ref()
+                        .map_or(1, |value| 9_usize.saturating_add(value.len())),
+                )
+            }),
+        };
+        total.saturating_add(column_bytes)
+    })
 }
 
 fn execute_write(transaction: &mut Transaction, statement: Statement) -> Result<StatementResult> {
@@ -719,6 +912,7 @@ fn compare(left: &Value, right: &Value, comparison: Comparison) -> bool {
 
 #[cfg(test)]
 mod cancellation_commit_tests {
+    use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
@@ -761,6 +955,51 @@ mod cancellation_commit_tests {
             self.publication_attempts.fetch_add(1, Ordering::SeqCst);
             !self.cancelled.load(Ordering::SeqCst)
         }
+    }
+
+    struct BatchCancellation {
+        checks: AtomicUsize,
+        publication_attempts: AtomicUsize,
+    }
+
+    impl ExecutionCancellation for BatchCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) >= 2
+        }
+
+        fn begin_publication(&self) -> bool {
+            self.publication_attempts.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[test]
+    fn cancelled_ingestion_discards_completed_batches_before_publication() {
+        let database = Database::new();
+        database.execute("CREATE TABLE events (id Int64)").unwrap();
+        let generation = database.current_generation().unwrap();
+        let cancellation = BatchCancellation {
+            checks: AtomicUsize::new(0),
+            publication_attempts: AtomicUsize::new(0),
+        };
+        let mut options = CsvOptions::default();
+        options.limits.batch_rows = 1;
+
+        assert!(matches!(
+            database.ingest_csv_controlled(
+                "events",
+                Cursor::new(b"id\n1\n2\n3\n"),
+                options,
+                &cancellation,
+            ),
+            Err(FormatError::Database(Error::QueryCancelled))
+        ));
+        assert_eq!(cancellation.publication_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(database.current_generation().unwrap(), generation);
+        assert!(matches!(
+            database.execute("SELECT * FROM events"),
+            Ok(StatementResult::Query(ResultSet { rows, .. })) if rows.is_empty()
+        ));
     }
 
     #[test]

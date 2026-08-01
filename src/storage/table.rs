@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::{DataType, Value};
+use crate::{Column, ColumnBatch, DataType, Schema, Value};
 
 /// A named field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,16 @@ impl ColumnData {
             (Self::Bool(values), Value::Null) => values.push(None),
             (Self::String(values), Value::Null) => values.push(None),
             _ => unreachable!("values are validated before they are appended"),
+        }
+    }
+
+    fn extend_batch(&mut self, column: &Column) {
+        match (self, column) {
+            (Self::Int64(target), Column::Int64(source)) => target.extend_from_slice(source),
+            (Self::Float64(target), Column::Float64(source)) => target.extend_from_slice(source),
+            (Self::Bool(target), Column::Bool(source)) => target.extend_from_slice(source),
+            (Self::String(target), Column::String(source)) => target.extend(source.iter().cloned()),
+            _ => unreachable!("batch types are validated before append"),
         }
     }
 
@@ -161,6 +171,22 @@ impl Table {
             for (column, value) in self.columns.iter_mut().zip(row) {
                 column.push(value);
             }
+        }
+        self.row_count = row_count;
+        Ok(())
+    }
+
+    pub(crate) fn append_batch(&mut self, batch: &ColumnBatch) -> Result<()> {
+        let schema = Schema::try_from(self.schema.as_slice())
+            .map_err(|error| Error::InvalidRow(error.to_string()))?;
+        ColumnBatch::validate(&schema, batch.columns())
+            .map_err(|error| Error::InvalidRow(error.to_string()))?;
+        let row_count = self
+            .row_count
+            .checked_add(batch.rows())
+            .ok_or_else(|| Error::InvalidRow("table row count overflowed".to_owned()))?;
+        for (target, source) in self.columns.iter_mut().zip(batch.columns()) {
+            target.extend_batch(source);
         }
         self.row_count = row_count;
         Ok(())

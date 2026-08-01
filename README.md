@@ -169,7 +169,7 @@ locks are released when `SnapshotStore` is dropped.
 
 ## Bulk CSV and NDJSON
 
-The library exposes query-independent typed storage and streaming bulk formats. A `Schema` defines ordered `Int64`, `Float64`, `Bool`, and `String` fields and whether each field accepts `NULL`. `CsvBatchReader` and `NdjsonBatchReader` produce rectangular `ColumnBatch` values without retaining the complete input.
+The library exposes query-independent typed storage and streaming bulk formats. A `Schema` defines ordered `Int64`, `Float64`, `Bool`, and `String` fields and whether each field accepts `NULL`. `CsvBatchReader` and `NdjsonBatchReader` produce rectangular `ColumnBatch` values without retaining the complete input. `Schema::try_from(&table_columns[..])` and `Schema::to_column_defs()` adapt between format schemas and durable SQL schemas.
 
 ```rust
 use rusthouse::formats::{CsvOptions, export_ndjson, ingest_csv};
@@ -204,6 +204,16 @@ The conversion rules are deliberately explicit:
 - Invalid UTF-8, non-finite floats, conversion failures, and `NULL` in non-nullable fields are typed errors. CSV and NDJSON exporters apply the inverse escaping rules and preserve schema order.
 
 `FormatLimits` independently bounds total input bytes, rows, fields per record, decoded field bytes, JSON nesting depth, decoded string bytes, record bytes, and rows per batch. JSON depth is capped at the stack-safe `MAX_JSON_NESTING_DEPTH`, and larger configurations are rejected. Batch columns allocate lazily as rows arrive, so a large batch limit does not reserve memory for an empty or short input. Parsing retains one bounded record and one typed batch. On Windows, macOS, and Linux, the `ingest_csv` and `ingest_ndjson` helpers write validated batches to an owner-only temporary spool, then replay them into the table. Unix creates the spool only after its private staging directory has been cleared of inherited ACL access; Windows installs a protected DACL during file creation. Other targets return `FormatError::UnsupportedPlatform` before creating a spool. A parse, limit, staging, or replay error leaves the destination at its original row count. Applications that consume the batch iterators directly own any already-consumed batches themselves.
+
+`Session::ingest_csv` and `Session::ingest_ndjson` append those bounded batches to an existing SQL table. The complete input is one transaction: a late parse, type, limit, cancellation, or conflict cannot expose a partial prefix. In an explicit transaction, a failed import also preserves work that was staged before the import. Autocommit imports publish through the durable snapshot protocol and survive reopen; as with SQL writes, a post-publication sync failure reports the full commit as durability-uncertain rather than implying rollback.
+
+The CLI imports a file, or standard input when the file is omitted or `-`:
+
+```bash
+rusthouse --database analytics.db -e 'CREATE TABLE events (id Int64, name String NULL)'
+rusthouse import csv --database analytics.db events events.csv
+cat events.ndjson | rusthouse import ndjson --database analytics.db events
+```
 
 ## Vector kernel layer
 
@@ -346,6 +356,12 @@ accept browser-safelisted form or `text/plain` submissions. Select an output wit
 | JSON array of row objects | `application/json` |
 | newline-delimited row objects | `application/x-ndjson` |
 | CSV with a header row | `text/csv` |
+
+`POST /import/{table}` atomically appends a request body to an existing durable
+table. Use `Content-Type: text/csv` for CSV with a header, or
+`Content-Type: application/x-ndjson` (also `application/ndjson`) for NDJSON. The
+normal request byte bound, execution deadline, cancellation, concurrency limits,
+and response negotiation apply to imports as well.
 
 Errors are JSON objects with stable codes, messages, and request IDs. The same
 request ID is returned in `x-request-id`. `GET /health/live` checks the process;
