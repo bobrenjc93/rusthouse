@@ -16,6 +16,19 @@ pub enum Error {
     TableAlreadyExists(String),
     /// A requested table does not exist.
     TableNotFound(String),
+    /// A view creation request reused an existing relation name.
+    ViewAlreadyExists(String),
+    /// A requested view does not exist.
+    ViewNotFound(String),
+    /// A data modification statement targeted a logical view.
+    CannotModifyView(String),
+    /// Logical view dependencies contain a recursive cycle.
+    ViewDependencyCycle(Vec<String>),
+    /// Logical view expansion exceeded the configured nesting limit.
+    ViewExpansionLimit {
+        /// Maximum number of nested views accepted by the resolver.
+        limit: usize,
+    },
     /// A schema contains the same column name more than once.
     DuplicateColumn(String),
     /// An identifier uses a reserved SQL literal.
@@ -67,6 +80,20 @@ impl fmt::Display for Error {
             }
             Self::TableAlreadyExists(table) => write!(f, "table '{table}' already exists"),
             Self::TableNotFound(table) => write!(f, "table '{table}' does not exist"),
+            Self::ViewAlreadyExists(view) => write!(f, "view '{view}' already exists"),
+            Self::ViewNotFound(view) => write!(f, "view '{view}' does not exist"),
+            Self::CannotModifyView(view) => {
+                write!(f, "cannot modify view '{view}'; views are read-only")
+            }
+            Self::ViewDependencyCycle(path) => {
+                write!(f, "view dependency cycle detected: {}", path.join(" -> "))
+            }
+            Self::ViewExpansionLimit { limit } => {
+                write!(
+                    f,
+                    "view expansion exceeds the limit of {limit} nested views"
+                )
+            }
             Self::DuplicateColumn(column) => write!(f, "duplicate column '{column}'"),
             Self::ReservedIdentifier {
                 identifier,

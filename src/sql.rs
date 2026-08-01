@@ -17,6 +17,18 @@ pub enum Statement {
         /// Ordered column definitions.
         columns: Vec<ColumnDef>,
     },
+    /// Creates a logical view backed by a validated `SELECT` query.
+    CreateView {
+        /// View name as written in SQL.
+        name: String,
+        /// Query evaluated whenever the view is referenced.
+        query: Select,
+    },
+    /// Removes a logical view from the catalog.
+    DropView {
+        /// View name as written in SQL.
+        name: String,
+    },
     /// Inserts one or more rows into a table.
     Insert {
         /// Target table name.
@@ -430,17 +442,28 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_keyword("CREATE") {
             self.parse_create()
+        } else if self.eat_keyword("DROP") {
+            self.parse_drop()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, DROP, INSERT, or SELECT")
         }
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
-        self.expect_keyword("TABLE")?;
+        if self.eat_keyword("TABLE") {
+            self.parse_create_table()
+        } else if self.eat_keyword("VIEW") {
+            self.parse_create_view()
+        } else {
+            self.error("expected keyword TABLE or VIEW after CREATE")
+        }
+    }
+
+    fn parse_create_table(&mut self) -> Result<Statement> {
         let name = self.expect_identifier("table name")?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
@@ -470,6 +493,20 @@ impl Parser {
         }
         self.expect(&TokenKind::RightParen, "')' after column definitions")?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_create_view(&mut self) -> Result<Statement> {
+        let name = self.expect_identifier("view name")?;
+        self.expect_keyword("AS")?;
+        self.expect_keyword("SELECT")?;
+        let query = self.parse_select()?;
+        Ok(Statement::CreateView { name, query })
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword("VIEW")?;
+        let name = self.expect_identifier("view name")?;
+        Ok(Statement::DropView { name })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -838,6 +875,26 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_create_and_drop_view() {
+        let statements = parse(
+            "CREATE VIEW totals AS SELECT region, SUM(amount) AS total \
+             FROM sales GROUP BY region; DROP VIEW totals",
+        )
+        .expect("valid view DDL");
+
+        let Statement::CreateView { name, query } = &statements[0] else {
+            panic!("expected create view");
+        };
+        assert_eq!(name, "totals");
+        assert_eq!(query.table, "sales");
+        assert_eq!(query.group_by, ["region"]);
+        assert!(matches!(
+            &statements[1],
+            Statement::DropView { name } if name == "totals"
+        ));
     }
 
     #[test]

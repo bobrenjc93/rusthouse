@@ -9,8 +9,10 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
 use crate::value::{DataType, Value, ValueRef};
+
+const MAX_VIEW_DEPTH: usize = 32;
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
@@ -84,7 +86,25 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::CreateView { name, query } => {
+                self.validate_new_view(&name, &query)?;
+                self.catalog.create_view(name, query)?;
+                Ok(StatementResult::Command {
+                    tag: "CREATE VIEW",
+                    affected_rows: 0,
+                })
+            }
+            Statement::DropView { name } => {
+                self.catalog.drop_view(&name)?;
+                Ok(StatementResult::Command {
+                    tag: "DROP VIEW",
+                    affected_rows: 0,
+                })
+            }
             Statement::Insert { table, rows } => {
+                if self.catalog.is_view(&table) {
+                    return Err(Error::CannotModifyView(table));
+                }
                 let affected_rows = rows.len();
                 {
                     let target = self.catalog.table(&table)?;
@@ -101,53 +121,225 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self.execute_select(&select).map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
-        let predicate = select
-            .predicate
-            .as_ref()
-            .map(|predicate| compile_predicate(table, predicate))
-            .transpose()?;
+    fn validate_new_view(&self, name: &str, query: &Select) -> Result<()> {
+        if self.catalog.contains_relation(name) {
+            return Err(Error::ViewAlreadyExists(name.to_owned()));
+        }
+
+        let pending = PendingView { name, query };
+        let schema = self.infer_view_schema(name, query, &mut Vec::new(), Some(pending))?;
+        Table::new(name.to_owned(), schema)?;
+        Ok(())
+    }
+
+    fn infer_view_schema(
+        &self,
+        name: &str,
+        query: &Select,
+        stack: &mut Vec<String>,
+        pending: Option<PendingView<'_>>,
+    ) -> Result<Vec<ColumnDef>> {
+        enter_view(name, stack)?;
+        let result = self.infer_select_schema(query, stack, pending);
+        stack.pop();
+        result
+    }
+
+    fn infer_select_schema(
+        &self,
+        select: &Select,
+        stack: &mut Vec<String>,
+        pending: Option<PendingView<'_>>,
+    ) -> Result<Vec<ColumnDef>> {
+        let source_schema = if let Some(table) = self.catalog.table_if_exists(&select.table) {
+            table.schema().to_vec()
+        } else {
+            let (name, query) = pending
+                .filter(|candidate| candidate.name.eq_ignore_ascii_case(&select.table))
+                .map(|candidate| (candidate.name, candidate.query))
+                .or_else(|| {
+                    self.catalog
+                        .view_if_exists(&select.table)
+                        .map(|view| (view.name(), view.query()))
+                })
+                .ok_or_else(|| Error::TableNotFound(select.table.clone()))?;
+            self.infer_view_schema(name, query, stack, pending)?
+        };
+
+        let source = Table::new(select.table.clone(), source_schema)?;
+        let plan = plan_select(&source, select)?;
+        Ok(plan
+            .result_columns
+            .into_iter()
+            .map(|column| ColumnDef {
+                name: column.name,
+                data_type: column.data_type,
+            })
+            .collect())
+    }
+
+    fn execute_select(&self, select: &Select) -> Result<QueryResult> {
+        self.execute_select_with_stack(select, &mut Vec::new())
+    }
+
+    fn execute_select_with_stack(
+        &self,
+        select: &Select,
+        stack: &mut Vec<String>,
+    ) -> Result<QueryResult> {
+        let source = self.resolve_source(&select.table, stack)?;
+        let table = source.table();
+        let plan = plan_select(table, select)?;
 
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
-                predicate
+                plan.predicate
                     .as_ref()
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
-        let (items, result_columns, aggregate_specs) =
-            resolve_select_items(table, &select.items, &group_columns)?;
-        let ordering = resolve_ordering(&result_columns, &select.order_by)?;
-
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        let grouped = !plan.group_columns.is_empty() || !plan.aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &plan.group_columns,
+                &plan.aggregate_specs,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
-                &items,
-                &ordering,
+                &plan.items,
+                &plan.ordering,
                 select.limit,
             );
-            grouped.project(&selected_groups, &items)
+            grouped.project(&selected_groups, &plan.items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
-            execute_projection(table, &matching_rows, &items)
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &plan.items,
+                &plan.ordering,
+                select.limit,
+            );
+            execute_projection(table, &matching_rows, &plan.items)
         };
 
         Ok(QueryResult {
-            columns: result_columns,
+            columns: plan.result_columns,
             rows,
         })
     }
+
+    fn resolve_source<'a>(
+        &'a self,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> Result<ResolvedSource<'a>> {
+        if let Some(table) = self.catalog.table_if_exists(name) {
+            return Ok(ResolvedSource::Table(table));
+        }
+        let view = self
+            .catalog
+            .view_if_exists(name)
+            .ok_or_else(|| Error::TableNotFound(name.to_owned()))?;
+
+        enter_view(view.name(), stack)?;
+        let result = self.execute_select_with_stack(view.query(), stack);
+        stack.pop();
+        materialize_view(view.name(), result?).map(ResolvedSource::View)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingView<'a> {
+    name: &'a str,
+    query: &'a Select,
+}
+
+#[derive(Debug)]
+enum ResolvedSource<'a> {
+    Table(&'a Table),
+    View(Table),
+}
+
+impl ResolvedSource<'_> {
+    fn table(&self) -> &Table {
+        match self {
+            Self::Table(table) => table,
+            Self::View(table) => table,
+        }
+    }
+}
+
+fn enter_view(name: &str, stack: &mut Vec<String>) -> Result<()> {
+    if let Some(start) = stack
+        .iter()
+        .position(|dependency| dependency.eq_ignore_ascii_case(name))
+    {
+        let mut cycle = stack[start..].to_vec();
+        cycle.push(name.to_owned());
+        return Err(Error::ViewDependencyCycle(cycle));
+    }
+    if stack.len() >= MAX_VIEW_DEPTH {
+        return Err(Error::ViewExpansionLimit {
+            limit: MAX_VIEW_DEPTH,
+        });
+    }
+    stack.push(name.to_owned());
+    Ok(())
+}
+
+fn materialize_view(name: &str, result: QueryResult) -> Result<Table> {
+    let schema = result
+        .columns
+        .into_iter()
+        .map(|column| ColumnDef {
+            name: column.name,
+            data_type: column.data_type,
+        })
+        .collect();
+    let mut table = Table::new(name.to_owned(), schema)?;
+    for row in result.rows {
+        table.insert_row(row)?;
+    }
+    Ok(table)
+}
+
+#[derive(Debug)]
+struct SelectPlan {
+    predicate: Option<CompiledPredicate>,
+    group_columns: Vec<usize>,
+    items: Vec<ResolvedItem>,
+    result_columns: Vec<ResultColumn>,
+    aggregate_specs: Vec<AggregateSpec>,
+    ordering: Vec<ResolvedOrder>,
+}
+
+fn plan_select(table: &Table, select: &Select) -> Result<SelectPlan> {
+    let predicate = select
+        .predicate
+        .as_ref()
+        .map(|predicate| compile_predicate(table, predicate))
+        .transpose()?;
+    let group_columns = resolve_group_columns(table, &select.group_by)?;
+    let (items, result_columns, aggregate_specs) =
+        resolve_select_items(table, &select.items, &group_columns)?;
+    let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+    Ok(SelectPlan {
+        predicate,
+        group_columns,
+        items,
+        result_columns,
+        aggregate_specs,
+        ordering,
+    })
 }
 
 #[derive(Debug)]
