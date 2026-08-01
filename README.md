@@ -1,23 +1,43 @@
 # RustHouse
 
-RustHouse is a from-scratch analytical database in Rust, inspired by the useful core of ClickHouse: typed columnar data, fast scans and aggregations, a practical SQL surface, and an operational interface that is easy to embed and understand.
+RustHouse is a from-scratch, in-memory analytical database in Rust, inspired by the useful core of ClickHouse: typed columnar data, scans and aggregations, a practical SQL surface, and an interface that is easy to embed and understand.
 
 This is intentionally not a wire-compatible ClickHouse clone. The goal is to grow a credible small competitor through measured, reviewed iterations while keeping the implementation approachable.
 
-## Product target
+## Current SQL surface
 
-The first useful release should support:
+The engine stores every table as typed column vectors and supports nullable and non-nullable `Int64`, `Float64`, `Bool`, and `String` columns. A session accepts semicolon-separated:
 
-- typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
-- a genuinely columnar in-memory representation;
-- `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
-- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
-- a batch/interactive CLI with readable table, CSV, and JSON output;
-- durable local snapshots with an explicit, documented file format;
-- an HTTP endpoint for executing SQL;
-- deterministic tests and a small benchmark that demonstrate analytical behavior.
+- `CREATE TABLE`, including `Nullable(T)`, `IF NOT EXISTS`, and `ENGINE = Memory`;
+- atomic multi-row `INSERT INTO ... [(columns)] VALUES ...`;
+- projections, `*`, aliases, numeric arithmetic, and `DISTINCT`;
+- `WHERE` comparisons combined with `AND`, `OR`, `NOT`, and parentheses;
+- SQL null comparisons through `IS NULL` and `IS NOT NULL`;
+- `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, with `GROUP BY` and `HAVING`;
+- multi-column `ORDER BY` with `ASC`/`DESC`, aliases, or ordinals;
+- `LIMIT n`, `LIMIT offset,n`, and `LIMIT n OFFSET offset`.
 
-The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
+The engine has no third-party dependencies. It returns typed lexing, parsing, catalog, type, execution, resource-limit, and I/O errors. Tables are session-local: persistence, transactions across statements, joins, window functions, and a network server are not implemented.
+
+## CLI
+
+Pass a SQL script on standard input. `CREATE` and `INSERT` do not print rows; every `SELECT` emits a CSVWithNames-compatible header and result in statement order.
+
+```bash
+cat <<'SQL' | cargo run --quiet -- --format csv
+CREATE TABLE readings (sensor String, value Float64, ok Bool);
+INSERT INTO readings VALUES ('a', 2.5, true), ('a', 3.5, true), ('b', 9, false);
+SELECT sensor, avg(value) AS mean
+FROM readings WHERE ok = true
+GROUP BY sensor ORDER BY mean DESC;
+SQL
+```
+
+CSV string fields and names use RFC 4180 quoting, and nulls are written as `\N`. Input is limited to 128 MiB, a catalog to 128 tables, a table to 256 columns and 5,000,000 rows, materialized results and output to 256 MiB, and expression nesting to 256 levels.
+
+## Library
+
+`rusthouse::Database::execute` exposes the same stateful SQL boundary. It returns one `QueryResult` for each `SELECT`; `rusthouse::write_csv` and `rusthouse::CsvWriter` render results.
 
 ## Development model
 
@@ -25,6 +45,7 @@ RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burn
 
 ```bash
 cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --help
 ```
 
