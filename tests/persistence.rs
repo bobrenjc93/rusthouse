@@ -25,6 +25,18 @@ fn lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock)
 }
 
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[test]
+fn unsupported_platform_is_rejected_before_database_or_lock_creation() {
+    let path = temporary_path("unsupported-platform");
+    assert!(matches!(
+        Database::open(&path),
+        Err(Error::UnsupportedPlatform(_))
+    ));
+    assert!(!path.exists());
+    assert!(!lock_path(&path).exists());
+}
+
 #[cfg(target_os = "macos")]
 fn install_inheritable_test_acl(path: &Path) {
     use exacl::{AclEntry, Flag, Perm};

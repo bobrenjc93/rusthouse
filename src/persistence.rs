@@ -65,6 +65,7 @@ pub(crate) struct Persistence {
 
 impl Persistence {
     pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
+        ensure_persistence_platform_supported()?;
         let path = normalize_path(&path)?;
         if path.file_name().is_some_and(is_reserved_name) {
             return Err(Error::ReservedDatabasePath(path.display().to_string()));
@@ -186,6 +187,18 @@ impl Persistence {
             result
         }
     }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn ensure_persistence_platform_supported() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn ensure_persistence_platform_supported() -> Result<()> {
+    Err(Error::UnsupportedPlatform(
+        "private snapshots require Windows, macOS, or Linux ACL semantics",
+    ))
 }
 
 #[cfg(not(unix))]

@@ -45,6 +45,7 @@ pub enum Error {
         limit: usize,
         attempted: usize,
     },
+    UnsupportedPlatform(&'static str),
     DatabaseAlreadyOpen(String),
     ReservedDatabasePath(String),
     UnsafeLockPath(String),
@@ -210,6 +211,9 @@ impl fmt::Display for Error {
                 f,
                 "snapshot {resource} limit exceeded: limit {limit}, attempted {attempted}"
             ),
+            Self::UnsupportedPlatform(message) => {
+                write!(f, "database persistence is unsupported: {message}")
+            }
             Self::DatabaseAlreadyOpen(path) => {
                 write!(f, "database is already open by another handle: {path}")
             }

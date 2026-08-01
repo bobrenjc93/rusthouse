@@ -1347,6 +1347,16 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_private_segment_file(path: &Path) -> io::Result<File> {
+    create_private_segment_file_with_security(path, |file| {
+        crate::catalog::protect_temp_security(file).map_err(io::Error::other)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_private_segment_file_with_security(
+    path: &Path,
+    protect: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = OpenOptions::new()
@@ -1354,7 +1364,21 @@ fn create_private_segment_file(path: &Path) -> io::Result<File> {
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    crate::catalog::protect_temp_security(&file).map_err(io::Error::other)?;
+    if let Err(protection_error) = protect(&file) {
+        drop(file);
+        return match std::fs::remove_file(path) {
+            Ok(()) => Err(protection_error),
+            Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {
+                Err(protection_error)
+            }
+            Err(cleanup_error) => Err(io::Error::new(
+                cleanup_error.kind(),
+                format!(
+                    "segment security setup failed: {protection_error}; temporary-file cleanup failed: {cleanup_error}"
+                ),
+            )),
+        };
+    }
     Ok(file)
 }
 
@@ -3284,6 +3308,26 @@ mod tests {
         )
         .unwrap();
         assert!(!acl_allows_nobody(&path));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn security_setup_failure_removes_created_segment_candidate() {
+        let directory = test_directory("segment-security-failure");
+        let path = directory.join(".segment.rhs.rusthouse-tmp-injected");
+        let error = create_private_segment_file_with_security(&path, |_| {
+            Err(io::Error::other("injected segment security failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected segment security failure")
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

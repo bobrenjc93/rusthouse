@@ -410,9 +410,9 @@ impl From<Error> for QueryError {
             | Error::MemoryLimitExceeded { .. }
             | Error::GroupLimitExceeded { .. }
             | Error::ExpressionTooDeep { .. } => QueryErrorKind::ResourceLimit,
-            Error::DatabaseAlreadyOpen(_) | Error::CommitRecoveryRequired(_) => {
-                QueryErrorKind::Unavailable
-            }
+            Error::UnsupportedPlatform(_)
+            | Error::DatabaseAlreadyOpen(_)
+            | Error::CommitRecoveryRequired(_) => QueryErrorKind::Unavailable,
             Error::QueryCancelled => QueryErrorKind::Unavailable,
             Error::CommitDurabilityUncertain { .. } => QueryErrorKind::PublishedUncertain,
             Error::ReservedDatabasePath(_)

@@ -1230,6 +1230,7 @@ fn set_private_unix_acl(file: &File, _is_directory: bool) -> Result<(), Snapshot
 
 #[cfg(unix)]
 pub(crate) fn protect_temp_security(file: &File) -> Result<(), SnapshotError> {
+    ensure_platform_supported()?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     set_private_unix_acl(file, false)?;
     rustix::fs::fchmod(file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
@@ -1347,6 +1348,7 @@ pub(crate) fn prepare_temp_security(
 ) -> Result<(), SnapshotError> {
     use std::os::unix::fs::MetadataExt;
 
+    ensure_platform_supported()?;
     if let Some(existing) = existing {
         let metadata = existing.metadata()?;
         rustix::fs::fchown(
@@ -1394,7 +1396,7 @@ fn copy_unix_acl(temp: &File, existing: &File) -> Result<(), SnapshotError> {
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn copy_unix_acl(_temp: &File, _existing: &File) -> Result<(), SnapshotError> {
-    Ok(())
+    ensure_platform_supported()
 }
 
 #[cfg(windows)]

@@ -258,7 +258,9 @@ CREATE accounting includes every persisted string length prefix, name, type,
 nullability flag, column count, and row-count field. A statement that would exceed either limit has no effect and leaves an
 explicit transaction active. The defaults are 1,000,000 rows and 256 MiB.
 
-`Database::open` persists each committed generation with a checksum and format version.
+On Windows, macOS, and Linux, `Database::open` persists each committed generation
+with a checksum and format version. Other targets return `Error::UnsupportedPlatform`
+before creating the database lock because their inherited ACL semantics are not implemented.
 It writes and syncs a temporary file, atomically renames it, and syncs the parent
 directory before publishing the generation to other sessions. A canonical database
 path has one exclusive in-process or cross-process owner; a second `Database::open`
@@ -278,10 +280,10 @@ Writer-side validation guarantees every committed catalog satisfies the decoder'
 table, column, row, string, file-size, and total-allocation bounds.
 
 Snapshot temporary files are protected owner-only before any catalog bytes are written
-and are synced before publication. Unix removes inherited ACL entries and Windows uses
-a protected DACL granting access only to the owner and system. Existing
-Unix UID/GID, modes, and ACLs are copied before the atomic rename (ACLs on macOS, Linux,
-and FreeBSD), followed by a parent-directory sync. If that final sync fails, the API
+and are synced before publication. Supported Unix targets remove inherited ACL entries,
+and Windows uses a protected DACL granting access only to the owner and system. Existing
+Unix UID/GID, modes, and native ACLs are copied before the atomic rename, followed by a
+parent-directory sync. If that final sync fails, the API
 returns `Error::CommitDurabilityUncertain` but installs the already-published generation
 in memory and ends the transaction. Windows uses `ReplaceFileW` for existing
 snapshots so ACL/security metadata is retained, and write-through `MoveFileExW` for
