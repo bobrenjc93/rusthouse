@@ -283,9 +283,12 @@ fn normalize_group_by(
     aliases: &HashMap<String, Expr>,
 ) -> Result<()> {
     for expression in &mut select.group_by {
-        if let Expr::Literal(Value::Int64(position)) = expression
-            && *position > 0
-        {
+        if let Expr::Literal(Value::Int64(position)) = expression {
+            if *position <= 0 {
+                return Err(Error::new(format!(
+                    "GROUP BY position {position} is outside the SELECT list"
+                )));
+            }
             let position = usize::try_from(*position)
                 .map_err(|_| Error::new("GROUP BY position is too large"))?;
             let item = select.items.get(position - 1).ok_or_else(|| {
@@ -361,6 +364,14 @@ fn validate_select(select: &Select, table: &Table) -> Result<()> {
         require_boolean(data_type, "HAVING")?;
     }
     for order in &select.order_by {
+        if let Expr::Literal(Value::Int64(position)) = order.expression
+            && (position <= 0
+                || usize::try_from(position).map_or(true, |position| position > select.items.len()))
+        {
+            return Err(Error::new(format!(
+                "ORDER BY position {position} is outside the SELECT list"
+            )));
+        }
         validate_expr(&order.expression, table, &aliases, true)?;
     }
 
@@ -749,7 +760,7 @@ fn estimate_expression_size(
                 maximum = maximum.max(estimate_expression_size(
                     &arguments[0],
                     &EvalContext::row(context.table, row),
-                    None,
+                    aliases,
                 )?);
             }
             Ok(maximum)
@@ -805,7 +816,7 @@ fn eval(
             name,
             arguments,
             distinct,
-        } => aggregate(name, arguments, *distinct, context),
+        } => aggregate(name, arguments, *distinct, context, aliases),
         Expr::Binary {
             left,
             operator,
@@ -833,6 +844,7 @@ fn aggregate(
     arguments: &[Expr],
     distinct: bool,
     context: &EvalContext<'_>,
+    aliases: Option<&HashMap<String, Expr>>,
 ) -> Result<Value> {
     let rows = context
         .rows
@@ -848,7 +860,7 @@ fn aggregate(
     let mut values = Vec::with_capacity(rows.len());
     let mut seen = HashSet::new();
     for &row in rows {
-        let value = eval(argument, &EvalContext::row(context.table, row), None)?;
+        let value = eval(argument, &EvalContext::row(context.table, row), aliases)?;
         if value == Value::Null {
             continue;
         }

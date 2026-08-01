@@ -6,6 +6,9 @@ use crate::sql::{ColumnDefinition, CreateTable};
 
 pub(crate) const MAX_COLUMNS: usize = 1_024;
 pub(crate) const MAX_ROWS: usize = 1_000_000;
+const MAX_TABLE_CELLS: usize = 10_000_000;
+const MAX_TABLE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_INSERT_STAGING_BYTES: usize = 128 * 1024 * 1024;
 
 /// A physical column type supported by RustHouse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +193,30 @@ impl ColumnData {
             _ => unreachable!("values are coerced before append (null={is_null})"),
         }
     }
+
+    fn try_reserve(&mut self, additional: usize) -> Result<()> {
+        let reserve = |error: std::collections::TryReserveError| {
+            Error::new(format!("unable to reserve column storage: {error}"))
+        };
+        match self {
+            Self::Int64 { values, nulls } => {
+                values.try_reserve(additional).map_err(reserve)?;
+                nulls.try_reserve(additional).map_err(reserve)
+            }
+            Self::Float64 { values, nulls } => {
+                values.try_reserve(additional).map_err(reserve)?;
+                nulls.try_reserve(additional).map_err(reserve)
+            }
+            Self::Bool { values, nulls } => {
+                values.try_reserve(additional).map_err(reserve)?;
+                nulls.try_reserve(additional).map_err(reserve)
+            }
+            Self::String { values, nulls } => {
+                values.try_reserve(additional).map_err(reserve)?;
+                nulls.try_reserve(additional).map_err(reserve)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +224,7 @@ pub(crate) struct Table {
     pub schema: Vec<ColumnSchema>,
     pub columns: Vec<ColumnData>,
     pub row_count: usize,
+    storage_bytes: usize,
     column_indexes: HashMap<String, usize>,
 }
 
@@ -228,7 +256,61 @@ impl Table {
         }
 
         let targets = self.insert_targets(column_names)?;
-        let mut staged = Vec::with_capacity(rows.len());
+        let table_cells = new_count
+            .checked_mul(self.schema.len())
+            .ok_or_else(|| Error::new("table cell count overflow"))?;
+        if table_cells > MAX_TABLE_CELLS {
+            return Err(Error::new(format!(
+                "table cell limit exceeded (maximum {MAX_TABLE_CELLS})"
+            )));
+        }
+
+        let mut target_positions = vec![None; self.schema.len()];
+        for (position, &target) in targets.iter().enumerate() {
+            target_positions[target] = Some(position);
+        }
+        for (index, schema) in self.schema.iter().enumerate() {
+            if target_positions[index].is_none() && !schema.nullable {
+                return Err(Error::new(format!(
+                    "INSERT omits non-nullable column '{}'",
+                    schema.name
+                )));
+            }
+        }
+
+        let row_storage_bytes = self.schema.iter().try_fold(0usize, |total, schema| {
+            total
+                .checked_add(base_storage_bytes(schema.data_type))
+                .ok_or_else(|| Error::new("table storage size overflow"))
+        })?;
+        let mut insert_bytes = row_storage_bytes
+            .checked_mul(rows.len())
+            .ok_or_else(|| Error::new("table storage size overflow"))?;
+        check_table_bytes(self.storage_bytes, insert_bytes)?;
+
+        let staged_cells = rows
+            .len()
+            .checked_mul(targets.len())
+            .ok_or_else(|| Error::new("INSERT staging size overflow"))?;
+        let staging_bytes = staged_cells
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| Error::new("INSERT staging size overflow"))?;
+        if staging_bytes > MAX_INSERT_STAGING_BYTES {
+            return Err(Error::new(format!(
+                "INSERT staging limit exceeded (maximum {MAX_INSERT_STAGING_BYTES} bytes)"
+            )));
+        }
+
+        let mut staged = targets
+            .iter()
+            .map(|_| {
+                let mut column = Vec::new();
+                column.try_reserve(rows.len()).map_err(|error| {
+                    Error::new(format!("unable to reserve INSERT staging: {error}"))
+                })?;
+                Ok(column)
+            })
+            .collect::<Result<Vec<Vec<Value>>>>()?;
         for (row_index, row) in rows.into_iter().enumerate() {
             if row.len() != targets.len() {
                 return Err(Error::new(format!(
@@ -238,35 +320,42 @@ impl Table {
                     targets.len()
                 )));
             }
-            let mut complete = vec![Value::Null; self.schema.len()];
-            for ((value, &target), input_position) in row.into_iter().zip(&targets).zip(0usize..) {
-                complete[target] = coerce(
+            for (input_position, (value, &target)) in row.into_iter().zip(&targets).enumerate() {
+                let value = coerce(
                     value,
                     &self.schema[target],
                     row_index + 1,
                     input_position + 1,
                 )?;
-            }
-            for (column_index, schema) in self.schema.iter().enumerate() {
-                if complete[column_index] == Value::Null && !schema.nullable {
-                    return Err(Error::new(format!(
-                        "INSERT row {} omits non-nullable column '{}'",
-                        row_index + 1,
-                        schema.name
-                    )));
+                if let Value::String(value) = &value {
+                    insert_bytes = insert_bytes
+                        .checked_add(value.len())
+                        .ok_or_else(|| Error::new("table storage size overflow"))?;
                 }
+                staged[input_position].push(value);
             }
-            staged.push(complete);
         }
+        check_table_bytes(self.storage_bytes, insert_bytes)?;
 
+        // Reservations may change capacities, but table values remain untouched on failure.
+        let inserted = staged.first().map_or(0, Vec::len);
+        for column in &mut self.columns {
+            column.try_reserve(inserted)?;
+        }
         // All fallible work is complete; mutations below commit the full statement.
-        let inserted = staged.len();
-        for row in staged {
-            for (column, value) in self.columns.iter_mut().zip(row) {
-                column.append(value);
+        for (column_index, column) in self.columns.iter_mut().enumerate() {
+            if let Some(position) = target_positions[column_index] {
+                for value in std::mem::take(&mut staged[position]) {
+                    column.append(value);
+                }
+            } else {
+                for _ in 0..inserted {
+                    column.append(Value::Null);
+                }
             }
         }
         self.row_count = new_count;
+        self.storage_bytes += insert_bytes;
         Ok(inserted)
     }
 
@@ -291,6 +380,29 @@ impl Table {
                     .ok_or_else(|| Error::new(format!("unknown column '{name}'")))
             })
             .collect()
+    }
+}
+
+fn base_storage_bytes(data_type: DataType) -> usize {
+    let value = match data_type {
+        DataType::Int64 => std::mem::size_of::<i64>(),
+        DataType::Float64 => std::mem::size_of::<f64>(),
+        DataType::Bool => std::mem::size_of::<bool>(),
+        DataType::String => std::mem::size_of::<String>(),
+    };
+    value + std::mem::size_of::<bool>()
+}
+
+fn check_table_bytes(existing: usize, additional: usize) -> Result<()> {
+    let total = existing
+        .checked_add(additional)
+        .ok_or_else(|| Error::new("table storage size overflow"))?;
+    if total > MAX_TABLE_BYTES {
+        Err(Error::new(format!(
+            "table storage byte limit exceeded (maximum {MAX_TABLE_BYTES} bytes)"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -362,6 +474,7 @@ impl Catalog {
                 schema,
                 columns,
                 row_count: 0,
+                storage_bytes: 0,
                 column_indexes,
             },
         );
@@ -470,5 +583,52 @@ mod tests {
             .insert("t", Some(&["id".to_owned()]), vec![vec![Value::Int64(1)]])
             .unwrap();
         assert_eq!(catalog.table("t").unwrap().value(1, 0), Value::Null);
+    }
+
+    #[test]
+    fn compact_inserts_obey_table_cell_and_byte_limits() {
+        fn wide_catalog(name: &str, columns: usize, data_type: DataType) -> Catalog {
+            let mut catalog = Catalog::default();
+            catalog
+                .create(CreateTable {
+                    name: name.to_owned(),
+                    if_not_exists: false,
+                    columns: (0..columns)
+                        .map(|index| ColumnDefinition {
+                            name: format!("c{index}"),
+                            data_type,
+                            nullable: true,
+                        })
+                        .collect(),
+                })
+                .unwrap();
+            catalog
+        }
+
+        let mut cells = wide_catalog("cells", MAX_COLUMNS, DataType::Bool);
+        let cell_rows = MAX_TABLE_CELLS / MAX_COLUMNS + 1;
+        let error = cells
+            .insert(
+                "cells",
+                Some(&["c0".to_owned()]),
+                vec![vec![Value::Bool(true)]; cell_rows],
+            )
+            .unwrap_err();
+        assert!(error.message().contains("table cell limit"));
+        assert_eq!(cells.table("cells").unwrap().row_count, 0);
+
+        let string_columns = 512;
+        let bytes_per_row = string_columns * base_storage_bytes(DataType::String);
+        let byte_rows = MAX_TABLE_BYTES / bytes_per_row + 1;
+        let mut bytes = wide_catalog("bytes", string_columns, DataType::String);
+        let error = bytes
+            .insert(
+                "bytes",
+                Some(&["c0".to_owned()]),
+                vec![vec![Value::String(String::new())]; byte_rows],
+            )
+            .unwrap_err();
+        assert!(error.message().contains("storage byte limit"));
+        assert_eq!(bytes.table("bytes").unwrap().row_count, 0);
     }
 }

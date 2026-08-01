@@ -1,6 +1,9 @@
 use crate::error::{Error, Result};
 use crate::storage::{DataType, Value};
 
+const MAX_SQL_TOKENS: usize = 1_000_000;
+const MAX_STATEMENTS: usize = 10_000;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Statement {
     Create(CreateTable),
@@ -152,6 +155,12 @@ impl<'a> Lexer<'a> {
         let mut tokens = Vec::new();
         loop {
             self.skip_trivia()?;
+            if tokens.len() >= MAX_SQL_TOKENS {
+                return Err(self.error(
+                    self.offset,
+                    format!("SQL token limit exceeded (maximum {MAX_SQL_TOKENS})"),
+                ));
+            }
             let offset = self.offset;
             let Some(character) = self.peek() else {
                 tokens.push(Token {
@@ -397,6 +406,11 @@ impl Parser {
         while !self.is_end() {
             if self.consume(&TokenKind::Semicolon) {
                 continue;
+            }
+            if statements.len() >= MAX_STATEMENTS {
+                return Err(Error::new(format!(
+                    "SQL statement limit exceeded (maximum {MAX_STATEMENTS})"
+                )));
             }
             statements.push(self.parse_statement()?);
             if !self.consume(&TokenKind::Semicolon) && !self.is_end() {

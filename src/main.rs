@@ -36,7 +36,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     for result in results {
-        if let Err(error) = output.write_all(render(&result, format).as_bytes()) {
+        let encoded = render(&result, format)?;
+        if let Err(error) = output.write_all(encoded.as_bytes()) {
             if error.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(());
             }

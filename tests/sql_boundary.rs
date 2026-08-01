@@ -238,3 +238,43 @@ fn int64_boundaries_and_quoted_keyword_columns_execute_correctly() {
     assert_eq!(result.rows[0][2], Value::String("stored".to_owned()));
     assert_eq!(result.rows[1][0], Value::Int64(i64::MAX));
 }
+
+#[test]
+fn aggregate_arguments_resolve_aliases_even_when_names_collide() {
+    let mut engine = Engine::new();
+    let results = engine
+        .execute(
+            "CREATE TABLE no_collision (x Int64);\
+             INSERT INTO no_collision VALUES (1), (2);\
+             SELECT x AS y, count(*) AS n FROM no_collision \
+             GROUP BY x HAVING count(y) > 0 ORDER BY y;\
+             CREATE TABLE collision (x Int64, y Nullable(Int64));\
+             INSERT INTO collision VALUES (1, NULL), (2, NULL);\
+             SELECT x AS y, count(*) AS n FROM collision \
+             GROUP BY x HAVING count(y) > 0 ORDER BY y;",
+        )
+        .unwrap();
+    assert_eq!(results[0].rows.len(), 2);
+    assert_eq!(results[1].rows.len(), 2);
+    assert_eq!(results[1].rows[0][0], Value::Int64(1));
+}
+
+#[test]
+fn order_and_group_positions_must_reference_the_select_list() {
+    let mut engine = populated_engine();
+    let valid = engine
+        .execute("SELECT region, id FROM facts ORDER BY 2 DESC LIMIT 1")
+        .unwrap()
+        .remove(0);
+    assert_eq!(valid.rows[0][1], Value::Int64(5));
+
+    for query in [
+        "SELECT id FROM facts ORDER BY 2",
+        "SELECT id FROM facts ORDER BY 0",
+        "SELECT id FROM facts ORDER BY -1",
+        "SELECT region, count(*) FROM facts GROUP BY 0",
+        "SELECT region, count(*) FROM facts GROUP BY 3",
+    ] {
+        assert!(engine.execute(query).is_err(), "accepted: {query}");
+    }
+}

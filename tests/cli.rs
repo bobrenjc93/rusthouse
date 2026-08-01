@@ -117,3 +117,53 @@ fn repeated_large_string_projections_respect_the_result_byte_limit() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn punctuation_heavy_input_respects_the_token_limit() {
+    let output = run_cli(&[], &";".repeat(1_000_001));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("token limit"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn json_accounts_for_repeated_large_aliases_before_rendering() {
+    let alias = "a".repeat(1024 * 1024);
+    let rows = (0..65)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>();
+    let sql = format!(
+        "CREATE TABLE aliases (x Int64); \
+         INSERT INTO aliases VALUES {}; \
+         SELECT x AS \"{alias}\" FROM aliases;",
+        rows.join(",")
+    );
+    let output = run_cli(&["--format", "json"], &sql);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("encoded output limit"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn json_rejects_duplicate_projected_names() {
+    let output = run_cli(
+        &["--format", "json"],
+        "CREATE TABLE duplicate_names (x Int64); \
+         INSERT INTO duplicate_names VALUES (1); \
+         SELECT x, x + 1 AS x FROM duplicate_names;",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate 'x'"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

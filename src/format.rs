@@ -1,6 +1,13 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
+use crate::error::{Error, Result};
 use crate::{QueryResult, Value};
+
+#[cfg(not(test))]
+const MAX_ENCODED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const MAX_ENCODED_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// A supported command-line result encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,15 +29,16 @@ impl OutputFormat {
 
 /// Encodes one query result. CSV has no header row; JSON is an array of
 /// objects whose keys are the projected column names.
-pub fn render(result: &QueryResult, format: OutputFormat) -> String {
-    match format {
-        OutputFormat::Csv => render_csv(result),
-        OutputFormat::Json => render_json(result),
-    }
+pub fn render(result: &QueryResult, format: OutputFormat) -> Result<String> {
+    let size = encoded_size(result, format)?;
+    Ok(match format {
+        OutputFormat::Csv => render_csv(result, size),
+        OutputFormat::Json => render_json(result, size),
+    })
 }
 
-fn render_csv(result: &QueryResult) -> String {
-    let mut output = String::new();
+fn render_csv(result: &QueryResult, capacity: usize) -> String {
+    let mut output = String::with_capacity(capacity);
     for row in &result.rows {
         for (index, value) in row.iter().enumerate() {
             if index != 0 {
@@ -64,8 +72,9 @@ fn csv_field(output: &mut String, value: &str) {
     }
 }
 
-fn render_json(result: &QueryResult) -> String {
-    let mut output = String::from("[");
+fn render_json(result: &QueryResult, capacity: usize) -> String {
+    let mut output = String::with_capacity(capacity);
+    output.push('[');
     for (row_index, row) in result.rows.iter().enumerate() {
         if row_index != 0 {
             output.push(',');
@@ -83,6 +92,127 @@ fn render_json(result: &QueryResult) -> String {
     }
     output.push_str("]\n");
     output
+}
+
+fn encoded_size(result: &QueryResult, format: OutputFormat) -> Result<usize> {
+    for row in &result.rows {
+        if row.len() != result.columns.len() {
+            return Err(Error::new(format!(
+                "result row has {} values but {} columns were expected",
+                row.len(),
+                result.columns.len()
+            )));
+        }
+    }
+    let size = match format {
+        OutputFormat::Csv => csv_size(result)?,
+        OutputFormat::Json => json_size(result)?,
+    };
+    if size > MAX_ENCODED_OUTPUT_BYTES {
+        Err(Error::new(format!(
+            "encoded output limit exceeded (maximum {MAX_ENCODED_OUTPUT_BYTES} bytes)"
+        )))
+    } else {
+        Ok(size)
+    }
+}
+
+fn csv_size(result: &QueryResult) -> Result<usize> {
+    result.rows.iter().try_fold(0usize, |total, row| {
+        let separators = row.len().saturating_sub(1) + 1;
+        let total = checked_output_add(total, separators)?;
+        row.iter().try_fold(total, |total, value| {
+            checked_output_add(total, csv_value_size(value))
+        })
+    })
+}
+
+fn csv_value_size(value: &Value) -> usize {
+    match value {
+        Value::Null => 2,
+        Value::Int64(value) => value.to_string().len(),
+        Value::Float64(value) => value.to_string().len(),
+        Value::Bool(value) => {
+            if *value {
+                4
+            } else {
+                5
+            }
+        }
+        Value::String(value) if value.contains([',', '"', '\n', '\r']) || value == "\\N" => {
+            2 + value.len() + value.bytes().filter(|byte| *byte == b'"').count()
+        }
+        Value::String(value) => value.len(),
+    }
+}
+
+fn json_size(result: &QueryResult) -> Result<usize> {
+    let mut names = HashSet::new();
+    let mut row_syntax = 2usize;
+    for (index, name) in result.columns.iter().enumerate() {
+        if !names.insert(name.as_str()) {
+            return Err(Error::new(format!(
+                "JSON output requires unique column names; duplicate '{name}'"
+            )));
+        }
+        if index != 0 {
+            row_syntax = checked_output_add(row_syntax, 1)?;
+        }
+        row_syntax = checked_output_add(row_syntax, json_string_size(name))?;
+        row_syntax = checked_output_add(row_syntax, 1)?;
+    }
+
+    let mut total = 3usize;
+    if !result.rows.is_empty() {
+        total = checked_output_add(total, result.rows.len() - 1)?;
+    }
+    total = checked_output_add(
+        total,
+        row_syntax
+            .checked_mul(result.rows.len())
+            .ok_or_else(output_size_error)?,
+    )?;
+    for row in &result.rows {
+        for value in row {
+            total = checked_output_add(total, json_value_size(value))?;
+        }
+    }
+    Ok(total)
+}
+
+fn json_value_size(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Int64(value) => value.to_string().len(),
+        Value::Float64(value) => value.to_string().len(),
+        Value::Bool(value) => {
+            if *value {
+                4
+            } else {
+                5
+            }
+        }
+        Value::String(value) => json_string_size(value),
+    }
+}
+
+fn json_string_size(value: &str) -> usize {
+    2 + value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+            control if control <= '\u{1f}' => 6,
+            other => other.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
+fn checked_output_add(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(output_size_error)
+}
+
+fn output_size_error() -> Error {
+    Error::new("encoded output size overflow")
 }
 
 fn json_value(output: &mut String, value: &Value) {
@@ -140,7 +270,7 @@ mod tests {
     #[test]
     fn renders_rfc_style_csv_without_a_header() {
         assert_eq!(
-            render(&result(), OutputFormat::Csv),
+            render(&result(), OutputFormat::Csv).unwrap(),
             "\"a,\"\"b\",1.5,true\n\"line\n2\",\\N,false\n"
         );
     }
@@ -148,8 +278,29 @@ mod tests {
     #[test]
     fn renders_typed_json_objects() {
         assert_eq!(
-            render(&result(), OutputFormat::Json),
+            render(&result(), OutputFormat::Json).unwrap(),
             "[{\"name\":\"a,\\\"b\",\"value\":1.5,\"valid\":true},{\"name\":\"line\\n2\",\"value\":null,\"valid\":false}]\n"
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_json_keys() {
+        let result = QueryResult {
+            columns: vec!["x".to_owned(), "x".to_owned()],
+            rows: vec![vec![Value::Int64(1), Value::Int64(2)]],
+        };
+        let error = render(&result, OutputFormat::Json).unwrap_err();
+        assert!(error.message().contains("duplicate 'x'"));
+        assert!(render(&result, OutputFormat::Csv).is_ok());
+    }
+
+    #[test]
+    fn accounts_for_repeated_json_column_names_before_allocating() {
+        let result = QueryResult {
+            columns: vec!["x".repeat(64 * 1024)],
+            rows: vec![vec![Value::Int64(1)]; 17],
+        };
+        let error = render(&result, OutputFormat::Json).unwrap_err();
+        assert!(error.message().contains("encoded output limit"));
     }
 }
