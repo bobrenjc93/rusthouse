@@ -1,16 +1,19 @@
-//! RustHouse is an experimental, compact analytical database.
+//! RustHouse is a compact, in-memory columnar analytical database.
+//!
+//! [`Engine`] owns an isolated catalog. It accepts a semicolon-separated SQL
+//! batch and returns a result for every statement.
 
-/// Returns the product name while the first storage engine is being built.
+mod engine;
+mod error;
+pub mod output;
+mod storage;
+mod types;
+
+pub use engine::{Engine, EngineConfig, QueryResult, StatementResult};
+pub use error::{Error, Result};
+pub use storage::{ColumnVector, Field, Schema, Table};
+pub use types::{DataType, Value};
+
 pub fn product_name() -> &'static str {
     "RustHouse"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identifies_the_database() {
-        assert_eq!(product_name(), "RustHouse");
-    }
 }
