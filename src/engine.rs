@@ -346,6 +346,11 @@ impl Engine {
                 "aggregate functions are not allowed in GROUP BY".into(),
             ));
         }
+        if select.selection.as_ref().is_some_and(contains_aggregate) {
+            return Err(Error::Constraint(
+                "aggregate functions are not allowed in WHERE".into(),
+            ));
+        }
         let alias_expressions = projections
             .iter()
             .map(|projection| (normalize_identifier(&projection.header), &projection.expr))
@@ -363,6 +368,7 @@ impl Engine {
             validate_expression_references(having, &source, &alias_expressions)?;
         }
         for order in order_by {
+            order_ordinal(&order.expr, projections.len())?;
             validate_expression_references(&order.expr, &source, &alias_expressions)?;
         }
         let empty_type_aliases = HashMap::new();
@@ -434,7 +440,6 @@ impl Engine {
             .map(|projection| projection.header.clone())
             .collect::<Vec<_>>();
         let mut projected = Vec::new();
-        let mut projected_bytes = columns_retained_bytes(&columns);
         for rows in groups {
             if let Some(having) = &select.having
                 && eval_group(
@@ -460,14 +465,6 @@ impl Engine {
                     &HashMap::new(),
                     &empty_type_aliases,
                 )?);
-            }
-            projected_bytes = projected_bytes.saturating_add(row_retained_bytes(&values));
-            if projected_bytes > self.config.max_batch_result_bytes {
-                return Err(Error::ResourceLimit {
-                    resource: "result bytes",
-                    limit: self.config.max_batch_result_bytes,
-                    actual: projected_bytes,
-                });
             }
             projected.push(ProjectedRow {
                 values,
@@ -769,13 +766,7 @@ fn parse_data_type(sql: &str) -> Result<(DataType, bool)> {
             DataType::Float64
         }
         "bool" | "boolean" => DataType::Bool,
-        name if name == "string"
-            || name == "text"
-            || name.starts_with("varchar")
-            || name.starts_with("char") =>
-        {
-            DataType::String
-        }
+        "string" | "text" | "varchar" | "char" => DataType::String,
         _ => return Err(Error::Unsupported(format!("data type {sql}"))),
     };
     Ok((data_type, nullable))
@@ -1963,7 +1954,11 @@ fn like_matches(value: &str, tokens: &[LikeToken]) -> bool {
 
 fn function_parts(function: &Function) -> Result<(String, &[FunctionArg], bool)> {
     let name = object_name(&function.name)?.to_ascii_lowercase();
-    if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() {
+    if function.over.is_some()
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+    {
         return Err(Error::Unsupported(format!("function modifiers on {name}")));
     }
     let FunctionArguments::List(arguments) = &function.args else {
@@ -3014,6 +3009,79 @@ mod tests {
         assert_eq!(
             query(&mut engine, "SELECT COUNT(*), COUNT(DISTINCT n) FROM t").rows,
             vec![vec![Value::Int64(3), Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn rejects_aggregates_in_where_at_all_cardinalities() {
+        let mut engine = Engine::default();
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        let sql = "SELECT COUNT(*) FROM t WHERE COUNT(*) > 0";
+        assert!(engine.execute(sql).is_err());
+        engine.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(engine.execute(sql).is_err());
+    }
+
+    #[test]
+    fn validates_order_by_ordinals_before_scanning() {
+        let mut engine = Engine::default();
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        assert!(engine.execute("SELECT n FROM t ORDER BY 2").is_err());
+        engine.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(engine.execute("SELECT n FROM t ORDER BY 2").is_err());
+        assert_eq!(
+            query(&mut engine, "SELECT n FROM t ORDER BY 1").rows,
+            vec![vec![Value::Int64(1)]]
+        );
+    }
+
+    #[test]
+    fn result_byte_limit_uses_rows_after_distinct_and_limit() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 100,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        engine
+            .execute("INSERT INTO t VALUES (1), (1), (1), (1)")
+            .unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT n FROM t LIMIT 1").rows,
+            vec![vec![Value::Int64(1)]]
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT DISTINCT n FROM t").rows,
+            vec![vec![Value::Int64(1)]]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_character_type_prefixes() {
+        let mut engine = Engine::default();
+        assert!(
+            engine
+                .execute("CREATE TABLE misspelled (n CHARLATAN)")
+                .is_err()
+        );
+        assert!(engine.table("misspelled").is_none());
+        engine.execute("CREATE TABLE valid (n VARCHAR)").unwrap();
+    }
+
+    #[test]
+    fn rejects_function_null_treatment_modifiers() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Nullable(Int64))")
+            .unwrap();
+        assert!(
+            engine
+                .execute("SELECT SUM(n) RESPECT NULLS FROM t")
+                .is_err()
+        );
+        assert!(
+            engine
+                .execute("SELECT LOWER(NULL) IGNORE NULLS FROM t")
+                .is_err()
         );
     }
 
