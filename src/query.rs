@@ -16,9 +16,11 @@ pub type QueryFuture<'a> =
 pub trait QueryService: Send + Sync + 'static {
     /// Executes one SQL statement and returns a materialized tabular result.
     ///
-    /// This method must construct and return its future promptly. Blocking work
-    /// and query side effects belong inside the future so server deadlines,
-    /// cancellation, and shutdown admission remain effective.
+    /// This method must construct and return its future promptly. The HTTP server
+    /// polls the future on a bounded blocking worker so a slow poll cannot starve
+    /// its async I/O workers. Blocking or CPU-heavy implementations must still
+    /// observe cancellation; otherwise they retain their execution slot until the
+    /// poll returns.
     fn execute(&self, request: QueryRequest) -> QueryFuture<'_>;
 
     /// Returns current readiness. This method must not block.

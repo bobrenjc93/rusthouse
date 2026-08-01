@@ -17,6 +17,7 @@ Options:
   --max-response-bytes BYTES     Maximum encoded result size [default: 16777216]
   --max-concurrent-queries N     Query execution slots [default: 16]
   --max-concurrent-requests N    HTTP query request slots [default: 64]
+  --max-connections N            Accepted client connections [default: 128]
   --request-body-timeout-ms MS   Request body deadline [default: 10000]
   --query-timeout-ms MS          Per-query deadline [default: 30000]
   --shutdown-timeout-ms MS       Graceful shutdown window [default: 10000]
@@ -94,6 +95,9 @@ async fn run() -> Result<(), String> {
             }
             "--max-concurrent-requests" => {
                 config.max_concurrent_requests = parse_number(&option, &value)?;
+            }
+            "--max-connections" => {
+                config.max_connections = parse_number(&option, &value)?;
             }
             "--request-body-timeout-ms" => {
                 config.request_body_timeout = Duration::from_millis(parse_number(&option, &value)?);

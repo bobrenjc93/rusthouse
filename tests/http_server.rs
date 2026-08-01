@@ -102,6 +102,18 @@ impl QueryService for TestService {
                     vec!["value".into()],
                     vec![vec![QueryValue::String("x".repeat(1024))]],
                 )),
+                "slow response" => Ok(QueryResult::new(
+                    vec!["value".into()],
+                    vec![vec![QueryValue::String("x".repeat(8 * 1024 * 1024))]],
+                )),
+                "blocking" => {
+                    std::thread::sleep(Duration::from_millis(300));
+                    rows_result()
+                }
+                "blocking shutdown" => {
+                    std::thread::sleep(Duration::from_secs(1));
+                    rows_result()
+                }
                 "bad sql" => Err(QueryError::invalid_query("test syntax error")),
                 _ => rows_result(),
             }
@@ -478,6 +490,134 @@ async fn bounds_and_times_out_stalled_request_bodies() {
 }
 
 #[tokio::test]
+async fn connection_cap_bounds_unread_response_buffers() {
+    const CONNECTIONS: usize = 2;
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        max_connections: CONNECTIONS,
+        max_concurrent_requests: CONNECTIONS,
+        max_response_bytes: 9 * 1024 * 1024,
+        ..ServerConfig::default()
+    };
+    let (server, _) = start(service.clone(), config).await;
+    let mut slow_readers = Vec::new();
+
+    for _ in 0..CONNECTIONS {
+        let mut connection = TcpStream::connect(server.local_addr()).await.unwrap();
+        write_query(&mut connection, "slow response").await;
+        let headers = read_http_head(&mut connection).await;
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        slow_readers.push(connection);
+    }
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), CONNECTIONS);
+
+    let mut waiting = TcpStream::connect(server.local_addr()).await.unwrap();
+    write_query(&mut waiting, "rows").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), CONNECTIONS);
+
+    drop(slow_readers.pop());
+    let response = tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut waiting))
+        .await
+        .expect("a connection slot should be released when a slow reader disconnects");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        service.execute_calls.load(Ordering::SeqCst),
+        CONNECTIONS + 1
+    );
+
+    drop(waiting);
+    drop(slow_readers);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn blocking_engine_poll_does_not_starve_http_or_release_its_slot_early() {
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        max_concurrent_queries: 1,
+        query_timeout: Duration::from_millis(40),
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(service.clone(), config).await;
+    let client = Client::new();
+    let query_client = client.clone();
+    let query_url = url.clone();
+    let blocking = tokio::spawn(async move {
+        query_client
+            .post(format!("{query_url}/query"))
+            .header("content-type", "application/sql")
+            .body("blocking")
+            .send()
+            .await
+            .unwrap()
+    });
+    service.wait_for_starts(1).await;
+
+    let health_started = Instant::now();
+    let health = tokio::time::timeout(
+        Duration::from_millis(100),
+        client.get(format!("{url}/health/live")).send(),
+    )
+    .await
+    .expect("blocking query poll must not stall the HTTP runtime")
+    .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(health_started.elapsed() < Duration::from_millis(100));
+
+    let timed_out = blocking.await.unwrap();
+    assert_eq!(timed_out.status(), StatusCode::GATEWAY_TIMEOUT);
+    let overloaded = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        overloaded.json::<Value>().await.unwrap()["error"]["code"],
+        "overloaded"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let recovered = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn blocking_engine_poll_does_not_delay_forced_shutdown() {
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        query_timeout: Duration::from_secs(5),
+        shutdown_timeout: Duration::from_millis(40),
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(service.clone(), config).await;
+    let overall_started = Instant::now();
+    let request = tokio::spawn(async move {
+        Client::new()
+            .post(format!("{url}/query"))
+            .header("content-type", "application/sql")
+            .body("blocking shutdown")
+            .send()
+            .await
+    });
+    service.wait_for_starts(1).await;
+
+    server.shutdown().await.unwrap();
+    assert!(overall_started.elapsed() < Duration::from_millis(500));
+    let _ = request.await;
+}
+
+#[tokio::test]
 async fn keeps_http_1_connection_alive_for_multiple_queries() {
     let service = Arc::new(TestService::new());
     let (server, _) = start(service, ServerConfig::default()).await;
@@ -564,31 +704,43 @@ async fn shutdown_is_bounded_and_cancels_work_after_grace_period() {
 }
 
 #[tokio::test]
-async fn forced_shutdown_closes_admission_before_a_stalled_body_can_execute() {
+async fn forced_shutdown_terminates_stalled_connection_tasks() {
     let service = Arc::new(TestService::new());
     let config = ServerConfig {
         request_body_timeout: Duration::from_secs(5),
         shutdown_timeout: Duration::from_millis(40),
+        max_response_bytes: 9 * 1024 * 1024,
         ..ServerConfig::default()
     };
     let (server, _) = start(service.clone(), config).await;
-    let mut connection = TcpStream::connect(server.local_addr()).await.unwrap();
-    connection
+    let mut stalled_body = TcpStream::connect(server.local_addr()).await.unwrap();
+    stalled_body
         .write_all(stalled_query_headers().as_bytes())
         .await
         .unwrap();
-    let interim = read_http_head(&mut connection).await;
+    let interim = read_http_head(&mut stalled_body).await;
     assert!(interim.starts_with("HTTP/1.1 100 Continue\r\n"));
 
-    let shutdown = tokio::spawn(server.shutdown());
-    tokio::time::sleep(Duration::from_millis(70)).await;
-    connection.write_all(b"rows").await.unwrap();
-    let response = read_http_response(&mut connection).await;
-    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
-    assert!(response.contains("\"code\":\"shutting_down\""));
+    let mut stalled_response = TcpStream::connect(server.local_addr()).await.unwrap();
+    write_query(&mut stalled_response, "slow response").await;
+    let response_headers = read_http_head(&mut stalled_response).await;
+    assert!(response_headers.starts_with("HTTP/1.1 200 OK\r\n"));
 
-    shutdown.await.unwrap().unwrap();
-    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 0);
+    let started = Instant::now();
+    server.shutdown().await.unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 1);
+
+    for mut connection in [stalled_body, stalled_response] {
+        let mut remaining = Vec::new();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("forced shutdown should close every connection task");
+        assert!(closed.is_ok());
+    }
 }
 
 fn stalled_query_headers() -> String {
@@ -601,6 +753,22 @@ fn stalled_query_headers() -> String {
         "\r\n"
     )
     .to_owned()
+}
+
+async fn write_query(stream: &mut TcpStream, sql: &str) {
+    let request = format!(
+        concat!(
+            "POST /query HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Content-Type: application/sql\r\n",
+            "Content-Length: {}\r\n",
+            "\r\n",
+            "{}"
+        ),
+        sql.len(),
+        sql
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
 }
 
 async fn read_http_response(stream: &mut TcpStream) -> String {

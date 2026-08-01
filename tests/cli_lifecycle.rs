@@ -1,3 +1,19 @@
+use std::process::Command;
+
+#[test]
+fn oversized_concurrency_is_reported_without_panicking() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["serve", "--max-concurrent-queries", &usize::MAX.to_string()])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid server config"));
+    assert!(stderr.contains("max_concurrent_queries must not exceed"));
+    assert!(!stderr.contains("panicked"));
+}
+
 #[cfg(unix)]
 mod unix {
     use std::{

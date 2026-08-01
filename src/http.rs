@@ -18,8 +18,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use hyper::server::conn::http1;
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::{JoinHandle, JoinSet},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::query::{
@@ -40,6 +46,8 @@ pub struct ServerConfig {
     pub max_concurrent_queries: usize,
     /// Maximum number of query requests being read or processed at once.
     pub max_concurrent_requests: usize,
+    /// Maximum number of accepted client connections.
+    pub max_connections: usize,
     /// Maximum time allowed to read a complete query request body.
     pub request_body_timeout: Duration,
     /// Maximum engine execution time for one query.
@@ -55,6 +63,7 @@ impl Default for ServerConfig {
             max_response_bytes: 16 * 1024 * 1024,
             max_concurrent_queries: 16,
             max_concurrent_requests: 64,
+            max_connections: 128,
             request_body_timeout: Duration::from_secs(10),
             query_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(10),
@@ -75,16 +84,9 @@ impl ServerConfig {
                 "max_response_bytes must be greater than zero".into(),
             ));
         }
-        if self.max_concurrent_queries == 0 {
-            return Err(ServerError::InvalidConfig(
-                "max_concurrent_queries must be greater than zero".into(),
-            ));
-        }
-        if self.max_concurrent_requests == 0 {
-            return Err(ServerError::InvalidConfig(
-                "max_concurrent_requests must be greater than zero".into(),
-            ));
-        }
+        validate_permit_count("max_concurrent_queries", self.max_concurrent_queries)?;
+        validate_permit_count("max_concurrent_requests", self.max_concurrent_requests)?;
+        validate_permit_count("max_connections", self.max_connections)?;
         if self.request_body_timeout.is_zero() {
             return Err(ServerError::InvalidConfig(
                 "request_body_timeout must be greater than zero".into(),
@@ -102,6 +104,21 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+fn validate_permit_count(name: &str, count: usize) -> Result<(), ServerError> {
+    if count == 0 {
+        return Err(ServerError::InvalidConfig(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    if count > Semaphore::MAX_PERMITS {
+        return Err(ServerError::InvalidConfig(format!(
+            "{name} must not exceed {}",
+            Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(())
 }
 
 /// An error produced while configuring or running the HTTP server.
@@ -264,12 +281,13 @@ pub fn spawn_on_listener(
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
 
-    let shutdown_signal = graceful_shutdown.clone();
-    let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal.cancelled_owned())
-            .await
-    });
+    let task = tokio::spawn(serve_connections(
+        listener,
+        app,
+        config.max_connections,
+        graceful_shutdown.clone(),
+        force_cancellation.clone(),
+    ));
 
     Ok(ServerHandle {
         local_addr,
@@ -279,6 +297,81 @@ pub fn spawn_on_listener(
         shutdown_timeout: config.shutdown_timeout,
         task: Some(task),
     })
+}
+
+async fn serve_connections(
+    listener: TcpListener,
+    app: Router,
+    max_connections: usize,
+    graceful_shutdown: CancellationToken,
+    force_cancellation: CancellationToken,
+) -> io::Result<()> {
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
+    let mut connections = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            () = graceful_shutdown.cancelled() => break,
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                let _ = result;
+            }
+            permit = connection_permits.clone().acquire_owned() => {
+                let permit = permit.expect("connection semaphore is never closed");
+                let accepted = tokio::select! {
+                    biased;
+                    () = graceful_shutdown.cancelled() => {
+                        drop(permit);
+                        break;
+                    }
+                    accepted = listener.accept() => accepted,
+                };
+                let (stream, _) = accepted?;
+                connections.spawn(serve_connection(
+                    stream,
+                    app.clone(),
+                    permit,
+                    graceful_shutdown.clone(),
+                    force_cancellation.clone(),
+                ));
+            }
+        }
+    }
+
+    while let Some(result) = connections.join_next().await {
+        let _ = result;
+    }
+    Ok(())
+}
+
+async fn serve_connection(
+    stream: TcpStream,
+    app: Router,
+    _permit: OwnedSemaphorePermit,
+    graceful_shutdown: CancellationToken,
+    force_cancellation: CancellationToken,
+) {
+    let connection =
+        http1::Builder::new().serve_connection(TokioIo::new(stream), TowerToHyperService::new(app));
+    tokio::pin!(connection);
+
+    tokio::select! {
+        biased;
+        () = force_cancellation.cancelled() => {}
+        result = &mut connection => {
+            let _ = result;
+        }
+        () = graceful_shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            tokio::select! {
+                biased;
+                () = force_cancellation.cancelled() => {}
+                result = &mut connection => {
+                    let _ = result;
+                }
+            }
+        }
+    }
 }
 
 async fn liveness(State(state): State<Arc<HttpState>>) -> Response {
@@ -374,10 +467,6 @@ async fn handle_query(
         .try_acquire_owned()
         .map_err(|_| ApiError::overloaded(state.config.max_concurrent_queries))?;
 
-    let admission = state
-        .query_admission
-        .enter()
-        .ok_or_else(ApiError::shutting_down)?;
     let token = state.force_cancellation.child_token();
     let cancellation = QueryCancellation::new(token.clone());
     let mut cancel_on_drop = CancelOnDrop(Some(cancellation.clone()));
@@ -386,26 +475,76 @@ async fn handle_query(
         request_id,
         cancellation,
     };
-    let execution = state.service.execute(query_request);
-    drop(admission);
+    let service = state.service.clone();
+    let query_admission = state.query_admission.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let deadline = tokio::time::Instant::now() + state.config.query_timeout;
+    let mut execution = tokio::task::spawn_blocking(move || {
+        let Some(admission) = query_admission.enter() else {
+            return EngineTaskOutput::AdmissionClosed(permit);
+        };
+        if query_request.cancellation.is_cancelled() {
+            return EngineTaskOutput::Cancelled(permit);
+        }
+        let execution = service.execute(query_request);
+        drop(admission);
+        EngineTaskOutput::Finished(permit, runtime.block_on(execution))
+    });
 
-    let result = tokio::select! {
+    let output = tokio::select! {
         biased;
         () = state.force_cancellation.cancelled() => {
             token.cancel();
+            execution.abort();
             return Err(ApiError::shutting_down());
         }
-        result = execution => result.map_err(ApiError::from_query_error)?,
-        () = tokio::time::sleep(state.config.query_timeout) => {
+        () = tokio::time::sleep_until(deadline) => {
             token.cancel();
+            execution.abort();
             return Err(ApiError::timeout(state.config.query_timeout));
         }
+        output = &mut execution => output
+            .map_err(|error| ApiError::blocking_task_failed("query execution", error))?,
     };
-    cancel_on_drop.0 = None;
+    let (permit, result) = match output {
+        EngineTaskOutput::AdmissionClosed(permit) => {
+            drop(permit);
+            return Err(ApiError::shutting_down());
+        }
+        EngineTaskOutput::Cancelled(permit) => {
+            drop(permit);
+            return Err(ApiError::shutting_down());
+        }
+        EngineTaskOutput::Finished(permit, result) => (permit, result),
+    };
+    let result = result.map_err(ApiError::from_query_error)?;
 
-    result.validate().map_err(ApiError::from_query_error)?;
-    let bytes = serialize_result(&result, format, state.config.max_response_bytes)?;
+    let response_limit = state.config.max_response_bytes;
+    let mut encoding = tokio::task::spawn_blocking(move || {
+        let encoded = result
+            .validate()
+            .map_err(ApiError::from_query_error)
+            .and_then(|()| serialize_result(&result, format, response_limit));
+        (permit, encoded)
+    });
+    let (permit, bytes) = tokio::select! {
+        biased;
+        () = state.force_cancellation.cancelled() => {
+            token.cancel();
+            encoding.abort();
+            return Err(ApiError::shutting_down());
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            token.cancel();
+            encoding.abort();
+            return Err(ApiError::timeout(state.config.query_timeout));
+        }
+        output = &mut encoding => output
+            .map_err(|error| ApiError::blocking_task_failed("result encoding", error))?,
+    };
     drop(permit);
+    let bytes = bytes?;
+    cancel_on_drop.0 = None;
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -414,6 +553,12 @@ async fn handle_query(
     );
     insert_common_headers(&mut response, request_id);
     Ok(response)
+}
+
+enum EngineTaskOutput {
+    AdmissionClosed(OwnedSemaphorePermit),
+    Cancelled(OwnedSemaphorePermit),
+    Finished(OwnedSemaphorePermit, Result<QueryResult, QueryError>),
 }
 
 struct CancelOnDrop(Option<QueryCancellation>);
@@ -921,6 +1066,10 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
+    fn blocking_task_failed(stage: &str, error: tokio::task::JoinError) -> Self {
+        Self::internal(format!("{stage} worker failed: {error}"))
+    }
+
     fn from_query_error(error: QueryError) -> Self {
         let status = match error.kind {
             QueryErrorKind::InvalidQuery => StatusCode::BAD_REQUEST,
@@ -1089,5 +1238,34 @@ mod tests {
         );
         let error = serialize_result(&result, ResponseFormat::Json, 4).unwrap_err();
         assert_eq!(error.code, "response_too_large");
+    }
+
+    #[test]
+    fn rejects_semaphore_counts_above_tokio_limit() {
+        let too_many = Semaphore::MAX_PERMITS + 1;
+        for field in [
+            "max_concurrent_queries",
+            "max_concurrent_requests",
+            "max_connections",
+        ] {
+            let mut config = ServerConfig::default();
+            match field {
+                "max_concurrent_queries" => config.max_concurrent_queries = too_many,
+                "max_concurrent_requests" => config.max_concurrent_requests = too_many,
+                "max_connections" => config.max_connections = too_many,
+                _ => unreachable!(),
+            }
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(field));
+            assert!(error.to_string().contains("must not exceed"));
+        }
+
+        let boundary = ServerConfig {
+            max_concurrent_queries: Semaphore::MAX_PERMITS,
+            max_concurrent_requests: Semaphore::MAX_PERMITS,
+            max_connections: Semaphore::MAX_PERMITS,
+            ..ServerConfig::default()
+        };
+        boundary.validate().unwrap();
     }
 }
