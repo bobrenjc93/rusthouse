@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TokenKind {
     Word(String),
+    QuotedWord(String),
     Number(String),
     String(String),
     Comma,
@@ -82,16 +83,25 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                                     position: start,
                                     message: "unterminated string escape".to_owned(),
                                 })?;
-                            value.push(match escaped {
-                                b'n' => '\n',
-                                b'r' => '\r',
-                                b't' => '\t',
-                                b'0' => '\0',
-                                b'\\' => '\\',
-                                b'\'' => '\'',
-                                other => other as char,
-                            });
-                            position += 1;
+                            if escaped.is_ascii() {
+                                value.push(match escaped {
+                                    b'n' => '\n',
+                                    b'r' => '\r',
+                                    b't' => '\t',
+                                    b'0' => '\0',
+                                    b'\\' => '\\',
+                                    b'\'' => '\'',
+                                    other => other as char,
+                                });
+                                position += 1;
+                            } else {
+                                let character = input[position..]
+                                    .chars()
+                                    .next()
+                                    .expect("escape position is a UTF-8 boundary");
+                                value.push(character);
+                                position += character.len_utf8();
+                            }
                         }
                         byte if byte.is_ascii() => {
                             value.push(byte as char);
@@ -148,7 +158,7 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                     });
                 }
                 tokens.push(Token {
-                    kind: TokenKind::Word(value),
+                    kind: TokenKind::QuotedWord(value),
                     position: start,
                 });
             }

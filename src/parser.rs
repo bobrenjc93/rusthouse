@@ -1,5 +1,6 @@
 use crate::ast::{BinaryOp, Expr, OrderItem, Select, SelectItem, Statement, UnaryOp};
 use crate::error::{Error, Result};
+use crate::identifier::{Identifier, ObjectName};
 use crate::lexer::{Token, TokenKind, lex};
 use crate::storage::ColumnSchema;
 use crate::value::{DataType, Value};
@@ -10,6 +11,7 @@ pub(crate) fn parse(input: &str) -> Result<Vec<Statement>> {
         tokens,
         index: 0,
         expression_depth: 0,
+        expression_nodes: 0,
     }
     .parse_script()
 }
@@ -18,9 +20,11 @@ struct Parser {
     tokens: Vec<Token>,
     index: usize,
     expression_depth: usize,
+    expression_nodes: usize,
 }
 
 const MAX_EXPRESSION_DEPTH: usize = 256;
+const MAX_EXPRESSION_NODES: usize = 1_024;
 
 impl Parser {
     fn parse_script(&mut self) -> Result<Vec<Statement>> {
@@ -72,9 +76,10 @@ impl Parser {
                 nullable = true;
             }
             columns.push(ColumnSchema {
-                name,
+                name: name.value,
                 data_type,
                 nullable,
+                quoted: name.quoted,
             });
             if self.consume(&TokenKind::Comma) {
                 continue;
@@ -85,7 +90,7 @@ impl Parser {
 
         if self.consume_word("engine") {
             self.consume(&TokenKind::Equal);
-            let engine = self.parse_identifier()?;
+            let engine = self.parse_word_identifier()?;
             if !engine.eq_ignore_ascii_case("memory") {
                 return Err(Error::parse(
                     self.previous_position(),
@@ -104,7 +109,7 @@ impl Parser {
     }
 
     fn parse_data_type(&mut self) -> Result<(DataType, bool)> {
-        let name = self.parse_identifier()?;
+        let name = self.parse_word_identifier()?;
         if name.eq_ignore_ascii_case("nullable") {
             self.expect(TokenKind::LeftParen, "'('")?;
             let (kind, nested_nullable) = self.parse_data_type()?;
@@ -280,7 +285,7 @@ impl Parser {
             (None, 0)
         };
         if self.consume_word("format") {
-            let format = self.parse_identifier()?;
+            let format = self.parse_word_identifier()?;
             if !format.eq_ignore_ascii_case("csv") && !format.eq_ignore_ascii_case("csvwithnames") {
                 return Err(Error::parse(
                     self.previous_position(),
@@ -313,6 +318,9 @@ impl Parser {
     }
 
     fn parse_expr(&mut self, minimum_precedence: u8) -> Result<Expr> {
+        if self.expression_depth == 0 {
+            self.expression_nodes = 0;
+        }
         if self.expression_depth >= MAX_EXPRESSION_DEPTH {
             return Err(Error::Limit {
                 resource: "SQL expression nesting",
@@ -339,6 +347,7 @@ impl Parser {
                     expr: Box::new(left),
                     negated,
                 };
+                self.note_expression_node()?;
                 continue;
             }
             let Some((operator, precedence)) = self.current_binary_operator() else {
@@ -354,28 +363,41 @@ impl Parser {
                 op: operator,
                 right: Box::new(right),
             };
+            self.note_expression_node()?;
         }
         Ok(left)
     }
 
     fn parse_prefix(&mut self) -> Result<Expr> {
         if self.consume(&TokenKind::Plus) {
-            return Ok(Expr::Unary {
+            let expression = Expr::Unary {
                 op: UnaryOp::Plus,
                 expr: Box::new(self.parse_expr(6)?),
-            });
+            };
+            self.note_expression_node()?;
+            return Ok(expression);
         }
         if self.consume(&TokenKind::Minus) {
-            return Ok(Expr::Unary {
+            if let TokenKind::Number(text) = self.current().kind.clone() {
+                let position = self.current().position;
+                self.index += 1;
+                self.note_expression_node()?;
+                return Ok(Expr::Literal(parse_number(&text, position, true)?));
+            }
+            let expression = Expr::Unary {
                 op: UnaryOp::Minus,
                 expr: Box::new(self.parse_expr(6)?),
-            });
+            };
+            self.note_expression_node()?;
+            return Ok(expression);
         }
         if self.consume_word("not") {
-            return Ok(Expr::Unary {
+            let expression = Expr::Unary {
                 op: UnaryOp::Not,
-                expr: Box::new(self.parse_expr(6)?),
-            });
+                expr: Box::new(self.parse_expr(3)?),
+            };
+            self.note_expression_node()?;
+            return Ok(expression);
         }
         if self.consume(&TokenKind::LeftParen) {
             let expression = self.parse_expr(0)?;
@@ -383,6 +405,7 @@ impl Parser {
             return Ok(expression);
         }
         if self.consume(&TokenKind::Star) {
+            self.note_expression_node()?;
             return Ok(Expr::Wildcard);
         }
 
@@ -390,22 +413,27 @@ impl Parser {
         match token.kind {
             TokenKind::Number(text) => {
                 self.index += 1;
+                self.note_expression_node()?;
                 Ok(Expr::Literal(parse_number(&text, token.position, false)?))
             }
             TokenKind::String(value) => {
                 self.index += 1;
+                self.note_expression_node()?;
                 Ok(Expr::Literal(Value::String(value)))
             }
             TokenKind::Word(word) if word.eq_ignore_ascii_case("null") => {
                 self.index += 1;
+                self.note_expression_node()?;
                 Ok(Expr::Literal(Value::Null))
             }
             TokenKind::Word(word) if word.eq_ignore_ascii_case("true") => {
                 self.index += 1;
+                self.note_expression_node()?;
                 Ok(Expr::Literal(Value::Bool(true)))
             }
             TokenKind::Word(word) if word.eq_ignore_ascii_case("false") => {
                 self.index += 1;
+                self.note_expression_node()?;
                 Ok(Expr::Literal(Value::Bool(false)))
             }
             TokenKind::Word(word) => {
@@ -421,15 +449,25 @@ impl Parser {
                         }
                         self.expect(TokenKind::RightParen, "')'")?;
                     }
+                    self.note_expression_node()?;
                     Ok(Expr::Function { name: word, args })
                 } else {
-                    let mut name = word;
+                    let mut parts = vec![Identifier::unquoted(word)];
                     while self.consume(&TokenKind::Dot) {
-                        name.push('.');
-                        name.push_str(&self.parse_identifier()?);
+                        parts.push(self.parse_identifier()?);
                     }
-                    Ok(Expr::Column(name))
+                    self.note_expression_node()?;
+                    Ok(Expr::Column(parts))
                 }
+            }
+            TokenKind::QuotedWord(word) => {
+                self.index += 1;
+                let mut parts = vec![Identifier::quoted(word)];
+                while self.consume(&TokenKind::Dot) {
+                    parts.push(self.parse_identifier()?);
+                }
+                self.note_expression_node()?;
+                Ok(Expr::Column(parts))
             }
             _ => Err(self.expected("an expression")),
         }
@@ -455,7 +493,7 @@ impl Parser {
         Some(pair)
     }
 
-    fn parse_identifier_list(&mut self) -> Result<Vec<String>> {
+    fn parse_identifier_list(&mut self) -> Result<Vec<Identifier>> {
         let mut names = Vec::new();
         loop {
             names.push(self.parse_identifier()?);
@@ -466,22 +504,35 @@ impl Parser {
         Ok(names)
     }
 
-    fn parse_object_name(&mut self) -> Result<String> {
-        let mut name = self.parse_identifier()?;
+    fn parse_object_name(&mut self) -> Result<ObjectName> {
+        let mut parts = vec![self.parse_identifier()?];
         while self.consume(&TokenKind::Dot) {
-            name.push('.');
-            name.push_str(&self.parse_identifier()?);
+            parts.push(self.parse_identifier()?);
         }
-        Ok(name)
+        Ok(ObjectName(parts))
     }
 
-    fn parse_identifier(&mut self) -> Result<String> {
+    fn parse_identifier(&mut self) -> Result<Identifier> {
+        match self.current().kind.clone() {
+            TokenKind::Word(name) => {
+                self.index += 1;
+                Ok(Identifier::unquoted(name))
+            }
+            TokenKind::QuotedWord(name) => {
+                self.index += 1;
+                Ok(Identifier::quoted(name))
+            }
+            _ => Err(self.expected("an identifier")),
+        }
+    }
+
+    fn parse_word_identifier(&mut self) -> Result<String> {
         match self.current().kind.clone() {
             TokenKind::Word(name) => {
                 self.index += 1;
                 Ok(name)
             }
-            _ => Err(self.expected("an identifier")),
+            _ => Err(self.expected("an unquoted identifier")),
         }
     }
 
@@ -518,8 +569,20 @@ impl Parser {
                     | "or"
                     | "is"
             ),
+            TokenKind::QuotedWord(_) => true,
             _ => false,
         }
+    }
+
+    fn note_expression_node(&mut self) -> Result<()> {
+        self.expression_nodes += 1;
+        if self.expression_nodes > MAX_EXPRESSION_NODES {
+            return Err(Error::Limit {
+                resource: "SQL expression nodes",
+                limit: MAX_EXPRESSION_NODES,
+            });
+        }
+        Ok(())
     }
 
     fn expect_word(&mut self, expected: &str) -> Result<()> {
@@ -604,7 +667,9 @@ fn parse_number(text: &str, position: usize, negative: bool) -> Result<Value> {
 
 fn describe(kind: &TokenKind) -> String {
     match kind {
-        TokenKind::Word(word) | TokenKind::Number(word) => format!("'{word}'"),
+        TokenKind::Word(word) | TokenKind::QuotedWord(word) | TokenKind::Number(word) => {
+            format!("'{word}'")
+        }
         TokenKind::String(_) => "a string literal".to_owned(),
         TokenKind::Eof => "end of input".to_owned(),
         other => format!("'{other:?}'"),

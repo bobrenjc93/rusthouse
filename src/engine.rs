@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinaryOp, Expr, OrderItem, Select, SelectItem, Statement, UnaryOp};
 use crate::error::{Error, Result};
+use crate::identifier::Identifier;
 use crate::parser;
-use crate::storage::{Catalog, Table, normalize};
+use crate::storage::{Catalog, Table};
 use crate::value::{DataType, Value};
 
 pub const MAX_RESULT_ROWS: usize = 5_000_000;
@@ -82,7 +83,7 @@ impl Database {
     fn select(&self, mut query: Select, byte_limit: usize) -> Result<QueryResult> {
         let table = query
             .table
-            .as_deref()
+            .as_ref()
             .map(|name| self.catalog.table(name))
             .transpose()?;
         query.projection = expand_wildcard(query.projection, table)?;
@@ -121,21 +122,25 @@ impl Database {
                 .iter()
                 .any(|item| item.expr.contains_aggregate());
 
-        if aggregate_query {
-            for item in &query.projection {
-                validate_group_expression(&item.expr, &query.group_by)?;
-            }
-        }
+        validate_aggregate_query(&query, aggregate_query)?;
 
         let mut records = Vec::new();
-        let mut materialized_bytes = 0_usize;
+        let mut materialized_bytes = filtered_rows
+            .len()
+            .saturating_mul(std::mem::size_of::<usize>());
+        ensure_materialized_limit(materialized_bytes, byte_limit)?;
         if aggregate_query {
             let groups = if query.group_by.is_empty() {
                 vec![filtered_rows]
             } else {
-                build_groups(table, &filtered_rows, &query.group_by)?
+                build_groups(
+                    table,
+                    &filtered_rows,
+                    &query.group_by,
+                    &mut materialized_bytes,
+                    byte_limit,
+                )?
             };
-            records.reserve(groups.len().min(MAX_RESULT_ROWS));
             for group in groups {
                 if let Some(record) = evaluate_record(&query, table, &group, true, records.len())? {
                     push_record(&mut records, record, &mut materialized_bytes, byte_limit)?;
@@ -146,12 +151,6 @@ impl Database {
                 .limit
                 .filter(|_| query.order_by.is_empty() && !query.distinct)
                 .map(|limit| query.offset.saturating_add(limit));
-            records.reserve(
-                early_stop
-                    .unwrap_or(filtered_rows.len())
-                    .min(filtered_rows.len())
-                    .min(MAX_RESULT_ROWS),
-            );
             for row in filtered_rows {
                 if early_stop.is_some_and(|count| records.len() >= count) {
                     break;
@@ -169,8 +168,7 @@ impl Database {
         }
 
         if query.distinct {
-            let mut seen = HashSet::with_capacity(records.len());
-            records.retain(|record| seen.insert(RowKey::from_values(&record.values)));
+            apply_distinct(&mut records, materialized_bytes, byte_limit)?;
         }
         if !query.order_by.is_empty() {
             records.sort_by(|left, right| compare_records(left, right, &query.order_by));
@@ -189,20 +187,19 @@ impl Database {
         let columns = query
             .projection
             .iter()
-            .enumerate()
-            .map(|(column, item)| {
-                let data_type = rows.iter().find_map(|row| row[column].data_type());
-                let nullable = rows.iter().any(|row| row[column] == Value::Null);
-                ResultColumn {
+            .map(|item| {
+                let expression_type = infer_expr_type(&item.expr, table)?;
+                Ok(ResultColumn {
                     name: item
                         .alias
-                        .clone()
+                        .as_ref()
+                        .map(|alias| alias.value.clone())
                         .unwrap_or_else(|| item.expr.display_name()),
-                    data_type,
-                    nullable,
-                }
+                    data_type: expression_type.data_type,
+                    nullable: expression_type.nullable,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -255,20 +252,14 @@ fn push_record(
     materialized_bytes: &mut usize,
     byte_limit: usize,
 ) -> Result<()> {
-    *materialized_bytes = (*materialized_bytes).saturating_add(
-        record
-            .values
-            .iter()
-            .chain(&record.order_values)
-            .map(value_size)
-            .sum::<usize>(),
-    );
-    if *materialized_bytes > byte_limit {
-        return Err(Error::Limit {
-            resource: "materialized query result bytes",
-            limit: MAX_MATERIALIZED_RESULT_BYTES,
-        });
-    }
+    let record_bytes = record
+        .values
+        .iter()
+        .chain(&record.order_values)
+        .map(value_size)
+        .sum::<usize>()
+        .saturating_add(std::mem::size_of::<Record>().saturating_mul(2));
+    add_materialized_bytes(materialized_bytes, record_bytes, byte_limit)?;
     records.push(record);
     if records.len() > MAX_RESULT_ROWS {
         return Err(Error::Limit {
@@ -277,6 +268,54 @@ fn push_record(
         });
     }
     Ok(())
+}
+
+fn add_materialized_bytes(total: &mut usize, bytes: usize, byte_limit: usize) -> Result<()> {
+    *total = total.saturating_add(bytes);
+    ensure_materialized_limit(*total, byte_limit)
+}
+
+fn ensure_materialized_limit(bytes: usize, byte_limit: usize) -> Result<()> {
+    if bytes > byte_limit {
+        return Err(Error::Limit {
+            resource: "materialized query result bytes",
+            limit: MAX_MATERIALIZED_RESULT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn apply_distinct(records: &mut Vec<Record>, base_bytes: usize, byte_limit: usize) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    let mut materialized_bytes = base_bytes;
+    for record in records.drain(..) {
+        let key = RowKey::from_values(&record.values);
+        if seen.contains(&key) {
+            continue;
+        }
+        add_materialized_bytes(
+            &mut materialized_bytes,
+            row_key_size(&key)
+                .saturating_add(std::mem::size_of::<RowKey>())
+                .saturating_add(64),
+            byte_limit,
+        )?;
+        seen.insert(key);
+        unique.push(record);
+    }
+    *records = unique;
+    Ok(())
+}
+
+fn row_key_size(key: &RowKey) -> usize {
+    key.0
+        .iter()
+        .map(|value| match value {
+            KeyValue::String(value) => value.len().saturating_add(std::mem::size_of::<KeyValue>()),
+            _ => std::mem::size_of::<KeyValue>(),
+        })
+        .fold(0_usize, usize::saturating_add)
 }
 
 fn value_size(value: &Value) -> usize {
@@ -300,6 +339,99 @@ fn result_size(result: &QueryResult) -> usize {
         .fold(0_usize, usize::saturating_add)
 }
 
+#[derive(Clone, Copy)]
+struct ExprType {
+    data_type: Option<DataType>,
+    nullable: bool,
+}
+
+fn infer_expr_type(expression: &Expr, table: Option<&Table>) -> Result<ExprType> {
+    match expression {
+        Expr::Literal(value) => Ok(ExprType {
+            data_type: value.data_type(),
+            nullable: matches!(value, Value::Null),
+        }),
+        Expr::Column(parts) => {
+            let identifier = parts
+                .last()
+                .ok_or_else(|| Error::execution("empty column reference"))?;
+            let table = table.ok_or_else(|| {
+                Error::execution(format!("column '{}' requires a table", identifier.value))
+            })?;
+            let column = table.column_schema(identifier)?;
+            Ok(ExprType {
+                data_type: Some(column.data_type),
+                nullable: column.nullable,
+            })
+        }
+        Expr::Wildcard => Err(Error::execution("wildcard has no scalar result metadata")),
+        Expr::Unary { op, expr } => {
+            let mut expression_type = infer_expr_type(expr, table)?;
+            if matches!(op, UnaryOp::Not) {
+                expression_type.data_type = Some(DataType::Bool);
+            }
+            Ok(expression_type)
+        }
+        Expr::Binary { left, op, right } => {
+            let left = infer_expr_type(left, table)?;
+            let right = infer_expr_type(right, table)?;
+            let nullable = left.nullable || right.nullable;
+            let data_type = match op {
+                BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Modulo => {
+                    if matches!(left.data_type, Some(DataType::Float64))
+                        || matches!(right.data_type, Some(DataType::Float64))
+                    {
+                        Some(DataType::Float64)
+                    } else {
+                        Some(DataType::Int64)
+                    }
+                }
+                BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual
+                | BinaryOp::And
+                | BinaryOp::Or => Some(DataType::Bool),
+            };
+            Ok(ExprType {
+                data_type,
+                nullable,
+            })
+        }
+        Expr::Function { name, args } => match name.to_ascii_lowercase().as_str() {
+            "count" => Ok(ExprType {
+                data_type: Some(DataType::Int64),
+                nullable: false,
+            }),
+            "avg" => Ok(ExprType {
+                data_type: Some(DataType::Float64),
+                nullable: true,
+            }),
+            "sum" | "min" | "max" => {
+                let argument = args.first().ok_or_else(|| {
+                    Error::execution(format!("aggregate '{name}' requires an argument"))
+                })?;
+                let argument_type = infer_expr_type(argument, table)?;
+                Ok(ExprType {
+                    data_type: argument_type.data_type,
+                    nullable: true,
+                })
+            }
+            _ => Err(Error::execution(format!("unsupported function '{name}'"))),
+        },
+        Expr::IsNull { .. } => Ok(ExprType {
+            data_type: Some(DataType::Bool),
+            nullable: false,
+        }),
+    }
+}
+
 fn expand_wildcard(projection: Vec<SelectItem>, table: Option<&Table>) -> Result<Vec<SelectItem>> {
     let mut expanded = Vec::new();
     for item in projection {
@@ -311,7 +443,10 @@ fn expand_wildcard(projection: Vec<SelectItem>, table: Option<&Table>) -> Result
             }
             let table = table.ok_or_else(|| Error::execution("SELECT * requires a table"))?;
             expanded.extend(table.schema.iter().map(|column| SelectItem {
-                expr: Expr::Column(column.name.clone()),
+                expr: Expr::Column(vec![Identifier {
+                    value: column.name.clone(),
+                    quoted: column.quoted,
+                }]),
                 alias: None,
             }));
         } else {
@@ -355,6 +490,8 @@ fn build_groups(
     table: Option<&Table>,
     rows: &[usize],
     expressions: &[Expr],
+    materialized_bytes: &mut usize,
+    byte_limit: usize,
 ) -> Result<Vec<Vec<usize>>> {
     let mut lookup: HashMap<RowKey, usize> = HashMap::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -372,8 +509,21 @@ fn build_groups(
                 .collect::<Result<Vec<_>>>()?,
         );
         if let Some(index) = lookup.get(&key).copied() {
+            add_materialized_bytes(materialized_bytes, std::mem::size_of::<usize>(), byte_limit)?;
             groups[index].push(row);
         } else {
+            if groups.len() >= MAX_RESULT_ROWS {
+                return Err(Error::Limit {
+                    resource: "groups",
+                    limit: MAX_RESULT_ROWS,
+                });
+            }
+            let group_bytes = row_key_size(&key)
+                .saturating_add(std::mem::size_of::<RowKey>())
+                .saturating_add(std::mem::size_of::<Vec<usize>>())
+                .saturating_add(std::mem::size_of::<usize>())
+                .saturating_add(64);
+            add_materialized_bytes(materialized_bytes, group_bytes, byte_limit)?;
             let index = groups.len();
             lookup.insert(key, index);
             groups.push(vec![row]);
@@ -382,33 +532,115 @@ fn build_groups(
     Ok(groups)
 }
 
-fn validate_group_expression(expression: &Expr, group_by: &[Expr]) -> Result<()> {
-    if expression.contains_aggregate()
-        || matches!(expression, Expr::Literal(_))
-        || group_by.iter().any(|group| {
-            group
-                .display_name()
-                .eq_ignore_ascii_case(&expression.display_name())
-        })
+fn validate_aggregate_query(query: &Select, aggregate_query: bool) -> Result<()> {
+    if query
+        .selection
+        .as_ref()
+        .is_some_and(Expr::contains_aggregate)
     {
+        return Err(Error::execution(
+            "aggregate functions are not allowed in WHERE",
+        ));
+    }
+    if query.group_by.iter().any(Expr::contains_aggregate) {
+        return Err(Error::execution(
+            "aggregate functions are not allowed in GROUP BY",
+        ));
+    }
+    if !aggregate_query {
         return Ok(());
     }
+
+    let aliases = query
+        .projection
+        .iter()
+        .filter_map(|item| {
+            item.alias
+                .as_ref()
+                .map(|alias| (alias.lookup_key(), &item.expr))
+        })
+        .collect::<HashMap<_, _>>();
+    for item in &query.projection {
+        validate_group_expression(&item.expr, &query.group_by, &aliases, false, false)?;
+    }
+    if let Some(having) = &query.having {
+        validate_group_expression(having, &query.group_by, &aliases, false, true)?;
+    }
+    for item in &query.order_by {
+        if !matches!(item.expr, Expr::Literal(Value::Int64(position)) if position > 0) {
+            validate_group_expression(&item.expr, &query.group_by, &aliases, false, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_group_expression(
+    expression: &Expr,
+    group_by: &[Expr],
+    aliases: &HashMap<String, &Expr>,
+    inside_aggregate: bool,
+    resolve_alias: bool,
+) -> Result<()> {
+    if !inside_aggregate && group_by.iter().any(|group| group == expression) {
+        return Ok(());
+    }
+
     match expression {
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
-            validate_group_expression(expr, group_by)
+            validate_group_expression(expr, group_by, aliases, inside_aggregate, resolve_alias)
         }
         Expr::Binary { left, right, .. } => {
-            validate_group_expression(left, group_by)?;
-            validate_group_expression(right, group_by)
+            validate_group_expression(left, group_by, aliases, inside_aggregate, resolve_alias)?;
+            validate_group_expression(right, group_by, aliases, inside_aggregate, resolve_alias)
         }
-        Expr::Column(name) => Err(Error::execution(format!(
-            "column '{name}' must appear in GROUP BY or an aggregate function"
-        ))),
+        Expr::Function { name, args } if is_aggregate_function(name) => {
+            if inside_aggregate {
+                return Err(Error::execution("aggregate functions cannot be nested"));
+            }
+            for argument in args {
+                validate_group_expression(argument, group_by, aliases, true, false)?;
+            }
+            Ok(())
+        }
+        Expr::Function { args, .. } => {
+            for argument in args {
+                validate_group_expression(
+                    argument,
+                    group_by,
+                    aliases,
+                    inside_aggregate,
+                    resolve_alias,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::Column(parts) if inside_aggregate => Ok(()),
+        Expr::Column(parts) => {
+            if resolve_alias
+                && parts.len() == 1
+                && let Some(aliased) = aliases.get(&parts[0].lookup_key())
+                && *aliased != expression
+            {
+                return validate_group_expression(aliased, group_by, aliases, false, false);
+            }
+            Err(Error::execution(format!(
+                "column '{}' must appear in GROUP BY or an aggregate function",
+                expression.display_name()
+            )))
+        }
+        Expr::Wildcard if inside_aggregate => Ok(()),
         Expr::Wildcard => Err(Error::execution(
-            "wildcard is invalid in an aggregate query",
+            "wildcard is invalid outside an aggregate function in an aggregate query",
         )),
-        Expr::Function { .. } | Expr::Literal(_) => Ok(()),
+        Expr::Literal(_) => Ok(()),
     }
+}
+
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count" | "sum" | "min" | "max" | "avg"
+    )
 }
 
 struct EvalContext<'a> {
@@ -421,20 +653,27 @@ struct EvalContext<'a> {
 fn eval_expr(expression: &Expr, context: &EvalContext<'_>) -> Result<Value> {
     match expression {
         Expr::Literal(value) => Ok(value.clone()),
-        Expr::Column(name) => {
-            if let Some(value) = context
-                .aliases
-                .and_then(|aliases| aliases.get(&normalize(name)))
+        Expr::Column(parts) => {
+            let identifier = parts
+                .last()
+                .ok_or_else(|| Error::execution("empty column reference"))?;
+            if parts.len() == 1
+                && let Some(value) = context
+                    .aliases
+                    .and_then(|aliases| aliases.get(&identifier.lookup_key()))
             {
                 return Ok(value.clone());
             }
-            let table = context
-                .table
-                .ok_or_else(|| Error::execution(format!("column '{name}' requires a table")))?;
-            let row = context.row.ok_or_else(|| {
-                Error::execution(format!("column '{name}' has no row in an empty group"))
+            let table = context.table.ok_or_else(|| {
+                Error::execution(format!("column '{}' requires a table", identifier.value))
             })?;
-            Ok(table.value(table.column_index(name)?, row))
+            let row = context.row.ok_or_else(|| {
+                Error::execution(format!(
+                    "column '{}' has no row in an empty group",
+                    identifier.value
+                ))
+            })?;
+            Ok(table.value(table.column_index(identifier)?, row))
         }
         Expr::Wildcard => Err(Error::execution(
             "wildcard is only valid in SELECT or COUNT",
@@ -709,16 +948,13 @@ fn result_aliases(items: &[SelectItem], values: &[Value]) -> HashMap<String, Val
     items
         .iter()
         .zip(values)
-        .map(|(item, value)| {
-            (
-                normalize(item.alias.as_deref().unwrap_or_else(|| match &item.expr {
-                    Expr::Column(name) => name,
-                    _ => "",
-                })),
-                value.clone(),
-            )
+        .filter_map(|(item, value)| {
+            let identifier = item.alias.as_ref().or_else(|| match &item.expr {
+                Expr::Column(parts) if parts.len() == 1 => parts.first(),
+                _ => None,
+            })?;
+            Some((identifier.lookup_key(), value.clone()))
         })
-        .filter(|(name, _)| !name.is_empty())
         .collect()
 }
 
@@ -765,4 +1001,33 @@ fn compare_records(left: &Record, right: &Record, ordering: &[OrderItem]) -> Ord
         }
     }
     left.sequence.cmp(&right.sequence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_intermediates_obey_the_materialization_budget() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE t (name String); INSERT INTO t VALUES ('a'), ('b'), ('c');")
+            .unwrap();
+        let Statement::Select(select) =
+            parser::parse("SELECT name, count(*) FROM t GROUP BY name LIMIT 1;")
+                .unwrap()
+                .pop()
+                .unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let error = database.select(select, 64).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Limit {
+                resource: "materialized query result bytes",
+                ..
+            }
+        ));
+    }
 }

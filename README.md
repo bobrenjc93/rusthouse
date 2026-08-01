@@ -33,7 +33,7 @@ GROUP BY sensor ORDER BY mean DESC;
 SQL
 ```
 
-CSV string fields and names use RFC 4180 quoting, and nulls are written as `\N`. Input is limited to 128 MiB, a catalog to 128 tables, a table to 256 columns and 5,000,000 rows, materialized results and output to 256 MiB, and expression nesting to 256 levels.
+CSV string fields and names use RFC 4180 quoting, and nulls are written as `\N`. Input is limited to 128 MiB, a catalog to 128 tables, a table to 256 columns and 5,000,000 rows, materialized results and output to 256 MiB, and each expression to 256 nesting levels and 1,024 AST nodes.
 
 ## Library
 

@@ -8,6 +8,7 @@ mod ast;
 mod engine;
 mod error;
 mod format;
+mod identifier;
 mod lexer;
 mod parser;
 mod storage;

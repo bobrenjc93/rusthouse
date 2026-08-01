@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
+use crate::identifier::{Identifier, ObjectName};
 use crate::value::{DataType, Value};
 
 pub const MAX_COLUMNS: usize = 256;
@@ -13,6 +14,8 @@ pub struct ColumnSchema {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Whether SQL name resolution treats the column name as quoted and case-sensitive.
+    pub quoted: bool,
 }
 
 #[derive(Debug)]
@@ -84,7 +87,11 @@ impl Table {
 
         let mut column_lookup = HashMap::with_capacity(schema.len());
         for (index, column) in schema.iter().enumerate() {
-            let key = normalize(&column.name);
+            let key = Identifier {
+                value: column.name.clone(),
+                quoted: column.quoted,
+            }
+            .lookup_key();
             if column_lookup.insert(key, index).is_some() {
                 return Err(Error::Catalog(format!(
                     "duplicate column '{}'",
@@ -108,12 +115,15 @@ impl Table {
         self.row_count
     }
 
-    pub(crate) fn column_index(&self, name: &str) -> Result<usize> {
-        let unqualified = name.rsplit('.').next().unwrap_or(name);
+    pub(crate) fn column_index(&self, name: &Identifier) -> Result<usize> {
         self.column_lookup
-            .get(&normalize(unqualified))
+            .get(&name.lookup_key())
             .copied()
-            .ok_or_else(|| Error::Execution(format!("unknown column '{name}'")))
+            .ok_or_else(|| Error::Execution(format!("unknown column '{}'", name.value)))
+    }
+
+    pub(crate) fn column_schema(&self, name: &Identifier) -> Result<&ColumnSchema> {
+        Ok(&self.schema[self.column_index(name)?])
     }
 
     pub(crate) fn value(&self, column: usize, row: usize) -> Value {
@@ -122,7 +132,7 @@ impl Table {
 
     pub(crate) fn insert_rows(
         &mut self,
-        names: Option<&[String]>,
+        names: Option<&[Identifier]>,
         rows: Vec<Vec<Value>>,
     ) -> Result<usize> {
         if self.row_count.saturating_add(rows.len()) > MAX_ROWS_PER_TABLE {
@@ -139,7 +149,8 @@ impl Table {
                 let index = self.column_index(name)?;
                 if !seen.insert(index) {
                     return Err(Error::Catalog(format!(
-                        "column '{name}' appears more than once in INSERT"
+                        "column '{}' appears more than once in INSERT",
+                        name.value
                     )));
                 }
                 mapping.push(index);
@@ -201,16 +212,19 @@ pub struct Catalog {
 impl Catalog {
     pub(crate) fn create_table(
         &mut self,
-        name: String,
+        name: ObjectName,
         schema: Vec<ColumnSchema>,
         if_not_exists: bool,
     ) -> Result<()> {
-        let key = normalize(&name);
+        let key = name.lookup_key();
         if self.tables.contains_key(&key) {
             return if if_not_exists {
                 Ok(())
             } else {
-                Err(Error::Catalog(format!("table '{name}' already exists")))
+                Err(Error::Catalog(format!(
+                    "table '{}' already exists",
+                    name.display()
+                )))
             };
         }
         if self.tables.len() >= MAX_TABLES {
@@ -223,19 +237,15 @@ impl Catalog {
         Ok(())
     }
 
-    pub(crate) fn table(&self, name: &str) -> Result<&Table> {
+    pub(crate) fn table(&self, name: &ObjectName) -> Result<&Table> {
         self.tables
-            .get(&normalize(name))
-            .ok_or_else(|| Error::Catalog(format!("unknown table '{name}'")))
+            .get(&name.lookup_key())
+            .ok_or_else(|| Error::Catalog(format!("unknown table '{}'", name.display())))
     }
 
-    pub(crate) fn table_mut(&mut self, name: &str) -> Result<&mut Table> {
+    pub(crate) fn table_mut(&mut self, name: &ObjectName) -> Result<&mut Table> {
         self.tables
-            .get_mut(&normalize(name))
-            .ok_or_else(|| Error::Catalog(format!("unknown table '{name}'")))
+            .get_mut(&name.lookup_key())
+            .ok_or_else(|| Error::Catalog(format!("unknown table '{}'", name.display())))
     }
-}
-
-pub(crate) fn normalize(name: &str) -> String {
-    name.to_ascii_lowercase()
 }

@@ -1,26 +1,27 @@
+use crate::identifier::{Identifier, ObjectName};
 use crate::storage::ColumnSchema;
 use crate::value::Value;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Statement {
     CreateTable {
-        name: String,
+        name: ObjectName,
         columns: Vec<ColumnSchema>,
         if_not_exists: bool,
     },
     Insert {
-        table: String,
-        columns: Option<Vec<String>>,
+        table: ObjectName,
+        columns: Option<Vec<Identifier>>,
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Select {
     pub distinct: bool,
     pub projection: Vec<SelectItem>,
-    pub table: Option<String>,
+    pub table: Option<ObjectName>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
@@ -29,22 +30,22 @@ pub(crate) struct Select {
     pub offset: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SelectItem {
     pub expr: Expr,
-    pub alias: Option<String>,
+    pub alias: Option<Identifier>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OrderItem {
     pub expr: Expr,
     pub descending: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
     Literal(Value),
-    Column(String),
+    Column(Vec<Identifier>),
     Wildcard,
     Unary {
         op: UnaryOp,
@@ -73,7 +74,11 @@ impl Expr {
             Self::Literal(Value::Float64(value)) => value.to_string(),
             Self::Literal(Value::Bool(value)) => value.to_string(),
             Self::Literal(Value::String(value)) => format!("'{value}'"),
-            Self::Column(name) => name.clone(),
+            Self::Column(parts) => parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
             Self::Wildcard => "*".to_owned(),
             Self::Unary { op, expr } => {
                 format!("{}{}", op.symbol(), expr.display_name())
@@ -117,7 +122,7 @@ impl Expr {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnaryOp {
     Plus,
     Minus,
@@ -134,7 +139,7 @@ impl UnaryOp {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BinaryOp {
     Add,
     Subtract,
