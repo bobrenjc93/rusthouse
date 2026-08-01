@@ -48,8 +48,8 @@ assert_eq!(store.load()?, Some(image));
 resource-constrained inputs. Limits cover the complete file, object counts,
 rows, total values, names, individual strings, and total string bytes. Counts
 and lengths are checked before allocation, allocation is fallible, and invalid
-images are rejected before the current snapshot is changed. Only one store may
-hold the nonblocking writer lock for a snapshot in one pinned parent directory;
+images are rejected before the current snapshot is changed. Writer locks are
+nonblocking and cover one snapshot on Unix or one directory on Windows;
 concurrent commits made through one shared store handle are serialized in
 process. Dot-prefixed snapshot filenames are rejected because that namespace is
 reserved for lock and temporary sidecars, including filesystem-specific Unicode
@@ -65,8 +65,10 @@ sidecar operation is relative to the parent directory handle opened by the
 store. Publication and directory fsync use that same handle, so replacing the
 parent path or final component after open cannot redirect snapshot access.
 Linux ACL operations use file descriptors directly and do not require procfs.
-On Windows, the store holds a parent-directory handle without delete sharing,
-which prevents renaming or replacing that directory until the store is dropped.
+On Windows, writers are serialized per directory and existing snapshots must be
+opened with their normalized long filename, so DOS short aliases cannot acquire
+independent locks. The store also holds a parent-directory handle without delete
+sharing, which prevents renaming or replacing that directory until it is dropped.
 
 ### Version 1 binary format
 

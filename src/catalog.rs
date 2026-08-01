@@ -465,7 +465,9 @@ impl SnapshotStore {
     ///
     /// The parent directory must already exist. A second writer receives
     /// [`SnapshotError::Locked`] rather than waiting indefinitely. The final
-    /// path component must not be a symbolic link.
+    /// path component must not be a symbolic link. Windows permits one writer
+    /// per directory and requires the normalized long filename for an existing
+    /// snapshot.
     pub fn open_with_limits(
         path: impl AsRef<Path>,
         limits: SnapshotLimits,
@@ -512,6 +514,8 @@ impl SnapshotStore {
             Err(fs4::TryLockError::Error(error)) => return Err(SnapshotError::Io(error)),
         }
 
+        #[cfg(windows)]
+        drop(open_snapshot_file_path(&path)?);
         #[cfg(unix)]
         cleanup_staging_at(&parent_dir, &temp_name)?;
         #[cfg(windows)]
@@ -612,6 +616,8 @@ impl SnapshotStore {
         cleanup_staging(&self.temp_dir, &self.path)?;
         #[cfg(windows)]
         create_secure_staging_dir(&self.temp_dir)?;
+        #[cfg(windows)]
+        drop(self.open_current_snapshot()?);
         #[cfg(windows)]
         let mut temp = create_secure_temp(&self.temp_path)?;
         temp.write_all(&bytes)?;
@@ -777,6 +783,7 @@ fn open_snapshot_file_at(
 #[cfg(windows)]
 fn open_snapshot_file_path(path: &Path) -> Result<Option<File>, SnapshotError> {
     use std::mem;
+    use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::ptr;
     use windows_sys::Win32::Foundation::{
@@ -784,8 +791,10 @@ fn open_snapshot_file_path(path: &Path) -> Result<Option<File>, SnapshotError> {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
+        VOLUME_NAME_DOS,
     };
 
     let wide_path = wide_path(path);
@@ -798,7 +807,7 @@ fn open_snapshot_file_path(path: &Path) -> Result<Option<File>, SnapshotError> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
         )
     };
@@ -828,6 +837,48 @@ fn open_snapshot_file_path(path: &Path) -> Result<Option<File>, SnapshotError> {
     }
     if tag_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(SnapshotError::SymlinkSnapshot(path.to_owned()));
+    }
+    if !file.metadata()?.file_type().is_file() {
+        return Err(SnapshotError::InvalidImage(
+            "snapshot path must identify a regular file".to_owned(),
+        ));
+    }
+
+    let mut normalized_path = vec![0u16; 512];
+    let normalized_len = loop {
+        // SAFETY: The handle is valid and the buffer is writable for its full
+        // advertised length.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle() as HANDLE,
+                normalized_path.as_mut_ptr(),
+                normalized_path.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if length == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let length = usize::try_from(length).map_err(|_| SnapshotError::AllocationFailed)?;
+        if length < normalized_path.len() {
+            break length;
+        }
+        if length > 32_767 {
+            return Err(SnapshotError::InvalidImage(
+                "normalized snapshot path exceeds the Windows path limit".to_owned(),
+            ));
+        }
+        let required = length.saturating_add(1);
+        normalized_path
+            .try_reserve(required.saturating_sub(normalized_path.len()))
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        normalized_path.resize(required, 0);
+    };
+    let normalized_path = PathBuf::from(std::ffi::OsString::from_wide(
+        &normalized_path[..normalized_len],
+    ));
+    if normalized_path.file_name() != path.file_name() {
+        return Err(SnapshotError::ReservedSnapshotName(path.to_owned()));
     }
     Ok(Some(file))
 }
@@ -880,10 +931,11 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
     let parent = path.parent().ok_or_else(|| {
         SnapshotError::InvalidImage("snapshot path must have a parent directory".to_owned())
     })?;
-    Ok((
-        parent.join(format!(".{file_name}.lock")),
-        parent.join(format!(".{file_name}.tmp")),
-    ))
+    #[cfg(unix)]
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    #[cfg(windows)]
+    let lock_path = parent.join(".rusthouse-catalog.lock");
+    Ok((lock_path, parent.join(format!(".{file_name}.tmp"))))
 }
 
 #[cfg(unix)]
@@ -2198,6 +2250,35 @@ mod tests {
             .is_empty()
     }
 
+    #[cfg(windows)]
+    fn windows_short_path(path: &Path) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let wide_path = wide_path(path);
+        let mut short_path = vec![0u16; 512];
+        loop {
+            // SAFETY: Both input and output buffers are valid for the call.
+            let length = unsafe {
+                GetShortPathNameW(
+                    wide_path.as_ptr(),
+                    short_path.as_mut_ptr(),
+                    short_path.len() as u32,
+                )
+            };
+            if length == 0 {
+                return None;
+            }
+            let length = usize::try_from(length).expect("Windows path length fits usize");
+            if length < short_path.len() {
+                return Some(PathBuf::from(std::ffi::OsString::from_wide(
+                    &short_path[..length],
+                )));
+            }
+            short_path.resize(length.saturating_add(1), 0);
+        }
+    }
+
     #[test]
     fn typed_image_validation_rejects_bad_shapes_and_names() {
         let left =
@@ -2469,6 +2550,41 @@ mod tests {
             store.load().expect("canonical snapshot remains readable"),
             Some(sample_image(3))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_dos_aliases_cannot_acquire_distinct_locks() {
+        let directory = TestDirectory::new();
+        let long_path = directory
+            .0
+            .join("catalog-snapshot-with-a-long-filename.rhcat");
+        let dos_candidate = directory.0.join("CATALO~1.RHC");
+        let image = sample_image(54);
+        let store = SnapshotStore::open(&long_path).expect("open absent long-name writer");
+
+        assert!(matches!(
+            SnapshotStore::open(&dos_candidate),
+            Err(SnapshotError::Locked(_))
+        ));
+        store.commit(&image).expect("commit long-name snapshot");
+
+        let lock_path = directory.0.join(".rusthouse-catalog.lock");
+        for aliased_path in [&long_path, &lock_path] {
+            if let Some(short_path) = windows_short_path(aliased_path)
+                && short_path.file_name() != aliased_path.file_name()
+            {
+                assert!(matches!(
+                    SnapshotStore::open(short_path),
+                    Err(SnapshotError::ReservedSnapshotName(_))
+                ));
+            }
+        }
+        assert!(matches!(
+            SnapshotStore::open(&long_path),
+            Err(SnapshotError::Locked(_))
+        ));
+        assert_eq!(store.load().expect("load long-name snapshot"), Some(image));
     }
 
     #[cfg(windows)]
