@@ -4,6 +4,11 @@ This document defines the runtime contract of RustHouse's scalar expression
 and aggregate subsystem. Errors are returned as `rusthouse::Error`; evaluation
 does not panic for data-dependent failures.
 
+Parsed and directly constructed expressions have a maximum depth of
+`MAX_EXPRESSION_DEPTH` (currently 128). The parser guards recursive syntax and
+left-deep operator chains, and evaluation checks the AST iteratively before
+descending. Deeper input returns `Error::ExpressionTooDeep`.
+
 ## Values and NULL
 
 Runtime values are `Int64`, `Float64`, `Bool`, `String`, or `NULL`. `NULL` is
@@ -17,6 +22,9 @@ when any required input is `NULL`. The exceptions are:
 - `AND`, `OR`, and `NOT`, which implement the SQL three-valued truth tables;
 - `CASE`, which treats only `TRUE` as a matching searched condition;
 - `COALESCE`, which returns its first non-NULL argument.
+
+Double-quoted names are identifiers even when their contents are keywords, so
+`"NULL"`, `"TRUE"`, and `"CASE"` refer to columns rather than SQL syntax.
 
 `CASE` evaluates only conditions through the first match and its selected
 result. `COALESCE` evaluates only through its first non-NULL argument.
@@ -85,8 +93,11 @@ or `Error::Type`. These functions propagate NULL, including `CONCAT`.
 `MAX`, and `AVG` ignore NULL inputs and return NULL for empty or all-NULL
 input. `COUNT` returns zero in those cases.
 
-Integer `SUM` is checked and returns `Error::Overflow`; encountering a
-`Float64` promotes the result to `Float64`. `AVG` always returns `Float64`.
+Integer `SUM` accumulates exactly in an internal `i128` and checks the final
+`Int64` result, so cancellation and overflow do not depend on input order.
+Encountering a `Float64` promotes the result to `Float64`; integer and floating
+components are retained separately until finalization, so promotion does not
+depend on which arrives first. `AVG` always returns `Float64`.
 NaN propagates through all numeric aggregates, including `MIN` and `MAX`.
 Mixed numeric inputs are comparable, while incompatible MIN/MAX domains and
 nonnumeric SUM/AVG inputs return `Error::Aggregate`.

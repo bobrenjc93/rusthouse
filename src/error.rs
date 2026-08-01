@@ -18,6 +18,9 @@ pub enum Error {
     Overflow {
         operation: String,
     },
+    ExpressionTooDeep {
+        limit: usize,
+    },
     DivideByZero,
     InvalidCast {
         value: String,
@@ -48,6 +51,9 @@ impl fmt::Display for Error {
                 "type error in {operation}: expected {expected}, got {actual}"
             ),
             Self::Overflow { operation } => write!(f, "numeric overflow in {operation}"),
+            Self::ExpressionTooDeep { limit } => {
+                write!(f, "expression exceeds the maximum depth of {limit}")
+            }
             Self::DivideByZero => f.write_str("division by zero"),
             Self::InvalidCast { value, target } => {
                 write!(f, "cannot cast {value} to {target}")

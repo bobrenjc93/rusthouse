@@ -11,7 +11,9 @@ mod value;
 
 pub use aggregate::{Aggregate, AggregateFunction};
 pub use error::{Error, Result};
-pub use expression::{BinaryOperator, EvaluationContext, Expr, UnaryOperator, evaluate, parse};
+pub use expression::{
+    BinaryOperator, EvaluationContext, Expr, MAX_EXPRESSION_DEPTH, UnaryOperator, evaluate, parse,
+};
 pub use value::{DataType, Value};
 
 /// Returns the product name.

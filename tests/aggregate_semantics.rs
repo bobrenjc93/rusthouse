@@ -80,6 +80,43 @@ fn numeric_aggregates_promote_mixed_values_and_check_integer_overflow() {
 }
 
 #[test]
+fn sum_promotion_and_overflow_are_independent_of_row_order() {
+    let max = Value::Int64(i64::MAX);
+    let one = Value::Int64(1);
+    let float = Value::Float64(0.0);
+    let permutations = [
+        [max.clone(), one.clone(), float.clone()],
+        [max.clone(), float.clone(), one.clone()],
+        [one.clone(), max.clone(), float.clone()],
+        [one.clone(), float.clone(), max.clone()],
+        [float.clone(), max.clone(), one.clone()],
+        [float, one, max],
+    ];
+    let expected = Value::Float64((i128::from(i64::MAX) + 1) as f64);
+    for values in permutations {
+        assert_eq!(
+            aggregate(AggregateFunction::Sum, &values).unwrap(),
+            expected
+        );
+    }
+
+    let cancellable = [
+        [Value::Int64(i64::MAX), Value::Int64(1), Value::Int64(-1)],
+        [Value::Int64(i64::MAX), Value::Int64(-1), Value::Int64(1)],
+        [Value::Int64(1), Value::Int64(i64::MAX), Value::Int64(-1)],
+        [Value::Int64(1), Value::Int64(-1), Value::Int64(i64::MAX)],
+        [Value::Int64(-1), Value::Int64(i64::MAX), Value::Int64(1)],
+        [Value::Int64(-1), Value::Int64(1), Value::Int64(i64::MAX)],
+    ];
+    for values in cancellable {
+        assert_eq!(
+            aggregate(AggregateFunction::Sum, &values).unwrap(),
+            Value::Int64(i64::MAX)
+        );
+    }
+}
+
+#[test]
 fn min_max_compare_strings_and_reject_incompatible_domains() {
     let strings = ["pear".into(), Value::Null, "apple".into()];
     assert_eq!(

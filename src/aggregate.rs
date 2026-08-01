@@ -45,16 +45,18 @@ impl fmt::Display for AggregateFunction {
     }
 }
 
-#[derive(Debug, Clone)]
-enum SumState {
-    Int(i64),
-    Float(f64),
+#[derive(Debug, Clone, Default)]
+struct SumState {
+    integer: i128,
+    float: f64,
+    saw_integer: bool,
+    saw_float: bool,
 }
 
 #[derive(Debug, Clone)]
 enum State {
     Count(u64),
-    Sum(Option<SumState>),
+    Sum(SumState),
     Min(Option<Value>),
     Max(Option<Value>),
     Avg { sum: f64, count: u64 },
@@ -71,7 +73,7 @@ impl Aggregate {
     pub fn new(function: AggregateFunction) -> Self {
         let state = match function {
             AggregateFunction::Count | AggregateFunction::CountAll => State::Count(0),
-            AggregateFunction::Sum => State::Sum(None),
+            AggregateFunction::Sum => State::Sum(SumState::default()),
             AggregateFunction::Min => State::Min(None),
             AggregateFunction::Max => State::Max(None),
             AggregateFunction::Avg => State::Avg { sum: 0.0, count: 0 },
@@ -130,9 +132,16 @@ impl Aggregate {
                         operation: self.function.to_string(),
                     })
             }
-            State::Sum(None) | State::Min(None) | State::Max(None) => Ok(Value::Null),
-            State::Sum(Some(SumState::Int(value))) => Ok(Value::Int64(*value)),
-            State::Sum(Some(SumState::Float(value))) => Ok(Value::Float64(*value)),
+            State::Sum(sum) if !sum.saw_integer && !sum.saw_float => Ok(Value::Null),
+            State::Sum(sum) if sum.saw_float => Ok(Value::Float64(sum.integer as f64 + sum.float)),
+            State::Sum(sum) => {
+                i64::try_from(sum.integer)
+                    .map(Value::Int64)
+                    .map_err(|_| Error::Overflow {
+                        operation: "sum".to_owned(),
+                    })
+            }
+            State::Min(None) | State::Max(None) => Ok(Value::Null),
             State::Min(Some(value)) | State::Max(Some(value)) => Ok(value.clone()),
             State::Avg { count: 0, .. } => Ok(Value::Null),
             State::Avg { sum, count } => Ok(Value::Float64(*sum / *count as f64)),
@@ -146,29 +155,26 @@ fn increment_count(count: u64) -> Result<u64> {
     })
 }
 
-fn add_sum(state: &mut Option<SumState>, value: &Value) -> Result<()> {
-    if value.is_null() {
-        return Ok(());
+fn add_sum(state: &mut SumState, value: &Value) -> Result<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Int64(value) => {
+            state.integer = state
+                .integer
+                .checked_add(i128::from(*value))
+                .ok_or_else(|| Error::Overflow {
+                    operation: "sum".to_owned(),
+                })?;
+            state.saw_integer = true;
+            Ok(())
+        }
+        Value::Float64(value) => {
+            state.float += value;
+            state.saw_float = true;
+            Ok(())
+        }
+        value => Err(aggregate_type_error("sum", value)),
     }
-    let next = match (state.as_ref(), value) {
-        (None, Value::Int64(value)) => SumState::Int(*value),
-        (None, Value::Float64(value)) => SumState::Float(*value),
-        (Some(SumState::Int(current)), Value::Int64(value)) => {
-            SumState::Int(current.checked_add(*value).ok_or_else(|| Error::Overflow {
-                operation: "sum".to_owned(),
-            })?)
-        }
-        (Some(SumState::Int(current)), Value::Float64(value)) => {
-            SumState::Float(*current as f64 + value)
-        }
-        (Some(SumState::Float(current)), Value::Int64(value)) => {
-            SumState::Float(current + *value as f64)
-        }
-        (Some(SumState::Float(current)), Value::Float64(value)) => SumState::Float(current + value),
-        (_, value) => return Err(aggregate_type_error("sum", value)),
-    };
-    *state = Some(next);
-    Ok(())
 }
 
 fn add_extreme(current: &mut Option<Value>, value: &Value, minimum: bool) -> Result<()> {

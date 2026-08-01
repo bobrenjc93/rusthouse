@@ -1,4 +1,7 @@
-use rusthouse::{DataType, Error, EvaluationContext, Value, evaluate, parse};
+use rusthouse::{
+    DataType, Error, EvaluationContext, Expr, MAX_EXPRESSION_DEPTH, UnaryOperator, Value, evaluate,
+    parse,
+};
 
 fn eval(sql: &str) -> Value {
     evaluate(sql, &EvaluationContext::new()).unwrap()
@@ -216,6 +219,64 @@ fn identifiers_and_literals_work_at_the_public_sql_boundary() {
         Err(Error::UnknownColumn(name)) if name == "missing"
     ));
     parse("case when true then 'ok' end").unwrap();
+}
+
+#[test]
+fn quoted_identifiers_are_never_reclassified_as_keywords() {
+    let context = EvaluationContext::new()
+        .with_value("NULL", 11_i64)
+        .with_value("TRUE", 12_i64)
+        .with_value("CASE", 13_i64)
+        .with_value("odd\"name", 14_i64);
+
+    assert_eq!(evaluate("\"NULL\"", &context).unwrap(), 11_i64.into());
+    assert_eq!(evaluate("\"TRUE\"", &context).unwrap(), 12_i64.into());
+    assert_eq!(evaluate("\"CASE\"", &context).unwrap(), 13_i64.into());
+    assert_eq!(
+        evaluate("\"odd\"\"name\"", &context).unwrap(),
+        14_i64.into()
+    );
+}
+
+#[test]
+fn excessive_expression_depth_returns_an_error_instead_of_overflowing_the_stack() {
+    let allowed = format!("{}1", "+".repeat(MAX_EXPRESSION_DEPTH - 1));
+    assert_eq!(
+        evaluate(&allowed, &EvaluationContext::new()).unwrap(),
+        Value::Int64(1)
+    );
+
+    let unary = format!("{}1", "+".repeat(10_000));
+    assert_eq!(
+        evaluate(&unary, &EvaluationContext::new()),
+        Err(Error::ExpressionTooDeep {
+            limit: MAX_EXPRESSION_DEPTH
+        })
+    );
+
+    let left_deep = std::iter::repeat_n("1", 10_000)
+        .collect::<Vec<_>>()
+        .join("+");
+    assert_eq!(
+        parse(&left_deep),
+        Err(Error::ExpressionTooDeep {
+            limit: MAX_EXPRESSION_DEPTH
+        })
+    );
+
+    let mut direct = Expr::Literal(Value::Int64(1));
+    for _ in 0..MAX_EXPRESSION_DEPTH {
+        direct = Expr::Unary {
+            operator: UnaryOperator::Plus,
+            expression: Box::new(direct),
+        };
+    }
+    assert_eq!(
+        direct.evaluate(&EvaluationContext::new()),
+        Err(Error::ExpressionTooDeep {
+            limit: MAX_EXPRESSION_DEPTH
+        })
+    );
 }
 
 #[test]

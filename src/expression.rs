@@ -2,6 +2,9 @@ use std::{cmp::Ordering, collections::BTreeMap, str::FromStr};
 
 use crate::{DataType, Error, Result, Value};
 
+/// Maximum nesting allowed in parsed or directly constructed expressions.
+pub const MAX_EXPRESSION_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOperator {
     Plus,
@@ -97,6 +100,11 @@ pub fn evaluate(sql: &str, context: &EvaluationContext) -> Result<Value> {
 
 impl Expr {
     pub fn evaluate(&self, context: &EvaluationContext) -> Result<Value> {
+        validate_expression_depth(self)?;
+        self.evaluate_inner(context)
+    }
+
+    fn evaluate_inner(&self, context: &EvaluationContext) -> Result<Value> {
         match self {
             Self::Literal(value) => Ok(value.clone()),
             Self::Column(name) => context
@@ -106,7 +114,7 @@ impl Expr {
             Self::Unary {
                 operator,
                 expression,
-            } => evaluate_unary(*operator, expression.evaluate(context)?),
+            } => evaluate_unary(*operator, expression.evaluate_inner(context)?),
             Self::Binary {
                 left,
                 operator,
@@ -116,9 +124,11 @@ impl Expr {
                 expression,
                 negated,
             } => Ok(Value::Bool(
-                expression.evaluate(context)?.is_null() != *negated,
+                expression.evaluate_inner(context)?.is_null() != *negated,
             )),
-            Self::Cast { expression, target } => expression.evaluate(context)?.cast_to(*target),
+            Self::Cast { expression, target } => {
+                expression.evaluate_inner(context)?.cast_to(*target)
+            }
             Self::Case {
                 operand,
                 branches,
@@ -132,6 +142,48 @@ impl Expr {
             Self::Function { name, arguments } => evaluate_function(name, arguments, context),
         }
     }
+}
+
+fn validate_expression_depth(expression: &Expr) -> Result<()> {
+    let mut pending = vec![(expression, 1_usize)];
+    while let Some((expression, depth)) = pending.pop() {
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(Error::ExpressionTooDeep {
+                limit: MAX_EXPRESSION_DEPTH,
+            });
+        }
+        let child_depth = depth + 1;
+        match expression {
+            Expr::Literal(_) | Expr::Column(_) => {}
+            Expr::Unary { expression, .. }
+            | Expr::IsNull { expression, .. }
+            | Expr::Cast { expression, .. } => pending.push((expression, child_depth)),
+            Expr::Binary { left, right, .. } => {
+                pending.push((left, child_depth));
+                pending.push((right, child_depth));
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_expression,
+            } => {
+                if let Some(operand) = operand {
+                    pending.push((operand, child_depth));
+                }
+                for (condition, result) in branches {
+                    pending.push((condition, child_depth));
+                    pending.push((result, child_depth));
+                }
+                if let Some(else_expression) = else_expression {
+                    pending.push((else_expression, child_depth));
+                }
+            }
+            Expr::Function { arguments, .. } => {
+                pending.extend(arguments.iter().map(|argument| (argument, child_depth)));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn evaluate_unary(operator: UnaryOperator, value: Value) -> Result<Value> {
@@ -165,7 +217,7 @@ fn evaluate_binary_expression(
     right: &Expr,
     context: &EvaluationContext,
 ) -> Result<Value> {
-    let left = left.evaluate(context)?;
+    let left = left.evaluate_inner(context)?;
 
     // These two cases are value-independent SQL short circuits. NULL still
     // requires evaluation of the other operand to distinguish TRUE/FALSE.
@@ -176,7 +228,7 @@ fn evaluate_binary_expression(
         return Ok(Value::Bool(true));
     }
 
-    let right = right.evaluate(context)?;
+    let right = right.evaluate_inner(context)?;
     match operator {
         BinaryOperator::And => logical_and(left, right),
         BinaryOperator::Or => logical_or(left, right),
@@ -329,24 +381,24 @@ fn evaluate_case(
     context: &EvaluationContext,
 ) -> Result<Value> {
     let operand = operand
-        .map(|expression| expression.evaluate(context))
+        .map(|expression| expression.evaluate_inner(context))
         .transpose()?;
     for (condition, result) in branches {
         let matches = if let Some(operand) = &operand {
             compare(
                 operand.clone(),
                 BinaryOperator::Equal,
-                condition.evaluate(context)?,
+                condition.evaluate_inner(context)?,
             )? == Value::Bool(true)
         } else {
-            sql_truth(&condition.evaluate(context)?, "CASE WHEN")? == Some(true)
+            sql_truth(&condition.evaluate_inner(context)?, "CASE WHEN")? == Some(true)
         };
         if matches {
-            return result.evaluate(context);
+            return result.evaluate_inner(context);
         }
     }
     else_expression
-        .map(|expression| expression.evaluate(context))
+        .map(|expression| expression.evaluate_inner(context))
         .unwrap_or(Ok(Value::Null))
 }
 
@@ -355,7 +407,7 @@ fn evaluate_function(name: &str, arguments: &[Expr], context: &EvaluationContext
         "coalesce" => {
             require_at_least(name, arguments, 1)?;
             for argument in arguments {
-                let value = argument.evaluate(context)?;
+                let value = argument.evaluate_inner(context)?;
                 if !value.is_null() {
                     return Ok(value);
                 }
@@ -364,7 +416,7 @@ fn evaluate_function(name: &str, arguments: &[Expr], context: &EvaluationContext
         }
         "lower" | "upper" | "length" | "char_length" | "trim" | "ltrim" | "rtrim" => {
             require_exact(name, arguments, 1)?;
-            let value = arguments[0].evaluate(context)?;
+            let value = arguments[0].evaluate_inner(context)?;
             if value.is_null() {
                 return Ok(Value::Null);
             }
@@ -385,7 +437,7 @@ fn evaluate_function(name: &str, arguments: &[Expr], context: &EvaluationContext
             require_at_least(name, arguments, 1)?;
             let mut output = String::new();
             for argument in arguments {
-                match argument.evaluate(context)? {
+                match argument.evaluate_inner(context)? {
                     Value::Null => return Ok(Value::Null),
                     Value::String(value) => output.push_str(&value),
                     value => return Err(type_error(name, "String or NULL", &value)),
@@ -410,7 +462,7 @@ fn substring(name: &str, arguments: &[Expr], context: &EvaluationContext) -> Res
     }
     let values = arguments
         .iter()
-        .map(|argument| argument.evaluate(context))
+        .map(|argument| argument.evaluate_inner(context))
         .collect::<Result<Vec<_>>>()?;
     if values.iter().any(Value::is_null) {
         return Ok(Value::Null);
@@ -511,6 +563,7 @@ fn binary_name(operator: BinaryOperator) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 enum TokenKind {
     Word(String),
+    QuotedIdentifier(String),
     Number(String),
     String(String),
     LeftParen,
@@ -601,7 +654,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '\'' => TokenKind::String(self.string_literal(position)?),
-                '"' => TokenKind::Word(self.quoted_identifier(position)?),
+                '"' => TokenKind::QuotedIdentifier(self.quoted_identifier(position)?),
                 value if value.is_ascii_digit() || value == '.' => {
                     TokenKind::Number(self.number(position)?)
                 }
@@ -722,6 +775,7 @@ fn is_identifier_continue(value: char) -> bool {
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    nesting_depth: usize,
 }
 
 impl Parser {
@@ -729,6 +783,7 @@ impl Parser {
         Ok(Self {
             tokens: Lexer::new(sql).tokenize()?,
             current: 0,
+            nesting_depth: 1,
         })
     }
 
@@ -740,13 +795,14 @@ impl Parser {
                 self.peek().position,
             ));
         }
+        validate_expression_depth(&expression)?;
         Ok(expression)
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
         let mut expression = self.parse_and()?;
         while self.consume_word("OR") {
-            expression = binary(expression, BinaryOperator::Or, self.parse_and()?);
+            expression = checked_binary(expression, BinaryOperator::Or, self.parse_and()?)?;
         }
         Ok(expression)
     }
@@ -754,7 +810,7 @@ impl Parser {
     fn parse_and(&mut self) -> Result<Expr> {
         let mut expression = self.parse_not()?;
         while self.consume_word("AND") {
-            expression = binary(expression, BinaryOperator::And, self.parse_not()?);
+            expression = checked_binary(expression, BinaryOperator::And, self.parse_not()?)?;
         }
         Ok(expression)
     }
@@ -763,7 +819,7 @@ impl Parser {
         if self.consume_word("NOT") {
             Ok(Expr::Unary {
                 operator: UnaryOperator::Not,
-                expression: Box::new(self.parse_not()?),
+                expression: Box::new(self.nested(Self::parse_not)?),
             })
         } else {
             self.parse_comparison()
@@ -784,7 +840,7 @@ impl Parser {
             };
             if let Some(operator) = operator {
                 self.advance();
-                expression = binary(expression, operator, self.parse_additive()?);
+                expression = checked_binary(expression, operator, self.parse_additive()?)?;
                 continue;
             }
             if self.consume_word("IS") {
@@ -794,6 +850,7 @@ impl Parser {
                     expression: Box::new(expression),
                     negated,
                 };
+                validate_expression_depth(&expression)?;
                 continue;
             }
             break;
@@ -810,7 +867,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            expression = binary(expression, operator, self.parse_multiplicative()?);
+            expression = checked_binary(expression, operator, self.parse_multiplicative()?)?;
         }
         Ok(expression)
     }
@@ -825,7 +882,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            expression = binary(expression, operator, self.parse_unary()?);
+            expression = checked_binary(expression, operator, self.parse_unary()?)?;
         }
         Ok(expression)
     }
@@ -846,7 +903,7 @@ impl Parser {
             }
             Ok(Expr::Unary {
                 operator,
-                expression: Box::new(self.parse_unary()?),
+                expression: Box::new(self.nested(Self::parse_unary)?),
             })
         } else {
             self.parse_primary()
@@ -859,10 +916,11 @@ impl Parser {
             TokenKind::Number(value) => parse_number(&value, token.position),
             TokenKind::String(value) => Ok(Expr::Literal(Value::String(value))),
             TokenKind::LeftParen => {
-                let expression = self.parse_or()?;
+                let expression = self.nested(Self::parse_or)?;
                 self.expect(TokenKind::RightParen, "expected `)`")?;
                 Ok(expression)
             }
+            TokenKind::QuotedIdentifier(name) => Ok(Expr::Column(name)),
             TokenKind::Word(word) if word.eq_ignore_ascii_case("NULL") => {
                 Ok(Expr::Literal(Value::Null))
             }
@@ -888,7 +946,7 @@ impl Parser {
 
     fn parse_cast(&mut self) -> Result<Expr> {
         self.expect(TokenKind::LeftParen, "expected `(` after CAST")?;
-        let expression = self.parse_or()?;
+        let expression = self.nested(Self::parse_or)?;
         self.expect_word("AS")?;
         let token = self.advance().clone();
         let TokenKind::Word(name) = token.kind else {
@@ -907,13 +965,13 @@ impl Parser {
         let operand = if self.peek_word("WHEN") {
             None
         } else {
-            Some(Box::new(self.parse_or()?))
+            Some(Box::new(self.nested(Self::parse_or)?))
         };
         let mut branches = Vec::new();
         while self.consume_word("WHEN") {
-            let condition = self.parse_or()?;
+            let condition = self.nested(Self::parse_or)?;
             self.expect_word("THEN")?;
-            let result = self.parse_or()?;
+            let result = self.nested(Self::parse_or)?;
             branches.push((condition, result));
         }
         if branches.is_empty() {
@@ -923,7 +981,7 @@ impl Parser {
             ));
         }
         let else_expression = if self.consume_word("ELSE") {
-            Some(Box::new(self.parse_or()?))
+            Some(Box::new(self.nested(Self::parse_or)?))
         } else {
             None
         };
@@ -939,7 +997,7 @@ impl Parser {
         let mut arguments = Vec::new();
         if !self.consume(TokenKind::RightParen) {
             loop {
-                arguments.push(self.parse_or()?);
+                arguments.push(self.nested(Self::parse_or)?);
                 if self.consume(TokenKind::RightParen) {
                     break;
                 }
@@ -1004,6 +1062,18 @@ impl Parser {
             ))
         }
     }
+
+    fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.nesting_depth >= MAX_EXPRESSION_DEPTH {
+            return Err(Error::ExpressionTooDeep {
+                limit: MAX_EXPRESSION_DEPTH,
+            });
+        }
+        self.nesting_depth += 1;
+        let result = parse(self);
+        self.nesting_depth -= 1;
+        result
+    }
 }
 
 fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
@@ -1012,6 +1082,12 @@ fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
         operator,
         right: Box::new(right),
     }
+}
+
+fn checked_binary(left: Expr, operator: BinaryOperator, right: Expr) -> Result<Expr> {
+    let expression = binary(left, operator, right);
+    validate_expression_depth(&expression)?;
+    Ok(expression)
 }
 
 fn parse_number(value: &str, position: usize) -> Result<Expr> {
