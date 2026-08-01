@@ -1,9 +1,14 @@
 //! RustHouse is a compact analytical database with snapshot-isolated sessions.
+//!
+//! Its storage-independent scalar subsystem provides nullable SQL values,
+//! expression parsing and evaluation, and NULL-aware aggregate states.
 
+mod aggregate;
 pub mod batch;
 pub mod catalog;
 mod database;
 pub mod error;
+mod expression;
 pub mod formats;
 pub mod http;
 pub mod kernels;
@@ -11,13 +16,18 @@ mod persistence;
 pub mod query;
 mod sql;
 pub mod storage;
+mod value;
 
+pub use aggregate::{Aggregate, AggregateFunction};
 pub use catalog::{
     CatalogImage, ColumnData, ColumnImage, Corruption, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC,
     SchemaImage, SnapshotError, SnapshotLimits, SnapshotStore, TableImage,
 };
 pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};
+pub use expression::{
+    BinaryOperator, EvaluationContext, Expr, MAX_EXPRESSION_DEPTH, UnaryOperator, evaluate, parse,
+};
 pub use query::{
     QueryCancellation, QueryError, QueryErrorKind, QueryFuture, QueryRequest, QueryResult,
     QueryService, QueryValue, ServiceHealth,

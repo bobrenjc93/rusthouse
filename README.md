@@ -209,6 +209,17 @@ The deterministic benchmark uses fixed generated input and fixed iteration count
 cargo bench --bench vector_kernels
 ```
 
+## Scalar SQL semantics
+
+The storage-independent scalar expression subsystem parses and evaluates
+literals, column references, arithmetic, comparisons, `AND`/`OR`/`NOT`, `IS
+[NOT] NULL`, `CAST`, searched and simple `CASE`, `COALESCE`, and core string
+functions. Stateful `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` implementations
+define the behavior the query engine will use for groups.
+
+The complete semantic contract, including error and edge-case behavior, is in
+[`docs/sql-semantics.md`](docs/sql-semantics.md).
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.

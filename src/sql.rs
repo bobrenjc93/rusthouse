@@ -129,7 +129,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                     position += 1;
                 }
                 if exponent_start == position {
-                    return Err(Error::Parse("invalid numeric exponent".to_owned()));
+                    return Err(Error::Parse {
+                        message: "invalid numeric exponent".to_owned(),
+                        position,
+                    });
                 }
             }
             tokens.push(Token::Number(chars[start..position].iter().collect()));
@@ -170,15 +173,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 }
             }
             _ => {
-                return Err(Error::Parse(format!(
-                    "unexpected character {character:?} at character {}",
-                    position + 1
-                )));
+                return Err(Error::Parse {
+                    message: format!(
+                        "unexpected character {character:?} at character {}",
+                        position + 1
+                    ),
+                    position,
+                });
             }
         }
     }
     if tokens.is_empty() {
-        return Err(Error::Parse("statement is empty".to_owned()));
+        return Err(Error::Parse {
+            message: "statement is empty".to_owned(),
+            position: 0,
+        });
     }
     Ok(tokens)
 }
@@ -201,9 +210,10 @@ fn quoted(
             return Ok((value, position + 1));
         }
         if backslash_escapes && chars[position] == '\\' {
-            let escaped = chars
-                .get(position + 1)
-                .ok_or_else(|| Error::Parse("unterminated escape in string literal".to_owned()))?;
+            let escaped = chars.get(position + 1).ok_or_else(|| Error::Parse {
+                message: "unterminated escape in string literal".to_owned(),
+                position,
+            })?;
             value.push(match escaped {
                 'n' => '\n',
                 'r' => '\r',
@@ -218,14 +228,17 @@ fn quoted(
             position += 1;
         }
     }
-    Err(Error::Parse(format!(
-        "unterminated {}",
-        if delimiter == '\'' {
-            "string literal"
-        } else {
-            "quoted identifier"
-        }
-    )))
+    Err(Error::Parse {
+        message: format!(
+            "unterminated {}",
+            if delimiter == '\'' {
+                "string literal"
+            } else {
+                "quoted identifier"
+            }
+        ),
+        position: start,
+    })
 }
 
 struct Parser {
@@ -474,10 +487,10 @@ impl Parser {
     }
 
     fn error(&self, message: &str) -> Error {
-        Error::Parse(format!(
-            "{message} at token {}",
-            self.position.saturating_add(1)
-        ))
+        Error::Parse {
+            message: format!("{message} at token {}", self.position.saturating_add(1)),
+            position: 0,
+        }
     }
 }
 

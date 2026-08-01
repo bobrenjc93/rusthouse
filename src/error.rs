@@ -1,6 +1,8 @@
 use std::fmt;
 use std::io;
 
+use crate::DataType;
+
 /// The resource whose configured transaction limit was exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitKind {
@@ -11,7 +13,10 @@ pub enum LimitKind {
 /// Errors returned by the database, batch, and execution APIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    Parse(String),
+    Parse {
+        message: String,
+        position: usize,
+    },
     Unsupported(String),
     TableAlreadyExists(String),
     TableNotFound(String),
@@ -116,6 +121,28 @@ pub enum Error {
     GroupLimitExceeded {
         max_groups: usize,
     },
+    UnknownColumn(String),
+    Type {
+        operation: String,
+        expected: String,
+        actual: String,
+    },
+    Overflow {
+        operation: String,
+    },
+    ExpressionTooDeep {
+        limit: usize,
+    },
+    DivideByZero,
+    InvalidCast {
+        value: String,
+        target: DataType,
+    },
+    InvalidArgument {
+        function: String,
+        message: String,
+    },
+    Aggregate(String),
 }
 
 impl Error {
@@ -130,7 +157,9 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Parse(message) => write!(f, "SQL parse error: {message}"),
+            Self::Parse { message, position } => {
+                write!(f, "SQL parse error at byte {position}: {message}")
+            }
             Self::Unsupported(message) => write!(f, "unsupported operation: {message}"),
             Self::TableAlreadyExists(table) => write!(f, "table already exists: {table}"),
             Self::TableNotFound(table) => write!(f, "table not found: {table}"),
@@ -144,6 +173,15 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "type mismatch for column {column}: expected {expected}, got {actual}"
+            ),
+            Self::UnknownColumn(name) => write!(f, "unknown column `{name}`"),
+            Self::Type {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "type error in {operation}: expected {expected}, got {actual}"
             ),
             Self::TransactionAlreadyActive => f.write_str("a transaction is already active"),
             Self::NoActiveTransaction => f.write_str("no transaction is active"),
@@ -269,6 +307,18 @@ impl fmt::Display for Error {
             Self::GroupLimitExceeded { max_groups } => {
                 write!(f, "hash grouping exceeded its {max_groups} group limit")
             }
+            Self::Overflow { operation } => write!(f, "numeric overflow in {operation}"),
+            Self::ExpressionTooDeep { limit } => {
+                write!(f, "expression exceeds the maximum depth of {limit}")
+            }
+            Self::DivideByZero => f.write_str("division by zero"),
+            Self::InvalidCast { value, target } => {
+                write!(f, "cannot cast {value} to {target}")
+            }
+            Self::InvalidArgument { function, message } => {
+                write!(f, "invalid argument to {function}: {message}")
+            }
+            Self::Aggregate(message) => write!(f, "aggregate error: {message}"),
         }
     }
 }

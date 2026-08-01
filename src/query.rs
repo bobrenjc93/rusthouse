@@ -297,14 +297,22 @@ impl std::error::Error for QueryError {}
 impl From<Error> for QueryError {
     fn from(error: Error) -> Self {
         let kind = match &error {
-            Error::Parse(_)
+            Error::Parse { .. }
             | Error::Unsupported(_)
             | Error::DuplicateColumn(_)
             | Error::InvalidRow(_)
             | Error::TypeMismatch { .. }
             | Error::UnsupportedAggregate { .. }
-            | Error::InvalidAggregate { .. } => QueryErrorKind::InvalidQuery,
-            Error::TableNotFound(_) | Error::ColumnNotFound(_) => QueryErrorKind::NotFound,
+            | Error::InvalidAggregate { .. }
+            | Error::Type { .. }
+            | Error::Overflow { .. }
+            | Error::DivideByZero
+            | Error::InvalidCast { .. }
+            | Error::InvalidArgument { .. }
+            | Error::Aggregate(_) => QueryErrorKind::InvalidQuery,
+            Error::TableNotFound(_) | Error::ColumnNotFound(_) | Error::UnknownColumn(_) => {
+                QueryErrorKind::NotFound
+            }
             Error::TableAlreadyExists(_)
             | Error::TransactionAlreadyActive
             | Error::NoActiveTransaction
@@ -323,7 +331,8 @@ impl From<Error> for QueryError {
             | Error::SelectionMismatch { .. }
             | Error::ArithmeticOverflow { .. }
             | Error::MemoryLimitExceeded { .. }
-            | Error::GroupLimitExceeded { .. } => QueryErrorKind::ResourceLimit,
+            | Error::GroupLimitExceeded { .. }
+            | Error::ExpressionTooDeep { .. } => QueryErrorKind::ResourceLimit,
             Error::DatabaseAlreadyOpen(_) | Error::CommitRecoveryRequired(_) => {
                 QueryErrorKind::Unavailable
             }
