@@ -194,6 +194,28 @@ fn retained_results_reduce_sort_memory_across_statements() {
 }
 
 #[test]
+fn tiny_sorts_do_not_scale_their_allocation_to_the_memory_limit() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE tiny_sort (n Int64); INSERT INTO tiny_sort VALUES (1)")
+        .expect("setup succeeds");
+
+    query(&mut database, "SELECT n FROM tiny_sort");
+    let plain_peak = database.last_execution_stats().peak_memory_bytes;
+    query(&mut database, "SELECT n FROM tiny_sort ORDER BY n");
+    let ordered_peak = database.last_execution_stats().peak_memory_bytes;
+    query(
+        &mut database,
+        "SELECT n, COUNT(*) FROM tiny_sort GROUP BY n",
+    );
+    let grouped_peak = database.last_execution_stats().peak_memory_bytes;
+
+    assert!(plain_peak < 4_096);
+    assert!(ordered_peak < 4_096);
+    assert!(grouped_peak < 4_096);
+}
+
+#[test]
 fn sorter_success_is_monotonic_across_capacity_boundaries() {
     let values = (1..=17)
         .rev()

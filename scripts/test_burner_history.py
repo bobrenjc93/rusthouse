@@ -412,6 +412,40 @@ class GenerationTests(unittest.TestCase):
             burner_history.check_artifacts(history_path, svg_path)
             self.assertEqual(list(root.glob(".*.burner-*")), [])
 
+    def test_symlink_artifact_is_rejected_before_transaction(self) -> None:
+        history = burner_history.validate_history(example_history())
+        updated = burner_history.upsert_merge(
+            history,
+            pr_number=2,
+            merge_sha=MERGE_TWO_SHA,
+            recorded_at="2026-01-03T00:00:00.000Z",
+            title="Second merge",
+            scores={"eval_aaaaaaaa": 92, "eval_bbbbbbbb": 91},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history_target = root / "real-history.json"
+            history_path = root / "history.json"
+            svg_path = root / "progress.svg"
+            history_target.write_bytes(
+                burner_history.encode_history(history).encode("utf-8")
+            )
+            history_path.symlink_to(history_target)
+            svg_path.write_bytes(burner_history.render_svg(history).encode("utf-8"))
+            old_pair = history_target.read_bytes(), svg_path.read_bytes()
+
+            with self.assertRaisesRegex(burner_history.HistoryError, "symbolic links"):
+                burner_history._write_artifacts_transactionally(
+                    history_path,
+                    burner_history.encode_history(updated),
+                    svg_path,
+                    burner_history.render_svg(updated),
+                )
+
+            self.assertTrue(history_path.is_symlink())
+            self.assertEqual((history_target.read_bytes(), svg_path.read_bytes()), old_pair)
+            self.assertEqual(list(root.glob(".*.burner-*")), [])
+
     def test_svg_is_deterministic_fixed_scale_and_xml_escaped(self) -> None:
         history = burner_history.validate_history(example_history())
         first = burner_history.render_svg(history)

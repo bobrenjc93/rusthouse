@@ -555,6 +555,8 @@ def _transaction_paths(history_path: Path, svg_path: Path) -> tuple[Path, Path, 
 
 
 def _ensure_safe_artifact_paths(history_path: Path, svg_path: Path) -> None:
+    if history_path.is_symlink() or svg_path.is_symlink():
+        _fail("history and SVG artifact paths must not be symbolic links")
     marker, history_backup, svg_backup = _transaction_paths(history_path, svg_path)
     paths = (history_path, svg_path, marker, history_backup, svg_backup)
     resolved = [path.resolve() for path in paths]

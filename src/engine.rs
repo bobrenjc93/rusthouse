@@ -927,7 +927,12 @@ fn execute_ungrouped(
 
     let compare =
         |left: usize, right: usize| compare_source_rows(table, items, ordering, left, right);
-    let mut sorter = IndexSorter::new(compare, context, settings.spill_directory);
+    let mut sorter = IndexSorter::new(
+        compare,
+        table.row_count(),
+        context,
+        settings.spill_directory,
+    );
     scan_matching_rows(
         table,
         predicate,
@@ -1032,7 +1037,7 @@ fn execute_grouped_sequential(
     let compare = |left: usize, right: usize| {
         compare_group_keys(table, group_columns, left, right).then_with(|| left.cmp(&right))
     };
-    let mut sorter = IndexSorter::new(compare, context, spill_directory);
+    let mut sorter = IndexSorter::new(compare, table.row_count(), context, spill_directory);
     for row in 0..table.row_count() {
         if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
             context.add_intermediate_rows(1)?;
@@ -2037,7 +2042,7 @@ fn project_grouped_rows(
         return Ok(Vec::new());
     }
     let compare = |left, right| compare_group_rows(data, items, ordering, left, right);
-    let mut sorter = IndexSorter::new(compare, context, spill_directory);
+    let mut sorter = IndexSorter::new(compare, data.groups.len(), context, spill_directory);
     for group in 0..data.groups.len() {
         sorter.add(group, context)?;
     }
@@ -2095,11 +2100,16 @@ impl<F> IndexSorter<F>
 where
     F: Fn(usize, usize) -> Ordering,
 {
-    fn new(compare: F, context: &ExecutionContext<'_>, spill_directory: &Arc<PathBuf>) -> Self {
+    fn new(
+        compare: F,
+        candidate_count: usize,
+        context: &ExecutionContext<'_>,
+        spill_directory: &Arc<PathBuf>,
+    ) -> Self {
         let available_memory = context.available_memory();
         Self {
             compare,
-            chunk_capacity: available_memory / (2 * size_of::<usize>()),
+            chunk_capacity: candidate_count.min(available_memory / (2 * size_of::<usize>())),
             chunk_memory_bytes: 0,
             run_memory_bytes: 0,
             chunk: Vec::new(),
@@ -2203,7 +2213,13 @@ where
         let capacity = self.chunk_capacity.max(1);
         let reserved = capacity.saturating_mul(size_of::<usize>());
         context.reserve_memory(reserved)?;
-        let chunk = Vec::with_capacity(capacity);
+        let mut chunk = Vec::new();
+        if let Err(error) = chunk.try_reserve_exact(capacity) {
+            context.release_memory(reserved);
+            return Err(Error::AllocationFailed(format!(
+                "sort index buffer of {reserved} bytes: {error}"
+            )));
+        }
         let actual = chunk.capacity().saturating_mul(size_of::<usize>());
         if let Err(error) = context.adjust_memory_reservation(reserved, actual) {
             context.release_memory(reserved);
@@ -2995,6 +3011,7 @@ mod tests {
         let context = ExecutionContext::new(&database.limits, 0);
         let sorter = IndexSorter::new(
             |left: usize, right: usize| left.cmp(&right),
+            1,
             &context,
             &database.spill_directory,
         );
@@ -3004,6 +3021,27 @@ mod tests {
             sorter.spill_directory.as_ref().as_path(),
         ));
         assert_eq!(context.stats.peak_memory_bytes, 0);
+    }
+
+    #[test]
+    fn sorter_reports_index_allocation_failure() {
+        let limits = ExecutionLimits {
+            max_memory_bytes: usize::MAX,
+            ..ExecutionLimits::default()
+        };
+        let mut context = ExecutionContext::new(&limits, 0);
+        let spill_directory = Arc::new(std::env::temp_dir());
+        let mut sorter = IndexSorter::new(
+            |left: usize, right: usize| left.cmp(&right),
+            usize::MAX,
+            &context,
+            &spill_directory,
+        );
+
+        assert!(matches!(
+            sorter.add(0, &mut context),
+            Err(Error::AllocationFailed(message)) if message.contains("sort index buffer")
+        ));
     }
 
     #[test]

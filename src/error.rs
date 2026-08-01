@@ -96,6 +96,8 @@ pub enum Error {
     InvalidConfiguration(String),
     /// A parallel scan worker could not be created.
     WorkerSpawn(String),
+    /// A transient execution buffer could not be allocated.
+    AllocationFailed(String),
     /// An integer aggregate exceeded its representable range.
     NumericOverflow(String),
     /// A configured execution or rendering ceiling was exceeded.
@@ -154,6 +156,7 @@ impl fmt::Display for Error {
                 write!(f, "invalid configuration: {message}")
             }
             Self::WorkerSpawn(message) => write!(f, "could not spawn scan worker: {message}"),
+            Self::AllocationFailed(message) => write!(f, "allocation failed: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
