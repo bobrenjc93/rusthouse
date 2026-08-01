@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "evaluations": {
+    "eval_1760dce7": {
+      "name": "Analytical database capability",
+      "color": "#ff6b35"
+    },
+    "eval_09a06479": {
+      "name": "Rust engineering quality",
+      "color": "#7c5cff"
+    },
+    "eval_fec7c3c5": {
+      "name": "ClickHouse sustained parity",
+      "color": "#00a7a5"
+    },
+    "eval_5e8ac76b": {
+      "name": "Benchmark integrity and anti-gaming",
+      "color": "#e6a700"
+    },
+    "eval_5a64f410": {
+      "name": "ClickHouse feature comprehensiveness",
+      "color": "#d94f8a"
+    },
+    "eval_cc70b9b9": {
+      "name": "Evaluation progress accounting",
+      "color": "#2589bd"
+    }
+  },
+  "points": [
+    {
+      "key": "base:693daae972cd9690ffee802c8b1a8988483f9171",
+      "commit": "693daae972cd9690ffee802c8b1a8988483f9171",
+      "recordedAt": "2026-08-01T23:22:29.797Z",
+      "label": "base 693daae",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_1760dce7": 0,
+        "eval_09a06479": 25,
+        "eval_fec7c3c5": 0,
+        "eval_5e8ac76b": 80,
+        "eval_5a64f410": 0,
+        "eval_cc70b9b9": 0
+      }
+    },
+    {
+      "key": "pr:158",
+      "recordedAt": "2026-08-01T23:22:29.797Z",
+      "label": "PR #158",
+      "kind": "leaf",
+      "prNumber": 158,
+      "title": "Build the benchmark-complete in-memory SQL vertical slice",
+      "scores": {
+        "eval_1760dce7": 50,
+        "eval_09a06479": 70,
+        "eval_fec7c3c5": 0,
+        "eval_5e8ac76b": 80,
+        "eval_5a64f410": 20,
+        "eval_cc70b9b9": 0
+      }
+    }
+  ]
+}
