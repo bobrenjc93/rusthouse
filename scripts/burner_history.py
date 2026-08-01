@@ -28,7 +28,7 @@ DISPATCH_EVENT = "burner_evaluation_completed"
 MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_EVALUATIONS = 100
-MAX_POINTS = 10_000
+MAX_POINTS = 1_000
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 EVALUATION_ID_RE = re.compile(r"eval_[0-9a-f]{8}")
 RUN_ID_RE = re.compile(r"evalrun_[0-9a-f]{8}")
@@ -110,7 +110,7 @@ def validate_score(value: Any, location: str) -> None:
     require(0 <= value <= 100, f"{location} must be between 0 and 100")
 
 
-def validate_history(history: Any) -> None:
+def validate_history(history: Any, *, check_svg_capacity: bool = True) -> None:
     require(isinstance(history, dict), "history must be a JSON object")
     exact_keys(history, {"version", "description", "tracking", "evaluations", "points"}, "history")
     require(history["version"] == 1 and type(history["version"]) is int,
@@ -232,8 +232,8 @@ def validate_history(history: Any) -> None:
                 require(isinstance(run_id, str) and RUN_ID_RE.fullmatch(run_id) is not None,
                         f"{location}.evidence.runs.{evaluation_id} is invalid")
         else:
-            require(type(point["prNumber"]) is int and point["prNumber"] > 0,
-                    f"{location}.prNumber must be a positive integer")
+            require(type(point["prNumber"]) is int and 0 < point["prNumber"] <= 2_147_483_647,
+                    f"{location}.prNumber must be a positive 32-bit integer")
             require(point["prNumber"] not in seen_prs,
                     f"duplicate PR number: {point['prNumber']}")
             seen_prs.add(point["prNumber"])
@@ -256,16 +256,32 @@ def validate_history(history: Any) -> None:
                     f"{location}.evidence.source must be {DISPATCH_EVENT!r}")
 
     require(baseline_count == 1, "history must contain exactly one baseline point")
-    require(covered_evaluations == set(evaluations),
-            "every registered evaluation must have scores from its introduction")
+    pending_evaluations = set(evaluations) - covered_evaluations
+    invalid_pending = sorted(
+        evaluation_id for evaluation_id in pending_evaluations
+        if evaluation_times[evaluation_id] <= previous_time
+    )
+    require(not invalid_pending,
+            "evaluations without scores must have introducedAt after the latest point: "
+            f"{invalid_pending}")
+
+    try:
+        canonical_json = (json.dumps(history, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+    except (OverflowError, TypeError, ValueError) as error:
+        raise HistoryError(f"history cannot be serialized as canonical JSON: {error}") from error
+    require(len(canonical_json) <= MAX_DOCUMENT_BYTES,
+            f"canonical history exceeds the {MAX_DOCUMENT_BYTES}-byte artifact limit")
+    if check_svg_capacity:
+        svg_contents = _render_svg(history).encode("utf-8")
+        require(len(svg_contents) <= MAX_DOCUMENT_BYTES,
+                f"generated SVG exceeds the {MAX_DOCUMENT_BYTES}-byte artifact limit")
 
 
 def xml(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
-def render_svg(history: dict[str, Any]) -> str:
-    validate_history(history)
+def _render_svg(history: dict[str, Any]) -> str:
     evaluations = list(history["evaluations"].items())
     points = history["points"]
     width = 1200
@@ -322,8 +338,11 @@ def render_svg(history: dict[str, Any]) -> str:
                 f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{evaluation["color"]}" '
                 f'stroke-width="3" stroke-linejoin="round" stroke-linecap="round"{dash}/>'
             )
+        dot_values = list(zip(coordinates, visible))
+        if len(points) > 60:
+            dot_values = dot_values[-1:]
         dots = []
-        for coordinate, (_index, point, score) in zip(coordinates, visible):
+        for coordinate, (_index, point, score) in dot_values:
             cx, cy = coordinate.split(",")
             dots.append(
                 f'<circle cx="{cx}" cy="{cy}" r="5" fill="{evaluation["color"]}" '
@@ -373,6 +392,14 @@ def render_svg(history: dict[str, Any]) -> str:
 {"".join(legend_parts)}
 </svg>
 '''
+
+
+def render_svg(history: dict[str, Any]) -> str:
+    validate_history(history, check_svg_capacity=False)
+    rendered = _render_svg(history)
+    require(len(rendered.encode("utf-8")) <= MAX_DOCUMENT_BYTES,
+            f"generated SVG exceeds the {MAX_DOCUMENT_BYTES}-byte artifact limit")
+    return rendered
 
 
 def readme_block() -> str:
@@ -493,8 +520,8 @@ def validate_dispatch_payload(payload: Any) -> dict[str, Any]:
     exact_keys(payload, {"schema_version", "pr_number", "merge_commit", "scores"}, "client_payload")
     require(payload["schema_version"] == 1 and type(payload["schema_version"]) is int,
             "client_payload.schema_version must be the integer 1")
-    require(type(payload["pr_number"]) is int and payload["pr_number"] > 0,
-            "client_payload.pr_number must be a positive integer")
+    require(type(payload["pr_number"]) is int and 0 < payload["pr_number"] <= 2_147_483_647,
+            "client_payload.pr_number must be a positive 32-bit integer")
     require(isinstance(payload["merge_commit"], str)
             and SHA_RE.fullmatch(payload["merge_commit"]) is not None,
             "client_payload.merge_commit must be a full lowercase commit SHA")
@@ -567,11 +594,11 @@ def record_merge(
     )
     require(conflicting_key is None,
             f"merge commit {payload['merge_commit']} is already assigned to another point")
-    history["points"].append(point)
-    history["points"].sort(key=lambda item: (parse_time(item["recordedAt"], "point.recordedAt"),
+    updated = {**history, "points": [*history["points"], point]}
+    updated["points"].sort(key=lambda item: (parse_time(item["recordedAt"], "point.recordedAt"),
                                              item.get("prNumber", 0)))
-    validate_history(history)
-    return history, True
+    validate_history(updated)
+    return updated, True
 
 
 def load_dispatch_event(path: Path) -> tuple[dict[str, Any], str, str]:

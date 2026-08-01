@@ -12,6 +12,7 @@ from scripts import burner_history as history_tool
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MERGE_A = "b" * 40
 MERGE_B = "c" * 40
+MERGE_C = "d" * 40
 
 
 class BurnerHistoryTests(unittest.TestCase):
@@ -95,6 +96,42 @@ class BurnerHistoryTests(unittest.TestCase):
         conflict["scores"] = self.scores(20)
         with self.assertRaisesRegex(history_tool.HistoryError, "conflicting retry"):
             history_tool.record_merge(retried, conflict, self.pull())
+
+    def test_pending_evaluation_becomes_required_at_introduction_boundary(self) -> None:
+        pending_id = "eval_dddddddd"
+        pending = copy.deepcopy(self.history)
+        pending["evaluations"][pending_id] = {
+            "name": "Newly introduced evaluation",
+            "color": "#475569",
+            "dash": "6 2",
+            "introducedAt": "2026-08-03T00:00:00Z",
+        }
+        history_tool.validate_history(pending)
+
+        before_boundary, _ = history_tool.record_merge(
+            pending,
+            self.payload(143, MERGE_A),
+            self.pull(143, MERGE_A, "2026-08-02T10:00:00Z"),
+        )
+        self.assertNotIn(pending_id, before_boundary["points"][-1]["scores"])
+
+        missing_score = self.payload(144, MERGE_B)
+        with self.assertRaisesRegex(history_tool.HistoryError, "exactly the active evaluations"):
+            history_tool.record_merge(
+                before_boundary,
+                missing_score,
+                self.pull(144, MERGE_B, "2026-08-04T10:00:00Z"),
+            )
+
+        complete = self.payload(144, MERGE_C)
+        complete["scores"] = {**complete["scores"], pending_id: 55}
+        after_boundary, _ = history_tool.record_merge(
+            before_boundary,
+            complete,
+            self.pull(144, MERGE_C, "2026-08-04T10:00:00Z"),
+        )
+        self.assertNotIn(pending_id, after_boundary["points"][0]["scores"])
+        self.assertEqual(55, after_boundary["points"][-1]["scores"][pending_id])
 
     def test_delayed_dispatches_are_sorted_and_reversed_history_fails(self) -> None:
         updated, _ = history_tool.record_merge(
@@ -191,6 +228,60 @@ class BurnerHistoryTests(unittest.TestCase):
         self.assertEqual(9, len(legend_labels))
         self.assertLess(max(float(node.attrib["y"]) for node in legend_labels) + 20, height)
         self.assertEqual(height, float(root.attrib["viewBox"].split()[-1]))
+
+    def test_maximum_history_shape_fits_artifact_limit(self) -> None:
+        maximum = copy.deepcopy(self.history)
+        baseline = maximum["points"][0]
+        used_colors = {item["color"].lower() for item in maximum["evaluations"].values()}
+        sequence = 0
+        while len(maximum["evaluations"]) < history_tool.MAX_EVALUATIONS:
+            evaluation_id = f"eval_{0x10000000 + sequence:08x}"
+            color = f"#{0x010000 + sequence:06x}"
+            sequence += 1
+            if evaluation_id in maximum["evaluations"] or color in used_colors:
+                continue
+            used_colors.add(color)
+            name = (f"Maximum-size evaluation {sequence} " + "x" * 120)[:120]
+            maximum["evaluations"][evaluation_id] = {
+                "name": name,
+                "color": color,
+                "dash": "1 1",
+                "introducedAt": "2026-08-01T04:51:12.000Z",
+            }
+            baseline["scores"][evaluation_id] = 99.99999999999999
+            baseline["evidence"]["runs"][evaluation_id] = f"evalrun_{0x10000000 + sequence:08x}"
+
+        scores = {
+            evaluation_id: 99.99999999999999
+            for evaluation_id in maximum["evaluations"]
+        }
+        baseline["scores"] = scores.copy()
+        for index in range(1, history_tool.MAX_POINTS):
+            pr_number = 100_000 + index
+            merge_commit = f"{index:040x}"
+            maximum["points"].append({
+                "key": f"merge:{merge_commit}",
+                "kind": "merge",
+                "recordedAt": "2026-08-02T00:00:00Z",
+                "label": f"PR #{pr_number}",
+                "prNumber": pr_number,
+                "mergeCommit": merge_commit,
+                "title": "x" * 300,
+                "url": f"https://github.com/bobrenjc93/rusthouse/pull/{pr_number}",
+                "scores": scores.copy(),
+                "evidence": {"source": history_tool.DISPATCH_EVENT},
+            })
+
+        history_tool.validate_history(maximum)
+        self.assertLessEqual(len(history_tool.json_bytes(maximum)), history_tool.MAX_DOCUMENT_BYTES)
+        self.assertLessEqual(
+            len(history_tool.render_svg(maximum).encode("utf-8")),
+            history_tool.MAX_DOCUMENT_BYTES,
+        )
+
+        overflow = {**maximum, "points": [*maximum["points"], {}]}
+        with self.assertRaisesRegex(history_tool.HistoryError, "cannot contain more than"):
+            history_tool.validate_history(overflow)
 
     def test_invalid_input_does_not_replace_generated_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

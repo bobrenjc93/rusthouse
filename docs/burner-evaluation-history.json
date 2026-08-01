@@ -7,7 +7,7 @@
     "startedAt": "2026-08-01T04:52:01.438Z",
     "rootCommit": "a915131d85a32ced9ee26ad9de4cbe927ff32cd8",
     "dispatchEvent": "burner_evaluation_completed",
-    "updatePolicy": "After Burner finishes every enabled evaluation for a merged PR, it sends one version-1 repository dispatch containing the PR number, merge commit, and complete score set. The workflow verifies GitHub merge evidence and default-branch ancestry before recording the point; exact retries do not add another point and conflicting retries fail."
+    "updatePolicy": "After Burner finishes every enabled evaluation for a merged PR, it sends one version-1 repository dispatch containing the PR number, merge commit, and complete score set. The workflow verifies GitHub merge evidence and default-branch ancestry before recording the point; exact retries do not add another point and conflicting retries fail. A new evaluation may be registered with introducedAt after the latest point, and its score becomes mandatory on the first merge at or after that boundary."
   },
   "evaluations": {
     "eval_d50af811": {
