@@ -7,11 +7,14 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The segment format version emitted by this module.
 pub const FORMAT_VERSION: u16 = 1;
@@ -20,6 +23,7 @@ const MAGIC: &[u8; 8] = b"RHSEG\0\0\0";
 const HEADER_SIZE: usize = 48;
 const HEADER_CHECKSUM_OFFSET: usize = 40;
 const HAS_MIN_MAX: u8 = 1;
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A physical column type supported by immutable segments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -436,7 +440,11 @@ struct EncodedBlock {
     payload: Vec<u8>,
 }
 
-/// An opened, validated segment. Block checksums are verified lazily on read.
+/// An opened, validated segment.
+///
+/// Opening verifies every block checksum and recomputes every zone map before
+/// the segment can be scanned. Reads still verify a selected block immediately
+/// before decoding it, which also detects changes to an in-memory byte buffer.
 pub struct Segment {
     bytes: Vec<u8>,
     schema: Schema,
@@ -744,7 +752,7 @@ impl Segment {
             ));
         }
 
-        Ok(Self {
+        let segment = Self {
             bytes,
             schema,
             row_count,
@@ -752,7 +760,9 @@ impl Segment {
             row_group_count,
             blocks,
             limits,
-        })
+        };
+        segment.validate_block_statistics()?;
+        Ok(segment)
     }
 
     pub fn version(&self) -> u16 {
@@ -884,6 +894,20 @@ impl Segment {
                 value.data_type(),
                 field.data_type
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_block_statistics(&self) -> Result<(), SegmentError> {
+        for meta in &self.blocks {
+            let column = self.decode_block(meta)?;
+            let actual = statistics_from_column(&column, meta.row_start)?;
+            if actual != meta.stats {
+                return Err(SegmentError::Corrupt(format!(
+                    "zone map does not match column {} row group {}",
+                    meta.column, meta.row_group
+                )));
+            }
         }
         Ok(())
     }
@@ -1030,8 +1054,11 @@ pub fn encode_segment(
     Ok(output)
 }
 
-/// Creates a new segment file, flushes its contents, and refuses to replace an
-/// existing path. Segment files are immutable after creation.
+/// Atomically publishes a new segment and refuses to replace an existing path.
+///
+/// The complete segment is written and synced through a temporary file in the
+/// destination directory. A no-replace hard link publishes the final name,
+/// after which the directory is synced before this function returns success.
 pub fn write_segment(
     path: impl AsRef<Path>,
     schema: &Schema,
@@ -1039,14 +1066,91 @@ pub fn write_segment(
     options: &WriteOptions,
 ) -> Result<(), SegmentError> {
     let bytes = encode_segment(schema, columns, options)?;
-    let path = path.as_ref();
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(SegmentError::Io(error));
+    publish_segment_bytes(path.as_ref(), &bytes, || {})
+}
+
+fn publish_segment_bytes(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(),
+) -> Result<(), SegmentError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        SegmentError::InvalidInput("segment path must include a file name".into())
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (temporary_path, mut file) = create_temporary_file(parent, file_name)?;
+    let mut cleanup = RemoveOnDrop::new(temporary_path.clone());
+
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    before_publish();
+
+    std::fs::hard_link(&temporary_path, path)?;
+    let cleanup_result = std::fs::remove_file(&temporary_path);
+    if cleanup_result.is_ok() {
+        cleanup.disarm();
     }
+    let sync_result = sync_directory(parent);
+    cleanup_result?;
+    sync_result?;
     Ok(())
+}
+
+fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBuf, File)> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..1_024 {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(
+            ".rusthouse-tmp-{}-{timestamp}-{id}",
+            std::process::id()
+        ));
+        let path = parent.join(temporary_name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary segment name",
+    ))
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+struct RemoveOnDrop {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl RemoveOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn validate_fields(fields: &[Field]) -> Result<(), SegmentError> {
@@ -1579,6 +1683,67 @@ fn decode_strings(
     Ok(Column::String(restore_nulls(bitmap, row_count, decoded)?))
 }
 
+fn statistics_from_column(
+    column: &Column,
+    row_start: u64,
+) -> Result<BlockStatistics, SegmentError> {
+    let row_count = usize_to_u32(column.len(), "decoded block row count")?;
+    let (null_count, min, max) = match column {
+        Column::Int64(values) => (
+            values.iter().filter(|value| value.is_none()).count(),
+            values
+                .iter()
+                .flatten()
+                .min()
+                .copied()
+                .map(ScalarValue::Int64),
+            values
+                .iter()
+                .flatten()
+                .max()
+                .copied()
+                .map(ScalarValue::Int64),
+        ),
+        Column::Bool(values) => (
+            values.iter().filter(|value| value.is_none()).count(),
+            values
+                .iter()
+                .flatten()
+                .min()
+                .copied()
+                .map(ScalarValue::Bool),
+            values
+                .iter()
+                .flatten()
+                .max()
+                .copied()
+                .map(ScalarValue::Bool),
+        ),
+        Column::String(values) => (
+            values.iter().filter(|value| value.is_none()).count(),
+            values
+                .iter()
+                .flatten()
+                .min()
+                .cloned()
+                .map(ScalarValue::String),
+            values
+                .iter()
+                .flatten()
+                .max()
+                .cloned()
+                .map(ScalarValue::String),
+        ),
+    };
+    Ok(BlockStatistics {
+        row_start,
+        row_count,
+        null_count: usize_to_u32(null_count, "decoded block null count")?,
+        min,
+        max,
+    })
+}
+
 fn predicate_can_skip(predicate: &Predicate, stats: &BlockStatistics) -> bool {
     match predicate {
         Predicate::IsNull { .. } => stats.null_count == 0,
@@ -2072,6 +2237,8 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_schema() -> Schema {
@@ -2116,6 +2283,17 @@ mod tests {
                 None,
             ]),
         ]
+    }
+
+    fn test_directory(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("rusthouse-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
     }
 
     #[test]
@@ -2254,11 +2432,30 @@ mod tests {
         let first_payload = parsed.blocks[0].offset as usize;
         let mut payload_corruption = bytes;
         payload_corruption[first_payload] ^= 0x80;
-        let segment = Segment::from_bytes(payload_corruption, DecodeLimits::default()).unwrap();
         assert!(matches!(
-            segment.read_column(0),
+            Segment::from_bytes(payload_corruption, DecodeLimits::default()),
             Err(SegmentError::ChecksumMismatch { location, .. })
                 if location == "column 0 row group 0"
+        ));
+    }
+
+    #[test]
+    fn rejects_semantically_incorrect_zone_maps_with_valid_checksums() {
+        let schema = Schema::new(vec![Field::new("number", DataType::Int64, false)]).unwrap();
+        let columns = vec![Column::Int64(vec![Some(1), Some(100)])];
+        let mut bytes = encode_segment(&schema, &columns, &WriteOptions::default()).unwrap();
+
+        let schema_len = 4 + 4 + schema.fields[0].name.len() + 1 + 1 + 2;
+        let first_max = HEADER_SIZE + schema_len + 52 + 8;
+        bytes[first_max..first_max + 8].copy_from_slice(&1_i64.to_le_bytes());
+        let header_len = read_u32_at(&bytes, 12).unwrap() as usize;
+        let checksum = checksum_with_zeroed_header_field(&bytes[..header_len]);
+        bytes[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+
+        assert!(matches!(
+            Segment::from_bytes(bytes, DecodeLimits::default()),
+            Err(SegmentError::Corrupt(message)) if message.contains("zone map does not match")
         ));
     }
 
@@ -2319,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn zone_maps_prune_corrupt_unneeded_blocks() {
+    fn verified_zone_maps_prune_unneeded_blocks() {
         let schema = Schema::new(vec![
             Field::new("number", DataType::Int64, false),
             Field::new("label", DataType::String, false),
@@ -2340,10 +2537,6 @@ mod tests {
             ),
         ];
         let bytes = encode_segment(&schema, &columns, &WriteOptions { rows_per_block: 4 }).unwrap();
-        let parsed = Segment::from_bytes(bytes.clone(), DecodeLimits::default()).unwrap();
-        let skipped_block_offset = parsed.block(0, 0).offset as usize;
-        let mut bytes = bytes;
-        bytes[skipped_block_offset] ^= 0x40;
         let segment = Segment::from_bytes(bytes, DecodeLimits::default()).unwrap();
 
         let result = segment
@@ -2373,10 +2566,6 @@ mod tests {
                 column_blocks_decoded: 2,
             }
         );
-        assert!(matches!(
-            segment.read_column(0),
-            Err(SegmentError::ChecksumMismatch { .. })
-        ));
     }
 
     #[test]
@@ -2418,26 +2607,64 @@ mod tests {
 
     #[test]
     fn immutable_file_write_refuses_replacement_and_reopens() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "rusthouse-segment-{}-{unique}.rhs",
-            std::process::id()
-        ));
+        let directory = test_directory("immutable");
+        let path = directory.join("segment.rhs");
         let schema = test_schema();
         let columns = test_columns();
 
         write_segment(&path, &schema, &columns, &WriteOptions::default()).unwrap();
         let reopened = Segment::open(&path, DecodeLimits::default()).unwrap();
         assert_eq!(reopened.read_all().unwrap(), columns);
+
+        let mut replacement = test_columns();
+        let Column::Int64(values) = &mut replacement[0] else {
+            unreachable!()
+        };
+        values[0] = Some(999);
         assert!(matches!(
-            write_segment(&path, &schema, &test_columns(), &WriteOptions::default()),
+            write_segment(&path, &schema, &replacement, &WriteOptions::default()),
             Err(SegmentError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
         ));
+        let reopened = Segment::open(&path, DecodeLimits::default()).unwrap();
+        assert_eq!(reopened.read_all().unwrap(), columns);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
 
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_hides_the_final_path_until_the_synced_file_is_complete() {
+        let directory = test_directory("publication");
+        let path = directory.join("segment.rhs");
+        let schema = test_schema();
+        let columns = test_columns();
+        let bytes = encode_segment(&schema, &columns, &WriteOptions::default()).unwrap();
+        let writer_path = path.clone();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (publish_sender, publish_receiver) = mpsc::channel();
+
+        let writer = thread::spawn(move || {
+            publish_segment_bytes(&writer_path, &bytes, || {
+                ready_sender.send(()).unwrap();
+                publish_receiver.recv().unwrap();
+            })
+        });
+        ready_receiver.recv().unwrap();
+
+        assert!(!path.exists());
+        assert!(matches!(
+            Segment::open(&path, DecodeLimits::default()),
+            Err(SegmentError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        publish_sender.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        let segment = Segment::open(&path, DecodeLimits::default()).unwrap();
+        assert_eq!(segment.read_all().unwrap(), columns);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -23,7 +23,9 @@ The early implementation should favor Rust's standard library and a small depend
 
 `storage::segment` provides the first durable columnar format. Version 1 files contain a checksummed fixed header, schema, and block directory followed by contiguous column blocks. Blocks are grouped by row range and carry null counts and exact min/max zone maps. Integer blocks use delta bit packing with a plain fallback for extreme deltas, booleans use validity and value bitmaps, and strings use a front-coded UTF-8 buffer.
 
-Readers verify header metadata before allocating, enforce configurable limits for files, metadata, rows, columns, blocks, decoded buffers, and strings, and verify each block checksum when that block is read. A predicate scan consults zone maps first, so pruned blocks are neither decoded nor checksummed. `write_segment` uses create-new semantics, syncs completed contents, and never replaces an existing segment.
+Readers verify header metadata before allocating and enforce configurable limits for files, metadata, rows, columns, blocks, decoded buffers, and strings. Opening a segment verifies every block checksum and recomputes every zone map from decoded values; persisted statistics are never trusted until that integrity pass succeeds. Later predicate scans consult the verified zone maps first and do not decode pruned blocks during the scan.
+
+`write_segment` writes and syncs a uniquely named temporary file in the destination directory, atomically publishes it with a no-replace hard link, removes the temporary name, and syncs the parent directory. The final path is therefore never visible with partial contents, an existing segment is never replaced, and success is not reported before the directory entry is durable.
 
 The format is intentionally self-contained and little-endian. Readers reject unknown versions, unknown encodings, non-canonical or overlapping block extents, invalid UTF-8, inconsistent null maps or statistics, non-zero padding, trailing data, and arithmetic overflow.
 
