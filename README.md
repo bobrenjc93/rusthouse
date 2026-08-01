@@ -311,6 +311,10 @@ cargo run -- --database demo.db \
   -e 'COMMIT'
 ```
 
+Query output defaults to a tab-separated table with a row count. Pass `--format csv`
+for ClickHouse `CSVWithNames`-compatible output: command acknowledgements are omitted,
+column names and strings are quoted, and SQL `NULL` is written as `\N`.
+
 ```rust
 use rusthouse::{Database, StatementResult};
 

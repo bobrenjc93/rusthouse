@@ -1,7 +1,7 @@
 use std::{
     env,
     error::Error,
-    io::{self, BufRead},
+    io::{self, BufRead, Write},
     net::SocketAddr,
     path::PathBuf,
     process::ExitCode,
@@ -24,6 +24,7 @@ Usage:
 Query options:
   -d, --database FILE            Persist data in FILE
   -e, --execute SQL              Execute SQL; repeat to share one session
+  -f, --format FORMAT            Output format: table (default) or csv
   -h, --help                     Print help
 
 Without --execute, one SQL statement is read from each input line.
@@ -76,18 +77,21 @@ fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
     };
     let database = open_database(options.database)?;
     let mut session = database.session();
+    let stdout = io::stdout();
+    let mut output = io::BufWriter::new(stdout.lock());
     if options.statements.is_empty() {
         for line in io::stdin().lock().lines() {
             let line = line?;
             if !line.trim().is_empty() {
-                print_result(session.execute(&line)?);
+                write_result(&mut output, session.execute(&line)?, options.format)?;
             }
         }
     } else {
         for statement in options.statements {
-            print_result(session.execute(&statement)?);
+            write_result(&mut output, session.execute(&statement)?, options.format)?;
         }
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -101,12 +105,14 @@ fn open_database(path: Option<PathBuf>) -> rusthouse::Result<Database> {
 struct CliOptions {
     database: Option<PathBuf>,
     statements: Vec<String>,
+    format: OutputFormat,
 }
 
 impl CliOptions {
     fn parse(mut arguments: impl Iterator<Item = String>) -> io::Result<Option<Self>> {
         let mut database = None;
         let mut statements = Vec::new();
+        let mut format = OutputFormat::Table;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "-h" | "--help" => return Ok(None),
@@ -122,6 +128,14 @@ impl CliOptions {
                         "--execute requires a SQL statement",
                     )?);
                 }
+                "-f" | "--format" => {
+                    let value =
+                        required_argument(&mut arguments, "--format requires an output format")?;
+                    format = OutputFormat::parse(&value)?;
+                }
+                _ if argument.starts_with("--format=") => {
+                    format = OutputFormat::parse(&argument["--format=".len()..])?;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -133,7 +147,27 @@ impl CliOptions {
         Ok(Some(Self {
             database,
             statements,
+            format,
         }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Table,
+    CsvWithNames,
+}
+
+impl OutputFormat {
+    fn parse(value: &str) -> io::Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "table" => Ok(Self::Table),
+            "csv" | "csvwithnames" => Ok(Self::CsvWithNames),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown output format {value:?}; expected table, csv, or CSVWithNames"),
+            )),
+        }
     }
 }
 
@@ -312,24 +346,37 @@ impl ShutdownSignals {
     }
 }
 
-fn print_result(result: StatementResult) {
+fn write_result(
+    output: &mut impl Write,
+    result: StatementResult,
+    format: OutputFormat,
+) -> io::Result<()> {
+    if format == OutputFormat::CsvWithNames {
+        return match result {
+            StatementResult::Query(result) => write_csv_with_names(output, &result),
+            _ => Ok(()),
+        };
+    }
+
     match result {
         StatementResult::TransactionStarted { generation } => {
-            println!("BEGIN (generation {generation})");
+            writeln!(output, "BEGIN (generation {generation})")?;
         }
         StatementResult::TransactionCommitted { generation } => {
-            println!("COMMIT (generation {generation})");
+            writeln!(output, "COMMIT (generation {generation})")?;
         }
-        StatementResult::TransactionRolledBack => println!("ROLLBACK"),
-        StatementResult::TableCreated => println!("CREATE TABLE"),
-        StatementResult::TableDropped => println!("DROP TABLE"),
-        StatementResult::RowsInserted { rows } => println!("INSERT {rows}"),
-        StatementResult::Query(result) => print_rows(&result),
+        StatementResult::TransactionRolledBack => writeln!(output, "ROLLBACK")?,
+        StatementResult::TableCreated => writeln!(output, "CREATE TABLE")?,
+        StatementResult::TableDropped => writeln!(output, "DROP TABLE")?,
+        StatementResult::RowsInserted { rows } => writeln!(output, "INSERT {rows}")?,
+        StatementResult::Query(result) => write_table_rows(output, &result)?,
     }
+    Ok(())
 }
 
-fn print_rows(result: &ResultSet) {
-    println!(
+fn write_table_rows(output: &mut impl Write, result: &ResultSet) -> io::Result<()> {
+    writeln!(
+        output,
         "{}",
         result
             .columns
@@ -337,14 +384,71 @@ fn print_rows(result: &ResultSet) {
             .map(|column| escape_field(&column.name))
             .collect::<Vec<_>>()
             .join("\t")
-    );
+    )?;
     for row in &result.rows {
-        println!(
+        writeln!(
+            output,
             "{}",
             row.iter().map(format_value).collect::<Vec<_>>().join("\t")
-        );
+        )?;
     }
-    println!("{} row(s)", result.row_count());
+    writeln!(output, "{} row(s)", result.row_count())
+}
+
+fn write_csv_with_names(output: &mut impl Write, result: &ResultSet) -> io::Result<()> {
+    write_csv_record(
+        output,
+        result
+            .columns
+            .iter()
+            .map(|column| CsvField::String(&column.name)),
+    )?;
+    for row in &result.rows {
+        write_csv_record(output, row.iter().map(csv_value))?;
+    }
+    Ok(())
+}
+
+enum CsvField<'a> {
+    String(&'a str),
+    Scalar(String),
+    Null,
+}
+
+fn csv_value(value: &Value) -> CsvField<'_> {
+    match value {
+        Value::Null => CsvField::Null,
+        Value::String(value) => CsvField::String(value),
+        value => CsvField::Scalar(format_value(value)),
+    }
+}
+
+fn write_csv_record<'a>(
+    output: &mut impl Write,
+    fields: impl Iterator<Item = CsvField<'a>>,
+) -> io::Result<()> {
+    for (index, field) in fields.enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        match field {
+            CsvField::String(value) => write_quoted_csv_field(output, value)?,
+            CsvField::Scalar(value) => output.write_all(value.as_bytes())?,
+            CsvField::Null => output.write_all(b"\\N")?,
+        }
+    }
+    output.write_all(b"\n")
+}
+
+fn write_quoted_csv_field(output: &mut impl Write, value: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
+    for part in value.split_inclusive('"') {
+        output.write_all(part.as_bytes())?;
+        if part.ends_with('"') {
+            output.write_all(b"\"")?;
+        }
+    }
+    output.write_all(b"\"")
 }
 
 fn format_value(value: &Value) -> String {
