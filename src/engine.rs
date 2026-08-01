@@ -79,6 +79,17 @@ impl Engine {
         let mut results = Vec::new();
         for statement in self.parse_statements(sql)? {
             let remaining_bytes = max_batch_result_bytes.saturating_sub(retained_bytes);
+            if matches!(
+                &statement,
+                Statement::CreateTable { .. } | Statement::Insert(_)
+            ) && std::mem::size_of::<StatementResult>() > remaining_bytes
+            {
+                return Err(Error::ResourceLimit {
+                    resource: "batch result bytes",
+                    limit: max_batch_result_bytes,
+                    actual: retained_bytes.saturating_add(std::mem::size_of::<StatementResult>()),
+                });
+            }
             let result = match self.execute_statement_with_budget(statement, remaining_bytes) {
                 Err(Error::ResourceLimit {
                     resource, actual, ..
@@ -550,14 +561,17 @@ impl Engine {
                 values.push(value);
             }
             if distinct {
+                let key_bytes = row_key_retained_bytes(&values);
+                let key_memory = memory.reserve(key_bytes)?;
                 let key = row_key(&values);
                 if seen.contains(&key) {
                     continue;
                 }
+                drop(key_memory);
                 seen_memory
                     .as_mut()
                     .expect("DISTINCT reservation exists")
-                    .grow(key_retained_bytes(&key).saturating_add(std::mem::size_of::<usize>()))?;
+                    .grow(key_bytes.saturating_add(std::mem::size_of::<usize>()))?;
                 seen.insert(key);
             }
             let source_rows = if ordered { rows } else { Vec::new() };
@@ -588,28 +602,44 @@ impl Engine {
 
         if ordered {
             for row in &mut projected {
+                let alias_bytes = columns.iter().zip(&row.values).fold(
+                    std::mem::size_of::<HashMap<String, Value>>(),
+                    |size, (name, value)| {
+                        size.saturating_add(std::mem::size_of::<String>())
+                            .saturating_add(name.len())
+                            .saturating_add(value_retained_payload_bytes(value))
+                            .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+                    },
+                );
+                let _alias_memory = memory.reserve(alias_bytes)?;
                 let aliases = columns
                     .iter()
-                    .cloned()
-                    .zip(row.values.iter().cloned())
-                    .map(|(name, value)| (normalize_identifier(&name), value))
+                    .zip(&row.values)
+                    .map(|(name, value)| (normalize_identifier(name), value.clone()))
                     .collect::<HashMap<_, _>>();
-                let sort_keys = order_by
-                    .iter()
-                    .map(|order| {
-                        if let Some(index) = order_ordinal(&order.expr, columns.len())? {
-                            return Ok(row.values[index].clone());
+                let mut sort_memory =
+                    memory.reserve(std::mem::size_of::<Vec<Value>>().saturating_add(
+                        order_by.len().saturating_mul(std::mem::size_of::<Value>()),
+                    ))?;
+                let mut sort_keys = Vec::with_capacity(order_by.len());
+                for order in order_by {
+                    let value = if let Some(index) = order_ordinal(&order.expr, columns.len())? {
+                        if let Value::String(value) = &row.values[index] {
+                            sort_memory.grow(value.len())?;
                         }
-                        if let Expr::Identifier(identifier) = &order.expr
-                            && let Some((index, _)) =
-                                columns.iter().enumerate().find(|(_, name)| {
-                                    normalize_identifier(name)
-                                        == normalize_identifier(&identifier.value)
-                                })
-                        {
-                            return Ok(row.values[index].clone());
+                        row.values[index].clone()
+                    } else if let Expr::Identifier(identifier) = &order.expr
+                        && let Some((index, _)) = columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, name)| name.eq_ignore_ascii_case(&identifier.value))
+                    {
+                        if let Value::String(value) = &row.values[index] {
+                            sort_memory.grow(value.len())?;
                         }
-                        eval_group(
+                        row.values[index].clone()
+                    } else {
+                        let value = eval_group(
                             &order.expr,
                             &source,
                             &row.source_rows,
@@ -617,14 +647,20 @@ impl Engine {
                             &alias_expressions,
                             &alias_types,
                             &memory,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                        )?;
+                        if let Value::String(value) = &value {
+                            sort_memory.grow(value.len())?;
+                        }
+                        value
+                    };
+                    sort_keys.push(value);
+                }
+                drop(sort_memory);
                 projected_memory.grow(values_retained_payload_bytes(&sort_keys))?;
                 row.sort_keys = sort_keys;
             }
             validate_sort_types(&projected)?;
-            projected.sort_by(|left, right| compare_projected(left, right, order_by));
+            projected.sort_unstable_by(|left, right| compare_projected(left, right, order_by));
         }
 
         projected.truncate(limit);
@@ -1824,24 +1860,28 @@ fn eval_row_with_memory(
             expr,
             pattern,
             escape_char,
-        } => eval_like(
-            eval_row_with_memory(expr, source, row, memory)?,
-            eval_row_with_memory(pattern, source, row, memory)?,
+        } => eval_like_operands(
+            expr,
+            pattern,
             *negated,
             false,
             escape_char.as_deref(),
+            memory,
+            |expr| eval_row_with_memory(expr, source, row, memory),
         ),
         Expr::ILike {
             negated,
             expr,
             pattern,
             escape_char,
-        } => eval_like(
-            eval_row_with_memory(expr, source, row, memory)?,
-            eval_row_with_memory(pattern, source, row, memory)?,
+        } => eval_like_operands(
+            expr,
+            pattern,
             *negated,
             true,
             escape_char.as_deref(),
+            memory,
+            |expr| eval_row_with_memory(expr, source, row, memory),
         ),
         Expr::Cast {
             kind,
@@ -2162,12 +2202,40 @@ fn eval_cast(
     }
 }
 
+fn eval_like_operands(
+    value_expr: &Expr,
+    pattern_expr: &Expr,
+    negated: bool,
+    insensitive: bool,
+    escape: Option<&str>,
+    memory: Option<&MemoryTracker>,
+    mut evaluate: impl FnMut(&Expr) -> Result<Value>,
+) -> Result<Value> {
+    let mut operand_memory = memory
+        .map(|memory| memory.reserve(std::mem::size_of::<Value>().saturating_mul(2)))
+        .transpose()?;
+    let value = evaluate(value_expr)?;
+    if let Some(reservation) = &mut operand_memory
+        && let Value::String(value) = &value
+    {
+        reservation.grow(value.len())?;
+    }
+    let pattern = evaluate(pattern_expr)?;
+    if let Some(reservation) = &mut operand_memory
+        && let Value::String(pattern) = &pattern
+    {
+        reservation.grow(pattern.len())?;
+    }
+    eval_like(value, pattern, negated, insensitive, escape, memory)
+}
+
 fn eval_like(
     value: Value,
     pattern: Value,
     negated: bool,
     insensitive: bool,
     escape: Option<&str>,
+    memory: Option<&MemoryTracker>,
 ) -> Result<Value> {
     if value.is_null() || pattern.is_null() {
         return Ok(Value::Null);
@@ -2175,22 +2243,56 @@ fn eval_like(
     let (Value::String(mut value), Value::String(pattern)) = (value, pattern) else {
         return Err(Error::Type("LIKE expects String operands".into()));
     };
+    let mut like_memory = memory.map(|memory| memory.reserve(0)).transpose()?;
     let escape = like_escape_char(escape)?;
-    let mut tokens = like_tokens(&pattern, escape)?;
-    if insensitive {
-        value = value.to_lowercase();
-        tokens = tokens
-            .into_iter()
-            .flat_map(|token| match token {
-                LikeToken::Literal(character) => character
-                    .to_lowercase()
-                    .map(LikeToken::Literal)
-                    .collect::<Vec<_>>(),
-                token => vec![token],
-            })
-            .collect();
+    let token_count = pattern.chars().count();
+    if let Some(reservation) = &mut like_memory {
+        reservation.grow(
+            std::mem::size_of::<Vec<LikeToken>>()
+                .saturating_add(token_count.saturating_mul(std::mem::size_of::<LikeToken>())),
+        )?;
     }
-    let matched = like_matches(&value, &tokens);
+    let mut tokens = like_tokens(&pattern, escape, token_count)?;
+    if insensitive {
+        let lowercase_length = lowercase_len(&value);
+        let folded_token_count = tokens.iter().fold(0_usize, |count, token| {
+            count.saturating_add(match token {
+                LikeToken::Literal(character) => character.to_lowercase().count(),
+                _ => 1,
+            })
+        });
+        if let Some(reservation) = &mut like_memory {
+            reservation.grow(
+                std::mem::size_of::<String>()
+                    .saturating_add(lowercase_length)
+                    .saturating_add(std::mem::size_of::<Vec<LikeToken>>())
+                    .saturating_add(
+                        folded_token_count.saturating_mul(std::mem::size_of::<LikeToken>()),
+                    ),
+            )?;
+        }
+        let mut lowercase = String::with_capacity(lowercase_length);
+        lowercase.extend(value.chars().flat_map(char::to_lowercase));
+        value = lowercase;
+        let mut folded_tokens = Vec::with_capacity(folded_token_count);
+        for token in tokens {
+            match token {
+                LikeToken::Literal(character) => {
+                    folded_tokens.extend(character.to_lowercase().map(LikeToken::Literal))
+                }
+                token => folded_tokens.push(token),
+            }
+        }
+        tokens = folded_tokens;
+    }
+    let value_char_count = value.chars().count();
+    if let Some(reservation) = &mut like_memory {
+        reservation.grow(
+            std::mem::size_of::<Vec<char>>()
+                .saturating_add(value_char_count.saturating_mul(std::mem::size_of::<char>())),
+        )?;
+    }
+    let matched = like_matches(&value, &tokens, value_char_count);
     Ok(Value::Bool(if negated { !matched } else { matched }))
 }
 
@@ -2218,8 +2320,8 @@ enum LikeToken {
     AnyMany,
 }
 
-fn like_tokens(pattern: &str, escape: Option<char>) -> Result<Vec<LikeToken>> {
-    let mut tokens = Vec::with_capacity(pattern.chars().count());
+fn like_tokens(pattern: &str, escape: Option<char>, token_count: usize) -> Result<Vec<LikeToken>> {
+    let mut tokens = Vec::with_capacity(token_count);
     let mut characters = pattern.chars();
     while let Some(character) = characters.next() {
         if Some(character) == escape {
@@ -2238,8 +2340,10 @@ fn like_tokens(pattern: &str, escape: Option<char>) -> Result<Vec<LikeToken>> {
     Ok(tokens)
 }
 
-fn like_matches(value: &str, tokens: &[LikeToken]) -> bool {
-    let value = value.chars().collect::<Vec<_>>();
+fn like_matches(value: &str, tokens: &[LikeToken], value_char_count: usize) -> bool {
+    let mut characters = Vec::with_capacity(value_char_count);
+    characters.extend(value.chars());
+    let value = characters;
     let (mut value_index, mut pattern_index) = (0, 0);
     let (mut star, mut retry) = (None, 0);
     while value_index < value.len() {
@@ -2368,17 +2472,21 @@ fn eval_scalar_function_with(
 }
 
 fn lowercase_with_memory(value: &str, memory: Option<&MemoryTracker>) -> Result<String> {
-    let length = value.chars().fold(0_usize, |length, character| {
-        character.to_lowercase().fold(length, |length, character| {
-            length.saturating_add(character.len_utf8())
-        })
-    });
+    let length = lowercase_len(value);
     let _result_memory = memory
         .map(|memory| memory.reserve(std::mem::size_of::<Value>().saturating_add(length)))
         .transpose()?;
     let mut result = String::with_capacity(length);
     result.extend(value.chars().flat_map(char::to_lowercase));
     Ok(result)
+}
+
+fn lowercase_len(value: &str) -> usize {
+    value.chars().fold(0_usize, |length, character| {
+        character.to_lowercase().fold(length, |length, character| {
+            length.saturating_add(character.len_utf8())
+        })
+    })
 }
 
 fn uppercase_with_memory(value: &str, memory: Option<&MemoryTracker>) -> Result<String> {
@@ -2715,56 +2823,48 @@ fn eval_group(
             expr,
             pattern,
             escape_char,
-        } => eval_like(
-            eval_group(
-                expr,
-                source,
-                rows,
-                aliases,
-                lazy_aliases,
-                alias_types,
-                memory,
-            )?,
-            eval_group(
-                pattern,
-                source,
-                rows,
-                aliases,
-                lazy_aliases,
-                alias_types,
-                memory,
-            )?,
+        } => eval_like_operands(
+            expr,
+            pattern,
             *negated,
             false,
             escape_char.as_deref(),
+            Some(memory),
+            |expr| {
+                eval_group(
+                    expr,
+                    source,
+                    rows,
+                    aliases,
+                    lazy_aliases,
+                    alias_types,
+                    memory,
+                )
+            },
         ),
         Expr::ILike {
             negated,
             expr,
             pattern,
             escape_char,
-        } => eval_like(
-            eval_group(
-                expr,
-                source,
-                rows,
-                aliases,
-                lazy_aliases,
-                alias_types,
-                memory,
-            )?,
-            eval_group(
-                pattern,
-                source,
-                rows,
-                aliases,
-                lazy_aliases,
-                alias_types,
-                memory,
-            )?,
+        } => eval_like_operands(
+            expr,
+            pattern,
             *negated,
             true,
             escape_char.as_deref(),
+            Some(memory),
+            |expr| {
+                eval_group(
+                    expr,
+                    source,
+                    rows,
+                    aliases,
+                    lazy_aliases,
+                    alias_types,
+                    memory,
+                )
+            },
         ),
         Expr::Cast {
             kind,
@@ -2837,19 +2937,22 @@ fn eval_aggregate(
         if value.is_null() {
             continue;
         }
+        let value_memory = memory.reserve(value_retained_payload_bytes(&value))?;
         if distinct {
+            let key_bytes = value_key_retained_bytes(&value);
+            let key_memory = memory.reserve(key_bytes)?;
             let key = value_key(&value);
             if seen.contains(&key) {
                 continue;
             }
+            drop(key_memory);
             seen_memory
                 .as_mut()
                 .expect("DISTINCT reservation exists")
-                .grow(
-                    key_value_retained_bytes(&key).saturating_add(std::mem::size_of::<usize>()),
-                )?;
+                .grow(key_bytes.saturating_add(std::mem::size_of::<usize>()))?;
             seen.insert(key);
         }
+        drop(value_memory);
         values_memory.grow(value_retained_payload_bytes(&value))?;
         values.push(value);
     }
@@ -2989,16 +3092,21 @@ fn row_key(values: &[Value]) -> Vec<KeyValue> {
     values.iter().map(value_key).collect()
 }
 
-fn key_retained_bytes(key: &[KeyValue]) -> usize {
-    key.iter()
+fn row_key_retained_bytes(values: &[Value]) -> usize {
+    values
+        .iter()
         .fold(std::mem::size_of::<Vec<KeyValue>>(), |size, value| {
-            size.saturating_add(key_value_retained_bytes(value))
+            size.saturating_add(std::mem::size_of::<KeyValue>())
+                .saturating_add(match value {
+                    Value::String(value) => value.len(),
+                    _ => 0,
+                })
         })
 }
 
-fn key_value_retained_bytes(value: &KeyValue) -> usize {
+fn value_key_retained_bytes(value: &Value) -> usize {
     std::mem::size_of::<KeyValue>().saturating_add(match value {
-        KeyValue::String(value) => value.len(),
+        Value::String(value) => value.len(),
         _ => 0,
     })
 }
@@ -3021,15 +3129,23 @@ fn make_groups<'a>(
     let mut index_memory = memory.reserve(std::mem::size_of::<HashMap<Vec<KeyValue>, usize>>())?;
     let mut groups = Vec::<Vec<usize>>::new();
     for row in rows {
-        let key = group_by
-            .iter()
-            .map(|expr| {
-                eval_row_with_memory(expr, source, Some(row), Some(memory))
-                    .map(|value| value_key(&value))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let key_bytes = key_retained_bytes(&key);
+        let mut key_values_memory = memory.reserve(
+            std::mem::size_of::<Vec<Value>>()
+                .saturating_add(group_by.len().saturating_mul(std::mem::size_of::<Value>())),
+        )?;
+        let mut key_values = Vec::with_capacity(group_by.len());
+        for expression in group_by {
+            let value = eval_row_with_memory(expression, source, Some(row), Some(memory))?;
+            if let Value::String(value) = &value {
+                key_values_memory.grow(value.len())?;
+            }
+            key_values.push(value);
+        }
+        let key_bytes = row_key_retained_bytes(&key_values);
         let key_memory = memory.reserve(key_bytes)?;
+        let key = row_key(&key_values);
+        drop(key_values_memory);
+        drop(key_values);
         if let Some(index) = indexes.get(&key).copied() {
             group_memory.grow(std::mem::size_of::<usize>())?;
             groups[index].push(row);
@@ -3764,6 +3880,89 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn like_buffers_obey_the_intermediate_byte_limit() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 5 * 1_024 * 1_024,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (s String)").unwrap();
+        let value = "x".repeat(4 * 1_024 * 1_024);
+        engine
+            .execute(&format!("INSERT INTO t VALUES ('{value}')"))
+            .unwrap();
+
+        assert!(matches!(
+            engine.execute("SELECT COUNT(*) FROM t WHERE s LIKE s"),
+            Err(Error::ResourceLimit {
+                resource: "intermediate result bytes",
+                limit: 5_242_880,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn owned_keys_and_sort_state_are_preflighted() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 4 * 1_024,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (s String)").unwrap();
+        let value = "x".repeat(3_000);
+        engine
+            .execute(&format!("INSERT INTO t VALUES ('{value}')"))
+            .unwrap();
+
+        for sql in [
+            "SELECT s, COUNT(*) FROM t GROUP BY s",
+            "SELECT DISTINCT s FROM t",
+            "SELECT s FROM t ORDER BY s",
+        ] {
+            assert!(matches!(
+                engine.execute(sql),
+                Err(Error::ResourceLimit {
+                    resource: "intermediate result bytes",
+                    limit: 4_096,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn command_result_preflight_prevents_catalog_mutation() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 1,
+            ..EngineConfig::default()
+        });
+        assert!(matches!(
+            engine.execute("CREATE TABLE rejected (n Int64)"),
+            Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(engine.table("rejected").is_none());
+
+        for result in engine
+            .execute_iter("CREATE TABLE existing (n Int64)")
+            .unwrap()
+        {
+            result.unwrap();
+        }
+        assert!(matches!(
+            engine.execute("INSERT INTO existing VALUES (1)"),
+            Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                limit: 1,
+                ..
+            })
+        ));
+        assert_eq!(engine.table("existing").unwrap().row_count(), 0);
     }
 
     #[test]
