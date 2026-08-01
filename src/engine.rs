@@ -761,7 +761,7 @@ fn parse_data_type(sql: &str) -> Result<(DataType, bool)> {
         .map_or((compact.as_str(), false), |name| (name, true));
     let data_type = match name {
         "tinyint" | "smallint" | "int" | "integer" | "bigint" | "int8" | "int16" | "int32"
-        | "int64" | "uint8" | "uint16" | "uint32" | "uint64" => DataType::Int64,
+        | "int64" => DataType::Int64,
         "float" | "float32" | "float64" | "double" | "doubleprecision" | "real" => {
             DataType::Float64
         }
@@ -1102,7 +1102,14 @@ fn infer_function_type(
                 }
                 return Err(Error::Constraint(format!("{name}(*) is invalid")));
             }
-            FunctionArgExpr::Expr(expr) => infer_expression_type(expr, source, aliases)?,
+            FunctionArgExpr::Expr(expr) => {
+                if references_projection_alias(expr, source, aliases) {
+                    return Err(Error::Unsupported(
+                        "projection aliases inside aggregate arguments".into(),
+                    ));
+                }
+                infer_expression_type(expr, source, &HashMap::new())?
+            }
         };
         return match name.as_str() {
             "count" => Ok(Some(DataType::Int64)),
@@ -1152,6 +1159,68 @@ fn infer_function_type(
             .iter()
             .try_fold(None, |common, data_type| common_type(common, *data_type)),
         _ => Err(Error::Unsupported(format!("scalar function {name}"))),
+    }
+}
+
+fn references_projection_alias(
+    expr: &Expr,
+    source: &EvalSource<'_>,
+    aliases: &HashMap<String, Option<DataType>>,
+) -> bool {
+    match expr {
+        Expr::Identifier(identifier) => {
+            let name = normalize_identifier(&identifier.value);
+            aliases.contains_key(&name)
+                && source
+                    .table
+                    .is_none_or(|table| table.schema().index_of(&identifier.value).is_err())
+        }
+        Expr::CompoundIdentifier(_) | Expr::Value(_) => false,
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::Cast { expr, .. } => references_projection_alias(expr, source, aliases),
+        Expr::BinaryOp { left, right, .. } => {
+            references_projection_alias(left, source, aliases)
+                || references_projection_alias(right, source, aliases)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            references_projection_alias(expr, source, aliases)
+                || references_projection_alias(low, source, aliases)
+                || references_projection_alias(high, source, aliases)
+        }
+        Expr::InList { expr, list, .. } => {
+            references_projection_alias(expr, source, aliases)
+                || list
+                    .iter()
+                    .any(|item| references_projection_alias(item, source, aliases))
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            references_projection_alias(expr, source, aliases)
+                || references_projection_alias(pattern, source, aliases)
+        }
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
+                let argument = match argument {
+                    FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
+                };
+                match argument {
+                    FunctionArgExpr::Expr(expr) => {
+                        references_projection_alias(expr, source, aliases)
+                    }
+                    _ => false,
+                }
+            }),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -3272,6 +3341,59 @@ mod tests {
                 .is_err()
         );
         assert!(engine.table("should_not_exist").is_none());
+    }
+
+    #[test]
+    fn rejects_projection_aliases_inside_aggregate_arguments_at_all_cardinalities() {
+        let mut engine = Engine::default();
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        let invalid_queries = [
+            "SELECT n AS x, COUNT(*) FROM t GROUP BY n HAVING SUM(x) > 0",
+            "SELECT n AS x, COUNT(*) FROM t GROUP BY n HAVING SUM(COALESCE(x, 0)) > 0",
+        ];
+
+        for sql in invalid_queries {
+            assert!(matches!(engine.execute(sql), Err(Error::Unsupported(_))));
+        }
+        engine.execute("INSERT INTO t VALUES (1)").unwrap();
+        for sql in invalid_queries {
+            assert!(matches!(engine.execute(sql), Err(Error::Unsupported(_))));
+        }
+
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT n AS x, COUNT(*) FROM t GROUP BY n HAVING x > 0",
+            )
+            .rows,
+            vec![vec![Value::Int64(1), Value::Int64(1)]]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_unsigned_integer_declarations() {
+        let mut engine = Engine::default();
+        for (table, data_type) in [
+            ("u8_values", "UInt8"),
+            ("u16_values", "UInt16"),
+            ("u32_values", "UInt32"),
+            ("u64_values", "UInt64"),
+        ] {
+            assert!(matches!(
+                engine.execute(&format!("CREATE TABLE {table} (n {data_type})")),
+                Err(Error::Unsupported(_))
+            ));
+            assert!(engine.table(table).is_none());
+        }
+
+        engine.execute("CREATE TABLE signed (n Int64)").unwrap();
+        engine
+            .execute("INSERT INTO signed VALUES (-9223372036854775808), (9223372036854775807)")
+            .unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT MIN(n), MAX(n) FROM signed").rows,
+            vec![vec![Value::Int64(i64::MIN), Value::Int64(i64::MAX)]]
+        );
     }
 
     proptest::proptest! {
