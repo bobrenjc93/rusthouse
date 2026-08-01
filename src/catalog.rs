@@ -870,19 +870,11 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| SnapshotError::InvalidImage("snapshot filename must be UTF-8".to_owned()))?;
-    let normalized_name = file_name.trim_end_matches([' ', '.']);
     #[cfg(windows)]
-    if normalized_name != file_name {
+    if file_name.trim_end_matches([' ', '.']) != file_name {
         return Err(SnapshotError::ReservedSnapshotName(path.to_owned()));
     }
-    if normalized_name.starts_with('.')
-        && (normalized_name
-            .get(normalized_name.len().saturating_sub(5)..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".lock"))
-            || normalized_name
-                .get(normalized_name.len().saturating_sub(4)..)
-                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".tmp")))
-    {
+    if file_name.starts_with('.') {
         return Err(SnapshotError::ReservedSnapshotName(path.to_owned()));
     }
     let parent = path.parent().ok_or_else(|| {
@@ -1030,6 +1022,13 @@ fn install_linux_acl(file: &File, acl: *mut std::ffi::c_void) -> Result<(), Snap
 
 #[cfg(target_os = "linux")]
 fn set_private_unix_acl(file: &File, is_directory: bool) -> Result<(), SnapshotError> {
+    if is_directory {
+        match rustix::fs::fremovexattr(file, "system.posix_acl_default") {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::NODATA => {}
+            Err(error) => return Err(rustix_io_error(error)),
+        }
+    }
     let text = if is_directory {
         b"u::rwx,g::---,o::---\0"
     } else {
@@ -2192,6 +2191,13 @@ mod tests {
             .any(|entry| entry.name.ends_with("nobody") && entry.perms.contains(exacl::Perm::READ))
     }
 
+    #[cfg(target_os = "linux")]
+    fn has_default_acl(path: &Path) -> bool {
+        !exacl::getfacl(path, exacl::AclOption::DEFAULT_ACL)
+            .expect("read default ACL")
+            .is_empty()
+    }
+
     #[test]
     fn typed_image_validation_rejects_bad_shapes_and_names() {
         let left =
@@ -2382,7 +2388,7 @@ mod tests {
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
-    fn rejects_snapshot_names_that_overlap_live_sidecars() {
+    fn rejects_dot_prefixed_snapshot_names_before_live_sidecars() {
         let directory = TestDirectory::new();
         let path = directory.0.join("catalog");
         let original = sample_image(3);
@@ -2395,6 +2401,8 @@ mod tests {
             ".CATALOG.LOCK",
             ".catalog.tmp.",
             ".catalog.lock ",
+            ".hidden",
+            ".catalog.loc\u{212a}",
         ] {
             let reserved_path = directory.0.join(reserved);
             assert!(matches!(
@@ -2839,6 +2847,8 @@ mod tests {
     fn inherited_parent_acl_does_not_reach_staging_or_first_snapshot() {
         let directory = TestDirectory::new();
         install_inheritable_test_acl(&directory.0);
+        #[cfg(target_os = "linux")]
+        assert!(has_default_acl(&directory.0));
         let probe = directory.0.join("probe");
         fs::write(&probe, b"probe").expect("create ACL inheritance probe");
         assert!(acl_allows_nobody(&probe));
@@ -2852,6 +2862,8 @@ mod tests {
         ));
         assert!(!acl_allows_nobody(&store.temp_dir));
         assert!(!acl_allows_nobody(&store.temp_path));
+        #[cfg(target_os = "linux")]
+        assert!(!has_default_acl(&store.temp_dir));
         drop(store);
 
         let recovered = SnapshotStore::open(&path).expect("clean interrupted staging");

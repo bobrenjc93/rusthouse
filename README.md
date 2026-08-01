@@ -51,10 +51,10 @@ and lengths are checked before allocation, allocation is fallible, and invalid
 images are rejected before the current snapshot is changed. Only one store may
 hold the nonblocking writer lock for a snapshot in one pinned parent directory;
 concurrent commits made through one shared store handle are serialized in
-process. Snapshot filenames
-matching the generated `.<name>.lock` or `.<name>.tmp` sidecar namespace are
-rejected, including case aliases. Windows also rejects all snapshot names with
-trailing dots or spaces because Win32 resolves them as aliases of trimmed names.
+process. Dot-prefixed snapshot filenames are rejected because that namespace is
+reserved for lock and temporary sidecars, including filesystem-specific Unicode
+aliases. Windows also rejects all snapshot names with trailing dots or spaces
+because Win32 resolves them as aliases of trimmed names.
 
 Snapshot persistence supports Windows, macOS, and Linux. Other Unix targets,
 including FreeBSD filesystems with either POSIX.1e or NFSv4 ACLs, compile but
