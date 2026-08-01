@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+import xml.etree.ElementTree as element_tree
 from pathlib import Path
 
 from scripts import burner_history as history_tool
@@ -161,6 +162,35 @@ class BurnerHistoryTests(unittest.TestCase):
         self.assertIn("100</text>", svg)
         for evaluation in self.history["evaluations"].values():
             self.assertIn(evaluation["name"], svg)
+
+    def test_svg_expands_to_contain_multi_series_legend(self) -> None:
+        expanded = copy.deepcopy(self.history)
+        additions = [
+            ("eval_aaaaaaaa", "Recovery durability", "#334155", "evalrun_aaaaaaaa"),
+            ("eval_bbbbbbbb", "Concurrent query safety", "#a16207", "evalrun_bbbbbbbb"),
+            ("eval_cccccccc", "Operational readiness", "#0369a1", "evalrun_cccccccc"),
+        ]
+        baseline = expanded["points"][0]
+        for index, (evaluation_id, name, color, run_id) in enumerate(additions, start=1):
+            expanded["evaluations"][evaluation_id] = {
+                "name": name,
+                "color": color,
+                "dash": "5 2",
+                "introducedAt": "2026-08-01T04:51:12.000Z",
+            }
+            baseline["scores"][evaluation_id] = index * 10
+            baseline["evidence"]["runs"][evaluation_id] = run_id
+
+        svg = history_tool.render_svg(expanded)
+        root = element_tree.fromstring(svg)
+        height = float(root.attrib["height"])
+        legend_labels = [
+            node for node in root.findall("{http://www.w3.org/2000/svg}text")
+            if node.attrib.get("class") == "legend"
+        ]
+        self.assertEqual(9, len(legend_labels))
+        self.assertLess(max(float(node.attrib["y"]) for node in legend_labels) + 20, height)
+        self.assertEqual(height, float(root.attrib["viewBox"].split()[-1]))
 
     def test_invalid_input_does_not_replace_generated_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

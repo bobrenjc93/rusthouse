@@ -269,10 +269,13 @@ def render_svg(history: dict[str, Any]) -> str:
     evaluations = list(history["evaluations"].items())
     points = history["points"]
     width = 1200
-    height = 540
     left, right, top, plot_height = 90, 40, 72, 300
     plot_width = width - left - right
     plot_bottom = top + plot_height
+    legend_start_y = 447
+    legend_row_height = 27
+    legend_rows = math.ceil(len(evaluations) / 2)
+    height = max(540, legend_start_y + (legend_rows - 1) * legend_row_height + 35)
 
     def x_position(index: int) -> float:
         if len(points) == 1:
@@ -335,15 +338,18 @@ def render_svg(history: dict[str, Any]) -> str:
         column = index % 2
         row = index // 2
         legend_x = left + column * 535
-        legend_y = 447 + row * 27
+        legend_y = legend_start_y + row * legend_row_height
         latest_score = latest["scores"].get(evaluation_id)
         suffix = f" ({latest_score}/100)" if latest_score is not None else ""
+        legend_label = evaluation["name"] + suffix
+        if len(legend_label) > 64:
+            legend_label = legend_label[:61] + "..."
         dash = f' stroke-dasharray="{xml(evaluation["dash"])}"' if evaluation["dash"] else ""
         legend_parts.append(
             f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 28}" y2="{legend_y}" '
             f'stroke="{evaluation["color"]}" stroke-width="4"{dash}/>'
             f'<text x="{legend_x + 38}" y="{legend_y + 5}" class="legend">'
-            f'{xml(evaluation["name"] + suffix)}</text>'
+            f'{xml(legend_label)}</text>'
         )
 
     latest_summary = "; ".join(
