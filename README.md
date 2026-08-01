@@ -298,3 +298,53 @@ let StatementResult::Query(rows) = session.execute("SELECT * FROM events")? else
 assert_eq!(rows.row_count(), 1);
 # Ok::<(), rusthouse::Error>(())
 ```
+
+## HTTP query service
+
+The `rusthouse::http` module exposes a long-lived HTTP/1.1 server behind the
+engine-independent `QueryService` trait. An engine implements that trait and
+returns a `QueryResult`; the frontend owns protocol parsing, output encoding,
+admission control, deadlines, cancellation, and shutdown.
+
+`POST /query` accepts UTF-8 SQL as `application/sql`, or a JSON object such as
+`{"query":"SELECT 1"}` with `application/json`. A Content-Type is required and
+browser-originated requests are rejected; the endpoint intentionally does not
+accept browser-safelisted form or `text/plain` submissions. Select an output with
+`Accept` or with `?format=`:
+
+| Format | `Accept` value |
+| --- | --- |
+| JSON array of row objects | `application/json` |
+| newline-delimited row objects | `application/x-ndjson` |
+| CSV with a header row | `text/csv` |
+
+Errors are JSON objects with stable codes, messages, and request IDs. The same
+request ID is returned in `x-request-id`. `GET /health/live` checks the process;
+`GET /health/ready` and `GET /health` report `QueryService::health()`.
+
+The server defaults to 1 MiB requests, 16 MiB encoded responses, 16 concurrent
+queries, 64 concurrent HTTP query requests, a 10 second body-read deadline, a 30
+second query deadline, 128 accepted connections, a 10 second header deadline, a
+60 second connection idle deadline, and a 10 second graceful shutdown window.
+Connection admission is held through response delivery, while the idle deadline
+closes stalled headers, keep-alive clients, and response readers. Busy request or
+execution slots fail immediately with `503` and `Retry-After`, so slow clients do
+not create an unbounded queue. Transient accept errors are retried with capped
+backoff, and owners can await unexpected server-task termination. Query futures
+and result encoding run on bounded blocking workers; timed-out jobs retain their
+execution slot until they actually exit. Configured timeouts are capped at 365
+days so deadline arithmetic remains representable.
+Query implementations should observe the supplied `QueryCancellation` while doing
+expensive work. It is signaled when a request is dropped, its deadline expires, or
+forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown
+path.
+
+The executable attaches the HTTP service to the same autocommit database used by
+the CLI. It uses an in-memory database by default; pass `--database FILE` to serve
+a durable database. Each request executes one statement, so transaction control
+remains available only through a persistent library or CLI session:
+
+```bash
+cargo run -- serve --database demo.db --bind 127.0.0.1:8080 \
+  --max-concurrent-queries 8
+```

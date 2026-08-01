@@ -5,8 +5,10 @@ pub mod catalog;
 mod database;
 pub mod error;
 pub mod formats;
+pub mod http;
 pub mod kernels;
 mod persistence;
+pub mod query;
 mod sql;
 pub mod storage;
 
@@ -16,6 +18,10 @@ pub use catalog::{
 };
 pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};
+pub use query::{
+    QueryCancellation, QueryError, QueryErrorKind, QueryFuture, QueryRequest, QueryResult,
+    QueryService, QueryValue, ServiceHealth,
+};
 pub use storage::{Column, ColumnBatch, ColumnDef, DataType, Field, Schema, Table, Value};
 
 /// Returns the product name.
