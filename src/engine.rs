@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::{
     BinaryOperator, ColumnOption, Distinct, DuplicateTreatment, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectName, OrderByExpr, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value as SqlValue,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, HiveDistributionStyle, HiveFormat, Insert,
+    ObjectName, OrderByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    UnaryOperator, Value as SqlValue, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -19,6 +20,7 @@ pub struct EngineConfig {
     pub max_rows_per_insert: usize,
     pub max_rows_per_table: usize,
     pub max_result_rows: usize,
+    pub max_batch_result_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -28,6 +30,7 @@ impl Default for EngineConfig {
             max_rows_per_insert: 100_000,
             max_rows_per_table: 1_000_000,
             max_result_rows: 100_000,
+            max_batch_result_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -70,6 +73,30 @@ impl Engine {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        let max_batch_result_bytes = self.config.max_batch_result_bytes;
+        let mut retained_bytes = 0_usize;
+        let mut results = Vec::new();
+        for result in self.execute_iter(sql)? {
+            let result = result?;
+            retained_bytes = retained_bytes.saturating_add(result_retained_bytes(&result));
+            if retained_bytes > max_batch_result_bytes {
+                return Err(Error::ResourceLimit {
+                    resource: "batch result bytes",
+                    limit: max_batch_result_bytes,
+                    actual: retained_bytes,
+                });
+            }
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Executes parsed statements one at a time so callers can release each
+    /// result before the next statement runs.
+    pub fn execute_iter(
+        &mut self,
+        sql: &str,
+    ) -> Result<impl Iterator<Item = Result<StatementResult>> + '_> {
         if sql.len() > self.config.max_input_bytes {
             return Err(Error::ResourceLimit {
                 resource: "SQL input bytes",
@@ -79,11 +106,17 @@ impl Engine {
         }
         let statements = Parser::parse_sql(&GenericDialect {}, sql)
             .map_err(|error| Error::Sql(error.to_string()))?;
-        let mut results = Vec::with_capacity(statements.len());
-        for statement in statements {
-            results.push(self.execute_statement(statement)?);
-        }
-        Ok(results)
+        let mut statements = statements.into_iter();
+        let mut failed = false;
+        Ok(std::iter::from_fn(move || {
+            if failed {
+                return None;
+            }
+            let statement = statements.next()?;
+            let result = self.execute_statement(statement);
+            failed = result.is_err();
+            Some(result)
+        }))
     }
 
     pub fn table(&self, name: &str) -> Option<&Table> {
@@ -91,6 +124,7 @@ impl Engine {
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+        validate_statement_options(&statement)?;
         match statement {
             Statement::CreateTable {
                 name,
@@ -257,22 +291,98 @@ impl Engine {
             if !from.joins.is_empty() {
                 return Err(Error::Unsupported("JOIN".into()));
             }
-            let TableFactor::Table { name, .. } = &from.relation else {
+            let TableFactor::Table {
+                name,
+                alias,
+                args,
+                with_hints,
+                version,
+                partitions,
+            } = &from.relation
+            else {
                 return Err(Error::Unsupported(
                     "derived and table-function sources".into(),
                 ));
             };
+            if args.is_some()
+                || !with_hints.is_empty()
+                || version.is_some()
+                || !partitions.is_empty()
+                || alias
+                    .as_ref()
+                    .is_some_and(|alias| !alias.columns.is_empty())
+            {
+                return Err(Error::Unsupported("table source option".into()));
+            }
             let name = object_name(name)?;
             let table = self
                 .tables
                 .get(&normalize_identifier(&name))
-                .ok_or(Error::TableNotFound(name))?;
-            EvalSource { table: Some(table) }
+                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+            let qualifier = alias
+                .as_ref()
+                .map_or(name, |alias| alias.name.value.clone());
+            EvalSource {
+                table: Some(table),
+                qualifier: Some(normalize_identifier(&qualifier)),
+            }
         } else {
-            EvalSource { table: None }
+            EvalSource {
+                table: None,
+                qualifier: None,
+            }
         };
 
         let projections = expand_projections(&select.projection, &source)?;
+        let group_by = match select.group_by {
+            GroupByExpr::Expressions(expressions) => expressions,
+            GroupByExpr::All => {
+                return Err(Error::Unsupported("GROUP BY ALL".into()));
+            }
+        };
+        let group_by = resolve_group_by(&group_by, &projections)?;
+        if group_by.iter().any(contains_aggregate) {
+            return Err(Error::Constraint(
+                "aggregate functions are not allowed in GROUP BY".into(),
+            ));
+        }
+        let alias_expressions = projections
+            .iter()
+            .map(|projection| (normalize_identifier(&projection.header), &projection.expr))
+            .collect::<HashMap<_, _>>();
+        for projection in &projections {
+            validate_expression_references(&projection.expr, &source, &HashMap::new())?;
+        }
+        if let Some(selection) = &select.selection {
+            validate_expression_references(selection, &source, &HashMap::new())?;
+        }
+        for expression in &group_by {
+            validate_expression_references(expression, &source, &HashMap::new())?;
+        }
+        if let Some(having) = &select.having {
+            validate_expression_references(having, &source, &alias_expressions)?;
+        }
+        for order in order_by {
+            validate_expression_references(&order.expr, &source, &alias_expressions)?;
+        }
+        let grouped = !group_by.is_empty()
+            || projections
+                .iter()
+                .any(|item| contains_aggregate(&item.expr))
+            || select.having.as_ref().is_some_and(contains_aggregate)
+            || order_by.iter().any(|item| contains_aggregate(&item.expr));
+        if grouped {
+            for projection in &projections {
+                validate_grouped_expression(&projection.expr, &group_by, &HashMap::new(), false)?;
+            }
+            if let Some(having) = &select.having {
+                validate_grouped_expression(having, &group_by, &alias_expressions, false)?;
+            }
+            for order in order_by {
+                validate_grouped_expression(&order.expr, &group_by, &alias_expressions, false)?;
+            }
+        }
+
         let mut filtered_rows = Vec::new();
         let source_rows = source.table.map_or(1, Table::row_count);
         for row in 0..source_rows {
@@ -283,20 +393,6 @@ impl Engine {
             }
             filtered_rows.push(row);
         }
-
-        let group_by = match select.group_by {
-            GroupByExpr::Expressions(expressions) => expressions,
-            GroupByExpr::All => {
-                return Err(Error::Unsupported("GROUP BY ALL".into()));
-            }
-        };
-        let group_by = resolve_group_by(&group_by, &projections)?;
-        let grouped = !group_by.is_empty()
-            || projections
-                .iter()
-                .any(|item| contains_aggregate(&item.expr))
-            || select.having.as_ref().is_some_and(contains_aggregate)
-            || order_by.iter().any(|item| contains_aggregate(&item.expr));
         let groups = if grouped {
             make_groups(&source, filtered_rows, &group_by)?
         } else {
@@ -308,6 +404,7 @@ impl Engine {
             .map(|projection| projection.header.clone())
             .collect::<Vec<_>>();
         let mut projected = Vec::new();
+        let mut projected_bytes = columns_retained_bytes(&columns);
         for rows in groups {
             let mut values = Vec::with_capacity(projections.len());
             for projection in &projections {
@@ -317,6 +414,14 @@ impl Engine {
                     &rows,
                     &HashMap::new(),
                 )?);
+            }
+            projected_bytes = projected_bytes.saturating_add(row_retained_bytes(&values));
+            if projected_bytes > self.config.max_batch_result_bytes {
+                return Err(Error::ResourceLimit {
+                    resource: "result bytes",
+                    limit: self.config.max_batch_result_bytes,
+                    actual: projected_bytes,
+                });
             }
             let aliases = columns
                 .iter()
@@ -381,16 +486,39 @@ impl Engine {
                 actual: projected.len(),
             });
         }
-        Ok(QueryResult {
+        let result = QueryResult {
             columns,
             rows: projected.into_iter().map(|row| row.values).collect(),
-        })
+        };
+        let result_bytes = query_result_retained_bytes(&result);
+        if result_bytes > self.config.max_batch_result_bytes {
+            return Err(Error::ResourceLimit {
+                resource: "result bytes",
+                limit: self.config.max_batch_result_bytes,
+                actual: result_bytes,
+            });
+        }
+        Ok(result)
     }
 }
 
-#[derive(Clone, Copy)]
 struct EvalSource<'a> {
     table: Option<&'a Table>,
+    qualifier: Option<String>,
+}
+
+impl EvalSource<'_> {
+    fn validate_qualifier(&self, qualifier: &str) -> Result<()> {
+        let expected = self
+            .qualifier
+            .as_ref()
+            .ok_or_else(|| Error::ColumnNotFound(format!("{qualifier}.*")))?;
+        if expected == &normalize_identifier(qualifier) {
+            Ok(())
+        } else {
+            Err(Error::ColumnNotFound(format!("{qualifier}.*")))
+        }
+    }
 }
 
 struct Projection {
@@ -402,6 +530,164 @@ struct ProjectedRow {
     values: Vec<Value>,
     source_rows: Vec<usize>,
     sort_keys: Vec<Value>,
+}
+
+fn validate_statement_options(statement: &Statement) -> Result<()> {
+    match statement {
+        Statement::CreateTable {
+            or_replace,
+            temporary,
+            external,
+            global,
+            transient,
+            columns,
+            constraints,
+            hive_distribution,
+            hive_formats,
+            table_properties,
+            with_options,
+            file_format,
+            location,
+            query,
+            without_rowid,
+            like,
+            clone,
+            engine,
+            comment,
+            auto_increment_offset,
+            default_charset,
+            collation,
+            on_commit,
+            on_cluster,
+            order_by,
+            partition_by,
+            cluster_by,
+            options,
+            strict,
+            ..
+        } => {
+            let unsupported_table_option = *or_replace
+                || *temporary
+                || *external
+                || global.is_some()
+                || *transient
+                || !constraints.is_empty()
+                || !matches!(hive_distribution, HiveDistributionStyle::NONE)
+                || hive_formats
+                    .as_ref()
+                    .is_some_and(|format| format != &HiveFormat::default())
+                || !table_properties.is_empty()
+                || !with_options.is_empty()
+                || file_format.is_some()
+                || location.is_some()
+                || query.is_some()
+                || *without_rowid
+                || like.is_some()
+                || clone.is_some()
+                || engine
+                    .as_ref()
+                    .is_some_and(|engine| normalize_identifier(engine.trim()) != "memory")
+                || comment.is_some()
+                || auto_increment_offset.is_some()
+                || default_charset.is_some()
+                || collation.is_some()
+                || on_commit.is_some()
+                || on_cluster.is_some()
+                || order_by.is_some()
+                || partition_by.is_some()
+                || cluster_by.is_some()
+                || options.is_some()
+                || *strict;
+            if unsupported_table_option {
+                return Err(Error::Unsupported(
+                    "CREATE TABLE option or table constraint".into(),
+                ));
+            }
+            for column in columns {
+                if column.collation.is_some() {
+                    return Err(Error::Unsupported("column collation".into()));
+                }
+                for option in &column.options {
+                    if option.name.is_some()
+                        || !matches!(option.option, ColumnOption::Null | ColumnOption::NotNull)
+                    {
+                        return Err(Error::Unsupported(format!(
+                            "column option {}",
+                            option.option
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Statement::Insert(insert) => validate_insert_options(insert),
+        _ => Ok(()),
+    }
+}
+
+fn validate_insert_options(insert: &Insert) -> Result<()> {
+    if insert.or.is_some()
+        || insert.ignore
+        || insert.table_alias.is_some()
+        || insert.overwrite
+        || insert.partitioned.is_some()
+        || !insert.after_columns.is_empty()
+        || insert.table
+        || insert.on.is_some()
+        || insert.returning.is_some()
+        || insert.replace_into
+        || insert.priority.is_some()
+        || insert.insert_alias.is_some()
+    {
+        return Err(Error::Unsupported("INSERT option or RETURNING".into()));
+    }
+    if let Some(source) = &insert.source
+        && (source.with.is_some()
+            || !source.order_by.is_empty()
+            || source.limit.is_some()
+            || !source.limit_by.is_empty()
+            || source.offset.is_some()
+            || source.fetch.is_some()
+            || !source.locks.is_empty()
+            || source.for_clause.is_some())
+    {
+        return Err(Error::Unsupported("clause on INSERT VALUES".into()));
+    }
+    Ok(())
+}
+
+fn result_retained_bytes(result: &StatementResult) -> usize {
+    match result {
+        StatementResult::Command { .. } => std::mem::size_of::<StatementResult>(),
+        StatementResult::Query(result) => query_result_retained_bytes(result),
+    }
+}
+
+fn query_result_retained_bytes(result: &QueryResult) -> usize {
+    result
+        .rows
+        .iter()
+        .fold(columns_retained_bytes(&result.columns), |size, row| {
+            size.saturating_add(row_retained_bytes(row))
+        })
+}
+
+fn columns_retained_bytes(columns: &[String]) -> usize {
+    columns.iter().fold(0_usize, |size, column| {
+        size.saturating_add(std::mem::size_of::<String>())
+            .saturating_add(column.len())
+    })
+}
+
+fn row_retained_bytes(row: &[Value]) -> usize {
+    row.iter()
+        .fold(std::mem::size_of::<Vec<Value>>(), |size, value| {
+            size.saturating_add(std::mem::size_of::<Value>())
+                .saturating_add(match value {
+                    Value::String(value) => value.len(),
+                    _ => 0,
+                })
+        })
 }
 
 fn object_name(name: &ObjectName) -> Result<String> {
@@ -436,6 +722,14 @@ fn parse_data_type(sql: &str) -> Result<(DataType, bool)> {
     Ok((data_type, nullable))
 }
 
+fn validate_wildcard_options(options: &WildcardAdditionalOptions) -> Result<()> {
+    if options == &WildcardAdditionalOptions::default() {
+        Ok(())
+    } else {
+        Err(Error::Unsupported("wildcard modifiers".into()))
+    }
+}
+
 fn expand_projections(items: &[SelectItem], source: &EvalSource<'_>) -> Result<Vec<Projection>> {
     let mut projections = Vec::new();
     for item in items {
@@ -448,7 +742,21 @@ fn expand_projections(items: &[SelectItem], source: &EvalSource<'_>) -> Result<V
                 header: alias.value.clone(),
                 expr: expr.clone(),
             }),
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+            SelectItem::Wildcard(options) => {
+                validate_wildcard_options(options)?;
+                let table = source
+                    .table
+                    .ok_or_else(|| Error::Constraint("wildcard requires a FROM table".into()))?;
+                for field in table.schema().fields() {
+                    projections.push(Projection {
+                        expr: Expr::Identifier(sqlparser::ast::Ident::new(&field.name)),
+                        header: field.name.clone(),
+                    });
+                }
+            }
+            SelectItem::QualifiedWildcard(qualifier, options) => {
+                validate_wildcard_options(options)?;
+                source.validate_qualifier(&object_name(qualifier)?)?;
                 let table = source
                     .table
                     .ok_or_else(|| Error::Constraint("wildcard requires a FROM table".into()))?;
@@ -484,18 +792,223 @@ fn resolve_group_by(group_by: &[Expr], projections: &[Projection]) -> Result<Vec
         .collect()
 }
 
+fn validate_expression_references(
+    expr: &Expr,
+    source: &EvalSource<'_>,
+    aliases: &HashMap<String, &Expr>,
+) -> Result<()> {
+    match expr {
+        Expr::Identifier(identifier) => {
+            if aliases.contains_key(&normalize_identifier(&identifier.value)) {
+                return Ok(());
+            }
+            source
+                .table
+                .ok_or_else(|| Error::ColumnNotFound(identifier.value.clone()))?
+                .schema()
+                .index_of(&identifier.value)
+                .map(|_| ())
+        }
+        Expr::CompoundIdentifier(identifiers) => {
+            if identifiers.len() != 2 {
+                return Err(Error::ColumnNotFound(expr.to_string()));
+            }
+            source.validate_qualifier(&identifiers[0].value)?;
+            source
+                .table
+                .ok_or_else(|| Error::ColumnNotFound(expr.to_string()))?
+                .schema()
+                .index_of(&identifiers[1].value)
+                .map(|_| ())
+        }
+        Expr::Value(_) => Ok(()),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::Cast { expr, .. } => validate_expression_references(expr, source, aliases),
+        Expr::BinaryOp { left, right, .. } => {
+            validate_expression_references(left, source, aliases)?;
+            validate_expression_references(right, source, aliases)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_expression_references(expr, source, aliases)?;
+            validate_expression_references(low, source, aliases)?;
+            validate_expression_references(high, source, aliases)
+        }
+        Expr::InList { expr, list, .. } => {
+            validate_expression_references(expr, source, aliases)?;
+            for item in list {
+                validate_expression_references(item, source, aliases)?;
+            }
+            Ok(())
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            validate_expression_references(expr, source, aliases)?;
+            validate_expression_references(pattern, source, aliases)
+        }
+        Expr::Function(function) => {
+            let (_, arguments, _) = function_parts(function)?;
+            for argument in arguments {
+                match unnamed_argument(argument)? {
+                    FunctionArgExpr::Expr(expr) => {
+                        validate_expression_references(expr, source, aliases)?;
+                    }
+                    FunctionArgExpr::QualifiedWildcard(qualifier) => {
+                        source.validate_qualifier(&object_name(qualifier)?)?;
+                    }
+                    FunctionArgExpr::Wildcard => {}
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_grouped_expression(
+    expr: &Expr,
+    group_by: &[Expr],
+    aliases: &HashMap<String, &Expr>,
+    inside_aggregate: bool,
+) -> Result<()> {
+    if group_by
+        .iter()
+        .any(|group_expr| equivalent_group_expression(expr, group_expr))
+    {
+        return Ok(());
+    }
+    match expr {
+        Expr::Identifier(identifier) => {
+            if let Some(alias) = aliases.get(&normalize_identifier(&identifier.value)) {
+                return validate_grouped_expression(alias, group_by, &HashMap::new(), false);
+            }
+            Err(Error::Constraint(format!(
+                "column {} must appear in GROUP BY or an aggregate function",
+                identifier.value
+            )))
+        }
+        Expr::CompoundIdentifier(_) => Err(Error::Constraint(format!(
+            "column {expr} must appear in GROUP BY or an aggregate function"
+        ))),
+        Expr::Value(_) => Ok(()),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::Cast { expr, .. } => {
+            validate_grouped_expression(expr, group_by, aliases, inside_aggregate)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            validate_grouped_expression(left, group_by, aliases, inside_aggregate)?;
+            validate_grouped_expression(right, group_by, aliases, inside_aggregate)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_grouped_expression(expr, group_by, aliases, inside_aggregate)?;
+            validate_grouped_expression(low, group_by, aliases, inside_aggregate)?;
+            validate_grouped_expression(high, group_by, aliases, inside_aggregate)
+        }
+        Expr::InList { expr, list, .. } => {
+            validate_grouped_expression(expr, group_by, aliases, inside_aggregate)?;
+            for item in list {
+                validate_grouped_expression(item, group_by, aliases, inside_aggregate)?;
+            }
+            Ok(())
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            validate_grouped_expression(expr, group_by, aliases, inside_aggregate)?;
+            validate_grouped_expression(pattern, group_by, aliases, inside_aggregate)
+        }
+        Expr::Function(function) => {
+            let (name, arguments, _) = function_parts(function)?;
+            let aggregate = is_aggregate_name(&name);
+            if aggregate && inside_aggregate {
+                return Err(Error::Constraint(
+                    "aggregate functions may not be nested".into(),
+                ));
+            }
+            if aggregate {
+                for argument in arguments {
+                    if let FunctionArgExpr::Expr(expr) = unnamed_argument(argument)?
+                        && contains_aggregate(expr)
+                    {
+                        return Err(Error::Constraint(
+                            "aggregate functions may not be nested".into(),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            for argument in arguments {
+                match unnamed_argument(argument)? {
+                    FunctionArgExpr::Expr(expr) => {
+                        validate_grouped_expression(expr, group_by, aliases, inside_aggregate)?;
+                    }
+                    _ => {
+                        return Err(Error::Unsupported(format!("wildcard argument to {name}")));
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn equivalent_group_expression(left: &Expr, right: &Expr) -> bool {
+    if left == right {
+        return true;
+    }
+    match (column_reference(left), column_reference(right)) {
+        (Some(left), Some(right)) => normalize_identifier(left) == normalize_identifier(right),
+        _ => false,
+    }
+}
+
+fn column_reference(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(identifier) => Some(&identifier.value),
+        Expr::CompoundIdentifier(identifiers) if identifiers.len() == 2 => {
+            Some(&identifiers[1].value)
+        }
+        _ => None,
+    }
+}
+
 fn eval_constant(expr: &Expr) -> Result<Value> {
-    eval_row(expr, &EvalSource { table: None }, None)
+    eval_row(
+        expr,
+        &EvalSource {
+            table: None,
+            qualifier: None,
+        },
+        None,
+    )
 }
 
 fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<Value> {
     match expr {
         Expr::Value(value) => sql_value(value),
         Expr::Identifier(identifier) => lookup_column(source, row, &identifier.value),
-        Expr::CompoundIdentifier(identifiers) => identifiers
-            .last()
-            .ok_or_else(|| Error::ColumnNotFound(expr.to_string()))
-            .and_then(|identifier| lookup_column(source, row, &identifier.value)),
+        Expr::CompoundIdentifier(identifiers) => {
+            if identifiers.len() != 2 {
+                return Err(Error::ColumnNotFound(expr.to_string()));
+            }
+            source.validate_qualifier(&identifiers[0].value)?;
+            lookup_column(source, row, &identifiers[1].value)
+        }
         Expr::Nested(expr) => eval_row(expr, source, row),
         Expr::UnaryOp { op, expr } => eval_unary(op, eval_row(expr, source, row)?),
         Expr::BinaryOp { left, op, right } => {
@@ -568,23 +1081,25 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
             negated,
             expr,
             pattern,
-            ..
+            escape_char,
         } => eval_like(
             eval_row(expr, source, row)?,
             eval_row(pattern, source, row)?,
             *negated,
             false,
+            escape_char.as_deref(),
         ),
         Expr::ILike {
             negated,
             expr,
             pattern,
-            ..
+            escape_char,
         } => eval_like(
             eval_row(expr, source, row)?,
             eval_row(pattern, source, row)?,
             *negated,
             true,
+            escape_char.as_deref(),
         ),
         Expr::Cast {
             expr, data_type, ..
@@ -665,7 +1180,7 @@ fn eval_binary(left: Value, operator: &BinaryOperator, right: Value) -> Result<V
         | BinaryOperator::GtEq
         | BinaryOperator::Lt
         | BinaryOperator::LtEq => {
-            let ordering = left.total_cmp(&right)?;
+            let ordering = left.sql_cmp(&right)?;
             let value = match operator {
                 BinaryOperator::Eq => ordering == Ordering::Equal,
                 BinaryOperator::NotEq => ordering != Ordering::Equal,
@@ -765,7 +1280,17 @@ fn numeric_modulo(left: Value, right: Value) -> Result<Value> {
             .checked_rem(right)
             .map(Value::Int64)
             .ok_or_else(|| Error::Type("Int64 modulo overflow".into())),
-        (left, right) => numeric_arithmetic(left, right, i64::checked_rem, |a, b| a % b),
+        (Value::Int64(_), Value::Float64(0.0))
+        | (Value::Float64(_), Value::Int64(0))
+        | (Value::Float64(_), Value::Float64(0.0)) => Err(Error::Type("modulo by zero".into())),
+        (Value::Int64(left), Value::Float64(right)) => Ok(Value::Float64((left as f64) % right)),
+        (Value::Float64(left), Value::Int64(right)) => Ok(Value::Float64(left % right as f64)),
+        (Value::Float64(left), Value::Float64(right)) => Ok(Value::Float64(left % right)),
+        (left, right) => Err(Error::Type(format!(
+            "modulo cannot combine {} and {}",
+            left.type_name(),
+            right.type_name()
+        ))),
     }
 }
 
@@ -779,7 +1304,9 @@ fn cast_value(value: Value, target: DataType) -> Result<Value> {
         | (value @ Value::Bool(_), DataType::Bool)
         | (value @ Value::String(_), DataType::String) => Ok(value),
         (Value::Int64(value), DataType::Float64) => Ok(Value::Float64(value as f64)),
-        (Value::Float64(value), DataType::Int64) if value.is_finite() => {
+        (Value::Float64(value), DataType::Int64)
+            if value.is_finite() && value >= i64::MIN as f64 && value < i64::MAX as f64 =>
+        {
             Ok(Value::Int64(value as i64))
         }
         (value, DataType::String) => Ok(Value::String(value.to_string())),
@@ -802,7 +1329,13 @@ fn cast_value(value: Value, target: DataType) -> Result<Value> {
     }
 }
 
-fn eval_like(value: Value, pattern: Value, negated: bool, insensitive: bool) -> Result<Value> {
+fn eval_like(
+    value: Value,
+    pattern: Value,
+    negated: bool,
+    insensitive: bool,
+    escape: Option<&str>,
+) -> Result<Value> {
     if value.is_null() || pattern.is_null() {
         return Ok(Value::Null);
     }
@@ -813,20 +1346,58 @@ fn eval_like(value: Value, pattern: Value, negated: bool, insensitive: bool) -> 
         value = value.to_lowercase();
         pattern = pattern.to_lowercase();
     }
-    let matched = like_matches(value.as_bytes(), pattern.as_bytes());
+    let escape = escape
+        .map(|escape| {
+            let mut characters = escape.chars();
+            let character = characters
+                .next()
+                .ok_or_else(|| Error::Constraint("LIKE ESCAPE must be one character".into()))?;
+            if characters.next().is_some() {
+                return Err(Error::Constraint(
+                    "LIKE ESCAPE must be one character".into(),
+                ));
+            }
+            Ok(character)
+        })
+        .transpose()?;
+    let matched = like_matches(&value, &pattern, escape)?;
     Ok(Value::Bool(if negated { !matched } else { matched }))
 }
 
-fn like_matches(value: &[u8], pattern: &[u8]) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LikeToken {
+    Literal(char),
+    AnyOne,
+    AnyMany,
+}
+
+fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
+    let value = value.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::with_capacity(pattern.chars().count());
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        if Some(character) == escape {
+            let literal = characters.next().ok_or_else(|| {
+                Error::Constraint("LIKE pattern ends with its escape character".into())
+            })?;
+            tokens.push(LikeToken::Literal(literal));
+        } else {
+            tokens.push(match character {
+                '_' => LikeToken::AnyOne,
+                '%' => LikeToken::AnyMany,
+                character => LikeToken::Literal(character),
+            });
+        }
+    }
     let (mut value_index, mut pattern_index) = (0, 0);
     let (mut star, mut retry) = (None, 0);
     while value_index < value.len() {
-        if pattern.get(pattern_index) == Some(&b'_')
-            || pattern.get(pattern_index) == Some(&value[value_index])
+        if tokens.get(pattern_index) == Some(&LikeToken::AnyOne)
+            || tokens.get(pattern_index) == Some(&LikeToken::Literal(value[value_index]))
         {
             value_index += 1;
             pattern_index += 1;
-        } else if pattern.get(pattern_index) == Some(&b'%') {
+        } else if tokens.get(pattern_index) == Some(&LikeToken::AnyMany) {
             star = Some(pattern_index);
             pattern_index += 1;
             retry = value_index;
@@ -835,13 +1406,13 @@ fn like_matches(value: &[u8], pattern: &[u8]) -> bool {
             value_index = retry;
             pattern_index = star_index + 1;
         } else {
-            return false;
+            return Ok(false);
         }
     }
-    while pattern.get(pattern_index) == Some(&b'%') {
+    while tokens.get(pattern_index) == Some(&LikeToken::AnyMany) {
         pattern_index += 1;
     }
-    pattern_index == pattern.len()
+    Ok(pattern_index == tokens.len())
 }
 
 fn function_parts(function: &Function) -> Result<(String, &[FunctionArg], bool)> {
@@ -874,6 +1445,13 @@ fn eval_scalar_function(
     source: &EvalSource<'_>,
     row: Option<usize>,
 ) -> Result<Value> {
+    eval_scalar_function_with(function, |expr| eval_row(expr, source, row))
+}
+
+fn eval_scalar_function_with(
+    function: &Function,
+    mut evaluate: impl FnMut(&Expr) -> Result<Value>,
+) -> Result<Value> {
     let (name, arguments, distinct) = function_parts(function)?;
     if distinct {
         return Err(Error::Unsupported(format!(
@@ -883,7 +1461,7 @@ fn eval_scalar_function(
     let values = arguments
         .iter()
         .map(|argument| match unnamed_argument(argument)? {
-            FunctionArgExpr::Expr(expr) => eval_row(expr, source, row),
+            FunctionArgExpr::Expr(expr) => evaluate(expr),
             _ => Err(Error::Unsupported(format!("wildcard argument to {name}"))),
         })
         .collect::<Result<Vec<_>>>()?;
@@ -895,8 +1473,11 @@ fn eval_scalar_function(
         ("abs", [Value::Float64(value)]) => Ok(Value::Float64(value.abs())),
         ("abs", [Value::Null]) => Ok(Value::Null),
         ("lower", [Value::String(value)]) => Ok(Value::String(value.to_lowercase())),
+        ("lower", [Value::Null]) => Ok(Value::Null),
         ("upper", [Value::String(value)]) => Ok(Value::String(value.to_uppercase())),
+        ("upper", [Value::Null]) => Ok(Value::Null),
         ("length", [Value::String(value)]) => Ok(Value::Int64(value.chars().count() as i64)),
+        ("length", [Value::Null]) => Ok(Value::Null),
         ("coalesce", values) => Ok(values
             .iter()
             .find(|value| !value.is_null())
@@ -908,8 +1489,22 @@ fn eval_scalar_function(
 
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Function(function) => object_name(&function.name)
-            .is_ok_and(|name| is_aggregate_name(&name.to_ascii_lowercase())),
+        Expr::Function(function) => {
+            if object_name(&function.name)
+                .is_ok_and(|name| is_aggregate_name(&name.to_ascii_lowercase()))
+            {
+                return true;
+            }
+            let FunctionArguments::List(arguments) = &function.args else {
+                return false;
+            };
+            arguments.args.iter().any(|argument| match argument {
+                FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => match arg {
+                    FunctionArgExpr::Expr(expr) => contains_aggregate(expr),
+                    _ => false,
+                },
+            })
+        }
         Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -925,6 +1520,9 @@ fn contains_aggregate(expr: &Expr) -> bool {
         } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
         Expr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            contains_aggregate(expr) || contains_aggregate(pattern)
         }
         _ => false,
     }
@@ -946,12 +1544,16 @@ fn eval_group(
         return Ok(value.clone());
     }
     match expr {
+        Expr::Value(value) => sql_value(value),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            eval_row(expr, source, rows.first().copied())
+        }
         Expr::Function(function) => {
             let name = object_name(&function.name)?.to_ascii_lowercase();
             if is_aggregate_name(&name) {
                 eval_aggregate(function, source, rows)
             } else {
-                eval_row(expr, source, rows.first().copied())
+                eval_scalar_function_with(function, |expr| eval_group(expr, source, rows, aliases))
             }
         }
         Expr::BinaryOp { left, op, right } => eval_binary(
@@ -966,6 +1568,18 @@ fn eval_group(
         )),
         Expr::IsNotNull(expr) => Ok(Value::Bool(
             !eval_group(expr, source, rows, aliases)?.is_null(),
+        )),
+        Expr::IsTrue(expr) => Ok(Value::Bool(
+            eval_group(expr, source, rows, aliases)?.sql_bool()? == Some(true),
+        )),
+        Expr::IsFalse(expr) => Ok(Value::Bool(
+            eval_group(expr, source, rows, aliases)?.sql_bool()? == Some(false),
+        )),
+        Expr::IsNotTrue(expr) => Ok(Value::Bool(
+            eval_group(expr, source, rows, aliases)?.sql_bool()? != Some(true),
+        )),
+        Expr::IsNotFalse(expr) => Ok(Value::Bool(
+            eval_group(expr, source, rows, aliases)?.sql_bool()? != Some(false),
         )),
         Expr::Between {
             expr,
@@ -991,7 +1605,64 @@ fn eval_group(
                 Ok(result)
             }
         }
-        _ => eval_row(expr, source, rows.first().copied()),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = eval_group(expr, source, rows, aliases)?;
+            let mut result = Value::Bool(false);
+            for item in list {
+                let equal = eval_binary(
+                    needle.clone(),
+                    &BinaryOperator::Eq,
+                    eval_group(item, source, rows, aliases)?,
+                )?;
+                if equal == Value::Bool(true) {
+                    result = equal;
+                    break;
+                }
+                if equal.is_null() {
+                    result = Value::Null;
+                }
+            }
+            if *negated {
+                eval_unary(&UnaryOperator::Not, result)
+            } else {
+                Ok(result)
+            }
+        }
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => eval_like(
+            eval_group(expr, source, rows, aliases)?,
+            eval_group(pattern, source, rows, aliases)?,
+            *negated,
+            false,
+            escape_char.as_deref(),
+        ),
+        Expr::ILike {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => eval_like(
+            eval_group(expr, source, rows, aliases)?,
+            eval_group(pattern, source, rows, aliases)?,
+            *negated,
+            true,
+            escape_char.as_deref(),
+        ),
+        Expr::Cast {
+            expr, data_type, ..
+        } => cast_value(
+            eval_group(expr, source, rows, aliases)?,
+            parse_data_type(&data_type.to_string())?.0,
+        ),
+        _ => Err(Error::Unsupported(format!("expression {expr}"))),
     }
 }
 
@@ -1335,6 +2006,186 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ungrouped_columns_in_grouped_queries() {
+        let mut engine = Engine::default();
+        engine
+            .execute(
+                "CREATE TABLE t (cat String, n Int64);
+                 INSERT INTO t VALUES ('a', 2), ('a', 1), ('b', 4);",
+            )
+            .unwrap();
+        let error = engine
+            .execute("SELECT cat, n, SUM(n) FROM t GROUP BY cat")
+            .unwrap_err();
+        assert!(matches!(error, Error::Constraint(message) if message.contains("n")));
+        assert!(engine.execute("SELECT cat, n FROM t GROUP BY cat").is_err());
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT cat, SUM(n) FROM t GROUP BY cat ORDER BY cat"
+            )
+            .rows,
+            vec![
+                vec![Value::String("a".into()), Value::Int64(3)],
+                vec![Value::String("b".into()), Value::Int64(4)],
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_ddl_and_dml_before_mutation() {
+        let mut engine = Engine::default();
+        for (name, sql) in [
+            (
+                "primary_column",
+                "CREATE TABLE primary_column (n Int64 PRIMARY KEY)",
+            ),
+            (
+                "unique_column",
+                "CREATE TABLE unique_column (n Int64 UNIQUE)",
+            ),
+            (
+                "checked_column",
+                "CREATE TABLE checked_column (n Int64 CHECK (n > 0))",
+            ),
+            (
+                "primary_table",
+                "CREATE TABLE primary_table (n Int64, PRIMARY KEY (n))",
+            ),
+            ("defaulted", "CREATE TABLE defaulted (n Int64 DEFAULT 1)"),
+        ] {
+            assert!(engine.execute(sql).is_err(), "{sql} unexpectedly succeeded");
+            assert!(engine.table(name).is_none());
+        }
+
+        engine.execute("CREATE TABLE target (n Int64)").unwrap();
+        assert!(
+            engine
+                .execute("INSERT INTO target VALUES (1) RETURNING n")
+                .is_err()
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT COUNT(*) FROM target").rows,
+            vec![vec![Value::Int64(0)]]
+        );
+    }
+
+    #[test]
+    fn bounds_collected_batch_result_bytes_but_supports_streaming() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 1_000,
+            ..EngineConfig::default()
+        });
+        let literal = "x".repeat(600);
+        let one = format!("SELECT '{literal}' AS value");
+        assert_eq!(query(&mut engine, &one).rows.len(), 1);
+
+        let batch = format!("{one}; {one}");
+        assert!(matches!(
+            engine.execute(&batch),
+            Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                ..
+            })
+        ));
+        let mut streamed = 0;
+        for result in engine.execute_iter(&batch).unwrap() {
+            result.unwrap();
+            streamed += 1;
+        }
+        assert_eq!(streamed, 2);
+    }
+
+    #[test]
+    fn evaluates_aggregates_inside_scalar_functions_and_casts() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Int64); INSERT INTO t VALUES (1), (2)")
+            .unwrap();
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT COALESCE(SUM(n), 0), CAST(SUM(n) AS Float64) FROM t"
+            )
+            .rows,
+            vec![vec![Value::Int64(3), Value::Float64(3.0)]]
+        );
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT COALESCE(SUM(n), 0) FROM t WHERE n > 100"
+            )
+            .rows,
+            vec![vec![Value::Int64(0)]]
+        );
+    }
+
+    #[test]
+    fn validates_table_qualifiers_and_aliases() {
+        let mut engine = Engine::default();
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT actual.n FROM t AS actual").columns,
+            vec!["actual.n"]
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT actual.* FROM t AS actual").columns,
+            vec!["n"]
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT COUNT(actual.*) FROM t AS actual").rows,
+            vec![vec![Value::Int64(0)]]
+        );
+        for sql in [
+            "SELECT bogus.n FROM t AS actual",
+            "SELECT bogus.* FROM t AS actual",
+            "SELECT t.n FROM t AS actual",
+            "SELECT COUNT(bogus.*) FROM t AS actual",
+        ] {
+            assert!(engine.execute(sql).is_err(), "{sql} unexpectedly succeeded");
+        }
+    }
+
+    #[test]
+    fn handles_numeric_boundaries_without_saturation_or_nan() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(&mut engine, "SELECT -0.0 = 0.0").rows,
+            vec![vec![Value::Bool(true)]]
+        );
+        assert!(engine.execute("SELECT 1.0 % 0.0").is_err());
+        assert!(engine.execute("SELECT 1.0 % -0.0").is_err());
+        assert!(engine.execute("SELECT CAST(1e100 AS Int64)").is_err());
+    }
+
+    #[test]
+    fn like_matches_unicode_and_honors_escape() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT 'é' LIKE '_', 'a_b' LIKE 'a!_b' ESCAPE '!',
+                        'a%b' LIKE 'a!%b' ESCAPE '!'"
+            )
+            .rows,
+            vec![vec![
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+            ]]
+        );
+    }
+
+    #[test]
+    fn scalar_string_functions_propagate_null() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(&mut engine, "SELECT LOWER(NULL), UPPER(NULL), LENGTH(NULL)").rows,
+            vec![vec![Value::Null, Value::Null, Value::Null]]
+        );
+    }
+
+    #[test]
     fn empty_aggregate_has_sql_values() {
         let mut engine = fixture();
         let result = query(
@@ -1386,6 +2237,7 @@ mod tests {
             max_rows_per_insert: 2,
             max_rows_per_table: 2,
             max_result_rows: 1,
+            max_batch_result_bytes: 10_000,
         });
         engine.execute("CREATE TABLE t (n Int64)").unwrap();
         assert!(matches!(

@@ -86,6 +86,28 @@ impl Value {
             ))),
         }
     }
+
+    pub(crate) fn sql_cmp(&self, other: &Self) -> Result<Ordering> {
+        match (self, other) {
+            (Self::Int64(left), Self::Int64(right)) => Ok(left.cmp(right)),
+            (Self::Float64(left), Self::Float64(right)) => left
+                .partial_cmp(right)
+                .ok_or_else(|| Error::Type("NaN cannot be compared".into())),
+            (Self::Int64(left), Self::Float64(right)) => (*left as f64)
+                .partial_cmp(right)
+                .ok_or_else(|| Error::Type("NaN cannot be compared".into())),
+            (Self::Float64(left), Self::Int64(right)) => left
+                .partial_cmp(&(*right as f64))
+                .ok_or_else(|| Error::Type("NaN cannot be compared".into())),
+            (Self::Bool(left), Self::Bool(right)) => Ok(left.cmp(right)),
+            (Self::String(left), Self::String(right)) => Ok(left.cmp(right)),
+            (left, right) => Err(Error::Type(format!(
+                "cannot compare {} with {}",
+                left.type_name(),
+                right.type_name()
+            ))),
+        }
+    }
 }
 
 impl fmt::Display for Value {

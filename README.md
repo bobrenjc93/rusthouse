@@ -48,7 +48,7 @@ hardware,2,16
 
 The engine deliberately rejects unsupported syntax with typed errors. Joins, subqueries, windows, persistence, transactions spanning statements, and concurrent service access are not implemented.
 
-Embedding starts with `rusthouse::Engine`. `EngineConfig` bounds SQL bytes, rows per insert, rows per table, and emitted rows per query. Each insert batch is validated before any column is changed.
+Embedding starts with `rusthouse::Engine`. `EngineConfig` bounds SQL bytes, rows per insert, rows per table, emitted rows per query, and retained result bytes. `execute_iter` yields one statement result at a time; the CLI uses it so multi-statement batches do not retain prior results. The collecting `execute` API also enforces a cumulative byte limit. Each insert batch is validated before any column is changed.
 
 ## Product target
 

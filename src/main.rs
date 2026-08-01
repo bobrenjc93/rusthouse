@@ -38,10 +38,10 @@ fn run() -> std::result::Result<(), Box<dyn StdError>> {
     let sql =
         std::str::from_utf8(&input).map_err(|error| format!("stdin is not UTF-8: {error}"))?;
     let mut engine = Engine::new(config);
-    let results = engine.execute(sql)?;
     let stdout = io::stdout();
     let mut writer = io::BufWriter::new(stdout.lock());
-    for result in results {
+    for result in engine.execute_iter(sql)? {
+        let result = result?;
         if let StatementResult::Query(result) = result {
             write_result(&mut writer, &result, format)?;
         }
@@ -87,6 +87,10 @@ fn parse_args(
                 config.max_result_rows =
                     parse_size_option(flag, &option_value(flag, inline_value, &mut args)?)?;
             }
+            "--max-batch-result-bytes" => {
+                config.max_batch_result_bytes =
+                    parse_size_option(flag, &option_value(flag, inline_value, &mut args)?)?;
+            }
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -123,6 +127,7 @@ fn print_help() {
            --max-rows-per-insert <N>       Maximum rows in one INSERT\n  \
            --max-rows-per-table <N>        Maximum rows stored in a table\n  \
            --max-result-rows <N>           Maximum emitted rows per SELECT\n  \
+           --max-batch-result-bytes <N>    Maximum retained result bytes\n  \
          -h, --help                        Print help",
         name = rusthouse::product_name(),
         binary = env!("CARGO_PKG_NAME")
