@@ -1258,31 +1258,33 @@ fn validate_wildcard_options(options: &WildcardAdditionalOptions) -> Result<()> 
 fn expand_projections(items: &[SelectItem], source: &EvalSource<'_>) -> Result<Vec<Projection>> {
     let mut projections = Vec::new();
     for item in items {
-        match item {
-            SelectItem::UnnamedExpr(expr) => projections.push(Projection {
-                header: expr.to_string(),
+        let projection = match item {
+            SelectItem::UnnamedExpr(expr) => Some(Projection {
                 expr: expr.clone(),
+                header: expr.to_string(),
             }),
-            SelectItem::ExprWithAlias { expr, alias } => projections.push(Projection {
+            SelectItem::ExprWithAlias { expr, alias } => Some(Projection {
+                expr: expr.clone(),
                 header: {
                     if alias.quote_style.is_some() {
                         return Err(Error::Unsupported("quoted identifiers".into()));
                     }
                     alias.value.clone()
                 },
-                expr: expr.clone(),
             }),
             SelectItem::Wildcard(options) => {
                 validate_wildcard_options(options)?;
                 let table = source
                     .table
                     .ok_or_else(|| Error::Constraint("wildcard requires a FROM table".into()))?;
+                enforce_projection_limit(projections.len(), table.schema().len())?;
                 for field in table.schema().fields() {
                     projections.push(Projection {
                         expr: Expr::Identifier(sqlparser::ast::Ident::new(&field.name)),
                         header: field.name.clone(),
                     });
                 }
+                None
             }
             SelectItem::QualifiedWildcard(qualifier, options) => {
                 validate_wildcard_options(options)?;
@@ -1290,16 +1292,34 @@ fn expand_projections(items: &[SelectItem], source: &EvalSource<'_>) -> Result<V
                 let table = source
                     .table
                     .ok_or_else(|| Error::Constraint("wildcard requires a FROM table".into()))?;
+                enforce_projection_limit(projections.len(), table.schema().len())?;
                 for field in table.schema().fields() {
                     projections.push(Projection {
                         expr: Expr::Identifier(sqlparser::ast::Ident::new(&field.name)),
                         header: field.name.clone(),
                     });
                 }
+                None
             }
+        };
+        if let Some(projection) = projection {
+            enforce_projection_limit(projections.len(), 1)?;
+            projections.push(projection);
         }
     }
     Ok(projections)
+}
+
+fn enforce_projection_limit(current: usize, additional: usize) -> Result<()> {
+    let actual = current.saturating_add(additional);
+    if actual > MAX_SELECT_PROJECTIONS {
+        return Err(Error::ResourceLimit {
+            resource: "SELECT projections",
+            limit: MAX_SELECT_PROJECTIONS,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn resolve_group_by(
@@ -5041,6 +5061,42 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn wildcard_expansion_obeys_the_projection_limit() {
+        let mut engine = Engine::default();
+        let wide_columns = (0..=MAX_SELECT_PROJECTIONS)
+            .map(|index| format!("c{index} Int64"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("CREATE TABLE wide ({wide_columns})"))
+            .unwrap();
+        for sql in [
+            "SELECT * FROM wide LIMIT 0",
+            "SELECT wide.* FROM wide LIMIT 0",
+        ] {
+            assert!(matches!(
+                engine.execute(sql),
+                Err(Error::ResourceLimit {
+                    resource: "SELECT projections",
+                    limit: MAX_SELECT_PROJECTIONS,
+                    actual,
+                }) if actual == MAX_SELECT_PROJECTIONS + 1
+            ));
+        }
+
+        let boundary_columns = (0..MAX_SELECT_PROJECTIONS)
+            .map(|index| format!("c{index} Int64"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("CREATE TABLE boundary ({boundary_columns})"))
+            .unwrap();
+        let result = query(&mut engine, "SELECT * FROM boundary LIMIT 0");
+        assert_eq!(result.columns.len(), MAX_SELECT_PROJECTIONS);
+        assert!(result.rows.is_empty());
     }
 
     #[test]
