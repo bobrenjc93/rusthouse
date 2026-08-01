@@ -141,6 +141,38 @@ fn min_max_compare_strings_and_reject_incompatible_domains() {
 }
 
 #[test]
+fn mixed_numeric_min_max_are_exact_and_independent_of_input_order() {
+    let int_max = Value::Int64(i64::MAX);
+    let two_to_63 = Value::Float64(9_223_372_036_854_775_808.0);
+    for values in [
+        [int_max.clone(), two_to_63.clone()],
+        [two_to_63.clone(), int_max.clone()],
+    ] {
+        assert_eq!(aggregate(AggregateFunction::Min, &values).unwrap(), int_max);
+        assert_eq!(
+            aggregate(AggregateFunction::Max, &values).unwrap(),
+            two_to_63
+        );
+    }
+
+    let exact_int = Value::Int64(9_007_199_254_740_993);
+    let rounded_float = Value::Float64(9_007_199_254_740_992.0);
+    for values in [
+        [exact_int.clone(), rounded_float.clone()],
+        [rounded_float.clone(), exact_int.clone()],
+    ] {
+        assert_eq!(
+            aggregate(AggregateFunction::Min, &values).unwrap(),
+            rounded_float
+        );
+        assert_eq!(
+            aggregate(AggregateFunction::Max, &values).unwrap(),
+            exact_int
+        );
+    }
+}
+
+#[test]
 fn nan_is_counted_and_propagates_through_numeric_aggregates() {
     let values = [1_f64.into(), Value::Float64(f64::NAN), Value::Null];
     assert_eq!(

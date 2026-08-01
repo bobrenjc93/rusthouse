@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, fmt, str::FromStr};
 
-use crate::{Error, Result, Value};
+use crate::{Error, Result, Value, value::compare_int_float};
 
 /// Built-in aggregate functions. `CountAll` models `COUNT(*)`; `Count` models
 /// `COUNT(expression)` and therefore ignores NULL inputs.
@@ -225,11 +225,10 @@ fn comparable_domains(left: &Value, right: &Value) -> bool {
 fn aggregate_compare(left: &Value, right: &Value) -> Result<Ordering> {
     match (left, right) {
         (Value::Int64(left), Value::Int64(right)) => Ok(left.cmp(right)),
-        (Value::Int64(left), Value::Float64(right)) => (*left as f64)
-            .partial_cmp(right)
+        (Value::Int64(left), Value::Float64(right)) => compare_int_float(*left, *right)
             .ok_or_else(|| Error::Aggregate("NaN is unordered".to_owned())),
-        (Value::Float64(left), Value::Int64(right)) => left
-            .partial_cmp(&(*right as f64))
+        (Value::Float64(left), Value::Int64(right)) => compare_int_float(*right, *left)
+            .map(Ordering::reverse)
             .ok_or_else(|| Error::Aggregate("NaN is unordered".to_owned())),
         (Value::Float64(left), Value::Float64(right)) => left
             .partial_cmp(right)

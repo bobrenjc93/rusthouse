@@ -43,9 +43,10 @@ returns `Error::DivideByZero`; a NULL operand still produces NULL.
 Floating arithmetic follows IEEE 754 and can produce infinity or NaN rather
 than an overflow error. NaN is a non-NULL value. It is unequal to every value,
 including itself; `<>` is true and all ordered comparisons involving NaN are
-false. Other comparisons accept two numeric values (with `Int64` promoted to
-`Float64`) or values of the same nonnumeric type. Incompatible domains return
-`Error::Type` rather than being converted implicitly.
+false. Other comparisons accept two numeric values or values of the same
+nonnumeric type. Mixed numeric comparison is exact and does not round an
+`Int64` to `Float64`. Incompatible domains return `Error::Type` rather than
+being converted implicitly.
 
 Logical operators accept only `Bool` and `NULL`. Their truth tables are:
 

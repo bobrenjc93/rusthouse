@@ -113,6 +113,32 @@ fn comparisons_support_numeric_promotion_and_reject_unrelated_types() {
 }
 
 #[test]
+fn mixed_numeric_comparisons_are_exact_at_float_precision_boundaries() {
+    assert_eq!(
+        eval("9007199254740993 = 9007199254740992.0"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval("9007199254740993 > 9007199254740992.0"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("9223372036854775807 = 9223372036854775808.0"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval("9223372036854775807 < 9223372036854775808.0"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("-9223372036854775808 = -9223372036854775808.0"),
+        Value::Bool(true)
+    );
+    assert_eq!(eval("-1 > -1.5"), Value::Bool(true));
+    assert_eq!(eval("0 < 0.5"), Value::Bool(true));
+}
+
+#[test]
 fn nan_is_non_null_and_follows_ieee_comparisons() {
     let context = EvaluationContext::new().with_value("nan", f64::NAN);
     assert_eq!(

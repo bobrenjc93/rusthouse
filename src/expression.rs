@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::BTreeMap, str::FromStr};
 
-use crate::{DataType, Error, Result, Value};
+use crate::{DataType, Error, Result, Value, value::compare_int_float};
 
 /// Maximum nesting allowed in parsed or directly constructed expressions.
 pub const MAX_EXPRESSION_DEPTH: usize = 128;
@@ -344,8 +344,10 @@ fn compare(left: Value, operator: BinaryOperator, right: Value) -> Result<Value>
 
     let ordering = match (&left, &right) {
         (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
-        (Value::Int64(left), Value::Float64(right)) => (*left as f64).partial_cmp(right),
-        (Value::Float64(left), Value::Int64(right)) => left.partial_cmp(&(*right as f64)),
+        (Value::Int64(left), Value::Float64(right)) => compare_int_float(*left, *right),
+        (Value::Float64(left), Value::Int64(right)) => {
+            compare_int_float(*right, *left).map(Ordering::reverse)
+        }
         (Value::Float64(left), Value::Float64(right)) => left.partial_cmp(right),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
         (Value::String(left), Value::String(right)) => Some(left.cmp(right)),

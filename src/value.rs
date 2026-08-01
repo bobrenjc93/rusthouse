@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 use crate::{Error, Result};
 
@@ -184,4 +184,28 @@ impl From<&str> for Value {
     fn from(value: &str) -> Self {
         Self::String(value.to_owned())
     }
+}
+
+/// Compares an Int64 with a Float64 without first rounding the integer to the
+/// Float64 precision. NaN is unordered and returns `None`.
+pub(crate) fn compare_int_float(integer: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+
+    let lower_bound = i64::MIN as f64;
+    let upper_bound = -(i64::MIN as f64);
+    if float < lower_bound {
+        return Some(Ordering::Greater);
+    }
+    if float >= upper_bound {
+        return Some(Ordering::Less);
+    }
+
+    let truncated = float as i64;
+    Some(match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() > 0.0 => Ordering::Less,
+        Ordering::Equal if float.fract() < 0.0 => Ordering::Greater,
+        ordering => ordering,
+    })
 }
