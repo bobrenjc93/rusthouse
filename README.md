@@ -19,6 +19,18 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Vector kernel layer
+
+`rusthouse::batch` provides query-independent fixed-capacity `Int64`, `Float64`, bit-packed Boolean, and dictionary-encoded String arrays. A `RecordBatch` validates its schema, equal column shape, nullability, and byte ceiling before it can be used. `retained_bytes()` is the sum of owned heap payloads, including fixed buffers, bitmap words, dictionary slots and UTF-8 bytes, schema metadata, and column containers; allocator bookkeeping is intentionally excluded.
+
+`rusthouse::kernels` provides selection-aware comparisons, `IS NULL`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and bounded hash grouping. Predicates use SQL-style NULL filtering and IEEE comparisons. Floating extrema use `f64::total_cmp`; grouping coalesces signed zeroes and groups all NaNs together. Hash grouping has independent `max_groups` and retained-byte limits and reports both final and peak retained bytes.
+
+The deterministic benchmark uses fixed generated input and fixed iteration counts:
+
+```bash
+cargo bench --bench vector_kernels
+```
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.

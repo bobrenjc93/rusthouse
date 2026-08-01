@@ -7,3 +7,7 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+
+[[bench]]
+name = "vector_kernels"
+harness = false
