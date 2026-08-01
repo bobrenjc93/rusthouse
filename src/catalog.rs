@@ -454,7 +454,7 @@ impl SnapshotStore {
             .open(&lock_path)?;
         match fs2::FileExt::try_lock_exclusive(&lock) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contended(&error) => {
                 return Err(SnapshotError::Locked(path));
             }
             Err(error) => return Err(SnapshotError::Io(error)),
@@ -564,6 +564,14 @@ impl SnapshotStore {
         }
 
         sync_parent(&self.path)
+    }
+}
+
+fn is_lock_contended(error: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match expected.raw_os_error() {
+        Some(code) => error.raw_os_error() == Some(code),
+        None => error.kind() == expected.kind(),
     }
 }
 
@@ -1503,6 +1511,11 @@ mod tests {
         ));
         drop(first);
         SnapshotStore::open(&path).expect("lock released with store");
+    }
+
+    #[test]
+    fn recognizes_the_platform_lock_contention_error() {
+        assert!(is_lock_contended(&fs2::lock_contended_error()));
     }
 
     #[test]
