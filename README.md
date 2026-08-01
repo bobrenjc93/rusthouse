@@ -64,6 +64,9 @@ symbolic links are rejected. On Unix, each subsequent read, metadata copy, and
 sidecar operation is relative to the parent directory handle opened by the
 store. Publication and directory fsync use that same handle, so replacing the
 parent path or final component after open cannot redirect snapshot access.
+Linux ACL operations use file descriptors directly and do not require procfs.
+On Windows, the store holds a parent-directory handle without delete sharing,
+which prevents renaming or replacing that directory until the store is dropped.
 
 ### Version 1 binary format
 

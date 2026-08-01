@@ -435,6 +435,8 @@ pub struct SnapshotStore {
     file_name: std::ffi::OsString,
     #[cfg(unix)]
     temp_name: std::ffi::OsString,
+    #[cfg(windows)]
+    _parent_guard: File,
     temp_dir: PathBuf,
     temp_path: PathBuf,
     limits: SnapshotLimits,
@@ -482,6 +484,9 @@ impl SnapshotStore {
         #[cfg(unix)]
         drop(open_snapshot_file_at(&parent_dir, &file_name, &path)?);
         #[cfg(windows)]
+        let parent_guard =
+            open_parent_directory_guard(path.parent().expect("normalized path has a parent"))?;
+        #[cfg(windows)]
         drop(open_snapshot_file_path(&path)?);
         #[cfg(unix)]
         let lock_name = lock_path.file_name().expect("sidecar path has a filename");
@@ -521,6 +526,8 @@ impl SnapshotStore {
             file_name,
             #[cfg(unix)]
             temp_name,
+            #[cfg(windows)]
+            _parent_guard: parent_guard,
             temp_dir,
             temp_path,
             limits,
@@ -675,6 +682,37 @@ impl SnapshotStore {
     #[cfg(windows)]
     fn publish_staged(&self) -> Result<(), SnapshotError> {
         publish_temp(&self.temp_path, &self.path)
+    }
+}
+
+#[cfg(windows)]
+fn open_parent_directory_guard(path: &Path) -> Result<File, SnapshotError> {
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide_path = wide_path(path);
+    // SAFETY: `wide_path` is NUL-terminated. Omitting FILE_SHARE_DELETE keeps
+    // the parent directory name stable until the returned handle is dropped.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(io::Error::last_os_error().into())
+    } else {
+        // SAFETY: CreateFileW returned a new owned handle.
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 }
 
@@ -964,23 +1002,45 @@ fn create_secure_temp_at(_staging_dir: &File) -> Result<File, SnapshotError> {
 }
 
 #[cfg(target_os = "linux")]
-fn set_private_unix_acl(file: &File, is_directory: bool) -> Result<(), SnapshotError> {
-    use exacl::{AclEntry, Perm};
+#[link(name = "acl")]
+unsafe extern "C" {
+    fn acl_free(object: *mut std::ffi::c_void) -> std::ffi::c_int;
+    fn acl_from_text(text: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn acl_get_fd(file_descriptor: std::ffi::c_int) -> *mut std::ffi::c_void;
+    fn acl_set_fd(file_descriptor: std::ffi::c_int, acl: *mut std::ffi::c_void) -> std::ffi::c_int;
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_acl(file: &File, acl: *mut std::ffi::c_void) -> Result<(), SnapshotError> {
     use std::os::fd::AsRawFd;
 
-    let owner_permissions = if is_directory {
-        Perm::READ | Perm::WRITE | Perm::EXECUTE
-    } else {
-        Perm::READ | Perm::WRITE
-    };
-    let acl = [
-        AclEntry::allow_user("", owner_permissions, None),
-        AclEntry::allow_group("", Perm::empty(), None),
-        AclEntry::allow_other(Perm::empty(), None),
-    ];
-    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    exacl::setfacl(&[descriptor_path], &acl, None)?;
+    // SAFETY: `acl` is a live libacl object and `file` remains open for the call.
+    let set_result = unsafe { acl_set_fd(file.as_raw_fd(), acl) };
+    let set_error = (set_result != 0).then(io::Error::last_os_error);
+    // SAFETY: The caller transfers ownership of `acl` to this function.
+    let free_result = unsafe { acl_free(acl) };
+    if let Some(error) = set_error {
+        return Err(error.into());
+    }
+    if free_result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_private_unix_acl(file: &File, is_directory: bool) -> Result<(), SnapshotError> {
+    let text = if is_directory {
+        b"u::rwx,g::---,o::---\0"
+    } else {
+        b"u::rw-,g::---,o::---\0"
+    };
+    // SAFETY: `text` is a NUL-terminated POSIX ACL string.
+    let acl = unsafe { acl_from_text(text.as_ptr().cast()) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error().into());
+    }
+    install_linux_acl(file, acl)
 }
 
 #[cfg(target_os = "macos")]
@@ -1154,11 +1214,13 @@ fn prepare_temp_security(temp: &File, existing: Option<&File>) -> Result<(), Sna
 fn copy_unix_acl(temp: &File, existing: &File) -> Result<(), SnapshotError> {
     use std::os::fd::AsRawFd;
 
-    let existing_path = PathBuf::from(format!("/proc/self/fd/{}", existing.as_raw_fd()));
-    let temp_path = PathBuf::from(format!("/proc/self/fd/{}", temp.as_raw_fd()));
-    let acl = exacl::getfacl(existing_path, None)?;
-    exacl::setfacl(&[temp_path], &acl, None)?;
-    Ok(())
+    // SAFETY: `existing` remains open and acl_get_fd returns an owned ACL or
+    // null while setting errno.
+    let acl = unsafe { acl_get_fd(existing.as_raw_fd()) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error().into());
+    }
+    install_linux_acl(temp, acl)
 }
 
 #[cfg(target_os = "macos")]
@@ -2026,10 +2088,9 @@ enum Failpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc, Barrier,
-        atomic::{AtomicU64, Ordering},
-    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    use std::sync::{Arc, Barrier};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -2150,6 +2211,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn commits_and_reopens_every_column_type() {
         let directory = TestDirectory::new();
@@ -2169,6 +2231,7 @@ mod tests {
         assert_eq!(reopened.load().expect("load reopened image"), Some(image));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn excludes_a_second_writer_until_the_first_is_dropped() {
         let directory = TestDirectory::new();
@@ -2183,7 +2246,7 @@ mod tests {
         SnapshotStore::open(&path).expect("lock released with store");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn rejects_final_component_symlinks_without_touching_the_target() {
         use std::os::unix::fs::symlink;
@@ -2305,9 +2368,9 @@ mod tests {
         assert!(!active_parent.join(".catalog.rhcat.tmp").exists());
     }
 
-    #[cfg(target_os = "freebsd")]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     #[test]
-    fn freebsd_is_rejected_before_sidecar_creation() {
+    fn unsupported_unix_is_rejected_before_sidecar_creation() {
         let directory = TestDirectory::new();
         let path = directory.snapshot();
         assert!(matches!(
@@ -2317,6 +2380,7 @@ mod tests {
         assert!(!directory.0.join(".catalog.rhcat.lock").exists());
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn rejects_snapshot_names_that_overlap_live_sidecars() {
         let directory = TestDirectory::new();
@@ -2399,6 +2463,89 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_parent_directory_replacement_is_blocked_until_drop() {
+        let directory = TestDirectory::new();
+        let active_parent = directory.0.join("active");
+        let moved_parent = directory.0.join("moved");
+        fs::create_dir(&active_parent).expect("create guarded parent");
+        let path = active_parent.join("catalog.rhcat");
+        let moved_path = moved_parent.join("catalog.rhcat");
+        let image = sample_image(52);
+        let store = SnapshotStore::open(&path).expect("open guarded Windows store");
+
+        assert!(fs::rename(&active_parent, &moved_parent).is_err());
+        assert!(active_parent.exists());
+        assert!(!moved_parent.exists());
+        assert!(matches!(
+            SnapshotStore::open(&path),
+            Err(SnapshotError::Locked(_))
+        ));
+        store.commit(&image).expect("commit under guarded parent");
+        assert_eq!(
+            store.load().expect("load guarded snapshot"),
+            Some(image.clone())
+        );
+
+        drop(store);
+        fs::rename(&active_parent, &moved_parent).expect("rename after guard is dropped");
+        let reopened = SnapshotStore::open(&moved_path).expect("reopen through renamed parent");
+        assert_eq!(reopened.load().expect("load renamed snapshot"), Some(image));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_commit_succeeds_without_procfs() {
+        const CHILD_ENV: &str = "RUSTHOUSE_NO_PROCFS_CHILD";
+        const ROOT_ENV: &str = "RUSTHOUSE_NO_PROCFS_ROOT";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("chroot path"));
+            if let Err(error) = rustix::process::chroot(&root) {
+                if error == rustix::io::Errno::PERM {
+                    std::process::exit(77);
+                }
+                panic!("enter procfs-free chroot: {error}");
+            }
+            std::env::set_current_dir("/").expect("enter chroot root");
+            let path = Path::new("/data/catalog.rhcat");
+            let image = sample_image(53);
+            let store = SnapshotStore::open(path).expect("open store without procfs");
+            store.commit(&image).expect("commit without procfs");
+            drop(store);
+            let reopened = SnapshotStore::open(path).expect("reopen without procfs");
+            assert_eq!(reopened.load().expect("load without procfs"), Some(image));
+            return;
+        }
+
+        let directory = TestDirectory::new();
+        let root = directory.0.join("chroot");
+        fs::create_dir(&root).expect("create chroot root");
+        fs::create_dir(root.join("data")).expect("create chroot data directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "catalog::tests::linux_commit_succeeds_without_procfs",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(ROOT_ENV, &root)
+            .output()
+            .expect("run procfs-free child test");
+        if output.status.code() == Some(77) {
+            eprintln!("skipping procfs-free chroot: CAP_SYS_CHROOT is unavailable");
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "procfs-free child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn serializes_threads_sharing_one_writer_handle() {
         let directory = TestDirectory::new();
@@ -2431,6 +2578,7 @@ mod tests {
         assert_eq!(loaded, sample_image(loaded.generation()));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn removes_an_orphan_temp_only_after_acquiring_the_lock() {
         let directory = TestDirectory::new();
@@ -2493,6 +2641,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn load_rejects_corruption_from_disk() {
         let directory = TestDirectory::new();
@@ -2560,6 +2709,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn file_and_image_limits_preserve_the_existing_snapshot() {
         let directory = TestDirectory::new();
@@ -2711,6 +2861,7 @@ mod tests {
         assert_eq!(recovered.load().expect("load first snapshot"), Some(image));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn failure_after_temp_sync_leaves_previous_snapshot_and_cleans_orphan() {
         let directory = TestDirectory::new();
@@ -2737,6 +2888,7 @@ mod tests {
         assert_eq!(recovered.load().expect("load recovered image"), Some(old));
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn failure_after_rename_still_reopens_a_complete_new_snapshot() {
         let directory = TestDirectory::new();
