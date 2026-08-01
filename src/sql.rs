@@ -1,6 +1,7 @@
 //! SQL syntax tree and parser.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Resource, Result};
+use crate::execution::{ExecutionLimits, ExecutionStats};
 use crate::storage::{ColumnDef, is_reserved_column_name};
 use crate::value::{DataType, Value};
 
@@ -172,8 +173,44 @@ pub struct OrderBy {
 
 /// Parse one or more semicolon-separated SQL statements.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens).parse_script()
+    let mut stats = ExecutionStats::default();
+    parse_bounded(
+        input,
+        &ExecutionLimits {
+            max_input_bytes: usize::MAX,
+            max_tokens: usize::MAX,
+            max_statements: usize::MAX,
+            max_schema_width: usize::MAX,
+            max_stored_values: usize::MAX,
+            max_intermediate_rows: usize::MAX,
+            max_memory_bytes: usize::MAX,
+            max_result_rows: usize::MAX,
+            max_rendered_bytes: usize::MAX,
+        },
+        &mut stats,
+    )
+}
+
+pub(crate) fn parse_bounded(
+    input: &str,
+    limits: &ExecutionLimits,
+    stats: &mut ExecutionStats,
+) -> Result<Vec<Statement>> {
+    if input.len() > limits.max_input_bytes {
+        return Err(Error::ResourceLimitExceeded {
+            resource: Resource::InputBytes,
+            limit: limits.max_input_bytes,
+            actual: input.len(),
+        });
+    }
+    let tokens = Lexer::new(input).tokenize(limits.max_tokens, stats)?;
+    Parser::new(
+        tokens,
+        limits.max_statements,
+        limits.max_schema_width,
+        stats,
+    )
+    .parse_script()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,7 +249,7 @@ impl<'a> Lexer<'a> {
         Self { input, position: 0 }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>> {
+    fn tokenize(mut self, max_tokens: usize, stats: &mut ExecutionStats) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
             self.skip_ignored();
@@ -295,6 +332,14 @@ impl<'a> Lexer<'a> {
                 }
             };
             tokens.push(Token { kind, position });
+            stats.tokens = tokens.len();
+            if tokens.len() > max_tokens {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: Resource::Tokens,
+                    limit: max_tokens,
+                    actual: tokens.len(),
+                });
+            }
         }
     }
 
@@ -394,20 +439,31 @@ impl<'a> Lexer<'a> {
     }
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    max_statements: usize,
+    max_schema_width: usize,
+    stats: &'a mut ExecutionStats,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+impl<'a> Parser<'a> {
+    fn new(
+        tokens: Vec<Token>,
+        max_statements: usize,
+        max_schema_width: usize,
+        stats: &'a mut ExecutionStats,
+    ) -> Self {
         Self {
             tokens,
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            max_statements,
+            max_schema_width,
+            stats,
         }
     }
 
@@ -416,6 +472,14 @@ impl Parser {
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
             statements.push(self.parse_statement()?);
+            self.stats.statements = statements.len();
+            if statements.len() > self.max_statements {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: Resource::Statements,
+                    limit: self.max_statements,
+                    actual: statements.len(),
+                });
+            }
             if !self.eat(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("expected ';' between statements");
             }
@@ -464,6 +528,14 @@ impl Parser {
                 name: column_name,
                 data_type,
             });
+            self.stats.schema_width = self.stats.schema_width.max(columns.len());
+            if columns.len() > self.max_schema_width {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: Resource::SchemaWidth,
+                    limit: self.max_schema_width,
+                    actual: columns.len(),
+                });
+            }
             if !self.eat(&TokenKind::Comma) {
                 break;
             }

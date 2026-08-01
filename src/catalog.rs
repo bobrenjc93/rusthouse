@@ -44,6 +44,15 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    /// Returns the number of logical values stored across every table.
+    #[must_use]
+    pub fn stored_values(&self) -> usize {
+        self.tables
+            .values()
+            .map(|table| table.row_count().saturating_mul(table.schema().len()))
+            .fold(0, usize::saturating_add)
+    }
 }
 
 fn normalize(identifier: &str) -> String {

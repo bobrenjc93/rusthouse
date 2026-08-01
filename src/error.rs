@@ -2,6 +2,46 @@
 
 use std::fmt;
 
+/// A configurable resource governed by [`ExecutionLimits`](crate::ExecutionLimits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resource {
+    /// SQL input bytes.
+    InputBytes,
+    /// Lexical tokens.
+    Tokens,
+    /// Statements in one batch.
+    Statements,
+    /// Columns in one table schema.
+    SchemaWidth,
+    /// Values stored across all tables.
+    StoredValues,
+    /// Rows emitted between execution operators.
+    IntermediateRows,
+    /// Estimated transient execution memory.
+    MemoryBytes,
+    /// Rows returned from a batch.
+    ResultRows,
+    /// Bytes produced by a renderer.
+    RenderedBytes,
+}
+
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::InputBytes => "input bytes",
+            Self::Tokens => "tokens",
+            Self::Statements => "statements",
+            Self::SchemaWidth => "schema width",
+            Self::StoredValues => "stored values",
+            Self::IntermediateRows => "intermediate rows",
+            Self::MemoryBytes => "memory bytes",
+            Self::ResultRows => "result rows",
+            Self::RenderedBytes => "rendered bytes",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Errors returned by storage, parsing, and query execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -54,6 +94,17 @@ pub enum Error {
     InvalidQuery(String),
     /// An integer aggregate exceeded its representable range.
     NumericOverflow(String),
+    /// A configured execution or rendering ceiling was exceeded.
+    ResourceLimitExceeded {
+        /// Resource whose configured ceiling was exceeded.
+        resource: Resource,
+        /// Configured inclusive maximum.
+        limit: usize,
+        /// Observed value that exceeded the maximum.
+        actual: usize,
+    },
+    /// Temporary spill storage could not be created, read, or written.
+    SpillIo(String),
 }
 
 /// A RustHouse operation result using [`Error`].
@@ -98,6 +149,15 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                f,
+                "resource limit exceeded for {resource}: limit {limit}, observed {actual}"
+            ),
+            Self::SpillIo(message) => write!(f, "spill I/O error: {message}"),
         }
     }
 }

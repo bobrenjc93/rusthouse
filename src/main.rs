@@ -4,8 +4,8 @@ use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
 
-use rusthouse::format::{OutputFormat, render};
-use rusthouse::{Database, QueryResult, StatementResult};
+use rusthouse::format::{OutputFormat, render_with_limit};
+use rusthouse::{Database, Error, QueryResult, Resource, StatementResult};
 
 const HELP: &str = "\
 RustHouse - an in-memory columnar SQL engine
@@ -39,17 +39,15 @@ fn run() -> Result<(), String> {
         return Ok(());
     };
 
+    let mut database = Database::new();
+    let max_input_bytes = database.limits().max_input_bytes;
+    let max_rendered_bytes = database.limits().max_rendered_bytes;
     let sql = if let Some(sql) = config.execute {
         sql
     } else {
-        let mut sql = String::new();
-        io::stdin()
-            .read_to_string(&mut sql)
-            .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
-        sql
+        read_sql_bounded(io::stdin(), max_input_bytes)?
     };
 
-    let mut database = Database::new();
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -64,32 +62,84 @@ fn run() -> Result<(), String> {
             StatementResult::Query(result) => queries.push(result),
         }
     }
-    print!("{}", render_query_results(&queries, config.format));
+    print!(
+        "{}",
+        render_query_results_bounded(&queries, config.format, max_rendered_bytes)
+            .map_err(|error| error.to_string())?
+    );
     Ok(())
 }
 
+fn read_sql_bounded(reader: impl Read, max_bytes: usize) -> Result<String, String> {
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read SQL from stdin: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(Error::ResourceLimitExceeded {
+            resource: Resource::InputBytes,
+            limit: max_bytes,
+            actual: bytes.len(),
+        }
+        .to_string());
+    }
+    String::from_utf8(bytes).map_err(|error| format!("SQL input is not valid UTF-8: {error}"))
+}
+
+#[cfg(test)]
 fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String {
+    render_query_results_bounded(results, format, usize::MAX)
+        .expect("unbounded rendering cannot exceed its limit")
+}
+
+fn render_query_results_bounded(
+    results: &[QueryResult],
+    format: OutputFormat,
+    max_bytes: usize,
+) -> rusthouse::Result<String> {
     if format == OutputFormat::Json {
-        let rendered = results
-            .iter()
-            .map(|result| render(result, format))
-            .collect::<Vec<_>>()
-            .join(",");
-        return format!("{{\"results\":[{rendered}]}}\n");
+        let mut output = String::new();
+        append_bounded(&mut output, "{\"results\":[", max_bytes)?;
+        for (index, result) in results.iter().enumerate() {
+            if index > 0 {
+                append_bounded(&mut output, ",", max_bytes)?;
+            }
+            let rendered = render_with_limit(result, format, max_bytes)?;
+            append_bounded(&mut output, &rendered, max_bytes)?;
+        }
+        append_bounded(&mut output, "]}\n", max_bytes)?;
+        return Ok(output);
     }
 
     let mut output = String::new();
     for (index, result) in results.iter().enumerate() {
         if index > 0 {
-            output.push('\n');
+            append_bounded(&mut output, "\n", max_bytes)?;
         }
-        let rendered = render(result, format);
-        output.push_str(&rendered);
+        let rendered = render_with_limit(result, format, max_bytes)?;
+        append_bounded(&mut output, &rendered, max_bytes)?;
         if !rendered.ends_with('\n') {
-            output.push('\n');
+            append_bounded(&mut output, "\n", max_bytes)?;
         }
     }
-    output
+    Ok(output)
+}
+
+fn append_bounded(output: &mut String, value: &str, limit: usize) -> rusthouse::Result<()> {
+    let actual = output.len().saturating_add(value.len());
+    if actual > limit {
+        return Err(Error::ResourceLimitExceeded {
+            resource: Resource::RenderedBytes,
+            limit,
+            actual,
+        });
+    }
+    output.push_str(value);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -147,6 +197,7 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
 mod tests {
     use super::*;
     use rusthouse::{DataType, ResultColumn, Value};
+    use std::io::Cursor;
 
     #[test]
     fn parses_equals_style_options() {
@@ -182,5 +233,17 @@ mod tests {
             render_query_results(&[result.clone(), result], OutputFormat::Json),
             "{\"results\":[{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]},{\"columns\":[{\"name\":\"n\",\"type\":\"Int64\"}],\"rows\":[[1]]}]}\n"
         );
+    }
+
+    #[test]
+    fn stdin_reader_stops_one_byte_past_the_input_limit() {
+        let mut input = Cursor::new(b"SELECT 1234567890".to_vec());
+        let error = read_sql_bounded(&mut input, 6).expect_err("seventh byte exceeds limit");
+
+        assert!(error.contains("limit 6, observed 7"));
+        assert_eq!(input.position(), 7);
+
+        let exact = read_sql_bounded(Cursor::new(b"SELECT"), 6).expect("exact limit succeeds");
+        assert_eq!(exact, "SELECT");
     }
 }
