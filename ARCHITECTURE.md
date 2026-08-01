@@ -20,7 +20,8 @@ latest catalog. This is snapshot isolation rather than full serializable isolati
 Persistent databases encode a complete catalog generation in a versioned, checksummed
 snapshot. Publication uses a synced temporary file, atomic rename, and parent-directory
 sync. A canonical-path sidecar lock in a reserved filename namespace gives one database
-handle exclusive ownership across processes. Encoding validates the same table, column, row, string, and total-allocation
+handle exclusive ownership across processes. Temporary candidates and backups use a
+separate reserved filename prefix that cannot be opened as a database. Encoding validates the same table, column, row, string, and total-allocation
 bounds that decoding enforces. The decoder charges raw bytes, catalog/map nodes, table
 and `Arc` storage, schema and column vectors, strings, column values, and conservative
 allocator overhead before reserving them, and it rejects unknown or malformed data.

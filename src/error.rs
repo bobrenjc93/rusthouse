@@ -118,7 +118,7 @@ impl fmt::Display for Error {
             }
             Self::ReservedDatabasePath(path) => write!(
                 f,
-                "database path uses the reserved lock-file namespace: {path}"
+                "database path uses the reserved internal-file namespace: {path}"
             ),
             Self::CommitDurabilityUncertain {
                 generation,

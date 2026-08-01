@@ -110,6 +110,30 @@ fn database_names_cannot_replace_another_databases_lock() {
 }
 
 #[test]
+fn temporary_snapshot_namespace_cannot_be_another_database() {
+    let path = temporary_path("temp-namespace");
+    let owner = Database::open(&path).unwrap();
+    let generated_shape = path.parent().unwrap().join(format!(
+        ".rusthouse-tmp.{}.999999.backup",
+        std::process::id()
+    ));
+    assert!(matches!(
+        Database::open(&generated_shape),
+        Err(Error::ReservedDatabasePath(_))
+    ));
+
+    owner.execute("CREATE TABLE original (id Int64)").unwrap();
+    drop(owner);
+    let reopened = Database::open(&path).unwrap();
+    assert!(matches!(
+        reopened.execute("SELECT * FROM original"),
+        Ok(StatementResult::Query(_))
+    ));
+    drop(reopened);
+    remove_database(&path);
+}
+
+#[test]
 fn writer_rejects_catalog_shape_that_reopen_would_reject() {
     let path = temporary_path("wide");
     let database = Database::open(&path).unwrap();

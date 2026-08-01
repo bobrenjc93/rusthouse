@@ -51,6 +51,9 @@ path has one exclusive in-process or cross-process owner; a second `Database::op
 returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are dropped.
 Locks use a reserved `.rusthouse-lock` namespace; database paths ending in that suffix
 are rejected so no database can replace another database's active lock inode.
+Candidates and recovery backups use the reserved `.rusthouse-tmp.` filename prefix,
+which `Database::open` also rejects after canonicalizing the path. A concurrent database
+therefore cannot adopt or replace another database's pending snapshot.
 Writer-side validation guarantees every committed catalog satisfies the decoder's
 table, column, row, string, file-size, and total-allocation bounds.
 

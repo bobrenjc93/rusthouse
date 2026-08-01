@@ -23,6 +23,7 @@ const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const TABLE_MAP_ENTRY_ALLOCATION: usize = 512;
 const HEAP_ALLOCATION_OVERHEAD: usize = 64;
 const LOCK_SUFFIX: &str = ".rusthouse-lock";
+const TEMP_PREFIX: &str = ".rusthouse-tmp.";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, unix))]
 static FAIL_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
@@ -51,9 +52,8 @@ impl Persistence {
     pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
         let path = normalize_path(&path)?;
         if path.file_name().is_some_and(|name| {
-            name.to_string_lossy()
-                .to_ascii_lowercase()
-                .ends_with(LOCK_SUFFIX)
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            name.ends_with(LOCK_SUFFIX) || name.starts_with(TEMP_PREFIX)
         }) {
             return Err(Error::ReservedDatabasePath(path.display().to_string()));
         }
@@ -125,17 +125,7 @@ impl Persistence {
         fs::create_dir_all(parent)
             .map_err(|error| Error::io("create snapshot directory", error))?;
 
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("rusthouse.db");
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{file_name}.tmp.{}.{}",
-            std::process::id(),
-            sequence
-        ));
+        let temporary = next_temporary_snapshot_path(parent);
 
         let result = write_and_replace(&temporary, &self.path, parent, &bytes);
         if result.is_err() {
@@ -143,6 +133,11 @@ impl Persistence {
         }
         result
     }
+}
+
+fn next_temporary_snapshot_path(parent: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{TEMP_PREFIX}{}.{}", std::process::id(), sequence))
 }
 
 fn normalize_path(path: &Path) -> Result<PathBuf> {
@@ -1112,6 +1107,22 @@ mod tests {
                 Err(Error::CorruptSnapshot(_))
             ));
         }
+    }
+
+    #[test]
+    fn generated_temporary_and_backup_paths_are_reserved() {
+        let temporary = next_temporary_snapshot_path(&std::env::temp_dir());
+        assert!(matches!(
+            Persistence::acquire(temporary.clone()),
+            Err(Error::ReservedDatabasePath(_))
+        ));
+
+        let mut backup = temporary.as_os_str().to_os_string();
+        backup.push(".backup");
+        assert!(matches!(
+            Persistence::acquire(PathBuf::from(backup)),
+            Err(Error::ReservedDatabasePath(_))
+        ));
     }
 
     #[test]
