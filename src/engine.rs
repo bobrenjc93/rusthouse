@@ -24,6 +24,7 @@ const MAX_SQL_STATEMENTS: usize = 1_024;
 const MAX_SELECT_PROJECTIONS: usize = 1_024;
 const LIKE_WORK_FACTOR: usize = 16;
 const MINIMUM_LIKE_WORK: usize = 4_096;
+const HASH_CONTROL_GROUP_BYTES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -261,17 +262,55 @@ impl Engine {
                         actual: attempted,
                     });
                 }
-                let column_indexes = insert
-                    .columns
-                    .iter()
-                    .map(|column| table.schema().index_of(&column.value))
-                    .collect::<Result<Vec<_>>>()?;
+                let column_indexes = if insert.columns.is_empty() {
+                    (0..table.schema().len()).collect::<Vec<_>>()
+                } else {
+                    insert
+                        .columns
+                        .iter()
+                        .map(|column| table.schema().index_of(&column.value))
+                        .collect::<Result<Vec<_>>>()?
+                };
                 if column_indexes.iter().copied().collect::<HashSet<_>>().len()
                     != column_indexes.len()
                 {
                     return Err(Error::Constraint(
                         "an INSERT column may only be specified once".into(),
                     ));
+                }
+                if !insert.columns.is_empty() {
+                    for (index, field) in table.schema().fields().iter().enumerate() {
+                        if !column_indexes.contains(&index) && !field.nullable {
+                            return Err(Error::Constraint(format!(
+                                "column {} is not nullable",
+                                field.name
+                            )));
+                        }
+                    }
+                }
+                let constant_source = EvalSource {
+                    table: None,
+                    qualifier: None,
+                };
+                let no_aliases = HashMap::new();
+                for expressions in &values.rows {
+                    if expressions.len() != column_indexes.len() {
+                        return Err(Error::Constraint(format!(
+                            "expected {} values, found {}",
+                            column_indexes.len(),
+                            expressions.len()
+                        )));
+                    }
+                    for (expression, column) in expressions.iter().zip(&column_indexes) {
+                        if contains_aggregate(expression) {
+                            return Err(Error::Constraint(
+                                "aggregate functions are not allowed in VALUES".into(),
+                            ));
+                        }
+                        let data_type =
+                            infer_expression_type(expression, &constant_source, &no_aliases)?;
+                        validate_insert_type(data_type, &table.schema().fields()[*column])?;
+                    }
                 }
                 let mut rows = Vec::with_capacity(values.rows.len());
                 for expressions in values.rows {
@@ -282,13 +321,6 @@ impl Engine {
                     if insert.columns.is_empty() {
                         rows.push(values);
                     } else {
-                        if values.len() != column_indexes.len() {
-                            return Err(Error::Constraint(format!(
-                                "expected {} values, found {}",
-                                column_indexes.len(),
-                                values.len()
-                            )));
-                        }
                         let mut row = vec![Value::Null; table.schema().len()];
                         for (column, value) in column_indexes.iter().copied().zip(values) {
                             row[column] = value;
@@ -536,7 +568,7 @@ impl Engine {
             {
                 continue;
             }
-            filtered_memory.grow(std::mem::size_of::<usize>())?;
+            reserve_vec_slot(&mut filtered_rows, &mut filtered_memory)?;
             filtered_rows.push(row);
             if filtered_rows.len() >= scan_limit {
                 break;
@@ -601,29 +633,31 @@ impl Engine {
                 values.push(value);
             }
             if distinct {
-                let key_bytes = row_key_retained_bytes(&values);
-                let key_memory = memory.reserve(key_bytes)?;
+                let key_bytes = estimated_row_key_heap_bytes(&values);
+                let mut key_memory = memory.reserve(key_bytes)?;
                 let key = row_key(&values);
+                let actual_key_bytes = row_key_heap_bytes(&key);
+                if actual_key_bytes > key_bytes {
+                    key_memory.grow(actual_key_bytes - key_bytes)?;
+                }
                 if seen.contains(&key) {
                     continue;
                 }
                 drop(key_memory);
-                seen_memory
-                    .as_mut()
-                    .expect("DISTINCT reservation exists")
-                    .grow(key_bytes.saturating_add(std::mem::size_of::<usize>()))?;
+                let seen_memory = seen_memory.as_mut().expect("DISTINCT reservation exists");
+                seen_memory.grow(row_key_heap_bytes(&key))?;
+                reserve_hash_set_slot(&mut seen, seen_memory)?;
                 seen.insert(key);
             }
             let source_rows = if ordered { rows } else { Vec::new() };
             drop(row_memory);
+            reserve_vec_slot(&mut projected, &mut projected_memory)?;
             projected_memory.grow(
-                std::mem::size_of::<ProjectedRow>()
-                    .saturating_add(values_retained_payload_bytes(&values))
-                    .saturating_add(
-                        source_rows
-                            .len()
-                            .saturating_mul(std::mem::size_of::<usize>()),
-                    ),
+                row_retained_bytes(&values).saturating_add(
+                    source_rows
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                ),
             )?;
             projected.push(ProjectedRow {
                 values,
@@ -642,21 +676,25 @@ impl Engine {
 
         if ordered {
             for row in &mut projected {
-                let alias_bytes = columns.iter().zip(&row.values).fold(
-                    std::mem::size_of::<HashMap<String, Value>>(),
-                    |size, (name, value)| {
-                        size.saturating_add(std::mem::size_of::<String>())
-                            .saturating_add(name.len())
-                            .saturating_add(value_retained_payload_bytes(value))
-                            .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
-                    },
-                );
-                let _alias_memory = memory.reserve(alias_bytes)?;
+                let mut alias_memory =
+                    memory.reserve(std::mem::size_of::<HashMap<String, Value>>())?;
                 let mut aliases = HashMap::new();
                 for (name, value) in columns.iter().zip(&row.values) {
-                    aliases
-                        .entry(normalize_identifier(name))
-                        .or_insert_with(|| value.clone());
+                    let estimated_heap = name.len().saturating_add(value_heap_bytes(value));
+                    let mut entry_memory = memory.reserve(estimated_heap)?;
+                    let name = normalize_identifier(name);
+                    let value = value.clone();
+                    let actual_heap = name.capacity().saturating_add(value_heap_bytes(&value));
+                    if actual_heap > estimated_heap {
+                        entry_memory.grow(actual_heap - estimated_heap)?;
+                    }
+                    if aliases.contains_key(&name) {
+                        continue;
+                    }
+                    drop(entry_memory);
+                    alias_memory.grow(actual_heap)?;
+                    reserve_hash_map_slot(&mut aliases, &mut alias_memory)?;
+                    aliases.insert(name, value);
                 }
                 let mut sort_memory =
                     memory.reserve(std::mem::size_of::<Vec<Value>>().saturating_add(
@@ -697,7 +735,7 @@ impl Engine {
                     sort_keys.push(value);
                 }
                 drop(sort_memory);
-                projected_memory.grow(values_retained_payload_bytes(&sort_keys))?;
+                projected_memory.grow(row_retained_bytes(&sort_keys))?;
                 row.sort_keys = sort_keys;
             }
             validate_sort_types(&projected)?;
@@ -1000,6 +1038,14 @@ impl MemoryReservation<'_> {
         self.bytes = self.bytes.saturating_add(bytes);
         Ok(())
     }
+
+    fn shrink(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.tracker
+            .current
+            .set(self.tracker.current.get().saturating_sub(bytes));
+        self.bytes -= bytes;
+    }
 }
 
 impl Drop for MemoryReservation<'_> {
@@ -1007,6 +1053,134 @@ impl Drop for MemoryReservation<'_> {
         self.tracker
             .current
             .set(self.tracker.current.get().saturating_sub(self.bytes));
+    }
+}
+
+fn reserve_vec_slot<T>(values: &mut Vec<T>, memory: &mut MemoryReservation<'_>) -> Result<()> {
+    if values.len() < values.capacity() || std::mem::size_of::<T>() == 0 {
+        return Ok(());
+    }
+    let old_capacity = values.capacity();
+    let target_capacity = if old_capacity == 0 {
+        1
+    } else {
+        old_capacity.saturating_mul(2)
+    };
+    let expected_growth = target_capacity.saturating_sub(old_capacity);
+    memory.grow(expected_growth.saturating_mul(std::mem::size_of::<T>()))?;
+    values
+        .try_reserve_exact(target_capacity.saturating_sub(values.len()))
+        .map_err(|_| memory_limit_error(memory))?;
+    let actual_growth = values.capacity().saturating_sub(old_capacity);
+    if actual_growth > expected_growth {
+        memory.grow(
+            actual_growth
+                .saturating_sub(expected_growth)
+                .saturating_mul(std::mem::size_of::<T>()),
+        )?;
+    } else {
+        memory.shrink(
+            expected_growth
+                .saturating_sub(actual_growth)
+                .saturating_mul(std::mem::size_of::<T>()),
+        );
+    }
+    Ok(())
+}
+
+fn reserve_hash_map_slot<K: Eq + std::hash::Hash, V>(
+    values: &mut HashMap<K, V>,
+    memory: &mut MemoryReservation<'_>,
+) -> Result<()> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let old_capacity = values.capacity();
+    let target_capacity = next_hash_capacity(old_capacity);
+    let slot_bytes = std::mem::size_of::<(K, V)>().saturating_add(1);
+    let old_buckets = hash_bucket_count(old_capacity);
+    let expected_growth = hash_bucket_count(target_capacity).saturating_sub(old_buckets);
+    if old_capacity == 0 {
+        memory.grow(HASH_CONTROL_GROUP_BYTES)?;
+    }
+    memory.grow(expected_growth.saturating_mul(slot_bytes))?;
+    values
+        .try_reserve(1)
+        .map_err(|_| memory_limit_error(memory))?;
+    let actual_growth = hash_bucket_count(values.capacity()).saturating_sub(old_buckets);
+    if actual_growth > expected_growth {
+        memory.grow(
+            actual_growth
+                .saturating_sub(expected_growth)
+                .saturating_mul(slot_bytes),
+        )?;
+    } else {
+        memory.shrink(
+            expected_growth
+                .saturating_sub(actual_growth)
+                .saturating_mul(slot_bytes),
+        );
+    }
+    Ok(())
+}
+
+fn reserve_hash_set_slot<T: Eq + std::hash::Hash>(
+    values: &mut HashSet<T>,
+    memory: &mut MemoryReservation<'_>,
+) -> Result<()> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let old_capacity = values.capacity();
+    let target_capacity = next_hash_capacity(old_capacity);
+    let slot_bytes = std::mem::size_of::<T>().saturating_add(1);
+    let old_buckets = hash_bucket_count(old_capacity);
+    let expected_growth = hash_bucket_count(target_capacity).saturating_sub(old_buckets);
+    if old_capacity == 0 {
+        memory.grow(HASH_CONTROL_GROUP_BYTES)?;
+    }
+    memory.grow(expected_growth.saturating_mul(slot_bytes))?;
+    values
+        .try_reserve(1)
+        .map_err(|_| memory_limit_error(memory))?;
+    let actual_growth = hash_bucket_count(values.capacity()).saturating_sub(old_buckets);
+    if actual_growth > expected_growth {
+        memory.grow(
+            actual_growth
+                .saturating_sub(expected_growth)
+                .saturating_mul(slot_bytes),
+        )?;
+    } else {
+        memory.shrink(
+            expected_growth
+                .saturating_sub(actual_growth)
+                .saturating_mul(slot_bytes),
+        );
+    }
+    Ok(())
+}
+
+fn next_hash_capacity(current: usize) -> usize {
+    if current == 0 {
+        3
+    } else {
+        current.saturating_mul(2).saturating_add(1)
+    }
+}
+
+fn hash_bucket_count(capacity: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity.saturating_add(1).next_power_of_two()
+    }
+}
+
+fn memory_limit_error(memory: &MemoryReservation<'_>) -> Error {
+    Error::ResourceLimit {
+        resource: "intermediate result bytes",
+        limit: memory.tracker.limit,
+        actual: usize::MAX,
     }
 }
 
@@ -1199,12 +1373,6 @@ fn row_retained_bytes(row: &Vec<Value>) -> usize {
             })
         },
     )
-}
-
-fn values_retained_payload_bytes(values: &[Value]) -> usize {
-    values.iter().fold(0_usize, |size, value| {
-        size.saturating_add(value_retained_payload_bytes(value))
-    })
 }
 
 fn value_retained_payload_bytes(value: &Value) -> usize {
@@ -1789,6 +1957,22 @@ fn common_type(left: Option<DataType>, right: Option<DataType>) -> Result<Option
         }
         (Some(left), Some(right)) => Err(Error::Type(format!(
             "incompatible types {left} and {right}"
+        ))),
+    }
+}
+
+fn validate_insert_type(data_type: Option<DataType>, field: &Field) -> Result<()> {
+    match data_type {
+        None if field.nullable => Ok(()),
+        None => Err(Error::Constraint(format!(
+            "column {} is not nullable",
+            field.name
+        ))),
+        Some(data_type) if data_type == field.data_type => Ok(()),
+        Some(DataType::Int64) if field.data_type == DataType::Float64 => Ok(()),
+        Some(data_type) => Err(Error::Type(format!(
+            "column {} expects {}, found {data_type}",
+            field.name, field.data_type
         ))),
     }
 }
@@ -3374,21 +3558,25 @@ fn eval_aggregate(
         }
         let value_memory = memory.reserve(value_retained_payload_bytes(&value))?;
         if distinct {
-            let key_bytes = value_key_retained_bytes(&value);
-            let key_memory = memory.reserve(key_bytes)?;
+            let key_bytes = estimated_value_key_heap_bytes(&value);
+            let mut key_memory = memory.reserve(key_bytes)?;
             let key = value_key(&value);
+            let actual_key_bytes = value_key_heap_bytes(&key);
+            if actual_key_bytes > key_bytes {
+                key_memory.grow(actual_key_bytes - key_bytes)?;
+            }
             if seen.contains(&key) {
                 continue;
             }
             drop(key_memory);
-            seen_memory
-                .as_mut()
-                .expect("DISTINCT reservation exists")
-                .grow(key_bytes.saturating_add(std::mem::size_of::<usize>()))?;
+            let seen_memory = seen_memory.as_mut().expect("DISTINCT reservation exists");
+            seen_memory.grow(value_key_heap_bytes(&key))?;
+            reserve_hash_set_slot(&mut seen, seen_memory)?;
             seen.insert(key);
         }
         drop(value_memory);
-        values_memory.grow(value_retained_payload_bytes(&value))?;
+        reserve_vec_slot(&mut values, &mut values_memory)?;
+        values_memory.grow(value_heap_bytes(&value))?;
         values.push(value);
     }
     match name.as_str() {
@@ -3524,26 +3712,50 @@ fn value_key(value: &Value) -> KeyValue {
 }
 
 fn row_key(values: &[Value]) -> Vec<KeyValue> {
-    values.iter().map(value_key).collect()
+    let mut key = Vec::with_capacity(values.len());
+    key.extend(values.iter().map(value_key));
+    key
 }
 
-fn row_key_retained_bytes(values: &[Value]) -> usize {
-    values
-        .iter()
-        .fold(std::mem::size_of::<Vec<KeyValue>>(), |size, value| {
-            size.saturating_add(std::mem::size_of::<KeyValue>())
-                .saturating_add(match value {
-                    Value::String(value) => value.len(),
-                    _ => 0,
-                })
-        })
+fn estimated_row_key_heap_bytes(values: &[Value]) -> usize {
+    values.iter().fold(
+        values.len().saturating_mul(std::mem::size_of::<KeyValue>()),
+        |size, value| {
+            size.saturating_add(match value {
+                Value::String(value) => value.len(),
+                _ => 0,
+            })
+        },
+    )
 }
 
-fn value_key_retained_bytes(value: &Value) -> usize {
-    std::mem::size_of::<KeyValue>().saturating_add(match value {
+fn row_key_heap_bytes(key: &Vec<KeyValue>) -> usize {
+    key.iter().fold(
+        key.capacity()
+            .saturating_mul(std::mem::size_of::<KeyValue>()),
+        |size, value| size.saturating_add(value_key_heap_bytes(value)),
+    )
+}
+
+fn estimated_value_key_heap_bytes(value: &Value) -> usize {
+    match value {
         Value::String(value) => value.len(),
         _ => 0,
-    })
+    }
+}
+
+fn value_key_heap_bytes(value: &KeyValue) -> usize {
+    match value {
+        KeyValue::String(value) => value.capacity(),
+        _ => 0,
+    }
+}
+
+fn value_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(value) => value.capacity(),
+        _ => 0,
+    }
 }
 
 fn make_groups<'a>(
@@ -3554,11 +3766,11 @@ fn make_groups<'a>(
 ) -> Result<(Vec<Vec<usize>>, MemoryReservation<'a>)> {
     let mut group_memory = memory.reserve(std::mem::size_of::<Vec<Vec<usize>>>())?;
     if group_by.is_empty() {
-        group_memory.grow(
-            std::mem::size_of::<Vec<usize>>()
-                .saturating_add(rows.len().saturating_mul(std::mem::size_of::<usize>())),
-        )?;
-        return Ok((vec![rows], group_memory));
+        let mut groups = Vec::new();
+        reserve_vec_slot(&mut groups, &mut group_memory)?;
+        group_memory.grow(rows.capacity().saturating_mul(std::mem::size_of::<usize>()))?;
+        groups.push(rows);
+        return Ok((groups, group_memory));
     }
     let mut indexes = HashMap::<Vec<KeyValue>, usize>::new();
     let mut index_memory = memory.reserve(std::mem::size_of::<HashMap<Vec<KeyValue>, usize>>())?;
@@ -3576,23 +3788,28 @@ fn make_groups<'a>(
             }
             key_values.push(value);
         }
-        let key_bytes = row_key_retained_bytes(&key_values);
-        let key_memory = memory.reserve(key_bytes)?;
+        let key_bytes = estimated_row_key_heap_bytes(&key_values);
+        let mut key_memory = memory.reserve(key_bytes)?;
         let key = row_key(&key_values);
+        let actual_key_bytes = row_key_heap_bytes(&key);
+        if actual_key_bytes > key_bytes {
+            key_memory.grow(actual_key_bytes - key_bytes)?;
+        }
         drop(key_values_memory);
         drop(key_values);
         if let Some(index) = indexes.get(&key).copied() {
-            group_memory.grow(std::mem::size_of::<usize>())?;
+            reserve_vec_slot(&mut groups[index], &mut group_memory)?;
             groups[index].push(row);
         } else {
             drop(key_memory);
-            index_memory
-                .grow(key_bytes.saturating_add(std::mem::size_of::<usize>().saturating_mul(2)))?;
-            group_memory.grow(
-                std::mem::size_of::<Vec<usize>>().saturating_add(std::mem::size_of::<usize>()),
-            )?;
+            index_memory.grow(row_key_heap_bytes(&key))?;
+            reserve_hash_map_slot(&mut indexes, &mut index_memory)?;
+            let mut group = Vec::new();
+            reserve_vec_slot(&mut group, &mut group_memory)?;
+            group.push(row);
+            reserve_vec_slot(&mut groups, &mut group_memory)?;
             indexes.insert(key, groups.len());
-            groups.push(vec![row]);
+            groups.push(group);
         }
     }
     Ok((groups, group_memory))
@@ -3605,9 +3822,11 @@ fn make_single_row_groups(
     let mut group_memory = memory.reserve(std::mem::size_of::<Vec<Vec<usize>>>())?;
     let mut groups = Vec::new();
     for row in rows {
-        group_memory
-            .grow(std::mem::size_of::<Vec<usize>>().saturating_add(std::mem::size_of::<usize>()))?;
-        groups.push(vec![row]);
+        let mut group = Vec::new();
+        reserve_vec_slot(&mut group, &mut group_memory)?;
+        group.push(row);
+        reserve_vec_slot(&mut groups, &mut group_memory)?;
+        groups.push(group);
     }
     Ok((groups, group_memory))
 }
@@ -4787,6 +5006,30 @@ mod tests {
     }
 
     #[test]
+    fn group_capacity_growth_obeys_the_intermediate_byte_limit() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 2_500_000,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        let values = (0..20_000)
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+
+        assert!(matches!(
+            engine.execute("SELECT n, COUNT(*) FROM t GROUP BY n HAVING false"),
+            Err(Error::ResourceLimit {
+                resource: "intermediate result bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_character_type_prefixes() {
         let mut engine = Engine::default();
         assert!(
@@ -4879,6 +5122,35 @@ mod tests {
         assert!(engine.execute("SELECT n IS FALSE FROM t").is_err());
         engine.execute("INSERT INTO t VALUES (1)").unwrap();
         assert!(engine.execute("SELECT n IS TRUE FROM t").is_err());
+    }
+
+    #[test]
+    fn nullable_insert_expressions_are_bound_before_evaluation() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Nullable(Int64))")
+            .unwrap();
+        for expression in [
+            "CAST(NULL AS String)",
+            "CAST(NULL AS Int64) || 1",
+            "NULL & NULL",
+        ] {
+            assert!(
+                engine
+                    .execute(&format!("INSERT INTO t VALUES ({expression})"))
+                    .is_err(),
+                "{expression} unexpectedly succeeded"
+            );
+            assert_eq!(engine.table("t").unwrap().row_count(), 0);
+        }
+
+        engine
+            .execute("INSERT INTO t VALUES (NULL), (CAST(NULL AS Int64)), (1)")
+            .unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT n FROM t").rows,
+            vec![vec![Value::Null], vec![Value::Null], vec![Value::Int64(1)],]
+        );
     }
 
     #[test]
