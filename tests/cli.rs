@@ -64,6 +64,25 @@ fn json_batches_are_one_valid_document() {
     );
 }
 
+#[test]
+fn json_errors_do_not_leave_malformed_documents() {
+    let parse_error = run("SELECT (", &["--format", "json"]);
+    assert!(!parse_error.status.success());
+    assert!(parse_error.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&parse_error.stderr).contains("SQL error"));
+
+    let runtime_error = run(
+        "SELECT 1 AS n; SELECT 1 / 0 AS invalid",
+        &["--format", "json"],
+    );
+    assert!(!runtime_error.status.success());
+    assert_eq!(
+        String::from_utf8(runtime_error.stdout).unwrap(),
+        "[{\"columns\":[\"n\"],\"rows\":[[1]]}\n]\n"
+    );
+    assert!(String::from_utf8_lossy(&runtime_error.stderr).contains("division by zero"));
+}
+
 #[cfg(unix)]
 #[test]
 fn closed_output_pipe_is_a_successful_exit() {

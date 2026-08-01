@@ -38,6 +38,7 @@ fn run() -> std::result::Result<(), Box<dyn StdError>> {
     let sql =
         std::str::from_utf8(&input).map_err(|error| format!("stdin is not UTF-8: {error}"))?;
     let mut engine = Engine::new(config);
+    let results = engine.execute_iter(sql)?;
     let stdout = io::stdout();
     let mut writer = io::BufWriter::new(stdout.lock());
     let json_batch = format == OutputFormat::Json;
@@ -45,8 +46,17 @@ fn run() -> std::result::Result<(), Box<dyn StdError>> {
     if json_batch {
         writer.write_all(b"[")?;
     }
-    for result in engine.execute_iter(sql)? {
-        let result = result?;
+    for result in results {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if json_batch {
+                    writer.write_all(b"]\n")?;
+                    writer.flush()?;
+                }
+                return Err(error.into());
+            }
+        };
         if let StatementResult::Query(result) = result {
             if json_batch && !first_query {
                 writer.write_all(b",")?;
