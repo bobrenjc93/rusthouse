@@ -51,6 +51,68 @@ fn reader_snapshot_is_stable_while_another_session_commits() {
 }
 
 #[test]
+fn system_metadata_uses_the_transaction_catalog_snapshot() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE existing (id Int64)")
+        .unwrap();
+    let mut reader = database.session();
+    let mut writer = database.session();
+
+    let pinned = reader.begin().unwrap();
+    writer
+        .execute("CREATE TABLE concurrent_table (value String)")
+        .unwrap();
+
+    assert_eq!(
+        query(
+            &mut reader,
+            "SELECT generation FROM system.tables WHERE name = 'existing'",
+        ),
+        vec![vec![Value::Int64(
+            i64::try_from(pinned).expect("test generation fits in i64")
+        )]]
+    );
+    assert!(
+        query(
+            &mut reader,
+            "SELECT name FROM system.tables WHERE name = 'concurrent_table'",
+        )
+        .is_empty()
+    );
+    assert!(
+        query(
+            &mut reader,
+            "SELECT name FROM system.columns WHERE table = 'concurrent_table'",
+        )
+        .is_empty()
+    );
+    assert!(
+        query(
+            &mut reader,
+            "SELECT table FROM system.segments WHERE table = 'concurrent_table'",
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        query(
+            &mut writer,
+            "SELECT name FROM system.tables WHERE name = 'concurrent_table'",
+        ),
+        vec![vec![Value::String("concurrent_table".to_owned())]]
+    );
+
+    reader.commit().unwrap();
+    assert_eq!(
+        query(
+            &mut reader,
+            "SELECT name FROM system.tables WHERE name = 'concurrent_table'",
+        ),
+        vec![vec![Value::String("concurrent_table".to_owned())]]
+    );
+}
+
+#[test]
 fn ddl_and_dml_become_visible_in_one_commit() {
     let database = Database::new();
     let mut owner = database.session();

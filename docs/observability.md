@@ -2,7 +2,8 @@
 
 RustHouse exposes read-only metadata through SQL and a bounded engine snapshot through HTTP.
 The `system` namespace is reserved: `CREATE` in that namespace fails, as do `INSERT` and `DROP`
-against a virtual system table. All system-table reads use one committed catalog snapshot.
+against a virtual system table. All system-table reads use one committed catalog snapshot; an
+active transaction uses its pinned catalog generation rather than a newer concurrent commit.
 
 Snapshots written by older RustHouse versions can contain a quoted table whose literal name starts
 with `system.`. Such a real catalog table takes precedence over the virtual table after upgrade and
@@ -45,10 +46,11 @@ monotonic milliseconds since engine execution began. Scanned rows count rows con
 engine table scan. Scanned bytes count logical value bytes accessed by predicates and projections,
 not filesystem or compressed bytes: `Int64` and `Float64` are 8 bytes, `Bool` is 1 byte,
 `String` is its UTF-8 byte length, and `NULL` is 0 bytes. Value-container and allocator overhead is
-excluded. Peak memory is the largest accounted materialized-result size; allocator metadata and
-HTTP serialization buffers are excluded. Spill bytes are zero until an execution operator uses
-spill storage. `cancelled` changes as soon as the cooperative cancellation token is signalled,
-including while an engine worker is still unwinding.
+excluded. Predicates are evaluated left to right, and scanned bytes exclude predicates skipped by
+short-circuit evaluation. Peak memory is the largest accounted materialized-result size; allocator
+metadata and HTTP serialization buffers are excluded. Spill bytes are zero until an execution
+operator uses spill storage. `cancelled` changes as soon as the cooperative cancellation token is
+signalled, including while an engine worker is still unwinding.
 
 Active query records retain at most 4,096 UTF-8 bytes of SQL without splitting a code point. The
 registry retains at most 1,024 records. `active_queries` remains the exact running-query gauge when

@@ -159,7 +159,7 @@ async fn http_metrics_exposes_the_engine_snapshot() {
 }
 
 #[tokio::test]
-async fn scanned_bytes_use_logical_value_widths() {
+async fn scanned_bytes_use_logical_widths_and_predicate_short_circuiting() {
     let database = Database::new();
     database
         .execute(
@@ -167,7 +167,9 @@ async fn scanned_bytes_use_logical_value_widths() {
         )
         .unwrap();
     database
-        .execute("INSERT INTO scan_values VALUES (1, 1.5, true, 'éx'), (NULL, NULL, NULL, NULL)")
+        .execute(
+            "INSERT INTO scan_values VALUES (1, 1.5, true, 'éx'), (NULL, NULL, NULL, NULL), (2, 2.5, true, 'ignored')",
+        )
         .unwrap();
     let server = spawn_http_server(
         "127.0.0.1:0".parse().unwrap(),
@@ -198,13 +200,34 @@ async fn scanned_bytes_use_logical_value_widths() {
         .json::<JsonValue>()
         .await
         .unwrap();
-    assert_eq!(metrics["engine_metrics"]["scanned_rows_total"], 2);
+    assert_eq!(metrics["engine_metrics"]["scanned_rows_total"], 3);
     // The non-NULL row reads Int64 + Bool predicates and String + Float64 projections.
-    // The second row contains only NULL values, whose logical payload width is zero.
+    // The NULL row contributes zero, and the final row stops after its 8-byte Int64 predicate.
     assert_eq!(
         metrics["engine_metrics"]["scanned_bytes_total"],
-        8 + 1 + 3 + 8
+        8 + 1 + 3 + 8 + 8
     );
+
+    let response = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("SELECT name FROM system.tables WHERE database = 'other' AND name = 'scan_values'")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let metrics = client
+        .get(format!("{url}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .json::<JsonValue>()
+        .await
+        .unwrap();
+    assert_eq!(metrics["engine_metrics"]["scanned_rows_total"], 4);
+    // The virtual row stops after reading the 7-byte "default" database value.
+    assert_eq!(metrics["engine_metrics"]["scanned_bytes_total"], 35);
 
     server.shutdown().await.unwrap();
 }

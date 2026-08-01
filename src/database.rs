@@ -249,12 +249,12 @@ impl DatabaseInner {
 
     fn execute_system_read(
         &self,
+        catalog: &CatalogGeneration,
         name: &str,
         statement: Statement,
         control: Option<ExecutionControl<'_>>,
     ) -> Result<StatementResult> {
         check_cancellation(control)?;
-        let catalog = self.snapshot()?;
         let Statement::Select {
             columns,
             predicates,
@@ -603,14 +603,13 @@ fn execute_virtual_rows<'a>(
             .map(VirtualValue::into_value)
             .collect::<Vec<_>>();
 
-        let predicate_bytes = predicates.iter().fold(0_usize, |bytes, (column, _, _)| {
-            bytes.saturating_add(row[*column].logical_bytes())
+        let mut predicate_bytes = 0_usize;
+        let matches = predicates.iter().all(|(column, comparison, value)| {
+            predicate_bytes = predicate_bytes.saturating_add(row[*column].logical_bytes());
+            compare(&row[*column], value, *comparison)
         });
         add_scan(control, 1, predicate_bytes);
-        if predicates
-            .iter()
-            .all(|(column, comparison, value)| compare(&row[*column], value, *comparison))
-        {
+        if matches {
             let projected_owned_bytes = projection.iter().fold(0_usize, |bytes, column| {
                 bytes.saturating_add(value_owned_bytes(&row[*column]))
             });
@@ -802,29 +801,32 @@ impl Session {
                     Statement::Select { table, .. } => table.clone(),
                     _ => unreachable!("the match arm guarantees SELECT"),
                 };
-                let tables = if let Some(transaction) = &self.transaction {
-                    &transaction.tables
+                if let Some(transaction) = &self.transaction {
+                    if table_name.starts_with("system.")
+                        && !transaction.tables.contains_key(&table_name)
+                    {
+                        return self.database.inner.execute_system_read(
+                            &transaction.base,
+                            &table_name,
+                            statement,
+                            control,
+                        );
+                    }
+                    execute_read(&transaction.tables, statement, control)
                 } else {
                     let snapshot = self.database.inner.snapshot()?;
                     if table_name.starts_with("system.")
                         && !snapshot.tables.contains_key(&table_name)
                     {
                         return self.database.inner.execute_system_read(
+                            &snapshot,
                             &table_name,
                             statement,
                             control,
                         );
                     }
-                    return execute_read(&snapshot.tables, statement, control);
-                };
-                if table_name.starts_with("system.") && !tables.contains_key(&table_name) {
-                    return self.database.inner.execute_system_read(
-                        &table_name,
-                        statement,
-                        control,
-                    );
+                    execute_read(&snapshot.tables, statement, control)
                 }
-                execute_read(tables, statement, control)
             }
             statement => {
                 if let Some(transaction) = &mut self.transaction {
@@ -1073,13 +1075,14 @@ fn execute_read_table_parts(
     set_peak_memory(control, result_bytes);
     for row in 0..table.row_count() {
         check_cancellation(control)?;
-        let predicate_bytes = predicates.iter().fold(0_usize, |bytes, (column, _, _)| {
-            bytes.saturating_add(table.logical_value_bytes(row, *column))
+        let mut predicate_bytes = 0_usize;
+        let matches = predicates.iter().all(|(column, comparison, value)| {
+            predicate_bytes =
+                predicate_bytes.saturating_add(table.logical_value_bytes(row, *column));
+            compare(&table.value(row, *column), value, *comparison)
         });
         add_scan(control, 1, predicate_bytes);
-        if predicates.iter().all(|(column, comparison, value)| {
-            compare(&table.value(row, *column), value, *comparison)
-        }) {
+        if matches {
             let row_bytes = projection.iter().fold(0usize, |bytes, column| {
                 bytes.saturating_add(table.owned_value_bytes(row, *column))
             });
