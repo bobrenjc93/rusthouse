@@ -30,6 +30,8 @@ Double-quoted names are identifiers even when their contents are keywords, so
 result. `COALESCE` evaluates only through its first non-NULL argument.
 Evaluation is left-to-right. `FALSE AND ...` and `TRUE OR ...` do not evaluate
 their right operand; other logical combinations require both operands.
+Ordinary multi-argument functions evaluate every argument before applying
+NULL propagation or runtime type validation.
 
 ## Operators
 
@@ -85,7 +87,9 @@ one string. `CONCAT` takes one or more strings. `SUBSTRING`/`SUBSTR` takes a
 string, a one-based positive `Int64` start, and an optional nonnegative
 `Int64` length. Length and substring positions count Unicode scalar values,
 not UTF-8 bytes. Wrong types, arity, or ranges return `Error::InvalidArgument`
-or `Error::Type`. These functions propagate NULL, including `CONCAT`.
+or `Error::Type`. Positions beyond the platform index width behave as beyond
+the end of the string, and oversized lengths consume the remainder. These
+functions propagate NULL, including `CONCAT`.
 
 ## Aggregates
 
@@ -101,4 +105,6 @@ components are retained separately until finalization, so promotion does not
 depend on which arrives first. `AVG` always returns `Float64`.
 NaN propagates through all numeric aggregates, including `MIN` and `MAX`.
 Mixed numeric inputs are comparable, while incompatible MIN/MAX domains and
-nonnumeric SUM/AVG inputs return `Error::Aggregate`.
+nonnumeric SUM/AVG inputs return `Error::Aggregate`. Equal mixed numeric
+MIN/MAX values use the canonical `Float64` representation, independent of row
+order.

@@ -198,10 +198,10 @@ fn add_extreme(current: &mut Option<Value>, value: &Value, minimum: bool) -> Res
         None => true,
         Some(current) => {
             let ordering = aggregate_compare(value, current)?;
-            if minimum {
-                ordering == Ordering::Less
-            } else {
-                ordering == Ordering::Greater
+            match ordering {
+                Ordering::Less => minimum,
+                Ordering::Greater => !minimum,
+                Ordering::Equal => matches!((value, current), (Value::Float64(_), Value::Int64(_))),
             }
         }
     };

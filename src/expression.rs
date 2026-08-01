@@ -437,10 +437,16 @@ fn evaluate_function(name: &str, arguments: &[Expr], context: &EvaluationContext
         }
         "concat" => {
             require_at_least(name, arguments, 1)?;
+            let values = arguments
+                .iter()
+                .map(|argument| argument.evaluate_inner(context))
+                .collect::<Result<Vec<_>>>()?;
+            if values.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
             let mut output = String::new();
-            for argument in arguments {
-                match argument.evaluate_inner(context)? {
-                    Value::Null => return Ok(Value::Null),
+            for value in values {
+                match value {
                     Value::String(value) => output.push_str(&value),
                     value => return Err(type_error(name, "String or NULL", &value)),
                 }
@@ -491,13 +497,19 @@ fn substring(name: &str, arguments: &[Expr], context: &EvaluationContext) -> Res
                 message: "length cannot be negative".to_owned(),
             });
         }
-        Some(length as usize)
+        Some(length)
     } else {
         None
     };
-    let characters = value.chars().skip((start - 1) as usize);
+    let Ok(start_index) = usize::try_from(start - 1) else {
+        return Ok(Value::String(String::new()));
+    };
+    let characters = value.chars().skip(start_index);
     let output = match length {
-        Some(length) => characters.take(length).collect(),
+        Some(length) => match usize::try_from(length) {
+            Ok(length) => characters.take(length).collect(),
+            Err(_) => characters.collect(),
+        },
         None => characters.collect(),
     };
     Ok(Value::String(output))

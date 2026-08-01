@@ -173,6 +173,19 @@ fn mixed_numeric_min_max_are_exact_and_independent_of_input_order() {
 }
 
 #[test]
+fn equal_mixed_numeric_extrema_have_a_canonical_float_type() {
+    let integer = Value::Int64(1);
+    let float = Value::Float64(1.0);
+    for values in [
+        [integer.clone(), float.clone()],
+        [float.clone(), integer.clone()],
+    ] {
+        assert_eq!(aggregate(AggregateFunction::Min, &values).unwrap(), float);
+        assert_eq!(aggregate(AggregateFunction::Max, &values).unwrap(), float);
+    }
+}
+
+#[test]
 fn nan_is_counted_and_propagates_through_numeric_aggregates() {
     let values = [1_f64.into(), Value::Float64(f64::NAN), Value::Null];
     assert_eq!(

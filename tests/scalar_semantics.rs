@@ -70,6 +70,15 @@ fn null_propagates_except_for_null_aware_constructs() {
 }
 
 #[test]
+fn concat_evaluates_all_arguments_before_null_and_type_handling() {
+    assert_eq!(eval("concat(1, NULL)"), Value::Null);
+    assert_eq!(eval("concat(NULL, 1)"), Value::Null);
+    assert_eq!(eval_error("concat(NULL, 1 / 0)"), Error::DivideByZero);
+    assert_eq!(eval_error("concat(1 / 0, NULL)"), Error::DivideByZero);
+    assert!(matches!(eval_error("concat(1, 'x')"), Error::Type { .. }));
+}
+
+#[test]
 fn precedence_and_arithmetic_are_sql_shaped() {
     assert_eq!(eval("2 + 3 * 4"), 14_i64.into());
     assert_eq!(eval("(2 + 3) * 4"), 20_i64.into());
@@ -220,6 +229,8 @@ fn core_string_functions_are_unicode_aware() {
     assert_eq!(eval("concat('a', '', 'b')"), "ab".into());
     assert_eq!(eval("substring('é🙂xyz', 2, 3)"), "🙂xy".into());
     assert_eq!(eval("substr('rusthouse', 5)"), "house".into());
+    assert_eq!(eval("substring('abc', 4294967297)"), "".into());
+    assert_eq!(eval("substring('abc', 2, 4294967297)"), "bc".into());
     assert!(matches!(
         eval_error("substring('x', 0)"),
         Error::InvalidArgument { .. }
