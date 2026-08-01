@@ -606,6 +606,61 @@ fn group_peak_tracks_transient_growth_between_accumulators() {
 }
 
 #[test]
+fn empty_selection_produces_one_global_aggregate_group() {
+    let input = input();
+    let mut batch = batch(&input);
+    batch
+        .replace_selection(SelectionMask::none(LEN, CAPACITY).unwrap())
+        .unwrap();
+    let expressions = [
+        AggregateExpr::count_all(),
+        AggregateExpr::new(AggregateKind::Count, 0),
+        AggregateExpr::new(AggregateKind::Sum, 0),
+        AggregateExpr::new(AggregateKind::Min, 0),
+        AggregateExpr::new(AggregateKind::Max, 0),
+        AggregateExpr::new(AggregateKind::Avg, 0),
+        AggregateExpr::new(AggregateKind::Min, 4),
+    ];
+
+    let grouped = hash_group(&batch, &[], &expressions, GroupByConfig::unlimited(1)).unwrap();
+    assert_eq!(grouped.len(), 1);
+    let group = grouped.iter().next().unwrap();
+    assert!(group.keys().is_empty());
+    let expected = [
+        AggregateResult::Count(0),
+        AggregateResult::Count(0),
+        AggregateResult::Sum(None),
+        AggregateResult::Min(None),
+        AggregateResult::Max(None),
+        AggregateResult::Avg(None),
+        AggregateResult::Min(None),
+    ];
+    for (index, expected) in expected.into_iter().enumerate() {
+        assert_eq!(group.aggregate(index), Some(expected));
+    }
+
+    let required = grouped.retained_bytes();
+    assert!(hash_group(&batch, &[], &expressions, GroupByConfig::new(1, required)).is_ok());
+    assert!(matches!(
+        hash_group(
+            &batch,
+            &[],
+            &expressions,
+            GroupByConfig::new(1, required - 1),
+        ),
+        Err(Error::MemoryLimitExceeded {
+            operator: "hash grouping",
+            required: actual,
+            limit,
+        }) if actual == required && limit == required - 1
+    ));
+    assert_eq!(
+        hash_group(&batch, &[], &expressions, GroupByConfig::unlimited(0)).unwrap_err(),
+        Error::GroupLimitExceeded { max_groups: 0 }
+    );
+}
+
+#[test]
 fn fixed_capacity_and_group_limits_fail_cleanly() {
     let mut array = Int64Array::with_capacity(1);
     array.push(Some(1)).unwrap();

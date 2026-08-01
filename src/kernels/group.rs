@@ -244,6 +244,10 @@ pub fn hash_group(
         memory_limit_bytes: config.memory_limit_bytes,
     };
 
+    if key_columns.is_empty() {
+        initialize_global_group(&mut result, batch, aggregates)?;
+    }
+
     for word_index in 0..batch.selection().word_count() {
         let mut selected = batch.selection().word(word_index);
         while selected != 0 {
@@ -287,6 +291,48 @@ fn validate(
             }
         }
     }
+    Ok(())
+}
+
+fn initialize_global_group(
+    result: &mut GroupedResults,
+    batch: &RecordBatch,
+    expressions: &[AggregateExpr],
+) -> Result<()> {
+    if result.groups.is_empty() {
+        return Err(Error::GroupLimitExceeded { max_groups: 0 });
+    }
+    let estimated = expressions
+        .len()
+        .checked_mul(size_of::<Accumulator>())
+        .ok_or(Error::MemoryLimitExceeded {
+            operator: "hash grouping",
+            required: usize::MAX,
+            limit: result.memory_limit_bytes,
+        })?;
+    let required =
+        result
+            .retained_bytes
+            .checked_add(estimated)
+            .ok_or(Error::MemoryLimitExceeded {
+                operator: "hash grouping",
+                required: usize::MAX,
+                limit: result.memory_limit_bytes,
+            })?;
+    ensure_memory(required, result.memory_limit_bytes)?;
+
+    let group = Group {
+        hash: FNV_OFFSET,
+        keys: Vec::new().into_boxed_slice(),
+        accumulators: build_accumulators(batch, expressions).into_boxed_slice(),
+    };
+    debug_assert_eq!(result.retained_bytes + group.retained_bytes(), required);
+    let slot = FNV_OFFSET as usize & (result.slots.len() - 1);
+    result.groups[0] = Some(group);
+    result.slots[slot] = Some(0);
+    result.group_count = 1;
+    result.retained_bytes = required;
+    result.update_peak();
     Ok(())
 }
 
