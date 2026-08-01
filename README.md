@@ -28,4 +28,50 @@ cargo test
 cargo run -- --help
 ```
 
-The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+## Current transaction model
+
+The library exposes `Database` and independent `Session` handles. A session accepts
+`BEGIN`, `COMMIT`, and `ROLLBACK` alongside `CREATE TABLE`, `DROP TABLE`, `INSERT
+INTO ... VALUES`, and simple `SELECT` projections and predicates.
+
+Transactions pin an immutable catalog generation. Reads use that generation plus the
+session's staged table replacements, so readers remain stable and writers read their
+own changes. Commit checks every written table against the pinned generation. Changes
+to the same table conflict; changes to disjoint tables merge into a new generation.
+A conflict ends the transaction, while a persistence error keeps it active for retry.
+
+`TransactionLimits` bounds cumulative inserted rows and the estimated encoded bytes of
+staged DDL/DML. A statement that would exceed either limit has no effect and leaves an
+explicit transaction active. The defaults are 1,000,000 rows and 256 MiB.
+
+`Database::open` persists each committed generation with a checksum and format version.
+It writes and syncs a temporary file, atomically renames it, and syncs the parent
+directory before publishing the generation to other sessions.
+
+The CLI uses the same session implementation. Repeat `-e` to keep several statements
+in one session, or omit it to read one statement per input line:
+
+```bash
+cargo run -- --database demo.db \
+  -e 'BEGIN' \
+  -e 'CREATE TABLE events (id Int64, label String)' \
+  -e "INSERT INTO events VALUES (1, 'ready')" \
+  -e 'COMMIT'
+```
+
+```rust
+use rusthouse::{Database, StatementResult};
+
+let database = Database::new();
+let mut session = database.session();
+session.execute("BEGIN")?;
+session.execute("CREATE TABLE events (id Int64, label String)")?;
+session.execute("INSERT INTO events VALUES (1, 'ready')")?;
+session.execute("COMMIT")?;
+
+let StatementResult::Query(rows) = session.execute("SELECT * FROM events")? else {
+    unreachable!();
+};
+assert_eq!(rows.row_count(), 1);
+# Ok::<(), rusthouse::Error>(())
+```
