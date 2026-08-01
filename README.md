@@ -50,7 +50,9 @@ rows, total values, names, individual strings, and total string bytes. Counts
 and lengths are checked before allocation, allocation is fallible, and invalid
 images are rejected before the current snapshot is changed. Only one store may
 hold the nonblocking writer lock for a path at a time; concurrent commits made
-through one shared store handle are serialized in process.
+through one shared store handle are serialized in process. Snapshot filenames
+matching the generated `.<name>.lock` or `.<name>.tmp` sidecar namespace are
+rejected, including case and trailing-dot/space aliases.
 
 ### Version 1 binary format
 
@@ -110,13 +112,16 @@ checksum mismatch.
 For `catalog.rhcat`, the store holds an OS advisory lock on
 `.catalog.rhcat.lock`. While holding it, a commit validates and encodes the
 image, creates `.catalog.rhcat.tmp` in the same directory, writes and calls
-`sync_all` on that file, atomically renames it over `catalog.rhcat`, then calls
-`sync_all` on the parent directory. A failure before rename leaves the previous
-snapshot unchanged. A crash after rename exposes either the old or new complete
-file according to filesystem recovery; reopening validates the selected file.
+`sync_all` on that file, then atomically renames it over `catalog.rhcat`. Unix
+syncs the parent directory after rename. Windows publishes with
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, which makes
+the metadata update durable without opening the directory. A failure before
+rename leaves the previous snapshot unchanged. A crash after rename exposes
+either the old or new complete file according to filesystem recovery; reopening
+validates the selected file.
 Reopening while holding the writer lock removes an orphan `.tmp` left before a
-rename and syncs that directory removal. Lock files are intentionally retained,
-but their OS locks are released when `SnapshotStore` is dropped.
+rename; Unix also syncs that directory removal. Lock files are intentionally
+retained, but their OS locks are released when `SnapshotStore` is dropped.
 
 ## Development model
 

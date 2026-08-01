@@ -8,3 +8,6 @@ repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
 fs2 = "0.4.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

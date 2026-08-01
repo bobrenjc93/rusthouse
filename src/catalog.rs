@@ -335,6 +335,8 @@ pub enum SnapshotError {
     Io(io::Error),
     /// Another process or handle owns the writer lock for this path.
     Locked(PathBuf),
+    /// The filename occupies the namespace reserved for lock or temp sidecars.
+    ReservedSnapshotName(PathBuf),
     /// The file was structurally invalid or failed a checksum.
     Corrupt(Corruption),
     /// The file has valid header integrity but uses an unknown version.
@@ -363,6 +365,11 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::Io(error) => write!(f, "snapshot I/O failed: {error}"),
             Self::Locked(path) => write!(f, "snapshot writer is already open: {}", path.display()),
+            Self::ReservedSnapshotName(path) => write!(
+                f,
+                "snapshot filename is reserved for persistence sidecars: {}",
+                path.display()
+            ),
             Self::Corrupt(error) => write!(f, "corrupt snapshot: {error}"),
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported snapshot version {version}")
@@ -511,8 +518,9 @@ impl SnapshotStore {
     /// Atomically and durably replaces the current snapshot.
     ///
     /// The encoded image is written to a same-directory temp file, synced,
-    /// renamed over the destination, and followed by a parent-directory sync.
-    /// A failure before rename leaves the previous snapshot untouched.
+    /// and renamed over the destination. Unix then syncs the parent directory;
+    /// Windows uses a write-through rename. A failure before rename leaves the
+    /// previous snapshot untouched.
     pub fn commit(&self, image: &CatalogImage) -> Result<(), SnapshotError> {
         self.commit_inner(image, None)
     }
@@ -548,7 +556,7 @@ impl SnapshotStore {
             return Err(SnapshotError::InjectedFailure("after temp sync"));
         }
 
-        fs::rename(&self.temp_path, &self.path)?;
+        publish_temp(&self.temp_path, &self.path)?;
 
         #[cfg(test)]
         if failpoint == Some(Failpoint::AfterRename) {
@@ -585,6 +593,17 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| SnapshotError::InvalidImage("snapshot filename must be UTF-8".to_owned()))?;
+    let normalized_name = file_name.trim_end_matches([' ', '.']);
+    if normalized_name.starts_with('.')
+        && (normalized_name
+            .get(normalized_name.len().saturating_sub(5)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".lock"))
+            || normalized_name
+                .get(normalized_name.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".tmp")))
+    {
+        return Err(SnapshotError::ReservedSnapshotName(path.to_owned()));
+    }
     let parent = path.parent().ok_or_else(|| {
         SnapshotError::InvalidImage("snapshot path must have a parent directory".to_owned())
     })?;
@@ -594,6 +613,47 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
     ))
 }
 
+#[cfg(unix)]
+fn publish_temp(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publish_temp(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_path: Vec<u16> = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain
+    // alive for the call. The paths are distinct files in the same directory.
+    let result = unsafe {
+        MoveFileExW(
+            temp_path.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), SnapshotError> {
     let parent = path.parent().ok_or_else(|| {
         SnapshotError::InvalidImage("snapshot path must have a parent directory".to_owned())
@@ -601,6 +661,16 @@ fn sync_parent(path: &Path) -> Result<(), SnapshotError> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+
+#[cfg(windows)]
+fn sync_parent(_path: &Path) -> Result<(), SnapshotError> {
+    // Windows has no portable directory-fsync operation. Snapshot publication
+    // is made durable by MOVEFILE_WRITE_THROUGH in publish_temp instead.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("catalog snapshots require Unix or Windows filesystem semantics");
 
 fn validate_name(name: &str, kind: &'static str) -> Result<(), SnapshotError> {
     if name.is_empty() {
@@ -1433,6 +1503,62 @@ mod tests {
         ));
         drop(first);
         SnapshotStore::open(&path).expect("lock released with store");
+    }
+
+    #[test]
+    fn rejects_snapshot_names_that_overlap_live_sidecars() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("catalog");
+        let original = sample_image(3);
+        let store = SnapshotStore::open(&path).expect("open protected store");
+        store.commit(&original).expect("commit protected snapshot");
+
+        for reserved in [
+            ".catalog.lock",
+            ".catalog.tmp",
+            ".CATALOG.LOCK",
+            ".catalog.tmp.",
+            ".catalog.lock ",
+        ] {
+            let reserved_path = directory.0.join(reserved);
+            assert!(matches!(
+                SnapshotStore::open(&reserved_path),
+                Err(SnapshotError::ReservedSnapshotName(_))
+            ));
+        }
+
+        assert_eq!(
+            store.load().expect("load protected snapshot"),
+            Some(original)
+        );
+        assert!(matches!(
+            SnapshotStore::open(&path),
+            Err(SnapshotError::Locked(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_through_publish_replaces_and_reopens_snapshot() {
+        let directory = TestDirectory::new();
+        let path = directory.snapshot();
+        let store = SnapshotStore::open(&path).expect("open Windows store");
+        store.commit(&sample_image(1)).expect("publish first image");
+        let replacement = sample_image(2);
+        store
+            .commit(&replacement)
+            .expect("write-through replacement succeeds");
+        assert_eq!(
+            store.load().expect("load replacement"),
+            Some(replacement.clone())
+        );
+        drop(store);
+
+        let reopened = SnapshotStore::open(&path).expect("reopen Windows store");
+        assert_eq!(
+            reopened.load().expect("load after reopen"),
+            Some(replacement)
+        );
     }
 
     #[test]
