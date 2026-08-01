@@ -14,6 +14,9 @@ use crate::sql::{Comparison, Predicate, Statement, parse};
 use crate::storage::{ColumnDef, EngineTable as Table, Value};
 
 const SELECT_BATCH_SIZE: usize = 1024;
+// Keep fixed buffers practical for small result limits while bounding each scan worker.
+const MIN_SELECT_BATCH_MEMORY_BYTES: usize = 256 * 1024;
+const MAX_SELECT_BATCH_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) trait ExecutionCancellation {
     fn is_cancelled(&self) -> bool;
@@ -607,22 +610,39 @@ fn execute_read(
     let mut result_bytes =
         column_bytes.saturating_add(row_capacity.saturating_mul(std::mem::size_of::<Vec<Value>>()));
     enforce_result_limit(control, result_bytes)?;
+    let batch_memory_limit = select_batch_memory_limit(control);
     for batch_start in (0..table.row_count()).step_by(SELECT_BATCH_SIZE) {
         check_cancellation(control)?;
-        let mut batch = table.record_batch(batch_start, SELECT_BATCH_SIZE)?;
+        let batch_len = (table.row_count() - batch_start).min(SELECT_BATCH_SIZE);
+        let mut selection = SelectionMask::all(batch_len, SELECT_BATCH_SIZE)?;
         for predicate in &predicates {
             check_cancellation(control)?;
-            let selection = execute_predicate(&batch, predicate)?;
+            if selection.selected_count() == 0 {
+                break;
+            }
+            if matches!(&predicate.2, Value::Null) {
+                selection = SelectionMask::none(batch_len, SELECT_BATCH_SIZE)?;
+                break;
+            }
+            let mut batch = table.record_batch(
+                batch_start,
+                SELECT_BATCH_SIZE,
+                predicate.0,
+                batch_memory_limit,
+                || check_cancellation(control),
+            )?;
             batch.replace_selection(selection)?;
+            selection = execute_predicate(&batch, predicate.1, &predicate.2)?;
         }
         check_cancellation(control)?;
-        for row in 0..batch.len() {
+        for row in 0..batch_len {
             check_cancellation(control)?;
-            if !batch.selection().is_selected(row) {
+            if !selection.is_selected(row) {
                 continue;
             }
+            let table_row = batch_start + row;
             let row_bytes = projection.iter().fold(0usize, |bytes, column| {
-                bytes.saturating_add(batch_owned_value_bytes(&batch, row, *column))
+                bytes.saturating_add(table.owned_value_bytes(table_row, *column))
             });
             let additional_outer_bytes = if control.is_some() && rows.len() == row_capacity {
                 std::mem::size_of::<Vec<Value>>()
@@ -637,7 +657,7 @@ fn execute_read(
             rows.push(
                 projection
                     .iter()
-                    .map(|column| batch_value(&batch, row, *column))
+                    .map(|column| table.value(table_row, *column))
                     .collect(),
             );
         }
@@ -651,9 +671,10 @@ fn execute_read(
 
 fn execute_predicate(
     batch: &RecordBatch,
-    predicate: &(usize, Comparison, Value),
+    comparison: Comparison,
+    value: &Value,
 ) -> Result<SelectionMask> {
-    let (column, comparison, value) = predicate;
+    const COLUMN: usize = 0;
     let operation = match comparison {
         Comparison::Equal => ComparisonOp::Eq,
         Comparison::NotEqual => ComparisonOp::NotEq,
@@ -664,38 +685,27 @@ fn execute_predicate(
     };
     match value {
         Value::Null => SelectionMask::none(batch.len(), batch.capacity()),
-        Value::Int64(value) => match batch.column(*column)? {
-            BatchColumn::Int64(_) => compare_i64(batch, *column, operation, *value),
-            BatchColumn::Float64(_) => compare_f64_i64(batch, *column, operation, *value),
+        Value::Int64(value) => match batch.column(COLUMN)? {
+            BatchColumn::Int64(_) => compare_i64(batch, COLUMN, operation, *value),
+            BatchColumn::Float64(_) => compare_f64_i64(batch, COLUMN, operation, *value),
             _ => unreachable!("predicate types were validated against the table schema"),
         },
-        Value::Float64(value) => match batch.column(*column)? {
-            BatchColumn::Int64(_) => compare_i64_f64(batch, *column, operation, *value),
-            BatchColumn::Float64(_) => compare_f64(batch, *column, operation, *value),
+        Value::Float64(value) => match batch.column(COLUMN)? {
+            BatchColumn::Int64(_) => compare_i64_f64(batch, COLUMN, operation, *value),
+            BatchColumn::Float64(_) => compare_f64(batch, COLUMN, operation, *value),
             _ => unreachable!("predicate types were validated against the table schema"),
         },
-        Value::Bool(value) => compare_bool(batch, *column, operation, *value),
-        Value::String(value) => compare_string(batch, *column, operation, value),
+        Value::Bool(value) => compare_bool(batch, COLUMN, operation, *value),
+        Value::String(value) => compare_string(batch, COLUMN, operation, value),
     }
 }
 
-fn batch_owned_value_bytes(batch: &RecordBatch, row: usize, column: usize) -> usize {
-    std::mem::size_of::<Value>()
-        + match batch.columns().get(column) {
-            Some(BatchColumn::String(array)) => array.value(row).map_or(0, str::len),
-            _ => 0,
-        }
-}
-
-fn batch_value(batch: &RecordBatch, row: usize, column: usize) -> Value {
-    match &batch.columns()[column] {
-        BatchColumn::Int64(array) => array.value(row).map_or(Value::Null, Value::Int64),
-        BatchColumn::Float64(array) => array.value(row).map_or(Value::Null, Value::Float64),
-        BatchColumn::Boolean(array) => array.value(row).map_or(Value::Null, Value::Bool),
-        BatchColumn::String(array) => array
-            .value(row)
-            .map_or(Value::Null, |value| Value::String(value.to_owned())),
-    }
+fn select_batch_memory_limit(control: Option<ExecutionControl<'_>>) -> usize {
+    control.map_or(MAX_SELECT_BATCH_MEMORY_BYTES, |control| {
+        control
+            .max_result_bytes
+            .clamp(MIN_SELECT_BATCH_MEMORY_BYTES, MAX_SELECT_BATCH_MEMORY_BYTES)
+    })
 }
 
 fn check_cancellation(control: Option<ExecutionControl<'_>>) -> Result<()> {
@@ -839,7 +849,7 @@ mod controlled_execution_tests {
             .unwrap();
         let cancellation = CancelAfterChecks {
             checks: AtomicUsize::new(0),
-            cancel_at: SELECT_BATCH_SIZE + 6,
+            cancel_at: SELECT_BATCH_SIZE * 2 + 10,
         };
 
         assert!(matches!(
@@ -850,7 +860,103 @@ mod controlled_execution_tests {
             ),
             Err(Error::QueryCancelled)
         ));
-        assert!(cancellation.checks.load(Ordering::SeqCst) > SELECT_BATCH_SIZE);
+        assert!(cancellation.checks.load(Ordering::SeqCst) > SELECT_BATCH_SIZE * 2);
+    }
+
+    #[test]
+    fn scan_does_not_materialize_unprojected_payloads_and_bounds_predicates() {
+        let database = Database::new();
+        database
+            .execute("CREATE TABLE wide_scan (id Int64, payload String)")
+            .unwrap();
+        let payload = "x".repeat(MIN_SELECT_BATCH_MEMORY_BYTES * 2);
+        database
+            .execute(&format!("INSERT INTO wide_scan VALUES (1, '{payload}')"))
+            .unwrap();
+
+        let result = database
+            .execute_controlled(
+                "SELECT id FROM wide_scan WHERE id < 0",
+                128,
+                &NeverCancelled,
+            )
+            .unwrap()
+            .into_result_set()
+            .unwrap();
+        assert!(result.rows.is_empty());
+        let result = database
+            .execute_controlled(
+                "SELECT payload FROM wide_scan WHERE id < 0 AND payload = 'absent'",
+                128,
+                &NeverCancelled,
+            )
+            .unwrap()
+            .into_result_set()
+            .unwrap();
+        assert!(result.rows.is_empty());
+
+        assert!(matches!(
+            database.execute_controlled(
+                "SELECT id FROM wide_scan WHERE payload = 'absent'",
+                128,
+                &NeverCancelled,
+            ),
+            Err(Error::MemoryLimitExceeded {
+                operator: "SELECT batch",
+                limit: MIN_SELECT_BATCH_MEMORY_BYTES,
+                ..
+            })
+        ));
+
+        let cancellation = CancelAfterChecks {
+            checks: AtomicUsize::new(0),
+            cancel_at: 7,
+        };
+        assert!(matches!(
+            database.execute_controlled(
+                "SELECT id FROM wide_scan WHERE payload = 'absent'",
+                usize::MAX,
+                &cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        ));
+        assert!(cancellation.checks.load(Ordering::SeqCst) < 20);
+    }
+
+    #[test]
+    fn string_dictionary_build_observes_cancellation() {
+        const ROWS: usize = 128;
+        let database = Database::new();
+        database
+            .execute("CREATE TABLE string_scan (id Int64, payload String)")
+            .unwrap();
+        let prefix = "shared-prefix-".repeat(64);
+        let values = (0..ROWS)
+            .map(|row| format!("({row}, '{prefix}{row:04}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        database
+            .execute(&format!("INSERT INTO string_scan VALUES {values}"))
+            .unwrap();
+        let cancellation = CancelAfterChecks {
+            checks: AtomicUsize::new(0),
+            cancel_at: ROWS + 22,
+        };
+
+        assert!(matches!(
+            database.execute_controlled(
+                "SELECT id FROM string_scan WHERE payload != 'absent'",
+                usize::MAX,
+                &cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        ));
+        let checks = cancellation.checks.load(Ordering::SeqCst);
+        assert!(
+            checks > ROWS,
+            "cancellation should happen during construction"
+        );
+        assert!(checks < ROWS * 3, "construction should stop cooperatively");
     }
 
     #[test]
