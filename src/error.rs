@@ -92,6 +92,8 @@ pub enum Error {
     },
     /// A syntactically valid query violates an execution rule.
     InvalidQuery(String),
+    /// Database execution settings are invalid.
+    InvalidConfiguration(String),
     /// An integer aggregate exceeded its representable range.
     NumericOverflow(String),
     /// A configured execution or rendering ceiling was exceeded.
@@ -146,6 +148,9 @@ impl fmt::Display for Error {
                 "type mismatch for {context}: expected {expected}, found {actual}"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
+            Self::InvalidConfiguration(message) => {
+                write!(f, "invalid configuration: {message}")
+            }
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }

@@ -10,6 +10,6 @@ RustHouse should evolve through narrow modules with explicit boundaries:
 6. Persistence serializes catalog state atomically and rejects corrupt or incompatible data.
 7. CLI and HTTP front ends share the same engine API.
 
-The initial engine can be single-process and single-node. Public interfaces should leave room for immutable parts, parallel scans, compression, and a write-ahead log, but those are later experiments rather than premature abstractions.
+The engine is single-process and single-node. Immutable table data is scanned in fixed-size morsels by a configurable number of scoped workers. Filters and aggregate states are computed per morsel, then merged in stable source order. Public interfaces should leave room for compression and a write-ahead log, but those remain later experiments rather than premature abstractions.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.

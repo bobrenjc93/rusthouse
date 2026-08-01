@@ -4,8 +4,11 @@ use std::cmp::Ordering;
 use std::fs::{File, OpenOptions, remove_file};
 use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Resource, Result};
@@ -17,6 +20,8 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+const SCAN_MORSEL_ROWS: usize = 4_096;
+
 /// A reusable in-memory SQL database.
 #[derive(Debug)]
 pub struct Database {
@@ -24,6 +29,7 @@ pub struct Database {
     limits: ExecutionLimits,
     last_execution_stats: ExecutionStats,
     spill_directory: Arc<PathBuf>,
+    worker_count: usize,
 }
 
 impl Default for Database {
@@ -33,6 +39,7 @@ impl Default for Database {
             limits: ExecutionLimits::default(),
             last_execution_stats: ExecutionStats::default(),
             spill_directory: Arc::new(std::env::temp_dir()),
+            worker_count: thread::available_parallelism().map_or(1, usize::from),
         }
     }
 }
@@ -96,7 +103,35 @@ impl Database {
             limits,
             last_execution_stats: ExecutionStats::default(),
             spill_directory: Arc::new(spill_directory.into()),
+            worker_count: thread::available_parallelism().map_or(1, usize::from),
         }
+    }
+
+    /// Creates an empty database that uses at most `worker_count` scan workers.
+    ///
+    /// A worker count of zero is rejected. The engine may use fewer workers
+    /// when a query contains fewer fixed-size scan morsels than workers.
+    pub fn with_worker_count(worker_count: usize) -> Result<Self> {
+        validate_worker_count(worker_count)?;
+        Ok(Self {
+            worker_count,
+            ..Self::default()
+        })
+    }
+
+    /// Returns the maximum number of scan workers used by a query.
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    /// Changes the maximum number of scan workers used by subsequent queries.
+    ///
+    /// A worker count of zero is rejected without changing the current value.
+    pub fn set_worker_count(&mut self, worker_count: usize) -> Result<()> {
+        validate_worker_count(worker_count)?;
+        self.worker_count = worker_count;
+        Ok(())
     }
 
     /// Returns the database's catalog for read-only schema and table inspection.
@@ -218,6 +253,10 @@ impl Database {
         let planning_memory = group_memory
             .saturating_add(select_memory)
             .saturating_add(ordering_memory);
+        let execution_settings = ScanExecutionSettings {
+            worker_count: self.worker_count,
+            spill_directory: &self.spill_directory,
+        };
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -226,8 +265,8 @@ impl Database {
                 predicate.as_ref(),
                 &group_columns,
                 &aggregate_specs,
+                &execution_settings,
                 context,
-                &self.spill_directory,
             )?;
             let grouped_memory = grouped.memory_bytes;
             let projected = project_grouped_rows(
@@ -248,8 +287,8 @@ impl Database {
                 &items,
                 &ordering,
                 select.limit,
+                &execution_settings,
                 context,
-                &self.spill_directory,
             )?
         };
 
@@ -266,6 +305,20 @@ impl Database {
             rows,
         })
     }
+}
+
+struct ScanExecutionSettings<'a> {
+    worker_count: usize,
+    spill_directory: &'a Arc<PathBuf>,
+}
+
+fn validate_worker_count(worker_count: usize) -> Result<()> {
+    if worker_count == 0 {
+        return Err(Error::InvalidConfiguration(
+            "worker count must be at least 1".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -617,14 +670,148 @@ fn project_source_row(
     Ok(values)
 }
 
+#[derive(Clone, Copy)]
+struct MatchMask {
+    words: [u64; SCAN_MORSEL_ROWS / u64::BITS as usize],
+}
+
+impl MatchMask {
+    fn new() -> Self {
+        Self {
+            words: [0; SCAN_MORSEL_ROWS / u64::BITS as usize],
+        }
+    }
+
+    fn insert(&mut self, offset: usize) {
+        self.words[offset / u64::BITS as usize] |= 1_u64 << (offset % u64::BITS as usize);
+    }
+
+    fn contains(&self, offset: usize) -> bool {
+        self.words[offset / u64::BITS as usize] & (1_u64 << (offset % u64::BITS as usize)) != 0
+    }
+}
+
+fn execute_morsels<T>(
+    row_count: usize,
+    worker_count: usize,
+    execute: impl Fn(Range<usize>) -> T + Sync,
+) -> Vec<T>
+where
+    T: Send,
+{
+    let morsel_count = row_count.div_ceil(SCAN_MORSEL_ROWS);
+    let active_workers = worker_count.min(morsel_count);
+    if active_workers <= 1 {
+        return (0..morsel_count)
+            .map(|morsel| execute(morsel_range(morsel, row_count)))
+            .collect();
+    }
+
+    let next_morsel = AtomicUsize::new(0);
+    let completed = Mutex::new(
+        std::iter::repeat_with(|| None)
+            .take(morsel_count)
+            .collect::<Vec<_>>(),
+    );
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(active_workers);
+        for _ in 0..active_workers {
+            handles.push(scope.spawn(|| {
+                loop {
+                    let morsel = next_morsel.fetch_add(1, AtomicOrdering::Relaxed);
+                    if morsel >= morsel_count {
+                        break;
+                    }
+                    let result = execute(morsel_range(morsel, row_count));
+                    completed.lock().expect("morsel result lock poisoned")[morsel] = Some(result);
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    });
+
+    completed
+        .into_inner()
+        .expect("morsel result lock poisoned")
+        .into_iter()
+        .map(|result| result.expect("every morsel is completed by one worker"))
+        .collect()
+}
+
+fn morsel_range(morsel: usize, row_count: usize) -> Range<usize> {
+    let start = morsel * SCAN_MORSEL_ROWS;
+    start..(start + SCAN_MORSEL_ROWS).min(row_count)
+}
+
+fn morsel_execution_memory<T>(row_count: usize, worker_count: usize) -> usize {
+    let morsels = row_count.div_ceil(SCAN_MORSEL_ROWS);
+    let workers = worker_count.min(morsels);
+    morsels
+        .saturating_mul(size_of::<Option<T>>())
+        .saturating_add(workers.saturating_mul(128))
+}
+
+fn scan_matching_rows(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    worker_count: usize,
+    context: &mut ExecutionContext<'_>,
+    mut visit: impl FnMut(usize, &mut ExecutionContext<'_>) -> Result<bool>,
+) -> Result<()> {
+    let reservation = morsel_execution_memory::<MatchMask>(table.row_count(), worker_count);
+    if worker_count <= 1
+        || table.row_count() <= SCAN_MORSEL_ROWS
+        || reservation > context.available_memory()
+    {
+        for row in 0..table.row_count() {
+            if predicate.is_none_or(|predicate| predicate.evaluate(table, row))
+                && !visit(row, context)?
+            {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    context.reserve_memory(reservation)?;
+    let masks = execute_morsels(table.row_count(), worker_count, |range| {
+        let start = range.start;
+        let mut mask = MatchMask::new();
+        for row in range {
+            if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+                mask.insert(row - start);
+            }
+        }
+        mask
+    });
+    let outcome = (|| {
+        for (morsel, mask) in masks.iter().enumerate() {
+            let range = morsel_range(morsel, table.row_count());
+            for row in range {
+                if mask.contains(row - morsel * SCAN_MORSEL_ROWS) && !visit(row, context)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    })();
+    drop(masks);
+    context.release_memory(reservation);
+    outcome
+}
+
 fn execute_ungrouped(
     table: &Table,
     predicate: Option<&CompiledPredicate>,
     items: &[ResolvedItem],
     ordering: &[ResolvedOrder],
     limit: Option<usize>,
+    settings: &ScanExecutionSettings<'_>,
     context: &mut ExecutionContext<'_>,
-    spill_directory: &Arc<PathBuf>,
 ) -> Result<Vec<Vec<Value>>> {
     if limit == Some(0) {
         return Ok(Vec::new());
@@ -632,30 +819,37 @@ fn execute_ungrouped(
 
     let mut rows = Vec::new();
     if ordering.is_empty() {
-        for row in 0..table.row_count() {
-            if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+        scan_matching_rows(
+            table,
+            predicate,
+            settings.worker_count,
+            context,
+            |row, context| {
                 context.add_intermediate_rows(1)?;
                 context.add_result_row()?;
                 reserve_vec_slot(&mut rows, context)?;
                 let projected = project_source_row(table, row, items, context)?;
                 rows.push(projected);
-                if limit.is_some_and(|limit| rows.len() == limit) {
-                    break;
-                }
-            }
-        }
+                Ok(limit.is_none_or(|limit| rows.len() != limit))
+            },
+        )?;
         return Ok(rows);
     }
 
     let compare =
         |left: usize, right: usize| compare_source_rows(table, items, ordering, left, right);
-    let mut sorter = IndexSorter::new(compare, context, spill_directory);
-    for row in 0..table.row_count() {
-        if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+    let mut sorter = IndexSorter::new(compare, context, settings.spill_directory);
+    scan_matching_rows(
+        table,
+        predicate,
+        settings.worker_count,
+        context,
+        |row, context| {
             context.add_intermediate_rows(1)?;
             sorter.add(row, context)?;
-        }
-    }
+            Ok(true)
+        },
+    )?;
     sorter.prepare(context)?;
     let working_memory = sorter.working_memory_bytes();
     context.reserve_memory(working_memory)?;
@@ -685,6 +879,42 @@ fn execute_grouped(
     predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    settings: &ScanExecutionSettings<'_>,
+    context: &mut ExecutionContext<'_>,
+) -> Result<GroupedData> {
+    let reservation = parallel_aggregation_memory(table, aggregate_specs, settings.worker_count);
+    if settings.worker_count > 1
+        && table.row_count() > SCAN_MORSEL_ROWS
+        && reservation <= context.available_memory()
+    {
+        context.reserve_memory(reservation)?;
+        let outcome = execute_grouped_parallel(
+            table,
+            predicate,
+            group_columns,
+            aggregate_specs,
+            settings.worker_count,
+            context,
+        );
+        context.release_memory(reservation);
+        return outcome;
+    }
+
+    execute_grouped_sequential(
+        table,
+        predicate,
+        group_columns,
+        aggregate_specs,
+        context,
+        settings.spill_directory,
+    )
+}
+
+fn execute_grouped_sequential(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
     context: &mut ExecutionContext<'_>,
     spill_directory: &Arc<PathBuf>,
 ) -> Result<GroupedData> {
@@ -694,7 +924,7 @@ fn execute_grouped(
         for row in 0..table.row_count() {
             if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
                 context.add_intermediate_rows(1)?;
-                update_aggregates(&mut states.values, aggregate_specs, table, row)?;
+                update_aggregates(&mut states, aggregate_specs, table, row, context)?;
             }
         }
         push_group(
@@ -743,7 +973,7 @@ fn execute_grouped(
         if current_key_row.is_none() {
             current_key_row = Some(row);
         }
-        update_aggregates(&mut states.values, aggregate_specs, table, row)?;
+        update_aggregates(&mut states, aggregate_specs, table, row, context)?;
         Ok(true)
     });
     context.release_memory(
@@ -763,14 +993,238 @@ fn execute_grouped(
     Ok(data)
 }
 
-fn update_aggregates(
+#[derive(Debug)]
+struct PartialGroup {
+    key_row: usize,
+    states: Vec<AggregateState>,
+}
+
+#[derive(Debug)]
+struct PartialGroupedData {
+    groups: Vec<PartialGroup>,
+    matching_rows: usize,
+}
+
+fn parallel_aggregation_memory(
+    table: &Table,
+    specs: &[AggregateSpec],
+    worker_count: usize,
+) -> usize {
+    let rows = table.row_count();
+    let float_specs = specs
+        .iter()
+        .filter(|spec| spec.input_type == Some(DataType::Float64))
+        .count();
+    let row_memory = size_of::<usize>()
+        .saturating_add(size_of::<PartialGroup>().saturating_mul(2))
+        .saturating_add(size_of::<AggregateState>().saturating_mul(specs.len()))
+        .saturating_add(
+            size_of::<(i16, i128)>()
+                .saturating_mul(float_specs)
+                .saturating_mul(4),
+        );
+    morsel_execution_memory::<Result<PartialGroupedData>>(rows, worker_count)
+        .saturating_add(rows.saturating_mul(row_memory))
+        .saturating_add(
+            rows.div_ceil(SCAN_MORSEL_ROWS)
+                .saturating_mul(specs.len())
+                .saturating_mul(size_of::<AggregateState>()),
+        )
+}
+
+fn execute_grouped_parallel(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+    worker_count: usize,
+    context: &mut ExecutionContext<'_>,
+) -> Result<GroupedData> {
+    let partials = execute_morsels(table.row_count(), worker_count, |rows| {
+        aggregate_morsel(table, rows, predicate, group_columns, aggregate_specs)
+    });
+    let mut groups = Vec::new();
+    for partial in partials {
+        let partial = partial?;
+        for _ in 0..partial.matching_rows {
+            context.add_intermediate_rows(1)?;
+        }
+        groups.extend(partial.groups);
+    }
+
+    if group_columns.is_empty() && groups.is_empty() {
+        groups.push(PartialGroup {
+            key_row: 0,
+            states: aggregate_specs.iter().map(AggregateState::new).collect(),
+        });
+    }
+    groups.sort_unstable_by(|left, right| {
+        if group_columns.is_empty() {
+            left.key_row.cmp(&right.key_row)
+        } else {
+            compare_group_keys(table, group_columns, left.key_row, right.key_row)
+                .then_with(|| left.key_row.cmp(&right.key_row))
+        }
+    });
+
+    let mut data = GroupedData::default();
+    let mut groups = groups.into_iter();
+    let Some(mut current) = groups.next() else {
+        return Ok(data);
+    };
+    for partial in groups {
+        let same_group = group_columns.is_empty()
+            || compare_group_keys(table, group_columns, current.key_row, partial.key_row)
+                == Ordering::Equal;
+        if same_group {
+            merge_aggregates(&mut current.states, partial.states, aggregate_specs, table)?;
+            continue;
+        }
+        push_partial_group(
+            &mut data,
+            current,
+            group_columns,
+            aggregate_specs,
+            table,
+            context,
+        )?;
+        current = partial;
+    }
+    push_partial_group(
+        &mut data,
+        current,
+        group_columns,
+        aggregate_specs,
+        table,
+        context,
+    )?;
+    Ok(data)
+}
+
+fn aggregate_morsel(
+    table: &Table,
+    rows: Range<usize>,
+    predicate: Option<&CompiledPredicate>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+) -> Result<PartialGroupedData> {
+    let first_row = rows.start;
+    if group_columns.is_empty() {
+        let mut states = aggregate_specs
+            .iter()
+            .map(AggregateState::new)
+            .collect::<Vec<_>>();
+        let mut matching_rows = 0;
+        for row in rows {
+            if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+                matching_rows += 1;
+                update_aggregates_untracked(&mut states, aggregate_specs, table, row)?;
+            }
+        }
+        return Ok(PartialGroupedData {
+            groups: vec![PartialGroup {
+                key_row: first_row,
+                states,
+            }],
+            matching_rows,
+        });
+    }
+
+    let mut matching = rows
+        .filter(|row| predicate.is_none_or(|predicate| predicate.evaluate(table, *row)))
+        .collect::<Vec<_>>();
+    matching.sort_unstable_by(|left, right| {
+        compare_group_keys(table, group_columns, *left, *right).then_with(|| left.cmp(right))
+    });
+    let matching_rows = matching.len();
+    let mut groups: Vec<PartialGroup> = Vec::new();
+    for row in matching {
+        let new_group = groups.last().is_none_or(|group| {
+            compare_group_keys(table, group_columns, group.key_row, row) != Ordering::Equal
+        });
+        if new_group {
+            groups.push(PartialGroup {
+                key_row: row,
+                states: aggregate_specs.iter().map(AggregateState::new).collect(),
+            });
+        }
+        update_aggregates_untracked(
+            &mut groups.last_mut().expect("group was inserted").states,
+            aggregate_specs,
+            table,
+            row,
+        )?;
+    }
+    Ok(PartialGroupedData {
+        groups,
+        matching_rows,
+    })
+}
+
+fn push_partial_group(
+    data: &mut GroupedData,
+    group: PartialGroup,
+    group_columns: &[usize],
+    specs: &[AggregateSpec],
+    table: &Table,
+    context: &mut ExecutionContext<'_>,
+) -> Result<()> {
+    let key = if group_columns.is_empty() {
+        TrackedValues {
+            values: Vec::new(),
+            memory_bytes: 0,
+        }
+    } else {
+        clone_group_key(table, group_columns, group.key_row, context)?
+    };
+    push_group(
+        data,
+        key,
+        TrackedAggregateStates {
+            values: group.states,
+            memory_bytes: 0,
+        },
+        specs,
+        table,
+        context,
+    )
+}
+
+fn update_aggregates_untracked(
     states: &mut [AggregateState],
     specs: &[AggregateSpec],
     table: &Table,
     row: usize,
 ) -> Result<()> {
     for (state, spec) in states.iter_mut().zip(specs) {
-        state.update(spec, table, row)?;
+        state.update_untracked(spec, table, row)?;
+    }
+    Ok(())
+}
+
+fn merge_aggregates(
+    states: &mut [AggregateState],
+    partials: Vec<AggregateState>,
+    specs: &[AggregateSpec],
+    table: &Table,
+) -> Result<()> {
+    for ((state, partial), spec) in states.iter_mut().zip(partials).zip(specs) {
+        state.merge(partial, spec, table)?;
+    }
+    Ok(())
+}
+
+fn update_aggregates(
+    states: &mut TrackedAggregateStates,
+    specs: &[AggregateSpec],
+    table: &Table,
+    row: usize,
+    context: &mut ExecutionContext<'_>,
+) -> Result<()> {
+    for (state, spec) in states.values.iter_mut().zip(specs) {
+        states.memory_bytes = states
+            .memory_bytes
+            .saturating_add(state.update_tracked(spec, table, row, context)?);
     }
     Ok(())
 }
@@ -816,15 +1270,296 @@ struct GroupRow {
     aggregates: Vec<Value>,
 }
 
+const FLOAT_FRACTION_BITS: usize = 52;
+const FLOAT_FRACTION_MASK: u64 = (1_u64 << FLOAT_FRACTION_BITS) - 1;
+const EXACT_FLOAT_MIN_POWER: i16 = -1_074;
+const EXACT_FLOAT_LIMBS: usize = 34;
+type FloatMagnitude = [u64; EXACT_FLOAT_LIMBS];
+
+// Exact exponent bins make fixed-morsel partials mergeable without early overflow.
+#[derive(Debug)]
+struct ExactFloatSum {
+    bins: Vec<(i16, i128)>,
+}
+
+impl ExactFloatSum {
+    fn new() -> Self {
+        Self { bins: Vec::new() }
+    }
+
+    fn add_untracked(&mut self, value: f64) -> Result<()> {
+        self.add(value, None).map(|_| ())
+    }
+
+    fn add_tracked(&mut self, value: f64, context: &mut ExecutionContext<'_>) -> Result<usize> {
+        self.add(value, Some(context))
+    }
+
+    fn add(&mut self, value: f64, context: Option<&mut ExecutionContext<'_>>) -> Result<usize> {
+        debug_assert!(value.is_finite());
+        let bits = value.to_bits();
+        let raw_exponent = ((bits >> FLOAT_FRACTION_BITS) & 0x7ff) as i16;
+        let fraction = bits & FLOAT_FRACTION_MASK;
+        let (significand, power) = if raw_exponent == 0 {
+            if fraction == 0 {
+                return Ok(0);
+            }
+            (fraction, EXACT_FLOAT_MIN_POWER)
+        } else {
+            (
+                (1_u64 << FLOAT_FRACTION_BITS) | fraction,
+                raw_exponent - 1_075,
+            )
+        };
+        let coefficient = i128::from(significand);
+        self.add_bin(
+            power,
+            if bits >> 63 == 0 {
+                coefficient
+            } else {
+                -coefficient
+            },
+            context,
+        )
+    }
+
+    fn merge(&mut self, partial: Self) -> Result<()> {
+        for (power, coefficient) in partial.bins {
+            self.add_bin(power, coefficient, None)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self, divisor: u64) -> Option<f64> {
+        debug_assert!(divisor > 0);
+        let mut positive = [0; EXACT_FLOAT_LIMBS];
+        let mut negative = [0; EXACT_FLOAT_LIMBS];
+        for (power, coefficient) in self.bins {
+            let shift = usize::try_from(power - EXACT_FLOAT_MIN_POWER).ok()?;
+            let magnitude = if coefficient >= 0 {
+                &mut positive
+            } else {
+                &mut negative
+            };
+            add_shifted(magnitude, coefficient.unsigned_abs(), shift)?;
+        }
+
+        let (negative_result, mut magnitude) = match compare_magnitudes(&positive, &negative) {
+            Ordering::Greater => (false, subtract_magnitudes(&positive, &negative)),
+            Ordering::Less => (true, subtract_magnitudes(&negative, &positive)),
+            Ordering::Equal => return Some(0.0),
+        };
+        let remainder = divide_magnitude(&mut magnitude, divisor);
+        magnitude_to_f64(&magnitude, remainder, divisor, negative_result)
+    }
+
+    fn add_bin(
+        &mut self,
+        power: i16,
+        coefficient: i128,
+        mut context: Option<&mut ExecutionContext<'_>>,
+    ) -> Result<usize> {
+        match self.bins.binary_search_by_key(&power, |(power, _)| *power) {
+            Ok(index) => {
+                let combined = self.bins[index].1.checked_add(coefficient).ok_or_else(|| {
+                    Error::NumericOverflow("floating-point accumulator".to_owned())
+                })?;
+                if combined == 0 {
+                    self.bins.remove(index);
+                } else {
+                    self.bins[index].1 = combined;
+                }
+                Ok(0)
+            }
+            Err(index) => {
+                let old_capacity = self.bins.capacity();
+                let reserved = usize::from(old_capacity == self.bins.len())
+                    .saturating_mul(size_of::<(i16, i128)>());
+                if let Some(context) = context.as_deref_mut() {
+                    context.reserve_memory(reserved)?;
+                }
+                self.bins.reserve_exact(1);
+                let actual = self
+                    .bins
+                    .capacity()
+                    .saturating_sub(old_capacity)
+                    .saturating_mul(size_of::<(i16, i128)>());
+                if let Some(context) = context {
+                    context.adjust_memory_reservation(reserved, actual)?;
+                }
+                self.bins.insert(index, (power, coefficient));
+                Ok(actual)
+            }
+        }
+    }
+}
+
+fn add_shifted(target: &mut FloatMagnitude, value: u128, shift: usize) -> Option<()> {
+    let first_limb = shift / u64::BITS as usize;
+    let offset = shift % u64::BITS as usize;
+    for (word_index, word) in [value as u64, (value >> u64::BITS) as u64]
+        .into_iter()
+        .enumerate()
+    {
+        if word == 0 {
+            continue;
+        }
+        add_word(target, first_limb + word_index, word << offset)?;
+        if offset > 0 {
+            add_word(
+                target,
+                first_limb + word_index + 1,
+                word >> (u64::BITS as usize - offset),
+            )?;
+        }
+    }
+    Some(())
+}
+
+fn add_word(target: &mut FloatMagnitude, mut index: usize, mut word: u64) -> Option<()> {
+    while word != 0 {
+        let limb = target.get_mut(index)?;
+        let (sum, carry) = limb.overflowing_add(word);
+        *limb = sum;
+        word = u64::from(carry);
+        index += 1;
+    }
+    Some(())
+}
+
+fn compare_magnitudes(left: &FloatMagnitude, right: &FloatMagnitude) -> Ordering {
+    for (left, right) in left.iter().rev().zip(right.iter().rev()) {
+        let ordering = left.cmp(right);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn subtract_magnitudes(larger: &FloatMagnitude, smaller: &FloatMagnitude) -> FloatMagnitude {
+    let mut result = [0; EXACT_FLOAT_LIMBS];
+    let mut borrow = false;
+    for ((result, larger), smaller) in result.iter_mut().zip(larger).zip(smaller) {
+        let (difference, first_borrow) = larger.overflowing_sub(*smaller);
+        let (difference, second_borrow) = difference.overflowing_sub(u64::from(borrow));
+        *result = difference;
+        borrow = first_borrow || second_borrow;
+    }
+    debug_assert!(!borrow);
+    result
+}
+
+fn divide_magnitude(magnitude: &mut FloatMagnitude, divisor: u64) -> u64 {
+    let mut remainder = 0_u64;
+    for limb in magnitude.iter_mut().rev() {
+        let dividend = (u128::from(remainder) << u64::BITS) | u128::from(*limb);
+        *limb = (dividend / u128::from(divisor)) as u64;
+        remainder = (dividend % u128::from(divisor)) as u64;
+    }
+    remainder
+}
+
+fn magnitude_to_f64(
+    magnitude: &FloatMagnitude,
+    remainder: u64,
+    divisor: u64,
+    negative: bool,
+) -> Option<f64> {
+    let sign = u64::from(negative) << 63;
+    let Some(mut highest_bit) = highest_bit(magnitude) else {
+        let rounded = u64::from(round_fraction(remainder, divisor, false));
+        return Some(f64::from_bits(sign | rounded));
+    };
+
+    if highest_bit < FLOAT_FRACTION_BITS {
+        let mut rounded = magnitude[0];
+        if round_fraction(remainder, divisor, rounded & 1 != 0) {
+            rounded += 1;
+        }
+        return Some(f64::from_bits(sign | rounded));
+    }
+
+    let discarded_bits = highest_bit - FLOAT_FRACTION_BITS;
+    let mut significand =
+        shifted_low_u64(magnitude, discarded_bits) & ((1_u64 << (FLOAT_FRACTION_BITS + 1)) - 1);
+    let round_up = if discarded_bits == 0 {
+        round_fraction(remainder, divisor, significand & 1 != 0)
+    } else {
+        let round_bit = bit_is_set(magnitude, discarded_bits - 1);
+        let sticky = any_bits_below(magnitude, discarded_bits - 1) || remainder != 0;
+        round_bit && (sticky || significand & 1 != 0)
+    };
+    if round_up {
+        significand += 1;
+        if significand == 1_u64 << (FLOAT_FRACTION_BITS + 1) {
+            significand >>= 1;
+            highest_bit += 1;
+        }
+    }
+
+    let exponent = i32::try_from(highest_bit).ok()? + i32::from(EXACT_FLOAT_MIN_POWER);
+    if exponent > 1_023 {
+        return None;
+    }
+    debug_assert!(exponent >= -1_022);
+    let raw_exponent = u64::try_from(exponent + 1_023).ok()?;
+    Some(f64::from_bits(
+        sign | (raw_exponent << FLOAT_FRACTION_BITS) | (significand & FLOAT_FRACTION_MASK),
+    ))
+}
+
+fn highest_bit(magnitude: &FloatMagnitude) -> Option<usize> {
+    magnitude
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, limb)| **limb != 0)
+        .map(|(index, limb)| {
+            index * u64::BITS as usize + (u64::BITS - 1 - limb.leading_zeros()) as usize
+        })
+}
+
+fn shifted_low_u64(magnitude: &FloatMagnitude, shift: usize) -> u64 {
+    let limb = shift / u64::BITS as usize;
+    let offset = shift % u64::BITS as usize;
+    let mut value = magnitude[limb] >> offset;
+    if offset > 0 && limb + 1 < magnitude.len() {
+        value |= magnitude[limb + 1] << (u64::BITS as usize - offset);
+    }
+    value
+}
+
+fn bit_is_set(magnitude: &FloatMagnitude, bit: usize) -> bool {
+    magnitude[bit / u64::BITS as usize] & (1_u64 << (bit % u64::BITS as usize)) != 0
+}
+
+fn any_bits_below(magnitude: &FloatMagnitude, bit_count: usize) -> bool {
+    let full_limbs = bit_count / u64::BITS as usize;
+    if magnitude[..full_limbs].iter().any(|limb| *limb != 0) {
+        return true;
+    }
+    let remaining = bit_count % u64::BITS as usize;
+    remaining > 0 && magnitude[full_limbs] & ((1_u64 << remaining) - 1) != 0
+}
+
+fn round_fraction(remainder: u64, divisor: u64, odd: bool) -> bool {
+    match (u128::from(remainder) * 2).cmp(&u128::from(divisor)) {
+        Ordering::Greater => true,
+        Ordering::Equal => odd,
+        Ordering::Less => false,
+    }
+}
+
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
+    SumInt(i128),
+    SumFloat(ExactFloatSum),
     Min(Option<usize>),
     Max(Option<usize>),
     AvgInt { sum: i128, count: u64 },
-    AvgFloat { sum: f64, count: u64 },
+    AvgFloat { sum: ExactFloatSum, count: u64 },
 }
 
 impl AggregateState {
@@ -832,17 +1567,41 @@ impl AggregateState {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum => Self::SumFloat(ExactFloatSum::new()),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
             AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
                 Self::AvgInt { sum: 0, count: 0 }
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Avg => Self::AvgFloat {
+                sum: ExactFloatSum::new(),
+                count: 0,
+            },
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+    fn update_untracked(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+        self.update(spec, table, row, None).map(|_| ())
+    }
+
+    fn update_tracked(
+        &mut self,
+        spec: &AggregateSpec,
+        table: &Table,
+        row: usize,
+        context: &mut ExecutionContext<'_>,
+    ) -> Result<usize> {
+        self.update(spec, table, row, Some(context))
+    }
+
+    fn update(
+        &mut self,
+        spec: &AggregateSpec,
+        table: &Table,
+        row: usize,
+        context: Option<&mut ExecutionContext<'_>>,
+    ) -> Result<usize> {
+        let mut added_memory = 0;
         match self {
             Self::Count(count) => {
                 *count = count
@@ -855,7 +1614,7 @@ impl AggregateState {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(i128::from(values[row]))
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
@@ -864,10 +1623,13 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
-                }
+                added_memory = match context {
+                    Some(context) => sum.add_tracked(values[row], context)?,
+                    None => {
+                        sum.add_untracked(values[row])?;
+                        0
+                    }
+                };
             }
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
@@ -901,14 +1663,81 @@ impl AggregateState {
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                added_memory = match context {
+                    Some(context) => sum.add_tracked(values[row], context)?,
+                    None => {
+                        sum.add_untracked(values[row])?;
+                        0
+                    }
+                };
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
+            }
+        }
+        Ok(added_memory)
+    }
+
+    fn merge(&mut self, partial: Self, spec: &AggregateSpec, table: &Table) -> Result<()> {
+        match (self, partial) {
+            (Self::Count(count), Self::Count(partial)) => {
+                *count = count
+                    .checked_add(partial)
+                    .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+            }
+            (Self::SumInt(sum), Self::SumInt(partial)) => {
+                *sum = sum
+                    .checked_add(partial)
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+            }
+            (Self::SumFloat(sum), Self::SumFloat(partial)) => sum.merge(partial)?,
+            (Self::Min(current), Self::Min(partial)) => {
+                if let Some(partial) = partial {
+                    let column = &table.columns()[spec.argument.expect("MIN argument")];
+                    if current.is_none_or(|existing| {
+                        column.value_ref(partial) < column.value_ref(existing)
+                    }) {
+                        *current = Some(partial);
+                    }
                 }
             }
+            (Self::Max(current), Self::Max(partial)) => {
+                if let Some(partial) = partial {
+                    let column = &table.columns()[spec.argument.expect("MAX argument")];
+                    if current.is_none_or(|existing| {
+                        column.value_ref(partial) > column.value_ref(existing)
+                    }) {
+                        *current = Some(partial);
+                    }
+                }
+            }
+            (
+                Self::AvgInt { sum, count },
+                Self::AvgInt {
+                    sum: partial_sum,
+                    count: partial_count,
+                },
+            ) => {
+                *sum = sum
+                    .checked_add(partial_sum)
+                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+                *count = count
+                    .checked_add(partial_count)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
+            (
+                Self::AvgFloat { sum, count },
+                Self::AvgFloat {
+                    sum: partial_sum,
+                    count: partial_count,
+                },
+            ) => {
+                sum.merge(partial_sum)?;
+                *count = count
+                    .checked_add(partial_count)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
+            _ => unreachable!("aggregate states for one specification have the same variant"),
         }
         Ok(())
     }
@@ -920,8 +1749,14 @@ impl AggregateState {
         context: &mut ExecutionContext<'_>,
     ) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt(value) => i64::try_from(value)
+                .map(Value::Int64)
+                .map_err(|_| Error::NumericOverflow("SUM(Int64)".to_owned())),
+            Self::SumFloat(value) => value
+                .finish(1)
+                .map(Value::Float64)
+                .ok_or_else(|| Error::NumericOverflow("SUM(Float64)".to_owned())),
             Self::Min(Some(row)) | Self::Max(Some(row)) => clone_value_ref_tracked(
                 table.columns()[spec.argument.expect("extremum argument")].value_ref(row),
                 context,
@@ -929,7 +1764,10 @@ impl AggregateState {
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
-            Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
+            Self::AvgFloat { sum, count } if count > 0 => sum
+                .finish(count)
+                .map(Value::Float64)
+                .ok_or_else(|| Error::NumericOverflow("AVG(Float64) sum".to_owned())),
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),
@@ -1616,6 +2454,264 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn small_scans_stay_on_the_calling_thread_and_worker_counts_are_validated() {
+        let caller = thread::current().id();
+        let threads = execute_morsels(SCAN_MORSEL_ROWS, 8, |_| thread::current().id());
+        assert_eq!(threads, vec![caller]);
+
+        let mut database = Database::with_worker_count(2).expect("valid worker count");
+        assert_eq!(database.worker_count(), 2);
+        assert!(matches!(
+            database.set_worker_count(0),
+            Err(Error::InvalidConfiguration(message))
+                if message == "worker count must be at least 1"
+        ));
+        assert_eq!(database.worker_count(), 2);
+    }
+
+    #[test]
+    fn filters_and_aggregates_are_equivalent_across_worker_counts() {
+        let row_count = SCAN_MORSEL_ROWS * 3 + 137;
+        let mut database = Database::with_worker_count(1).expect("valid worker count");
+        database
+            .execute(
+                "CREATE TABLE parallel_data (
+                    id Int64, bucket Int64, amount Int64,
+                    reading Float64, keep Bool, unique_key String
+                 );",
+            )
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("parallel_data")
+            .expect("table exists");
+        for row in 0..row_count {
+            table
+                .insert_row(vec![
+                    Value::Int64(row as i64),
+                    Value::Int64((row % 257) as i64),
+                    Value::Int64((row % 31) as i64 - 15),
+                    Value::Float64(((row % 19) as f64 - 9.0) * 0.25),
+                    Value::Bool(row % 3 != 0),
+                    Value::String(format!("key-{row:05}")),
+                ])
+                .expect("generated row is valid");
+        }
+
+        let statements = [
+            "SELECT id, unique_key FROM parallel_data
+             WHERE keep = true AND id >= 4000;",
+            "SELECT COUNT(*) AS rows, SUM(amount) AS total,
+                    MIN(reading) AS low, MAX(reading) AS high,
+                    AVG(reading) AS mean
+             FROM parallel_data WHERE keep = true;",
+            "SELECT bucket, COUNT(*) AS rows, SUM(amount) AS total,
+                    MIN(reading) AS low, MAX(reading) AS high,
+                    AVG(reading) AS mean
+             FROM parallel_data WHERE keep = true GROUP BY bucket;",
+            "SELECT unique_key, COUNT(*) AS rows, SUM(amount) AS total
+             FROM parallel_data WHERE keep = true GROUP BY unique_key;",
+        ];
+        let expected = statements
+            .iter()
+            .map(|statement| query(&mut database, statement))
+            .collect::<Vec<_>>();
+
+        assert_eq!(expected[1].rows.len(), 1);
+        assert_eq!(expected[2].rows.len(), 257);
+        assert_eq!(
+            expected[3].rows.len(),
+            (0..row_count).filter(|row| row % 3 != 0).count()
+        );
+        assert!(expected[3].rows.iter().all(|row| row[1] == Value::Int64(1)));
+
+        for worker_count in [2, 4] {
+            database
+                .set_worker_count(worker_count)
+                .expect("valid worker count");
+            for (statement, expected) in statements.iter().zip(&expected) {
+                assert_eq!(
+                    query(&mut database, statement),
+                    *expected,
+                    "query differed with {worker_count} workers: {statement}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_grouping_falls_back_to_spill_when_partials_exceed_the_budget() {
+        let mut database = Database::with_limits(ExecutionLimits {
+            max_memory_bytes: 1_280,
+            ..ExecutionLimits::default()
+        });
+        database.set_worker_count(4).expect("valid worker count");
+        database
+            .execute("CREATE TABLE spill_fallback (bucket Int64, value Int64);")
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("spill_fallback")
+            .expect("table exists");
+        for row in 0..(SCAN_MORSEL_ROWS + 904) {
+            table
+                .insert_row(vec![Value::Int64((row % 4) as i64), Value::Int64(1)])
+                .expect("generated row is valid");
+        }
+
+        let result = query(
+            &mut database,
+            "SELECT bucket, SUM(value) AS total
+             FROM spill_fallback GROUP BY bucket ORDER BY bucket;",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int64(0), Value::Int64(1_250)],
+                vec![Value::Int64(1), Value::Int64(1_250)],
+                vec![Value::Int64(2), Value::Int64(1_250)],
+                vec![Value::Int64(3), Value::Int64(1_250)],
+            ]
+        );
+        assert!(database.last_execution_stats().spill_runs > 0);
+        assert!(database.last_execution_stats().peak_memory_bytes <= 1_280);
+    }
+
+    #[test]
+    fn parallel_aggregate_overflow_is_reported_after_morsel_merging() {
+        let row_count = SCAN_MORSEL_ROWS * 3;
+        let mut database = Database::with_worker_count(4).expect("valid worker count");
+        database
+            .execute(
+                "CREATE TABLE overflow_data (
+                    group_key String, local_value Int64, merge_value Int64
+                 );",
+            )
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("overflow_data")
+            .expect("table exists");
+        for row in 0..row_count {
+            let local_value = match row {
+                value if value == SCAN_MORSEL_ROWS + 10 => i64::MAX,
+                value if value == SCAN_MORSEL_ROWS + 11 => 1,
+                _ => 0,
+            };
+            let merge_value = match row {
+                value if value == SCAN_MORSEL_ROWS - 1 => i64::MAX,
+                value if value == SCAN_MORSEL_ROWS => 1,
+                _ => 0,
+            };
+            table
+                .insert_row(vec![
+                    Value::String("all".to_owned()),
+                    Value::Int64(local_value),
+                    Value::Int64(merge_value),
+                ])
+                .expect("generated row is valid");
+        }
+
+        assert_eq!(
+            database
+                .execute("SELECT SUM(local_value) FROM overflow_data;")
+                .expect_err("an unrepresentable morsel total is rejected"),
+            Error::NumericOverflow("SUM(Int64)".to_owned())
+        );
+        assert_eq!(
+            database
+                .execute(
+                    "SELECT group_key, SUM(merge_value)
+                     FROM overflow_data GROUP BY group_key;",
+                )
+                .expect_err("an unrepresentable cross-morsel total is rejected"),
+            Error::NumericOverflow("SUM(Int64)".to_owned())
+        );
+    }
+
+    #[test]
+    fn numeric_aggregates_allow_cancellation_across_morsel_boundaries() {
+        let row_count = SCAN_MORSEL_ROWS * 2;
+        let mut database = Database::with_worker_count(1).expect("valid worker count");
+        database
+            .execute("CREATE TABLE cancellation (integer_value Int64, float_value Float64);")
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("cancellation")
+            .expect("table exists");
+        for row in 0..row_count {
+            let integer_value = match row {
+                0 => i64::MIN,
+                value if value == SCAN_MORSEL_ROWS => i64::MAX,
+                value if value == SCAN_MORSEL_ROWS + 1 => 1,
+                _ => 0,
+            };
+            let float_value = match row {
+                0 => -1e308,
+                value if value == SCAN_MORSEL_ROWS => 1e308,
+                value if value == SCAN_MORSEL_ROWS + 1 => 1e308,
+                _ => 0.0,
+            };
+            table
+                .insert_row(vec![
+                    Value::Int64(integer_value),
+                    Value::Float64(float_value),
+                ])
+                .expect("generated row is valid");
+        }
+
+        let expected = vec![vec![
+            Value::Int64(0),
+            Value::Float64(1e308),
+            Value::Float64(1e308 / row_count as f64),
+        ]];
+        for worker_count in [1, 4] {
+            database
+                .set_worker_count(worker_count)
+                .expect("valid worker count");
+            assert_eq!(
+                query(
+                    &mut database,
+                    "SELECT SUM(integer_value), SUM(float_value), AVG(float_value)
+                     FROM cancellation;"
+                )
+                .rows,
+                expected,
+                "cross-morsel cancellation failed with {worker_count} workers"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_float_accumulator_handles_large_averages_and_subnormal_rounding() {
+        let mut large = ExactFloatSum::new();
+        large.add_untracked(f64::MAX).expect("finite value");
+        large.add_untracked(f64::MAX).expect("finite value");
+        assert_eq!(large.finish(2), Some(f64::MAX));
+
+        let mut overflow = ExactFloatSum::new();
+        overflow.add_untracked(f64::MAX).expect("finite value");
+        overflow.add_untracked(f64::MAX).expect("finite value");
+        assert_eq!(overflow.finish(1), None);
+
+        let smallest = f64::from_bits(1);
+        let mut rounds_to_even_zero = ExactFloatSum::new();
+        rounds_to_even_zero
+            .add_untracked(smallest)
+            .expect("finite value");
+        assert_eq!(rounds_to_even_zero.finish(2), Some(0.0));
+
+        let mut rounds_to_even_two = ExactFloatSum::new();
+        for _ in 0..3 {
+            rounds_to_even_two
+                .add_untracked(smallest)
+                .expect("finite value");
+        }
+        assert_eq!(rounds_to_even_two.finish(2), Some(f64::from_bits(2)));
     }
 
     #[test]

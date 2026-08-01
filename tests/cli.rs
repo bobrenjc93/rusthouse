@@ -8,6 +8,7 @@ fn execute_argument_emits_clean_json_and_command_statuses() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args([
             "--format=json",
+            "--workers=2",
             "--execute",
             "CREATE TABLE items (name String, n Int64);
              INSERT INTO items VALUES ('b', 2), ('a', 1);

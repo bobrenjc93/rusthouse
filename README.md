@@ -12,6 +12,7 @@ RustHouse is a small analytical SQL engine written in Rust. It keeps tables in m
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
 - bounded execution with spill-backed grouping and sorting
+- parallel filtered scans and partial aggregation with deterministic result merging
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -43,6 +44,15 @@ Choose table (the default), csv, or json:
 ~~~bash
 cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
+~~~
+
+By default, scans use the process's available parallelism. Set an explicit
+maximum worker count with `--workers`; small inputs still run on the calling
+thread:
+
+~~~bash
+cargo run -- --workers 4 --execute \
+  "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT COUNT(*) FROM t"
 ~~~
 
 Or pipe a batch through standard input:
@@ -163,6 +173,15 @@ than its byte limit. Table output computes widths in one pass and streams cells
 in a second pass; CSV escaping is also streamed. The CLI applies the default
 rendered-output ceiling and reads at most one byte beyond the input ceiling from
 standard input before rejecting oversized piped SQL.
+
+`Database::new()` uses the available parallelism reported by the operating
+system. `Database::with_worker_count` and `Database::set_worker_count` select an
+explicit positive maximum. Scans use fixed 4,096-row morsels; eligible
+per-morsel aggregate states are merged in source order, so results are
+reproducible across worker counts. A scan that fits in one morsel does not create
+worker threads. Parallel aggregation falls back to the spill-backed path when
+its conservative transient-memory reservation would exceed the configured
+budget.
 
 ## Current boundaries
 
