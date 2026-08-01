@@ -96,6 +96,26 @@ impl ColumnData {
                 _ => 0,
             }
     }
+
+    fn logical_bytes(&self) -> usize {
+        match self {
+            Self::Int64(values) => values
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<i64>>()),
+            Self::Float64(values) => values
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<f64>>()),
+            Self::Bool(values) => values
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<bool>>()),
+            Self::String(values) => values.iter().fold(
+                values
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<String>>()),
+                |bytes, value| bytes.saturating_add(value.as_ref().map_or(0, String::len)),
+            ),
+        }
+    }
 }
 
 /// An immutable-on-commit, typed columnar table.
@@ -143,6 +163,19 @@ impl Table {
 
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    pub(crate) fn logical_bytes(&self) -> usize {
+        self.schema
+            .iter()
+            .fold(0_usize, |bytes, column| {
+                bytes
+                    .saturating_add(std::mem::size_of::<ColumnDef>())
+                    .saturating_add(column.name.len())
+            })
+            .saturating_add(self.columns.iter().fold(0_usize, |bytes, column| {
+                bytes.saturating_add(column.logical_bytes())
+            }))
     }
 
     pub(crate) fn column_index(&self, name: &str) -> Option<usize> {

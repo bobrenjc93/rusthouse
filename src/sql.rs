@@ -164,7 +164,7 @@ fn tokenize(input: &str) -> Result<Tokenized> {
             continue;
         }
         match character {
-            '(' | ')' | ',' | '*' | ';' => {
+            '(' | ')' | ',' | '.' | '*' | ';' => {
                 tokens.push(Token::Symbol(character));
                 positions.push(token_position);
                 position += 1;
@@ -471,10 +471,19 @@ impl Parser {
     }
 
     fn identifier(&mut self) -> Result<String> {
-        match self.next() {
-            Some(Token::Word(value) | Token::QuotedIdentifier(value)) => Ok(value),
-            _ => Err(self.error_at_last("expected an identifier")),
+        let mut identifier = match self.next() {
+            Some(Token::Word(value) | Token::QuotedIdentifier(value)) => value,
+            _ => return Err(self.error_at_last("expected an identifier")),
+        };
+        while self.consume_symbol('.') {
+            let part = match self.next() {
+                Some(Token::Word(value) | Token::QuotedIdentifier(value)) => value,
+                _ => return Err(self.error_at_last("expected an identifier after `.`")),
+            };
+            identifier.push('.');
+            identifier.push_str(&part);
         }
+        Ok(identifier)
     }
 
     fn expect_keyword(&mut self, expected: &str) -> Result<()> {

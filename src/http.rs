@@ -318,6 +318,7 @@ pub fn spawn_on_listener(
 
     let app = Router::new()
         .route("/query", post(query))
+        .route("/metrics", get(metrics))
         .route("/health", get(readiness))
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
@@ -586,6 +587,19 @@ async fn readiness(State(state): State<Arc<HttpState>>) -> Response {
             message: health.message,
         },
     )
+}
+
+async fn metrics(State(state): State<Arc<HttpState>>) -> Response {
+    let request_id = state.next_request_id();
+    match state.service.observability() {
+        Some(snapshot) => json_response(StatusCode::OK, request_id, &snapshot),
+        None => ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "observability_unavailable",
+            "the query service does not expose engine observability",
+        )
+        .into_response(request_id),
+    }
 }
 
 async fn query(State(state): State<Arc<HttpState>>, request: Request) -> Response {

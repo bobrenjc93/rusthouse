@@ -1,15 +1,17 @@
 //! Engine-independent query types used by frontends such as the HTTP server.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
+use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::{Database, Error, ResultSet, StatementResult, Value, database::ExecutionCancellation};
@@ -17,6 +19,383 @@ use crate::{Database, Error, ResultSet, StatementResult, Value, database::Execut
 const EXECUTION_ACTIVE: u8 = 0;
 const EXECUTION_CANCELLED: u8 = 1;
 const EXECUTION_PUBLISHING: u8 = 2;
+
+/// Maximum number of per-query records retained for inspection at once.
+pub const MAX_ACTIVE_QUERY_ENTRIES: usize = 1_024;
+/// Maximum UTF-8 byte length retained from a query's SQL text.
+pub const MAX_OBSERVED_QUERY_BYTES: usize = 4_096;
+
+/// A stable execution phase reported by query observability surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryPhase {
+    Queued,
+    Parsing,
+    Planning,
+    Scanning,
+    Publishing,
+}
+
+impl QueryPhase {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Parsing,
+            2 => Self::Planning,
+            3 => Self::Scanning,
+            4 => Self::Publishing,
+            _ => Self::Queued,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Parsing => "parsing",
+            Self::Planning => "planning",
+            Self::Scanning => "scanning",
+            Self::Publishing => "publishing",
+        }
+    }
+}
+
+/// A bounded point-in-time record for one executing query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveQuerySnapshot {
+    /// Transport-assigned query identifier.
+    pub query_id: u64,
+    /// SQL text, truncated to [`MAX_OBSERVED_QUERY_BYTES`].
+    pub query: String,
+    /// Current engine execution phase.
+    pub phase: QueryPhase,
+    /// Monotonic time since engine execution began.
+    pub elapsed_ms: u64,
+    /// Logical rows considered by scans.
+    pub scanned_rows: u64,
+    /// Logical value bytes accessed by scans.
+    pub scanned_bytes: u64,
+    /// Largest accounted engine result allocation.
+    pub peak_memory_bytes: u64,
+    /// Bytes written by spill operators.
+    pub spill_bytes: u64,
+    /// Whether cooperative cancellation has been requested.
+    pub cancelled: bool,
+}
+
+/// Monotonic engine counters and current query-registry gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EngineMetricsSnapshot {
+    /// Exact number of queries currently executing.
+    pub active_queries: u64,
+    /// Number of active queries retained in the bounded registry.
+    pub tracked_active_queries: u64,
+    /// Queries whose engine execution began.
+    pub queries_total: u64,
+    /// Queries whose engine execution returned a result.
+    pub queries_succeeded_total: u64,
+    /// Queries whose engine execution returned an error.
+    pub queries_failed_total: u64,
+    /// Finished queries for which cancellation was requested.
+    pub queries_cancelled_total: u64,
+    /// Logical rows scanned by finished queries.
+    pub scanned_rows_total: u64,
+    /// Logical value bytes scanned by finished queries.
+    pub scanned_bytes_total: u64,
+    /// Process high-water mark for accounted query memory.
+    pub peak_memory_bytes: u64,
+    /// Bytes spilled by finished queries.
+    pub spill_bytes_total: u64,
+    /// Active query records omitted because the registry was full.
+    pub dropped_active_query_records_total: u64,
+}
+
+/// The complete bounded payload shared by system tables and the HTTP endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObservabilitySnapshot {
+    /// Bounded records for currently executing queries.
+    pub active_queries: Vec<ActiveQuerySnapshot>,
+    /// Current gauges and process-lifetime counters.
+    pub engine_metrics: EngineMetricsSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct EngineCounters {
+    active_queries: AtomicU64,
+    queries_total: AtomicU64,
+    queries_succeeded: AtomicU64,
+    queries_failed: AtomicU64,
+    queries_cancelled: AtomicU64,
+    scanned_rows: AtomicU64,
+    scanned_bytes: AtomicU64,
+    peak_memory_bytes: AtomicU64,
+    spill_bytes: AtomicU64,
+    dropped_active_query_records: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ActiveQueryState {
+    query_id: u64,
+    query: String,
+    started: Instant,
+    phase: AtomicU8,
+    scanned_rows: AtomicU64,
+    scanned_bytes: AtomicU64,
+    peak_memory_bytes: AtomicU64,
+    spill_bytes: AtomicU64,
+    cancellation: QueryCancellation,
+}
+
+impl ActiveQueryState {
+    fn snapshot(&self) -> ActiveQuerySnapshot {
+        ActiveQuerySnapshot {
+            query_id: self.query_id,
+            query: self.query.clone(),
+            phase: QueryPhase::from_u8(self.phase.load(Ordering::Acquire)),
+            elapsed_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            scanned_rows: self.scanned_rows.load(Ordering::Relaxed),
+            scanned_bytes: self.scanned_bytes.load(Ordering::Relaxed),
+            peak_memory_bytes: self.peak_memory_bytes.load(Ordering::Relaxed),
+            spill_bytes: self.spill_bytes.load(Ordering::Relaxed),
+            cancelled: self.cancellation.is_cancelled(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueryObservabilityInner {
+    next_token: AtomicU64,
+    max_active_entries: usize,
+    active: Mutex<BTreeMap<u64, Arc<ActiveQueryState>>>,
+    counters: EngineCounters,
+}
+
+/// Engine-owned, bounded query lifecycle registry.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryObservability {
+    inner: Arc<QueryObservabilityInner>,
+}
+
+impl Default for QueryObservability {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(QueryObservabilityInner {
+                next_token: AtomicU64::new(1),
+                max_active_entries: MAX_ACTIVE_QUERY_ENTRIES,
+                active: Mutex::new(BTreeMap::new()),
+                counters: EngineCounters::default(),
+            }),
+        }
+    }
+}
+
+impl QueryObservability {
+    #[cfg(test)]
+    fn with_max_active_entries(max_active_entries: usize) -> Self {
+        Self {
+            inner: Arc::new(QueryObservabilityInner {
+                next_token: AtomicU64::new(1),
+                max_active_entries,
+                active: Mutex::new(BTreeMap::new()),
+                counters: EngineCounters::default(),
+            }),
+        }
+    }
+
+    pub(crate) fn begin(
+        &self,
+        query_id: u64,
+        sql: &str,
+        cancellation: QueryCancellation,
+    ) -> QueryObservation {
+        saturating_increment(&self.inner.counters.active_queries, 1);
+        saturating_increment(&self.inner.counters.queries_total, 1);
+        let state = Arc::new(ActiveQueryState {
+            query_id,
+            query: truncate_utf8(sql, MAX_OBSERVED_QUERY_BYTES),
+            started: Instant::now(),
+            phase: AtomicU8::new(QueryPhase::Queued.as_u8()),
+            scanned_rows: AtomicU64::new(0),
+            scanned_bytes: AtomicU64::new(0),
+            peak_memory_bytes: AtomicU64::new(0),
+            spill_bytes: AtomicU64::new(0),
+            cancellation,
+        });
+        let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
+        let mut active = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tracked = if active.len() < self.inner.max_active_entries {
+            active.insert(token, Arc::clone(&state));
+            Some(token)
+        } else {
+            saturating_increment(&self.inner.counters.dropped_active_query_records, 1);
+            None
+        };
+        drop(active);
+        QueryObservation {
+            observability: self.clone(),
+            state,
+            tracked,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ObservabilitySnapshot {
+        let states = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_queries = states
+            .iter()
+            .map(|state| state.snapshot())
+            .collect::<Vec<_>>();
+        let counters = &self.inner.counters;
+        ObservabilitySnapshot {
+            engine_metrics: EngineMetricsSnapshot {
+                active_queries: counters.active_queries.load(Ordering::Relaxed),
+                tracked_active_queries: active_queries.len() as u64,
+                queries_total: counters.queries_total.load(Ordering::Relaxed),
+                queries_succeeded_total: counters.queries_succeeded.load(Ordering::Relaxed),
+                queries_failed_total: counters.queries_failed.load(Ordering::Relaxed),
+                queries_cancelled_total: counters.queries_cancelled.load(Ordering::Relaxed),
+                scanned_rows_total: counters.scanned_rows.load(Ordering::Relaxed),
+                scanned_bytes_total: counters.scanned_bytes.load(Ordering::Relaxed),
+                peak_memory_bytes: counters.peak_memory_bytes.load(Ordering::Relaxed),
+                spill_bytes_total: counters.spill_bytes.load(Ordering::Relaxed),
+                dropped_active_query_records_total: counters
+                    .dropped_active_query_records
+                    .load(Ordering::Relaxed),
+            },
+            active_queries,
+        }
+    }
+}
+
+pub(crate) struct QueryObservation {
+    observability: QueryObservability,
+    state: Arc<ActiveQueryState>,
+    tracked: Option<u64>,
+    completed: bool,
+}
+
+impl QueryObservation {
+    pub(crate) fn set_phase(&self, phase: QueryPhase) {
+        self.state.phase.store(phase.as_u8(), Ordering::Release);
+    }
+
+    pub(crate) fn add_scan(&self, rows: u64, bytes: u64) {
+        saturating_increment(&self.state.scanned_rows, rows);
+        saturating_increment(&self.state.scanned_bytes, bytes);
+    }
+
+    pub(crate) fn set_peak_memory(&self, bytes: u64) {
+        self.state
+            .peak_memory_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    fn finish(mut self, succeeded: bool) {
+        self.complete(succeeded);
+    }
+
+    fn complete(&mut self, succeeded: bool) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Some(token) = self.tracked.take() {
+            self.observability
+                .inner
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&token);
+        }
+        let counters = &self.observability.inner.counters;
+        saturating_decrement(&counters.active_queries);
+        if succeeded {
+            saturating_increment(&counters.queries_succeeded, 1);
+        } else {
+            saturating_increment(&counters.queries_failed, 1);
+        }
+        if self.state.cancellation.is_cancelled() {
+            saturating_increment(&counters.queries_cancelled, 1);
+        }
+        let snapshot = self.state.snapshot();
+        saturating_increment(&counters.scanned_rows, snapshot.scanned_rows);
+        saturating_increment(&counters.scanned_bytes, snapshot.scanned_bytes);
+        counters
+            .peak_memory_bytes
+            .fetch_max(snapshot.peak_memory_bytes, Ordering::Relaxed);
+        saturating_increment(&counters.spill_bytes, snapshot.spill_bytes);
+        write_query_log(&snapshot, succeeded);
+    }
+}
+
+impl Drop for QueryObservation {
+    fn drop(&mut self) {
+        self.complete(false);
+    }
+}
+
+#[derive(Serialize)]
+struct QueryLog<'a> {
+    event: &'static str,
+    outcome: &'static str,
+    #[serde(flatten)]
+    query: &'a ActiveQuerySnapshot,
+}
+
+fn write_query_log(snapshot: &ActiveQuerySnapshot, succeeded: bool) {
+    let log = QueryLog {
+        event: "query_finished",
+        outcome: if snapshot.cancelled {
+            "cancelled"
+        } else if succeeded {
+            "succeeded"
+        } else {
+            "failed"
+        },
+        query: snapshot,
+    };
+    if let Ok(line) = serde_json::to_string(&log) {
+        eprintln!("{line}");
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    value[..end].to_owned()
+}
+
+fn saturating_increment(value: &AtomicU64, increment: u64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(increment))
+    });
+}
+
+fn saturating_decrement(value: &AtomicU64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
 
 /// The boxed future returned by [`QueryService`].
 pub type QueryFuture<'a> =
@@ -43,27 +422,45 @@ pub trait QueryService: Send + Sync + 'static {
     fn health(&self) -> ServiceHealth {
         ServiceHealth::ready()
     }
+
+    /// Returns a bounded engine observability snapshot when supported.
+    fn observability(&self) -> Option<ObservabilitySnapshot> {
+        None
+    }
 }
 
 impl QueryService for Database {
     fn execute(&self, request: QueryRequest) -> QueryFuture<'_> {
         Box::pin(async move {
+            let observation = self.begin_observation(
+                request.request_id,
+                &request.sql,
+                request.cancellation.clone(),
+            );
             if request.cancellation.is_cancelled() {
+                observation.finish(false);
                 return Err(QueryError::unavailable("query was cancelled"));
             }
 
             let result = self
-                .execute_controlled(
+                .execute_observed(
                     &request.sql,
                     request.max_result_bytes,
                     &request.cancellation,
+                    &observation,
                 )
                 .map_err(QueryError::from)?;
             if request.cancellation.is_cancelled() {
+                observation.finish(false);
                 return Err(QueryError::unavailable("query was cancelled"));
             }
+            observation.finish(true);
             Ok(statement_result(result))
         })
+    }
+
+    fn observability(&self) -> Option<ObservabilitySnapshot> {
+        Some(self.observability_snapshot())
     }
 }
 
@@ -437,6 +834,115 @@ impl From<Error> for QueryError {
             | Error::LockPoisoned => QueryErrorKind::Internal,
         };
         Self::new(kind, error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    #[test]
+    fn concurrent_query_lifecycles_are_visible_and_accounted_once() {
+        const QUERY_COUNT: usize = 8;
+        let observability = QueryObservability::default();
+        let started = Arc::new(Barrier::new(QUERY_COUNT + 1));
+        let release = Arc::new(Barrier::new(QUERY_COUNT + 1));
+        let mut cancellations = Vec::new();
+        let mut workers = Vec::new();
+
+        for query_id in 1..=QUERY_COUNT as u64 {
+            let cancellation = QueryCancellation::new(CancellationToken::new());
+            cancellations.push(cancellation.clone());
+            let observability = observability.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            workers.push(std::thread::spawn(move || {
+                let observation =
+                    observability.begin(query_id, "SELECT * FROM events", cancellation.clone());
+                observation.set_phase(QueryPhase::Scanning);
+                observation.add_scan(query_id, query_id * 10);
+                observation.set_peak_memory(query_id * 100);
+                started.wait();
+                release.wait();
+                observation.finish(!cancellation.is_cancelled());
+            }));
+        }
+
+        started.wait();
+        let active = observability.snapshot();
+        assert_eq!(active.active_queries.len(), QUERY_COUNT);
+        assert_eq!(active.engine_metrics.active_queries, QUERY_COUNT as u64);
+        assert!(
+            active
+                .active_queries
+                .iter()
+                .all(|query| query.phase == QueryPhase::Scanning && !query.cancelled)
+        );
+
+        assert_eq!(cancellations[0].cancel(), CancellationOutcome::Cancelled);
+        assert!(
+            observability
+                .snapshot()
+                .active_queries
+                .iter()
+                .find(|query| query.query_id == 1)
+                .unwrap()
+                .cancelled
+        );
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let completed = observability.snapshot();
+        assert!(completed.active_queries.is_empty());
+        assert_eq!(completed.engine_metrics.active_queries, 0);
+        assert_eq!(completed.engine_metrics.queries_total, QUERY_COUNT as u64);
+        assert_eq!(
+            completed.engine_metrics.queries_succeeded_total,
+            QUERY_COUNT as u64 - 1
+        );
+        assert_eq!(completed.engine_metrics.queries_failed_total, 1);
+        assert_eq!(completed.engine_metrics.queries_cancelled_total, 1);
+        assert_eq!(completed.engine_metrics.scanned_rows_total, 36);
+        assert_eq!(completed.engine_metrics.scanned_bytes_total, 360);
+        assert_eq!(completed.engine_metrics.peak_memory_bytes, 800);
+    }
+
+    #[test]
+    fn observed_sql_is_truncated_on_a_utf8_boundary() {
+        let sql = format!("{}é", "x".repeat(MAX_OBSERVED_QUERY_BYTES - 1));
+        let truncated = truncate_utf8(&sql, MAX_OBSERVED_QUERY_BYTES);
+        assert_eq!(truncated.len(), MAX_OBSERVED_QUERY_BYTES - 1);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn active_query_registry_enforces_its_cardinality_limit() {
+        let observability = QueryObservability::with_max_active_entries(2);
+        let observations = (1..=3)
+            .map(|query_id| {
+                observability.begin(
+                    query_id,
+                    "SELECT * FROM events",
+                    QueryCancellation::new(CancellationToken::new()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = observability.snapshot();
+        assert_eq!(snapshot.active_queries.len(), 2);
+        assert_eq!(snapshot.engine_metrics.active_queries, 3);
+        assert_eq!(snapshot.engine_metrics.tracked_active_queries, 2);
+        assert_eq!(
+            snapshot.engine_metrics.dropped_active_query_records_total,
+            1
+        );
+        for observation in observations {
+            observation.finish(true);
+        }
     }
 }
 

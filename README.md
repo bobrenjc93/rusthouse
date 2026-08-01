@@ -330,6 +330,12 @@ assert_eq!(rows.row_count(), 1);
 
 ## HTTP query service
 
+Read-only operational metadata is available in `system.tables`, `system.columns`,
+`system.segments`, `system.active_queries`, and `system.engine_metrics`. `GET /metrics` returns the
+same bounded query and engine snapshot as JSON, and completed service queries emit structured JSON
+logs. Field definitions, stability guarantees, accounting semantics, and cardinality limits are in
+[`docs/observability.md`](docs/observability.md).
+
 The `rusthouse::http` module exposes a long-lived HTTP/1.1 server behind the
 engine-independent `QueryService` trait. An engine implements that trait and
 returns a `QueryResult`; the frontend owns protocol parsing, output encoding,
