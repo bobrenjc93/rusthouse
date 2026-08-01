@@ -385,6 +385,7 @@ impl Engine {
         if matches!(&select.distinct, Some(Distinct::On(_))) {
             return Err(Error::Unsupported("DISTINCT ON".into()));
         }
+        let distinct = select.distinct.is_some();
         if select.top.is_some()
             || select.into.is_some()
             || !select.lateral_views.is_empty()
@@ -471,6 +472,10 @@ impl Engine {
                 .entry(normalize_identifier(&projection.header))
                 .or_insert(&projection.expr);
         }
+        let order_projection_indexes = order_by
+            .iter()
+            .map(|order| order_projection_index(&order.expr, &projections))
+            .collect::<Result<Vec<_>>>()?;
         for projection in &projections {
             validate_expression_references(&projection.expr, &source, &HashMap::new())?;
         }
@@ -484,8 +489,18 @@ impl Engine {
             validate_expression_references(having, &source, &alias_expressions)?;
         }
         for order in order_by {
-            order_ordinal(&order.expr, projections.len())?;
             validate_expression_references(&order.expr, &source, &alias_expressions)?;
+        }
+        if distinct
+            && let Some(order) = order_by
+                .iter()
+                .zip(&order_projection_indexes)
+                .find_map(|(order, index)| index.is_none().then_some(order))
+        {
+            return Err(Error::Constraint(format!(
+                "ORDER BY expression {} must appear in the DISTINCT projection",
+                order.expr
+            )));
         }
         let empty_type_aliases = HashMap::new();
         let projection_types = projections
@@ -542,7 +557,7 @@ impl Engine {
             .collect::<Vec<_>>();
         let limit = limit.map(parse_limit).transpose()?.unwrap_or(usize::MAX);
         let ordered = !order_by.is_empty();
-        let distinct = select.distinct.is_some();
+        let order_needs_source = order_projection_indexes.iter().any(Option::is_none);
         if limit == 0 {
             let result = QueryResult {
                 columns,
@@ -649,7 +664,7 @@ impl Engine {
                 reserve_hash_set_slot(&mut seen, seen_memory)?;
                 seen.insert(key);
             }
-            let source_rows = if ordered { rows } else { Vec::new() };
+            let source_rows = if order_needs_source { rows } else { Vec::new() };
             drop(row_memory);
             reserve_vec_slot(&mut projected, &mut projected_memory)?;
             projected_memory.grow(
@@ -701,22 +716,12 @@ impl Engine {
                         order_by.len().saturating_mul(std::mem::size_of::<Value>()),
                     ))?;
                 let mut sort_keys = Vec::with_capacity(order_by.len());
-                for order in order_by {
-                    let value = if let Some(index) = order_ordinal(&order.expr, columns.len())? {
-                        if let Value::String(value) = &row.values[index] {
+                for (order, projection_index) in order_by.iter().zip(&order_projection_indexes) {
+                    let value = if let Some(index) = projection_index {
+                        if let Value::String(value) = &row.values[*index] {
                             sort_memory.grow(value.len())?;
                         }
-                        row.values[index].clone()
-                    } else if let Expr::Identifier(identifier) = &order.expr
-                        && let Some((index, _)) = columns
-                            .iter()
-                            .enumerate()
-                            .find(|(_, name)| name.eq_ignore_ascii_case(&identifier.value))
-                    {
-                        if let Value::String(value) = &row.values[index] {
-                            sort_memory.grow(value.len())?;
-                        }
-                        row.values[index].clone()
+                        row.values[*index].clone()
                     } else {
                         let value = eval_group(
                             &order.expr,
@@ -3841,11 +3846,24 @@ fn parse_limit(expr: &Expr) -> Result<usize> {
     }
 }
 
-fn order_ordinal(expr: &Expr, column_count: usize) -> Result<Option<usize>> {
-    let mut expr = expr;
-    while let Expr::Nested(nested) = expr {
-        expr = nested;
+fn order_projection_index(expr: &Expr, projections: &[Projection]) -> Result<Option<usize>> {
+    if let Some(index) = order_ordinal(expr, projections.len())? {
+        return Ok(Some(index));
     }
+    if let Expr::Identifier(identifier) = strip_nested_expression(expr)
+        && let Some(index) = projections
+            .iter()
+            .position(|projection| projection.header.eq_ignore_ascii_case(&identifier.value))
+    {
+        return Ok(Some(index));
+    }
+    Ok(projections
+        .iter()
+        .position(|projection| equivalent_group_expression(expr, &projection.expr)))
+}
+
+fn order_ordinal(expr: &Expr, column_count: usize) -> Result<Option<usize>> {
+    let expr = strip_nested_expression(expr);
     let Expr::Value(SqlValue::Number(value, _)) = expr else {
         return Ok(None);
     };
@@ -3861,6 +3879,13 @@ fn order_ordinal(expr: &Expr, column_count: usize) -> Result<Option<usize>> {
         )));
     }
     Ok(Some(ordinal - 1))
+}
+
+fn strip_nested_expression(mut expr: &Expr) -> &Expr {
+    while let Expr::Nested(nested) = expr {
+        expr = nested;
+    }
+    expr
 }
 
 fn validate_sort_types(rows: &[ProjectedRow]) -> Result<()> {
@@ -4841,6 +4866,52 @@ mod tests {
             query(&mut engine, "SELECT a AS x, b AS x FROM t ORDER BY (x)").rows,
             expected
         );
+    }
+
+    #[test]
+    fn distinct_order_by_requires_a_projected_value() {
+        for values in [
+            "('a', 100), ('a', 1), ('b', 50)",
+            "('a', 1), ('a', 100), ('b', 50)",
+        ] {
+            let mut engine = Engine::default();
+            engine
+                .execute("CREATE TABLE t (label String, rank Int64)")
+                .unwrap();
+            engine
+                .execute(&format!("INSERT INTO t VALUES {values}"))
+                .unwrap();
+            assert!(matches!(
+                engine.execute("SELECT DISTINCT label FROM t ORDER BY rank"),
+                Err(Error::Constraint(message)) if message.contains("DISTINCT projection")
+            ));
+            assert_eq!(
+                query(&mut engine, "SELECT DISTINCT label FROM t ORDER BY label").rows,
+                vec![
+                    vec![Value::String("a".into())],
+                    vec![Value::String("b".into())],
+                ]
+            );
+            assert_eq!(
+                query(
+                    &mut engine,
+                    "SELECT DISTINCT label AS name FROM t ORDER BY (name) DESC",
+                )
+                .rows,
+                vec![
+                    vec![Value::String("b".into())],
+                    vec![Value::String("a".into())],
+                ]
+            );
+            assert_eq!(
+                query(
+                    &mut engine,
+                    "SELECT DISTINCT rank % 10 AS bucket FROM t ORDER BY rank % 10, 1",
+                )
+                .rows,
+                vec![vec![Value::Int64(0)], vec![Value::Int64(1)]]
+            );
+        }
     }
 
     #[test]
