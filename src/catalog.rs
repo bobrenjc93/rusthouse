@@ -337,6 +337,10 @@ pub enum SnapshotError {
     Locked(PathBuf),
     /// The filename occupies the namespace reserved for lock or temp sidecars.
     ReservedSnapshotName(PathBuf),
+    /// The final snapshot path is a symbolic link and cannot be atomically replaced safely.
+    SymlinkSnapshot(PathBuf),
+    /// This platform lacks the ACL operations required for private staging.
+    UnsupportedPlatform(&'static str),
     /// The file was structurally invalid or failed a checksum.
     Corrupt(Corruption),
     /// The file has valid header integrity but uses an unknown version.
@@ -370,6 +374,14 @@ impl fmt::Display for SnapshotError {
                 "snapshot filename is reserved for persistence sidecars: {}",
                 path.display()
             ),
+            Self::SymlinkSnapshot(path) => write!(
+                f,
+                "snapshot path must not be a symbolic link: {}",
+                path.display()
+            ),
+            Self::UnsupportedPlatform(reason) => {
+                write!(f, "snapshot persistence is unsupported: {reason}")
+            }
             Self::Corrupt(error) => write!(f, "corrupt snapshot: {error}"),
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported snapshot version {version}")
@@ -440,11 +452,13 @@ impl SnapshotStore {
     /// Opens and exclusively locks a snapshot path with caller-supplied limits.
     ///
     /// The parent directory must already exist. A second writer receives
-    /// [`SnapshotError::Locked`] rather than waiting indefinitely.
+    /// [`SnapshotError::Locked`] rather than waiting indefinitely. The final
+    /// path component must not be a symbolic link.
     pub fn open_with_limits(
         path: impl AsRef<Path>,
         limits: SnapshotLimits,
     ) -> Result<Self, SnapshotError> {
+        ensure_platform_supported()?;
         limits.validate()?;
         let path = absolute_normalized_path(path.as_ref())?;
         let (lock_path, temp_dir) = sidecar_paths(&path)?;
@@ -588,7 +602,35 @@ fn absolute_normalized_path(path: &Path) -> Result<PathBuf, SnapshotError> {
         SnapshotError::InvalidImage("snapshot path must have a parent directory".to_owned())
     })?;
     let canonical_parent = parent.canonicalize()?;
-    Ok(canonical_parent.join(file_name))
+    let path = canonical_parent.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(SnapshotError::SymlinkSnapshot(path))
+        }
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd"
+))]
+fn ensure_platform_supported() -> Result<(), SnapshotError> {
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+fn ensure_platform_supported() -> Result<(), SnapshotError> {
+    Err(SnapshotError::UnsupportedPlatform(
+        "requires Windows, macOS, Linux, or FreeBSD ACL semantics",
+    ))
 }
 
 fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
@@ -632,24 +674,76 @@ fn cleanup_staging(temp_dir: &Path, path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
 fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700).create(path)?;
+    set_private_unix_acl(path, true)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
-    use std::os::unix::fs::OpenOptionsExt;
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+fn create_secure_staging_dir(_path: &Path) -> Result<(), SnapshotError> {
+    ensure_platform_supported()
+}
 
-    Ok(OpenOptions::new()
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
+fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?)
+        .open(path)?;
+    set_private_unix_acl(path, false)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+fn create_secure_temp(_path: &Path) -> Result<File, SnapshotError> {
+    ensure_platform_supported()?;
+    unreachable!("unsupported platforms return an error")
+}
+
+#[cfg(target_os = "macos")]
+fn set_private_unix_acl(path: &Path, _is_directory: bool) -> Result<(), SnapshotError> {
+    exacl::setfacl(&[path], &[], None)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn set_private_unix_acl(path: &Path, is_directory: bool) -> Result<(), SnapshotError> {
+    use exacl::{AclEntry, Perm};
+
+    let owner_permissions = if is_directory {
+        Perm::READ | Perm::WRITE | Perm::EXECUTE
+    } else {
+        Perm::READ | Perm::WRITE
+    };
+    let acl = [
+        AclEntry::allow_user("", owner_permissions, None),
+        AclEntry::allow_group("", Perm::empty(), None),
+        AclEntry::allow_other(Perm::empty(), None),
+    ];
+    exacl::setfacl(&[path], &acl, None)?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1710,6 +1804,41 @@ mod tests {
         bytes[28..32].copy_from_slice(&header_checksum.to_le_bytes());
     }
 
+    #[cfg(target_os = "macos")]
+    fn install_inheritable_test_acl(path: &Path) {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let acl = [AclEntry::allow_user(
+            "nobody",
+            Perm::READ | Perm::EXECUTE,
+            Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT,
+        )];
+        exacl::setfacl(&[path], &acl, None).expect("install inheritable parent ACL");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_inheritable_test_acl(path: &Path) {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let mut acl = exacl::getfacl(path, None).expect("read parent ACL");
+        acl.extend([
+            AclEntry::allow_user("", Perm::READ | Perm::WRITE | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_user("nobody", Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_group("", Perm::empty(), Flag::DEFAULT),
+            AclEntry::allow_mask(Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_other(Perm::empty(), Flag::DEFAULT),
+        ]);
+        exacl::setfacl(&[path], &acl, None).expect("install inheritable parent ACL");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn acl_allows_nobody(path: &Path) -> bool {
+        exacl::getfacl(path, None)
+            .expect("read ACL")
+            .iter()
+            .any(|entry| entry.name.ends_with("nobody") && entry.perms.contains(exacl::Perm::READ))
+    }
+
     #[test]
     fn typed_image_validation_rejects_bad_shapes_and_names() {
         let left =
@@ -1760,6 +1889,29 @@ mod tests {
         ));
         drop(first);
         SnapshotStore::open(&path).expect("lock released with store");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_final_component_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target.rhcat");
+        let link = directory.0.join("link.rhcat");
+        let image = sample_image(4);
+        let target_store = SnapshotStore::open(&target).expect("open target store");
+        target_store.commit(&image).expect("commit target image");
+        drop(target_store);
+        symlink(&target, &link).expect("create snapshot symlink");
+
+        assert!(matches!(
+            SnapshotStore::open(&link),
+            Err(SnapshotError::SymlinkSnapshot(_))
+        ));
+        assert!(!directory.0.join(".link.rhcat.lock").exists());
+        let reopened = SnapshotStore::open(&target).expect("reopen target store");
+        assert_eq!(reopened.load().expect("load target image"), Some(image));
     }
 
     #[test]
@@ -2101,6 +2253,33 @@ mod tests {
             store.load().expect("load surviving image"),
             Some(replacement)
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn inherited_parent_acl_does_not_reach_staging_or_first_snapshot() {
+        let directory = TestDirectory::new();
+        install_inheritable_test_acl(&directory.0);
+        let probe = directory.0.join("probe");
+        fs::write(&probe, b"probe").expect("create ACL inheritance probe");
+        assert!(acl_allows_nobody(&probe));
+        fs::remove_file(probe).expect("remove inheritance probe");
+
+        let path = directory.snapshot();
+        let store = SnapshotStore::open(&path).expect("open store under inherited ACL");
+        assert!(matches!(
+            store.commit_inner(&sample_image(40), Some(Failpoint::TempSynced)),
+            Err(SnapshotError::InjectedFailure("after temp sync"))
+        ));
+        assert!(!acl_allows_nobody(&store.temp_dir));
+        assert!(!acl_allows_nobody(&store.temp_path));
+        drop(store);
+
+        let recovered = SnapshotStore::open(&path).expect("clean interrupted staging");
+        let image = sample_image(41);
+        recovered.commit(&image).expect("publish first snapshot");
+        assert!(!acl_allows_nobody(&path));
+        assert_eq!(recovered.load().expect("load first snapshot"), Some(image));
     }
 
     #[test]

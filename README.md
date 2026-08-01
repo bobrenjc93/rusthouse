@@ -54,6 +54,12 @@ through one shared store handle are serialized in process. Snapshot filenames
 matching the generated `.<name>.lock` or `.<name>.tmp` sidecar namespace are
 rejected, including case and trailing-dot/space aliases.
 
+Snapshot persistence supports Windows, macOS, Linux, and FreeBSD. Other Unix
+targets compile but return `SnapshotError::UnsupportedPlatform` before creating
+sidecars because their ACL semantics are not implemented. Existing or dangling
+final-component symbolic links are rejected so reads, locks, and publication
+cannot address different filesystem objects.
+
 ### Version 1 binary format
 
 All integers are little-endian. Offsets and sizes below are bytes. CRC32 means
@@ -115,11 +121,12 @@ image, creates `.catalog.rhcat.tmp` as a private staging directory inside the
 snapshot directory, writes and calls `sync_all` on its `snapshot` file, then
 atomically renames that file over `catalog.rhcat`. Unix creates the staging
 directory with mode `0700`; Windows creates it with a protected DACL granting
-access only to its owner and the system. Immediately before publish, an
-existing snapshot's Unix owner, group, mode, and native ACL (on macOS, Linux,
-and FreeBSD), or Windows owner, group, and DACL is copied to the staged file.
-The enclosing private directory keeps prepared data inaccessible after a failed
-or interrupted publish. Unix syncs the parent directory after rename. Windows
+access only to its owner and the system. Unix also removes inherited and default
+ACL entries before creating the staged file. Immediately before publish, an
+existing snapshot's Unix owner, group, mode, and native ACL, or Windows owner,
+group, and DACL is copied to the staged file. The enclosing private directory
+keeps prepared data inaccessible after a failed or interrupted publish. Unix
+syncs the parent directory after rename. Windows
 publishes with `MoveFileExW` using `MOVEFILE_REPLACE_EXISTING` and
 `MOVEFILE_WRITE_THROUGH`, which makes the metadata update durable without opening
 the directory. A failure before rename leaves the previous snapshot unchanged.
