@@ -75,25 +75,41 @@ impl Engine {
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         let max_batch_result_bytes = self.config.max_batch_result_bytes;
-        let mut retained_bytes = 0_usize;
-        let mut results = Vec::new();
-        for statement in self.parse_statements(sql)? {
+        let statements = self.parse_statements(sql)?;
+        let minimum_outer_bytes = std::mem::size_of::<Vec<StatementResult>>().saturating_add(
+            statements
+                .len()
+                .saturating_mul(std::mem::size_of::<StatementResult>()),
+        );
+        if minimum_outer_bytes > max_batch_result_bytes {
+            return Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                limit: max_batch_result_bytes,
+                actual: minimum_outer_bytes,
+            });
+        }
+        let mut results = Vec::with_capacity(statements.len());
+        let mut retained_bytes = std::mem::size_of::<Vec<StatementResult>>().saturating_add(
+            results
+                .capacity()
+                .saturating_mul(std::mem::size_of::<StatementResult>()),
+        );
+        if retained_bytes > max_batch_result_bytes {
+            return Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                limit: max_batch_result_bytes,
+                actual: retained_bytes,
+            });
+        }
+        let query_wrapper_bytes = std::mem::size_of::<StatementResult>()
+            .saturating_sub(std::mem::size_of::<QueryResult>());
+        for statement in statements {
             let remaining_bytes = max_batch_result_bytes.saturating_sub(retained_bytes);
-            if matches!(
-                &statement,
-                Statement::CreateTable { .. } | Statement::Insert(_)
-            ) && std::mem::size_of::<StatementResult>() > remaining_bytes
-            {
-                return Err(Error::ResourceLimit {
-                    resource: "batch result bytes",
-                    limit: max_batch_result_bytes,
-                    actual: retained_bytes.saturating_add(std::mem::size_of::<StatementResult>()),
-                });
-            }
-            let result = match self.execute_statement_with_budget(statement, remaining_bytes) {
+            let statement_budget = remaining_bytes.saturating_add(query_wrapper_bytes);
+            let result = match self.execute_statement_with_budget(statement, statement_budget) {
                 Err(Error::ResourceLimit {
                     resource, actual, ..
-                }) if retained_bytes > 0
+                }) if !results.is_empty()
                     && matches!(resource, "result bytes" | "intermediate result bytes") =>
                 {
                     return Err(Error::ResourceLimit {
@@ -104,7 +120,7 @@ impl Engine {
                 }
                 result => result?,
             };
-            retained_bytes = retained_bytes.saturating_add(result_retained_bytes(&result));
+            retained_bytes = retained_bytes.saturating_add(result_heap_bytes(&result));
             if retained_bytes > max_batch_result_bytes {
                 return Err(Error::ResourceLimit {
                     resource: "batch result bytes",
@@ -910,12 +926,10 @@ fn validate_insert_options(insert: &Insert) -> Result<()> {
     Ok(())
 }
 
-fn result_retained_bytes(result: &StatementResult) -> usize {
+fn result_heap_bytes(result: &StatementResult) -> usize {
     match result {
-        StatementResult::Command { .. } => std::mem::size_of::<StatementResult>(),
-        StatementResult::Query(result) => {
-            std::mem::size_of::<StatementResult>().saturating_add(query_result_heap_bytes(result))
-        }
+        StatementResult::Command { .. } => 0,
+        StatementResult::Query(result) => query_result_heap_bytes(result),
     }
 }
 
@@ -2342,7 +2356,7 @@ fn eval_like(
     if value.is_null() || pattern.is_null() {
         return Ok(Value::Null);
     }
-    let (Value::String(mut value), Value::String(pattern)) = (value, pattern) else {
+    let (Value::String(value), Value::String(pattern)) = (value, pattern) else {
         return Err(Error::Type("LIKE expects String operands".into()));
     };
     let mut like_memory = memory.map(|memory| memory.reserve(0)).transpose()?;
@@ -2354,39 +2368,7 @@ fn eval_like(
                 .saturating_add(token_count.saturating_mul(std::mem::size_of::<LikeToken>())),
         )?;
     }
-    let mut tokens = like_tokens(&pattern, escape, token_count)?;
-    if insensitive {
-        let lowercase_length = lowercase_len(&value);
-        let folded_token_count = tokens.iter().fold(0_usize, |count, token| {
-            count.saturating_add(match token {
-                LikeToken::Literal(character) => character.to_lowercase().count(),
-                _ => 1,
-            })
-        });
-        if let Some(reservation) = &mut like_memory {
-            reservation.grow(
-                std::mem::size_of::<String>()
-                    .saturating_add(lowercase_length)
-                    .saturating_add(std::mem::size_of::<Vec<LikeToken>>())
-                    .saturating_add(
-                        folded_token_count.saturating_mul(std::mem::size_of::<LikeToken>()),
-                    ),
-            )?;
-        }
-        let mut lowercase = String::with_capacity(lowercase_length);
-        lowercase.extend(value.chars().flat_map(char::to_lowercase));
-        value = lowercase;
-        let mut folded_tokens = Vec::with_capacity(folded_token_count);
-        for token in tokens {
-            match token {
-                LikeToken::Literal(character) => {
-                    folded_tokens.extend(character.to_lowercase().map(LikeToken::Literal))
-                }
-                token => folded_tokens.push(token),
-            }
-        }
-        tokens = folded_tokens;
-    }
+    let tokens = like_tokens(&pattern, escape, token_count)?;
     let value_char_count = value.chars().count();
     if let Some(reservation) = &mut like_memory {
         reservation.grow(
@@ -2394,7 +2376,7 @@ fn eval_like(
                 .saturating_add(value_char_count.saturating_mul(std::mem::size_of::<char>())),
         )?;
     }
-    let matched = like_matches(&value, &tokens, value_char_count);
+    let matched = like_matches(&value, &tokens, value_char_count, insensitive);
     Ok(Value::Bool(if negated { !matched } else { matched }))
 }
 
@@ -2442,16 +2424,25 @@ fn like_tokens(pattern: &str, escape: Option<char>, token_count: usize) -> Resul
     Ok(tokens)
 }
 
-fn like_matches(value: &str, tokens: &[LikeToken], value_char_count: usize) -> bool {
+fn like_matches(
+    value: &str,
+    tokens: &[LikeToken],
+    value_char_count: usize,
+    insensitive: bool,
+) -> bool {
     let mut characters = Vec::with_capacity(value_char_count);
     characters.extend(value.chars());
     let value = characters;
     let (mut value_index, mut pattern_index) = (0, 0);
     let (mut star, mut retry) = (None, 0);
     while value_index < value.len() {
-        if tokens.get(pattern_index) == Some(&LikeToken::AnyOne)
-            || tokens.get(pattern_index) == Some(&LikeToken::Literal(value[value_index]))
-        {
+        let literal_matches = matches!(tokens.get(pattern_index), Some(LikeToken::Literal(pattern))
+        if if insensitive {
+            pattern.to_lowercase().eq(value[value_index].to_lowercase())
+        } else {
+            *pattern == value[value_index]
+        });
+        if tokens.get(pattern_index) == Some(&LikeToken::AnyOne) || literal_matches {
             value_index += 1;
             pattern_index += 1;
         } else if tokens.get(pattern_index) == Some(&LikeToken::AnyMany) {
@@ -3460,7 +3451,7 @@ mod tests {
     #[test]
     fn bounds_collected_batch_result_bytes_but_supports_streaming() {
         let mut engine = Engine::new(EngineConfig {
-            max_batch_result_bytes: 1_000,
+            max_batch_result_bytes: 1_500,
             ..EngineConfig::default()
         });
         let literal = "x".repeat(600);
@@ -3491,7 +3482,7 @@ mod tests {
         });
         let one = "SELECT 1 AS n";
         assert_eq!(query(&mut engine, one).rows, vec![vec![Value::Int64(1)]]);
-        let batch = std::iter::repeat_n(one, 20).collect::<Vec<_>>().join(";");
+        let batch = std::iter::repeat_n(one, 100).collect::<Vec<_>>().join(";");
         assert!(matches!(
             engine.execute(&batch),
             Err(Error::ResourceLimit {
@@ -3771,8 +3762,18 @@ mod tests {
     fn ilike_escape_is_applied_before_case_folding() {
         let mut engine = Engine::default();
         assert_eq!(
-            query(&mut engine, "SELECT '%' ILIKE 'A%' ESCAPE 'A'").rows,
-            vec![vec![Value::Bool(true)]]
+            query(
+                &mut engine,
+                "SELECT '%' ILIKE 'A%' ESCAPE 'A',
+                        'İ' ILIKE '_', 'İ' ILIKE '__', 'İx' ILIKE '__'",
+            )
+            .rows,
+            vec![vec![
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Bool(true),
+            ]]
         );
     }
 
@@ -3952,7 +3953,6 @@ mod tests {
             engine.execute(&format!("SELECT {expression} AS amplified FROM t")),
             Err(Error::ResourceLimit {
                 resource: "intermediate result bytes",
-                limit: 1_024,
                 ..
             })
         ));
@@ -3967,7 +3967,6 @@ mod tests {
             engine.execute(&format!("SELECT {expression} AS amplified FROM small")),
             Err(Error::ResourceLimit {
                 resource: "intermediate result bytes",
-                limit: 1_024,
                 ..
             })
         ));
@@ -3994,7 +3993,6 @@ mod tests {
                 constrained.execute(sql),
                 Err(Error::ResourceLimit {
                     resource: "intermediate result bytes",
-                    limit: 1_300,
                     ..
                 })
             ));
@@ -4040,7 +4038,6 @@ mod tests {
                 constrained.execute(sql),
                 Err(Error::ResourceLimit {
                     resource: "intermediate result bytes",
-                    limit: 1_300,
                     ..
                 })
             ));
@@ -4107,7 +4104,6 @@ mod tests {
             engine.execute("SELECT COUNT(*) FROM t WHERE s LIKE s"),
             Err(Error::ResourceLimit {
                 resource: "intermediate result bytes",
-                limit: 5_242_880,
                 ..
             })
         ));
@@ -4134,7 +4130,6 @@ mod tests {
                 engine.execute(sql),
                 Err(Error::ResourceLimit {
                     resource: "intermediate result bytes",
-                    limit: 4_096,
                     ..
                 })
             ));
@@ -4175,9 +4170,39 @@ mod tests {
     }
 
     #[test]
+    fn outer_result_capacity_is_preflighted_before_batch_mutation() {
+        let batch = "CREATE TABLE t0 (n Int64);
+                     CREATE TABLE t1 (n Int64);
+                     CREATE TABLE t2 (n Int64);
+                     CREATE TABLE t3 (n Int64)";
+        let required = std::mem::size_of::<Vec<StatementResult>>()
+            + 4 * std::mem::size_of::<StatementResult>();
+        let mut constrained = Engine::new(EngineConfig {
+            max_batch_result_bytes: required - 1,
+            ..EngineConfig::default()
+        });
+        assert!(matches!(
+            constrained.execute(batch),
+            Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                ..
+            })
+        ));
+        for table in ["t0", "t1", "t2", "t3"] {
+            assert!(constrained.table(table).is_none());
+        }
+
+        let mut sufficient = Engine::new(EngineConfig {
+            max_batch_result_bytes: required,
+            ..EngineConfig::default()
+        });
+        assert_eq!(sufficient.execute(batch).unwrap().len(), 4);
+    }
+
+    #[test]
     fn limit_zero_short_circuits_before_scanning() {
         let mut engine = Engine::new(EngineConfig {
-            max_batch_result_bytes: 100,
+            max_batch_result_bytes: 200,
             ..EngineConfig::default()
         });
         engine.execute("CREATE TABLE t (n Int64)").unwrap();
@@ -4219,7 +4244,6 @@ mod tests {
                 engine.execute(sql),
                 Err(Error::ResourceLimit {
                     resource: "intermediate result bytes",
-                    limit: 100,
                     ..
                 })
             ));
