@@ -756,15 +756,262 @@ impl GroupedData<'_> {
     }
 }
 
+const FLOAT_FRACTION_BITS: usize = 52;
+const FLOAT_FRACTION_MASK: u64 = (1_u64 << FLOAT_FRACTION_BITS) - 1;
+const EXACT_FLOAT_MIN_POWER: i16 = -1_074;
+const EXACT_FLOAT_LIMBS: usize = 34;
+type FloatMagnitude = [u64; EXACT_FLOAT_LIMBS];
+
+// Exact exponent bins keep partial sums mergeable without overflowing before cancellation.
+#[derive(Debug)]
+struct ExactFloatSum {
+    bins: Vec<(i16, i128)>,
+}
+
+impl ExactFloatSum {
+    fn new() -> Self {
+        Self { bins: Vec::new() }
+    }
+
+    fn add(&mut self, value: f64) -> Option<()> {
+        debug_assert!(value.is_finite());
+        let bits = value.to_bits();
+        let raw_exponent = ((bits >> FLOAT_FRACTION_BITS) & 0x7ff) as i16;
+        let fraction = bits & FLOAT_FRACTION_MASK;
+        let (significand, power) = if raw_exponent == 0 {
+            if fraction == 0 {
+                return Some(());
+            }
+            (fraction, EXACT_FLOAT_MIN_POWER)
+        } else {
+            (
+                (1_u64 << FLOAT_FRACTION_BITS) | fraction,
+                raw_exponent - 1_075,
+            )
+        };
+        let coefficient = i128::from(significand);
+        self.add_bin(
+            power,
+            if bits >> 63 == 0 {
+                coefficient
+            } else {
+                -coefficient
+            },
+        )
+    }
+
+    fn merge(&mut self, partial: Self) -> Option<()> {
+        for (power, coefficient) in partial.bins {
+            self.add_bin(power, coefficient)?;
+        }
+        Some(())
+    }
+
+    fn finish(self, divisor: u64) -> Option<f64> {
+        debug_assert!(divisor > 0);
+        let mut positive = [0; EXACT_FLOAT_LIMBS];
+        let mut negative = [0; EXACT_FLOAT_LIMBS];
+        for (power, coefficient) in self.bins {
+            let shift = usize::try_from(power - EXACT_FLOAT_MIN_POWER).ok()?;
+            let magnitude = if coefficient >= 0 {
+                &mut positive
+            } else {
+                &mut negative
+            };
+            add_shifted(magnitude, coefficient.unsigned_abs(), shift)?;
+        }
+
+        let (negative_result, mut magnitude) = match compare_magnitudes(&positive, &negative) {
+            Ordering::Greater => (false, subtract_magnitudes(&positive, &negative)),
+            Ordering::Less => (true, subtract_magnitudes(&negative, &positive)),
+            Ordering::Equal => return Some(0.0),
+        };
+        let remainder = divide_magnitude(&mut magnitude, divisor);
+        magnitude_to_f64(&magnitude, remainder, divisor, negative_result)
+    }
+
+    fn add_bin(&mut self, power: i16, coefficient: i128) -> Option<()> {
+        match self.bins.binary_search_by_key(&power, |(power, _)| *power) {
+            Ok(index) => {
+                let combined = self.bins[index].1.checked_add(coefficient)?;
+                if combined == 0 {
+                    self.bins.remove(index);
+                } else {
+                    self.bins[index].1 = combined;
+                }
+            }
+            Err(index) => self.bins.insert(index, (power, coefficient)),
+        }
+        Some(())
+    }
+}
+
+fn add_shifted(target: &mut FloatMagnitude, value: u128, shift: usize) -> Option<()> {
+    let first_limb = shift / u64::BITS as usize;
+    let offset = shift % u64::BITS as usize;
+    for (word_index, word) in [value as u64, (value >> u64::BITS) as u64]
+        .into_iter()
+        .enumerate()
+    {
+        if word == 0 {
+            continue;
+        }
+        add_word(target, first_limb + word_index, word << offset)?;
+        if offset > 0 {
+            add_word(
+                target,
+                first_limb + word_index + 1,
+                word >> (u64::BITS as usize - offset),
+            )?;
+        }
+    }
+    Some(())
+}
+
+fn add_word(target: &mut FloatMagnitude, mut index: usize, mut word: u64) -> Option<()> {
+    while word != 0 {
+        let limb = target.get_mut(index)?;
+        let (sum, carry) = limb.overflowing_add(word);
+        *limb = sum;
+        word = u64::from(carry);
+        index += 1;
+    }
+    Some(())
+}
+
+fn compare_magnitudes(left: &FloatMagnitude, right: &FloatMagnitude) -> Ordering {
+    for (left, right) in left.iter().rev().zip(right.iter().rev()) {
+        let ordering = left.cmp(right);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn subtract_magnitudes(larger: &FloatMagnitude, smaller: &FloatMagnitude) -> FloatMagnitude {
+    let mut result = [0; EXACT_FLOAT_LIMBS];
+    let mut borrow = false;
+    for ((result, larger), smaller) in result.iter_mut().zip(larger).zip(smaller) {
+        let (difference, first_borrow) = larger.overflowing_sub(*smaller);
+        let (difference, second_borrow) = difference.overflowing_sub(u64::from(borrow));
+        *result = difference;
+        borrow = first_borrow || second_borrow;
+    }
+    debug_assert!(!borrow);
+    result
+}
+
+fn divide_magnitude(magnitude: &mut FloatMagnitude, divisor: u64) -> u64 {
+    let mut remainder = 0_u64;
+    for limb in magnitude.iter_mut().rev() {
+        let dividend = (u128::from(remainder) << u64::BITS) | u128::from(*limb);
+        *limb = (dividend / u128::from(divisor)) as u64;
+        remainder = (dividend % u128::from(divisor)) as u64;
+    }
+    remainder
+}
+
+fn magnitude_to_f64(
+    magnitude: &FloatMagnitude,
+    remainder: u64,
+    divisor: u64,
+    negative: bool,
+) -> Option<f64> {
+    let sign = u64::from(negative) << 63;
+    let Some(mut highest_bit) = highest_bit(magnitude) else {
+        let rounded = u64::from(round_fraction(remainder, divisor, false));
+        return Some(f64::from_bits(sign | rounded));
+    };
+
+    if highest_bit < FLOAT_FRACTION_BITS {
+        let mut rounded = magnitude[0];
+        if round_fraction(remainder, divisor, rounded & 1 != 0) {
+            rounded += 1;
+        }
+        return Some(f64::from_bits(sign | rounded));
+    }
+
+    let discarded_bits = highest_bit - FLOAT_FRACTION_BITS;
+    let mut significand =
+        shifted_low_u64(magnitude, discarded_bits) & ((1_u64 << (FLOAT_FRACTION_BITS + 1)) - 1);
+    let round_up = if discarded_bits == 0 {
+        round_fraction(remainder, divisor, significand & 1 != 0)
+    } else {
+        let round_bit = bit_is_set(magnitude, discarded_bits - 1);
+        let sticky = any_bits_below(magnitude, discarded_bits - 1) || remainder != 0;
+        round_bit && (sticky || significand & 1 != 0)
+    };
+    if round_up {
+        significand += 1;
+        if significand == 1_u64 << (FLOAT_FRACTION_BITS + 1) {
+            significand >>= 1;
+            highest_bit += 1;
+        }
+    }
+
+    let exponent = i32::try_from(highest_bit).ok()? + i32::from(EXACT_FLOAT_MIN_POWER);
+    if exponent > 1_023 {
+        return None;
+    }
+    debug_assert!(exponent >= -1_022);
+    let raw_exponent = u64::try_from(exponent + 1_023).ok()?;
+    Some(f64::from_bits(
+        sign | (raw_exponent << FLOAT_FRACTION_BITS) | (significand & FLOAT_FRACTION_MASK),
+    ))
+}
+
+fn highest_bit(magnitude: &FloatMagnitude) -> Option<usize> {
+    magnitude
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, limb)| **limb != 0)
+        .map(|(index, limb)| {
+            index * u64::BITS as usize + (u64::BITS - 1 - limb.leading_zeros()) as usize
+        })
+}
+
+fn shifted_low_u64(magnitude: &FloatMagnitude, shift: usize) -> u64 {
+    let limb = shift / u64::BITS as usize;
+    let offset = shift % u64::BITS as usize;
+    let mut value = magnitude[limb] >> offset;
+    if offset > 0 && limb + 1 < magnitude.len() {
+        value |= magnitude[limb + 1] << (u64::BITS as usize - offset);
+    }
+    value
+}
+
+fn bit_is_set(magnitude: &FloatMagnitude, bit: usize) -> bool {
+    magnitude[bit / u64::BITS as usize] & (1_u64 << (bit % u64::BITS as usize)) != 0
+}
+
+fn any_bits_below(magnitude: &FloatMagnitude, bit_count: usize) -> bool {
+    let full_limbs = bit_count / u64::BITS as usize;
+    if magnitude[..full_limbs].iter().any(|limb| *limb != 0) {
+        return true;
+    }
+    let remaining = bit_count % u64::BITS as usize;
+    remaining > 0 && magnitude[full_limbs] & ((1_u64 << remaining) - 1) != 0
+}
+
+fn round_fraction(remainder: u64, divisor: u64, odd: bool) -> bool {
+    match (u128::from(remainder) * 2).cmp(&u128::from(divisor)) {
+        Ordering::Greater => true,
+        Ordering::Equal => odd,
+        Ordering::Less => false,
+    }
+}
+
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
     SumInt(i128),
-    SumFloat(f64),
+    SumFloat(ExactFloatSum),
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
-    AvgFloat { sum: f64, count: u64 },
+    AvgFloat { sum: ExactFloatSum, count: u64 },
 }
 
 impl AggregateState {
@@ -772,13 +1019,16 @@ impl AggregateState {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
             AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum => Self::SumFloat(ExactFloatSum::new()),
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
             AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
                 Self::AvgInt { sum: 0, count: 0 }
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Avg => Self::AvgFloat {
+                sum: ExactFloatSum::new(),
+                count: 0,
+            },
         }
     }
 
@@ -804,10 +1054,8 @@ impl AggregateState {
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
-                }
+                sum.add(values[row])
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Float64)".to_owned()))?;
             }
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
@@ -847,13 +1095,11 @@ impl AggregateState {
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                sum.add(values[row])
+                    .ok_or_else(|| Error::NumericOverflow("AVG(Float64) sum".to_owned()))?;
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
-                }
             }
         }
         Ok(())
@@ -872,10 +1118,8 @@ impl AggregateState {
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             (Self::SumFloat(sum), Self::SumFloat(partial)) => {
-                *sum += partial;
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
-                }
+                sum.merge(partial)
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Float64)".to_owned()))?;
             }
             (Self::Min(current), Self::Min(partial)) => {
                 if let Some(partial) = partial {
@@ -918,13 +1162,11 @@ impl AggregateState {
                     count: partial_count,
                 },
             ) => {
-                *sum += partial_sum;
+                sum.merge(partial_sum)
+                    .ok_or_else(|| Error::NumericOverflow("AVG(Float64) sum".to_owned()))?;
                 *count = count
                     .checked_add(partial_count)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
-                }
             }
             _ => unreachable!("aggregate states for one specification have the same variant"),
         }
@@ -937,12 +1179,18 @@ impl AggregateState {
             Self::SumInt(value) => i64::try_from(value)
                 .map(Value::Int64)
                 .map_err(|_| Error::NumericOverflow("SUM(Int64)".to_owned())),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::SumFloat(value) => value
+                .finish(1)
+                .map(Value::Float64)
+                .ok_or_else(|| Error::NumericOverflow("SUM(Float64)".to_owned())),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
-            Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
+            Self::AvgFloat { sum, count } if count > 0 => sum
+                .finish(count)
+                .map(Value::Float64)
+                .ok_or_else(|| Error::NumericOverflow("AVG(Float64) sum".to_owned())),
             Self::Min(None) => Err(Error::InvalidQuery(
                 "MIN is undefined for an empty input".to_owned(),
             )),
@@ -1428,5 +1676,72 @@ mod tests {
                 "cross-morsel cancellation failed with {worker_count} workers"
             );
         }
+    }
+
+    #[test]
+    fn float_sum_and_avg_allow_cancellation_across_morsel_boundaries() {
+        let row_count = SCAN_MORSEL_ROWS + 2;
+        let mut database = Database::with_worker_count(1).expect("valid worker count");
+        database
+            .execute("CREATE TABLE float_cancellation (value Float64);")
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("float_cancellation")
+            .expect("table exists");
+        for row in 0..row_count {
+            let value = match row {
+                0 => -1e308,
+                value if value == SCAN_MORSEL_ROWS => 1e308,
+                value if value == SCAN_MORSEL_ROWS + 1 => 1e308,
+                _ => 0.0,
+            };
+            table
+                .insert_row(vec![Value::Float64(value)])
+                .expect("generated row is valid");
+        }
+
+        let expected = vec![vec![
+            Value::Float64(1e308),
+            Value::Float64(1e308 / row_count as f64),
+        ]];
+        for worker_count in [1, 4] {
+            database
+                .set_worker_count(worker_count)
+                .expect("valid worker count");
+            assert_eq!(
+                query(
+                    &mut database,
+                    "SELECT SUM(value), AVG(value) FROM float_cancellation;"
+                )
+                .rows,
+                expected,
+                "cross-morsel cancellation failed with {worker_count} workers"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_float_accumulator_handles_large_averages_and_subnormal_rounding() {
+        let mut large = ExactFloatSum::new();
+        large.add(f64::MAX).expect("finite value");
+        large.add(f64::MAX).expect("finite value");
+        assert_eq!(large.finish(2), Some(f64::MAX));
+
+        let mut overflow = ExactFloatSum::new();
+        overflow.add(f64::MAX).expect("finite value");
+        overflow.add(f64::MAX).expect("finite value");
+        assert_eq!(overflow.finish(1), None);
+
+        let smallest = f64::from_bits(1);
+        let mut rounds_to_even_zero = ExactFloatSum::new();
+        rounds_to_even_zero.add(smallest).expect("finite value");
+        assert_eq!(rounds_to_even_zero.finish(2), Some(0.0));
+
+        let mut rounds_to_even_two = ExactFloatSum::new();
+        for _ in 0..3 {
+            rounds_to_even_two.add(smallest).expect("finite value");
+        }
+        assert_eq!(rounds_to_even_two.finish(2), Some(f64::from_bits(2)));
     }
 }
