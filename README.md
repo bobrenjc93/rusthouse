@@ -38,10 +38,12 @@ Transactions pin an immutable catalog generation. Reads use that generation plus
 session's staged table replacements, so readers remain stable and writers read their
 own changes. Commit checks every written table against the pinned generation. Changes
 to the same table conflict; changes to disjoint tables merge into a new generation.
-A conflict ends the transaction, while a persistence error keeps it active for retry.
+A conflict ends the transaction, while a pre-publication persistence error keeps it
+active for retry. Durability uncertainty ends it because the generation is visible.
 
-`TransactionLimits` bounds cumulative inserted rows and the estimated encoded bytes of
-staged DDL/DML. A statement that would exceed either limit has no effect and leaves an
+`TransactionLimits` bounds cumulative inserted rows and encoded staged DDL/DML bytes.
+CREATE accounting includes every persisted string length prefix, name, type,
+nullability flag, column count, and row-count field. A statement that would exceed either limit has no effect and leaves an
 explicit transaction active. The defaults are 1,000,000 rows and 256 MiB.
 
 `Database::open` persists each committed generation with a checksum and format version.
@@ -51,8 +53,8 @@ path has one exclusive in-process or cross-process owner; a second `Database::op
 returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are dropped.
 Locks use a reserved `.rusthouse-lock` namespace; database paths ending in that suffix
 are rejected so no database can replace another database's active lock inode. Lock
-files are opened without following symlinks and must resolve to the inode opened by the
-handle. The database parent directory must already exist; RustHouse never creates a
+files are opened without following symlinks and, after locking, must resolve to the same
+native file identity as the opened handle. The database parent directory must already exist; RustHouse never creates a
 directory tree whose ancestor entries fall outside its durability barrier.
 Candidates and recovery backups use the reserved `.rusthouse-tmp.` filename prefix,
 which `Database::open` also rejects after canonicalizing the path. A concurrent database
@@ -70,7 +72,10 @@ first publication; the synced temp handle is closed before either native operati
 Windows never attempts POSIX directory syncing. `ReplaceFileW` receives
 a unique backup path. On its partial-move error, RustHouse restores the old snapshot
 first, otherwise publishes the candidate, and retains both recovery files if neither
-operation succeeds. Generic error cleanup therefore never deletes the only snapshot.
+operation succeeds. Because `ReplaceFileW` has no supported write-through metadata
+barrier, successful existing-file replacement returns `CommitDurabilityUncertain` while
+keeping the published generation installed in memory. Generic error cleanup therefore
+never deletes the only snapshot.
 
 `Database::execute` is only for one-shot autocommit DDL, DML, and queries. Transaction
 control requires a persistent session returned by `Database::session`.

@@ -180,6 +180,27 @@ fn transaction_limits_are_cumulative_and_failed_statement_is_atomic() {
 }
 
 #[test]
+fn ddl_byte_limit_counts_the_complete_encoded_schema() {
+    let too_small = Database::with_limits(TransactionLimits::new(0, 35));
+    assert!(matches!(
+        too_small.execute("CREATE TABLE t (a Int64)"),
+        Err(Error::TransactionLimitExceeded {
+            kind: LimitKind::Bytes,
+            limit: 35,
+            attempted: 36,
+        })
+    ));
+    assert_eq!(too_small.current_generation().unwrap(), 0);
+
+    let exact = Database::with_limits(TransactionLimits::new(0, 36));
+    assert!(matches!(
+        exact.execute("CREATE TABLE t (a Int64)"),
+        Ok(StatementResult::TableCreated)
+    ));
+    assert_eq!(exact.current_generation().unwrap(), 1);
+}
+
+#[test]
 fn invalid_insert_does_not_modify_transaction() {
     let database = Database::new();
     database

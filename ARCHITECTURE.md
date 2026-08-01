@@ -21,7 +21,8 @@ Persistent databases encode a complete catalog generation in a versioned, checks
 snapshot. Publication uses a synced temporary file, atomic rename, and parent-directory
 sync. A canonical-path sidecar lock in a reserved filename namespace gives one database
 handle exclusive ownership across processes. Lock opens do not follow symlinks and
-validate the opened regular-file identity. Database parent directories must preexist,
+acquire the advisory lock before comparing the opened regular-file identity with the
+current path using native file IDs. Database parent directories must preexist,
 so publication only needs to sync the directory containing the snapshot. Temporary candidates and backups use a
 separate reserved filename prefix that cannot be opened as a database. Encoding validates the same table, column, row, string, and total-allocation
 bounds that decoding enforces. The decoder charges raw bytes, catalog/map nodes, table
@@ -34,7 +35,9 @@ advanced, preventing a published generation from being retried as an active tran
 native replacement calls: `ReplaceFileW` retains security metadata for existing files,
 while `MoveFileExW` provides write-through first publication without an invalid
 directory-sync step. The temp handle is closed before these calls so Windows can obtain
-the required unshared access. Replacement always supplies a unique backup name; documented
+the required unshared access. Since `ReplaceFileW` lacks a supported metadata durability
+barrier, a successful existing-file replacement advances memory but returns a
+durability-uncertain error. Replacement always supplies a unique backup name; documented
 partial-move failures restore the old file, fall back to publishing the candidate, or
 retain both artifacts and report manual recovery rather than deleting either snapshot.
 

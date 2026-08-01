@@ -479,8 +479,8 @@ fn arrange_rows(
 fn estimate_schema_bytes(name: &str, columns: &[ColumnDef]) -> usize {
     columns
         .iter()
-        .fold(name.len().saturating_add(16), |total, column| {
-            total.saturating_add(column.name.len()).saturating_add(2)
+        .fold(name.len().saturating_add(24), |total, column| {
+            total.saturating_add(column.name.len()).saturating_add(10)
         })
 }
 

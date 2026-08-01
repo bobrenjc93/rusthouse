@@ -326,9 +326,11 @@ fn windows_native_replacement_publishes_repeated_commits() {
     database
         .execute("CREATE TABLE windows_data (id Int64)")
         .unwrap();
-    database
-        .execute("INSERT INTO windows_data VALUES (1)")
-        .unwrap();
+    assert!(matches!(
+        database.execute("INSERT INTO windows_data VALUES (1)"),
+        Err(Error::CommitDurabilityUncertain { generation: 2, .. })
+    ));
+    assert_eq!(database.current_generation().unwrap(), 2);
     drop(database);
 
     let reopened = Database::open(&path).unwrap();

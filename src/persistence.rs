@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 #[cfg(all(test, unix))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +29,8 @@ const TEMP_PREFIX: &str = ".rusthouse-tmp.";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, unix))]
 static FAIL_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static REPLACE_LOCK_BEFORE_ACQUIRE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Debug)]
 pub(crate) enum StoreStatus {
@@ -60,14 +64,8 @@ impl Persistence {
         let mut lock_name = path.as_os_str().to_os_string();
         lock_name.push(LOCK_SUFFIX);
         let lock_path = PathBuf::from(lock_name);
-        let lock = open_database_lock(&lock_path)?;
-        match lock.try_lock() {
-            Ok(()) => Ok(Self { path, _lock: lock }),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                Err(Error::DatabaseAlreadyOpen(path.display().to_string()))
-            }
-            Err(std::fs::TryLockError::Error(error)) => Err(Error::io("lock database", error)),
-        }
+        let lock = open_database_lock(&lock_path, &path)?;
+        Ok(Self { path, _lock: lock })
     }
 
     pub(crate) fn load(&self) -> Result<CatalogGeneration> {
@@ -127,7 +125,7 @@ impl Persistence {
     }
 }
 
-fn open_database_lock(path: &Path) -> Result<File> {
+fn open_database_lock(path: &Path, database_path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -154,6 +152,31 @@ fn open_database_lock(path: &Path) -> Result<File> {
     let metadata = file
         .metadata()
         .map_err(|error| Error::io("inspect database lock", error))?;
+
+    #[cfg(test)]
+    {
+        let mut replacement = REPLACE_LOCK_BEFORE_ACQUIRE
+            .lock()
+            .expect("lock replacement test hook must not be poisoned");
+        if replacement.as_deref() == Some(path) {
+            *replacement = None;
+            fs::remove_file(path).map_err(|error| Error::io("inject lock replacement", error))?;
+            File::create(path).map_err(|error| Error::io("inject lock replacement", error))?;
+        }
+    }
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(Error::DatabaseAlreadyOpen(
+                database_path.display().to_string(),
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(Error::io("lock database", error));
+        }
+    }
+
     let path_metadata = fs::symlink_metadata(path)
         .map_err(|error| Error::io("inspect database lock path", error))?;
     if !metadata.is_file() || !path_metadata.is_file() || path_metadata.file_type().is_symlink() {
@@ -163,6 +186,12 @@ fn open_database_lock(path: &Path) -> Result<File> {
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+            return Err(Error::UnsafeLockPath(path.display().to_string()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !windows::same_file(&file, path)? {
             return Err(Error::UnsafeLockPath(path.display().to_string()));
         }
     }
@@ -337,6 +366,15 @@ fn windows_replacement_relocated_original(error_code: i32) -> bool {
 }
 
 #[cfg(any(test, windows))]
+fn windows_existing_replacement_status() -> StoreStatus {
+    StoreStatus::PublishedWithError(Error::Io {
+        operation: "durably replace Windows snapshot",
+        message: "ReplaceFileW published the snapshot, but Windows provides no supported write-through metadata barrier"
+            .to_owned(),
+    })
+}
+
+#[cfg(any(test, windows))]
 fn recover_relocated_windows_snapshot<R, P>(restore: R, publish: P) -> WindowsRecoveryOutcome
 where
     R: FnOnce() -> std::io::Result<()>,
@@ -357,24 +395,52 @@ where
 #[cfg(windows)]
 mod windows {
     use std::ffi::c_void;
-    use std::fs;
+    use std::fs::{self, File, OpenOptions};
     use std::io;
+    use std::mem::MaybeUninit;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::ptr;
 
     use super::{
         StoreStatus, WindowsRecoveryOutcome, recover_relocated_windows_snapshot,
-        windows_replacement_relocated_original,
+        windows_existing_replacement_status, windows_replacement_relocated_original,
     };
     use crate::error::{Error, Result};
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    #[repr(C)]
+    struct FileTime {
+        low_date_time: u32,
+        high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
 
     #[link(name = "Kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
         fn ReplaceFileW(
             replaced: *const u16,
             replacement: *const u16,
@@ -383,6 +449,44 @@ mod windows {
             exclude: *mut c_void,
             reserved: *mut c_void,
         ) -> i32;
+    }
+
+    pub(super) fn same_file(opened: &File, path: &Path) -> Result<bool> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let current = match options.open(path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        if current
+            .metadata()
+            .map_err(|error| Error::io("inspect database lock path", error))?
+            .file_type()
+            .is_symlink()
+        {
+            return Ok(false);
+        }
+        Ok(file_identity(opened)? == file_identity(&current)?)
+    }
+
+    fn file_identity(file: &File) -> Result<(u32, u64)> {
+        let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+        // The handle is live and the output points to storage for the documented C struct.
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+        if succeeded == 0 {
+            return Err(Error::io(
+                "inspect database lock identity",
+                io::Error::last_os_error(),
+            ));
+        }
+        // GetFileInformationByHandle initializes the structure when it succeeds.
+        let information = unsafe { information.assume_init() };
+        let file_index =
+            (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+        Ok((information.volume_serial_number, file_index))
     }
 
     pub(super) fn replace_snapshot(
@@ -408,7 +512,7 @@ mod windows {
             };
             if replaced != 0 {
                 let _ = fs::remove_file(&backup_path);
-                return Ok(StoreStatus::Durable);
+                return Ok(windows_existing_replacement_status());
             }
             let error = io::Error::last_os_error();
             if error
@@ -1150,6 +1254,29 @@ mod tests {
     }
 
     #[test]
+    fn lock_replacement_between_open_and_acquire_is_rejected() {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let database = std::env::temp_dir().join(format!(
+            "rusthouse-lock-race-{}-{sequence}.db",
+            std::process::id()
+        ));
+        let normalized = normalize_path(&database).unwrap();
+        let mut lock_name = normalized.as_os_str().to_os_string();
+        lock_name.push(LOCK_SUFFIX);
+        let lock = PathBuf::from(lock_name);
+        *REPLACE_LOCK_BEFORE_ACQUIRE
+            .lock()
+            .expect("lock replacement test hook must not be poisoned") = Some(lock.clone());
+
+        assert!(matches!(
+            Persistence::acquire(database.clone()),
+            Err(Error::UnsafeLockPath(_))
+        ));
+        let _ = fs::remove_file(lock);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
     fn wide_zero_row_tables_exhaust_metadata_budget_before_allocation() {
         let mut decoder = Decoder::with_allocation(&[], 0).unwrap();
         let metadata = table_metadata_allocation(MAX_COLUMNS_PER_TABLE);
@@ -1195,6 +1322,14 @@ mod tests {
     fn windows_partial_replace_error_codes_have_safe_layouts() {
         assert!(!windows_replacement_relocated_original(1176));
         assert!(windows_replacement_relocated_original(1177));
+    }
+
+    #[test]
+    fn windows_existing_replacement_is_not_acknowledged_durable() {
+        let StoreStatus::PublishedWithError(error) = windows_existing_replacement_status() else {
+            panic!("existing Windows replacement must report uncertain durability");
+        };
+        assert!(error.to_string().contains("no supported write-through"));
     }
 
     #[test]
