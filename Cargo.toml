@@ -1,0 +1,9 @@
+[package]
+name = "rusthouse"
+version = "0.1.0"
+edition = "2024"
+description = "A small, understandable analytical database written in Rust"
+license = "MIT"
+repository = "https://github.com/bobrenjc93/rusthouse"
+
+[dependencies]
