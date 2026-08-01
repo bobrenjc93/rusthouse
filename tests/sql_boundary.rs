@@ -278,3 +278,63 @@ fn order_and_group_positions_must_reference_the_select_list() {
         assert!(engine.execute(query).is_err(), "accepted: {query}");
     }
 }
+
+#[test]
+fn group_by_keys_obey_expression_and_work_cell_limits() {
+    let mut engine = Engine::new();
+    engine
+        .execute(&format!(
+            "CREATE TABLE grouped (id Int64); INSERT INTO grouped VALUES {};",
+            (0..1000)
+                .map(|value| format!("({value})"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .unwrap();
+
+    let too_many = std::iter::repeat_n("id", 1025)
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = engine
+        .execute(&format!("SELECT count(*) FROM grouped GROUP BY {too_many}"))
+        .unwrap_err();
+    assert!(error.message().contains("GROUP BY expression limit"));
+
+    let too_much_work = std::iter::repeat_n("id", 1001)
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = engine
+        .execute(&format!(
+            "SELECT count(*) FROM grouped GROUP BY {too_much_work}"
+        ))
+        .unwrap_err();
+    assert!(error.message().contains("GROUP BY key cell limit"));
+}
+
+#[test]
+fn unquoted_identifiers_are_ascii_and_quoted_identifiers_allow_unicode() {
+    let upper_a_umlaut = '\u{00c4}';
+    let lower_a_umlaut = '\u{00e4}';
+    let e_acute = '\u{00e9}';
+
+    let mut engine = Engine::new();
+    let error = engine
+        .execute(&format!("CREATE TABLE {upper_a_umlaut} (x Int64)"))
+        .unwrap_err();
+    assert!(error.message().contains("unexpected character"));
+
+    let result = engine
+        .execute(&format!(
+            "CREATE TABLE \"{upper_a_umlaut}\" (\"{e_acute}\" Int64); \
+             INSERT INTO \"{upper_a_umlaut}\" VALUES (7); \
+             SELECT \"{e_acute}\" FROM \"{upper_a_umlaut}\";"
+        ))
+        .unwrap()
+        .remove(0);
+    assert_eq!(result.rows, vec![vec![Value::Int64(7)]]);
+
+    let error = engine
+        .execute(&format!("INSERT INTO \"{lower_a_umlaut}\" VALUES (8)"))
+        .unwrap_err();
+    assert!(error.message().contains("unknown table"));
+}

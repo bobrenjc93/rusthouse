@@ -377,11 +377,11 @@ impl<'a> Lexer<'a> {
 }
 
 fn is_identifier_start(character: char) -> bool {
-    character == '_' || character.is_alphabetic()
+    character == '_' || character.is_ascii_alphabetic()
 }
 
 fn is_identifier_continue(character: char) -> bool {
-    character == '_' || character.is_alphanumeric()
+    character == '_' || character.is_ascii_alphanumeric()
 }
 
 struct Parser {

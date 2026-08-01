@@ -10,6 +10,9 @@ use crate::storage::{Catalog, DataType, Table, Value, canonical};
 
 const MAX_RESULT_ROWS: usize = 1_000_000;
 const MAX_RESULT_CELLS: usize = 10_000_000;
+const MAX_GROUP_BY_EXPRESSIONS: usize = 1_024;
+const MAX_GROUP_KEY_CELLS: usize = 1_000_000;
+const MAX_GROUP_KEY_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(not(test))]
 const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
@@ -41,6 +44,7 @@ impl Engine {
     pub fn execute(&mut self, sql: &str) -> std::result::Result<Vec<QueryResult>, crate::Error> {
         let statements = crate::sql::parse(sql)?;
         let mut results = Vec::new();
+        let mut retained_result_bytes = 0usize;
         for statement in statements {
             match statement {
                 Statement::Create(statement) => self.catalog.create(statement)?,
@@ -53,7 +57,18 @@ impl Engine {
                     self.catalog
                         .insert(&statement.table, statement.columns.as_deref(), rows)?;
                 }
-                Statement::Select(statement) => results.push(self.select(statement)?),
+                Statement::Select(statement) => {
+                    let result = self.select(statement)?;
+                    retained_result_bytes = retained_result_bytes
+                        .checked_add(query_result_size(&result)?)
+                        .ok_or_else(result_byte_limit_error)?;
+                    if retained_result_bytes > MAX_RESULT_BYTES {
+                        return Err(Error::new(format!(
+                            "cumulative result byte limit exceeded (maximum {MAX_RESULT_BYTES} bytes)"
+                        )));
+                    }
+                    results.push(result);
+                }
             }
         }
         Ok(results)
@@ -64,6 +79,11 @@ impl Engine {
         select.items = expand_wildcards(select.items, table)?;
         if select.items.is_empty() {
             return Err(Error::new("SELECT list cannot be empty"));
+        }
+        if select.group_by.len() > MAX_GROUP_BY_EXPRESSIONS {
+            return Err(Error::new(format!(
+                "GROUP BY expression limit exceeded (maximum {MAX_GROUP_BY_EXPRESSIONS})"
+            )));
         }
         let aliases = select_aliases(&select.items)?;
         normalize_group_by(&mut select, table, &aliases)?;
@@ -261,6 +281,29 @@ fn value_size(value: &Value) -> usize {
             Value::String(value) => value.len(),
             _ => 0,
         }
+}
+
+fn query_result_size(result: &QueryResult) -> Result<usize> {
+    let mut total = std::mem::size_of::<QueryResult>();
+    let column_storage = result
+        .columns
+        .len()
+        .checked_mul(std::mem::size_of::<String>())
+        .ok_or_else(result_byte_limit_error)?;
+    total = checked_size_sum(total, column_storage)?;
+    for column in &result.columns {
+        total = checked_size_sum(total, column.len())?;
+    }
+    let row_storage = result
+        .rows
+        .len()
+        .checked_mul(std::mem::size_of::<Vec<Value>>())
+        .ok_or_else(result_byte_limit_error)?;
+    total = checked_size_sum(total, row_storage)?;
+    for row in &result.rows {
+        total = checked_size_sum(total, values_size(row))?;
+    }
+    Ok(total)
 }
 
 fn check_result_size(rows: usize, columns: usize) -> Result<()> {
@@ -683,10 +726,39 @@ fn build_groups(table: &Table, group_by: &[Expr], rows: Vec<usize>) -> Result<Ve
     if group_by.is_empty() {
         return Ok(vec![rows]);
     }
+    if group_by.len() > MAX_GROUP_BY_EXPRESSIONS {
+        return Err(Error::new(format!(
+            "GROUP BY expression limit exceeded (maximum {MAX_GROUP_BY_EXPRESSIONS})"
+        )));
+    }
+    let key_cells = rows
+        .len()
+        .checked_mul(group_by.len())
+        .ok_or_else(|| Error::new("GROUP BY key cell count overflow"))?;
+    if key_cells > MAX_GROUP_KEY_CELLS {
+        return Err(Error::new(format!(
+            "GROUP BY key cell limit exceeded (maximum {MAX_GROUP_KEY_CELLS})"
+        )));
+    }
     let mut indexes = HashMap::<Vec<ValueKey>, usize>::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut key_bytes = 0usize;
     for row in rows {
         let context = EvalContext::row(table, row);
+        let row_bytes = group_by.iter().try_fold(
+            std::mem::size_of::<Vec<ValueKey>>() + std::mem::size_of::<usize>(),
+            |total, expression| {
+                checked_size_sum(total, estimate_expression_size(expression, &context, None)?)
+            },
+        )?;
+        key_bytes = key_bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| Error::new("GROUP BY key byte count overflow"))?;
+        if key_bytes > MAX_GROUP_KEY_BYTES {
+            return Err(Error::new(format!(
+                "GROUP BY key byte limit exceeded (maximum {MAX_GROUP_KEY_BYTES} bytes)"
+            )));
+        }
         let key = group_by
             .iter()
             .map(|expression| eval(expression, &context, None).map(ValueKey::from))

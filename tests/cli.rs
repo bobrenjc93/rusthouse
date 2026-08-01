@@ -167,3 +167,24 @@ fn json_rejects_duplicate_projected_names() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn repeated_selects_share_a_cumulative_result_budget() {
+    let value = "x".repeat(1024 * 1024);
+    let selects = std::iter::repeat_n("SELECT payload FROM retained;", 70)
+        .collect::<Vec<_>>()
+        .join("");
+    let sql = format!(
+        "CREATE TABLE retained (payload String); \
+         INSERT INTO retained VALUES ('{value}'); \
+         {selects}"
+    );
+    let output = run_cli(&[], &sql);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cumulative result byte limit"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -44,7 +44,7 @@ cargo run -- --help
 
 ## SQL notes
 
-Unquoted names and SQL keywords are case-insensitive. Strings use single quotes and escape a quote by doubling it (`'it''s'`). Aggregates ignore NULL values except `COUNT(*)`; a comparison involving NULL is unknown and therefore does not pass `WHERE` or `HAVING`. INSERT validates a complete batch before changing any column.
+Unquoted names start with an ASCII letter or underscore, continue with ASCII letters, digits, or underscores, and are case-insensitive; quote identifiers with double quotes or backticks when Unicode is needed. Strings use single quotes and escape a quote by doubling it (`'it''s'`). Aggregates ignore NULL values except `COUNT(*)`; a comparison involving NULL is unknown and therefore does not pass `WHERE` or `HAVING`. INSERT validates a complete batch before changing any column.
 
 The SQL surface is intentionally focused. It does not currently include joins, subqueries, casts, UPDATE/DELETE, persistent tables, or server protocols.
 

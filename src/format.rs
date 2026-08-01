@@ -174,17 +174,22 @@ fn json_size(result: &QueryResult) -> Result<usize> {
     )?;
     for row in &result.rows {
         for value in row {
-            total = checked_output_add(total, json_value_size(value))?;
+            total = checked_output_add(total, json_value_size(value)?)?;
         }
     }
     Ok(total)
 }
 
-fn json_value_size(value: &Value) -> usize {
-    match value {
+fn json_value_size(value: &Value) -> Result<usize> {
+    Ok(match value {
         Value::Null => 4,
         Value::Int64(value) => value.to_string().len(),
-        Value::Float64(value) => value.to_string().len(),
+        Value::Float64(value) if value.is_finite() => value.to_string().len(),
+        Value::Float64(_) => {
+            return Err(Error::new(
+                "JSON output cannot encode non-finite Float64 values",
+            ));
+        }
         Value::Bool(value) => {
             if *value {
                 4
@@ -193,7 +198,7 @@ fn json_value_size(value: &Value) -> usize {
             }
         }
         Value::String(value) => json_string_size(value),
-    }
+    })
 }
 
 fn json_string_size(value: &str) -> usize {
@@ -302,5 +307,18 @@ mod tests {
         };
         let error = render(&result, OutputFormat::Json).unwrap_err();
         assert!(error.message().contains("encoded output limit"));
+    }
+
+    #[test]
+    fn rejects_non_finite_public_values_in_json() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = QueryResult {
+                columns: vec!["value".to_owned()],
+                rows: vec![vec![Value::Float64(value)]],
+            };
+            let error = render(&result, OutputFormat::Json).unwrap_err();
+            assert!(error.message().contains("non-finite Float64"));
+            assert!(render(&result, OutputFormat::Csv).is_ok());
+        }
     }
 }
