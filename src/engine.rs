@@ -759,7 +759,7 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
+    SumInt(i128),
     SumFloat(f64),
     Min(Option<Value>),
     Max(Option<Value>),
@@ -795,7 +795,7 @@ impl AggregateState {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
+                    .checked_add(i128::from(values[row]))
                     .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
             }
             Self::SumFloat(sum) => {
@@ -933,7 +933,10 @@ impl AggregateState {
 
     fn finish(self) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt(value) => i64::try_from(value)
+                .map(Value::Int64)
+                .map_err(|_| Error::NumericOverflow("SUM(Int64)".to_owned())),
             Self::SumFloat(value) => Ok(Value::Float64(value)),
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
@@ -1341,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_aggregate_overflow_is_propagated_from_workers_and_merges() {
+    fn parallel_aggregate_overflow_is_reported_after_morsel_merging() {
         let row_count = SCAN_MORSEL_ROWS * 3;
         let mut database = Database::with_worker_count(4).expect("valid worker count");
         database
@@ -1377,7 +1380,7 @@ mod tests {
 
         let worker_error = database
             .execute("SELECT SUM(local_value) FROM overflow_data;")
-            .expect_err("overflow inside a worker morsel is returned");
+            .expect_err("an unrepresentable morsel total is rejected");
         assert_eq!(
             worker_error,
             Error::NumericOverflow("SUM(Int64)".to_owned())
@@ -1388,7 +1391,42 @@ mod tests {
                 "SELECT group_key, SUM(merge_value)
                  FROM overflow_data GROUP BY group_key;",
             )
-            .expect_err("overflow while merging adjacent morsels is returned");
+            .expect_err("an unrepresentable cross-morsel total is rejected");
         assert_eq!(merge_error, Error::NumericOverflow("SUM(Int64)".to_owned()));
+    }
+
+    #[test]
+    fn int_sum_allows_cancellation_across_morsel_boundaries() {
+        let row_count = SCAN_MORSEL_ROWS * 2;
+        let mut database = Database::with_worker_count(1).expect("valid worker count");
+        database
+            .execute("CREATE TABLE cancellation (value Int64);")
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("cancellation")
+            .expect("table exists");
+        for row in 0..row_count {
+            let value = match row {
+                0 => i64::MIN,
+                value if value == SCAN_MORSEL_ROWS => i64::MAX,
+                value if value == SCAN_MORSEL_ROWS + 1 => 1,
+                _ => 0,
+            };
+            table
+                .insert_row(vec![Value::Int64(value)])
+                .expect("generated row is valid");
+        }
+
+        for worker_count in [1, 4] {
+            database
+                .set_worker_count(worker_count)
+                .expect("valid worker count");
+            assert_eq!(
+                query(&mut database, "SELECT SUM(value) FROM cancellation;").rows,
+                vec![vec![Value::Int64(0)]],
+                "cross-morsel cancellation failed with {worker_count} workers"
+            );
+        }
     }
 }
