@@ -218,6 +218,27 @@ fn case_and_coalesce_are_lazy_and_null_aware() {
 }
 
 #[test]
+fn direct_ast_function_names_are_case_insensitive() {
+    let expression = Expr::Function {
+        name: "COALESCE".to_owned(),
+        arguments: vec![Expr::Literal(Value::Null), Expr::Literal(Value::Int64(7))],
+    };
+    assert_eq!(
+        expression.evaluate(&EvaluationContext::new()).unwrap(),
+        Value::Int64(7)
+    );
+
+    let expression = Expr::Function {
+        name: "LoWeR".to_owned(),
+        arguments: vec![Expr::Literal(Value::String("SQL".to_owned()))],
+    };
+    assert_eq!(
+        expression.evaluate(&EvaluationContext::new()).unwrap(),
+        Value::String("sql".to_owned())
+    );
+}
+
+#[test]
 fn core_string_functions_are_unicode_aware() {
     assert_eq!(eval("length('é🙂')"), 2_i64.into());
     assert_eq!(eval("char_length('rust')"), 4_i64.into());
@@ -276,6 +297,23 @@ fn quoted_identifiers_are_never_reclassified_as_keywords() {
 }
 
 #[test]
+fn quoted_identifier_bindings_preserve_exact_case_collisions() {
+    let mut context = EvaluationContext::new();
+    assert_eq!(context.insert("Foo", 1_i64), None);
+    assert_eq!(context.insert("foo", 2_i64), None);
+
+    assert_eq!(evaluate("\"Foo\"", &context).unwrap(), 1_i64.into());
+    assert_eq!(evaluate("\"foo\"", &context).unwrap(), 2_i64.into());
+    assert_eq!(evaluate("FOO", &context).unwrap(), 2_i64.into());
+    assert_eq!(context.get_quoted("Foo"), Some(&Value::Int64(1)));
+    assert_eq!(context.get_quoted("foo"), Some(&Value::Int64(2)));
+
+    assert_eq!(context.insert("Foo", 3_i64), Some(Value::Int64(1)));
+    assert_eq!(evaluate("\"Foo\"", &context).unwrap(), 3_i64.into());
+    assert_eq!(evaluate("foo", &context).unwrap(), 2_i64.into());
+}
+
+#[test]
 fn excessive_expression_depth_returns_an_error_instead_of_overflowing_the_stack() {
     let allowed = format!("{}1", "+".repeat(MAX_EXPRESSION_DEPTH - 1));
     assert_eq!(
@@ -314,6 +352,44 @@ fn excessive_expression_depth_returns_an_error_instead_of_overflowing_the_stack(
             limit: MAX_EXPRESSION_DEPTH
         })
     );
+}
+
+#[test]
+fn over_depth_direct_ast_cleanup_is_stack_safe_in_a_subprocess() {
+    const CHILD_MARKER: &str = "RUSTHOUSE_DEEP_DROP_CHILD_MARKER";
+    if let Some(marker) = std::env::var_os(CHILD_MARKER) {
+        let mut expression = Expr::Literal(Value::Int64(1));
+        for _ in 0..100_000 {
+            expression = Expr::Unary {
+                operator: UnaryOperator::Plus,
+                expression: Box::new(expression),
+            };
+        }
+        assert_eq!(
+            expression.evaluate(&EvaluationContext::new()),
+            Err(Error::ExpressionTooDeep {
+                limit: MAX_EXPRESSION_DEPTH
+            })
+        );
+        drop(expression);
+        std::fs::write(marker, b"completed").unwrap();
+        return;
+    }
+
+    let marker = std::env::temp_dir().join(format!("rusthouse-deep-drop-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "over_depth_direct_ast_cleanup_is_stack_safe_in_a_subprocess",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, &marker)
+        .status()
+        .unwrap();
+    assert!(status.success(), "deep-AST child exited with {status}");
+    assert!(marker.exists(), "deep-AST child test did not execute");
+    std::fs::remove_file(marker).unwrap();
 }
 
 #[test]

@@ -7,7 +7,8 @@ does not panic for data-dependent failures.
 Parsed and directly constructed expressions have a maximum depth of
 `MAX_EXPRESSION_DEPTH` (currently 128). The parser guards recursive syntax and
 left-deep operator chains, and evaluation checks the AST iteratively before
-descending. Deeper input returns `Error::ExpressionTooDeep`.
+descending. Deeper input returns `Error::ExpressionTooDeep`, and direct ASTs
+are destroyed iteratively so rejecting them cannot overflow the call stack.
 
 ## Values and NULL
 
@@ -25,6 +26,9 @@ when any required input is `NULL`. The exceptions are:
 
 Double-quoted names are identifiers even when their contents are keywords, so
 `"NULL"`, `"TRUE"`, and `"CASE"` refer to columns rather than SQL syntax.
+Quoted bindings are resolved with exact case; unquoted bindings use ASCII
+case-folding. Public `Expr::Function` names are also ASCII case-insensitive,
+matching parsed SQL.
 
 `CASE` evaluates only conditions through the first match and its selected
 result. `COALESCE` evaluates only through its first non-NULL argument.

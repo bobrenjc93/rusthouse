@@ -34,6 +34,7 @@ pub enum BinaryOperator {
 pub enum Expr {
     Literal(Value),
     Column(String),
+    QuotedColumn(String),
     Unary {
         operator: UnaryOperator,
         expression: Box<Self>,
@@ -62,10 +63,11 @@ pub enum Expr {
     },
 }
 
-/// Case-insensitive column bindings for expression evaluation.
+/// Exact column bindings with case-folded lookup for unquoted identifiers.
 #[derive(Debug, Clone, Default)]
 pub struct EvaluationContext {
     values: BTreeMap<String, Value>,
+    unquoted_names: BTreeMap<String, String>,
 }
 
 impl EvaluationContext {
@@ -79,12 +81,26 @@ impl EvaluationContext {
     }
 
     pub fn insert(&mut self, name: impl Into<String>, value: impl Into<Value>) -> Option<Value> {
-        self.values
-            .insert(name.into().to_ascii_lowercase(), value.into())
+        let name = name.into();
+        let folded = name.to_ascii_lowercase();
+        let current_is_canonical = self
+            .unquoted_names
+            .get(&folded)
+            .is_some_and(|current| current == &folded);
+        if name == folded || !current_is_canonical {
+            self.unquoted_names.insert(folded, name.clone());
+        }
+        self.values.insert(name, value.into())
     }
 
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.values.get(&name.to_ascii_lowercase())
+        self.unquoted_names
+            .get(&name.to_ascii_lowercase())
+            .and_then(|exact_name| self.values.get(exact_name))
+    }
+
+    pub fn get_quoted(&self, name: &str) -> Option<&Value> {
+        self.values.get(name)
     }
 }
 
@@ -109,6 +125,10 @@ impl Expr {
             Self::Literal(value) => Ok(value.clone()),
             Self::Column(name) => context
                 .get(name)
+                .cloned()
+                .ok_or_else(|| Error::UnknownColumn(name.clone())),
+            Self::QuotedColumn(name) => context
+                .get_quoted(name)
                 .cloned()
                 .ok_or_else(|| Error::UnknownColumn(name.clone())),
             Self::Unary {
@@ -142,6 +162,53 @@ impl Expr {
             Self::Function { name, arguments } => evaluate_function(name, arguments, context),
         }
     }
+
+    #[allow(clippy::vec_box)] // Drop types cannot be moved out of Box safely.
+    fn take_boxed_children(&mut self, pending: &mut Vec<Box<Self>>) {
+        fn empty_expression() -> Box<Expr> {
+            Box::new(Expr::Literal(Value::Null))
+        }
+
+        match self {
+            Self::Literal(_) | Self::Column(_) | Self::QuotedColumn(_) => {}
+            Self::Unary { expression, .. }
+            | Self::IsNull { expression, .. }
+            | Self::Cast { expression, .. } => {
+                pending.push(std::mem::replace(expression, empty_expression()));
+            }
+            Self::Binary { left, right, .. } => {
+                pending.push(std::mem::replace(left, empty_expression()));
+                pending.push(std::mem::replace(right, empty_expression()));
+            }
+            Self::Case {
+                operand,
+                branches,
+                else_expression,
+            } => {
+                pending.extend(operand.take());
+                for (condition, result) in branches.drain(..) {
+                    pending.push(Box::new(condition));
+                    pending.push(Box::new(result));
+                }
+                pending.extend(else_expression.take());
+            }
+            Self::Function { arguments, .. } => {
+                pending.extend(arguments.drain(..).map(Box::new));
+            }
+        }
+    }
+}
+
+impl Drop for Expr {
+    fn drop(&mut self) {
+        // Remove recursive children before Rust's field drop glue runs so an
+        // untrusted direct AST cannot overflow the stack during cleanup.
+        let mut pending = Vec::new();
+        self.take_boxed_children(&mut pending);
+        while let Some(mut expression) = pending.pop() {
+            expression.take_boxed_children(&mut pending);
+        }
+    }
 }
 
 fn validate_expression_depth(expression: &Expr) -> Result<()> {
@@ -154,7 +221,7 @@ fn validate_expression_depth(expression: &Expr) -> Result<()> {
         }
         let child_depth = depth + 1;
         match expression {
-            Expr::Literal(_) | Expr::Column(_) => {}
+            Expr::Literal(_) | Expr::Column(_) | Expr::QuotedColumn(_) => {}
             Expr::Unary { expression, .. }
             | Expr::IsNull { expression, .. }
             | Expr::Cast { expression, .. } => pending.push((expression, child_depth)),
@@ -405,6 +472,8 @@ fn evaluate_case(
 }
 
 fn evaluate_function(name: &str, arguments: &[Expr], context: &EvaluationContext) -> Result<Value> {
+    let normalized_name = name.to_ascii_lowercase();
+    let name = normalized_name.as_str();
     match name {
         "coalesce" => {
             require_at_least(name, arguments, 1)?;
@@ -934,7 +1003,7 @@ impl Parser {
                 self.expect(TokenKind::RightParen, "expected `)`")?;
                 Ok(expression)
             }
-            TokenKind::QuotedIdentifier(name) => Ok(Expr::Column(name)),
+            TokenKind::QuotedIdentifier(name) => Ok(Expr::QuotedColumn(name)),
             TokenKind::Word(word) if word.eq_ignore_ascii_case("NULL") => {
                 Ok(Expr::Literal(Value::Null))
             }
