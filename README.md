@@ -46,7 +46,14 @@ explicit transaction active. The defaults are 1,000,000 rows and 256 MiB.
 
 `Database::open` persists each committed generation with a checksum and format version.
 It writes and syncs a temporary file, atomically renames it, and syncs the parent
-directory before publishing the generation to other sessions.
+directory before publishing the generation to other sessions. A canonical database
+path has one exclusive in-process or cross-process owner; a second `Database::open`
+returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are dropped.
+Writer-side validation guarantees every committed catalog satisfies the decoder's
+table, column, row, string, file-size, and total-allocation bounds.
+
+`Database::execute` is only for one-shot autocommit DDL, DML, and queries. Transaction
+control requires a persistent session returned by `Database::session`.
 
 The CLI uses the same session implementation. Repeat `-e` to keep several statements
 in one session, or omit it to read one statement per input line:

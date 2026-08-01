@@ -108,6 +108,24 @@ impl ColumnData {
         }
     }
 
+    fn data_type(&self) -> DataType {
+        match self {
+            Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
+            Self::Bool(_) => DataType::Bool,
+            Self::String(_) => DataType::String,
+        }
+    }
+
+    fn has_null(&self) -> bool {
+        match self {
+            Self::Int64(values) => values.iter().any(Option::is_none),
+            Self::Float64(values) => values.iter().any(Option::is_none),
+            Self::Bool(values) => values.iter().any(Option::is_none),
+            Self::String(values) => values.iter().any(Option::is_none),
+        }
+    }
+
     fn push(&mut self, value: &Value) {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(Some(*value)),
@@ -239,27 +257,32 @@ impl Table {
     }
 
     pub(crate) fn from_parts(schema: Vec<ColumnDef>, columns: Vec<ColumnData>) -> Result<Self> {
-        let empty = Self::new(schema.clone())?;
-        let row_count = columns.first().map_or(0, ColumnData::len);
-        if schema.len() != columns.len()
-            || columns.iter().any(|column| column.len() != row_count)
-            || empty
-                .columns
-                .iter()
-                .zip(&columns)
-                .any(|(expected, actual)| {
-                    !matches!(
-                        (expected, actual),
-                        (ColumnData::Int64(_), ColumnData::Int64(_))
-                            | (ColumnData::Float64(_), ColumnData::Float64(_))
-                            | (ColumnData::Bool(_), ColumnData::Bool(_))
-                            | (ColumnData::String(_), ColumnData::String(_))
-                    )
-                })
-        {
+        if schema.is_empty() || schema.len() != columns.len() {
             return Err(Error::CorruptSnapshot(
-                "table columns do not match its schema or row count".to_owned(),
+                "table columns do not match its schema".to_owned(),
             ));
+        }
+        let row_count = columns.first().map_or(0, ColumnData::len);
+        for (index, (definition, data)) in schema.iter().zip(&columns).enumerate() {
+            if definition.name.is_empty()
+                || schema[..index]
+                    .iter()
+                    .any(|existing| existing.name == definition.name)
+            {
+                return Err(Error::CorruptSnapshot(
+                    "table schema contains an empty or duplicate column name".to_owned(),
+                ));
+            }
+            if data.len() != row_count || data.data_type() != definition.data_type {
+                return Err(Error::CorruptSnapshot(
+                    "table columns do not match its schema or row count".to_owned(),
+                ));
+            }
+            if !definition.nullable && data.has_null() {
+                return Err(Error::CorruptSnapshot(
+                    "non-nullable column contains NULL".to_owned(),
+                ));
+            }
         }
         Ok(Self {
             schema,

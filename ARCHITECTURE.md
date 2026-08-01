@@ -19,7 +19,10 @@ latest catalog. This is snapshot isolation rather than full serializable isolati
 
 Persistent databases encode a complete catalog generation in a versioned, checksummed
 snapshot. Publication uses a synced temporary file, atomic rename, and parent-directory
-sync. Decoding has file-size, collection, row, string, and allocation bounds and rejects
-unknown or malformed data.
+sync. A canonical-path sidecar lock gives one database handle exclusive ownership across
+processes. Encoding validates the same table, column, row, string, and total-allocation
+bounds that decoding enforces. The decoder charges raw bytes, catalog/map nodes, table
+and `Arc` storage, schema and column vectors, strings, column values, and conservative
+allocator overhead before reserving them, and it rejects unknown or malformed data.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.

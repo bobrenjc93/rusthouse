@@ -35,6 +35,12 @@ pub enum Error {
         limit: usize,
         attempted: usize,
     },
+    SnapshotLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+        attempted: usize,
+    },
+    DatabaseAlreadyOpen(String),
     GenerationOverflow,
     CorruptSnapshot(String),
     SnapshotTooLarge {
@@ -93,6 +99,17 @@ impl fmt::Display for Error {
                 f,
                 "transaction {kind:?} limit exceeded: limit {limit}, attempted {attempted}"
             ),
+            Self::SnapshotLimitExceeded {
+                resource,
+                limit,
+                attempted,
+            } => write!(
+                f,
+                "snapshot {resource} limit exceeded: limit {limit}, attempted {attempted}"
+            ),
+            Self::DatabaseAlreadyOpen(path) => {
+                write!(f, "database is already open by another handle: {path}")
+            }
             Self::GenerationOverflow => f.write_str("catalog generation counter overflowed"),
             Self::CorruptSnapshot(message) => write!(f, "corrupt snapshot: {message}"),
             Self::SnapshotTooLarge { size, maximum } => write!(

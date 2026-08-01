@@ -104,7 +104,7 @@ impl Database {
 
     /// Opens a persisted database with explicit transaction limits.
     pub fn open_with_limits(path: impl AsRef<Path>, limits: TransactionLimits) -> Result<Self> {
-        let persistence = Persistence::new(path.as_ref().to_path_buf());
+        let persistence = Persistence::acquire(path.as_ref().to_path_buf())?;
         let generation = persistence.load()?;
         Ok(Self::from_generation(generation, Some(persistence), limits))
     }
@@ -136,7 +136,16 @@ impl Database {
 
     /// Executes one autocommit statement in a temporary session.
     pub fn execute(&self, sql: &str) -> Result<StatementResult> {
-        self.session().execute(sql)
+        let statement = parse(sql)?;
+        if matches!(
+            statement,
+            Statement::Begin | Statement::Commit | Statement::Rollback
+        ) {
+            return Err(Error::Unsupported(
+                "transaction control requires a persistent Session".to_owned(),
+            ));
+        }
+        self.session().execute_statement(statement)
     }
 
     /// Returns the current committed catalog generation.
@@ -261,7 +270,11 @@ impl Transaction {
 impl Session {
     /// Executes one SQL statement, using the active snapshot when inside a transaction.
     pub fn execute(&mut self, sql: &str) -> Result<StatementResult> {
-        match parse(sql)? {
+        self.execute_statement(parse(sql)?)
+    }
+
+    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+        match statement {
             Statement::Begin => {
                 let generation = self.begin()?;
                 Ok(StatementResult::TransactionStarted { generation })

@@ -194,3 +194,16 @@ fn invalid_insert_does_not_modify_transaction() {
     assert!(query(&mut session, "SELECT * FROM typed").is_empty());
     session.rollback().unwrap();
 }
+
+#[test]
+fn one_shot_execute_rejects_transaction_control() {
+    let database = Database::new();
+    for statement in ["BEGIN", "COMMIT", "ROLLBACK"] {
+        assert!(matches!(
+            database.execute(statement),
+            Err(Error::Unsupported(message))
+                if message.contains("persistent Session")
+        ));
+    }
+    assert_eq!(database.current_generation().unwrap(), 0);
+}

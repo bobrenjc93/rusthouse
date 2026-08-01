@@ -18,20 +18,40 @@ const MAX_TABLES: usize = 100_000;
 const MAX_COLUMNS_PER_TABLE: usize = 4_096;
 const MAX_ROWS_PER_TABLE: usize = 10_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
+const TABLE_MAP_ENTRY_ALLOCATION: usize = 512;
+const HEAP_ALLOCATION_OVERHEAD: usize = 64;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Persistence {
     path: PathBuf,
+    _lock: File,
 }
 
 impl Persistence {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
+        let path = normalize_path(&path)?;
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| Error::io("open database lock", error))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Self { path, _lock: lock }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(Error::DatabaseAlreadyOpen(path.display().to_string()))
+            }
+            Err(std::fs::TryLockError::Error(error)) => Err(Error::io("lock database", error)),
+        }
     }
 
     pub(crate) fn load(&self) -> Result<CatalogGeneration> {
-        let file = match File::open(&self.path) {
+        let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(CatalogGeneration::empty());
@@ -52,13 +72,17 @@ impl Persistence {
             size,
             maximum: MAX_SNAPSHOT_BYTES,
         })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
+        let mut bytes = vec![0; capacity];
+        file.read_exact(&mut bytes)
             .map_err(|error| Error::io("read snapshot", error))?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        let mut extra = [0];
+        if file
+            .read(&mut extra)
+            .map_err(|error| Error::io("read snapshot", error))?
+            != 0
+        {
             return Err(Error::SnapshotTooLarge {
-                size: bytes.len() as u64,
+                size: size.saturating_add(1),
                 maximum: MAX_SNAPSHOT_BYTES,
             });
         }
@@ -95,6 +119,24 @@ impl Persistence {
     }
 }
 
+fn normalize_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path).map_err(|error| Error::io("resolve database path", error));
+    }
+    let file_name = path.file_name().ok_or_else(|| Error::Io {
+        operation: "resolve database path",
+        message: "database path must name a file".to_owned(),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| Error::io("create database directory", error))?;
+    let parent =
+        fs::canonicalize(parent).map_err(|error| Error::io("resolve database directory", error))?;
+    Ok(parent.join(file_name))
+}
+
 fn write_and_replace(
     temporary: &Path,
     destination: &Path,
@@ -120,6 +162,13 @@ fn write_and_replace(
 
 fn encode_snapshot(generation: &CatalogGeneration) -> Result<Vec<u8>> {
     let payload_capacity = encoded_payload_len(generation)?;
+    let total_len = payload_capacity
+        .checked_add(HEADER_LEN)
+        .ok_or(Error::SnapshotTooLarge {
+            size: u64::MAX,
+            maximum: MAX_SNAPSHOT_BYTES,
+        })?;
+    validate_generation(generation, total_len)?;
     let mut payload = Vec::with_capacity(payload_capacity);
     put_u64(&mut payload, generation.id);
     put_len(&mut payload, generation.tables.len())?;
@@ -165,6 +214,49 @@ fn encode_snapshot(generation: &CatalogGeneration) -> Result<Vec<u8>> {
     put_u64(&mut output, checksum(&payload));
     output.extend_from_slice(&payload);
     Ok(output)
+}
+
+fn validate_generation(generation: &CatalogGeneration, encoded_bytes: usize) -> Result<()> {
+    writer_limit("table count", generation.tables.len(), MAX_TABLES)?;
+    let mut allocation = heap_allocation(encoded_bytes);
+    writer_limit("decode allocation bytes", allocation, MAX_DECODE_ALLOCATION)?;
+    charge_allocation(&mut allocation, catalog_metadata_allocation())
+        .map_err(snapshot_limit_error)?;
+
+    for (name, table) in &generation.tables {
+        writer_limit("string bytes", name.len(), MAX_STRING_BYTES)?;
+        writer_limit(
+            "columns per table",
+            table.schema().len(),
+            MAX_COLUMNS_PER_TABLE,
+        )?;
+        writer_limit("rows per table", table.row_count(), MAX_ROWS_PER_TABLE)?;
+        charge_allocation(&mut allocation, heap_allocation(name.len()))
+            .map_err(snapshot_limit_error)?;
+        charge_allocation(
+            &mut allocation,
+            table_metadata_allocation(table.schema().len()),
+        )
+        .map_err(snapshot_limit_error)?;
+
+        for column in table.schema() {
+            writer_limit("string bytes", column.name.len(), MAX_STRING_BYTES)?;
+            charge_allocation(&mut allocation, heap_allocation(column.name.len()))
+                .map_err(snapshot_limit_error)?;
+        }
+        for column in table.columns() {
+            charge_allocation(&mut allocation, column_allocation(column))
+                .map_err(snapshot_limit_error)?;
+            if let ColumnData::String(values) = column {
+                for value in values.iter().flatten() {
+                    writer_limit("string bytes", value.len(), MAX_STRING_BYTES)?;
+                    charge_allocation(&mut allocation, heap_allocation(value.len()))
+                        .map_err(snapshot_limit_error)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn encoded_payload_len(generation: &CatalogGeneration) -> Result<usize> {
@@ -213,6 +305,91 @@ fn encoded_add(total: usize, amount: usize) -> Result<usize> {
         });
     }
     Ok(total)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LimitViolation {
+    resource: &'static str,
+    limit: usize,
+    attempted: usize,
+}
+
+fn check_limit(
+    resource: &'static str,
+    attempted: usize,
+    limit: usize,
+) -> std::result::Result<(), LimitViolation> {
+    if attempted > limit {
+        Err(LimitViolation {
+            resource,
+            limit,
+            attempted,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn writer_limit(resource: &'static str, attempted: usize, limit: usize) -> Result<()> {
+    check_limit(resource, attempted, limit).map_err(snapshot_limit_error)
+}
+
+fn snapshot_limit_error(violation: LimitViolation) -> Error {
+    Error::SnapshotLimitExceeded {
+        resource: violation.resource,
+        limit: violation.limit,
+        attempted: violation.attempted,
+    }
+}
+
+fn corrupt_limit_error(violation: LimitViolation) -> Error {
+    Error::CorruptSnapshot(format!(
+        "{} {} exceeds maximum {}",
+        violation.resource, violation.attempted, violation.limit
+    ))
+}
+
+fn charge_allocation(used: &mut usize, bytes: usize) -> std::result::Result<(), LimitViolation> {
+    let attempted = used.saturating_add(bytes);
+    check_limit("decode allocation bytes", attempted, MAX_DECODE_ALLOCATION)?;
+    *used = attempted;
+    Ok(())
+}
+
+fn table_metadata_allocation(column_count: usize) -> usize {
+    TABLE_MAP_ENTRY_ALLOCATION
+        .saturating_add(heap_allocation(
+            std::mem::size_of::<Table>().saturating_add(2 * std::mem::size_of::<usize>()),
+        ))
+        .saturating_add(allocation_for::<ColumnDef>(column_count))
+        .saturating_add(allocation_for::<ColumnData>(column_count))
+}
+
+fn catalog_metadata_allocation() -> usize {
+    heap_allocation(
+        std::mem::size_of::<CatalogGeneration>().saturating_add(2 * std::mem::size_of::<usize>()),
+    )
+}
+
+fn column_allocation(column: &ColumnData) -> usize {
+    match column {
+        ColumnData::Int64(values) => allocation_for::<Option<i64>>(values.len()),
+        ColumnData::Float64(values) => allocation_for::<Option<f64>>(values.len()),
+        ColumnData::Bool(values) => allocation_for::<Option<bool>>(values.len()),
+        ColumnData::String(values) => allocation_for::<Option<String>>(values.len()),
+    }
+}
+
+fn allocation_for<T>(length: usize) -> usize {
+    heap_allocation(std::mem::size_of::<T>().saturating_mul(length))
+}
+
+fn heap_allocation(bytes: usize) -> usize {
+    if bytes == 0 {
+        0
+    } else {
+        bytes.saturating_add(HEAP_ALLOCATION_OVERHEAD)
+    }
 }
 
 fn encode_column(output: &mut Vec<u8>, column: &ColumnData) -> Result<()> {
@@ -290,23 +467,22 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogGeneration> {
         return Err(Error::CorruptSnapshot("checksum mismatch".to_owned()));
     }
 
-    let mut decoder = Decoder::new(payload);
+    let mut decoder = Decoder::with_allocation(payload, heap_allocation(bytes.len()))?;
+    decoder.reserve_allocation(catalog_metadata_allocation())?;
     let id = decoder.u64()?;
     let table_count = decoder.collection_len(1)?;
-    if table_count > MAX_TABLES {
-        return Err(Error::CorruptSnapshot(format!(
-            "table count {table_count} exceeds maximum {MAX_TABLES}"
-        )));
-    }
+    decoder.limit("table count", table_count, MAX_TABLES)?;
     let mut tables = BTreeMap::new();
     for _ in 0..table_count {
         let name = decoder.string()?;
         let column_count = decoder.collection_len(3)?;
-        if column_count == 0 || column_count > MAX_COLUMNS_PER_TABLE {
-            return Err(Error::CorruptSnapshot(format!(
-                "column count {column_count} is outside the supported range 1..={MAX_COLUMNS_PER_TABLE}"
-            )));
+        if column_count == 0 {
+            return Err(Error::CorruptSnapshot(
+                "column count must be at least one".to_owned(),
+            ));
         }
+        decoder.limit("columns per table", column_count, MAX_COLUMNS_PER_TABLE)?;
+        decoder.reserve_allocation(table_metadata_allocation(column_count))?;
         let mut schema = Vec::with_capacity(column_count);
         for _ in 0..column_count {
             let name = decoder.string()?;
@@ -337,24 +513,16 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogGeneration> {
             });
         }
         let row_count = decoder.collection_len(column_count)?;
-        if row_count > MAX_ROWS_PER_TABLE {
-            return Err(Error::CorruptSnapshot(format!(
-                "row count {row_count} exceeds maximum {MAX_ROWS_PER_TABLE}"
-            )));
-        }
+        decoder.limit("rows per table", row_count, MAX_ROWS_PER_TABLE)?;
         let mut columns = Vec::with_capacity(column_count);
         for column in &schema {
             columns.push(decoder.column(column.data_type, row_count)?);
         }
-        let table = Arc::new(
-            Table::from_parts(schema, columns)
-                .map_err(|error| Error::CorruptSnapshot(error.to_string()))?,
-        );
-        if tables.insert(name.clone(), table).is_some() {
-            return Err(Error::CorruptSnapshot(format!(
-                "duplicate table name {name}"
-            )));
+        let table = Arc::new(Table::from_parts(schema, columns)?);
+        if tables.contains_key(&name) {
+            return Err(Error::CorruptSnapshot("duplicate table name".to_owned()));
         }
+        tables.insert(name, table);
     }
     if !decoder.is_empty() {
         return Err(Error::CorruptSnapshot(
@@ -367,7 +535,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogGeneration> {
 struct Decoder<'a> {
     input: &'a [u8],
     position: usize,
-    allocation_remaining: usize,
+    allocation_used: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -375,8 +543,22 @@ impl<'a> Decoder<'a> {
         Self {
             input,
             position: 0,
-            allocation_remaining: MAX_DECODE_ALLOCATION,
+            allocation_used: 0,
         }
+    }
+
+    fn with_allocation(input: &'a [u8], allocation_used: usize) -> Result<Self> {
+        check_limit(
+            "decode allocation bytes",
+            allocation_used,
+            MAX_DECODE_ALLOCATION,
+        )
+        .map_err(corrupt_limit_error)?;
+        Ok(Self {
+            input,
+            position: 0,
+            allocation_used,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -438,26 +620,18 @@ impl<'a> Decoder<'a> {
 
     fn string(&mut self) -> Result<String> {
         let length = self.collection_len(1)?;
-        if length > MAX_STRING_BYTES {
-            return Err(Error::CorruptSnapshot(format!(
-                "string length {length} exceeds maximum {MAX_STRING_BYTES}"
-            )));
-        }
-        self.reserve_allocation(length)?;
+        self.limit("string bytes", length, MAX_STRING_BYTES)?;
+        self.reserve_allocation(heap_allocation(length))?;
         String::from_utf8(self.take(length)?.to_vec())
             .map_err(|_| Error::CorruptSnapshot("string is not valid UTF-8".to_owned()))
     }
 
     fn reserve_allocation(&mut self, bytes: usize) -> Result<()> {
-        self.allocation_remaining =
-            self.allocation_remaining
-                .checked_sub(bytes)
-                .ok_or_else(|| {
-                    Error::CorruptSnapshot(format!(
-                        "decoded data exceeds the {MAX_DECODE_ALLOCATION}-byte allocation limit"
-                    ))
-                })?;
-        Ok(())
+        charge_allocation(&mut self.allocation_used, bytes).map_err(corrupt_limit_error)
+    }
+
+    fn limit(&self, resource: &'static str, attempted: usize, limit: usize) -> Result<()> {
+        check_limit(resource, attempted, limit).map_err(corrupt_limit_error)
     }
 
     fn present(&mut self) -> Result<bool> {
@@ -536,10 +710,7 @@ impl<'a> Decoder<'a> {
     }
 
     fn reserve_column<T>(&mut self, length: usize) -> Result<()> {
-        let bytes = std::mem::size_of::<T>()
-            .checked_mul(length)
-            .ok_or_else(|| Error::CorruptSnapshot("column allocation overflowed".to_owned()))?;
-        self.reserve_allocation(bytes)
+        self.reserve_allocation(allocation_for::<T>(length))
     }
 }
 
@@ -571,4 +742,88 @@ fn checksum(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_shape_limits_are_inclusive() {
+        let decoder = Decoder::with_allocation(&[], 0).unwrap();
+        for (resource, limit) in [
+            ("table count", MAX_TABLES),
+            ("columns per table", MAX_COLUMNS_PER_TABLE),
+            ("rows per table", MAX_ROWS_PER_TABLE),
+            ("string bytes", MAX_STRING_BYTES),
+        ] {
+            assert_eq!(check_limit(resource, limit, limit), Ok(()));
+            assert!(writer_limit(resource, limit, limit).is_ok());
+            assert!(decoder.limit(resource, limit, limit).is_ok());
+            assert_eq!(
+                check_limit(resource, limit + 1, limit),
+                Err(LimitViolation {
+                    resource,
+                    limit,
+                    attempted: limit + 1,
+                })
+            );
+            assert!(matches!(
+                writer_limit(resource, limit + 1, limit),
+                Err(Error::SnapshotLimitExceeded {
+                    resource: actual_resource,
+                    limit: actual_limit,
+                    attempted,
+                }) if actual_resource == resource
+                    && actual_limit == limit
+                    && attempted == limit + 1
+            ));
+            assert!(matches!(
+                decoder.limit(resource, limit + 1, limit),
+                Err(Error::CorruptSnapshot(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn wide_zero_row_tables_exhaust_metadata_budget_before_allocation() {
+        let mut decoder = Decoder::with_allocation(&[], 0).unwrap();
+        let metadata = table_metadata_allocation(MAX_COLUMNS_PER_TABLE);
+        let accepted_tables = MAX_DECODE_ALLOCATION / metadata;
+        for _ in 0..accepted_tables {
+            decoder.reserve_allocation(metadata).unwrap();
+        }
+        assert!(matches!(
+            decoder.reserve_allocation(metadata),
+            Err(Error::CorruptSnapshot(message))
+                if message.contains("decode allocation bytes")
+        ));
+    }
+
+    #[test]
+    fn checksummed_snapshot_cannot_put_null_in_non_nullable_column() {
+        let mut payload = Vec::new();
+        put_u64(&mut payload, 1);
+        put_u64(&mut payload, 1);
+        put_string(&mut payload, "invalid").unwrap();
+        put_u64(&mut payload, 1);
+        put_string(&mut payload, "id").unwrap();
+        payload.push(1);
+        payload.push(0);
+        put_u64(&mut payload, 1);
+        payload.push(0);
+
+        let mut snapshot = Vec::new();
+        snapshot.extend_from_slice(MAGIC);
+        put_u32(&mut snapshot, FORMAT_VERSION);
+        put_u64(&mut snapshot, payload.len() as u64);
+        put_u64(&mut snapshot, checksum(&payload));
+        snapshot.extend_from_slice(&payload);
+
+        assert!(matches!(
+            decode_snapshot(&snapshot),
+            Err(Error::CorruptSnapshot(message))
+                if message.contains("non-nullable column contains NULL")
+        ));
+    }
 }

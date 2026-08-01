@@ -13,6 +13,13 @@ fn database_path() -> PathBuf {
     ))
 }
 
+fn remove_database(path: &PathBuf) {
+    let _ = fs::remove_file(path);
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    let _ = fs::remove_file(PathBuf::from(lock));
+}
+
 #[test]
 fn repeated_execute_arguments_share_a_transaction_and_persist() {
     let path = database_path();
@@ -47,5 +54,5 @@ fn repeated_execute_arguments_share_a_transaction_and_persist() {
     assert!(output.status.success(), "{:?}", output.stderr);
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("id\tlabel\n3\tfrom cli\n1 row(s)"));
-    fs::remove_file(path).unwrap();
+    remove_database(&path);
 }
