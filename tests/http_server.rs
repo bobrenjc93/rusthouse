@@ -292,7 +292,7 @@ async fn production_database_bounds_result_materialization() {
     database
         .execute(&format!(
             "INSERT INTO payloads VALUES ('{}')",
-            "x".repeat(1024)
+            "x".repeat(4 * 1024 * 1024)
         ))
         .unwrap();
     let config = ServerConfig {

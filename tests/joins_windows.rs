@@ -230,6 +230,30 @@ fn bounded_float_sum_does_not_subtract_rounded_prefixes() {
 }
 
 #[test]
+fn float_window_sum_preserves_ordered_overflow_and_opposing_infinity() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE overflow_values (seq Int64, value Float64)")
+        .unwrap();
+    database
+        .execute("INSERT INTO overflow_values VALUES (1, 1e308), (2, 1e308), (3, -1e309)")
+        .unwrap();
+
+    let rows = query(
+        &database,
+        "SELECT seq, SUM(value) OVER (ORDER BY seq) AS running, \
+         SUM(value) OVER (ORDER BY seq ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS bounded \
+         FROM overflow_values ORDER BY seq",
+    );
+    assert_eq!(rows[0][1], Value::Float64(1e308));
+    assert_eq!(rows[0][2], Value::Float64(1e308));
+    assert_eq!(rows[1][1], Value::Float64(f64::INFINITY));
+    assert_eq!(rows[1][2], Value::Float64(f64::INFINITY));
+    assert!(matches!(&rows[2][1], Value::Float64(value) if value.is_nan()));
+    assert!(matches!(&rows[2][2], Value::Float64(value) if value.is_nan()));
+}
+
+#[test]
 fn rank_treats_signed_float_zeroes_as_peers() {
     let database = Database::new();
     database

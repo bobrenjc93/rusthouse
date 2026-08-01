@@ -940,30 +940,19 @@ fn evaluate_int_sum(
 
 #[derive(Clone, Copy, Default)]
 struct FloatAccumulator {
-    finite: f64,
-    nan: usize,
-    positive_infinity: usize,
-    negative_infinity: usize,
+    sum: f64,
     values: usize,
 }
 
 impl FloatAccumulator {
     fn add(&mut self, value: &Value) {
         match value {
-            Value::Float64(value) if value.is_nan() => {
-                self.nan += 1;
-                self.values += 1;
-            }
-            Value::Float64(value) if *value == f64::INFINITY => {
-                self.positive_infinity += 1;
-                self.values += 1;
-            }
-            Value::Float64(value) if *value == f64::NEG_INFINITY => {
-                self.negative_infinity += 1;
-                self.values += 1;
-            }
             Value::Float64(value) => {
-                self.finite += value;
+                if self.values == 0 {
+                    self.sum = *value;
+                } else {
+                    self.sum += value;
+                }
                 self.values += 1;
             }
             Value::Null => {}
@@ -974,14 +963,8 @@ impl FloatAccumulator {
     fn finish(self) -> Value {
         if self.values == 0 {
             Value::Null
-        } else if self.nan > 0 || (self.positive_infinity > 0 && self.negative_infinity > 0) {
-            Value::Float64(f64::NAN)
-        } else if self.positive_infinity > 0 {
-            Value::Float64(f64::INFINITY)
-        } else if self.negative_infinity > 0 {
-            Value::Float64(f64::NEG_INFINITY)
         } else {
-            Value::Float64(self.finite)
+            Value::Float64(self.sum)
         }
     }
 }
@@ -1059,23 +1042,27 @@ fn project_rows(
     let mut retained_bytes = estimated_schema_bytes(columns)
         .saturating_add(row_indexes.len().saturating_mul(row_fixed_bytes));
     enforce_result_bytes(retained_bytes, control)?;
+
+    for row_index in row_indexes {
+        check_cancellation(control)?;
+        let variable_bytes = (0..projection.len()).fold(0usize, |bytes, column| {
+            bytes.saturating_add(
+                match projected_value(source, projection, windows, *row_index, column) {
+                    Value::String(value) => value.len(),
+                    _ => 0,
+                },
+            )
+        });
+        retained_bytes = retained_bytes.saturating_add(variable_bytes);
+        enforce_result_bytes(retained_bytes, control)?;
+    }
+
     let mut result = Vec::<Vec<Value>>::with_capacity(row_indexes.len());
     for row_index in row_indexes {
         check_cancellation(control)?;
-        let source_row = &source.rows[*row_index];
-        let values = projection
-            .iter()
-            .zip(windows)
-            .map(|(projection, window)| match projection {
-                BoundProjection::Source(index) => source_row[*index].clone(),
-                BoundProjection::Window(_) => window
-                    .as_ref()
-                    .expect("window projection has evaluated values")[*row_index]
-                    .clone(),
-            })
+        let values = (0..projection.len())
+            .map(|column| projected_value(source, projection, windows, *row_index, column).clone())
             .collect::<Vec<_>>();
-        retained_bytes = retained_bytes.saturating_add(variable_row_bytes(&values));
-        enforce_result_bytes(retained_bytes, control)?;
         result.push(values);
     }
     Ok(result)

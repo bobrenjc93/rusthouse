@@ -146,6 +146,8 @@ nonnegative preceding/following bounds.
 
 Float64 running frames accumulate in order. Bounded frames are accumulated
 from their own rows instead of subtracting rounded floating-point prefixes.
+IEEE overflow and subsequent infinities are applied in that same order, so
+opposing infinities produce NaN.
 
 Binding resolves every source column before table data is copied. Materialized
 scans retain only columns needed by predicates, joins, projections, windows, or
@@ -157,6 +159,10 @@ is bounded by rows, with cumulative accounting for partition hash entries,
 index vectors, output vectors, and temporary accumulators. Join expansion and
 final output rows are separately bounded. These failures are reported as
 resource-limit errors.
+
+Controlled query results preflight fixed row storage and every projected
+string length before allocating or cloning result values. A result that cannot
+fit its transport ceiling therefore fails before duplicating source strings.
 
 Outer and window ordering use an in-place heapsort that polls query
 cancellation while building and draining the heap. Explicit source-row indexes
