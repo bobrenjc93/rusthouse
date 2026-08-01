@@ -1,12 +1,15 @@
 //! Bounded, engine-independent HTTP query service.
 
 use std::{
+    future::Future,
     io::{self, Write},
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -19,9 +22,13 @@ use axum::{
     routing::{get, post},
 };
 use hyper::server::conn::http1;
-use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use hyper_util::{
+    rt::{TokioIo, TokioTimer},
+    service::TowerToHyperService,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
@@ -34,6 +41,8 @@ use crate::query::{
 };
 
 const FORCE_CANCELLATION_WAIT: Duration = Duration::from_millis(250);
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Resource limits and deadlines enforced by the HTTP frontend.
 #[derive(Debug, Clone)]
@@ -48,6 +57,10 @@ pub struct ServerConfig {
     pub max_concurrent_requests: usize,
     /// Maximum number of accepted client connections.
     pub max_connections: usize,
+    /// Maximum time allowed to receive one complete HTTP request header.
+    pub header_read_timeout: Duration,
+    /// Maximum time a connection may make no read or write progress.
+    pub connection_idle_timeout: Duration,
     /// Maximum time allowed to read a complete query request body.
     pub request_body_timeout: Duration,
     /// Maximum engine execution time for one query.
@@ -64,6 +77,8 @@ impl Default for ServerConfig {
             max_concurrent_queries: 16,
             max_concurrent_requests: 64,
             max_connections: 128,
+            header_read_timeout: Duration::from_secs(10),
+            connection_idle_timeout: Duration::from_secs(60),
             request_body_timeout: Duration::from_secs(10),
             query_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(10),
@@ -87,6 +102,16 @@ impl ServerConfig {
         validate_permit_count("max_concurrent_queries", self.max_concurrent_queries)?;
         validate_permit_count("max_concurrent_requests", self.max_concurrent_requests)?;
         validate_permit_count("max_connections", self.max_connections)?;
+        if self.header_read_timeout.is_zero() {
+            return Err(ServerError::InvalidConfig(
+                "header_read_timeout must be greater than zero".into(),
+            ));
+        }
+        if self.connection_idle_timeout.is_zero() {
+            return Err(ServerError::InvalidConfig(
+                "connection_idle_timeout must be greater than zero".into(),
+            ));
+        }
         if self.request_body_timeout.is_zero() {
             return Err(ServerError::InvalidConfig(
                 "request_body_timeout must be greater than zero".into(),
@@ -130,6 +155,8 @@ pub enum ServerError {
     Io(io::Error),
     /// The background server task panicked or was cancelled unexpectedly.
     Task(tokio::task::JoinError),
+    /// The background server task was already consumed.
+    NotRunning,
 }
 
 impl std::fmt::Display for ServerError {
@@ -138,6 +165,7 @@ impl std::fmt::Display for ServerError {
             Self::InvalidConfig(message) => write!(formatter, "invalid server config: {message}"),
             Self::Io(error) => write!(formatter, "HTTP server I/O error: {error}"),
             Self::Task(error) => write!(formatter, "HTTP server task failed: {error}"),
+            Self::NotRunning => write!(formatter, "HTTP server is not running"),
         }
     }
 }
@@ -202,10 +230,25 @@ impl ServerHandle {
         self.local_addr
     }
 
+    /// Waits for unexpected background server termination.
+    ///
+    /// This normally remains pending until shutdown is requested. It is
+    /// cancellation-safe and can be raced against an operating-system signal.
+    pub async fn wait(&mut self) -> Result<(), ServerError> {
+        let result = match self.task.as_mut() {
+            Some(task) => task.await,
+            None => return Err(ServerError::NotRunning),
+        };
+        self.task.take();
+        result.map_err(ServerError::Task)?.map_err(ServerError::Io)
+    }
+
     /// Stops accepting connections, waits for the grace period, then cancels work.
     pub async fn shutdown(mut self) -> Result<(), ServerError> {
         self.graceful_shutdown.cancel();
-        let mut task = self.task.take().expect("server task is present");
+        let Some(mut task) = self.task.take() else {
+            return Err(ServerError::NotRunning);
+        };
 
         match tokio::time::timeout(self.shutdown_timeout, &mut task).await {
             Ok(result) => result.map_err(ServerError::Task)?.map_err(ServerError::Io),
@@ -285,6 +328,8 @@ pub fn spawn_on_listener(
         listener,
         app,
         config.max_connections,
+        config.header_read_timeout,
+        config.connection_idle_timeout,
         graceful_shutdown.clone(),
         force_cancellation.clone(),
     ));
@@ -303,11 +348,14 @@ async fn serve_connections(
     listener: TcpListener,
     app: Router,
     max_connections: usize,
+    header_read_timeout: Duration,
+    connection_idle_timeout: Duration,
     graceful_shutdown: CancellationToken,
     force_cancellation: CancellationToken,
 ) -> io::Result<()> {
     let connection_permits = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
+    let mut accept_backoff = ACCEPT_BACKOFF_INITIAL;
 
     loop {
         tokio::select! {
@@ -326,11 +374,35 @@ async fn serve_connections(
                     }
                     accepted = listener.accept() => accepted,
                 };
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => {
+                        accept_backoff = ACCEPT_BACKOFF_INITIAL;
+                        accepted
+                    }
+                    Err(error) => {
+                        drop(permit);
+                        if !is_recoverable_accept_error(&error) {
+                            return Err(error);
+                        }
+                        eprintln!(
+                            "RustHouse HTTP accept error: {error}; retrying in {} ms",
+                            accept_backoff.as_millis()
+                        );
+                        tokio::select! {
+                            biased;
+                            () = graceful_shutdown.cancelled() => break,
+                            () = tokio::time::sleep(accept_backoff) => {}
+                        }
+                        accept_backoff = next_accept_backoff(accept_backoff);
+                        continue;
+                    }
+                };
                 connections.spawn(serve_connection(
                     stream,
                     app.clone(),
                     permit,
+                    header_read_timeout,
+                    connection_idle_timeout,
                     graceful_shutdown.clone(),
                     force_cancellation.clone(),
                 ));
@@ -344,15 +416,35 @@ async fn serve_connections(
     Ok(())
 }
 
+fn next_accept_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(ACCEPT_BACKOFF_MAX)
+}
+
+fn is_recoverable_accept_error(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::Unsupported
+    )
+}
+
 async fn serve_connection(
     stream: TcpStream,
     app: Router,
     _permit: OwnedSemaphorePermit,
+    header_read_timeout: Duration,
+    connection_idle_timeout: Duration,
     graceful_shutdown: CancellationToken,
     force_cancellation: CancellationToken,
 ) {
-    let connection =
-        http1::Builder::new().serve_connection(TokioIo::new(stream), TowerToHyperService::new(app));
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    let stream = IdleTimeoutStream::new(stream, connection_idle_timeout);
+    let connection = builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app));
     tokio::pin!(connection);
 
     tokio::select! {
@@ -371,6 +463,99 @@ async fn serve_connection(
                 }
             }
         }
+    }
+}
+
+struct IdleTimeoutStream {
+    stream: TcpStream,
+    timeout: Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl IdleTimeoutStream {
+    fn new(stream: TcpStream, timeout: Duration) -> Self {
+        Self {
+            stream,
+            timeout,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    fn poll_timeout(&mut self, context: &mut Context<'_>) -> io::Result<()> {
+        if self.deadline.as_mut().poll(context).is_ready() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP connection was idle for too long",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_progress(&mut self) {
+        self.deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.timeout);
+    }
+}
+
+impl AsyncRead for IdleTimeoutStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Err(error) = this.poll_timeout(context) {
+            return Poll::Ready(Err(error));
+        }
+        let filled_before = buffer.filled().len();
+        match Pin::new(&mut this.stream).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                if buffer.filled().len() > filled_before {
+                    this.record_progress();
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl AsyncWrite for IdleTimeoutStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if let Err(error) = this.poll_timeout(context) {
+            return Poll::Ready(Err(error));
+        }
+        match Pin::new(&mut this.stream).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                if written > 0 {
+                    this.record_progress();
+                }
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Err(error) = this.poll_timeout(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Err(error) = this.poll_timeout(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.stream).poll_shutdown(context)
     }
 }
 
@@ -1267,5 +1452,44 @@ mod tests {
             ..ServerConfig::default()
         };
         boundary.validate().unwrap();
+    }
+
+    #[test]
+    fn accept_error_backoff_is_capped() {
+        assert_eq!(
+            next_accept_backoff(ACCEPT_BACKOFF_INITIAL),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            next_accept_backoff(Duration::from_millis(800)),
+            ACCEPT_BACKOFF_MAX
+        );
+        assert_eq!(next_accept_backoff(ACCEPT_BACKOFF_MAX), ACCEPT_BACKOFF_MAX);
+        assert!(is_recoverable_accept_error(&io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "transient"
+        )));
+        assert!(!is_recoverable_accept_error(&io::Error::new(
+            io::ErrorKind::NotConnected,
+            "fatal"
+        )));
+    }
+
+    #[tokio::test]
+    async fn server_task_failure_is_observable() {
+        let task = tokio::spawn(async { Err(io::Error::other("accept loop failed")) });
+        let mut server = ServerHandle {
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            graceful_shutdown: CancellationToken::new(),
+            force_cancellation: CancellationToken::new(),
+            query_admission: Arc::new(QueryAdmission::default()),
+            shutdown_timeout: Duration::from_secs(1),
+            task: Some(task),
+        };
+
+        let error = server.wait().await.unwrap_err();
+        assert!(matches!(error, ServerError::Io(_)));
+        assert!(error.to_string().contains("accept loop failed"));
+        assert!(matches!(server.wait().await, Err(ServerError::NotRunning)));
     }
 }

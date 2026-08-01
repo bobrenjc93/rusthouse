@@ -532,6 +532,65 @@ async fn connection_cap_bounds_unread_response_buffers() {
 }
 
 #[tokio::test]
+async fn idle_header_connection_expires_and_releases_its_slot() {
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        max_connections: 1,
+        header_read_timeout: Duration::from_millis(60),
+        connection_idle_timeout: Duration::from_millis(50),
+        ..ServerConfig::default()
+    };
+    let (server, _) = start(service.clone(), config).await;
+    let mut idle = TcpStream::connect(server.local_addr()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut waiting = TcpStream::connect(server.local_addr()).await.unwrap();
+    write_query(&mut waiting, "rows").await;
+    let response = tokio::time::timeout(Duration::from_secs(1), read_http_response(&mut waiting))
+        .await
+        .expect("idle header connection should release its slot automatically");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 1);
+
+    let mut remaining = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), idle.read_to_end(&mut remaining))
+        .await
+        .expect("idle connection should be closed")
+        .unwrap();
+    drop(waiting);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_response_reader_expires_and_releases_its_slot() {
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        max_connections: 1,
+        max_response_bytes: 9 * 1024 * 1024,
+        header_read_timeout: Duration::from_secs(1),
+        connection_idle_timeout: Duration::from_millis(500),
+        ..ServerConfig::default()
+    };
+    let (server, _) = start(service.clone(), config).await;
+    let mut stalled = TcpStream::connect(server.local_addr()).await.unwrap();
+    write_query(&mut stalled, "slow response").await;
+    let headers = read_http_head(&mut stalled).await;
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let mut waiting = TcpStream::connect(server.local_addr()).await.unwrap();
+    write_query(&mut waiting, "rows").await;
+    let response = tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut waiting))
+        .await
+        .expect("stalled response writer should release its slot automatically");
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 2);
+
+    drop(stalled);
+    drop(waiting);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn blocking_engine_poll_does_not_starve_http_or_release_its_slot_early() {
     let service = Arc::new(TestService::new());
     let config = ServerConfig {

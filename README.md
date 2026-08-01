@@ -53,12 +53,15 @@ request ID is returned in `x-request-id`. `GET /health/live` checks the process;
 
 The server defaults to 1 MiB requests, 16 MiB encoded responses, 16 concurrent
 queries, 64 concurrent HTTP query requests, a 10 second body-read deadline, a 30
-second query deadline, 128 accepted connections, and a 10 second graceful
-shutdown window. Connection admission is held through response delivery, bounding
-slow readers as well as request buffering. Busy request or execution slots fail
-immediately with `503` and `Retry-After`, so slow clients do not create an
-unbounded queue. Query futures and result encoding run on bounded blocking
-workers; timed-out jobs retain their execution slot until they actually exit.
+second query deadline, 128 accepted connections, a 10 second header deadline, a
+60 second connection idle deadline, and a 10 second graceful shutdown window.
+Connection admission is held through response delivery, while the idle deadline
+closes stalled headers, keep-alive clients, and response readers. Busy request or
+execution slots fail immediately with `503` and `Retry-After`, so slow clients do
+not create an unbounded queue. Transient accept errors are retried with capped
+backoff, and owners can await unexpected server-task termination. Query futures
+and result encoding run on bounded blocking workers; timed-out jobs retain their
+execution slot until they actually exit.
 Query implementations should observe the supplied `QueryCancellation` while doing
 expensive work. It is signaled when a request is dropped, its deadline expires, or
 forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown

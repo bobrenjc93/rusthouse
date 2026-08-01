@@ -18,6 +18,8 @@ Options:
   --max-concurrent-queries N     Query execution slots [default: 16]
   --max-concurrent-requests N    HTTP query request slots [default: 64]
   --max-connections N            Accepted client connections [default: 128]
+  --header-read-timeout-ms MS    HTTP header deadline [default: 10000]
+  --connection-idle-timeout-ms MS  Socket idle deadline [default: 60000]
   --request-body-timeout-ms MS   Request body deadline [default: 10000]
   --query-timeout-ms MS          Per-query deadline [default: 30000]
   --shutdown-timeout-ms MS       Graceful shutdown window [default: 10000]
@@ -99,6 +101,13 @@ async fn run() -> Result<(), String> {
             "--max-connections" => {
                 config.max_connections = parse_number(&option, &value)?;
             }
+            "--header-read-timeout-ms" => {
+                config.header_read_timeout = Duration::from_millis(parse_number(&option, &value)?);
+            }
+            "--connection-idle-timeout-ms" => {
+                config.connection_idle_timeout =
+                    Duration::from_millis(parse_number(&option, &value)?);
+            }
             "--request-body-timeout-ms" => {
                 config.request_body_timeout = Duration::from_millis(parse_number(&option, &value)?);
             }
@@ -113,14 +122,22 @@ async fn run() -> Result<(), String> {
     }
 
     let mut shutdown_signals = ShutdownSignals::new()?;
-    let server = spawn_http_server(address, Arc::new(EngineNotInstalled), config)
+    let mut server = spawn_http_server(address, Arc::new(EngineNotInstalled), config)
         .await
         .map_err(|error| error.to_string())?;
     eprintln!(
         "RustHouse HTTP server listening on http://{}",
         server.local_addr()
     );
-    shutdown_signals.wait().await?;
+    let signal = tokio::select! {
+        biased;
+        result = server.wait() => {
+            result.map_err(|error| error.to_string())?;
+            return Err("HTTP server stopped unexpectedly".into());
+        }
+        result = shutdown_signals.wait() => result,
+    };
+    signal?;
     server.shutdown().await.map_err(|error| error.to_string())
 }
 
