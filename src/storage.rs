@@ -144,6 +144,14 @@ impl ColumnData {
         }
     }
 
+    fn value_size(&self, row: usize) -> usize {
+        let payload = match self {
+            Self::String { values, nulls } if !nulls[row] => values[row].len(),
+            _ => 0,
+        };
+        std::mem::size_of::<Value>() + payload
+    }
+
     fn append(&mut self, value: Value) {
         let is_null = matches!(value, Value::Null);
         match (self, value) {
@@ -199,6 +207,10 @@ impl Table {
 
     pub(crate) fn value(&self, column: usize, row: usize) -> Value {
         self.columns[column].value(row)
+    }
+
+    pub(crate) fn value_size(&self, column: usize, row: usize) -> usize {
+        self.columns[column].value_size(row)
     }
 
     fn insert(&mut self, column_names: Option<&[String]>, rows: Vec<Vec<Value>>) -> Result<usize> {

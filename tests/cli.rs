@@ -79,3 +79,41 @@ fn cli_reports_bad_arguments_and_sql_on_stderr() {
     assert!(!bad_sql.status.success());
     assert!(String::from_utf8_lossy(&bad_sql.stderr).contains("SQL error"));
 }
+
+#[test]
+fn deeply_nested_input_is_rejected_without_aborting() {
+    let depth = 20_000;
+    let sql = format!(
+        "SELECT {}1{} FROM missing",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    let output = run_cli(&[], &sql);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("maximum depth"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn repeated_large_string_projections_respect_the_result_byte_limit() {
+    let value = "x".repeat(1024 * 1024);
+    let projections = std::iter::repeat_n("payload", 65)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "CREATE TABLE large (payload String); \
+         INSERT INTO large VALUES ('{value}'); \
+         SELECT {projections} FROM large;"
+    );
+    let output = run_cli(&[], &sql);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("result byte limit"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

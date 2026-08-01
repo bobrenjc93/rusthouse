@@ -172,3 +172,69 @@ fn a_failed_batch_insert_is_atomic_at_the_sql_boundary() {
         .remove(0);
     assert_eq!(result.rows, vec![vec![Value::Int64(5)]]);
 }
+
+#[test]
+fn mixed_numeric_comparisons_are_exact_around_f64_integer_precision() {
+    let mut engine = Engine::new();
+    let results = engine
+        .execute(
+            "CREATE TABLE precision (i Int64);\
+             INSERT INTO precision VALUES \
+                (9007199254740993), (9007199254740992), \
+                (-9007199254740993), (-9007199254740992);\
+             SELECT i FROM precision \
+             WHERE i = 9007199254740992.0 ORDER BY i;\
+             SELECT i FROM precision \
+             WHERE i > 9007199254740992.0 ORDER BY i;\
+             SELECT i FROM precision \
+             WHERE i < -9007199254740992.0 ORDER BY i;",
+        )
+        .unwrap();
+    assert_eq!(
+        results[0].rows,
+        vec![vec![Value::Int64(9_007_199_254_740_992)]]
+    );
+    assert_eq!(
+        results[1].rows,
+        vec![vec![Value::Int64(9_007_199_254_740_993)]]
+    );
+    assert_eq!(
+        results[2].rows,
+        vec![vec![Value::Int64(-9_007_199_254_740_993)]]
+    );
+}
+
+#[test]
+fn expression_types_are_validated_on_empty_tables() {
+    let invalid = [
+        "SELECT s + 1 FROM empty",
+        "SELECT sum(s) FROM empty",
+        "SELECT s FROM empty WHERE s",
+        "SELECT s = 1 FROM empty",
+        "SELECT count(*) FROM empty HAVING s",
+    ];
+    for query in invalid {
+        let mut engine = Engine::new();
+        engine.execute("CREATE TABLE empty (s String)").unwrap();
+        assert!(engine.execute(query).is_err(), "accepted: {query}");
+    }
+}
+
+#[test]
+fn int64_boundaries_and_quoted_keyword_columns_execute_correctly() {
+    let mut engine = Engine::new();
+    let result = engine
+        .execute(
+            "CREATE TABLE boundaries (i Int64, \"true\" Bool, \"null\" String);\
+             INSERT INTO boundaries VALUES \
+                (-9223372036854775808, false, 'stored'),\
+                (9223372036854775807, true, 'other');\
+             SELECT i, \"true\", \"null\" FROM boundaries ORDER BY i;",
+        )
+        .unwrap()
+        .remove(0);
+    assert_eq!(result.rows[0][0], Value::Int64(i64::MIN));
+    assert_eq!(result.rows[0][1], Value::Bool(false));
+    assert_eq!(result.rows[0][2], Value::String("stored".to_owned()));
+    assert_eq!(result.rows[1][0], Value::Int64(i64::MAX));
+}

@@ -6,10 +6,14 @@ use crate::error::{Error, Result};
 use crate::sql::{
     BinaryOperator, Expr, OrderBy, Select, SelectItem, Statement, UnaryOperator, expression_name,
 };
-use crate::storage::{Catalog, Table, Value, canonical};
+use crate::storage::{Catalog, DataType, Table, Value, canonical};
 
 const MAX_RESULT_ROWS: usize = 1_000_000;
 const MAX_RESULT_CELLS: usize = 10_000_000;
+#[cfg(not(test))]
+const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const MAX_RESULT_BYTES: usize = 1024 * 1024;
 
 /// A materialized result set returned by a SELECT statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,18 +92,23 @@ impl Engine {
                 .iter()
                 .any(|item| has_aggregate(&item.expression));
 
+        let mut budget = ResultBudget::default();
         let mut output = if aggregate_query {
-            self.aggregate_rows(table, &select, &aliases, matching_rows)?
+            self.aggregate_rows(table, &select, &aliases, matching_rows, &mut budget)?
         } else {
             if select.having.is_some() {
                 return Err(Error::new(
                     "HAVING requires GROUP BY or an aggregate expression",
                 ));
             }
-            self.project_rows(table, &select, &aliases, matching_rows)?
+            self.project_rows(table, &select, &aliases, matching_rows, &mut budget)?
         };
 
         if select.distinct {
+            let distinct_bytes = output.iter().try_fold(0usize, |total, row| {
+                checked_size_sum(total, values_size(&row.values))
+            })?;
+            budget.reserve(distinct_bytes)?;
             let mut seen = HashSet::new();
             output.retain(|row| seen.insert(ValueKey::row(&row.values)));
         }
@@ -131,22 +140,36 @@ impl Engine {
         select: &Select,
         aliases: &HashMap<String, Expr>,
         rows: Vec<usize>,
+        budget: &mut ResultBudget,
     ) -> Result<Vec<OutputRow>> {
         let mut output = Vec::with_capacity(rows.len());
         for (ordinal, row) in rows.into_iter().enumerate() {
             let context = EvalContext::row(table, row);
+            check_result_size(output.len() + 1, select.items.len())?;
+            let projection_bytes = select.items.iter().try_fold(0usize, |total, item| {
+                checked_size_sum(
+                    total,
+                    estimate_expression_size(&item.expression, &context, None)?,
+                )
+            })?;
+            budget.reserve(projection_bytes)?;
             let values = select
                 .items
                 .iter()
                 .map(|item| eval(&item.expression, &context, None))
                 .collect::<Result<Vec<_>>>()?;
+            budget.reserve(estimate_order_size(
+                &select.order_by,
+                &context,
+                aliases,
+                &values,
+            )?)?;
             let order_keys = order_keys(&select.order_by, &context, aliases, &values)?;
             output.push(OutputRow {
                 values,
                 order_keys,
                 ordinal,
             });
-            check_result_size(output.len(), select.items.len())?;
         }
         Ok(output)
     }
@@ -157,6 +180,7 @@ impl Engine {
         select: &Select,
         aliases: &HashMap<String, Expr>,
         rows: Vec<usize>,
+        budget: &mut ResultBudget,
     ) -> Result<Vec<OutputRow>> {
         let groups = build_groups(table, &select.group_by, rows)?;
         let mut output = Vec::with_capacity(groups.len());
@@ -167,21 +191,76 @@ impl Engine {
             {
                 continue;
             }
+            check_result_size(output.len() + 1, select.items.len())?;
+            let projection_bytes = select.items.iter().try_fold(0usize, |total, item| {
+                checked_size_sum(
+                    total,
+                    estimate_expression_size(&item.expression, &context, None)?,
+                )
+            })?;
+            budget.reserve(projection_bytes)?;
             let values = select
                 .items
                 .iter()
                 .map(|item| eval(&item.expression, &context, None))
                 .collect::<Result<Vec<_>>>()?;
+            budget.reserve(estimate_order_size(
+                &select.order_by,
+                &context,
+                aliases,
+                &values,
+            )?)?;
             let order_keys = order_keys(&select.order_by, &context, aliases, &values)?;
             output.push(OutputRow {
                 values,
                 order_keys,
                 ordinal: output.len(),
             });
-            check_result_size(output.len(), select.items.len())?;
         }
         Ok(output)
     }
+}
+
+#[derive(Default)]
+struct ResultBudget {
+    used: usize,
+}
+
+impl ResultBudget {
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .ok_or_else(result_byte_limit_error)?;
+        if self.used > MAX_RESULT_BYTES {
+            return Err(result_byte_limit_error());
+        }
+        Ok(())
+    }
+}
+
+fn result_byte_limit_error() -> Error {
+    Error::new(format!(
+        "result byte limit exceeded (maximum {MAX_RESULT_BYTES} bytes)"
+    ))
+}
+
+fn checked_size_sum(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(result_byte_limit_error)
+}
+
+fn values_size(values: &[Value]) -> usize {
+    values.iter().fold(0usize, |total, value| {
+        total.saturating_add(value_size(value))
+    })
+}
+
+fn value_size(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::String(value) => value.len(),
+            _ => 0,
+        }
 }
 
 fn check_result_size(rows: usize, columns: usize) -> Result<()> {
@@ -259,7 +338,8 @@ fn select_aliases(items: &[SelectItem]) -> Result<HashMap<String, Expr>> {
 
 fn validate_select(select: &Select, table: &Table) -> Result<()> {
     if let Some(filter) = &select.filter {
-        validate_expr(filter, table, &HashMap::new(), false)?;
+        let data_type = validate_expr(filter, table, &HashMap::new(), false)?;
+        require_boolean(data_type, "WHERE")?;
         if has_aggregate(filter) {
             return Err(Error::new("aggregate functions are not allowed in WHERE"));
         }
@@ -277,7 +357,8 @@ fn validate_select(select: &Select, table: &Table) -> Result<()> {
     }
     let aliases = select_aliases(&select.items)?;
     if let Some(having) = &select.having {
-        validate_expr(having, table, &aliases, true)?;
+        let data_type = validate_expr(having, table, &aliases, true)?;
+        require_boolean(data_type, "HAVING")?;
     }
     for order in &select.order_by {
         validate_expr(&order.expression, table, &aliases, true)?;
@@ -312,29 +393,36 @@ fn validate_expr(
     table: &Table,
     aliases: &HashMap<String, Expr>,
     allow_alias: bool,
-) -> Result<()> {
+) -> Result<ExprType> {
     fn walk(
         expression: &Expr,
         table: &Table,
         aliases: &HashMap<String, Expr>,
         allow_alias: bool,
         inside_aggregate: bool,
-    ) -> Result<()> {
+    ) -> Result<ExprType> {
         match expression {
             Expr::Column(name) => {
-                if table.column_index(name).is_some() {
-                    Ok(())
-                } else if allow_alias {
-                    if let Some(expression) = aliases.get(&canonical(name)) {
-                        walk(expression, table, &HashMap::new(), false, inside_aggregate)
-                    } else {
-                        Err(Error::new(format!("unknown column or alias '{name}'")))
-                    }
-                } else {
-                    Err(Error::new(format!("unknown column '{name}'")))
+                if allow_alias && let Some(expression) = aliases.get(&canonical(name)) {
+                    return walk(expression, table, &HashMap::new(), false, inside_aggregate);
                 }
+                let index = table.column_index(name).ok_or_else(|| {
+                    Error::new(if allow_alias {
+                        format!("unknown column or alias '{name}'")
+                    } else {
+                        format!("unknown column '{name}'")
+                    })
+                })?;
+                let schema = &table.schema[index];
+                Ok(ExprType::new(Some(schema.data_type), schema.nullable))
             }
-            Expr::Literal(_) => Ok(()),
+            Expr::Literal(value) => Ok(match value {
+                Value::Null => ExprType::new(None, true),
+                Value::Int64(_) => ExprType::not_null(DataType::Int64),
+                Value::Float64(_) => ExprType::not_null(DataType::Float64),
+                Value::Bool(_) => ExprType::not_null(DataType::Bool),
+                Value::String(_) => ExprType::not_null(DataType::String),
+            }),
             Expr::Wildcard => Err(Error::new(
                 "'*' is only valid in the SELECT list or COUNT(*)",
             )),
@@ -350,24 +438,162 @@ fn validate_expr(
                     return Err(Error::new("aggregate functions cannot be nested"));
                 }
                 validate_function_shape(name, arguments, *distinct)?;
-                for argument in arguments {
-                    if argument == &Expr::Wildcard {
-                        continue;
+                if name == "count" {
+                    if let Some(argument) = arguments.first()
+                        && argument != &Expr::Wildcard
+                    {
+                        walk(argument, table, aliases, allow_alias, true)?;
                     }
-                    walk(argument, table, aliases, allow_alias, true)?;
+                    return Ok(ExprType::not_null(DataType::Int64));
                 }
-                Ok(())
+                let argument = walk(&arguments[0], table, aliases, allow_alias, true)?;
+                match name.as_str() {
+                    "sum" => {
+                        require_numeric(argument, "SUM")?;
+                        Ok(ExprType::new(argument.data_type, true))
+                    }
+                    "avg" => {
+                        require_numeric(argument, "AVG")?;
+                        Ok(ExprType::new(Some(DataType::Float64), true))
+                    }
+                    "min" | "max" => Ok(ExprType::new(argument.data_type, true)),
+                    _ => unreachable!("aggregate name checked above"),
+                }
             }
-            Expr::Binary { left, right, .. } => {
-                walk(left, table, aliases, allow_alias, inside_aggregate)?;
-                walk(right, table, aliases, allow_alias, inside_aggregate)
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = walk(left, table, aliases, allow_alias, inside_aggregate)?;
+                let right = walk(right, table, aliases, allow_alias, inside_aggregate)?;
+                validate_binary_types(left, *operator, right)
             }
-            Expr::Unary { expression, .. } | Expr::IsNull { expression, .. } => {
-                walk(expression, table, aliases, allow_alias, inside_aggregate)
+            Expr::Unary {
+                operator,
+                expression,
+            } => {
+                let expression = walk(expression, table, aliases, allow_alias, inside_aggregate)?;
+                match operator {
+                    UnaryOperator::Not => {
+                        require_boolean(expression, "NOT")?;
+                        Ok(ExprType::new(Some(DataType::Bool), expression.nullable))
+                    }
+                    UnaryOperator::Negate | UnaryOperator::Positive => {
+                        require_numeric(expression, "unary numeric operator")?;
+                        Ok(expression)
+                    }
+                }
+            }
+            Expr::IsNull { expression, .. } => {
+                walk(expression, table, aliases, allow_alias, inside_aggregate)?;
+                Ok(ExprType::not_null(DataType::Bool))
             }
         }
     }
     walk(expression, table, aliases, allow_alias, false)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExprType {
+    data_type: Option<DataType>,
+    nullable: bool,
+}
+
+impl ExprType {
+    fn new(data_type: Option<DataType>, nullable: bool) -> Self {
+        Self {
+            data_type,
+            nullable,
+        }
+    }
+
+    fn not_null(data_type: DataType) -> Self {
+        Self::new(Some(data_type), false)
+    }
+}
+
+fn validate_binary_types(
+    left: ExprType,
+    operator: BinaryOperator,
+    right: ExprType,
+) -> Result<ExprType> {
+    let nullable = left.nullable || right.nullable;
+    match operator {
+        BinaryOperator::And | BinaryOperator::Or => {
+            require_boolean(left, "logical operator")?;
+            require_boolean(right, "logical operator")?;
+            Ok(ExprType::new(Some(DataType::Bool), nullable))
+        }
+        BinaryOperator::Equal
+        | BinaryOperator::NotEqual
+        | BinaryOperator::Less
+        | BinaryOperator::LessEqual
+        | BinaryOperator::Greater
+        | BinaryOperator::GreaterEqual => {
+            if let (Some(left), Some(right)) = (left.data_type, right.data_type)
+                && left != right
+                && !(is_numeric(left) && is_numeric(right))
+            {
+                return Err(Error::new(format!(
+                    "incompatible types in comparison: {left} and {right}"
+                )));
+            }
+            Ok(ExprType::new(Some(DataType::Bool), nullable))
+        }
+        BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply => {
+            numeric_binary_type(left, right, nullable, "arithmetic")
+        }
+        BinaryOperator::Divide => {
+            numeric_binary_type(left, right, nullable, "division")?;
+            Ok(ExprType::new(Some(DataType::Float64), nullable))
+        }
+        BinaryOperator::Modulo => numeric_binary_type(left, right, nullable, "modulo"),
+    }
+}
+
+fn numeric_binary_type(
+    left: ExprType,
+    right: ExprType,
+    nullable: bool,
+    context: &str,
+) -> Result<ExprType> {
+    require_numeric(left, context)?;
+    require_numeric(right, context)?;
+    let data_type = if left.data_type == Some(DataType::Float64)
+        || right.data_type == Some(DataType::Float64)
+    {
+        Some(DataType::Float64)
+    } else {
+        left.data_type.or(right.data_type)
+    };
+    Ok(ExprType::new(data_type, nullable))
+}
+
+fn require_numeric(data_type: ExprType, context: &str) -> Result<()> {
+    if data_type.data_type.is_none_or(is_numeric) {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "{context} requires a numeric value, got {}",
+            data_type.data_type.expect("checked Some")
+        )))
+    }
+}
+
+fn require_boolean(data_type: ExprType, context: &str) -> Result<()> {
+    if matches!(data_type.data_type, None | Some(DataType::Bool)) {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "{context} expression must produce Bool, got {}",
+            data_type.data_type.expect("checked Some")
+        )))
+    }
+}
+
+fn is_numeric(data_type: DataType) -> bool {
+    matches!(data_type, DataType::Int64 | DataType::Float64)
 }
 
 fn validate_group_dependency(
@@ -487,6 +713,70 @@ impl<'a> EvalContext<'a> {
             rows: Some(rows),
         }
     }
+}
+
+fn estimate_expression_size(
+    expression: &Expr,
+    context: &EvalContext<'_>,
+    aliases: Option<&HashMap<String, Expr>>,
+) -> Result<usize> {
+    let scalar_size = std::mem::size_of::<Value>();
+    match expression {
+        Expr::Column(name) => {
+            if let Some(alias_expression) =
+                aliases.and_then(|aliases| aliases.get(&canonical(name)))
+            {
+                return estimate_expression_size(alias_expression, context, None);
+            }
+            let column = context
+                .table
+                .column_index(name)
+                .ok_or_else(|| Error::new(format!("unknown column '{name}'")))?;
+            Ok(context
+                .row
+                .map_or(scalar_size, |row| context.table.value_size(column, row)))
+        }
+        Expr::Literal(value) => Ok(value_size(value)),
+        Expr::Wildcard => Err(Error::new("wildcard cannot be evaluated as a value")),
+        Expr::Function {
+            name, arguments, ..
+        } if matches!(name.as_str(), "min" | "max") => {
+            let rows = context.rows.ok_or_else(|| {
+                Error::new(format!("aggregate '{name}' requires a group context"))
+            })?;
+            let mut maximum = scalar_size;
+            for &row in rows {
+                maximum = maximum.max(estimate_expression_size(
+                    &arguments[0],
+                    &EvalContext::row(context.table, row),
+                    None,
+                )?);
+            }
+            Ok(maximum)
+        }
+        Expr::Function { .. } | Expr::Binary { .. } | Expr::Unary { .. } | Expr::IsNull { .. } => {
+            Ok(scalar_size)
+        }
+    }
+}
+
+fn estimate_order_size(
+    order_by: &[OrderBy],
+    context: &EvalContext<'_>,
+    aliases: &HashMap<String, Expr>,
+    values: &[Value],
+) -> Result<usize> {
+    order_by.iter().try_fold(0usize, |total, order| {
+        let size = if let Expr::Literal(Value::Int64(position)) = order.expression
+            && position > 0
+            && usize::try_from(position).is_ok_and(|position| position <= values.len())
+        {
+            value_size(&values[position as usize - 1])
+        } else {
+            estimate_expression_size(&order.expression, context, Some(aliases))?
+        };
+        checked_size_sum(total, size)
+    })
 }
 
 fn eval(
@@ -824,16 +1114,35 @@ fn compare_non_null(left: &Value, right: &Value) -> Result<Ordering> {
         (Value::Float64(left), Value::Float64(right)) => left
             .partial_cmp(right)
             .ok_or_else(|| Error::new("cannot compare NaN")),
-        (Value::Int64(left), Value::Float64(right)) => (*left as f64)
-            .partial_cmp(right)
-            .ok_or_else(|| Error::new("cannot compare NaN")),
-        (Value::Float64(left), Value::Int64(right)) => left
-            .partial_cmp(&(*right as f64))
-            .ok_or_else(|| Error::new("cannot compare NaN")),
+        (Value::Int64(left), Value::Float64(right)) => compare_i64_f64(*left, *right),
+        (Value::Float64(left), Value::Int64(right)) => {
+            compare_i64_f64(*right, *left).map(Ordering::reverse)
+        }
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         (Value::String(left), Value::String(right)) => Ok(left.cmp(right)),
         (Value::Null, _) | (_, Value::Null) => unreachable!("nulls handled by caller"),
         _ => incompatible_values(left, right, "comparison"),
+    }
+}
+
+fn compare_i64_f64(integer: i64, float: f64) -> Result<Ordering> {
+    if float.is_nan() {
+        return Err(Error::new("cannot compare NaN"));
+    }
+    // i64::MAX rounds up to 2^63 as f64, so the upper bound is exclusive.
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if float >= I64_UPPER_EXCLUSIVE {
+        return Ok(Ordering::Less);
+    }
+    if float < i64::MIN as f64 {
+        return Ok(Ordering::Greater);
+    }
+
+    let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() > 0.0 => Ok(Ordering::Less),
+        Ordering::Equal if float.fract() < 0.0 => Ok(Ordering::Greater),
+        ordering => Ok(ordering),
     }
 }
 
@@ -1124,5 +1433,23 @@ mod tests {
         assert!(error.message().contains("GROUP BY"));
         let error = engine.execute("SELECT missing FROM events").unwrap_err();
         assert!(error.message().contains("unknown column"));
+    }
+
+    #[test]
+    fn rejects_an_oversized_string_result_before_materializing_it() {
+        let value = "x".repeat(128 * 1024);
+        let rows = (0..10)
+            .map(|id| format!("({id}, '{value}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut engine = Engine::new();
+        engine
+            .execute(&format!(
+                "CREATE TABLE large (id Int64, value String); \
+                 INSERT INTO large VALUES {rows};"
+            ))
+            .unwrap();
+        let error = engine.execute("SELECT value FROM large").unwrap_err();
+        assert!(error.message().contains("result byte limit"));
     }
 }

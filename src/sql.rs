@@ -106,7 +106,7 @@ pub(crate) enum UnaryOperator {
 
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
-    Word(String),
+    Word { value: String, quoted: bool },
     Number(String),
     String(String),
     Comma,
@@ -203,11 +203,17 @@ impl<'a> Lexer<'a> {
                     TokenKind::NotEqual
                 }
                 '\'' => TokenKind::String(self.string_literal(offset)?),
-                '"' | '`' => TokenKind::Word(self.quoted_identifier(character, offset)?),
+                '"' | '`' => TokenKind::Word {
+                    value: self.quoted_identifier(character, offset)?,
+                    quoted: true,
+                },
                 c if c.is_ascii_digit() || (c == '.' && self.peek_second_is_digit()) => {
                     TokenKind::Number(self.number(offset)?)
                 }
-                c if is_identifier_start(c) => TokenKind::Word(self.word()),
+                c if is_identifier_start(c) => TokenKind::Word {
+                    value: self.word(),
+                    quoted: false,
+                },
                 _ => {
                     return Err(self.error(offset, format!("unexpected character {character:?}")));
                 }
@@ -372,11 +378,18 @@ fn is_identifier_continue(character: char) -> bool {
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    expression_depth: usize,
 }
+
+const MAX_EXPRESSION_DEPTH: usize = 256;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, index: 0 }
+        Self {
+            tokens,
+            index: 0,
+            expression_depth: 0,
+        }
     }
 
     fn parse_script(mut self) -> Result<Vec<Statement>> {
@@ -456,13 +469,17 @@ impl Parser {
     fn data_type(&mut self) -> Result<(DataType, bool)> {
         if self.consume_keyword("nullable") {
             self.expect(&TokenKind::LeftParen, "'('")?;
-            let (kind, nested_nullable) = self.data_type()?;
-            self.expect(&TokenKind::RightParen, "')'")?;
-            if nested_nullable {
+            if self.consume_keyword("nullable") {
                 return Err(Error::new("nested Nullable types are not supported"));
             }
+            let kind = self.base_data_type()?;
+            self.expect(&TokenKind::RightParen, "')'")?;
             return Ok((kind, true));
         }
+        Ok((self.base_data_type()?, false))
+    }
+
+    fn base_data_type(&mut self) -> Result<DataType> {
         let name = self.identifier()?;
         let kind = match name.to_ascii_lowercase().as_str() {
             "int64" => DataType::Int64,
@@ -471,7 +488,7 @@ impl Parser {
             "string" => DataType::String,
             _ => return Err(Error::new(format!("unsupported data type '{name}'"))),
         };
-        Ok((kind, false))
+        Ok(kind)
     }
 
     fn parse_insert(&mut self) -> Result<Insert> {
@@ -626,12 +643,25 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Result<Expr> {
-        self.parse_or()
+        if self.expression_depth >= MAX_EXPRESSION_DEPTH {
+            return Err(self.expression_depth_error());
+        }
+        self.expression_depth += 1;
+        let result = self.parse_or();
+        self.expression_depth -= 1;
+        let expression = result?;
+        if expression_tree_depth(&expression) > MAX_EXPRESSION_DEPTH {
+            Err(self.expression_depth_error())
+        } else {
+            Ok(expression)
+        }
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
         let mut expression = self.parse_and()?;
+        let mut operators = 0;
         while self.consume_keyword("or") {
+            self.check_expression_operators(&mut operators)?;
             expression = binary(expression, BinaryOperator::Or, self.parse_and()?);
         }
         Ok(expression)
@@ -639,25 +669,35 @@ impl Parser {
 
     fn parse_and(&mut self) -> Result<Expr> {
         let mut expression = self.parse_not()?;
+        let mut operators = 0;
         while self.consume_keyword("and") {
+            self.check_expression_operators(&mut operators)?;
             expression = binary(expression, BinaryOperator::And, self.parse_not()?);
         }
         Ok(expression)
     }
 
     fn parse_not(&mut self) -> Result<Expr> {
-        if self.consume_keyword("not") {
-            Ok(Expr::Unary {
-                operator: UnaryOperator::Not,
-                expression: Box::new(self.parse_not()?),
-            })
-        } else {
-            self.parse_comparison()
+        let mut operators = Vec::new();
+        while self.consume_keyword("not") {
+            if operators.len() >= MAX_EXPRESSION_DEPTH {
+                return Err(self.expression_depth_error());
+            }
+            operators.push(UnaryOperator::Not);
         }
+        let mut expression = self.parse_comparison()?;
+        for operator in operators.into_iter().rev() {
+            expression = Expr::Unary {
+                operator,
+                expression: Box::new(expression),
+            };
+        }
+        Ok(expression)
     }
 
     fn parse_comparison(&mut self) -> Result<Expr> {
         let mut expression = self.parse_additive()?;
+        let mut operators = 0;
         loop {
             let operator = if self.consume(&TokenKind::Equal) {
                 Some(BinaryOperator::Equal)
@@ -675,8 +715,10 @@ impl Parser {
                 None
             };
             if let Some(operator) = operator {
+                self.check_expression_operators(&mut operators)?;
                 expression = binary(expression, operator, self.parse_additive()?);
             } else if self.consume_keyword("is") {
+                self.check_expression_operators(&mut operators)?;
                 let negated = self.consume_keyword("not");
                 self.expect_keyword("null")?;
                 expression = Expr::IsNull {
@@ -691,6 +733,7 @@ impl Parser {
 
     fn parse_additive(&mut self) -> Result<Expr> {
         let mut expression = self.parse_multiplicative()?;
+        let mut operators = 0;
         loop {
             let operator = if self.consume(&TokenKind::Plus) {
                 Some(BinaryOperator::Add)
@@ -702,12 +745,14 @@ impl Parser {
             let Some(operator) = operator else {
                 return Ok(expression);
             };
+            self.check_expression_operators(&mut operators)?;
             expression = binary(expression, operator, self.parse_multiplicative()?);
         }
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
         let mut expression = self.parse_unary()?;
+        let mut operators = 0;
         loop {
             let operator = if self.consume(&TokenKind::Star) {
                 Some(BinaryOperator::Multiply)
@@ -721,26 +766,42 @@ impl Parser {
             let Some(operator) = operator else {
                 return Ok(expression);
             };
+            self.check_expression_operators(&mut operators)?;
             expression = binary(expression, operator, self.parse_unary()?);
         }
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
-        let operator = if self.consume(&TokenKind::Minus) {
-            Some(UnaryOperator::Negate)
-        } else if self.consume(&TokenKind::Plus) {
-            Some(UnaryOperator::Positive)
-        } else {
-            None
-        };
-        if let Some(operator) = operator {
-            Ok(Expr::Unary {
-                operator,
-                expression: Box::new(self.parse_unary()?),
-            })
-        } else {
-            self.parse_primary()
+        let mut operators = Vec::new();
+        loop {
+            if self.consume(&TokenKind::Minus) {
+                operators.push(UnaryOperator::Negate);
+            } else if self.consume(&TokenKind::Plus) {
+                operators.push(UnaryOperator::Positive);
+            } else {
+                break;
+            }
+            if operators.len() > MAX_EXPRESSION_DEPTH {
+                return Err(self.expression_depth_error());
+            }
         }
+        if matches!(self.current().kind, TokenKind::Number(_)) {
+            let negative = operators
+                .iter()
+                .filter(|operator| **operator == UnaryOperator::Negate)
+                .count()
+                % 2
+                == 1;
+            return self.numeric_literal(negative);
+        }
+        let mut expression = self.parse_primary()?;
+        for operator in operators.into_iter().rev() {
+            expression = Expr::Unary {
+                operator,
+                expression: Box::new(expression),
+            };
+        }
+        Ok(expression)
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
@@ -752,23 +813,8 @@ impl Parser {
         if self.consume(&TokenKind::Star) {
             return Ok(Expr::Wildcard);
         }
-        if let TokenKind::Number(number) = self.current().kind.clone() {
-            self.advance();
-            let value =
-                if number.contains(['.', 'e', 'E']) {
-                    let value = number
-                        .parse::<f64>()
-                        .map_err(|_| Error::new(format!("invalid Float64 literal '{number}'")))?;
-                    if !value.is_finite() {
-                        return Err(Error::new("non-finite Float64 literals are not supported"));
-                    }
-                    Value::Float64(value)
-                } else {
-                    Value::Int64(number.parse::<i64>().map_err(|_| {
-                        Error::new(format!("Int64 literal out of range: '{number}'"))
-                    })?)
-                };
-            return Ok(Expr::Literal(value));
+        if matches!(self.current().kind, TokenKind::Number(_)) {
+            return self.numeric_literal(false);
         }
         if let TokenKind::String(value) = self.current().kind.clone() {
             self.advance();
@@ -808,12 +854,63 @@ impl Parser {
 
     fn identifier(&mut self) -> Result<String> {
         match self.current().kind.clone() {
-            TokenKind::Word(name) => {
+            TokenKind::Word { value, .. } => {
                 self.advance();
-                Ok(name)
+                Ok(value)
             }
             _ => Err(self.expected("identifier")),
         }
+    }
+
+    fn numeric_literal(&mut self, negative: bool) -> Result<Expr> {
+        let TokenKind::Number(number) = self.current().kind.clone() else {
+            return Err(self.expected("numeric literal"));
+        };
+        self.advance();
+        let value = if number.contains(['.', 'e', 'E']) {
+            let unsigned = number
+                .parse::<f64>()
+                .map_err(|_| Error::new(format!("invalid Float64 literal '{number}'")))?;
+            let value = if negative { -unsigned } else { unsigned };
+            if !value.is_finite() {
+                return Err(Error::new("non-finite Float64 literals are not supported"));
+            }
+            Value::Float64(value)
+        } else {
+            let magnitude = number
+                .parse::<u64>()
+                .map_err(|_| Error::new(format!("Int64 literal out of range: '{number}'")))?;
+            let value = if negative {
+                if magnitude == i64::MAX as u64 + 1 {
+                    i64::MIN
+                } else {
+                    let magnitude = i64::try_from(magnitude).map_err(|_| {
+                        Error::new(format!("Int64 literal out of range: '-{number}'"))
+                    })?;
+                    -magnitude
+                }
+            } else {
+                i64::try_from(magnitude)
+                    .map_err(|_| Error::new(format!("Int64 literal out of range: '{number}'")))?
+            };
+            Value::Int64(value)
+        };
+        Ok(Expr::Literal(value))
+    }
+
+    fn check_expression_operators(&self, operators: &mut usize) -> Result<()> {
+        *operators += 1;
+        if *operators > MAX_EXPRESSION_DEPTH {
+            Err(self.expression_depth_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn expression_depth_error(&self) -> Error {
+        Error::new(format!(
+            "SQL expression nesting exceeds the maximum depth of {MAX_EXPRESSION_DEPTH}"
+        ))
     }
 
     fn unsigned_integer(&mut self, context: &str) -> Result<usize> {
@@ -830,9 +927,16 @@ impl Parser {
     }
 
     fn next_is_implicit_alias(&self) -> bool {
-        let TokenKind::Word(word) = &self.current().kind else {
+        let TokenKind::Word {
+            value: word,
+            quoted,
+        } = &self.current().kind
+        else {
             return false;
         };
+        if *quoted {
+            return true;
+        }
         !matches!(
             word.to_ascii_lowercase().as_str(),
             "from"
@@ -868,8 +972,10 @@ impl Parser {
     }
 
     fn consume_keyword(&mut self, keyword: &str) -> bool {
-        if matches!(&self.current().kind, TokenKind::Word(word) if word.eq_ignore_ascii_case(keyword))
-        {
+        if matches!(
+            &self.current().kind,
+            TokenKind::Word { value, quoted: false } if value.eq_ignore_ascii_case(keyword)
+        ) {
             self.advance();
             true
         } else {
@@ -922,13 +1028,41 @@ impl Parser {
 
     fn describe_current(&self) -> String {
         match &self.current().kind {
-            TokenKind::Word(value) => format!("'{value}'"),
+            TokenKind::Word { value, quoted } => {
+                if *quoted {
+                    format!("quoted identifier '{value}'")
+                } else {
+                    format!("'{value}'")
+                }
+            }
             TokenKind::Number(value) => format!("number '{value}'"),
             TokenKind::String(_) => "string literal".to_owned(),
             TokenKind::End => "end of input".to_owned(),
             other => format!("{other:?}"),
         }
     }
+}
+
+fn expression_tree_depth(expression: &Expr) -> usize {
+    let mut maximum = 0;
+    let mut pending = vec![(expression, 1usize)];
+    while let Some((expression, depth)) = pending.pop() {
+        maximum = maximum.max(depth);
+        match expression {
+            Expr::Function { arguments, .. } => {
+                pending.extend(arguments.iter().map(|argument| (argument, depth + 1)));
+            }
+            Expr::Binary { left, right, .. } => {
+                pending.push((left, depth + 1));
+                pending.push((right, depth + 1));
+            }
+            Expr::Unary { expression, .. } | Expr::IsNull { expression, .. } => {
+                pending.push((expression, depth + 1));
+            }
+            Expr::Column(_) | Expr::Literal(_) | Expr::Wildcard => {}
+        }
+    }
+    maximum
 }
 
 fn binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
@@ -1045,5 +1179,33 @@ mod tests {
     fn rejects_unknown_create_suffix() {
         let error = parse("CREATE TABLE t (id Int64) SOMETHING").unwrap_err();
         assert!(error.message().contains("end of statement"));
+    }
+
+    #[test]
+    fn parses_the_full_signed_int64_range() {
+        let statements =
+            parse("INSERT INTO t VALUES (-9223372036854775808), (9223372036854775807)").unwrap();
+        let Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert")
+        };
+        assert_eq!(
+            insert.rows,
+            vec![
+                vec![Expr::Literal(Value::Int64(i64::MIN))],
+                vec![Expr::Literal(Value::Int64(i64::MAX))]
+            ]
+        );
+        assert!(parse("INSERT INTO t VALUES (9223372036854775808)").is_err());
+        assert!(parse("INSERT INTO t VALUES (-9223372036854775809)").is_err());
+    }
+
+    #[test]
+    fn quoted_keywords_remain_identifiers() {
+        let statements = parse("SELECT \"true\", `null` FROM t").unwrap();
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected select")
+        };
+        assert_eq!(select.items[0].expression, Expr::Column("true".to_owned()));
+        assert_eq!(select.items[1].expression, Expr::Column("null".to_owned()));
     }
 }
