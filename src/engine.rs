@@ -77,8 +77,22 @@ impl Engine {
         let max_batch_result_bytes = self.config.max_batch_result_bytes;
         let mut retained_bytes = 0_usize;
         let mut results = Vec::new();
-        for result in self.execute_iter(sql)? {
-            let result = result?;
+        for statement in self.parse_statements(sql)? {
+            let remaining_bytes = max_batch_result_bytes.saturating_sub(retained_bytes);
+            let result = match self.execute_statement_with_budget(statement, remaining_bytes) {
+                Err(Error::ResourceLimit {
+                    resource, actual, ..
+                }) if retained_bytes > 0
+                    && matches!(resource, "result bytes" | "intermediate result bytes") =>
+                {
+                    return Err(Error::ResourceLimit {
+                        resource: "batch result bytes",
+                        limit: max_batch_result_bytes,
+                        actual: retained_bytes.saturating_add(actual),
+                    });
+                }
+                result => result?,
+            };
             retained_bytes = retained_bytes.saturating_add(result_retained_bytes(&result));
             if retained_bytes > max_batch_result_bytes {
                 return Err(Error::ResourceLimit {
@@ -98,15 +112,7 @@ impl Engine {
         &mut self,
         sql: &str,
     ) -> Result<impl Iterator<Item = Result<StatementResult>> + '_> {
-        if sql.len() > self.config.max_input_bytes {
-            return Err(Error::ResourceLimit {
-                resource: "SQL input bytes",
-                limit: self.config.max_input_bytes,
-                actual: sql.len(),
-            });
-        }
-        let statements = Parser::parse_sql(&GenericDialect {}, sql)
-            .map_err(|error| Error::Sql(error.to_string()))?;
+        let statements = self.parse_statements(sql)?;
         let mut statements = statements.into_iter();
         let mut failed = false;
         Ok(std::iter::from_fn(move || {
@@ -120,11 +126,30 @@ impl Engine {
         }))
     }
 
+    fn parse_statements(&self, sql: &str) -> Result<Vec<Statement>> {
+        if sql.len() > self.config.max_input_bytes {
+            return Err(Error::ResourceLimit {
+                resource: "SQL input bytes",
+                limit: self.config.max_input_bytes,
+                actual: sql.len(),
+            });
+        }
+        Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| Error::Sql(error.to_string()))
+    }
+
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(&normalize_identifier(name))
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+        self.execute_statement_with_budget(statement, self.config.max_batch_result_bytes)
+    }
+
+    fn execute_statement_with_budget(
+        &mut self,
+        statement: Statement,
+        result_byte_budget: usize,
+    ) -> Result<StatementResult> {
         validate_statement_options(&statement)?;
         match statement {
             Statement::CreateTable {
@@ -240,12 +265,14 @@ impl Engine {
                     .append_rows(rows)?;
                 Ok(StatementResult::Command { affected_rows })
             }
-            Statement::Query(query) => self.execute_query(*query).map(StatementResult::Query),
+            Statement::Query(query) => self
+                .execute_query(*query, result_byte_budget)
+                .map(StatementResult::Query),
             other => Err(Error::Unsupported(other.to_string())),
         }
     }
 
-    fn execute_query(&self, query: Query) -> Result<QueryResult> {
+    fn execute_query(&self, query: Query, result_byte_budget: usize) -> Result<QueryResult> {
         if query.with.is_some()
             || query.offset.is_some()
             || query.fetch.is_some()
@@ -260,7 +287,12 @@ impl Engine {
         let SetExpr::Select(select) = *query.body else {
             return Err(Error::Unsupported("set operations and subqueries".into()));
         };
-        self.execute_select(*select, &query.order_by, query.limit.as_ref())
+        self.execute_select(
+            *select,
+            &query.order_by,
+            query.limit.as_ref(),
+            result_byte_budget,
+        )
     }
 
     fn execute_select(
@@ -268,6 +300,7 @@ impl Engine {
         select: Select,
         order_by: &[OrderByExpr],
         limit: Option<&Expr>,
+        result_byte_budget: usize,
     ) -> Result<QueryResult> {
         if matches!(&select.distinct, Some(Distinct::On(_))) {
             return Err(Error::Unsupported("DISTINCT ON".into()));
@@ -420,18 +453,43 @@ impl Engine {
             }
         }
 
-        let memory = MemoryTracker::new(self.config.max_batch_result_bytes);
+        let columns = projections
+            .iter()
+            .map(|projection| projection.header.clone())
+            .collect::<Vec<_>>();
+        let limit = limit.map(parse_limit).transpose()?.unwrap_or(usize::MAX);
+        let ordered = !order_by.is_empty();
+        let distinct = select.distinct.is_some();
+        if limit == 0 {
+            let result = QueryResult {
+                columns,
+                rows: Vec::new(),
+            };
+            enforce_result_byte_limit(&result, result_byte_budget)?;
+            return Ok(result);
+        }
+
+        let memory = MemoryTracker::new(result_byte_budget);
         let mut filtered_rows = Vec::new();
         let mut filtered_memory = memory.reserve(std::mem::size_of::<Vec<usize>>())?;
         let source_rows = source.table.map_or(1, Table::row_count);
+        let scan_limit = if !grouped && !ordered && !distinct {
+            limit
+        } else {
+            usize::MAX
+        };
         for row in 0..source_rows {
             if let Some(predicate) = &select.selection
-                && eval_row(predicate, &source, Some(row))?.sql_bool()? != Some(true)
+                && eval_row_with_memory(predicate, &source, Some(row), Some(&memory))?.sql_bool()?
+                    != Some(true)
             {
                 continue;
             }
             filtered_memory.grow(std::mem::size_of::<usize>())?;
             filtered_rows.push(row);
+            if filtered_rows.len() >= scan_limit {
+                break;
+            }
         }
         let (groups, group_memory) = if grouped {
             make_groups(&source, filtered_rows, &group_by, &memory)?
@@ -440,13 +498,6 @@ impl Engine {
         };
         drop(filtered_memory);
 
-        let columns = projections
-            .iter()
-            .map(|projection| projection.header.clone())
-            .collect::<Vec<_>>();
-        let limit = limit.map(parse_limit).transpose()?.unwrap_or(usize::MAX);
-        let ordered = !order_by.is_empty();
-        let distinct = select.distinct.is_some();
         let mut projected_memory = memory.reserve(
             columns_retained_bytes(&columns)
                 .saturating_add(std::mem::size_of::<Vec<ProjectedRow>>()),
@@ -475,9 +526,16 @@ impl Engine {
             {
                 continue;
             }
+            let mut row_memory = memory.reserve(
+                std::mem::size_of::<Vec<Value>>().saturating_add(
+                    projections
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Value>()),
+                ),
+            )?;
             let mut values = Vec::with_capacity(projections.len());
             for projection in &projections {
-                values.push(eval_group(
+                let value = eval_group(
                     &projection.expr,
                     &source,
                     &rows,
@@ -485,7 +543,11 @@ impl Engine {
                     &HashMap::new(),
                     &empty_type_aliases,
                     &memory,
-                )?);
+                )?;
+                if let Value::String(value) = &value {
+                    row_memory.grow(value.len())?;
+                }
+                values.push(value);
             }
             if distinct {
                 let key = row_key(&values);
@@ -499,6 +561,7 @@ impl Engine {
                 seen.insert(key);
             }
             let source_rows = if ordered { rows } else { Vec::new() };
+            drop(row_memory);
             projected_memory.grow(
                 std::mem::size_of::<ProjectedRow>()
                     .saturating_add(values_retained_payload_bytes(&values))
@@ -576,14 +639,7 @@ impl Engine {
             columns,
             rows: projected.into_iter().map(|row| row.values).collect(),
         };
-        let result_bytes = query_result_retained_bytes(&result);
-        if result_bytes > self.config.max_batch_result_bytes {
-            return Err(Error::ResourceLimit {
-                resource: "result bytes",
-                limit: self.config.max_batch_result_bytes,
-                actual: result_bytes,
-            });
-        }
+        enforce_result_byte_limit(&result, result_byte_budget)?;
         Ok(result)
     }
 }
@@ -818,6 +874,19 @@ fn query_result_retained_bytes(result: &QueryResult) -> usize {
         .fold(columns_retained_bytes(&result.columns), |size, row| {
             size.saturating_add(row_retained_bytes(row))
         })
+}
+
+fn enforce_result_byte_limit(result: &QueryResult, limit: usize) -> Result<()> {
+    let actual = query_result_retained_bytes(result);
+    if actual > limit {
+        Err(Error::ResourceLimit {
+            resource: "result bytes",
+            limit,
+            actual,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn columns_retained_bytes(columns: &[String]) -> usize {
@@ -1647,41 +1716,54 @@ fn eval_constant(expr: &Expr) -> Result<Value> {
 }
 
 fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<Value> {
+    eval_row_with_memory(expr, source, row, None)
+}
+
+fn eval_row_with_memory(
+    expr: &Expr,
+    source: &EvalSource<'_>,
+    row: Option<usize>,
+    memory: Option<&MemoryTracker>,
+) -> Result<Value> {
     match expr {
-        Expr::Value(value) => sql_value(value),
-        Expr::Identifier(identifier) => lookup_column(source, row, &identifier.value),
+        Expr::Value(value) => sql_value_with_memory(value, memory),
+        Expr::Identifier(identifier) => lookup_column(source, row, &identifier.value, memory),
         Expr::CompoundIdentifier(identifiers) => {
             if identifiers.len() != 2 {
                 return Err(Error::ColumnNotFound(expr.to_string()));
             }
             source.validate_qualifier(&identifiers[0].value)?;
-            lookup_column(source, row, &identifiers[1].value)
+            lookup_column(source, row, &identifiers[1].value, memory)
         }
-        Expr::Nested(expr) => eval_row(expr, source, row),
+        Expr::Nested(expr) => eval_row_with_memory(expr, source, row, memory),
         Expr::UnaryOp { op, expr } => {
             if let Some(value) = minimum_int_literal(op, expr) {
                 return Ok(value);
             }
-            eval_unary(op, eval_row(expr, source, row)?)
+            eval_unary(op, eval_row_with_memory(expr, source, row, memory)?)
         }
         Expr::BinaryOp { left, op, right } => {
-            let left = eval_row(left, source, row)?;
-            let right = eval_row(right, source, row)?;
-            eval_binary(left, op, right)
+            let left = eval_row_with_memory(left, source, row, memory)?;
+            let right = eval_row_with_memory(right, source, row, memory)?;
+            eval_binary_with_memory(left, op, right, memory)
         }
-        Expr::IsNull(expr) => Ok(Value::Bool(eval_row(expr, source, row)?.is_null())),
-        Expr::IsNotNull(expr) => Ok(Value::Bool(!eval_row(expr, source, row)?.is_null())),
+        Expr::IsNull(expr) => Ok(Value::Bool(
+            eval_row_with_memory(expr, source, row, memory)?.is_null(),
+        )),
+        Expr::IsNotNull(expr) => Ok(Value::Bool(
+            !eval_row_with_memory(expr, source, row, memory)?.is_null(),
+        )),
         Expr::IsTrue(expr) => Ok(Value::Bool(
-            eval_row(expr, source, row)?.sql_bool()? == Some(true),
+            eval_row_with_memory(expr, source, row, memory)?.sql_bool()? == Some(true),
         )),
         Expr::IsFalse(expr) => Ok(Value::Bool(
-            eval_row(expr, source, row)?.sql_bool()? == Some(false),
+            eval_row_with_memory(expr, source, row, memory)?.sql_bool()? == Some(false),
         )),
         Expr::IsNotTrue(expr) => Ok(Value::Bool(
-            eval_row(expr, source, row)?.sql_bool()? != Some(true),
+            eval_row_with_memory(expr, source, row, memory)?.sql_bool()? != Some(true),
         )),
         Expr::IsNotFalse(expr) => Ok(Value::Bool(
-            eval_row(expr, source, row)?.sql_bool()? != Some(false),
+            eval_row_with_memory(expr, source, row, memory)?.sql_bool()? != Some(false),
         )),
         Expr::Between {
             expr,
@@ -1689,14 +1771,20 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
             low,
             high,
         } => {
-            let value = eval_row(expr, source, row)?;
-            let lower = eval_binary(
+            let value = eval_row_with_memory(expr, source, row, memory)?;
+            let lower = eval_binary_with_memory(
                 value.clone(),
                 &BinaryOperator::GtEq,
-                eval_row(low, source, row)?,
+                eval_row_with_memory(low, source, row, memory)?,
+                memory,
             )?;
-            let upper = eval_binary(value, &BinaryOperator::LtEq, eval_row(high, source, row)?)?;
-            let result = eval_binary(lower, &BinaryOperator::And, upper)?;
+            let upper = eval_binary_with_memory(
+                value,
+                &BinaryOperator::LtEq,
+                eval_row_with_memory(high, source, row, memory)?,
+                memory,
+            )?;
+            let result = eval_binary_with_memory(lower, &BinaryOperator::And, upper, memory)?;
             if *negated {
                 eval_unary(&UnaryOperator::Not, result)
             } else {
@@ -1708,13 +1796,14 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
             list,
             negated,
         } => {
-            let needle = eval_row(expr, source, row)?;
+            let needle = eval_row_with_memory(expr, source, row, memory)?;
             let mut result = Value::Bool(false);
             for item in list {
-                let equal = eval_binary(
+                let equal = eval_binary_with_memory(
                     needle.clone(),
                     &BinaryOperator::Eq,
-                    eval_row(item, source, row)?,
+                    eval_row_with_memory(item, source, row, memory)?,
+                    memory,
                 )?;
                 if equal == Value::Bool(true) {
                     result = equal;
@@ -1736,8 +1825,8 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
             pattern,
             escape_char,
         } => eval_like(
-            eval_row(expr, source, row)?,
-            eval_row(pattern, source, row)?,
+            eval_row_with_memory(expr, source, row, memory)?,
+            eval_row_with_memory(pattern, source, row, memory)?,
             *negated,
             false,
             escape_char.as_deref(),
@@ -1748,8 +1837,8 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
             pattern,
             escape_char,
         } => eval_like(
-            eval_row(expr, source, row)?,
-            eval_row(pattern, source, row)?,
+            eval_row_with_memory(expr, source, row, memory)?,
+            eval_row_with_memory(pattern, source, row, memory)?,
             *negated,
             true,
             escape_char.as_deref(),
@@ -1762,24 +1851,36 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
         } => eval_cast(
             kind,
             format.as_ref(),
-            eval_row(expr, source, row)?,
+            eval_row_with_memory(expr, source, row, memory)?,
             parse_data_type(&data_type.to_string())?.0,
         ),
-        Expr::Function(function) => eval_scalar_function(function, source, row),
+        Expr::Function(function) => eval_scalar_function(function, source, row, memory),
         _ => Err(Error::Unsupported(format!("expression {expr}"))),
     }
 }
 
-fn lookup_column(source: &EvalSource<'_>, row: Option<usize>, name: &str) -> Result<Value> {
+fn lookup_column(
+    source: &EvalSource<'_>,
+    row: Option<usize>,
+    name: &str,
+    memory: Option<&MemoryTracker>,
+) -> Result<Value> {
     let table = source
         .table
         .ok_or_else(|| Error::ColumnNotFound(name.into()))?;
     let column = table.schema().index_of(name)?;
     let row = row.ok_or_else(|| Error::ColumnNotFound(name.into()))?;
+    let _value_memory = memory
+        .map(|memory| memory.reserve(table.value_retained_bytes(row, column)))
+        .transpose()?;
     Ok(table.value(row, column))
 }
 
 fn sql_value(value: &SqlValue) -> Result<Value> {
+    sql_value_with_memory(value, None)
+}
+
+fn sql_value_with_memory(value: &SqlValue, memory: Option<&MemoryTracker>) -> Result<Value> {
     match value {
         SqlValue::Number(value, _) => {
             if value.contains(['.', 'e', 'E']) {
@@ -1798,7 +1899,14 @@ fn sql_value(value: &SqlValue) -> Result<Value> {
         | SqlValue::DoubleQuotedString(value)
         | SqlValue::EscapedStringLiteral(value)
         | SqlValue::NationalStringLiteral(value)
-        | SqlValue::RawStringLiteral(value) => Ok(Value::String(value.clone())),
+        | SqlValue::RawStringLiteral(value) => {
+            let _value_memory = memory
+                .map(|memory| {
+                    memory.reserve(std::mem::size_of::<Value>().saturating_add(value.len()))
+                })
+                .transpose()?;
+            Ok(Value::String(value.clone()))
+        }
         SqlValue::Boolean(value) => Ok(Value::Bool(*value)),
         SqlValue::Null => Ok(Value::Null),
         _ => Err(Error::Unsupported(format!("literal {value}"))),
@@ -1848,7 +1956,12 @@ fn eval_unary(operator: &UnaryOperator, value: Value) -> Result<Value> {
     }
 }
 
-fn eval_binary(left: Value, operator: &BinaryOperator, right: Value) -> Result<Value> {
+fn eval_binary_with_memory(
+    left: Value,
+    operator: &BinaryOperator,
+    right: Value,
+    memory: Option<&MemoryTracker>,
+) -> Result<Value> {
     if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
         return eval_boolean(left, operator, right);
     }
@@ -1880,7 +1993,18 @@ fn eval_binary(left: Value, operator: &BinaryOperator, right: Value) -> Result<V
         BinaryOperator::Divide => numeric_divide(left, right),
         BinaryOperator::Modulo => numeric_modulo(left, right),
         BinaryOperator::StringConcat => match (left, right) {
-            (Value::String(left), Value::String(right)) => Ok(Value::String(left + &right)),
+            (Value::String(left), Value::String(right)) => {
+                let length = left.len().saturating_add(right.len());
+                let _result_memory = memory
+                    .map(|memory| {
+                        memory.reserve(std::mem::size_of::<Value>().saturating_add(length))
+                    })
+                    .transpose()?;
+                let mut result = String::with_capacity(length);
+                result.push_str(&left);
+                result.push_str(&right);
+                Ok(Value::String(result))
+            }
             (left, right) => Err(Error::Type(format!(
                 "cannot concatenate {} and {}",
                 left.type_name(),
@@ -2175,14 +2299,18 @@ fn eval_scalar_function(
     function: &Function,
     source: &EvalSource<'_>,
     row: Option<usize>,
+    memory: Option<&MemoryTracker>,
 ) -> Result<Value> {
     let result_type = infer_function_type(function, source, &HashMap::new())?;
-    eval_scalar_function_with(function, result_type, |expr| eval_row(expr, source, row))
+    eval_scalar_function_with(function, result_type, memory, |expr| {
+        eval_row_with_memory(expr, source, row, memory)
+    })
 }
 
 fn eval_scalar_function_with(
     function: &Function,
     result_type: Option<DataType>,
+    memory: Option<&MemoryTracker>,
     mut evaluate: impl FnMut(&Expr) -> Result<Value>,
 ) -> Result<Value> {
     let (name, arguments, distinct) = function_parts(function)?;
@@ -2203,8 +2331,10 @@ fn eval_scalar_function_with(
             };
             let value = evaluate(expr)?;
             if !value.is_null() {
-                return result_type
-                    .map_or(Ok(value.clone()), |data_type| cast_value(value, data_type));
+                return match result_type {
+                    Some(data_type) => cast_value(value, data_type),
+                    None => Ok(value),
+                };
             }
         }
         return Ok(Value::Null);
@@ -2223,14 +2353,46 @@ fn eval_scalar_function_with(
             .ok_or_else(|| Error::Type("Int64 absolute-value overflow".into())),
         ("abs", [Value::Float64(value)]) => Ok(Value::Float64(value.abs())),
         ("abs", [Value::Null]) => Ok(Value::Null),
-        ("lower", [Value::String(value)]) => Ok(Value::String(value.to_lowercase())),
+        ("lower", [Value::String(value)]) => {
+            Ok(Value::String(lowercase_with_memory(value, memory)?))
+        }
         ("lower", [Value::Null]) => Ok(Value::Null),
-        ("upper", [Value::String(value)]) => Ok(Value::String(value.to_uppercase())),
+        ("upper", [Value::String(value)]) => {
+            Ok(Value::String(uppercase_with_memory(value, memory)?))
+        }
         ("upper", [Value::Null]) => Ok(Value::Null),
         ("length", [Value::String(value)]) => Ok(Value::Int64(value.chars().count() as i64)),
         ("length", [Value::Null]) => Ok(Value::Null),
         _ => Err(Error::Unsupported(format!("scalar function {name}"))),
     }
+}
+
+fn lowercase_with_memory(value: &str, memory: Option<&MemoryTracker>) -> Result<String> {
+    let length = value.chars().fold(0_usize, |length, character| {
+        character.to_lowercase().fold(length, |length, character| {
+            length.saturating_add(character.len_utf8())
+        })
+    });
+    let _result_memory = memory
+        .map(|memory| memory.reserve(std::mem::size_of::<Value>().saturating_add(length)))
+        .transpose()?;
+    let mut result = String::with_capacity(length);
+    result.extend(value.chars().flat_map(char::to_lowercase));
+    Ok(result)
+}
+
+fn uppercase_with_memory(value: &str, memory: Option<&MemoryTracker>) -> Result<String> {
+    let length = value.chars().fold(0_usize, |length, character| {
+        character.to_uppercase().fold(length, |length, character| {
+            length.saturating_add(character.len_utf8())
+        })
+    });
+    let _result_memory = memory
+        .map(|memory| memory.reserve(std::mem::size_of::<Value>().saturating_add(length)))
+        .transpose()?;
+    let mut result = String::with_capacity(length);
+    result.extend(value.chars().flat_map(char::to_uppercase));
+    Ok(result)
 }
 
 fn contains_aggregate(expr: &Expr) -> bool {
@@ -2290,6 +2452,7 @@ fn eval_group(
     if let Expr::Identifier(identifier) = expr
         && let Some(value) = aliases.get(&normalize_identifier(&identifier.value))
     {
+        let _value_memory = memory.reserve(value_retained_payload_bytes(value))?;
         return Ok(value.clone());
     }
     if let Expr::Identifier(identifier) = expr
@@ -2306,9 +2469,9 @@ fn eval_group(
         );
     }
     match expr {
-        Expr::Value(value) => sql_value(value),
+        Expr::Value(value) => sql_value_with_memory(value, Some(memory)),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            eval_row(expr, source, rows.first().copied())
+            eval_row_with_memory(expr, source, rows.first().copied(), Some(memory))
         }
         Expr::Function(function) => {
             let name = object_name(&function.name)?.to_ascii_lowercase();
@@ -2316,7 +2479,7 @@ fn eval_group(
                 eval_aggregate(function, source, rows, memory)
             } else {
                 let result_type = infer_function_type(function, source, alias_types)?;
-                eval_scalar_function_with(function, result_type, |expr| {
+                eval_scalar_function_with(function, result_type, Some(memory), |expr| {
                     eval_group(
                         expr,
                         source,
@@ -2329,7 +2492,7 @@ fn eval_group(
                 })
             }
         }
-        Expr::BinaryOp { left, op, right } => eval_binary(
+        Expr::BinaryOp { left, op, right } => eval_binary_with_memory(
             eval_group(
                 left,
                 source,
@@ -2349,6 +2512,7 @@ fn eval_group(
                 alias_types,
                 memory,
             )?,
+            Some(memory),
         ),
         Expr::UnaryOp { op, expr } => {
             if let Some(value) = minimum_int_literal(op, expr) {
@@ -2467,7 +2631,7 @@ fn eval_group(
                 alias_types,
                 memory,
             )?;
-            let lower = eval_binary(
+            let lower = eval_binary_with_memory(
                 value.clone(),
                 &BinaryOperator::GtEq,
                 eval_group(
@@ -2479,8 +2643,9 @@ fn eval_group(
                     alias_types,
                     memory,
                 )?,
+                Some(memory),
             )?;
-            let upper = eval_binary(
+            let upper = eval_binary_with_memory(
                 value,
                 &BinaryOperator::LtEq,
                 eval_group(
@@ -2492,8 +2657,9 @@ fn eval_group(
                     alias_types,
                     memory,
                 )?,
+                Some(memory),
             )?;
-            let result = eval_binary(lower, &BinaryOperator::And, upper)?;
+            let result = eval_binary_with_memory(lower, &BinaryOperator::And, upper, Some(memory))?;
             if *negated {
                 eval_unary(&UnaryOperator::Not, result)
             } else {
@@ -2516,7 +2682,7 @@ fn eval_group(
             )?;
             let mut result = Value::Bool(false);
             for item in list {
-                let equal = eval_binary(
+                let equal = eval_binary_with_memory(
                     needle.clone(),
                     &BinaryOperator::Eq,
                     eval_group(
@@ -2528,6 +2694,7 @@ fn eval_group(
                         alias_types,
                         memory,
                     )?,
+                    Some(memory),
                 )?;
                 if equal == Value::Bool(true) {
                     result = equal;
@@ -2666,7 +2833,7 @@ fn eval_aggregate(
         .then(|| memory.reserve(std::mem::size_of::<HashSet<KeyValue>>()))
         .transpose()?;
     for row in rows {
-        let value = eval_row(argument, source, Some(*row))?;
+        let value = eval_row_with_memory(argument, source, Some(*row), Some(memory))?;
         if value.is_null() {
             continue;
         }
@@ -2690,8 +2857,8 @@ fn eval_aggregate(
         "count" => Ok(Value::Int64(values.len() as i64)),
         "sum" => aggregate_sum(&values),
         "avg" => aggregate_avg(&values, memory),
-        "min" => aggregate_extreme(&values, false),
-        "max" => aggregate_extreme(&values, true),
+        "min" => aggregate_extreme(&values, false, memory),
+        "max" => aggregate_extreme(&values, true, memory),
         _ => unreachable!(),
     }
 }
@@ -2775,7 +2942,7 @@ fn aggregate_avg(values: &[Value], memory: &MemoryTracker) -> Result<Value> {
     finite_float(average, "AVG result")
 }
 
-fn aggregate_extreme(values: &[Value], maximum: bool) -> Result<Value> {
+fn aggregate_extreme(values: &[Value], maximum: bool, memory: &MemoryTracker) -> Result<Value> {
     let Some(first) = values.first() else {
         return Ok(Value::Null);
     };
@@ -2786,6 +2953,7 @@ fn aggregate_extreme(values: &[Value], maximum: bool) -> Result<Value> {
             extreme = value;
         }
     }
+    let _result_memory = memory.reserve(value_retained_payload_bytes(extreme))?;
     Ok(extreme.clone())
 }
 
@@ -2855,7 +3023,10 @@ fn make_groups<'a>(
     for row in rows {
         let key = group_by
             .iter()
-            .map(|expr| eval_row(expr, source, Some(row)).map(|value| value_key(&value)))
+            .map(|expr| {
+                eval_row_with_memory(expr, source, Some(row), Some(memory))
+                    .map(|value| value_key(&value))
+            })
             .collect::<Result<Vec<_>>>()?;
         let key_bytes = key_retained_bytes(&key);
         let key_memory = memory.reserve(key_bytes)?;
@@ -3521,7 +3692,7 @@ mod tests {
     #[test]
     fn bounds_intermediate_projection_materialization() {
         let mut engine = Engine::new(EngineConfig {
-            max_batch_result_bytes: 1_024,
+            max_batch_result_bytes: 2_048,
             ..EngineConfig::default()
         });
         engine.execute("CREATE TABLE t (payload String)").unwrap();
@@ -3553,6 +3724,66 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn rejects_string_expression_amplification_before_allocation() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 1_024,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (payload String)").unwrap();
+        let payload = "x".repeat(100 * 1_024);
+        engine
+            .execute(&format!("INSERT INTO t VALUES ('{payload}')"))
+            .unwrap();
+        let expression = std::iter::repeat_n("payload", 100)
+            .collect::<Vec<_>>()
+            .join(" || ");
+
+        assert!(matches!(
+            engine.execute(&format!("SELECT {expression} AS amplified FROM t")),
+            Err(Error::ResourceLimit {
+                resource: "intermediate result bytes",
+                limit: 1_024,
+                ..
+            })
+        ));
+
+        engine
+            .execute("CREATE TABLE small (payload String)")
+            .unwrap();
+        engine
+            .execute(&format!("INSERT INTO small VALUES ('{}')", "y".repeat(64)))
+            .unwrap();
+        assert!(matches!(
+            engine.execute(&format!("SELECT {expression} AS amplified FROM small")),
+            Err(Error::ResourceLimit {
+                resource: "intermediate result bytes",
+                limit: 1_024,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn limit_zero_short_circuits_before_scanning() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 100,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        let values = (0..100)
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+
+        let result = query(&mut engine, "SELECT n FROM t ORDER BY n LIMIT 0");
+        assert_eq!(result.columns, vec!["n"]);
+        assert!(result.rows.is_empty());
     }
 
     #[test]

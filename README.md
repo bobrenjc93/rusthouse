@@ -48,7 +48,7 @@ hardware,2,16
 
 The engine deliberately rejects unsupported syntax with typed errors. Joins, subqueries, windows, persistence, transactions spanning statements, and concurrent service access are not implemented.
 
-Embedding starts with `rusthouse::Engine`. `EngineConfig` bounds SQL bytes, rows per insert, rows per table, emitted rows per query, and retained or intermediate query bytes. The byte budget covers filtering, grouping, aggregate and `DISTINCT` state, projected rows, and sort keys. Unordered queries apply `DISTINCT` and `LIMIT` while scanning; ordered queries fail at the byte limit if their sort candidates cannot be retained safely. `execute_iter` yields one statement result at a time; the CLI uses it so multi-statement batches do not retain prior results. The collecting `execute` API also enforces a cumulative byte limit. Each insert batch is validated before any column is changed.
+Embedding starts with `rusthouse::Engine`. `EngineConfig` bounds SQL bytes, rows per insert, rows per table, emitted rows per query, and retained or intermediate query bytes. The byte budget covers expression results, filtering, grouping, aggregate and `DISTINCT` state, projected rows, and sort keys. `LIMIT 0` returns after binding without scanning, and plain unordered queries stop retaining scan candidates at their limit; ordered queries fail at the byte limit if their sort candidates cannot be retained safely. `execute_iter` yields one statement result at a time; the CLI uses it so multi-statement batches do not retain prior results. The collecting `execute` API gives each query only its remaining cumulative byte budget. Each insert batch is validated before any column is changed.
 
 ## Product target
 

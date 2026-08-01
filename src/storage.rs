@@ -95,6 +95,13 @@ impl ColumnVector {
         }
     }
 
+    fn value_retained_bytes(&self, row: usize) -> usize {
+        std::mem::size_of::<Value>().saturating_add(match self {
+            Self::String(values) => values[row].as_ref().map_or(0, String::len),
+            _ => 0,
+        })
+    }
+
     fn push(&mut self, value: Value) {
         match (self, value) {
             (Self::Int64(values), Value::Int64(value)) => values.push(Some(value)),
@@ -136,6 +143,10 @@ impl Table {
 
     pub fn value(&self, row: usize, column: usize) -> Value {
         self.columns[column].get(row)
+    }
+
+    pub(crate) fn value_retained_bytes(&self, row: usize, column: usize) -> usize {
+        self.columns[column].value_retained_bytes(row)
     }
 
     /// Validates the entire batch before mutating any column.
