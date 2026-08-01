@@ -365,6 +365,36 @@ impl Engine {
         for order in order_by {
             validate_expression_references(&order.expr, &source, &alias_expressions)?;
         }
+        let empty_type_aliases = HashMap::new();
+        let projection_types = projections
+            .iter()
+            .map(|projection| infer_expression_type(&projection.expr, &source, &empty_type_aliases))
+            .collect::<Result<Vec<_>>>()?;
+        let alias_types = projections
+            .iter()
+            .zip(&projection_types)
+            .map(|(projection, data_type)| (normalize_identifier(&projection.header), *data_type))
+            .collect::<HashMap<_, _>>();
+        if let Some(selection) = &select.selection {
+            ensure_type(
+                infer_expression_type(selection, &source, &empty_type_aliases)?,
+                DataType::Bool,
+                "WHERE",
+            )?;
+        }
+        for expression in &group_by {
+            infer_expression_type(expression, &source, &empty_type_aliases)?;
+        }
+        if let Some(having) = &select.having {
+            ensure_type(
+                infer_expression_type(having, &source, &alias_types)?,
+                DataType::Bool,
+                "HAVING",
+            )?;
+        }
+        for order in order_by {
+            infer_expression_type(&order.expr, &source, &alias_types)?;
+        }
         let grouped = !group_by.is_empty()
             || projections
                 .iter()
@@ -413,15 +443,8 @@ impl Engine {
                     &source,
                     &rows,
                     &HashMap::new(),
+                    &empty_type_aliases,
                 )?);
-            }
-            projected_bytes = projected_bytes.saturating_add(row_retained_bytes(&values));
-            if projected_bytes > self.config.max_batch_result_bytes {
-                return Err(Error::ResourceLimit {
-                    resource: "result bytes",
-                    limit: self.config.max_batch_result_bytes,
-                    actual: projected_bytes,
-                });
             }
             let aliases = columns
                 .iter()
@@ -430,9 +453,18 @@ impl Engine {
                 .map(|(name, value)| (normalize_identifier(&name), value))
                 .collect::<HashMap<_, _>>();
             if let Some(having) = &select.having
-                && eval_group(having, &source, &rows, &aliases)?.sql_bool()? != Some(true)
+                && eval_group(having, &source, &rows, &aliases, &alias_types)?.sql_bool()?
+                    != Some(true)
             {
                 continue;
+            }
+            projected_bytes = projected_bytes.saturating_add(row_retained_bytes(&values));
+            if projected_bytes > self.config.max_batch_result_bytes {
+                return Err(Error::ResourceLimit {
+                    resource: "result bytes",
+                    limit: self.config.max_batch_result_bytes,
+                    actual: projected_bytes,
+                });
             }
             projected.push(ProjectedRow {
                 values,
@@ -469,7 +501,13 @@ impl Engine {
                         {
                             return Ok(row.values[index].clone());
                         }
-                        eval_group(&order.expr, &source, &row.source_rows, &aliases)
+                        eval_group(
+                            &order.expr,
+                            &source,
+                            &row.source_rows,
+                            &aliases,
+                            &alias_types,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
             }
@@ -872,6 +910,277 @@ fn validate_expression_references(
     }
 }
 
+fn infer_expression_type(
+    expr: &Expr,
+    source: &EvalSource<'_>,
+    aliases: &HashMap<String, Option<DataType>>,
+) -> Result<Option<DataType>> {
+    match expr {
+        Expr::Identifier(identifier) => {
+            if let Some(data_type) = aliases.get(&normalize_identifier(&identifier.value)) {
+                return Ok(*data_type);
+            }
+            let table = source
+                .table
+                .ok_or_else(|| Error::ColumnNotFound(identifier.value.clone()))?;
+            let index = table.schema().index_of(&identifier.value)?;
+            Ok(Some(table.schema().fields()[index].data_type))
+        }
+        Expr::CompoundIdentifier(identifiers) if identifiers.len() == 2 => {
+            source.validate_qualifier(&identifiers[0].value)?;
+            let table = source
+                .table
+                .ok_or_else(|| Error::ColumnNotFound(expr.to_string()))?;
+            let index = table.schema().index_of(&identifiers[1].value)?;
+            Ok(Some(table.schema().fields()[index].data_type))
+        }
+        Expr::CompoundIdentifier(_) => Err(Error::ColumnNotFound(expr.to_string())),
+        Expr::Value(value) => Ok(sql_value(value)?.data_type()),
+        Expr::Nested(expr) => infer_expression_type(expr, source, aliases),
+        Expr::UnaryOp { op, expr } => {
+            if minimum_int_literal(op, expr).is_some() {
+                return Ok(Some(DataType::Int64));
+            }
+            let data_type = infer_expression_type(expr, source, aliases)?;
+            match (op, data_type) {
+                (_, None) => Ok(None),
+                (UnaryOperator::Plus | UnaryOperator::Minus, Some(data_type))
+                    if is_numeric(data_type) =>
+                {
+                    Ok(Some(data_type))
+                }
+                (UnaryOperator::Not, Some(DataType::Bool)) => Ok(Some(DataType::Bool)),
+                (_, Some(data_type)) => Err(Error::Type(format!(
+                    "operator {op} does not accept {data_type}"
+                ))),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left = infer_expression_type(left, source, aliases)?;
+            let right = infer_expression_type(right, source, aliases)?;
+            infer_binary_type(left, op, right)
+        }
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_) => Ok(Some(DataType::Bool)),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            let value = infer_expression_type(expr, source, aliases)?;
+            ensure_comparable(value, infer_expression_type(low, source, aliases)?)?;
+            ensure_comparable(value, infer_expression_type(high, source, aliases)?)?;
+            Ok(Some(DataType::Bool))
+        }
+        Expr::InList { expr, list, .. } => {
+            let value = infer_expression_type(expr, source, aliases)?;
+            for item in list {
+                ensure_comparable(value, infer_expression_type(item, source, aliases)?)?;
+            }
+            Ok(Some(DataType::Bool))
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            ensure_type(
+                infer_expression_type(expr, source, aliases)?,
+                DataType::String,
+                "LIKE value",
+            )?;
+            ensure_type(
+                infer_expression_type(pattern, source, aliases)?,
+                DataType::String,
+                "LIKE pattern",
+            )?;
+            Ok(Some(DataType::Bool))
+        }
+        Expr::Cast {
+            expr, data_type, ..
+        } => {
+            let source_type = infer_expression_type(expr, source, aliases)?;
+            let target = parse_data_type(&data_type.to_string())?.0;
+            if let Some(source_type) = source_type
+                && !cast_is_supported(source_type, target)
+            {
+                return Err(Error::Type(format!(
+                    "cannot cast {source_type} to {target}"
+                )));
+            }
+            Ok(Some(target))
+        }
+        Expr::Function(function) => infer_function_type(function, source, aliases),
+        _ => Err(Error::Unsupported(format!("expression {expr}"))),
+    }
+}
+
+fn infer_function_type(
+    function: &Function,
+    source: &EvalSource<'_>,
+    aliases: &HashMap<String, Option<DataType>>,
+) -> Result<Option<DataType>> {
+    let (name, arguments, distinct) = function_parts(function)?;
+    if is_aggregate_name(&name) {
+        if name == "count" && arguments.is_empty() {
+            return Ok(Some(DataType::Int64));
+        }
+        if arguments.len() != 1 {
+            return Err(Error::Constraint(format!("{name} expects one argument")));
+        }
+        let argument = unnamed_argument(&arguments[0])?;
+        let data_type = match argument {
+            FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => {
+                if name == "count" {
+                    return Ok(Some(DataType::Int64));
+                }
+                return Err(Error::Constraint(format!("{name}(*) is invalid")));
+            }
+            FunctionArgExpr::Expr(expr) => infer_expression_type(expr, source, aliases)?,
+        };
+        return match name.as_str() {
+            "count" => Ok(Some(DataType::Int64)),
+            "sum" => match data_type {
+                Some(data_type) if is_numeric(data_type) => Ok(Some(data_type)),
+                None => Ok(None),
+                Some(data_type) => Err(Error::Type(format!("SUM does not accept {data_type}"))),
+            },
+            "avg" => match data_type {
+                Some(data_type) if is_numeric(data_type) => Ok(Some(DataType::Float64)),
+                None => Ok(None),
+                Some(data_type) => Err(Error::Type(format!("AVG does not accept {data_type}"))),
+            },
+            "min" | "max" => Ok(data_type),
+            _ => unreachable!(),
+        };
+    }
+
+    if distinct {
+        return Err(Error::Unsupported(format!(
+            "DISTINCT on scalar function {name}"
+        )));
+    }
+    let mut types = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let FunctionArgExpr::Expr(expr) = unnamed_argument(argument)? else {
+            return Err(Error::Unsupported(format!("wildcard argument to {name}")));
+        };
+        types.push(infer_expression_type(expr, source, aliases)?);
+    }
+    match (name.as_str(), types.as_slice()) {
+        ("abs", [None]) => Ok(None),
+        ("abs", [Some(data_type)]) if is_numeric(*data_type) => Ok(Some(*data_type)),
+        ("abs", [Some(data_type)]) => Err(Error::Type(format!("ABS does not accept {data_type}"))),
+        ("lower" | "upper", [data_type]) => {
+            ensure_type(*data_type, DataType::String, &name)?;
+            Ok(Some(DataType::String))
+        }
+        ("length", [data_type]) => {
+            ensure_type(*data_type, DataType::String, &name)?;
+            Ok(Some(DataType::Int64))
+        }
+        ("coalesce", []) => Err(Error::Constraint(
+            "COALESCE expects at least one argument".into(),
+        )),
+        ("coalesce", types) => types
+            .iter()
+            .try_fold(None, |common, data_type| common_type(common, *data_type)),
+        _ => Err(Error::Unsupported(format!("scalar function {name}"))),
+    }
+}
+
+fn infer_binary_type(
+    left: Option<DataType>,
+    operator: &BinaryOperator,
+    right: Option<DataType>,
+) -> Result<Option<DataType>> {
+    match operator {
+        BinaryOperator::And | BinaryOperator::Or => {
+            ensure_type(left, DataType::Bool, "boolean operand")?;
+            ensure_type(right, DataType::Bool, "boolean operand")?;
+            Ok(Some(DataType::Bool))
+        }
+        BinaryOperator::Eq
+        | BinaryOperator::NotEq
+        | BinaryOperator::Gt
+        | BinaryOperator::GtEq
+        | BinaryOperator::Lt
+        | BinaryOperator::LtEq => {
+            ensure_comparable(left, right)?;
+            Ok(Some(DataType::Bool))
+        }
+        BinaryOperator::Plus
+        | BinaryOperator::Minus
+        | BinaryOperator::Multiply
+        | BinaryOperator::Divide
+        | BinaryOperator::Modulo => {
+            let common = common_type(left, right)?;
+            match common {
+                Some(data_type) if is_numeric(data_type) => {
+                    if matches!(operator, BinaryOperator::Divide) {
+                        Ok(Some(DataType::Float64))
+                    } else {
+                        Ok(Some(data_type))
+                    }
+                }
+                None => Ok(None),
+                Some(data_type) => Err(Error::Type(format!(
+                    "numeric operator does not accept {data_type}"
+                ))),
+            }
+        }
+        BinaryOperator::StringConcat => {
+            ensure_type(left, DataType::String, "concatenation operand")?;
+            ensure_type(right, DataType::String, "concatenation operand")?;
+            Ok(Some(DataType::String))
+        }
+        _ => Err(Error::Unsupported(format!("operator {operator}"))),
+    }
+}
+
+fn common_type(left: Option<DataType>, right: Option<DataType>) -> Result<Option<DataType>> {
+    match (left, right) {
+        (None, data_type) | (data_type, None) => Ok(data_type),
+        (Some(left), Some(right)) if left == right => Ok(Some(left)),
+        (Some(left), Some(right)) if is_numeric(left) && is_numeric(right) => {
+            Ok(Some(DataType::Float64))
+        }
+        (Some(left), Some(right)) => Err(Error::Type(format!(
+            "incompatible types {left} and {right}"
+        ))),
+    }
+}
+
+fn ensure_comparable(left: Option<DataType>, right: Option<DataType>) -> Result<()> {
+    common_type(left, right).map(|_| ())
+}
+
+fn ensure_type(actual: Option<DataType>, expected: DataType, context: &str) -> Result<()> {
+    match actual {
+        None => Ok(()),
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(Error::Type(format!(
+            "{context} expects {expected}, found {actual}"
+        ))),
+    }
+}
+
+fn is_numeric(data_type: DataType) -> bool {
+    matches!(data_type, DataType::Int64 | DataType::Float64)
+}
+
+fn cast_is_supported(source: DataType, target: DataType) -> bool {
+    source == target
+        || target == DataType::String
+        || matches!(
+            (source, target),
+            (DataType::Int64, DataType::Float64)
+                | (DataType::Float64, DataType::Int64)
+                | (
+                    DataType::String,
+                    DataType::Int64 | DataType::Float64 | DataType::Bool
+                )
+        )
+}
+
 fn validate_grouped_expression(
     expr: &Expr,
     group_by: &[Expr],
@@ -968,22 +1277,104 @@ fn validate_grouped_expression(
 }
 
 fn equivalent_group_expression(left: &Expr, right: &Expr) -> bool {
-    if left == right {
-        return true;
-    }
-    match (column_reference(left), column_reference(right)) {
-        (Some(left), Some(right)) => normalize_identifier(left) == normalize_identifier(right),
-        _ => false,
-    }
+    canonical_expression(left) == canonical_expression(right)
 }
 
-fn column_reference(expr: &Expr) -> Option<&str> {
+fn canonical_expression(expr: &Expr) -> String {
     match expr {
-        Expr::Identifier(identifier) => Some(&identifier.value),
-        Expr::CompoundIdentifier(identifiers) if identifiers.len() == 2 => {
-            Some(&identifiers[1].value)
+        Expr::Identifier(identifier) => {
+            format!("column:{}", normalize_identifier(&identifier.value))
         }
-        _ => None,
+        Expr::CompoundIdentifier(identifiers) if identifiers.len() == 2 => {
+            format!("column:{}", normalize_identifier(&identifiers[1].value))
+        }
+        Expr::Value(value) => format!("value:{value:?}"),
+        Expr::Nested(expr) => canonical_expression(expr),
+        Expr::UnaryOp { op, expr } => {
+            format!("unary:{op:?}({})", canonical_expression(expr))
+        }
+        Expr::BinaryOp { left, op, right } => format!(
+            "binary:{op:?}({},{})",
+            canonical_expression(left),
+            canonical_expression(right)
+        ),
+        Expr::IsNull(expr) => format!("is-null({})", canonical_expression(expr)),
+        Expr::IsNotNull(expr) => format!("is-not-null({})", canonical_expression(expr)),
+        Expr::IsTrue(expr) => format!("is-true({})", canonical_expression(expr)),
+        Expr::IsFalse(expr) => format!("is-false({})", canonical_expression(expr)),
+        Expr::IsNotTrue(expr) => format!("is-not-true({})", canonical_expression(expr)),
+        Expr::IsNotFalse(expr) => format!("is-not-false({})", canonical_expression(expr)),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => format!(
+            "between:{negated}({},{},{})",
+            canonical_expression(expr),
+            canonical_expression(low),
+            canonical_expression(high)
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "in:{negated}({};{})",
+            canonical_expression(expr),
+            list.iter()
+                .map(canonical_expression)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => format!(
+            "like:{negated}:{escape_char:?}({},{})",
+            canonical_expression(expr),
+            canonical_expression(pattern)
+        ),
+        Expr::ILike {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => format!(
+            "ilike:{negated}:{escape_char:?}({},{})",
+            canonical_expression(expr),
+            canonical_expression(pattern)
+        ),
+        Expr::Cast {
+            expr, data_type, ..
+        } => format!(
+            "cast:{}({})",
+            data_type.to_string().to_ascii_lowercase(),
+            canonical_expression(expr)
+        ),
+        Expr::Function(function) => {
+            let name = function.name.to_string().to_ascii_lowercase();
+            let arguments = match &function.args {
+                FunctionArguments::List(arguments) => arguments
+                    .args
+                    .iter()
+                    .map(|argument| match argument {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                            canonical_expression(expr)
+                        }
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => "*".into(),
+                        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => "q.*".into(),
+                        FunctionArg::Named { .. } => format!("{argument:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                arguments => format!("{arguments:?}"),
+            };
+            format!("function:{name}({arguments})")
+        }
+        _ => format!("{expr:?}"),
     }
 }
 
@@ -1010,7 +1401,12 @@ fn eval_row(expr: &Expr, source: &EvalSource<'_>, row: Option<usize>) -> Result<
             lookup_column(source, row, &identifiers[1].value)
         }
         Expr::Nested(expr) => eval_row(expr, source, row),
-        Expr::UnaryOp { op, expr } => eval_unary(op, eval_row(expr, source, row)?),
+        Expr::UnaryOp { op, expr } => {
+            if let Some(value) = minimum_int_literal(op, expr) {
+                return Ok(value);
+            }
+            eval_unary(op, eval_row(expr, source, row)?)
+        }
         Expr::BinaryOp { left, op, right } => {
             let left = eval_row(left, source, row)?;
             let right = eval_row(right, source, row)?;
@@ -1125,10 +1521,10 @@ fn sql_value(value: &SqlValue) -> Result<Value> {
     match value {
         SqlValue::Number(value, _) => {
             if value.contains(['.', 'e', 'E']) {
-                value
+                let parsed = value
                     .parse::<f64>()
-                    .map(Value::Float64)
-                    .map_err(|_| Error::Type(format!("invalid Float64 literal {value}")))
+                    .map_err(|_| Error::Type(format!("invalid Float64 literal {value}")))?;
+                finite_float(parsed, "Float64 literal")
             } else {
                 value
                     .parse::<i64>()
@@ -1144,6 +1540,30 @@ fn sql_value(value: &SqlValue) -> Result<Value> {
         SqlValue::Boolean(value) => Ok(Value::Bool(*value)),
         SqlValue::Null => Ok(Value::Null),
         _ => Err(Error::Unsupported(format!("literal {value}"))),
+    }
+}
+
+fn minimum_int_literal(operator: &UnaryOperator, expr: &Expr) -> Option<Value> {
+    if !matches!(operator, UnaryOperator::Minus) {
+        return None;
+    }
+    let expr = match expr {
+        Expr::Nested(expr) => expr.as_ref(),
+        expr => expr,
+    };
+    match expr {
+        Expr::Value(SqlValue::Number(value, _)) if value == "9223372036854775808" => {
+            Some(Value::Int64(i64::MIN))
+        }
+        _ => None,
+    }
+}
+
+fn finite_float(value: f64, context: &str) -> Result<Value> {
+    if value.is_finite() {
+        Ok(Value::Float64(value))
+    } else {
+        Err(Error::Type(format!("{context} is not finite")))
     }
 }
 
@@ -1239,12 +1659,14 @@ fn numeric_arithmetic(
             .map(Value::Int64)
             .ok_or_else(|| Error::Type("Int64 arithmetic overflow".into())),
         (Value::Int64(left), Value::Float64(right)) => {
-            Ok(Value::Float64(float(left as f64, right)))
+            finite_float(float(left as f64, right), "Float64 arithmetic result")
         }
         (Value::Float64(left), Value::Int64(right)) => {
-            Ok(Value::Float64(float(left, right as f64)))
+            finite_float(float(left, right as f64), "Float64 arithmetic result")
         }
-        (Value::Float64(left), Value::Float64(right)) => Ok(Value::Float64(float(left, right))),
+        (Value::Float64(left), Value::Float64(right)) => {
+            finite_float(float(left, right), "Float64 arithmetic result")
+        }
         (left, right) => Err(Error::Type(format!(
             "numeric operator cannot combine {} and {}",
             left.type_name(),
@@ -1270,7 +1692,7 @@ fn numeric_divide(left: Value, right: Value) -> Result<Value> {
     if right == 0.0 {
         return Err(Error::Type("division by zero".into()));
     }
-    Ok(Value::Float64(left / right))
+    finite_float(left / right, "Float64 division result")
 }
 
 fn numeric_modulo(left: Value, right: Value) -> Result<Value> {
@@ -1283,9 +1705,15 @@ fn numeric_modulo(left: Value, right: Value) -> Result<Value> {
         (Value::Int64(_), Value::Float64(0.0))
         | (Value::Float64(_), Value::Int64(0))
         | (Value::Float64(_), Value::Float64(0.0)) => Err(Error::Type("modulo by zero".into())),
-        (Value::Int64(left), Value::Float64(right)) => Ok(Value::Float64((left as f64) % right)),
-        (Value::Float64(left), Value::Int64(right)) => Ok(Value::Float64(left % right as f64)),
-        (Value::Float64(left), Value::Float64(right)) => Ok(Value::Float64(left % right)),
+        (Value::Int64(left), Value::Float64(right)) => {
+            finite_float((left as f64) % right, "Float64 modulo result")
+        }
+        (Value::Float64(left), Value::Int64(right)) => {
+            finite_float(left % right as f64, "Float64 modulo result")
+        }
+        (Value::Float64(left), Value::Float64(right)) => {
+            finite_float(left % right, "Float64 modulo result")
+        }
         (left, right) => Err(Error::Type(format!(
             "modulo cannot combine {} and {}",
             left.type_name(),
@@ -1314,10 +1742,12 @@ fn cast_value(value: Value, target: DataType) -> Result<Value> {
             .parse()
             .map(Value::Int64)
             .map_err(|_| Error::Type(format!("cannot cast {value:?} to Int64"))),
-        (Value::String(value), DataType::Float64) => value
-            .parse()
-            .map(Value::Float64)
-            .map_err(|_| Error::Type(format!("cannot cast {value:?} to Float64"))),
+        (Value::String(value), DataType::Float64) => {
+            let parsed = value
+                .parse()
+                .map_err(|_| Error::Type(format!("cannot cast {value:?} to Float64")))?;
+            finite_float(parsed, "Float64 cast result")
+        }
         (Value::String(value), DataType::Bool) => value
             .parse()
             .map(Value::Bool)
@@ -1339,13 +1769,9 @@ fn eval_like(
     if value.is_null() || pattern.is_null() {
         return Ok(Value::Null);
     }
-    let (Value::String(mut value), Value::String(mut pattern)) = (value, pattern) else {
+    let (Value::String(mut value), Value::String(pattern)) = (value, pattern) else {
         return Err(Error::Type("LIKE expects String operands".into()));
     };
-    if insensitive {
-        value = value.to_lowercase();
-        pattern = pattern.to_lowercase();
-    }
     let escape = escape
         .map(|escape| {
             let mut characters = escape.chars();
@@ -1360,7 +1786,21 @@ fn eval_like(
             Ok(character)
         })
         .transpose()?;
-    let matched = like_matches(&value, &pattern, escape)?;
+    let mut tokens = like_tokens(&pattern, escape)?;
+    if insensitive {
+        value = value.to_lowercase();
+        tokens = tokens
+            .into_iter()
+            .flat_map(|token| match token {
+                LikeToken::Literal(character) => character
+                    .to_lowercase()
+                    .map(LikeToken::Literal)
+                    .collect::<Vec<_>>(),
+                token => vec![token],
+            })
+            .collect();
+    }
+    let matched = like_matches(&value, &tokens);
     Ok(Value::Bool(if negated { !matched } else { matched }))
 }
 
@@ -1371,8 +1811,7 @@ enum LikeToken {
     AnyMany,
 }
 
-fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
-    let value = value.chars().collect::<Vec<_>>();
+fn like_tokens(pattern: &str, escape: Option<char>) -> Result<Vec<LikeToken>> {
     let mut tokens = Vec::with_capacity(pattern.chars().count());
     let mut characters = pattern.chars();
     while let Some(character) = characters.next() {
@@ -1389,6 +1828,11 @@ fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> Result<bool
             });
         }
     }
+    Ok(tokens)
+}
+
+fn like_matches(value: &str, tokens: &[LikeToken]) -> bool {
+    let value = value.chars().collect::<Vec<_>>();
     let (mut value_index, mut pattern_index) = (0, 0);
     let (mut star, mut retry) = (None, 0);
     while value_index < value.len() {
@@ -1406,13 +1850,13 @@ fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> Result<bool
             value_index = retry;
             pattern_index = star_index + 1;
         } else {
-            return Ok(false);
+            return false;
         }
     }
     while tokens.get(pattern_index) == Some(&LikeToken::AnyMany) {
         pattern_index += 1;
     }
-    Ok(pattern_index == tokens.len())
+    pattern_index == tokens.len()
 }
 
 fn function_parts(function: &Function) -> Result<(String, &[FunctionArg], bool)> {
@@ -1445,11 +1889,13 @@ fn eval_scalar_function(
     source: &EvalSource<'_>,
     row: Option<usize>,
 ) -> Result<Value> {
-    eval_scalar_function_with(function, |expr| eval_row(expr, source, row))
+    let result_type = infer_function_type(function, source, &HashMap::new())?;
+    eval_scalar_function_with(function, result_type, |expr| eval_row(expr, source, row))
 }
 
 fn eval_scalar_function_with(
     function: &Function,
+    result_type: Option<DataType>,
     mut evaluate: impl FnMut(&Expr) -> Result<Value>,
 ) -> Result<Value> {
     let (name, arguments, distinct) = function_parts(function)?;
@@ -1457,6 +1903,24 @@ fn eval_scalar_function_with(
         return Err(Error::Unsupported(format!(
             "DISTINCT on scalar function {name}"
         )));
+    }
+    if name == "coalesce" {
+        if arguments.is_empty() {
+            return Err(Error::Constraint(
+                "COALESCE expects at least one argument".into(),
+            ));
+        }
+        for argument in arguments {
+            let FunctionArgExpr::Expr(expr) = unnamed_argument(argument)? else {
+                return Err(Error::Unsupported("wildcard argument to coalesce".into()));
+            };
+            let value = evaluate(expr)?;
+            if !value.is_null() {
+                return result_type
+                    .map_or(Ok(value.clone()), |data_type| cast_value(value, data_type));
+            }
+        }
+        return Ok(Value::Null);
     }
     let values = arguments
         .iter()
@@ -1478,11 +1942,6 @@ fn eval_scalar_function_with(
         ("upper", [Value::Null]) => Ok(Value::Null),
         ("length", [Value::String(value)]) => Ok(Value::Int64(value.chars().count() as i64)),
         ("length", [Value::Null]) => Ok(Value::Null),
-        ("coalesce", values) => Ok(values
-            .iter()
-            .find(|value| !value.is_null())
-            .cloned()
-            .unwrap_or(Value::Null)),
         _ => Err(Error::Unsupported(format!("scalar function {name}"))),
     }
 }
@@ -1537,6 +1996,7 @@ fn eval_group(
     source: &EvalSource<'_>,
     rows: &[usize],
     aliases: &HashMap<String, Value>,
+    alias_types: &HashMap<String, Option<DataType>>,
 ) -> Result<Value> {
     if let Expr::Identifier(identifier) = expr
         && let Some(value) = aliases.get(&normalize_identifier(&identifier.value))
@@ -1553,33 +2013,41 @@ fn eval_group(
             if is_aggregate_name(&name) {
                 eval_aggregate(function, source, rows)
             } else {
-                eval_scalar_function_with(function, |expr| eval_group(expr, source, rows, aliases))
+                let result_type = infer_function_type(function, source, alias_types)?;
+                eval_scalar_function_with(function, result_type, |expr| {
+                    eval_group(expr, source, rows, aliases, alias_types)
+                })
             }
         }
         Expr::BinaryOp { left, op, right } => eval_binary(
-            eval_group(left, source, rows, aliases)?,
+            eval_group(left, source, rows, aliases, alias_types)?,
             op,
-            eval_group(right, source, rows, aliases)?,
+            eval_group(right, source, rows, aliases, alias_types)?,
         ),
-        Expr::UnaryOp { op, expr } => eval_unary(op, eval_group(expr, source, rows, aliases)?),
-        Expr::Nested(expr) => eval_group(expr, source, rows, aliases),
+        Expr::UnaryOp { op, expr } => {
+            if let Some(value) = minimum_int_literal(op, expr) {
+                return Ok(value);
+            }
+            eval_unary(op, eval_group(expr, source, rows, aliases, alias_types)?)
+        }
+        Expr::Nested(expr) => eval_group(expr, source, rows, aliases, alias_types),
         Expr::IsNull(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases)?.is_null(),
+            eval_group(expr, source, rows, aliases, alias_types)?.is_null(),
         )),
         Expr::IsNotNull(expr) => Ok(Value::Bool(
-            !eval_group(expr, source, rows, aliases)?.is_null(),
+            !eval_group(expr, source, rows, aliases, alias_types)?.is_null(),
         )),
         Expr::IsTrue(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases)?.sql_bool()? == Some(true),
+            eval_group(expr, source, rows, aliases, alias_types)?.sql_bool()? == Some(true),
         )),
         Expr::IsFalse(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases)?.sql_bool()? == Some(false),
+            eval_group(expr, source, rows, aliases, alias_types)?.sql_bool()? == Some(false),
         )),
         Expr::IsNotTrue(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases)?.sql_bool()? != Some(true),
+            eval_group(expr, source, rows, aliases, alias_types)?.sql_bool()? != Some(true),
         )),
         Expr::IsNotFalse(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases)?.sql_bool()? != Some(false),
+            eval_group(expr, source, rows, aliases, alias_types)?.sql_bool()? != Some(false),
         )),
         Expr::Between {
             expr,
@@ -1587,16 +2055,16 @@ fn eval_group(
             low,
             high,
         } => {
-            let value = eval_group(expr, source, rows, aliases)?;
+            let value = eval_group(expr, source, rows, aliases, alias_types)?;
             let lower = eval_binary(
                 value.clone(),
                 &BinaryOperator::GtEq,
-                eval_group(low, source, rows, aliases)?,
+                eval_group(low, source, rows, aliases, alias_types)?,
             )?;
             let upper = eval_binary(
                 value,
                 &BinaryOperator::LtEq,
-                eval_group(high, source, rows, aliases)?,
+                eval_group(high, source, rows, aliases, alias_types)?,
             )?;
             let result = eval_binary(lower, &BinaryOperator::And, upper)?;
             if *negated {
@@ -1610,13 +2078,13 @@ fn eval_group(
             list,
             negated,
         } => {
-            let needle = eval_group(expr, source, rows, aliases)?;
+            let needle = eval_group(expr, source, rows, aliases, alias_types)?;
             let mut result = Value::Bool(false);
             for item in list {
                 let equal = eval_binary(
                     needle.clone(),
                     &BinaryOperator::Eq,
-                    eval_group(item, source, rows, aliases)?,
+                    eval_group(item, source, rows, aliases, alias_types)?,
                 )?;
                 if equal == Value::Bool(true) {
                     result = equal;
@@ -1638,8 +2106,8 @@ fn eval_group(
             pattern,
             escape_char,
         } => eval_like(
-            eval_group(expr, source, rows, aliases)?,
-            eval_group(pattern, source, rows, aliases)?,
+            eval_group(expr, source, rows, aliases, alias_types)?,
+            eval_group(pattern, source, rows, aliases, alias_types)?,
             *negated,
             false,
             escape_char.as_deref(),
@@ -1650,8 +2118,8 @@ fn eval_group(
             pattern,
             escape_char,
         } => eval_like(
-            eval_group(expr, source, rows, aliases)?,
-            eval_group(pattern, source, rows, aliases)?,
+            eval_group(expr, source, rows, aliases, alias_types)?,
+            eval_group(pattern, source, rows, aliases, alias_types)?,
             *negated,
             true,
             escape_char.as_deref(),
@@ -1659,7 +2127,7 @@ fn eval_group(
         Expr::Cast {
             expr, data_type, ..
         } => cast_value(
-            eval_group(expr, source, rows, aliases)?,
+            eval_group(expr, source, rows, aliases, alias_types)?,
             parse_data_type(&data_type.to_string())?.0,
         ),
         _ => Err(Error::Unsupported(format!("expression {expr}"))),
@@ -1730,7 +2198,7 @@ fn aggregate_sum(values: &[Value]) -> Result<Value> {
                 }
             };
         }
-        Ok(Value::Float64(total))
+        finite_float(total, "SUM result")
     } else {
         let mut total = 0_i64;
         for value in values {
@@ -1760,7 +2228,7 @@ fn aggregate_avg(values: &[Value]) -> Result<Value> {
             value.type_name()
         ))),
     })?;
-    Ok(Value::Float64(sum / values.len() as f64))
+    finite_float(sum / values.len() as f64, "AVG result")
 }
 
 fn aggregate_extreme(values: &[Value], maximum: bool) -> Result<Value> {
@@ -2182,6 +2650,135 @@ mod tests {
         assert_eq!(
             query(&mut engine, "SELECT LOWER(NULL), UPPER(NULL), LENGTH(NULL)").rows,
             vec![vec![Value::Null, Value::Null, Value::Null]]
+        );
+    }
+
+    #[test]
+    fn binds_functions_and_types_even_when_tables_are_empty() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Int64, label String)")
+            .unwrap();
+        for sql in [
+            "SELECT made_up(n) FROM t",
+            "SELECT SUM(label) FROM t",
+            "SELECT n + label FROM t",
+        ] {
+            assert!(engine.execute(sql).is_err(), "{sql} unexpectedly succeeded");
+        }
+        engine.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        for sql in [
+            "SELECT made_up(n) FROM t",
+            "SELECT SUM(label) FROM t",
+            "SELECT n + label FROM t",
+        ] {
+            assert!(engine.execute(sql).is_err(), "{sql} unexpectedly succeeded");
+        }
+    }
+
+    #[test]
+    fn coalesce_is_lazy_and_uses_a_common_numeric_type() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(&mut engine, "SELECT COALESCE(1, 1 / 0)").rows,
+            vec![vec![Value::Float64(1.0)]]
+        );
+        engine
+            .execute(
+                "CREATE TABLE t (n Nullable(Int64));
+                 INSERT INTO t VALUES (1), (NULL);",
+            )
+            .unwrap();
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT COUNT(DISTINCT COALESCE(n, 1.0)) FROM t"
+            )
+            .rows,
+            vec![vec![Value::Int64(1)]]
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT DISTINCT COALESCE(n, 1.0) FROM t").rows,
+            vec![vec![Value::Float64(1.0)]]
+        );
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT COUNT(*) FROM t GROUP BY COALESCE(n, 1.0)"
+            )
+            .rows,
+            vec![vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn group_by_expression_identifiers_are_case_insensitive() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Int64); INSERT INTO t VALUES (1), (2)")
+            .unwrap();
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT n + 1 FROM t GROUP BY N + 1 ORDER BY n + 1"
+            )
+            .rows,
+            vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+        );
+    }
+
+    #[test]
+    fn having_discarded_groups_do_not_consume_result_bytes() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 100,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        engine
+            .execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .unwrap();
+        assert!(
+            query(&mut engine, "SELECT n FROM t GROUP BY n HAVING false")
+                .rows
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_float_results() {
+        let mut engine = Engine::default();
+        for sql in [
+            "SELECT 1e999",
+            "SELECT CAST('NaN' AS Float64)",
+            "SELECT 1e308 * 1e308",
+        ] {
+            assert!(engine.execute(sql).is_err(), "{sql} unexpectedly succeeded");
+        }
+    }
+
+    #[test]
+    fn supports_the_minimum_int64_literal() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(&mut engine, "SELECT -9223372036854775808").rows,
+            vec![vec![Value::Int64(i64::MIN)]]
+        );
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        engine
+            .execute("INSERT INTO t VALUES (-9223372036854775808)")
+            .unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT n FROM t").rows,
+            vec![vec![Value::Int64(i64::MIN)]]
+        );
+    }
+
+    #[test]
+    fn ilike_escape_is_applied_before_case_folding() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(&mut engine, "SELECT '%' ILIKE 'A%' ESCAPE 'A'").rows,
+            vec![vec![Value::Bool(true)]]
         );
     }
 

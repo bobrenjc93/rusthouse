@@ -99,7 +99,12 @@ fn write_json(writer: &mut impl Write, result: &QueryResult) -> io::Result<()> {
                 Value::Null => writer.write_all(b"null")?,
                 Value::Int64(value) => write!(writer, "{value}")?,
                 Value::Float64(value) if value.is_finite() => write!(writer, "{value}")?,
-                Value::Float64(_) => writer.write_all(b"null")?,
+                Value::Float64(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "non-finite Float64 cannot be represented as JSON",
+                    ));
+                }
                 Value::Bool(value) => write!(writer, "{value}")?,
                 Value::String(value) => write_json_string(writer, value)?,
             }
@@ -141,5 +146,16 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "name,value\n\"a,\"\"b\",\n"
         );
+    }
+
+    #[test]
+    fn json_rejects_non_finite_float_values() {
+        let result = QueryResult {
+            columns: vec!["value".into()],
+            rows: vec![vec![Value::Float64(f64::INFINITY)]],
+        };
+        let mut output = Vec::new();
+        let error = write_result(&mut output, &result, OutputFormat::Json).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

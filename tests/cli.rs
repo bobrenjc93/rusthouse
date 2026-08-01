@@ -49,6 +49,20 @@ fn cli_reports_sql_and_resource_boundaries() {
     assert!(String::from_utf8_lossy(&limited.stderr).contains("limit exceeded"));
 }
 
+#[test]
+fn json_batches_are_one_valid_document() {
+    let output = run("SELECT 1 AS n; SELECT 2 AS n", &["--format", "json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "[[{\"n\":1}]\n,[{\"n\":2}]\n]\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn closed_output_pipe_is_a_successful_exit() {

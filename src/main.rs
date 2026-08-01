@@ -40,11 +40,23 @@ fn run() -> std::result::Result<(), Box<dyn StdError>> {
     let mut engine = Engine::new(config);
     let stdout = io::stdout();
     let mut writer = io::BufWriter::new(stdout.lock());
+    let json_batch = format == OutputFormat::Json;
+    let mut first_query = true;
+    if json_batch {
+        writer.write_all(b"[")?;
+    }
     for result in engine.execute_iter(sql)? {
         let result = result?;
         if let StatementResult::Query(result) = result {
+            if json_batch && !first_query {
+                writer.write_all(b",")?;
+            }
             write_result(&mut writer, &result, format)?;
+            first_query = false;
         }
+    }
+    if json_batch {
+        writer.write_all(b"]\n")?;
     }
     writer.flush()?;
     Ok(())
