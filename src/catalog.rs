@@ -413,6 +413,7 @@ impl From<io::Error> for SnapshotError {
 /// handle is dropped.
 pub struct SnapshotStore {
     path: PathBuf,
+    temp_dir: PathBuf,
     temp_path: PathBuf,
     limits: SnapshotLimits,
     _lock: File,
@@ -423,6 +424,7 @@ impl fmt::Debug for SnapshotStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnapshotStore")
             .field("path", &self.path)
+            .field("temp_dir", &self.temp_dir)
             .field("temp_path", &self.temp_path)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -445,7 +447,7 @@ impl SnapshotStore {
     ) -> Result<Self, SnapshotError> {
         limits.validate()?;
         let path = absolute_normalized_path(path.as_ref())?;
-        let (lock_path, temp_path) = sidecar_paths(&path)?;
+        let (lock_path, temp_dir) = sidecar_paths(&path)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -460,13 +462,12 @@ impl SnapshotStore {
             Err(fs4::TryLockError::Error(error)) => return Err(SnapshotError::Io(error)),
         }
 
-        if temp_path.try_exists()? {
-            fs::remove_file(&temp_path)?;
-            sync_parent(&path)?;
-        }
+        cleanup_staging(&temp_dir, &path)?;
+        let temp_path = temp_dir.join("snapshot");
 
         Ok(Self {
             path,
+            temp_dir,
             temp_path,
             limits,
             _lock: lock,
@@ -517,10 +518,10 @@ impl SnapshotStore {
 
     /// Atomically and durably replaces the current snapshot.
     ///
-    /// The encoded image is written to a same-directory temp file, synced,
-    /// and renamed over the destination. Unix then syncs the parent directory;
-    /// Windows uses a write-through rename. A failure before rename leaves the
-    /// previous snapshot untouched.
+    /// The encoded image is written inside a private staging directory on the
+    /// destination filesystem, synced, and renamed over the destination. Unix
+    /// then syncs the parent directory; Windows uses a write-through rename. A
+    /// failure before rename leaves the previous snapshot untouched.
     pub fn commit(&self, image: &CatalogImage) -> Result<(), SnapshotError> {
         self.commit_inner(image, None)
     }
@@ -537,31 +538,34 @@ impl SnapshotStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        match fs::remove_file(&self.temp_path) {
-            Ok(()) => sync_parent(&self.path)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-
+        cleanup_staging(&self.temp_dir, &self.path)?;
+        create_secure_staging_dir(&self.temp_dir)?;
         let mut temp = create_secure_temp(&self.temp_path)?;
         temp.write_all(&bytes)?;
         temp.sync_all()?;
 
         #[cfg(test)]
-        if failpoint == Some(Failpoint::AfterTempSync) {
+        if failpoint == Some(Failpoint::TempSynced) {
             return Err(SnapshotError::InjectedFailure("after temp sync"));
         }
 
         prepare_temp_security(&temp, &self.temp_path, &self.path)?;
         temp.sync_all()?;
+
+        #[cfg(test)]
+        if failpoint == Some(Failpoint::SecurityPrepared) {
+            return Err(SnapshotError::InjectedFailure("after security preparation"));
+        }
+
         drop(temp);
         publish_temp(&self.temp_path, &self.path)?;
 
         #[cfg(test)]
-        if failpoint == Some(Failpoint::AfterRename) {
+        if failpoint == Some(Failpoint::Renamed) {
             return Err(SnapshotError::InjectedFailure("after rename"));
         }
 
+        let _ = fs::remove_dir(&self.temp_dir);
         sync_parent(&self.path)
     }
 }
@@ -612,6 +616,31 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
     ))
 }
 
+fn cleanup_staging(temp_dir: &Path, path: &Path) -> Result<(), SnapshotError> {
+    match fs::symlink_metadata(temp_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(temp_dir)?;
+            sync_parent(path)?;
+        }
+        Ok(_) => {
+            fs::remove_file(temp_dir)?;
+            sync_parent(path)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -624,40 +653,85 @@ fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
 }
 
 #[cfg(windows)]
+struct PrivateSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl PrivateSecurityDescriptor {
+    fn new() -> Result<Self, SnapshotError> {
+        use std::ptr;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+
+        let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;OW)\0".encode_utf16().collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated and `descriptor` points to writable
+        // storage for the LocalAlloc-owned descriptor returned by Win32.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            Err(io::Error::last_os_error().into())
+        } else {
+            Ok(Self(descriptor))
+        }
+    }
+
+    fn attributes(&self) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        use std::mem;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+        SECURITY_ATTRIBUTES {
+            nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PrivateSecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: The descriptor is owned by this value and was allocated by
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let path = wide_path(path);
+    let descriptor = PrivateSecurityDescriptor::new()?;
+    let attributes = descriptor.attributes();
+    // SAFETY: `path` is NUL-terminated and both the attributes and owned
+    // descriptor remain alive for the duration of the call.
+    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+        Err(io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
 fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
-    use std::mem;
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, WRITE_DAC, WRITE_OWNER,
     };
 
     let path = wide_path(path);
-    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;OW)\0".encode_utf16().collect();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `sddl` is NUL-terminated and `descriptor` points to writable
-    // storage for the LocalAlloc-owned security descriptor returned by Win32.
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error().into());
-    }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
+    let descriptor = PrivateSecurityDescriptor::new()?;
+    let attributes = descriptor.attributes();
     // SAFETY: `path` is NUL-terminated, `attributes` and its descriptor remain
     // alive for the call, and CREATE_NEW prevents following an existing temp.
     let handle = unsafe {
@@ -672,9 +746,6 @@ fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
         )
     };
     let create_error = (handle == INVALID_HANDLE_VALUE).then(io::Error::last_os_error);
-    // SAFETY: `descriptor` was allocated by the successful conversion above
-    // and is no longer referenced after CreateFileW returns.
-    unsafe { LocalFree(descriptor) };
     if let Some(error) = create_error {
         Err(error.into())
     } else {
@@ -685,12 +756,41 @@ fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
 }
 
 #[cfg(unix)]
-fn prepare_temp_security(temp: &File, _temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+fn prepare_temp_security(temp: &File, temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+    use std::os::unix::fs::MetadataExt;
+
     match fs::metadata(path) {
-        Ok(metadata) => temp.set_permissions(metadata.permissions())?,
+        Ok(metadata) => {
+            rustix::fs::fchown(
+                temp,
+                Some(rustix::fs::Uid::from_raw(metadata.uid())),
+                Some(rustix::fs::Gid::from_raw(metadata.gid())),
+            )
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+            copy_unix_acl(temp_path, path)?;
+            temp.set_permissions(metadata.permissions())?;
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
+fn copy_unix_acl(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+    let acl = exacl::getfacl(path, None)?;
+    exacl::setfacl(&[temp_path], &acl, None)?;
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
+fn copy_unix_acl(_temp_path: &Path, _path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
@@ -1532,8 +1632,9 @@ fn crc32(bytes: &[u8]) -> u32 {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Failpoint {
-    AfterTempSync,
-    AfterRename,
+    TempSynced,
+    SecurityPrepared,
+    Renamed,
 }
 
 #[cfg(test)]
@@ -1921,7 +2022,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn preserves_restricted_permissions_and_keeps_failed_temps_private() {
+    fn preserves_unix_security_metadata_and_keeps_failed_staging_private() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let directory = TestDirectory::new();
@@ -1930,27 +2031,71 @@ mod tests {
         let replacement = sample_image(31);
         let store = SnapshotStore::open(&path).expect("open store");
         store.commit(&original).expect("commit original image");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .expect("restrict original snapshot");
+
+        let original_gid = fs::metadata(&path).expect("initial metadata").gid();
+        if let Some(group) = rustix::process::getgroups()
+            .expect("read supplementary groups")
+            .into_iter()
+            .find(|group| group.as_raw() != original_gid)
+        {
+            rustix::fs::chown(&path, None, Some(group)).expect("set non-default group");
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+        {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            use exacl::AclEntryKind;
+            use exacl::{AclEntry, Perm};
+
+            let mut acl = exacl::getfacl(&path, None).expect("read original ACL");
+            acl.push(AclEntry::allow_user("nobody", Perm::READ, None));
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            if let Some(mask) = acl
+                .iter_mut()
+                .find(|entry| entry.kind == AclEntryKind::Mask)
+            {
+                mask.perms |= Perm::READ;
+            } else {
+                acl.push(AclEntry::allow_mask(Perm::READ, None));
+            }
+            exacl::setfacl(&[&path], &acl, None).expect("install named ACL");
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+            .expect("set non-default snapshot mode");
+        let expected_metadata = fs::metadata(&path).expect("original metadata");
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+        let expected_acl = exacl::getfacl(&path, None).expect("read expected ACL");
 
         store
             .commit(&replacement)
             .expect("replace restricted image");
+        let replaced_metadata = fs::metadata(&path).expect("replacement metadata");
+        assert_eq!(replaced_metadata.mode() & 0o777, 0o640);
+        assert_eq!(replaced_metadata.uid(), expected_metadata.uid());
+        assert_eq!(replaced_metadata.gid(), expected_metadata.gid());
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         assert_eq!(
-            fs::metadata(&path).expect("snapshot metadata").mode() & 0o777,
-            0o600
+            exacl::getfacl(&path, None).expect("read replacement ACL"),
+            expected_acl
         );
 
         assert!(matches!(
-            store.commit_inner(&sample_image(32), Some(Failpoint::AfterTempSync)),
-            Err(SnapshotError::InjectedFailure("after temp sync"))
+            store.commit_inner(&sample_image(32), Some(Failpoint::SecurityPrepared)),
+            Err(SnapshotError::InjectedFailure("after security preparation"))
         ));
         assert_eq!(
-            fs::metadata(&store.temp_path)
-                .expect("orphan temp metadata")
+            fs::metadata(&store.temp_dir)
+                .expect("private staging directory metadata")
                 .mode()
                 & 0o777,
-            0o600
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&store.temp_path)
+                .expect("prepared staged file metadata")
+                .mode()
+                & 0o777,
+            0o640
         );
         assert_eq!(
             store.load().expect("load surviving image"),
@@ -1968,7 +2113,7 @@ mod tests {
         store.commit(&old).expect("commit original image");
 
         assert!(matches!(
-            store.commit_inner(&new, Some(Failpoint::AfterTempSync)),
+            store.commit_inner(&new, Some(Failpoint::TempSynced)),
             Err(SnapshotError::InjectedFailure("after temp sync"))
         ));
         assert!(store.temp_path.exists());
@@ -1995,7 +2140,7 @@ mod tests {
         let new = sample_image(21);
 
         assert!(matches!(
-            store.commit_inner(&new, Some(Failpoint::AfterRename)),
+            store.commit_inner(&new, Some(Failpoint::Renamed)),
             Err(SnapshotError::InjectedFailure("after rename"))
         ));
         assert_eq!(store.load().expect("load renamed image"), Some(new.clone()));

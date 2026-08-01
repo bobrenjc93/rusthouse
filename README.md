@@ -111,21 +111,24 @@ checksum mismatch.
 
 For `catalog.rhcat`, the store holds an OS advisory lock on
 `.catalog.rhcat.lock`. While holding it, a commit validates and encodes the
-image, creates `.catalog.rhcat.tmp` in the same directory, writes and calls
-`sync_all` on that file, then atomically renames it over `catalog.rhcat`. Unix
-creates the temp with mode `0600`; Windows creates it with a protected DACL
-granting access only to its owner and the system. Immediately before publish,
-an existing snapshot's Unix mode or Windows owner, group, and DACL is copied to
-the temp, so replacement does not widen access. Interrupted pre-publish temps
-remain private. Unix syncs the parent directory after rename. Windows publishes
-with `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, which
-makes the metadata update durable without opening the directory. A failure
-before rename leaves the previous snapshot unchanged. A crash after rename
-exposes either the old or new complete file according to filesystem recovery;
-reopening validates the selected file.
-Reopening while holding the writer lock removes an orphan `.tmp` left before a
-rename; Unix also syncs that directory removal. Lock files are intentionally
-retained, but their OS locks are released when `SnapshotStore` is dropped.
+image, creates `.catalog.rhcat.tmp` as a private staging directory inside the
+snapshot directory, writes and calls `sync_all` on its `snapshot` file, then
+atomically renames that file over `catalog.rhcat`. Unix creates the staging
+directory with mode `0700`; Windows creates it with a protected DACL granting
+access only to its owner and the system. Immediately before publish, an
+existing snapshot's Unix owner, group, mode, and native ACL (on macOS, Linux,
+and FreeBSD), or Windows owner, group, and DACL is copied to the staged file.
+The enclosing private directory keeps prepared data inaccessible after a failed
+or interrupted publish. Unix syncs the parent directory after rename. Windows
+publishes with `MoveFileExW` using `MOVEFILE_REPLACE_EXISTING` and
+`MOVEFILE_WRITE_THROUGH`, which makes the metadata update durable without opening
+the directory. A failure before rename leaves the previous snapshot unchanged.
+A crash after rename exposes either the old or new complete file according to
+filesystem recovery; reopening validates the selected file.
+Reopening while holding the writer lock recursively removes an orphan `.tmp`
+staging directory (or a legacy temp file) left before rename; Unix also syncs
+that directory removal. Lock files are intentionally retained, but their OS
+locks are released when `SnapshotStore` is dropped.
 
 ## Development model
 
