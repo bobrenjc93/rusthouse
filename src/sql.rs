@@ -13,9 +13,85 @@ pub(crate) enum Comparison {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Predicate {
-    pub(crate) column: String,
+    pub(crate) column: ColumnRef,
     pub(crate) comparison: Comparison,
     pub(crate) value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnRef {
+    pub(crate) qualifier: Option<String>,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TableRef {
+    pub(crate) name: String,
+    pub(crate) alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Join {
+    pub(crate) kind: JoinKind,
+    pub(crate) table: TableRef,
+    pub(crate) equality: Vec<(ColumnRef, ColumnRef)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SelectItem {
+    Wildcard(Option<String>),
+    Column {
+        column: ColumnRef,
+        alias: Option<String>,
+    },
+    Window {
+        expression: WindowExpression,
+        alias: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WindowExpression {
+    pub(crate) function: WindowFunction,
+    pub(crate) partition_by: Vec<ColumnRef>,
+    pub(crate) order_by: Vec<OrderBy>,
+    pub(crate) frame: Option<WindowFrame>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WindowFunction {
+    RowNumber,
+    Rank,
+    Sum(ColumnRef),
+    Count(Option<ColumnRef>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OrderBy {
+    pub(crate) column: ColumnRef,
+    pub(crate) descending: bool,
+    pub(crate) nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowFrame {
+    pub(crate) start: FrameBound,
+    pub(crate) end: FrameBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
 }
 
 #[derive(Debug, Clone)]
@@ -36,9 +112,12 @@ pub(crate) enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select {
-        table: String,
-        columns: Option<Vec<String>>,
+        from: TableRef,
+        projection: Vec<SelectItem>,
+        joins: Vec<Join>,
         predicates: Vec<Predicate>,
+        order_by: Vec<OrderBy>,
+        limit: Option<usize>,
     },
 }
 
@@ -79,6 +158,16 @@ struct Tokenized {
     tokens: Vec<Token>,
     positions: Vec<usize>,
     end_position: usize,
+}
+
+fn frame_position(bound: FrameBound) -> i128 {
+    match bound {
+        FrameBound::UnboundedPreceding => i128::MIN,
+        FrameBound::Preceding(offset) => -(i128::try_from(offset).unwrap_or(i128::MAX)),
+        FrameBound::CurrentRow => 0,
+        FrameBound::Following(offset) => i128::try_from(offset).unwrap_or(i128::MAX),
+        FrameBound::UnboundedFollowing => i128::MAX,
+    }
 }
 
 fn tokenize(input: &str) -> Result<Tokenized> {
@@ -164,7 +253,7 @@ fn tokenize(input: &str) -> Result<Tokenized> {
             continue;
         }
         match character {
-            '(' | ')' | ',' | '*' | ';' => {
+            '(' | ')' | ',' | '*' | ';' | '.' => {
                 tokens.push(Token::Symbol(character));
                 positions.push(token_position);
                 position += 1;
@@ -396,24 +485,56 @@ impl Parser {
     }
 
     fn select(&mut self) -> Result<Statement> {
-        let columns = if self.consume_symbol('*') {
-            None
-        } else {
-            let mut columns = Vec::new();
+        let mut projection = Vec::new();
+        loop {
+            projection.push(self.select_item()?);
+            if !self.consume_symbol(',') {
+                break;
+            }
+        }
+        self.expect_keyword("from")?;
+        let from = self.table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            let kind = if self.consume_keyword("inner") {
+                self.expect_keyword("join")?;
+                Some(JoinKind::Inner)
+            } else if self.consume_keyword("left") {
+                self.consume_keyword("outer");
+                self.expect_keyword("join")?;
+                Some(JoinKind::Left)
+            } else if self.consume_keyword("join") {
+                Some(JoinKind::Inner)
+            } else {
+                None
+            };
+            let Some(kind) = kind else {
+                break;
+            };
+            let table = self.table_ref()?;
+            self.expect_keyword("on")?;
+            let mut equality = Vec::new();
             loop {
-                columns.push(self.identifier()?);
-                if !self.consume_symbol(',') {
+                let left = self.column_ref()?;
+                match self.next() {
+                    Some(Token::Comparison(Comparison::Equal)) => {}
+                    _ => return Err(self.error_at_last("joins require an equality predicate")),
+                }
+                equality.push((left, self.column_ref()?));
+                if !self.consume_keyword("and") {
                     break;
                 }
             }
-            Some(columns)
-        };
-        self.expect_keyword("from")?;
-        let table = self.identifier()?;
+            joins.push(Join {
+                kind,
+                table,
+                equality,
+            });
+        }
         let mut predicates = Vec::new();
         if self.consume_keyword("where") {
             loop {
-                let column = self.identifier()?;
+                let column = self.column_ref()?;
                 let comparison = match self.next() {
                     Some(Token::Comparison(comparison)) => comparison,
                     _ => return Err(self.error_at_last("expected a comparison operator")),
@@ -429,11 +550,271 @@ impl Parser {
                 }
             }
         }
+        let order_by = if self.consume_keyword("order") {
+            self.expect_keyword("by")?;
+            self.order_by_list()?
+        } else {
+            Vec::new()
+        };
+        let limit = if self.consume_keyword("limit") {
+            Some(self.usize_literal("LIMIT requires a nonnegative integer")?)
+        } else {
+            None
+        };
         Ok(Statement::Select {
-            table,
-            columns,
+            from,
+            projection,
+            joins,
             predicates,
+            order_by,
+            limit,
         })
+    }
+
+    fn select_item(&mut self) -> Result<SelectItem> {
+        if self.consume_symbol('*') {
+            return Ok(SelectItem::Wildcard(None));
+        }
+        if self.is_window_function() {
+            let expression = self.window_expression()?;
+            return Ok(SelectItem::Window {
+                expression,
+                alias: self.optional_alias()?,
+            });
+        }
+
+        let first = self.identifier()?;
+        if self.consume_symbol('.') {
+            if self.consume_symbol('*') {
+                return Ok(SelectItem::Wildcard(Some(first)));
+            }
+            let column = ColumnRef {
+                qualifier: Some(first),
+                name: self.identifier()?,
+            };
+            return Ok(SelectItem::Column {
+                column,
+                alias: self.optional_alias()?,
+            });
+        }
+        Ok(SelectItem::Column {
+            column: ColumnRef {
+                qualifier: None,
+                name: first,
+            },
+            alias: self.optional_alias()?,
+        })
+    }
+
+    fn is_window_function(&self) -> bool {
+        matches!(
+            (self.tokens.get(self.position), self.tokens.get(self.position + 1)),
+            (
+                Some(Token::Word(name)),
+                Some(Token::Symbol('('))
+            ) if matches!(name.as_str(), "row_number" | "rank" | "sum" | "count")
+        )
+    }
+
+    fn window_expression(&mut self) -> Result<WindowExpression> {
+        let name = self.identifier()?;
+        self.expect_symbol('(')?;
+        let function = match name.as_str() {
+            "row_number" => {
+                self.expect_symbol(')')?;
+                WindowFunction::RowNumber
+            }
+            "rank" => {
+                self.expect_symbol(')')?;
+                WindowFunction::Rank
+            }
+            "sum" => {
+                let column = self.column_ref()?;
+                self.expect_symbol(')')?;
+                WindowFunction::Sum(column)
+            }
+            "count" => {
+                let column = if self.consume_symbol('*') {
+                    None
+                } else {
+                    Some(self.column_ref()?)
+                };
+                self.expect_symbol(')')?;
+                WindowFunction::Count(column)
+            }
+            _ => return Err(self.error_at_last("unsupported window function")),
+        };
+        self.expect_keyword("over")?;
+        self.expect_symbol('(')?;
+        let partition_by = if self.consume_keyword("partition") {
+            self.expect_keyword("by")?;
+            self.column_ref_list()?
+        } else {
+            Vec::new()
+        };
+        let order_by = if self.consume_keyword("order") {
+            self.expect_keyword("by")?;
+            self.order_by_list()?
+        } else {
+            Vec::new()
+        };
+        let frame = if self.consume_keyword("rows") {
+            Some(self.window_frame()?)
+        } else {
+            None
+        };
+        self.expect_symbol(')')?;
+        Ok(WindowExpression {
+            function,
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    fn window_frame(&mut self) -> Result<WindowFrame> {
+        let (start, end) = if self.consume_keyword("between") {
+            let start = self.frame_bound()?;
+            self.expect_keyword("and")?;
+            (start, self.frame_bound()?)
+        } else {
+            (self.frame_bound()?, FrameBound::CurrentRow)
+        };
+        if start == FrameBound::UnboundedFollowing {
+            return Err(self.error_at_last("a ROWS frame may not start with UNBOUNDED FOLLOWING"));
+        }
+        if end == FrameBound::UnboundedPreceding {
+            return Err(self.error_at_last("a ROWS frame may not end with UNBOUNDED PRECEDING"));
+        }
+        if frame_position(start) > frame_position(end) {
+            return Err(self.error_at_last("a ROWS frame start must not follow its end"));
+        }
+        Ok(WindowFrame { start, end })
+    }
+
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.consume_keyword("unbounded") {
+            if self.consume_keyword("preceding") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            self.expect_keyword("following")?;
+            return Ok(FrameBound::UnboundedFollowing);
+        }
+        if self.consume_keyword("current") {
+            self.expect_keyword("row")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let offset = self.usize_literal("a ROWS frame offset must be a nonnegative integer")?;
+        if self.consume_keyword("preceding") {
+            Ok(FrameBound::Preceding(offset))
+        } else if self.consume_keyword("following") {
+            Ok(FrameBound::Following(offset))
+        } else {
+            Err(self.error("expected PRECEDING or FOLLOWING"))
+        }
+    }
+
+    fn order_by_list(&mut self) -> Result<Vec<OrderBy>> {
+        let mut order_by = Vec::new();
+        loop {
+            let column = self.column_ref()?;
+            let descending = if self.consume_keyword("desc") {
+                true
+            } else {
+                self.consume_keyword("asc");
+                false
+            };
+            let nulls_first = if self.consume_keyword("nulls") {
+                if self.consume_keyword("first") {
+                    Some(true)
+                } else {
+                    self.expect_keyword("last")?;
+                    Some(false)
+                }
+            } else {
+                None
+            };
+            order_by.push(OrderBy {
+                column,
+                descending,
+                nulls_first,
+            });
+            if !self.consume_symbol(',') {
+                break;
+            }
+        }
+        Ok(order_by)
+    }
+
+    fn column_ref_list(&mut self) -> Result<Vec<ColumnRef>> {
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.column_ref()?);
+            if !self.consume_symbol(',') {
+                break;
+            }
+        }
+        Ok(columns)
+    }
+
+    fn column_ref(&mut self) -> Result<ColumnRef> {
+        let first = self.identifier()?;
+        if self.consume_symbol('.') {
+            Ok(ColumnRef {
+                qualifier: Some(first),
+                name: self.identifier()?,
+            })
+        } else {
+            Ok(ColumnRef {
+                qualifier: None,
+                name: first,
+            })
+        }
+    }
+
+    fn table_ref(&mut self) -> Result<TableRef> {
+        let name = self.identifier()?;
+        let alias = self.optional_alias()?;
+        Ok(TableRef { name, alias })
+    }
+
+    fn optional_alias(&mut self) -> Result<Option<String>> {
+        if self.consume_keyword("as") {
+            return self.identifier().map(Some);
+        }
+        let is_clause = matches!(
+            self.peek(),
+            Some(Token::Word(word))
+                if matches!(
+                    word.as_str(),
+                    "from" | "inner" | "left" | "outer" | "join" | "on" | "where"
+                        | "order" | "limit" | "and" | "rows" | "partition" | "asc"
+                        | "desc" | "nulls" | "first" | "last" | "over"
+                )
+        );
+        if is_clause || matches!(self.peek(), Some(Token::Symbol(',' | ')'))) {
+            Ok(None)
+        } else if matches!(
+            self.peek(),
+            Some(Token::Word(_) | Token::QuotedIdentifier(_))
+        ) {
+            self.identifier().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn usize_literal(&mut self, message: &str) -> Result<usize> {
+        match self.next() {
+            Some(Token::Number(value))
+                if !value.contains(['.', 'e', 'E']) && !value.starts_with('-') =>
+            {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| self.error_at_last(message))
+            }
+            _ => Err(self.error_at_last(message)),
+        }
     }
 
     fn data_type(&mut self) -> Result<DataType> {

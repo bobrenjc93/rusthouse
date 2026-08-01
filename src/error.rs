@@ -21,6 +21,8 @@ pub enum Error {
     TableAlreadyExists(String),
     TableNotFound(String),
     ColumnNotFound(String),
+    AmbiguousColumn(String),
+    DuplicateTableAlias(String),
     DuplicateColumn(String),
     InvalidRow(String),
     TypeMismatch {
@@ -120,6 +122,11 @@ pub enum Error {
         required: usize,
         limit: usize,
     },
+    ExecutionRowLimitExceeded {
+        operator: &'static str,
+        limit: usize,
+        attempted: usize,
+    },
     GroupLimitExceeded {
         max_groups: usize,
     },
@@ -166,6 +173,8 @@ impl fmt::Display for Error {
             Self::TableAlreadyExists(table) => write!(f, "table already exists: {table}"),
             Self::TableNotFound(table) => write!(f, "table not found: {table}"),
             Self::ColumnNotFound(column) => write!(f, "column not found: {column}"),
+            Self::AmbiguousColumn(column) => write!(f, "column reference is ambiguous: {column}"),
+            Self::DuplicateTableAlias(alias) => write!(f, "duplicate table alias: {alias}"),
             Self::DuplicateColumn(column) => write!(f, "duplicate column: {column}"),
             Self::InvalidRow(message) => write!(f, "invalid row: {message}"),
             Self::TypeMismatch {
@@ -309,6 +318,14 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "{operator} requires {required} retained bytes, limit is {limit}"
+            ),
+            Self::ExecutionRowLimitExceeded {
+                operator,
+                limit,
+                attempted,
+            } => write!(
+                f,
+                "{operator} row limit exceeded: limit {limit}, attempted {attempted}"
             ),
             Self::GroupLimitExceeded { max_groups } => {
                 write!(f, "hash grouping exceeded its {max_groups} group limit")

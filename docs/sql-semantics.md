@@ -112,3 +112,39 @@ Mixed numeric inputs are comparable, while incompatible MIN/MAX domains and
 nonnumeric SUM/AVG inputs return `Error::Aggregate`. Equal mixed numeric
 MIN/MAX values use the canonical `Float64` representation, independent of row
 order.
+
+## Joins and qualified names
+
+SQL queries support chained `INNER` and `LEFT` hash joins whose `ON` clause is
+one or more equality predicates joined by `AND`. Each equality must compare a
+column from the new right table with a column already in the left input.
+Aliases qualify columns and hide the original table name. An unqualified name
+that exists in more than one input returns `Error::AmbiguousColumn`, including
+when the tables are empty.
+
+`NULL` and NaN join keys never match. Duplicate build keys produce one result
+for every match in build-table row order. A `LEFT JOIN` emits one null-extended
+row when no key matches, and its right-side result columns are nullable.
+
+## Window functions
+
+`ROW_NUMBER()` assigns consecutive positions within each partition. `RANK()`
+assigns the same value to peers and leaves gaps after ties. Partition and sort
+columns are bound before execution, including on empty input. `NULL` partition
+keys group together. Window sorts are stable, so row-number assignments within
+ties follow source row order; an outer `ORDER BY` defines returned row order.
+Ascending order places `NULL` last and descending order places it first unless
+`NULLS FIRST` or `NULLS LAST` is explicit.
+
+Windowed `SUM(column)` and `COUNT(column)` ignore `NULL`; `COUNT(*)` includes
+every framed row. Empty frames return zero for `COUNT` and `NULL` for `SUM`.
+Integer sums use an `i128` prefix and fail if the framed result does not fit
+`Int64`. With `ORDER BY`, the omitted frame is running rows from unbounded
+preceding through the current row. Without it, the omitted frame covers the
+whole partition. Explicit `ROWS` frames accept unbounded, current-row, and
+nonnegative preceding/following bounds.
+
+`QueryLimits` rejects a query before a join build exceeds its row or
+conservatively accounted retained-byte ceiling. It also bounds every window
+partition by rows and retained bytes, bounds join expansion and final output
+rows, and reports these failures as resource-limit errors.

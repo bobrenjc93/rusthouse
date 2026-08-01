@@ -253,6 +253,18 @@ to the same table conflict; changes to disjoint tables merge into a new generati
 A conflict ends the transaction, while a pre-publication persistence error keeps it
 active for retry. Durability uncertainty ends it because the generation is visible.
 
+`SELECT` accepts qualified table aliases, `INNER JOIN`/`JOIN` and `LEFT JOIN`
+with one or more equality keys, qualified wildcards and projections, `WHERE`,
+`ORDER BY`, and `LIMIT`. Window projections support `ROW_NUMBER`, `RANK`, and
+windowed `SUM`/`COUNT` with `PARTITION BY`, `ORDER BY`, and `ROWS` frames.
+Unqualified duplicate names are rejected as ambiguous; aliases are required to
+disambiguate duplicate projected names.
+
+`QueryLimits` bounds hash-join build rows and retained state, rows and retained
+state in each window partition, and materialized output rows. Limits can be set
+as database defaults or changed on a session. The HTTP service additionally
+applies its configured result-byte ceiling.
+
 `TransactionLimits` bounds cumulative inserted rows and encoded staged DDL/DML bytes.
 CREATE accounting includes every persisted string length prefix, name, type,
 nullability flag, column count, and row-count field. A statement that would exceed either limit has no effect and leaves an

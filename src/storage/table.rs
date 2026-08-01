@@ -89,12 +89,11 @@ impl ColumnData {
         }
     }
 
-    fn owned_value_bytes(&self, index: usize) -> usize {
-        std::mem::size_of::<Value>()
-            + match self {
-                Self::String(values) => values[index].as_ref().map_or(0, String::len),
-                _ => 0,
-            }
+    fn variable_value_bytes(&self, index: usize) -> usize {
+        match self {
+            Self::String(values) => values[index].as_ref().map_or(0, String::len),
+            _ => 0,
+        }
     }
 }
 
@@ -198,8 +197,15 @@ impl Table {
         self.columns[column].value(row)
     }
 
-    pub(crate) fn owned_value_bytes(&self, row: usize, column: usize) -> usize {
-        self.columns[column].owned_value_bytes(row)
+    pub(crate) fn estimated_row_bytes(&self, row: usize) -> usize {
+        self.columns.iter().fold(
+            std::mem::size_of::<Vec<Value>>().saturating_add(
+                self.columns
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            ),
+            |bytes, column| bytes.saturating_add(column.variable_value_bytes(row)),
+        )
     }
 
     pub(crate) fn columns(&self) -> &[ColumnData] {

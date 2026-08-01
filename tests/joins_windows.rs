@@ -1,0 +1,296 @@
+use rusthouse::{Database, Error, QueryLimits, StatementResult, Value};
+
+fn query(database: &Database, sql: &str) -> Vec<Vec<Value>> {
+    match database.execute(sql).unwrap() {
+        StatementResult::Query(result) => result.rows,
+        result => panic!("expected query result, got {result:?}"),
+    }
+}
+
+#[test]
+fn inner_hash_join_skips_null_keys_and_preserves_duplicate_matches() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE left_rows (seq Int64, id Int64 NULL, label String)")
+        .unwrap();
+    database
+        .execute("CREATE TABLE right_rows (id Int64 NULL, tag String)")
+        .unwrap();
+    database
+        .execute("INSERT INTO left_rows VALUES (1, 1, 'one'), (2, NULL, 'null'), (3, 2, 'two')")
+        .unwrap();
+    database
+        .execute("INSERT INTO right_rows VALUES (1, 'a'), (1, 'b'), (NULL, 'n')")
+        .unwrap();
+
+    let sql = "SELECT l.seq, l.label, r.tag FROM left_rows AS l \
+               INNER JOIN right_rows AS r ON l.id = r.id ORDER BY l.seq, r.tag";
+    assert_eq!(
+        query(&database, sql),
+        vec![
+            vec![Value::Int64(1), Value::from("one"), Value::from("a")],
+            vec![Value::Int64(1), Value::from("one"), Value::from("b")],
+        ]
+    );
+    assert_eq!(query(&database, sql), query(&database, sql));
+}
+
+#[test]
+fn left_join_null_extends_unmatched_rows_and_handles_an_empty_build() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE left_rows (seq Int64, id Int64 NULL)")
+        .unwrap();
+    database
+        .execute("CREATE TABLE empty_right (id Int64, tag String)")
+        .unwrap();
+    database
+        .execute("INSERT INTO left_rows VALUES (1, 7), (2, NULL)")
+        .unwrap();
+
+    let result = database
+        .execute(
+            "SELECT l.seq, r.tag FROM left_rows l LEFT JOIN empty_right r \
+             ON l.id = r.id ORDER BY l.seq",
+        )
+        .unwrap()
+        .into_result_set()
+        .unwrap();
+    assert!(result.columns[1].nullable);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(1), Value::Null],
+            vec![Value::Int64(2), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn binding_rejects_ambiguous_and_invalid_qualified_columns_on_empty_inputs() {
+    let database = Database::new();
+    database.execute("CREATE TABLE first (id Int64)").unwrap();
+    database.execute("CREATE TABLE second (id Int64)").unwrap();
+
+    assert!(matches!(
+        database.execute(
+            "SELECT id FROM first f INNER JOIN second s ON f.id = s.id"
+        ),
+        Err(Error::AmbiguousColumn(column)) if column == "id"
+    ));
+    assert!(matches!(
+        database.execute(
+            "SELECT first.id FROM first f INNER JOIN second s ON f.id = s.id"
+        ),
+        Err(Error::ColumnNotFound(column)) if column == "first.id"
+    ));
+    assert!(matches!(
+        database.execute("SELECT ROW_NUMBER() OVER (ORDER BY missing) AS rn FROM first"),
+        Err(Error::ColumnNotFound(column)) if column == "missing"
+    ));
+    assert!(
+        query(
+            &database,
+            "SELECT f.id, ROW_NUMBER() OVER (ORDER BY f.id) AS rn FROM first f"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn window_rank_and_bounded_running_aggregates_are_deterministic() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE events (grp String, seq Int64, score Int64 NULL)")
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO events VALUES \
+             ('a', 1, 10), ('a', 2, 10), ('a', 3, NULL), ('a', 4, 20), ('b', 1, 5)",
+        )
+        .unwrap();
+
+    let sql = "SELECT grp, seq, \
+               ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score) AS rn, \
+               RANK() OVER (PARTITION BY grp ORDER BY score) AS rnk, \
+               SUM(score) OVER (PARTITION BY grp ORDER BY seq \
+                 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS running, \
+               COUNT(score) OVER (PARTITION BY grp ORDER BY seq ROWS 1 PRECEDING) AS counted \
+               FROM events ORDER BY grp, seq";
+    let expected = vec![
+        vec![
+            Value::from("a"),
+            Value::Int64(1),
+            Value::Int64(1),
+            Value::Int64(1),
+            Value::Int64(10),
+            Value::Int64(1),
+        ],
+        vec![
+            Value::from("a"),
+            Value::Int64(2),
+            Value::Int64(2),
+            Value::Int64(1),
+            Value::Int64(20),
+            Value::Int64(2),
+        ],
+        vec![
+            Value::from("a"),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(4),
+            Value::Int64(10),
+            Value::Int64(1),
+        ],
+        vec![
+            Value::from("a"),
+            Value::Int64(4),
+            Value::Int64(3),
+            Value::Int64(3),
+            Value::Int64(20),
+            Value::Int64(1),
+        ],
+        vec![
+            Value::from("b"),
+            Value::Int64(1),
+            Value::Int64(1),
+            Value::Int64(1),
+            Value::Int64(5),
+            Value::Int64(1),
+        ],
+    ];
+    assert_eq!(query(&database, sql), expected);
+    assert_eq!(query(&database, sql), expected);
+}
+
+#[test]
+fn rows_following_frames_and_default_running_frames_have_sql_empty_values() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE numbers (seq Int64, value Int64 NULL)")
+        .unwrap();
+    database
+        .execute("INSERT INTO numbers VALUES (1, 2), (2, NULL), (3, 4)")
+        .unwrap();
+
+    assert_eq!(
+        query(
+            &database,
+            "SELECT seq, SUM(value) OVER (ORDER BY seq) AS running, \
+             COUNT(*) OVER (ORDER BY seq ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) AS next_rows, \
+             SUM(value) OVER (ORDER BY seq ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) AS next_sum \
+             FROM numbers ORDER BY seq"
+        ),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Null,
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(1),
+                Value::Int64(4),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Int64(6),
+                Value::Int64(0),
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+#[test]
+fn join_build_partition_and_output_limits_fail_explicitly() {
+    let limits = QueryLimits::new(1, usize::MAX, 2, usize::MAX, 1);
+    let database = Database::with_query_limits(limits);
+    database.execute("CREATE TABLE left_t (id Int64)").unwrap();
+    database.execute("CREATE TABLE right_t (id Int64)").unwrap();
+    database
+        .execute("INSERT INTO left_t VALUES (1), (2), (3)")
+        .unwrap();
+    database
+        .execute("INSERT INTO right_t VALUES (1), (1)")
+        .unwrap();
+
+    assert!(matches!(
+        database.execute("SELECT l.id FROM left_t l JOIN right_t r ON l.id = r.id"),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "hash join build",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+    assert!(matches!(
+        database.execute("SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn FROM left_t"),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "window partition",
+            limit: 2,
+            attempted: 3,
+        })
+    ));
+    assert!(matches!(
+        database.execute("SELECT id FROM left_t"),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "query output",
+            limit: 1,
+            attempted: 3,
+        })
+    ));
+    assert_eq!(
+        query(&database, "SELECT id FROM left_t ORDER BY id LIMIT 1"),
+        vec![vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn duplicate_join_matches_are_bounded_before_result_materialization() {
+    let database =
+        Database::with_query_limits(QueryLimits::new(2, usize::MAX, usize::MAX, usize::MAX, 1));
+    database.execute("CREATE TABLE left_t (id Int64)").unwrap();
+    database.execute("CREATE TABLE right_t (id Int64)").unwrap();
+    database.execute("INSERT INTO left_t VALUES (1)").unwrap();
+    database
+        .execute("INSERT INTO right_t VALUES (1), (1)")
+        .unwrap();
+
+    assert!(matches!(
+        database.execute("SELECT l.id FROM left_t l JOIN right_t r ON l.id = r.id"),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "hash join output",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+}
+
+#[test]
+fn join_and_window_byte_state_limits_are_enforced() {
+    let database =
+        Database::with_query_limits(QueryLimits::new(usize::MAX, 0, usize::MAX, 0, usize::MAX));
+    database.execute("CREATE TABLE left_t (id Int64)").unwrap();
+    database.execute("CREATE TABLE right_t (id Int64)").unwrap();
+    database.execute("INSERT INTO left_t VALUES (1)").unwrap();
+    database.execute("INSERT INTO right_t VALUES (1)").unwrap();
+
+    assert!(matches!(
+        database.execute("SELECT l.id FROM left_t l JOIN right_t r ON l.id = r.id"),
+        Err(Error::MemoryLimitExceeded {
+            operator: "hash join build",
+            limit: 0,
+            ..
+        })
+    ));
+    assert!(matches!(
+        database.execute("SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn FROM left_t"),
+        Err(Error::MemoryLimitExceeded {
+            operator: "window partition",
+            limit: 0,
+            ..
+        })
+    ));
+}

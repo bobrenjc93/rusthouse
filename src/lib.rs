@@ -14,6 +14,7 @@ pub mod http;
 pub mod kernels;
 mod persistence;
 pub mod query;
+mod relational;
 mod sidecar;
 mod sql;
 pub mod storage;
@@ -24,7 +25,7 @@ pub use catalog::{
     CatalogImage, ColumnData, ColumnImage, Corruption, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC,
     SchemaImage, SnapshotCommitOutcome, SnapshotError, SnapshotLimits, SnapshotStore, TableImage,
 };
-pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
+pub use database::{Database, QueryLimits, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};
 pub use expression::{
     BinaryOperator, EvaluationContext, Expr, MAX_EXPRESSION_DEPTH, UnaryOperator, evaluate, parse,

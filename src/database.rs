@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -6,9 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::catalog::CatalogGeneration;
 use crate::error::{Error, LimitKind, Result};
 use crate::persistence::{Persistence, StoreStatus};
-use crate::sql::{Comparison, Predicate, Statement, parse};
+use crate::sql::{Statement, parse};
 use crate::storage::{ColumnDef, EngineTable as Table, Value};
-use crate::value::compare_int_float;
 
 pub(crate) trait ExecutionCancellation {
     fn is_cancelled(&self) -> bool;
@@ -16,9 +14,55 @@ pub(crate) trait ExecutionCancellation {
 }
 
 #[derive(Clone, Copy)]
-struct ExecutionControl<'a> {
-    max_result_bytes: usize,
-    cancellation: &'a dyn ExecutionCancellation,
+pub(crate) struct ExecutionControl<'a> {
+    pub(crate) max_result_bytes: usize,
+    pub(crate) cancellation: &'a dyn ExecutionCancellation,
+}
+
+/// Resource bounds for relational query operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// Maximum rows accepted from the build side of one hash join.
+    pub max_join_build_rows: usize,
+    /// Maximum conservatively accounted retained bytes for one hash join build.
+    pub max_join_build_bytes: usize,
+    /// Maximum rows in one window partition.
+    pub max_window_partition_rows: usize,
+    /// Maximum conservatively accounted retained bytes in one window partition.
+    pub max_window_partition_bytes: usize,
+    /// Maximum rows emitted by a join or returned by a query.
+    pub max_output_rows: usize,
+}
+
+impl QueryLimits {
+    /// Constructs relational operator limits.
+    pub const fn new(
+        max_join_build_rows: usize,
+        max_join_build_bytes: usize,
+        max_window_partition_rows: usize,
+        max_window_partition_bytes: usize,
+        max_output_rows: usize,
+    ) -> Self {
+        Self {
+            max_join_build_rows,
+            max_join_build_bytes,
+            max_window_partition_rows,
+            max_window_partition_bytes,
+            max_output_rows,
+        }
+    }
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self::new(
+            1_000_000,
+            256 * 1024 * 1024,
+            1_000_000,
+            256 * 1024 * 1024,
+            1_000_000,
+        )
+    }
 }
 
 /// Per-transaction bounds for staged inserts and their encoded value sizes.
@@ -91,6 +135,7 @@ struct DatabaseInner {
     state: Mutex<DatabaseState>,
     persistence: Option<Persistence>,
     default_limits: TransactionLimits,
+    default_query_limits: QueryLimits,
 }
 
 #[derive(Debug)]
@@ -106,7 +151,25 @@ impl Database {
 
     /// Creates an in-memory database with explicit transaction limits.
     pub fn with_limits(limits: TransactionLimits) -> Self {
-        Self::from_generation(CatalogGeneration::empty(), None, limits)
+        Self::with_limits_and_query_limits(limits, QueryLimits::default())
+    }
+
+    /// Creates an in-memory database with explicit relational query limits.
+    pub fn with_query_limits(limits: QueryLimits) -> Self {
+        Self::with_limits_and_query_limits(TransactionLimits::default(), limits)
+    }
+
+    /// Creates an in-memory database with explicit transaction and query limits.
+    pub fn with_limits_and_query_limits(
+        transaction_limits: TransactionLimits,
+        query_limits: QueryLimits,
+    ) -> Self {
+        Self::from_generation(
+            CatalogGeneration::empty(),
+            None,
+            transaction_limits,
+            query_limits,
+        )
     }
 
     /// Opens an atomically persisted database snapshot, or an empty database if absent.
@@ -116,15 +179,30 @@ impl Database {
 
     /// Opens a persisted database with explicit transaction limits.
     pub fn open_with_limits(path: impl AsRef<Path>, limits: TransactionLimits) -> Result<Self> {
+        Self::open_with_limits_and_query_limits(path, limits, QueryLimits::default())
+    }
+
+    /// Opens a persisted database with explicit transaction and relational query limits.
+    pub fn open_with_limits_and_query_limits(
+        path: impl AsRef<Path>,
+        transaction_limits: TransactionLimits,
+        query_limits: QueryLimits,
+    ) -> Result<Self> {
         let persistence = Persistence::acquire(path.as_ref().to_path_buf())?;
         let generation = persistence.load()?;
-        Ok(Self::from_generation(generation, Some(persistence), limits))
+        Ok(Self::from_generation(
+            generation,
+            Some(persistence),
+            transaction_limits,
+            query_limits,
+        ))
     }
 
     fn from_generation(
         generation: CatalogGeneration,
         persistence: Option<Persistence>,
         default_limits: TransactionLimits,
+        default_query_limits: QueryLimits,
     ) -> Self {
         Self {
             inner: Arc::new(DatabaseInner {
@@ -133,6 +211,7 @@ impl Database {
                 }),
                 persistence,
                 default_limits,
+                default_query_limits,
             }),
         }
     }
@@ -143,6 +222,7 @@ impl Database {
             database: self.clone(),
             transaction: None,
             limits: self.inner.default_limits,
+            query_limits: self.inner.default_query_limits,
         }
     }
 
@@ -278,6 +358,7 @@ pub struct Session {
     database: Database,
     transaction: Option<Transaction>,
     limits: TransactionLimits,
+    query_limits: QueryLimits,
 }
 
 #[derive(Debug)]
@@ -356,9 +437,9 @@ impl Session {
                     &transaction.tables
                 } else {
                     let snapshot = self.database.inner.snapshot()?;
-                    return execute_read(&snapshot.tables, statement, control);
+                    return execute_read(&snapshot.tables, statement, self.query_limits, control);
                 };
-                execute_read(tables, statement, control)
+                execute_read(tables, statement, self.query_limits, control)
             }
             statement => {
                 if let Some(transaction) = &mut self.transaction {
@@ -431,6 +512,11 @@ impl Session {
         }
         self.limits = limits;
         Ok(())
+    }
+
+    /// Changes relational resource limits for subsequent queries in this session.
+    pub fn set_query_limits(&mut self, limits: QueryLimits) {
+        self.query_limits = limits;
     }
 }
 
@@ -543,96 +629,14 @@ fn estimate_insert_bytes(table: &str, rows: &[Vec<Value>]) -> usize {
 fn execute_read(
     tables: &BTreeMap<String, Arc<Table>>,
     statement: Statement,
+    limits: QueryLimits,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<StatementResult> {
-    let Statement::Select {
-        table,
-        columns,
-        predicates,
-    } = statement
-    else {
-        return Err(Error::Unsupported("statement is not a query".to_owned()));
-    };
-    let table = tables
-        .get(&table)
-        .ok_or_else(|| Error::TableNotFound(table.clone()))?;
-    let projection = match columns {
-        Some(columns) => {
-            let mut projection = Vec::with_capacity(columns.len());
-            for (position, name) in columns.iter().enumerate() {
-                if columns[..position].contains(name) {
-                    return Err(Error::DuplicateColumn(name.clone()));
-                }
-                projection.push(
-                    table
-                        .column_index(name)
-                        .ok_or_else(|| Error::ColumnNotFound(name.clone()))?,
-                );
-            }
-            projection
-        }
-        None => (0..table.schema().len()).collect(),
-    };
-    let predicates = prepare_predicates(table, &predicates)?;
-    let column_bytes = projection.iter().fold(
-        projection
-            .len()
-            .saturating_mul(std::mem::size_of::<ColumnDef>()),
-        |bytes, index| bytes.saturating_add(table.schema()[*index].name.len()),
-    );
-    enforce_result_limit(control, column_bytes)?;
-    let row_fixed_bytes = std::mem::size_of::<Vec<Value>>().saturating_add(
-        projection
-            .len()
-            .saturating_mul(std::mem::size_of::<Value>()),
-    );
-    let row_capacity = control.map_or(0, |control| {
-        control
-            .max_result_bytes
-            .saturating_sub(column_bytes)
-            .checked_div(row_fixed_bytes.max(1))
-            .unwrap_or(0)
-            .min(table.row_count())
-    });
-    let mut rows = if control.is_some() {
-        Vec::with_capacity(row_capacity)
-    } else {
-        Vec::new()
-    };
-    let mut result_bytes =
-        column_bytes.saturating_add(row_capacity.saturating_mul(std::mem::size_of::<Vec<Value>>()));
-    enforce_result_limit(control, result_bytes)?;
-    for row in 0..table.row_count() {
-        check_cancellation(control)?;
-        if predicates.iter().all(|(column, comparison, value)| {
-            compare(&table.value(row, *column), value, *comparison)
-        }) {
-            let row_bytes = projection.iter().fold(0usize, |bytes, column| {
-                bytes.saturating_add(table.owned_value_bytes(row, *column))
-            });
-            let additional_outer_bytes = if control.is_some() && rows.len() == row_capacity {
-                std::mem::size_of::<Vec<Value>>()
-            } else {
-                0
-            };
-            let required = result_bytes
-                .saturating_add(additional_outer_bytes)
-                .saturating_add(row_bytes);
-            enforce_result_limit(control, required)?;
-            result_bytes = required;
-            rows.push(
-                projection
-                    .iter()
-                    .map(|column| table.value(row, *column))
-                    .collect(),
-            );
-        }
-    }
-    let columns = projection
-        .iter()
-        .map(|index| table.schema()[*index].clone())
-        .collect();
-    Ok(StatementResult::Query(ResultSet { columns, rows }))
+    let output = crate::relational::execute(tables, statement, limits, control)?;
+    Ok(StatementResult::Query(ResultSet {
+        columns: output.columns,
+        rows: output.rows,
+    }))
 }
 
 fn check_cancellation(control: Option<ExecutionControl<'_>>) -> Result<()> {
@@ -648,72 +652,6 @@ fn begin_publication(control: Option<ExecutionControl<'_>>) -> Result<()> {
         Err(Error::QueryCancelled)
     } else {
         Ok(())
-    }
-}
-
-fn enforce_result_limit(control: Option<ExecutionControl<'_>>, required: usize) -> Result<()> {
-    if let Some(control) = control
-        && required > control.max_result_bytes
-    {
-        return Err(Error::MemoryLimitExceeded {
-            operator: "query result",
-            required,
-            limit: control.max_result_bytes,
-        });
-    }
-    Ok(())
-}
-
-fn prepare_predicates(
-    table: &Table,
-    predicates: &[Predicate],
-) -> Result<Vec<(usize, Comparison, Value)>> {
-    predicates
-        .iter()
-        .map(|predicate| {
-            let index = table
-                .column_index(&predicate.column)
-                .ok_or_else(|| Error::ColumnNotFound(predicate.column.clone()))?;
-            let column = &table.schema()[index];
-            if let Some(value_type) = predicate.value.data_type()
-                && value_type != column.data_type
-                && !(value_type.is_numeric() && column.data_type.is_numeric())
-            {
-                return Err(Error::TypeMismatch {
-                    column: column.name.clone(),
-                    expected: column.data_type.to_string(),
-                    actual: predicate.value.type_name().to_owned(),
-                });
-            }
-            Ok((index, predicate.comparison, predicate.value.clone()))
-        })
-        .collect()
-}
-
-fn compare(left: &Value, right: &Value, comparison: Comparison) -> bool {
-    if left == &Value::Null || right == &Value::Null {
-        return false;
-    }
-    let ordering = match (left, right) {
-        (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
-        (Value::Int64(left), Value::Float64(right)) => compare_int_float(*left, *right),
-        (Value::Float64(left), Value::Int64(right)) => {
-            compare_int_float(*right, *left).map(Ordering::reverse)
-        }
-        (Value::Float64(left), Value::Float64(right)) => left.partial_cmp(right),
-        (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
-        (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
-        _ => None,
-    };
-    match comparison {
-        Comparison::Equal => ordering == Some(Ordering::Equal),
-        Comparison::NotEqual => ordering != Some(Ordering::Equal),
-        Comparison::Less => ordering == Some(Ordering::Less),
-        Comparison::LessOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
-        Comparison::Greater => ordering == Some(Ordering::Greater),
-        Comparison::GreaterOrEqual => {
-            matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
-        }
     }
 }
 

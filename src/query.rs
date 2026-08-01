@@ -391,6 +391,8 @@ impl From<Error> for QueryError {
             Error::Parse { .. }
             | Error::Unsupported(_)
             | Error::DuplicateColumn(_)
+            | Error::AmbiguousColumn(_)
+            | Error::DuplicateTableAlias(_)
             | Error::InvalidRow(_)
             | Error::TypeMismatch { .. }
             | Error::UnsupportedAggregate { .. }
@@ -422,6 +424,7 @@ impl From<Error> for QueryError {
             | Error::SelectionMismatch { .. }
             | Error::ArithmeticOverflow { .. }
             | Error::MemoryLimitExceeded { .. }
+            | Error::ExecutionRowLimitExceeded { .. }
             | Error::GroupLimitExceeded { .. }
             | Error::ExpressionTooDeep { .. } => QueryErrorKind::ResourceLimit,
             Error::UnsupportedPlatform(_)
