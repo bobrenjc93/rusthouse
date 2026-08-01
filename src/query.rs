@@ -516,6 +516,21 @@ pub trait QueryService: Send + Sync + 'static {
     fn observability(&self) -> Option<ObservabilitySnapshot> {
         None
     }
+
+    /// Returns observability while honoring transport cancellation.
+    ///
+    /// Implementations that can block must inspect `cancellation` throughout
+    /// collection and return promptly after it is signalled.
+    fn observability_cancellable(
+        &self,
+        cancellation: &QueryCancellation,
+    ) -> Option<ObservabilitySnapshot> {
+        if cancellation.is_cancelled() {
+            None
+        } else {
+            self.observability()
+        }
+    }
 }
 
 impl QueryService for Database {

@@ -213,3 +213,68 @@ async fn concurrent_metrics_scrapes_share_query_admission() {
     assert_eq!(first.await.unwrap().status(), StatusCode::OK);
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn stalled_metrics_times_out_without_retaining_the_query_slot() {
+    let service = Arc::new(BlockingMetricsService::new());
+    let config = ServerConfig {
+        max_concurrent_queries: 1,
+        query_timeout: Duration::from_millis(40),
+        ..ServerConfig::default()
+    };
+    let server = spawn_http_server("127.0.0.1:0".parse().unwrap(), service.clone(), config)
+        .await
+        .unwrap();
+    let base_url = format!("http://{}", server.local_addr());
+    let client = Client::new();
+
+    let metrics = client
+        .get(format!("{base_url}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        metrics.json::<JsonValue>().await.unwrap()["error"]["code"],
+        "metrics_timeout"
+    );
+
+    let query = client
+        .post(format!("{base_url}/query"))
+        .header("content-type", "application/sql")
+        .body("SELECT * FROM anything")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(query.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        query.json::<JsonValue>().await.unwrap()["error"]["code"],
+        "unavailable"
+    );
+
+    service.release.store(true, Ordering::Release);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_metrics_does_not_delay_forced_shutdown() {
+    let service = Arc::new(BlockingMetricsService::new());
+    let config = ServerConfig {
+        query_timeout: Duration::from_secs(30),
+        shutdown_timeout: Duration::from_millis(40),
+        ..ServerConfig::default()
+    };
+    let server = spawn_http_server("127.0.0.1:0".parse().unwrap(), service.clone(), config)
+        .await
+        .unwrap();
+    let url = format!("http://{}/metrics", server.local_addr());
+    let request = tokio::spawn(async move { Client::new().get(url).send().await });
+    service.started.acquire().await.unwrap().forget();
+
+    tokio::time::timeout(Duration::from_secs(1), server.shutdown())
+        .await
+        .expect("shutdown remained blocked by metrics collection")
+        .unwrap();
+    service.release.store(true, Ordering::Release);
+    let _ = tokio::time::timeout(Duration::from_secs(1), request).await;
+}

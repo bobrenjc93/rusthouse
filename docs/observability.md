@@ -57,9 +57,12 @@ that bound is exceeded, `tracked_active_queries` reports retained records, and
 ## Metrics and logs
 
 `GET /metrics` returns `application/json` with `active_queries` and `engine_metrics`. Scrapes share
-the HTTP request and query admission limits, serialize on a blocking worker, and cannot exceed
-`max_response_bytes`. The active query objects use the same fields and bounds as
-`system.active_queries`. Engine metrics have these stable fields:
+the HTTP request, query, and shutdown admission controls; use `query_timeout` as their collection
+deadline; and cannot exceed `max_response_bytes`. Collection receives a cooperative cancellation
+signal. One dedicated detached metrics worker bounds even a non-cooperative implementation, so a
+stalled collector cannot retain query slots or delay Tokio runtime and process shutdown. The active
+query objects use the same fields and bounds as `system.active_queries`. Engine metrics have these
+stable fields:
 
 - `active_queries` and `tracked_active_queries` are current gauges.
 - `queries_total`, `queries_succeeded_total`, `queries_failed_total`, and

@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
+        mpsc::{SyncSender, TrySendError, sync_channel},
     },
     task::{Context, Poll},
     time::Duration,
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
@@ -184,9 +185,18 @@ struct HttpState {
     config: ServerConfig,
     request_permits: Arc<Semaphore>,
     query_permits: Arc<Semaphore>,
+    metrics_worker_permits: Arc<Semaphore>,
+    metrics_sender: SyncSender<MetricsTask>,
     request_ids: AtomicU64,
     force_cancellation: CancellationToken,
     query_admission: Arc<QueryAdmission>,
+}
+
+struct MetricsTask {
+    cancellation: QueryCancellation,
+    response_limit: usize,
+    result_sender: oneshot::Sender<Option<Result<Vec<u8>, ApiError>>>,
+    _worker_permit: OwnedSemaphorePermit,
 }
 
 impl HttpState {
@@ -306,10 +316,17 @@ pub fn spawn_on_listener(
     let graceful_shutdown = CancellationToken::new();
     let force_cancellation = CancellationToken::new();
     let query_admission = Arc::new(QueryAdmission::default());
+    let (metrics_sender, metrics_receiver) = sync_channel(1);
+    let metrics_service = Arc::clone(&service);
+    let _ = std::thread::Builder::new()
+        .name("rusthouse-metrics".to_owned())
+        .spawn(move || metrics_worker(metrics_receiver, metrics_service))?;
     let state = Arc::new(HttpState {
         service,
         request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         query_permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
+        metrics_worker_permits: Arc::new(Semaphore::new(1)),
+        metrics_sender,
         config: config.clone(),
         request_ids: AtomicU64::new(1),
         force_cancellation: force_cancellation.clone(),
@@ -344,6 +361,18 @@ pub fn spawn_on_listener(
         shutdown_timeout: config.shutdown_timeout,
         task: Some(task),
     })
+}
+
+fn metrics_worker(
+    receiver: std::sync::mpsc::Receiver<MetricsTask>,
+    service: Arc<dyn QueryService>,
+) {
+    while let Ok(task) = receiver.recv() {
+        let result = service
+            .observability_cancellable(&task.cancellation)
+            .map(|snapshot| serialize_json_value(&snapshot, task.response_limit));
+        let _ = task.result_sender.send(result);
+    }
 }
 
 async fn serve_connections(
@@ -605,22 +634,56 @@ async fn metrics(State(state): State<Arc<HttpState>>) -> Response {
                 .into_response(request_id);
         }
     };
-    let service = Arc::clone(&state.service);
-    let response_limit = state.config.max_response_bytes;
-    let task = tokio::task::spawn_blocking(move || {
-        let result = service
-            .observability()
-            .map(|snapshot| serialize_json_value(&snapshot, response_limit));
-        (query_permit, result)
-    });
-    let (query_permit, result) = match task.await {
-        Ok(output) => output,
-        Err(error) => {
-            return ApiError::blocking_task_failed("metrics serialization", error)
-                .into_response(request_id);
+    let worker_permit = match state.metrics_worker_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::overloaded(1).into_response(request_id);
         }
     };
+    let Some(admission) = state.query_admission.enter() else {
+        return ApiError::shutting_down().into_response(request_id);
+    };
+    let response_limit = state.config.max_response_bytes;
+    let token = state.force_cancellation.child_token();
+    let cancellation = QueryCancellation::new(token);
+    let mut cancel_on_drop = CancelOnDrop(Some(cancellation.clone()));
+    let (sender, receiver) = oneshot::channel();
+    let task = MetricsTask {
+        cancellation,
+        response_limit,
+        result_sender: sender,
+        _worker_permit: worker_permit,
+    };
+    let queued = state.metrics_sender.try_send(task);
+    drop(admission);
+    if let Err(error) = queued {
+        return match error {
+            TrySendError::Full(_) => ApiError::overloaded(1),
+            TrySendError::Disconnected(_) => ApiError::internal("metrics worker is not running"),
+        }
+        .into_response(request_id);
+    }
+    let deadline = deadline_after(state.config.query_timeout);
+    let result = tokio::select! {
+        biased;
+        () = state.force_cancellation.cancelled() => {
+            let _ = cancel_on_drop.0.take().expect("metrics cancellation is present").cancel();
+            return ApiError::shutting_down().into_response(request_id);
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            let _ = cancel_on_drop.0.take().expect("metrics cancellation is present").cancel();
+            return ApiError::metrics_timeout(state.config.query_timeout).into_response(request_id);
+        }
+        result = receiver => match result {
+            Ok(result) => result,
+            Err(_) => {
+                return ApiError::internal("metrics worker stopped without a result")
+                    .into_response(request_id);
+            }
+        },
+    };
     drop(query_permit);
+    cancel_on_drop.0 = None;
     match result {
         Some(Ok(bytes)) => {
             let mut response = Response::new(Body::from(bytes));
@@ -1343,6 +1406,17 @@ impl ApiError {
             StatusCode::GATEWAY_TIMEOUT,
             "query_timeout",
             format!("query exceeded its {} ms deadline", duration.as_millis()),
+        )
+    }
+
+    fn metrics_timeout(duration: Duration) -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "metrics_timeout",
+            format!(
+                "metrics collection exceeded its {} ms deadline",
+                duration.as_millis()
+            ),
         )
     }
 
