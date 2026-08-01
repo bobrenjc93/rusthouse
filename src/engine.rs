@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -9,13 +10,26 @@ use crate::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
     Select, SelectItem, Statement,
 };
-use crate::storage::{Column, Table};
+use crate::storage::{Column, ColumnDef, Table};
+use crate::telemetry::{
+    ExecutionMetrics, QueryLogEntry, QueryStatus, Telemetry, TelemetryConfig, TelemetryCounters,
+};
 use crate::value::{DataType, Value, ValueRef};
 
+const SYSTEM_TELEMETRY: &str = "system.telemetry";
+const SYSTEM_QUERY_LOG: &str = "system.query_log";
+
 /// A reusable in-memory SQL database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    telemetry: Telemetry,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::with_telemetry_config(TelemetryConfig::default())
+    }
 }
 
 /// Metadata for one column in a [`QueryResult`].
@@ -57,10 +71,44 @@ impl Database {
         Self::default()
     }
 
+    /// Creates an empty database with the supplied telemetry configuration.
+    #[must_use]
+    pub fn with_telemetry_config(config: TelemetryConfig) -> Self {
+        Self {
+            catalog: Catalog::new(),
+            telemetry: Telemetry::new(config),
+        }
+    }
+
     /// Returns the database's catalog for read-only schema and table inspection.
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Returns the active telemetry configuration.
+    #[must_use]
+    pub fn telemetry_config(&self) -> TelemetryConfig {
+        self.telemetry.config()
+    }
+
+    /// Reconfigures the bounded query log.
+    ///
+    /// Reducing the capacity evicts the oldest entries immediately. Disabling
+    /// or reducing SQL-text retention also redacts existing retained text.
+    pub fn set_telemetry_config(&mut self, config: TelemetryConfig) {
+        self.telemetry.set_config(config);
+    }
+
+    /// Returns lifetime aggregate counters for completed executions.
+    #[must_use]
+    pub fn telemetry_counters(&self) -> &TelemetryCounters {
+        self.telemetry.counters()
+    }
+
+    /// Iterates over retained query-log entries from oldest to newest.
+    pub fn query_log(&self) -> impl DoubleEndedIterator<Item = &QueryLogEntry> + ExactSizeIterator {
+        self.telemetry.query_log().iter()
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -69,15 +117,40 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        let query_id = self.telemetry.begin();
+        let started = Instant::now();
+        let mut metrics = ExecutionMetrics::default();
+        let result = self.execute_inner(sql, &mut metrics);
+        let status = match &result {
+            Ok(_) => QueryStatus::Succeeded,
+            Err(error) => QueryStatus::Failed(error.into()),
+        };
+        self.telemetry
+            .record(query_id, started.elapsed(), metrics, status, sql);
+        result
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    fn execute_inner(
+        &mut self,
+        sql: &str,
+        metrics: &mut ExecutionMetrics,
+    ) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            results.push(self.execute_statement(statement, metrics)?);
+        }
+        Ok(results)
+    }
+
+    fn execute_statement(
+        &mut self,
+        statement: Statement,
+        metrics: &mut ExecutionMetrics,
+    ) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
+                reject_system_write(&name)?;
                 self.catalog.create_table(name, columns)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
@@ -85,6 +158,7 @@ impl Database {
                 })
             }
             Statement::Insert { table, rows } => {
+                reject_system_write(&table)?;
                 let affected_rows = rows.len();
                 {
                     let target = self.catalog.table(&table)?;
@@ -96,23 +170,39 @@ impl Database {
                 for row in rows {
                     target.insert_row(row)?;
                 }
+                metrics.rows_written = metrics
+                    .rows_written
+                    .saturating_add(usize_to_u64(affected_rows));
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self
+                .execute_select(select, metrics)
+                .map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
-        let table = self.catalog.table(&select.table)?;
+    fn execute_select(
+        &self,
+        select: Select,
+        metrics: &mut ExecutionMetrics,
+    ) -> Result<QueryResult> {
+        let system_table = self.materialize_system_table(&select.table)?;
+        let table = match system_table.as_ref() {
+            Some(table) => table,
+            None => self.catalog.table(&select.table)?,
+        };
         let predicate = select
             .predicate
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
+        metrics.rows_scanned = metrics
+            .rows_scanned
+            .saturating_add(usize_to_u64(table.row_count()));
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
@@ -120,6 +210,9 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
+        metrics.rows_matched = metrics
+            .rows_matched
+            .saturating_add(usize_to_u64(matching_rows.len()));
 
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
@@ -128,7 +221,13 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &group_columns,
+                &aggregate_specs,
+                metrics,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -142,12 +241,152 @@ impl Database {
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
         };
+        metrics.result_rows = metrics.result_rows.saturating_add(usize_to_u64(rows.len()));
 
         Ok(QueryResult {
             columns: result_columns,
             rows,
         })
     }
+
+    fn materialize_system_table(&self, name: &str) -> Result<Option<Table>> {
+        if name.eq_ignore_ascii_case(SYSTEM_TELEMETRY) {
+            return telemetry_table(&self.telemetry).map(Some);
+        }
+        if name.eq_ignore_ascii_case(SYSTEM_QUERY_LOG) {
+            return query_log_table(&self.telemetry).map(Some);
+        }
+        Ok(None)
+    }
+}
+
+fn reject_system_write(name: &str) -> Result<()> {
+    if name
+        .split_once('.')
+        .is_some_and(|(namespace, _)| namespace.eq_ignore_ascii_case("system"))
+    {
+        Err(Error::ReadOnlySystemTable(name.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn telemetry_table(telemetry: &Telemetry) -> Result<Table> {
+    let mut table = Table::new(
+        SYSTEM_TELEMETRY.to_owned(),
+        vec![
+            int_column("executions"),
+            int_column("successful_executions"),
+            int_column("failed_executions"),
+            int_column("elapsed_micros"),
+            int_column("rows_scanned"),
+            int_column("rows_matched"),
+            int_column("groups_created"),
+            int_column("rows_written"),
+            int_column("result_rows"),
+            int_column("query_log_entries"),
+            int_column("query_log_capacity"),
+            bool_column("sql_text_retention_enabled"),
+            int_column("sql_text_max_bytes"),
+        ],
+    )?;
+    let counters = telemetry.counters();
+    let config = telemetry.config();
+    let (retention_enabled, max_bytes) = match config.sql_text_retention {
+        crate::telemetry::SqlTextRetention::Disabled => (false, 0),
+        crate::telemetry::SqlTextRetention::Truncate(max_bytes) => (true, max_bytes),
+    };
+    table.insert_row(vec![
+        int_value(counters.executions),
+        int_value(counters.successful_executions),
+        int_value(counters.failed_executions),
+        duration_micros_value(counters.elapsed),
+        int_value(counters.metrics.rows_scanned),
+        int_value(counters.metrics.rows_matched),
+        int_value(counters.metrics.groups_created),
+        int_value(counters.metrics.rows_written),
+        int_value(counters.metrics.result_rows),
+        int_value(usize_to_u64(telemetry.query_log().len())),
+        int_value(usize_to_u64(config.query_log_capacity)),
+        Value::Bool(retention_enabled),
+        int_value(usize_to_u64(max_bytes)),
+    ])?;
+    Ok(table)
+}
+
+fn query_log_table(telemetry: &Telemetry) -> Result<Table> {
+    let mut table = Table::new(
+        SYSTEM_QUERY_LOG.to_owned(),
+        vec![
+            int_column("query_id"),
+            string_column("status"),
+            string_column("failure_type"),
+            int_column("elapsed_micros"),
+            int_column("rows_scanned"),
+            int_column("rows_matched"),
+            int_column("groups_created"),
+            int_column("rows_written"),
+            int_column("result_rows"),
+            bool_column("sql_text_retained"),
+            bool_column("sql_text_truncated"),
+            string_column("sql_text"),
+        ],
+    )?;
+    for entry in telemetry.query_log() {
+        table.insert_row(vec![
+            int_value(entry.query_id),
+            Value::String(entry.status.as_str().to_owned()),
+            Value::String(
+                entry
+                    .status
+                    .failure()
+                    .map_or_else(String::new, |failure| failure.as_str().to_owned()),
+            ),
+            duration_micros_value(entry.elapsed),
+            int_value(entry.metrics.rows_scanned),
+            int_value(entry.metrics.rows_matched),
+            int_value(entry.metrics.groups_created),
+            int_value(entry.metrics.rows_written),
+            int_value(entry.metrics.result_rows),
+            Value::Bool(entry.sql_text.is_some()),
+            Value::Bool(entry.sql_text_truncated),
+            Value::String(entry.sql_text.clone().unwrap_or_default()),
+        ])?;
+    }
+    Ok(table)
+}
+
+fn int_column(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_owned(),
+        data_type: DataType::Int64,
+    }
+}
+
+fn bool_column(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_owned(),
+        data_type: DataType::Bool,
+    }
+}
+
+fn string_column(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_owned(),
+        data_type: DataType::String,
+    }
+}
+
+fn int_value(value: u64) -> Value {
+    Value::Int64(i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+fn duration_micros_value(duration: Duration) -> Value {
+    Value::Int64(i64::try_from(duration.as_micros()).unwrap_or(i64::MAX))
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug)]
@@ -339,9 +578,13 @@ fn execute_grouped<'a>(
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    metrics: &mut ExecutionMetrics,
 ) -> Result<GroupedData<'a>> {
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
+    metrics.groups_created = metrics
+        .groups_created
+        .saturating_add(usize_to_u64(group_count));
     let initial_capacity = matching_rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
@@ -358,6 +601,7 @@ fn execute_grouped<'a>(
         let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
         if inserted {
             group_count += 1;
+            metrics.groups_created = metrics.groups_created.saturating_add(1);
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 states.push(AggregateState::new(spec));
             }

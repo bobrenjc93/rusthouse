@@ -191,6 +191,7 @@ enum TokenKind {
     LeftParen,
     RightParen,
     Semicolon,
+    Dot,
     Star,
     Minus,
     Equal,
@@ -241,6 +242,10 @@ impl<'a> Lexer<'a> {
                 ';' => {
                     self.advance();
                     TokenKind::Semicolon
+                }
+                '.' => {
+                    self.advance();
+                    TokenKind::Dot
                 }
                 '*' => {
                     self.advance();
@@ -441,7 +446,7 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
-        let name = self.expect_identifier("table name")?;
+        let name = self.parse_table_name()?;
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
@@ -474,7 +479,7 @@ impl Parser {
 
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
-        let table = self.expect_identifier("table name")?;
+        let table = self.parse_table_name()?;
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -506,7 +511,7 @@ impl Parser {
             }
         }
         self.expect_keyword("FROM")?;
-        let table = self.expect_identifier("table name")?;
+        let table = self.parse_table_name()?;
 
         let predicate = if self.eat_keyword("WHERE") {
             self.predicate_depth = 0;
@@ -605,6 +610,15 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_table_name(&mut self) -> Result<String> {
+        let mut name = self.expect_identifier("table name")?;
+        while self.eat(&TokenKind::Dot) {
+            name.push('.');
+            name.push_str(&self.expect_identifier("table name after '.'")?);
+        }
+        Ok(name)
     }
 
     fn parse_or_predicate(&mut self) -> Result<Predicate> {

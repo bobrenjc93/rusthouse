@@ -54,6 +54,8 @@ pub enum Error {
     InvalidQuery(String),
     /// An integer aggregate exceeded its representable range.
     NumericOverflow(String),
+    /// A write targeted a table in the read-only `system` namespace.
+    ReadOnlySystemTable(String),
 }
 
 /// A RustHouse operation result using [`Error`].
@@ -97,6 +99,9 @@ impl fmt::Display for Error {
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
+            }
+            Self::ReadOnlySystemTable(table) => {
+                write!(f, "system table '{table}' is read-only")
             }
         }
     }

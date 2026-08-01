@@ -14,6 +14,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
+- bounded execution telemetry through read-only system tables
 
 Identifiers are unquoted and case-insensitive; TRUE and FALSE are reserved Boolean literals and cannot be column names. String literals use single quotes; write a quote inside one as ''.
 
@@ -78,6 +79,44 @@ assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+## Execution telemetry
+
+Each `Database::execute` call receives a database-local query ID and records
+elapsed time, rows scanned, rows matched, groups created, rows written, result
+rows, and a typed success or failure status. Multi-statement batches contribute
+one entry and retain counters for work completed before a later statement
+fails. Parse failures are recorded with zero work counters.
+
+Two virtual, read-only tables expose completed execution data and support the
+same projection, filtering, grouping, ordering, and limit operations as user
+tables:
+
+- `system.telemetry` contains one row of lifetime aggregate counters and the
+  active query-log settings.
+- `system.query_log` contains the bounded ring of per-execution records from
+  oldest to newest.
+
+An introspection query reads a snapshot of previously completed executions and
+is added to telemetry only after its result is built. The default log holds 128
+entries and does not retain SQL text. Library users can change the capacity and
+opt into a byte-bounded SQL prefix:
+
+~~~rust
+use rusthouse::{Database, SqlTextRetention, TelemetryConfig};
+
+let mut database = Database::with_telemetry_config(TelemetryConfig {
+    query_log_capacity: 256,
+    sql_text_retention: SqlTextRetention::Truncate(512),
+});
+database.execute("SELECT * FROM system.telemetry")?;
+
+# Ok::<(), rusthouse::Error>(())
+~~~
+
+Setting `query_log_capacity` to zero disables per-query logging while leaving
+aggregate counters enabled. `Database::query_log` and
+`Database::telemetry_counters` provide read-only typed access for library users.
 
 ## Current boundaries
 

@@ -42,10 +42,15 @@ pub mod error;
 pub mod format;
 pub mod sql;
 pub mod storage;
+pub mod telemetry;
 pub mod value;
 
 pub use engine::{Database, QueryResult, ResultColumn, StatementResult};
 pub use error::{Error, Result};
+pub use telemetry::{
+    ExecutionMetrics, QueryFailure, QueryLogEntry, QueryStatus, SqlTextRetention, TelemetryConfig,
+    TelemetryCounters,
+};
 pub use value::{DataType, Value};
 
 /// Returns the product name used by RustHouse front ends.
