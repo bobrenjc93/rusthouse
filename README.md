@@ -61,7 +61,8 @@ execution slots fail immediately with `503` and `Retry-After`, so slow clients d
 not create an unbounded queue. Transient accept errors are retried with capped
 backoff, and owners can await unexpected server-task termination. Query futures
 and result encoding run on bounded blocking workers; timed-out jobs retain their
-execution slot until they actually exit.
+execution slot until they actually exit. Configured timeouts are capped at 365
+days so deadline arithmetic remains representable.
 Query implementations should observe the supplied `QueryCancellation` while doing
 expensive work. It is signaled when a request is dropped, its deadline expires, or
 forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown

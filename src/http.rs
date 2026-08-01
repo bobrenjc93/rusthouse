@@ -43,6 +43,7 @@ use crate::query::{
 const FORCE_CANCELLATION_WAIT: Duration = Duration::from_millis(250);
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+const MAX_CONFIGURED_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Resource limits and deadlines enforced by the HTTP frontend.
 #[derive(Debug, Clone)]
@@ -102,33 +103,33 @@ impl ServerConfig {
         validate_permit_count("max_concurrent_queries", self.max_concurrent_queries)?;
         validate_permit_count("max_concurrent_requests", self.max_concurrent_requests)?;
         validate_permit_count("max_connections", self.max_connections)?;
-        if self.header_read_timeout.is_zero() {
-            return Err(ServerError::InvalidConfig(
-                "header_read_timeout must be greater than zero".into(),
-            ));
-        }
-        if self.connection_idle_timeout.is_zero() {
-            return Err(ServerError::InvalidConfig(
-                "connection_idle_timeout must be greater than zero".into(),
-            ));
-        }
-        if self.request_body_timeout.is_zero() {
-            return Err(ServerError::InvalidConfig(
-                "request_body_timeout must be greater than zero".into(),
-            ));
-        }
-        if self.query_timeout.is_zero() {
-            return Err(ServerError::InvalidConfig(
-                "query_timeout must be greater than zero".into(),
-            ));
-        }
-        if self.shutdown_timeout.is_zero() {
-            return Err(ServerError::InvalidConfig(
-                "shutdown_timeout must be greater than zero".into(),
-            ));
-        }
+        validate_timeout("header_read_timeout", self.header_read_timeout)?;
+        validate_timeout("connection_idle_timeout", self.connection_idle_timeout)?;
+        validate_timeout("request_body_timeout", self.request_body_timeout)?;
+        validate_timeout("query_timeout", self.query_timeout)?;
+        validate_timeout("shutdown_timeout", self.shutdown_timeout)?;
         Ok(())
     }
+}
+
+fn validate_timeout(name: &str, timeout: Duration) -> Result<(), ServerError> {
+    if timeout.is_zero() {
+        return Err(ServerError::InvalidConfig(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    if timeout > MAX_CONFIGURED_TIMEOUT {
+        return Err(ServerError::InvalidConfig(format!(
+            "{name} must not exceed {} seconds",
+            MAX_CONFIGURED_TIMEOUT.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
 }
 
 fn validate_permit_count(name: &str, count: usize) -> Result<(), ServerError> {
@@ -477,7 +478,7 @@ impl IdleTimeoutStream {
         Self {
             stream,
             timeout,
-            deadline: Box::pin(tokio::time::sleep(timeout)),
+            deadline: Box::pin(tokio::time::sleep_until(deadline_after(timeout))),
         }
     }
 
@@ -492,9 +493,7 @@ impl IdleTimeoutStream {
     }
 
     fn record_progress(&mut self) {
-        self.deadline
-            .as_mut()
-            .reset(tokio::time::Instant::now() + self.timeout);
+        self.deadline.as_mut().reset(deadline_after(self.timeout));
     }
 }
 
@@ -663,7 +662,7 @@ async fn handle_query(
     let service = state.service.clone();
     let query_admission = state.query_admission.clone();
     let runtime = tokio::runtime::Handle::current();
-    let deadline = tokio::time::Instant::now() + state.config.query_timeout;
+    let deadline = deadline_after(state.config.query_timeout);
     let mut execution = tokio::task::spawn_blocking(move || {
         let Some(admission) = query_admission.enter() else {
             return EngineTaskOutput::AdmissionClosed(permit);
@@ -1040,49 +1039,56 @@ fn write_json_value(writer: &mut impl Write, value: &QueryValue) -> io::Result<(
 }
 
 fn write_csv(result: &QueryResult, writer: &mut impl Write) -> io::Result<()> {
-    write_csv_row(writer, result.columns.iter().map(String::as_str))?;
+    for (index, column) in result.columns.iter().enumerate() {
+        write_csv_separator(writer, index)?;
+        write_csv_field(writer, column)?;
+    }
+    writer.write_all(b"\n")?;
+
     for row in &result.rows {
-        let fields = row.iter().map(csv_value).collect::<Vec<_>>();
-        write_csv_row(writer, fields.iter().map(String::as_str))?;
+        for (index, value) in row.iter().enumerate() {
+            write_csv_separator(writer, index)?;
+            write_csv_value(writer, value)?;
+        }
+        writer.write_all(b"\n")?;
     }
     Ok(())
 }
 
-fn csv_value(value: &QueryValue) -> String {
+fn write_csv_value(writer: &mut impl Write, value: &QueryValue) -> io::Result<()> {
     match value {
-        QueryValue::Null => String::new(),
-        QueryValue::Boolean(value) => value.to_string(),
-        QueryValue::Int64(value) => value.to_string(),
-        QueryValue::Float64(value) => value.to_string(),
-        QueryValue::String(value) => value.clone(),
+        QueryValue::Null => Ok(()),
+        QueryValue::Boolean(value) => write!(writer, "{value}"),
+        QueryValue::Int64(value) => write!(writer, "{value}"),
+        QueryValue::Float64(value) => write!(writer, "{value}"),
+        QueryValue::String(value) => write_csv_field(writer, value),
     }
 }
 
-fn write_csv_row<'a>(
-    writer: &mut impl Write,
-    fields: impl Iterator<Item = &'a str>,
-) -> io::Result<()> {
-    for (index, field) in fields.enumerate() {
-        if index > 0 {
-            writer.write_all(b",")?;
-        }
-        if field
-            .bytes()
-            .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'))
-        {
-            writer.write_all(b"\"")?;
-            for (index, part) in field.split('"').enumerate() {
-                if index > 0 {
-                    writer.write_all(b"\"\"")?;
-                }
-                writer.write_all(part.as_bytes())?;
-            }
-            writer.write_all(b"\"")?;
-        } else {
-            writer.write_all(field.as_bytes())?;
-        }
+fn write_csv_separator(writer: &mut impl Write, index: usize) -> io::Result<()> {
+    if index > 0 {
+        writer.write_all(b",")?;
     }
-    writer.write_all(b"\n")
+    Ok(())
+}
+
+fn write_csv_field(writer: &mut impl Write, field: &str) -> io::Result<()> {
+    if field
+        .bytes()
+        .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'))
+    {
+        writer.write_all(b"\"")?;
+        for (index, part) in field.split('"').enumerate() {
+            if index > 0 {
+                writer.write_all(b"\"\"")?;
+            }
+            writer.write_all(part.as_bytes())?;
+        }
+        writer.write_all(b"\"")?;
+    } else {
+        writer.write_all(field.as_bytes())?;
+    }
+    Ok(())
 }
 
 struct LimitedWriter {
@@ -1423,6 +1429,54 @@ mod tests {
         );
         let error = serialize_result(&result, ResponseFormat::Json, 4).unwrap_err();
         assert_eq!(error.code, "response_too_large");
+    }
+
+    #[test]
+    fn oversized_csv_is_stopped_by_limited_writer() {
+        let result = QueryResult::new(
+            vec!["value".into()],
+            vec![vec![QueryValue::String(
+                "large,\"field\"".repeat(128 * 1024),
+            )]],
+        );
+
+        let error = serialize_result(&result, ResponseFormat::Csv, 64).unwrap_err();
+        assert_eq!(error.code, "response_too_large");
+    }
+
+    #[test]
+    fn rejects_extreme_timeout_durations() {
+        for field in [
+            "header_read_timeout",
+            "connection_idle_timeout",
+            "request_body_timeout",
+            "query_timeout",
+            "shutdown_timeout",
+        ] {
+            let mut config = ServerConfig::default();
+            match field {
+                "header_read_timeout" => config.header_read_timeout = Duration::MAX,
+                "connection_idle_timeout" => config.connection_idle_timeout = Duration::MAX,
+                "request_body_timeout" => config.request_body_timeout = Duration::MAX,
+                "query_timeout" => config.query_timeout = Duration::MAX,
+                "shutdown_timeout" => config.shutdown_timeout = Duration::MAX,
+                _ => unreachable!(),
+            }
+
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(field));
+            assert!(error.to_string().contains("must not exceed"));
+        }
+
+        let boundary = ServerConfig {
+            header_read_timeout: MAX_CONFIGURED_TIMEOUT,
+            connection_idle_timeout: MAX_CONFIGURED_TIMEOUT,
+            request_body_timeout: MAX_CONFIGURED_TIMEOUT,
+            query_timeout: MAX_CONFIGURED_TIMEOUT,
+            shutdown_timeout: MAX_CONFIGURED_TIMEOUT,
+            ..ServerConfig::default()
+        };
+        boundary.validate().unwrap();
     }
 
     #[test]
