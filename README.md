@@ -28,4 +28,16 @@ cargo test
 cargo run -- --help
 ```
 
+## Scalar SQL semantics
+
+The first executable engine component is the storage-independent scalar
+expression subsystem. It parses and evaluates literals, column references,
+arithmetic, comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `CAST`, searched
+and simple `CASE`, `COALESCE`, and core string functions. Stateful `COUNT`,
+`SUM`, `MIN`, `MAX`, and `AVG` implementations define the behavior the query
+engine will use for groups.
+
+The complete semantic contract, including error and edge-case behavior, is in
+[`docs/sql-semantics.md`](docs/sql-semantics.md).
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
