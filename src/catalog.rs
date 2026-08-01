@@ -46,8 +46,8 @@ impl Catalog {
     /// Returns an error if the table already exists or its schema is invalid.
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
         let key = normalize(&name);
-        if self.tables.contains_key(&key) || self.views.contains_key(&key) {
-            return Err(Error::TableAlreadyExists(name));
+        if let Some(error) = self.relation_collision(&name) {
+            return Err(error);
         }
         let table = Table::new(name, schema)?;
         self.tables.insert(key, table);
@@ -72,10 +72,10 @@ impl Catalog {
     ///
     /// Query dependency validation is performed by the database before this
     /// catalog operation is called.
-    pub fn create_view(&mut self, name: String, query: Select) -> Result<()> {
+    pub(crate) fn create_view(&mut self, name: String, query: Select) -> Result<()> {
         let key = normalize(&name);
-        if self.tables.contains_key(&key) || self.views.contains_key(&key) {
-            return Err(Error::ViewAlreadyExists(name));
+        if let Some(error) = self.relation_collision(&name) {
+            return Err(error);
         }
         self.views.insert(key, View { name, query });
         Ok(())
@@ -103,9 +103,16 @@ impl Catalog {
         self.views.get(&normalize(name))
     }
 
-    pub(crate) fn contains_relation(&self, name: &str) -> bool {
+    pub(crate) fn relation_collision(&self, name: &str) -> Option<Error> {
         let key = normalize(name);
-        self.tables.contains_key(&key) || self.views.contains_key(&key)
+        self.tables
+            .get(&key)
+            .map(|table| Error::TableAlreadyExists(table.name().to_owned()))
+            .or_else(|| {
+                self.views
+                    .get(&key)
+                    .map(|view| Error::ViewAlreadyExists(view.name().to_owned()))
+            })
     }
 
     pub(crate) fn is_view(&self, name: &str) -> bool {
@@ -166,6 +173,30 @@ mod tests {
                 }],
             )
             .expect_err("relation name is occupied");
-        assert!(matches!(error, Error::TableAlreadyExists(_)));
+        assert!(matches!(error, Error::ViewAlreadyExists(name) if name == "Recent"));
+
+        catalog
+            .create_table(
+                "events".to_owned(),
+                vec![ColumnDef {
+                    name: "id".to_owned(),
+                    data_type: DataType::Int64,
+                }],
+            )
+            .expect("create table");
+        let error = catalog
+            .create_view(
+                "EVENTS".to_owned(),
+                Select {
+                    items: vec![SelectItem::Wildcard],
+                    table: "events".to_owned(),
+                    predicate: None,
+                    group_by: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                },
+            )
+            .expect_err("table occupies the relation name");
+        assert!(matches!(error, Error::TableAlreadyExists(name) if name == "events"));
     }
 }

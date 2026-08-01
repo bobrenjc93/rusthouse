@@ -120,6 +120,61 @@ fn creation_rejects_missing_and_invalid_dependencies() {
 }
 
 #[test]
+fn aggregate_view_outputs_require_referenceable_aliases() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2)")
+        .expect("setup succeeds");
+
+    let error = database
+        .execute("CREATE VIEW counts AS SELECT COUNT(*) FROM events")
+        .expect_err("generated aggregate name cannot be referenced");
+    assert!(matches!(
+        error,
+        Error::InvalidQuery(message)
+            if message.contains("COUNT(*)") && message.contains("AS alias")
+    ));
+    assert!(matches!(
+        database.catalog().view("counts"),
+        Err(Error::ViewNotFound(_))
+    ));
+
+    database
+        .execute("CREATE VIEW counts AS SELECT COUNT(*) AS count FROM events")
+        .expect("aliased aggregate view is valid");
+    assert_eq!(
+        query(&mut database, "SELECT count FROM counts").rows,
+        vec![vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn relation_name_collisions_report_the_existing_object_kind() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE occupied_table (id Int64)")
+        .expect("create table");
+    let table = database
+        .execute("CREATE VIEW OCCUPIED_TABLE AS SELECT id FROM occupied_table")
+        .expect_err("table occupies the name");
+    assert!(matches!(
+        table,
+        Error::TableAlreadyExists(name) if name == "occupied_table"
+    ));
+
+    database
+        .execute("CREATE VIEW occupied_view AS SELECT id FROM occupied_table")
+        .expect("create view");
+    let view = database
+        .execute("CREATE TABLE OCCUPIED_VIEW (id Int64)")
+        .expect_err("view occupies the name");
+    assert!(matches!(
+        view,
+        Error::ViewAlreadyExists(name) if name == "occupied_view"
+    ));
+}
+
+#[test]
 fn views_are_read_only_and_drop_removes_only_the_view() {
     let mut database = Database::new();
     database

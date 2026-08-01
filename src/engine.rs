@@ -126,13 +126,13 @@ impl Database {
     }
 
     fn validate_new_view(&self, name: &str, query: &Select) -> Result<()> {
-        if self.catalog.contains_relation(name) {
-            return Err(Error::ViewAlreadyExists(name.to_owned()));
+        if let Some(error) = self.catalog.relation_collision(name) {
+            return Err(error);
         }
 
         let pending = PendingView { name, query };
         let schema = self.infer_view_schema(name, query, &mut Vec::new(), Some(pending))?;
-        Table::new(name.to_owned(), schema)?;
+        validate_view_schema(name, schema)?;
         Ok(())
     }
 
@@ -305,11 +305,32 @@ fn materialize_view(name: &str, result: QueryResult) -> Result<Table> {
             data_type: column.data_type,
         })
         .collect();
-    let mut table = Table::new(name.to_owned(), schema)?;
+    let mut table = validate_view_schema(name, schema)?;
     for row in result.rows {
         table.insert_row(row)?;
     }
     Ok(table)
+}
+
+fn validate_view_schema(name: &str, schema: Vec<ColumnDef>) -> Result<Table> {
+    if let Some(column) = schema
+        .iter()
+        .find(|column| !is_unquoted_identifier(&column.name))
+    {
+        return Err(Error::InvalidQuery(format!(
+            "view '{name}' output column '{}' is not a valid unquoted identifier; use an AS alias",
+            column.name
+        )));
+    }
+    Table::new(name.to_owned(), schema)
+}
+
+fn is_unquoted_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 #[derive(Debug)]
