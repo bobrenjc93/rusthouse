@@ -15,7 +15,8 @@ mod storage;
 mod value;
 
 pub use engine::{
-    Database, MAX_MATERIALIZED_RESULT_BYTES, MAX_RESULT_ROWS, QueryResult, ResultColumn,
+    Database, MAX_GROUP_BY_EXPRESSIONS, MAX_MATERIALIZED_RESULT_BYTES, MAX_RESULT_ROWS,
+    QueryResult, ResultColumn,
 };
 pub use error::{Error, Result};
 pub use format::{CsvWriter, MAX_OUTPUT_BYTES, write_csv};

@@ -11,6 +11,7 @@ use crate::value::{DataType, Value};
 
 pub const MAX_RESULT_ROWS: usize = 5_000_000;
 pub const MAX_MATERIALIZED_RESULT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_GROUP_BY_EXPRESSIONS: usize = 64;
 
 /// Metadata for one query-result column.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +90,12 @@ impl Database {
             .map(|name| self.catalog.table(name))
             .transpose()?;
         query.projection = expand_wildcard(query.projection, table)?;
+        if query.group_by.len() > MAX_GROUP_BY_EXPRESSIONS {
+            return Err(Error::Limit {
+                resource: "GROUP BY expressions",
+                limit: MAX_GROUP_BY_EXPRESSIONS,
+            });
+        }
         let projection_names = projection_names(&query.projection)?;
 
         let aggregate_query = !query.group_by.is_empty()
@@ -750,6 +757,23 @@ impl KeyValue {
             Value::String(value) => Self::String(value.clone()),
         }
     }
+
+    fn from_owned(value: Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Int64(value) => Self::Int64(value),
+            Value::Float64(value) => Self::Float64(if value == 0.0 { 0 } else { value.to_bits() }),
+            Value::Bool(value) => Self::Bool(value),
+            Value::String(value) => Self::String(value),
+        }
+    }
+
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::String(value) => value.capacity(),
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -777,13 +801,33 @@ fn build_groups(
             group: None,
             aliases: None,
         };
-        let key = RowKey(
+        let mut candidate_bytes = std::mem::size_of::<RowKey>().saturating_add(
             expressions
-                .iter()
-                .map(|expr| eval_expr(expr, &context).map(|value| KeyValue::from_value(&value)))
-                .collect::<Result<Vec<_>>>()?,
+                .len()
+                .saturating_mul(std::mem::size_of::<KeyValue>()),
         );
+        ensure_materialized_limit(
+            materialized_bytes.saturating_add(candidate_bytes),
+            byte_limit,
+        )?;
+        let mut fields = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            let field = KeyValue::from_owned(eval_expr(expression, &context)?);
+            candidate_bytes = candidate_bytes.saturating_add(field.heap_size());
+            ensure_materialized_limit(
+                materialized_bytes.saturating_add(candidate_bytes),
+                byte_limit,
+            )?;
+            fields.push(field);
+        }
+        let key = RowKey(fields);
         if let Some(index) = lookup.get(&key).copied() {
+            ensure_materialized_limit(
+                materialized_bytes
+                    .saturating_add(candidate_bytes)
+                    .saturating_add(std::mem::size_of::<usize>()),
+                byte_limit,
+            )?;
             add_materialized_bytes(materialized_bytes, std::mem::size_of::<usize>(), byte_limit)?;
             groups[index].push(row);
         } else {
@@ -852,7 +896,11 @@ fn validate_group_expression(
     inside_aggregate: bool,
     resolve_alias: bool,
 ) -> Result<()> {
-    if !inside_aggregate && group_by.iter().any(|group| group == expression) {
+    if !inside_aggregate
+        && group_by
+            .iter()
+            .any(|group| group_expressions_equivalent(group, expression))
+    {
         return Ok(());
     }
 
@@ -904,6 +952,68 @@ fn validate_group_expression(
             "wildcard is invalid outside an aggregate function in an aggregate query",
         )),
         Expr::Literal(_) => Ok(()),
+    }
+}
+
+fn group_expressions_equivalent(left: &Expr, right: &Expr) -> bool {
+    match (left, right) {
+        (Expr::Literal(left), Expr::Literal(right)) => left == right,
+        (Expr::Column(left), Expr::Column(right)) => left.last() == right.last(),
+        (Expr::Wildcard, Expr::Wildcard) => true,
+        (
+            Expr::Unary {
+                op: left_op,
+                expr: left,
+            },
+            Expr::Unary {
+                op: right_op,
+                expr: right,
+            },
+        ) => left_op == right_op && group_expressions_equivalent(left, right),
+        (
+            Expr::Binary {
+                left: left_left,
+                op: left_op,
+                right: left_right,
+            },
+            Expr::Binary {
+                left: right_left,
+                op: right_op,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && group_expressions_equivalent(left_left, right_left)
+                && group_expressions_equivalent(left_right, right_right)
+        }
+        (
+            Expr::Function {
+                name: left_name,
+                args: left_args,
+            },
+            Expr::Function {
+                name: right_name,
+                args: right_args,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args)
+                    .all(|(left, right)| group_expressions_equivalent(left, right))
+        }
+        (
+            Expr::IsNull {
+                expr: left,
+                negated: left_negated,
+            },
+            Expr::IsNull {
+                expr: right,
+                negated: right_negated,
+            },
+        ) => left_negated == right_negated && group_expressions_equivalent(left, right),
+        _ => false,
     }
 }
 
@@ -1327,6 +1437,30 @@ mod tests {
             panic!("expected SELECT");
         };
         let error = database.select(select, 64).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Limit {
+                resource: "materialized query result bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn group_key_fields_are_charged_as_they_are_built() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE t (name String); INSERT INTO t VALUES ('abcdefghij');")
+            .unwrap();
+        let Statement::Select(select) =
+            parser::parse("SELECT count(*) FROM t GROUP BY name, name;")
+                .unwrap()
+                .pop()
+                .unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let error = database.select(select, 110).unwrap_err();
         assert!(matches!(
             error,
             Error::Limit {

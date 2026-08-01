@@ -1,4 +1,4 @@
-use rusthouse::{DataType, Database, Error, Value};
+use rusthouse::{DataType, Database, Error, MAX_GROUP_BY_EXPRESSIONS, Value};
 
 #[test]
 fn flat_expression_chains_hit_a_typed_node_limit() {
@@ -292,4 +292,40 @@ fn mixed_numeric_comparisons_are_exact_beyond_float_integer_precision() {
             Value::Bool(true),
         ]]
     );
+}
+
+#[test]
+fn repeated_string_group_keys_hit_the_width_limit_before_scanning() {
+    let group_by = vec!["name"; MAX_GROUP_BY_EXPRESSIONS + 1].join(", ");
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE t (name String); INSERT INTO t VALUES ('value');")
+        .unwrap();
+    let error = database
+        .execute(&format!("SELECT count(*) FROM t GROUP BY {group_by};"))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Limit {
+            resource: "GROUP BY expressions",
+            limit: MAX_GROUP_BY_EXPRESSIONS
+        }
+    ));
+}
+
+#[test]
+fn qualified_and_unqualified_group_columns_share_bound_identity() {
+    let results = Database::new()
+        .execute(
+            "CREATE TABLE t (id Int64); INSERT INTO t VALUES (1), (1), (2);
+             SELECT t.id AS key, count(*) AS n FROM t GROUP BY id ORDER BY key;
+             SELECT id AS key, count(*) AS n FROM t GROUP BY t.id ORDER BY key;",
+        )
+        .unwrap();
+    let expected = vec![
+        vec![Value::Int64(1), Value::Int64(2)],
+        vec![Value::Int64(2), Value::Int64(1)],
+    ];
+    assert_eq!(results[0].rows, expected);
+    assert_eq!(results[1].rows, expected);
 }
