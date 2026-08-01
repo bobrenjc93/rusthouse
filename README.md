@@ -181,9 +181,10 @@ use fixed 4,096-row morsels and explicitly sized worker stacks charged to the
 transient memory budget. Eligible per-morsel aggregate states are merged in
 source order, so results are
 reproducible across worker counts. A scan that fits in one morsel does not create
-worker threads. Parallel aggregation falls back to the spill-backed path when
-its conservative transient-memory reservation would exceed the configured
-budget.
+worker threads. Unordered scans with `LIMIT` stay on the calling thread so they
+stop evaluating source rows as soon as the result is full. Parallel aggregation
+falls back to the spill-backed path when its conservative transient-memory
+reservation would exceed the configured budget.
 
 ## Current boundaries
 

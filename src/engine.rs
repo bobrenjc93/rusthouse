@@ -817,17 +817,31 @@ fn scan_matching_rows(
     predicate: Option<&CompiledPredicate>,
     worker_count: usize,
     context: &mut ExecutionContext<'_>,
+    visit: impl FnMut(usize, &mut ExecutionContext<'_>) -> Result<bool>,
+) -> Result<()> {
+    scan_rows(
+        table.row_count(),
+        worker_count,
+        context,
+        |row| predicate.is_none_or(|predicate| predicate.evaluate(table, row)),
+        visit,
+    )
+}
+
+fn scan_rows(
+    row_count: usize,
+    worker_count: usize,
+    context: &mut ExecutionContext<'_>,
+    matches: impl Fn(usize) -> bool + Sync,
     mut visit: impl FnMut(usize, &mut ExecutionContext<'_>) -> Result<bool>,
 ) -> Result<()> {
-    let reservation = morsel_execution_memory::<MatchMask>(table.row_count(), worker_count);
+    let reservation = morsel_execution_memory::<MatchMask>(row_count, worker_count);
     if worker_count <= 1
-        || table.row_count() <= SCAN_MORSEL_ROWS
+        || row_count <= SCAN_MORSEL_ROWS
         || reservation > context.available_memory()
     {
-        for row in 0..table.row_count() {
-            if predicate.is_none_or(|predicate| predicate.evaluate(table, row))
-                && !visit(row, context)?
-            {
+        for row in 0..row_count {
+            if matches(row) && !visit(row, context)? {
                 break;
             }
         }
@@ -835,11 +849,11 @@ fn scan_matching_rows(
     }
 
     context.reserve_memory(reservation)?;
-    let masks = execute_morsels(table.row_count(), worker_count, |range| {
+    let masks = execute_morsels(row_count, worker_count, |range| {
         let start = range.start;
         let mut mask = MatchMask::new();
         for row in range {
-            if predicate.is_none_or(|predicate| predicate.evaluate(table, row)) {
+            if matches(row) {
                 mask.insert(row - start);
             }
         }
@@ -854,7 +868,7 @@ fn scan_matching_rows(
     };
     let outcome = (|| {
         for (morsel, mask) in masks.iter().enumerate() {
-            let range = morsel_range(morsel, table.row_count());
+            let range = morsel_range(morsel, row_count);
             for row in range {
                 if mask.contains(row - morsel * SCAN_MORSEL_ROWS) && !visit(row, context)? {
                     return Ok(());
@@ -866,6 +880,11 @@ fn scan_matching_rows(
     drop(masks);
     context.release_memory(reservation);
     outcome
+}
+
+fn unordered_scan_worker_count(worker_count: usize, limit: Option<usize>) -> usize {
+    // Parallel match masks materialize the full scan before the visitor can stop.
+    if limit.is_some() { 1 } else { worker_count }
 }
 
 fn execute_ungrouped(
@@ -886,7 +905,7 @@ fn execute_ungrouped(
         scan_matching_rows(
             table,
             predicate,
-            settings.worker_count,
+            unordered_scan_worker_count(settings.worker_count, limit),
             context,
             |row, context| {
                 context.add_intermediate_rows(1)?;
@@ -2576,6 +2595,31 @@ mod tests {
             error,
             Error::WorkerSpawn("synthetic worker exhaustion".to_owned())
         );
+    }
+
+    #[test]
+    fn unordered_limit_does_not_evaluate_rows_after_the_result_is_full() {
+        let limits = ExecutionLimits::default();
+        let mut context = ExecutionContext::new(&limits, 0);
+        let mut visited = Vec::new();
+
+        scan_rows(
+            SCAN_MORSEL_ROWS * 3,
+            unordered_scan_worker_count(8, Some(1)),
+            &mut context,
+            |row| {
+                assert_eq!(row, 0, "a later source row was evaluated after LIMIT 1");
+                true
+            },
+            |row, _| {
+                visited.push(row);
+                Ok(false)
+            },
+        )
+        .expect("limited scan succeeds");
+
+        assert_eq!(visited, vec![0]);
+        assert_eq!(unordered_scan_worker_count(8, None), 8);
     }
 
     #[test]
