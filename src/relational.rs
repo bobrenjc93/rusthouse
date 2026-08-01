@@ -16,6 +16,8 @@ use crate::{
     value::compare_int_float,
 };
 
+const MAX_JOIN_EQUALITY_KEYS: usize = 64;
+
 pub(crate) struct QueryOutput {
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) rows: Vec<Vec<Value>>,
@@ -110,7 +112,9 @@ pub(crate) fn execute(
         return Err(Error::Unsupported("statement is not a query".to_owned()));
     };
 
-    let (source_columns, bound_joins, base_width) = bind_sources(tables, &from, joins)?;
+    enforce_row_limit("query joins", joins.len(), limits.max_joins)?;
+    check_cancellation(control)?;
+    let (source_columns, bound_joins, base_width) = bind_sources(tables, &from, joins, control)?;
     let predicates = bind_predicates(&source_columns, &predicates)?;
     let (bound_projection, columns) = bind_projection(&source_columns, &projection)?;
     let result_order = bind_result_order(&source_columns, &columns, &order_by)?;
@@ -175,6 +179,7 @@ fn bind_sources(
     tables: &std::collections::BTreeMap<String, Arc<Table>>,
     from: &TableRef,
     joins: Vec<Join>,
+    control: Option<ExecutionControl<'_>>,
 ) -> Result<(Vec<BoundColumn>, Vec<BoundJoin>, usize)> {
     let base = tables
         .get(&from.name)
@@ -186,6 +191,7 @@ fn bind_sources(
     let mut bound_joins = Vec::with_capacity(joins.len());
 
     for join in joins {
+        check_cancellation(control)?;
         let qualifier = table_qualifier(&join.table);
         if !qualifiers.insert(qualifier.to_owned()) {
             return Err(Error::DuplicateTableAlias(qualifier.to_owned()));
@@ -195,10 +201,8 @@ fn bind_sources(
             .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
         let right_columns = table_columns(table, &join.table, join.kind == JoinKind::Left);
         let right_offset = columns.len();
-        let mut combined = columns.clone();
-        combined.extend(right_columns.iter().cloned());
-        let equality = bind_join_keys(&combined, right_offset, &join.equality)?;
-        columns = combined;
+        columns.extend(right_columns.iter().cloned());
+        let equality = bind_join_keys(&columns, right_offset, &join.equality, control)?;
         bound_joins.push(BoundJoin {
             kind: join.kind,
             table: join.table,
@@ -317,11 +321,30 @@ fn execute_join(
     limits: QueryLimits,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<Source> {
-    let left_width = left.columns.len();
-    let mut combined_columns = left.columns.clone();
+    check_cancellation(control)?;
+    let Source {
+        columns: mut combined_columns,
+        rows: left_rows,
+    } = left;
+    let left_width = combined_columns.len();
     combined_columns.extend(join.right_columns.iter().cloned());
     let right_required = &required_columns
         [join.right_offset..join.right_offset.saturating_add(join.right_columns.len())];
+    let build_table = tables
+        .get(&join.table.name)
+        .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
+    enforce_row_limit(
+        "hash join build",
+        build_table.row_count(),
+        limits.max_join_build_rows,
+    )?;
+    let preflight_bytes =
+        estimated_hash_build_table_bytes(build_table, right_required, &join.equality, control)?;
+    enforce_byte_limit(
+        "hash join build",
+        preflight_bytes,
+        limits.max_join_build_bytes,
+    )?;
     let mut right = load_table(
         tables,
         &join.table,
@@ -329,11 +352,6 @@ fn execute_join(
         right_required,
         limits.max_source_bytes,
         control,
-    )?;
-    enforce_row_limit(
-        "hash join build",
-        right.rows.len(),
-        limits.max_join_build_rows,
     )?;
     let (build_bytes, hash_capacity) = estimated_hash_build_bytes(&right, &join.equality, control)?;
     enforce_byte_limit("hash join build", build_bytes, limits.max_join_build_bytes)?;
@@ -356,7 +374,7 @@ fn execute_join(
 
     let mut rows = Vec::new();
     let mut output_payload_bytes = 0usize;
-    for left_row in &left.rows {
+    for left_row in &left_rows {
         check_cancellation(control)?;
         let indexes = join.equality.iter().map(|(left, _)| *left);
         let matches = join_key(left_row, indexes).and_then(|key| hash.get(&key));
@@ -417,9 +435,12 @@ fn bind_join_keys(
     columns: &[BoundColumn],
     left_width: usize,
     equality: &[(ColumnRef, ColumnRef)],
+    control: Option<ExecutionControl<'_>>,
 ) -> Result<Vec<(usize, usize)>> {
+    enforce_row_limit("join equality keys", equality.len(), MAX_JOIN_EQUALITY_KEYS)?;
     let mut keys = Vec::with_capacity(equality.len());
     for (first, second) in equality {
+        check_cancellation(control)?;
         let first = resolve_column(columns, first)?;
         let second = resolve_column(columns, second)?;
         let (left, right) = match (first < left_width, second < left_width) {
@@ -1404,6 +1425,27 @@ fn retained_rows_bytes(rows: &[Vec<Value>], outer_capacity: usize) -> usize {
                 .saturating_add(row.capacity().saturating_mul(size_of::<Value>()))
                 .saturating_add(variable_row_bytes(row))
         }))
+}
+
+fn estimated_hash_build_table_bytes(
+    table: &Table,
+    required_columns: &[bool],
+    equality: &[(usize, usize)],
+    control: Option<ExecutionControl<'_>>,
+) -> Result<usize> {
+    let mut bytes = estimated_scan_bytes(table, required_columns, control)?;
+    let fixed_entry = size_of::<ValueKey>()
+        .saturating_add(size_of::<Vec<usize>>())
+        .saturating_add(equality.len().saturating_mul(size_of::<KeyPart>()))
+        .saturating_add(size_of::<usize>());
+    for row in 0..table.row_count() {
+        check_cancellation(control)?;
+        let key_strings = equality.iter().fold(0usize, |size, (_, right)| {
+            size.saturating_add(table.variable_value_bytes(row, *right))
+        });
+        bytes = bytes.saturating_add(fixed_entry.saturating_add(key_strings).saturating_mul(4));
+    }
+    Ok(bytes)
 }
 
 fn estimated_hash_build_bytes(

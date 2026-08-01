@@ -260,11 +260,12 @@ windowed `SUM`/`COUNT` with `PARTITION BY`, `ORDER BY`, and `ROWS` frames.
 Unqualified duplicate names are rejected as ambiguous; aliases are required to
 disambiguate duplicate projected names.
 
-`QueryLimits` bounds pruned table-scan materialization, hash-join build rows,
-join build and expanded-output state, rows in each window partition,
-cumulative window maps/indexes/outputs and accumulator state, and materialized
-output rows. Limits can be set as database defaults or changed on a session.
-The HTTP service additionally applies its configured result-byte ceiling.
+`QueryLimits` bounds joined-table count, pruned table-scan materialization,
+hash-join build rows, join build and expanded-output state, rows in each window
+partition, cumulative window maps/indexes/outputs and accumulator state, and
+materialized output rows. Limits can be set as database defaults or changed on
+a session. The HTTP service additionally applies its configured result-byte
+ceiling.
 
 `TransactionLimits` bounds cumulative inserted rows and encoded staged DDL/DML bytes.
 CREATE accounting includes every persisted string length prefix, name, type,

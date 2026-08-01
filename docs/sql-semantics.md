@@ -122,6 +122,11 @@ Aliases qualify columns and hide the original table name. An unqualified name
 that exists in more than one input returns `Error::AmbiguousColumn`, including
 when the tables are empty.
 
+The default query limit accepts at most 64 joins, configurable through
+`QueryLimits::with_max_joins`; each join accepts at most 64 equality keys.
+Binding appends each right schema once and polls cancellation per join and key.
+Execution also polls once per join even when both inputs are empty.
+
 `NULL` and NaN join keys never match. Duplicate build keys produce one result
 for every match in build-table row order. A `LEFT JOIN` emits one null-extended
 row when no key matches, and its right-side result columns are nullable.
@@ -152,13 +157,13 @@ opposing infinities produce NaN.
 Binding resolves every source column before table data is copied. Materialized
 scans retain only columns needed by predicates, joins, projections, windows, or
 ordering and are bounded by `max_source_bytes`; unused string payloads are not
-cloned. `QueryLimits` also rejects a query before a join build exceeds its row
-ceiling or before conservatively reserved key buckets, match vectors, build
-rows, or expanded output exceed the join byte ceiling. Every window partition
-is bounded by rows, with cumulative accounting for partition hash entries,
-index vectors, output vectors, and temporary accumulators. Join expansion and
-final output rows are separately bounded. These failures are reported as
-resource-limit errors.
+cloned. `QueryLimits` also rejects a query before a build table is materialized
+when its stored row count or conservatively reserved row/key/bucket/index state
+exceeds the join ceiling. Expanded join output has a separate retained-state
+check. Every window partition is bounded by rows, with cumulative accounting
+for partition hash entries, index vectors, output vectors, and temporary
+accumulators. Join expansion and final output rows are separately bounded.
+These failures are reported as resource-limit errors.
 
 Controlled query results preflight fixed row storage and every projected
 string length before allocating or cloning result values. A result that cannot

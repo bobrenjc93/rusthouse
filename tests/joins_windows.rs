@@ -319,6 +319,66 @@ fn join_build_partition_and_output_limits_fail_explicitly() {
 }
 
 #[test]
+fn join_count_limit_rejects_schema_expansion_before_execution() {
+    let database = Database::with_query_limits(QueryLimits::default().with_max_joins(1));
+    database.execute("CREATE TABLE empty_t (id Int64)").unwrap();
+
+    assert!(matches!(
+        database.execute(
+            "SELECT a.id FROM empty_t a \
+             JOIN empty_t b ON a.id = b.id \
+             JOIN empty_t c ON a.id = c.id"
+        ),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "query joins",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+}
+
+#[test]
+fn join_build_limits_preflight_before_the_right_scan() {
+    let database = Database::new();
+    database.execute("CREATE TABLE probe (id Int64)").unwrap();
+    database
+        .execute("CREATE TABLE large_build (id Int64, payload String)")
+        .unwrap();
+    database
+        .execute(&format!(
+            "INSERT INTO large_build VALUES (1, '{}')",
+            "x".repeat(4 * 1024)
+        ))
+        .unwrap();
+    let sql = "SELECT p.id FROM probe p JOIN large_build b ON p.id = b.id";
+    let mut session = database.session();
+
+    session.set_query_limits(
+        QueryLimits::new(0, usize::MAX, usize::MAX, usize::MAX, usize::MAX).with_source_bytes(0),
+    );
+    assert!(matches!(
+        session.execute(sql),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "hash join build",
+            limit: 0,
+            attempted: 1,
+        })
+    ));
+
+    session.set_query_limits(
+        QueryLimits::new(usize::MAX, 0, usize::MAX, usize::MAX, usize::MAX).with_source_bytes(0),
+    );
+    assert!(matches!(
+        session.execute(sql),
+        Err(Error::MemoryLimitExceeded {
+            operator: "hash join build",
+            limit: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn duplicate_join_matches_are_bounded_before_result_materialization() {
     let database =
         Database::with_query_limits(QueryLimits::new(2, usize::MAX, usize::MAX, usize::MAX, 1));

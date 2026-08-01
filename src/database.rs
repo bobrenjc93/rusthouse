@@ -22,6 +22,8 @@ pub(crate) struct ExecutionControl<'a> {
 /// Resource bounds for relational query operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLimits {
+    /// Maximum joined tables in one SELECT.
+    pub max_joins: usize,
     /// Maximum retained bytes for one materialized table scan.
     pub max_source_bytes: usize,
     /// Maximum rows accepted from the build side of one hash join.
@@ -46,6 +48,7 @@ impl QueryLimits {
         max_output_rows: usize,
     ) -> Self {
         Self {
+            max_joins: 64,
             max_source_bytes: 256 * 1024 * 1024,
             max_join_build_rows,
             max_join_build_bytes,
@@ -58,6 +61,12 @@ impl QueryLimits {
     /// Overrides the table-scan materialization ceiling.
     pub const fn with_source_bytes(mut self, max_source_bytes: usize) -> Self {
         self.max_source_bytes = max_source_bytes;
+        self
+    }
+
+    /// Overrides the joined-table complexity ceiling.
+    pub const fn with_max_joins(mut self, max_joins: usize) -> Self {
+        self.max_joins = max_joins;
         self
     }
 }
@@ -789,6 +798,40 @@ mod cancellation_commit_tests {
 
     #[test]
     fn relational_inner_loops_observe_controlled_query_cancellation() {
+        let empty_database = Database::new();
+        empty_database
+            .execute("CREATE TABLE empty_t (id Int64)")
+            .unwrap();
+        let binding_cancellation = CancelExactlyOnCheck {
+            checks: AtomicUsize::new(0),
+            // The third check is the first join's schema-binding poll. Without
+            // it, binding reaches the invalid projection instead.
+            cancel_on: 3,
+        };
+        assert_eq!(
+            empty_database.execute_controlled(
+                "SELECT missing FROM empty_t a JOIN empty_t b ON a.id = b.id",
+                usize::MAX,
+                &binding_cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        );
+
+        let empty_join_cancellation = CancelExactlyOnCheck {
+            checks: AtomicUsize::new(0),
+            // Empty scans perform no row polls; the fourth check is the join
+            // execution poll that must still observe cancellation.
+            cancel_on: 4,
+        };
+        assert_eq!(
+            empty_database.execute_controlled(
+                "SELECT a.id FROM empty_t a JOIN empty_t b ON a.id = b.id",
+                usize::MAX,
+                &empty_join_cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        );
+
         let limits = QueryLimits::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, 0);
         let database = Database::with_query_limits(limits);
         database.execute("CREATE TABLE left_t (id Int64)").unwrap();
@@ -800,9 +843,10 @@ mod cancellation_commit_tests {
 
         let join_cancellation = CancelExactlyOnCheck {
             checks: AtomicUsize::new(0),
-            // Parsing/scan/build consume twelve checks; the thirteenth is the first
+            // Binding, scan preflights, scans, and hash build consume nineteen
+            // checks; the twentieth is the first
             // duplicate-match expansion.
-            cancel_on: 13,
+            cancel_on: 20,
         };
         assert_eq!(
             database.execute_controlled(
@@ -824,7 +868,7 @@ mod cancellation_commit_tests {
 
         let outer_sort_cancellation = CancelExactlyOnCheck {
             checks: AtomicUsize::new(0),
-            // The tenth check is inside the first heap sift. Without sort
+            // The tenth check is inside heap construction. Without sort
             // polling, the zero result-byte limit wins instead.
             cancel_on: 10,
         };
@@ -839,7 +883,7 @@ mod cancellation_commit_tests {
 
         let window_sort_cancellation = CancelExactlyOnCheck {
             checks: AtomicUsize::new(0),
-            // The fifteenth check is inside the window heap sift. Without
+            // The fifteenth check is inside window heap construction. Without
             // sort polling, the 340-byte prefix-state ceiling wins instead.
             cancel_on: 15,
         };
