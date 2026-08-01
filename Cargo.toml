@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
-fs2 = "0.4.3"
+fs4 = "1.1.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }

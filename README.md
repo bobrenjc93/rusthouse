@@ -113,12 +113,16 @@ For `catalog.rhcat`, the store holds an OS advisory lock on
 `.catalog.rhcat.lock`. While holding it, a commit validates and encodes the
 image, creates `.catalog.rhcat.tmp` in the same directory, writes and calls
 `sync_all` on that file, then atomically renames it over `catalog.rhcat`. Unix
-syncs the parent directory after rename. Windows publishes with
-`MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, which makes
-the metadata update durable without opening the directory. A failure before
-rename leaves the previous snapshot unchanged. A crash after rename exposes
-either the old or new complete file according to filesystem recovery; reopening
-validates the selected file.
+creates the temp with mode `0600`; Windows creates it with a protected DACL
+granting access only to its owner and the system. Immediately before publish,
+an existing snapshot's Unix mode or Windows owner, group, and DACL is copied to
+the temp, so replacement does not widen access. Interrupted pre-publish temps
+remain private. Unix syncs the parent directory after rename. Windows publishes
+with `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, which
+makes the metadata update durable without opening the directory. A failure
+before rename leaves the previous snapshot unchanged. A crash after rename
+exposes either the old or new complete file according to filesystem recovery;
+reopening validates the selected file.
 Reopening while holding the writer lock removes an orphan `.tmp` left before a
 rename; Unix also syncs that directory removal. Lock files are intentionally
 retained, but their OS locks are released when `SnapshotStore` is dropped.

@@ -452,12 +452,12 @@ impl SnapshotStore {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        match fs2::FileExt::try_lock_exclusive(&lock) {
+        match fs4::FileExt::try_lock(&lock) {
             Ok(()) => {}
-            Err(error) if is_lock_contended(&error) => {
+            Err(fs4::TryLockError::WouldBlock) => {
                 return Err(SnapshotError::Locked(path));
             }
-            Err(error) => return Err(SnapshotError::Io(error)),
+            Err(fs4::TryLockError::Error(error)) => return Err(SnapshotError::Io(error)),
         }
 
         if temp_path.try_exists()? {
@@ -543,19 +543,18 @@ impl SnapshotStore {
             Err(error) => return Err(error.into()),
         }
 
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.temp_path)?;
+        let mut temp = create_secure_temp(&self.temp_path)?;
         temp.write_all(&bytes)?;
         temp.sync_all()?;
-        drop(temp);
 
         #[cfg(test)]
         if failpoint == Some(Failpoint::AfterTempSync) {
             return Err(SnapshotError::InjectedFailure("after temp sync"));
         }
 
+        prepare_temp_security(&temp, &self.temp_path, &self.path)?;
+        temp.sync_all()?;
+        drop(temp);
         publish_temp(&self.temp_path, &self.path)?;
 
         #[cfg(test)]
@@ -564,14 +563,6 @@ impl SnapshotStore {
         }
 
         sync_parent(&self.path)
-    }
-}
-
-fn is_lock_contended(error: &io::Error) -> bool {
-    let expected = fs2::lock_contended_error();
-    match expected.raw_os_error() {
-        Some(code) => error.raw_os_error() == Some(code),
-        None => error.kind() == expected.kind(),
     }
 }
 
@@ -622,6 +613,173 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
 }
 
 #[cfg(unix)]
+fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    Ok(OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+#[cfg(windows)]
+fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
+    use std::mem;
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, WRITE_DAC, WRITE_OWNER,
+    };
+
+    let path = wide_path(path);
+    let sddl: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;OW)\0".encode_utf16().collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated and `descriptor` points to writable
+    // storage for the LocalAlloc-owned security descriptor returned by Win32.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `path` is NUL-terminated, `attributes` and its descriptor remain
+    // alive for the call, and CREATE_NEW prevents following an existing temp.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    let create_error = (handle == INVALID_HANDLE_VALUE).then(io::Error::last_os_error);
+    // SAFETY: `descriptor` was allocated by the successful conversion above
+    // and is no longer referenced after CreateFileW returns.
+    unsafe { LocalFree(descriptor) };
+    if let Some(error) = create_error {
+        Err(error.into())
+    } else {
+        // SAFETY: CreateFileW returned a new, owned file handle. File assumes
+        // ownership and closes it exactly once.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(unix)]
+fn prepare_temp_security(temp: &File, _temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+    match fs::metadata(path) {
+        Ok(metadata) => temp.set_permissions(metadata.permissions())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_temp_security(temp: &File, _temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        SetKernelObjectSecurity, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let path = wide_path(path);
+    let requested =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut needed = 0u32;
+    // SAFETY: The first call intentionally supplies no output buffer so Win32
+    // reports the required self-relative security descriptor length.
+    unsafe { GetFileSecurityW(path.as_ptr(), requested, ptr::null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let descriptor_len = usize::try_from(needed).map_err(|_| SnapshotError::AllocationFailed)?;
+    let mut descriptor = Vec::new();
+    descriptor
+        .try_reserve_exact(descriptor_len)
+        .map_err(|_| SnapshotError::AllocationFailed)?;
+    descriptor.resize(descriptor_len, 0u8);
+    let descriptor_ptr: PSECURITY_DESCRIPTOR = descriptor.as_mut_ptr().cast();
+    // SAFETY: `descriptor` has the exact writable size requested by the first
+    // call and both path and buffer remain valid for the duration of the call.
+    if unsafe {
+        GetFileSecurityW(
+            path.as_ptr(),
+            requested,
+            descriptor_ptr,
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: `descriptor_ptr` contains a validated security descriptor
+    // returned by GetFileSecurityW; both output pointers are valid.
+    if unsafe { GetSecurityDescriptorControl(descriptor_ptr, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let dacl_protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: `temp` owns a valid handle opened with WRITE_DAC and WRITE_OWNER,
+    // and `descriptor_ptr` remains valid through this call.
+    if unsafe {
+        SetKernelObjectSecurity(
+            temp.as_raw_handle() as HANDLE,
+            requested | dacl_protection,
+            descriptor_ptr,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect()
+}
+
+#[cfg(unix)]
 fn publish_temp(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
     fs::rename(temp_path, path)?;
     Ok(())
@@ -629,22 +787,12 @@ fn publish_temp(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
 
 #[cfg(windows)]
 fn publish_temp(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
-    use std::iter;
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    let temp_path: Vec<u16> = temp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect();
-    let path: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect();
+    let temp_path = wide_path(temp_path);
+    let path = wide_path(path);
     // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain
     // alive for the call. The paths are distinct files in the same directory.
     let result = unsafe {
@@ -1514,11 +1662,6 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_the_platform_lock_contention_error() {
-        assert!(is_lock_contended(&fs2::lock_contended_error()));
-    }
-
-    #[test]
     fn rejects_snapshot_names_that_overlap_live_sidecars() {
         let directory = TestDirectory::new();
         let path = directory.0.join("catalog");
@@ -1774,6 +1917,45 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_restricted_permissions_and_keeps_failed_temps_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = TestDirectory::new();
+        let path = directory.snapshot();
+        let original = sample_image(30);
+        let replacement = sample_image(31);
+        let store = SnapshotStore::open(&path).expect("open store");
+        store.commit(&original).expect("commit original image");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("restrict original snapshot");
+
+        store
+            .commit(&replacement)
+            .expect("replace restricted image");
+        assert_eq!(
+            fs::metadata(&path).expect("snapshot metadata").mode() & 0o777,
+            0o600
+        );
+
+        assert!(matches!(
+            store.commit_inner(&sample_image(32), Some(Failpoint::AfterTempSync)),
+            Err(SnapshotError::InjectedFailure("after temp sync"))
+        ));
+        assert_eq!(
+            fs::metadata(&store.temp_path)
+                .expect("orphan temp metadata")
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            store.load().expect("load surviving image"),
+            Some(replacement)
+        );
     }
 
     #[test]
