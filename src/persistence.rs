@@ -154,21 +154,13 @@ impl Persistence {
         #[cfg(unix)]
         {
             let temporary_name = next_temporary_snapshot_name();
-            let result = write_and_replace_at(
+            write_and_replace_at(
                 &self.parent_dir,
                 &temporary_name,
                 &self.file_name,
                 &self.path,
                 &bytes,
-            );
-            if result.is_err() {
-                let _ = rustix::fs::unlinkat(
-                    &self.parent_dir,
-                    &temporary_name,
-                    rustix::fs::AtFlags::empty(),
-                );
-            }
-            result
+            )
         }
         #[cfg(not(unix))]
         {
@@ -488,48 +480,79 @@ fn write_and_replace_at(
     display_path: &Path,
     bytes: &[u8],
 ) -> Result<StoreStatus> {
-    use rustix::fs::{Mode, OFlags};
+    use rustix::fs::AtFlags;
 
     let existing = open_snapshot_at(parent_dir, destination_name, display_path)?;
-    let descriptor = rustix::fs::openat(
-        parent_dir,
-        temporary_name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|error| rustix_error("create private temporary snapshot", error))?;
-    let mut file = File::from(descriptor);
-    crate::catalog::protect_temp_security(&file).map_err(|error| Error::Io {
-        operation: "protect temporary snapshot",
-        message: error.to_string(),
-    })?;
-    file.write_all(bytes)
-        .map_err(|error| Error::io("write temporary snapshot", error))?;
-    file.sync_all()
-        .map_err(|error| Error::io("sync temporary snapshot", error))?;
-    crate::catalog::prepare_temp_security(&file, existing.as_ref()).map_err(|error| Error::Io {
-        operation: "preserve snapshot security metadata",
-        message: error.to_string(),
-    })?;
-    file.sync_all()
-        .map_err(|error| Error::io("sync snapshot permissions", error))?;
-    drop(file);
+    let staging_dir = crate::catalog::create_secure_staging_dir_at(parent_dir, temporary_name)
+        .map_err(|error| Error::Io {
+            operation: "create private snapshot staging directory",
+            message: error.to_string(),
+        })?;
+    let publish_result = (|| {
+        let mut file = crate::catalog::create_secure_file_at(
+            &staging_dir,
+            std::ffi::OsStr::new("snapshot"),
+            false,
+        )
+        .map_err(|error| Error::Io {
+            operation: "create private temporary snapshot",
+            message: error.to_string(),
+        })?;
+        file.write_all(bytes)
+            .map_err(|error| Error::io("write temporary snapshot", error))?;
+        file.sync_all()
+            .map_err(|error| Error::io("sync temporary snapshot", error))?;
+        crate::catalog::prepare_temp_security(&file, existing.as_ref()).map_err(|error| {
+            Error::Io {
+                operation: "preserve snapshot security metadata",
+                message: error.to_string(),
+            }
+        })?;
+        file.sync_all()
+            .map_err(|error| Error::io("sync snapshot permissions", error))?;
+        drop(file);
 
-    rustix::fs::renameat(parent_dir, temporary_name, parent_dir, destination_name)
-        .map_err(|error| rustix_error("replace snapshot", error))?;
+        rustix::fs::renameat(&staging_dir, "snapshot", parent_dir, destination_name)
+            .map_err(|error| rustix_error("replace snapshot", error))
+    })();
+    if let Err(error) = publish_result {
+        drop(staging_dir);
+        let _ = crate::catalog::cleanup_staging_at(parent_dir, temporary_name);
+        return Err(error);
+    }
+    drop(staging_dir);
+
+    let cleanup_result = rustix::fs::unlinkat(parent_dir, temporary_name, AtFlags::REMOVEDIR)
+        .map_err(|error| rustix_error("remove snapshot staging directory", error));
     #[cfg(test)]
-    if FAIL_DIRECTORY_SYNC.swap(false, Ordering::SeqCst) {
-        return Ok(StoreStatus::PublishedWithError(Error::Io {
+    let inject_sync_failure = FAIL_DIRECTORY_SYNC.swap(false, Ordering::SeqCst);
+    #[cfg(not(test))]
+    let inject_sync_failure = false;
+    let sync_result = if inject_sync_failure {
+        Err(Error::Io {
             operation: "sync snapshot directory",
             message: "injected directory sync failure".to_owned(),
-        }));
-    }
-    match parent_dir.sync_all() {
-        Ok(()) => Ok(StoreStatus::Durable),
-        Err(error) => Ok(StoreStatus::PublishedWithError(Error::io(
-            "sync snapshot directory",
-            error,
-        ))),
+        })
+    } else {
+        parent_dir
+            .sync_all()
+            .map_err(|error| Error::io("sync snapshot directory", error))
+    };
+    match (cleanup_result.err(), sync_result.err()) {
+        (None, None) => Ok(StoreStatus::Durable),
+        (cleanup_error, sync_error) => {
+            let message = match (cleanup_error, sync_error) {
+                (Some(cleanup), Some(sync)) => {
+                    format!("{cleanup}; {sync}")
+                }
+                (Some(error), None) | (None, Some(error)) => error.to_string(),
+                (None, None) => unreachable!(),
+            };
+            Ok(StoreStatus::PublishedWithError(Error::Io {
+                operation: "finalize snapshot publication",
+                message,
+            }))
+        }
     }
 }
 

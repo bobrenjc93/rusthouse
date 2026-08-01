@@ -27,7 +27,7 @@ Readers verify header metadata before allocating and enforce configurable limits
 
 Block decoders stream packed integers and front-coded strings directly into their final nullable vectors. The decoded-block limit covers the nullable vector plus the cumulative string capacity, rather than relying on transient intermediate buffers outside the accounting.
 
-On Windows, macOS, and Linux, `write_segment` creates its temporary file owner-only before writing, clearing inherited native ACLs or applying a protected Windows DACL, then syncs and publishes it with platform-specific no-replace durability. Other targets return `SegmentError::UnsupportedPlatform` before creating the temporary file because their inherited ACL semantics are not implemented. Unix uses a hard link followed by temporary-name removal and a parent-directory sync; Windows uses an atomic `MOVEFILE_WRITE_THROUGH` move without the replace flag. The final path is therefore never visible with partial contents and an existing segment is never replaced. `SegmentWriteOutcome::Durable` confirms publication durability; `PublishedUncertain` means the final path is already visible but cleanup or directory syncing failed, so callers must not retry as a new write.
+On Windows, macOS, and Linux, `write_segment` creates its temporary file owner-only before writing. Unix creates it inside an ACL-hardened private staging directory; Windows applies a protected DACL atomically. Other targets return `SegmentError::UnsupportedPlatform` before creating temporary state because their inherited ACL semantics are not implemented. Unix pins the parent directory, then uses descriptor-relative hard-link publication, cleanup, and directory syncing; Windows uses an atomic `MOVEFILE_WRITE_THROUGH` move without the replace flag. The final path is therefore never visible with partial contents and an existing segment is never replaced. `SegmentWriteOutcome::Durable` confirms publication durability; `PublishedUncertain` means the final path is already visible but cleanup or directory syncing failed, so callers must not retry as a new write.
 
 The format is intentionally self-contained and little-endian. Readers reject unknown versions, unknown encodings, non-canonical or overlapping block extents, invalid UTF-8, inconsistent null maps or statistics, non-zero padding, trailing data, and arithmetic overflow.
 
@@ -203,7 +203,7 @@ The conversion rules are deliberately explicit:
 - NDJSON uses JSON scalars without implicit coercion: JSON numbers feed numeric columns, JSON booleans feed `Bool`, JSON strings feed `String`, and only literal `null` produces `NULL`. Nested values are rejected by scalar schemas.
 - Invalid UTF-8, non-finite floats, conversion failures, and `NULL` in non-nullable fields are typed errors. CSV and NDJSON exporters apply the inverse escaping rules and preserve schema order.
 
-`FormatLimits` independently bounds total input bytes, rows, fields per record, decoded field bytes, JSON nesting depth, decoded string bytes, record bytes, and rows per batch. JSON depth is capped at the stack-safe `MAX_JSON_NESTING_DEPTH`, and larger configurations are rejected. Batch columns allocate lazily as rows arrive, so a large batch limit does not reserve memory for an empty or short input. Parsing retains one bounded record and one typed batch. On Windows, macOS, and Linux, the `ingest_csv` and `ingest_ndjson` helpers write validated batches to an owner-only temporary spool, protected against inherited ACL access before any input is written, then replay them into the table. Other targets return `FormatError::UnsupportedPlatform` before creating a spool. A parse, limit, staging, or replay error leaves the destination at its original row count. Applications that consume the batch iterators directly own any already-consumed batches themselves.
+`FormatLimits` independently bounds total input bytes, rows, fields per record, decoded field bytes, JSON nesting depth, decoded string bytes, record bytes, and rows per batch. JSON depth is capped at the stack-safe `MAX_JSON_NESTING_DEPTH`, and larger configurations are rejected. Batch columns allocate lazily as rows arrive, so a large batch limit does not reserve memory for an empty or short input. Parsing retains one bounded record and one typed batch. On Windows, macOS, and Linux, the `ingest_csv` and `ingest_ndjson` helpers write validated batches to an owner-only temporary spool, then replay them into the table. Unix creates the spool only after its private staging directory has been cleared of inherited ACL access; Windows installs a protected DACL during file creation. Other targets return `FormatError::UnsupportedPlatform` before creating a spool. A parse, limit, staging, or replay error leaves the destination at its original row count. Applications that consume the batch iterators directly own any already-consumed batches themselves.
 
 ## Vector kernel layer
 
@@ -280,10 +280,11 @@ Writer-side validation guarantees every committed catalog satisfies the decoder'
 table, column, row, string, file-size, and total-allocation bounds.
 
 Snapshot temporary files are protected owner-only before any catalog bytes are written
-and are synced before publication. Supported Unix targets remove inherited ACL entries,
-and Windows uses a protected DACL granting access only to the owner and system. Existing
-Unix UID/GID, modes, and native ACLs are copied before the atomic rename, followed by a
-parent-directory sync. If that final sync fails, the API
+and are synced before publication. Supported Unix targets create candidates inside a
+private staging directory after removing its inherited and default ACL entries. Windows
+uses a protected DACL granting access only to the owner and system. Existing Unix UID/GID,
+modes, and native ACLs are copied while the candidate remains inside that directory,
+then the candidate is atomically renamed and the parent directory is synced. If that final sync fails, the API
 returns `Error::CommitDurabilityUncertain` but installs the already-published generation
 in memory and ends the transaction. Windows uses `ReplaceFileW` for existing
 snapshots so ACL/security metadata is retained, and write-through `MoveFileExW` for
@@ -372,7 +373,9 @@ error after publication returns HTTP `202` with code
 `mutation_published_durability_uncertain`, distinguishing it from a retryable failure.
 Query implementations should observe the supplied `QueryCancellation` while doing
 expensive work. It is signaled when a request is dropped, its deadline expires, or
-forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown
+forced shutdown begins. Custom services that mutate state must call
+`QueryCancellation::begin_publication` immediately before their irreversible commit
+and abort the mutation if it returns `false`. Ctrl-C and SIGTERM both use the bounded graceful-shutdown
 path.
 
 JSON and NDJSON encode non-finite `Float64` values as the strings `"NaN"`,

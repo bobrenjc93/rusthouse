@@ -10,10 +10,10 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(test, windows))]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1125,10 +1125,12 @@ pub fn encode_segment(
 
 /// Atomically publishes a new segment and refuses to replace an existing path.
 ///
-/// The complete segment is written and synced through a temporary file in the
-/// destination directory. A platform-specific no-replace operation publishes
-/// the final name. The returned outcome distinguishes confirmed durability from
-/// cleanup or directory-sync failure after the final path became visible.
+/// The complete segment is written and synced through private staging on the
+/// destination filesystem. A platform-specific no-replace operation publishes
+/// the final name. Unix publication and directory syncing remain relative to a
+/// pinned parent descriptor. The returned outcome distinguishes confirmed
+/// durability from cleanup or directory-sync failure after the final path became
+/// visible.
 pub fn write_segment(
     path: impl AsRef<Path>,
     schema: &Schema,
@@ -1144,7 +1146,7 @@ fn publish_segment_bytes(
     bytes: &[u8],
     before_publish: impl FnOnce(),
 ) -> Result<SegmentWriteOutcome, SegmentError> {
-    publish_segment_bytes_inner(path, bytes, before_publish, None)
+    publish_segment_bytes_inner(path, bytes, before_publish, || {}, None)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1162,13 +1164,24 @@ fn publish_segment_bytes_with_failure(
     bytes: &[u8],
     failure: PublicationFailure,
 ) -> Result<SegmentWriteOutcome, SegmentError> {
-    publish_segment_bytes_inner(path, bytes, || {}, Some(failure))
+    publish_segment_bytes_inner(path, bytes, || {}, || {}, Some(failure))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn publish_segment_bytes_with_hooks(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(),
+    before_directory_sync: impl FnOnce(),
+) -> Result<SegmentWriteOutcome, SegmentError> {
+    publish_segment_bytes_inner(path, bytes, before_publish, before_directory_sync, None)
 }
 
 fn publish_segment_bytes_inner(
     path: &Path,
     bytes: &[u8],
     before_publish: impl FnOnce(),
+    before_directory_sync: impl FnOnce(),
     failure: Option<PublicationFailure>,
 ) -> Result<SegmentWriteOutcome, SegmentError> {
     ensure_private_segment_platform()?;
@@ -1179,15 +1192,45 @@ fn publish_segment_bytes_inner(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let (temporary_path, mut file) = create_temporary_file(parent, file_name)?;
-    let mut cleanup = RemoveOnDrop::new(temporary_path.clone());
-
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    before_publish();
-
-    publish_temporary_file(&temporary_path, path, parent, &mut cleanup, failure)
+    #[cfg(unix)]
+    {
+        let parent_dir = File::open(parent)?;
+        let (staging_name, staging_dir, mut file) =
+            create_temporary_file_at(&parent_dir, file_name)?;
+        let mut staging = UnixSegmentStaging::new(&parent_dir, staging_name, staging_dir);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        before_publish();
+        publish_temporary_file_at(&mut staging, file_name, before_directory_sync, failure)
+    }
+    #[cfg(windows)]
+    {
+        let (temporary_path, mut file) = create_temporary_file(parent, file_name)?;
+        let mut cleanup = RemoveOnDrop::new(temporary_path.clone());
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        before_publish();
+        let _ = (before_directory_sync, failure);
+        publish_temporary_file(&temporary_path, path, &mut cleanup)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (
+            bytes,
+            before_publish,
+            before_directory_sync,
+            failure,
+            parent,
+            file_name,
+        );
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable atomic segment publication is unsupported on this platform",
+        )
+        .into())
+    }
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -1203,28 +1246,37 @@ fn ensure_private_segment_platform() -> Result<(), SegmentError> {
 }
 
 #[cfg(unix)]
-fn publish_temporary_file(
-    temporary_path: &Path,
-    path: &Path,
-    parent: &Path,
-    cleanup: &mut RemoveOnDrop,
+fn publish_temporary_file_at(
+    staging: &mut UnixSegmentStaging<'_>,
+    file_name: &OsStr,
+    before_directory_sync: impl FnOnce(),
     failure: Option<PublicationFailure>,
 ) -> Result<SegmentWriteOutcome, SegmentError> {
-    std::fs::hard_link(temporary_path, path)?;
+    use rustix::fs::AtFlags;
+
+    rustix::fs::linkat(
+        &staging.staging_dir,
+        "segment",
+        staging.parent_dir,
+        file_name,
+        AtFlags::empty(),
+    )
+    .map_err(segment_rustix_error)?;
     let cleanup_result = if failure == Some(PublicationFailure::TemporaryCleanup) {
         Err(io::Error::other("injected temporary cleanup failure"))
     } else {
-        std::fs::remove_file(temporary_path)
+        staging.remove_candidate()
     };
-    if cleanup_result.is_ok() {
-        cleanup.disarm();
-    }
+    let directory_cleanup_result = staging.remove_directory();
+    before_directory_sync();
     let sync_result = if failure == Some(PublicationFailure::DirectorySync) {
         Err(io::Error::other("injected segment directory sync failure"))
     } else {
-        sync_directory(parent)
+        staging.parent_dir.sync_all()
     };
-    let cleanup_error = cleanup_result.err();
+    let cleanup_error = cleanup_result
+        .err()
+        .or_else(|| directory_cleanup_result.err());
     let sync_error = sync_result.err();
     match (cleanup_error, sync_error) {
         (None, None) => Ok(SegmentWriteOutcome::Durable),
@@ -1257,9 +1309,7 @@ fn publication_uncertainty_message(
 fn publish_temporary_file(
     temporary_path: &Path,
     path: &Path,
-    _parent: &Path,
     cleanup: &mut RemoveOnDrop,
-    _failure: Option<PublicationFailure>,
 ) -> Result<SegmentWriteOutcome, SegmentError> {
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
@@ -1304,21 +1354,7 @@ fn nul_terminated_wide_path(path: &Path) -> io::Result<Vec<u16>> {
     Ok(encoded)
 }
 
-#[cfg(not(any(unix, windows)))]
-fn publish_temporary_file(
-    _temporary_path: &Path,
-    _path: &Path,
-    _parent: &Path,
-    _cleanup: &mut RemoveOnDrop,
-    _failure: Option<PublicationFailure>,
-) -> Result<SegmentWriteOutcome, SegmentError> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "durable atomic segment publication is unsupported on this platform",
-    )
-    .into())
-}
-
+#[cfg(windows)]
 fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBuf, File)> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1345,67 +1381,143 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn create_private_segment_file(path: &Path) -> io::Result<File> {
-    create_private_segment_file_with_security(path, |file| {
-        crate::catalog::protect_temp_security(file).map_err(io::Error::other)
-    })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn create_private_segment_file_with_security(
-    path: &Path,
-    protect: impl FnOnce(&File) -> io::Result<()>,
-) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    if let Err(protection_error) = protect(&file) {
-        drop(file);
-        return match std::fs::remove_file(path) {
-            Ok(()) => Err(protection_error),
-            Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {
-                Err(protection_error)
-            }
-            Err(cleanup_error) => Err(io::Error::new(
-                cleanup_error.kind(),
-                format!(
-                    "segment security setup failed: {protection_error}; temporary-file cleanup failed: {cleanup_error}"
-                ),
-            )),
-        };
-    }
-    Ok(file)
-}
-
 #[cfg(windows)]
 fn create_private_segment_file(path: &Path) -> io::Result<File> {
     crate::catalog::create_secure_temp(path).map_err(io::Error::other)
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn create_private_segment_file(path: &Path) -> io::Result<File> {
-    let _ = path;
+#[cfg(unix)]
+fn create_temporary_file_at(
+    parent_dir: &File,
+    file_name: &OsStr,
+) -> io::Result<(OsString, File, File)> {
+    create_temporary_file_at_with(parent_dir, file_name, |staging_dir| {
+        crate::catalog::create_secure_file_at(staging_dir, OsStr::new("segment"), false)
+    })
+}
+
+#[cfg(unix)]
+fn create_temporary_file_at_with(
+    parent_dir: &File,
+    file_name: &OsStr,
+    mut create_file: impl FnMut(&File) -> Result<File, crate::catalog::SnapshotError>,
+) -> io::Result<(OsString, File, File)> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..1_024 {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut staging_name = OsString::from(".");
+        staging_name.push(file_name);
+        staging_name.push(format!(
+            ".rusthouse-tmp-{}-{timestamp}-{id}",
+            std::process::id()
+        ));
+        let staging_dir =
+            match crate::catalog::create_secure_staging_dir_at(parent_dir, &staging_name) {
+                Ok(directory) => directory,
+                Err(crate::catalog::SnapshotError::Io(error))
+                    if error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(snapshot_io_error(error)),
+            };
+        match create_file(&staging_dir) {
+            Ok(file) => return Ok((staging_name, staging_dir, file)),
+            Err(error) => {
+                let _ = rustix::fs::unlinkat(&staging_dir, "segment", rustix::fs::AtFlags::empty());
+                drop(staging_dir);
+                let _ =
+                    rustix::fs::unlinkat(parent_dir, &staging_name, rustix::fs::AtFlags::REMOVEDIR);
+                return Err(snapshot_io_error(error));
+            }
+        }
+    }
     Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "private immutable files require Windows, macOS, or Linux ACL semantics",
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary segment directory",
     ))
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+fn snapshot_io_error(error: crate::catalog::SnapshotError) -> io::Error {
+    match error {
+        crate::catalog::SnapshotError::Io(error) => error,
+        error => io::Error::other(error.to_string()),
+    }
 }
 
+#[cfg(unix)]
+fn segment_rustix_error(error: rustix::io::Errno) -> SegmentError {
+    io::Error::from_raw_os_error(error.raw_os_error()).into()
+}
+
+#[cfg(unix)]
+struct UnixSegmentStaging<'a> {
+    parent_dir: &'a File,
+    staging_name: OsString,
+    staging_dir: File,
+    candidate_present: bool,
+    directory_present: bool,
+}
+
+#[cfg(unix)]
+impl<'a> UnixSegmentStaging<'a> {
+    fn new(parent_dir: &'a File, staging_name: OsString, staging_dir: File) -> Self {
+        Self {
+            parent_dir,
+            staging_name,
+            staging_dir,
+            candidate_present: true,
+            directory_present: true,
+        }
+    }
+
+    fn remove_candidate(&mut self) -> io::Result<()> {
+        rustix::fs::unlinkat(&self.staging_dir, "segment", rustix::fs::AtFlags::empty())
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        self.candidate_present = false;
+        Ok(())
+    }
+
+    fn remove_directory(&mut self) -> io::Result<()> {
+        rustix::fs::unlinkat(
+            self.parent_dir,
+            &self.staging_name,
+            rustix::fs::AtFlags::REMOVEDIR,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        self.directory_present = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSegmentStaging<'_> {
+    fn drop(&mut self) {
+        if self.candidate_present {
+            let _ =
+                rustix::fs::unlinkat(&self.staging_dir, "segment", rustix::fs::AtFlags::empty());
+        }
+        if self.directory_present {
+            let _ = rustix::fs::unlinkat(
+                self.parent_dir,
+                &self.staging_name,
+                rustix::fs::AtFlags::REMOVEDIR,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
 struct RemoveOnDrop {
     path: PathBuf,
     armed: bool,
 }
 
+#[cfg(windows)]
 impl RemoveOnDrop {
     fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
@@ -1416,6 +1528,7 @@ impl RemoveOnDrop {
     }
 }
 
+#[cfg(windows)]
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         if self.armed {
@@ -3314,19 +3427,27 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn security_setup_failure_removes_created_segment_candidate() {
-        let directory = test_directory("segment-security-failure");
-        let path = directory.join(".segment.rhs.rusthouse-tmp-injected");
-        let error = create_private_segment_file_with_security(&path, |_| {
-            Err(io::Error::other("injected segment security failure"))
-        })
-        .unwrap_err();
+        use rustix::fs::{Mode, OFlags};
 
-        assert!(
-            error
-                .to_string()
-                .contains("injected segment security failure")
-        );
-        assert!(!path.exists());
+        let directory = test_directory("segment-security-failure");
+        let parent_dir = File::open(&directory).unwrap();
+        let error =
+            create_temporary_file_at_with(&parent_dir, OsStr::new("segment.rhs"), |staging| {
+                let candidate = rustix::fs::openat(
+                    staging,
+                    "segment",
+                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .unwrap();
+                drop(candidate);
+                Err(crate::catalog::SnapshotError::InjectedFailure(
+                    "segment security setup",
+                ))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("segment security setup"));
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -3381,6 +3502,59 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_replacement_before_sync_uses_the_pinned_directory() {
+        use std::sync::{Arc, Barrier};
+
+        let active_parent = test_directory("replace-parent-active");
+        let moved_parent = active_parent.with_file_name(format!(
+            "rusthouse-replace-parent-moved-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let path = active_parent.join("segment.rhs");
+        let bytes =
+            encode_segment(&test_schema(), &test_columns(), &WriteOptions::default()).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let replacement_barrier = Arc::clone(&barrier);
+        let replacement_active = active_parent.clone();
+        let replacement_moved = moved_parent.clone();
+        let replacer = thread::spawn(move || {
+            replacement_barrier.wait();
+            std::fs::rename(&replacement_active, &replacement_moved).unwrap();
+            std::fs::create_dir(&replacement_active).unwrap();
+            replacement_barrier.wait();
+        });
+
+        let outcome = publish_segment_bytes_with_hooks(
+            &path,
+            &bytes,
+            || {},
+            || {
+                barrier.wait();
+                barrier.wait();
+            },
+        )
+        .unwrap();
+        replacer.join().unwrap();
+
+        assert_eq!(outcome, SegmentWriteOutcome::Durable);
+        assert!(!path.exists());
+        let published = moved_parent.join("segment.rhs");
+        assert_eq!(
+            Segment::open(&published, DecodeLimits::default())
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            test_columns()
+        );
+        assert_eq!(std::fs::read_dir(&active_parent).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&moved_parent).unwrap().count(), 1);
+        std::fs::remove_dir_all(active_parent).unwrap();
+        std::fs::remove_dir_all(moved_parent).unwrap();
     }
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]

@@ -1028,7 +1028,10 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
 }
 
 #[cfg(unix)]
-fn cleanup_staging_at(parent_dir: &File, temp_name: &std::ffi::OsStr) -> Result<(), SnapshotError> {
+pub(crate) fn cleanup_staging_at(
+    parent_dir: &File,
+    temp_name: &std::ffi::OsStr,
+) -> Result<(), SnapshotError> {
     use rustix::fs::{AtFlags, Mode, OFlags};
 
     let staging_dir = match rustix::fs::openat(
@@ -1082,28 +1085,38 @@ fn cleanup_staging(temp_dir: &Path, path: &Path) -> Result<(), SnapshotError> {
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn create_secure_staging_dir_at(
+pub(crate) fn create_secure_staging_dir_at(
     parent_dir: &File,
     temp_name: &std::ffi::OsStr,
 ) -> Result<File, SnapshotError> {
     use rustix::fs::{Mode, OFlags};
 
     rustix::fs::mkdirat(parent_dir, temp_name, Mode::RWXU).map_err(rustix_io_error)?;
-    let descriptor = rustix::fs::openat(
+    let descriptor = match rustix::fs::openat(
         parent_dir,
         temp_name,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
         Mode::empty(),
-    )
-    .map_err(rustix_io_error)?;
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let _ = rustix::fs::unlinkat(parent_dir, temp_name, rustix::fs::AtFlags::REMOVEDIR);
+            return Err(rustix_io_error(error));
+        }
+    };
     let directory = File::from(descriptor);
-    set_private_unix_acl(&directory, true)?;
-    rustix::fs::fchmod(&directory, Mode::RWXU).map_err(rustix_io_error)?;
+    let security_result = set_private_unix_acl(&directory, true)
+        .and_then(|()| rustix::fs::fchmod(&directory, Mode::RWXU).map_err(rustix_io_error));
+    if let Err(error) = security_result {
+        drop(directory);
+        let _ = rustix::fs::unlinkat(parent_dir, temp_name, rustix::fs::AtFlags::REMOVEDIR);
+        return Err(error);
+    }
     Ok(directory)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn create_secure_staging_dir_at(
+pub(crate) fn create_secure_staging_dir_at(
     _parent_dir: &File,
     _temp_name: &std::ffi::OsStr,
 ) -> Result<File, SnapshotError> {
@@ -1112,25 +1125,54 @@ fn create_secure_staging_dir_at(
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn create_secure_temp_at(staging_dir: &File) -> Result<File, SnapshotError> {
+pub(crate) fn create_secure_file_at(
+    staging_dir: &File,
+    file_name: &std::ffi::OsStr,
+    readable: bool,
+) -> Result<File, SnapshotError> {
+    create_secure_file_at_inner(staging_dir, file_name, readable, |_| {})
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn create_secure_file_at_inner(
+    staging_dir: &File,
+    file_name: &std::ffi::OsStr,
+    readable: bool,
+    after_create: impl FnOnce(&File),
+) -> Result<File, SnapshotError> {
     use rustix::fs::{Mode, OFlags};
 
+    let access = if readable {
+        OFlags::RDWR
+    } else {
+        OFlags::WRONLY
+    };
     let descriptor = rustix::fs::openat(
         staging_dir,
-        "snapshot",
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        file_name,
+        access | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(rustix_io_error)?;
     let file = File::from(descriptor);
+    after_create(&file);
     protect_temp_security(&file)?;
     Ok(file)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn create_secure_temp_at(_staging_dir: &File) -> Result<File, SnapshotError> {
+pub(crate) fn create_secure_file_at(
+    _staging_dir: &File,
+    _file_name: &std::ffi::OsStr,
+    _readable: bool,
+) -> Result<File, SnapshotError> {
     ensure_platform_supported()?;
     unreachable!("unsupported platforms return an error")
+}
+
+#[cfg(unix)]
+fn create_secure_temp_at(staging_dir: &File) -> Result<File, SnapshotError> {
+    create_secure_file_at(staging_dir, std::ffi::OsStr::new("snapshot"), false)
 }
 
 #[cfg(target_os = "linux")]
@@ -1228,10 +1270,8 @@ fn set_private_unix_acl(file: &File, _is_directory: bool) -> Result<(), Snapshot
     install_macos_acl(file, acl)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn protect_temp_security(file: &File) -> Result<(), SnapshotError> {
-    ensure_platform_supported()?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     set_private_unix_acl(file, false)?;
     rustix::fs::fchmod(file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
         .map_err(rustix_io_error)?;
@@ -3110,6 +3150,45 @@ mod tests {
         recovered.commit(&image).expect("publish first snapshot");
         assert!(!acl_allows_nobody(&path));
         assert_eq!(recovered.load().expect("load first snapshot"), Some(image));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn candidate_is_private_before_file_acl_hardening_begins() {
+        use std::sync::Barrier;
+
+        let directory = TestDirectory::new();
+        install_inheritable_test_acl(&directory.0);
+        let parent_dir = File::open(&directory.0).expect("open ACL test directory");
+        let staging_name = std::ffi::OsStr::new(".acl-race-staging");
+        let staging_dir = create_secure_staging_dir_at(&parent_dir, staging_name)
+            .expect("create protected staging directory");
+        let candidate_path = directory.0.join(staging_name).join("snapshot");
+        let barrier = Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            let creator = scope.spawn(|| {
+                create_secure_file_at_inner(
+                    &staging_dir,
+                    std::ffi::OsStr::new("snapshot"),
+                    true,
+                    |_| {
+                        barrier.wait();
+                        barrier.wait();
+                    },
+                )
+                .expect("finish candidate security setup")
+            });
+
+            barrier.wait();
+            assert!(!acl_allows_nobody(&directory.0.join(staging_name)));
+            assert!(!acl_allows_nobody(&candidate_path));
+            barrier.wait();
+            drop(creator.join().expect("candidate creator thread"));
+        });
+
+        drop(staging_dir);
+        cleanup_staging_at(&parent_dir, staging_name).expect("remove ACL test staging");
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]

@@ -25,6 +25,7 @@ struct TestService {
     active: AtomicUsize,
     max_active: AtomicUsize,
     started: Arc<Semaphore>,
+    publication_started: Arc<Semaphore>,
     release: CancellationToken,
     barrier: Option<Arc<Barrier>>,
     cancellations: Mutex<Vec<QueryCancellation>>,
@@ -38,6 +39,7 @@ impl TestService {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
             started: Arc::new(Semaphore::new(0)),
+            publication_started: Arc::new(Semaphore::new(0)),
             release: CancellationToken::new(),
             barrier: None,
             cancellations: Mutex::new(Vec::new()),
@@ -56,6 +58,10 @@ impl TestService {
         for _ in 0..count {
             self.started.acquire().await.unwrap().forget();
         }
+    }
+
+    async fn wait_for_publication(&self) {
+        self.publication_started.acquire().await.unwrap().forget();
     }
 
     fn last_cancellation(&self) -> QueryCancellation {
@@ -112,6 +118,16 @@ impl QueryService for TestService {
                 }
                 "blocking shutdown" => {
                     std::thread::sleep(Duration::from_secs(1));
+                    rows_result()
+                }
+                "publish and hold" => {
+                    if !request.cancellation.begin_publication() {
+                        return Err(QueryError::unavailable(
+                            "query was cancelled before publication",
+                        ));
+                    }
+                    self.publication_started.add_permits(1);
+                    self.release.cancelled().await;
                     rows_result()
                 }
                 "bad sql" => Err(QueryError::invalid_query("test syntax error")),
@@ -654,6 +670,36 @@ async fn enforces_deadline_and_signals_cancellation() {
     );
     assert!(service.last_cancellation().is_cancelled());
 
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_service_publication_handoff_prevents_retryable_timeout() {
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        query_timeout: Duration::from_millis(40),
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(service.clone(), config).await;
+    let request = tokio::spawn(async move {
+        Client::new()
+            .post(format!("{url}/query"))
+            .header("content-type", "application/sql")
+            .body("publish and hold")
+            .send()
+            .await
+            .unwrap()
+    });
+    service.wait_for_publication().await;
+
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "query_outcome_unknown"
+    );
+
+    service.release.cancel();
     server.shutdown().await.unwrap();
 }
 

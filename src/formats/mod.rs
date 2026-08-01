@@ -14,8 +14,6 @@ use crate::storage::{Column, ColumnBatch, DataType, Schema, StorageError, Table}
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -359,6 +357,7 @@ static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct StagedBatches {
     file: Option<File>,
     path: PathBuf,
+    cleanup_dir: Option<PathBuf>,
 }
 
 impl StagedBatches {
@@ -375,21 +374,25 @@ impl StagedBatches {
             .as_nanos();
         for _ in 0..128 {
             let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!(
+            let candidate_name = format!(
                 "rusthouse-ingest-{}-{timestamp}-{sequence}.tmp",
                 std::process::id()
-            ));
-            match create_private_spool_file(&path) {
-                Ok(mut file) => {
+            );
+            match create_private_spool_file(directory, std::ffi::OsStr::new(&candidate_name)) {
+                Ok((mut file, path, cleanup_dir)) => {
                     let result = file.write_all(b"RHBATCH1");
                     if let Err(error) = result {
                         drop(file);
                         let _ = std::fs::remove_file(&path);
+                        if let Some(cleanup_dir) = cleanup_dir {
+                            let _ = std::fs::remove_dir(cleanup_dir);
+                        }
                         return Err(FormatError::Io(error));
                     }
                     return Ok(Self {
                         file: Some(file),
                         path,
+                        cleanup_dir,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -527,29 +530,39 @@ fn ensure_private_spool_platform() -> Result<(), FormatError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn create_private_spool_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    if let Err(error) = crate::catalog::protect_temp_security(&file) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(io::Error::other(format!(
-            "could not protect ingestion spool: {error}"
-        )));
-    }
-    Ok(file)
+fn create_private_spool_file(
+    parent: &Path,
+    staging_name: &std::ffi::OsStr,
+) -> io::Result<(File, PathBuf, Option<PathBuf>)> {
+    let parent_dir = File::open(parent)?;
+    let staging_dir = crate::catalog::create_secure_staging_dir_at(&parent_dir, staging_name)
+        .map_err(snapshot_io_error)?;
+    let file = match crate::catalog::create_secure_file_at(
+        &staging_dir,
+        std::ffi::OsStr::new("spool"),
+        true,
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = rustix::fs::unlinkat(&staging_dir, "spool", rustix::fs::AtFlags::empty());
+            drop(staging_dir);
+            let _ = rustix::fs::unlinkat(&parent_dir, staging_name, rustix::fs::AtFlags::REMOVEDIR);
+            return Err(snapshot_io_error(error));
+        }
+    };
+    let cleanup_dir = parent.join(staging_name);
+    let path = cleanup_dir.join("spool");
+    Ok((file, path, Some(cleanup_dir)))
 }
 
 #[cfg(windows)]
-fn create_private_spool_file(path: &Path) -> io::Result<File> {
-    match crate::catalog::create_secure_temp(path) {
-        Ok(file) => Ok(file),
+fn create_private_spool_file(
+    parent: &Path,
+    candidate_name: &std::ffi::OsStr,
+) -> io::Result<(File, PathBuf, Option<PathBuf>)> {
+    let path = parent.join(candidate_name);
+    match crate::catalog::create_secure_temp(&path) {
+        Ok(file) => Ok((file, path, None)),
         Err(crate::catalog::SnapshotError::Io(error)) => Err(error),
         Err(error) => Err(io::Error::other(format!(
             "could not protect ingestion spool: {error}"
@@ -558,17 +571,31 @@ fn create_private_spool_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn create_private_spool_file(_path: &Path) -> io::Result<File> {
+fn create_private_spool_file(
+    _parent: &Path,
+    _candidate_name: &std::ffi::OsStr,
+) -> io::Result<(File, PathBuf, Option<PathBuf>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "private temporary files require Windows, macOS, or Linux ACL semantics",
     ))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn snapshot_io_error(error: crate::catalog::SnapshotError) -> io::Error {
+    match error {
+        crate::catalog::SnapshotError::Io(error) => error,
+        error => io::Error::other(error.to_string()),
+    }
+}
+
 impl Drop for StagedBatches {
     fn drop(&mut self) {
         drop(self.file.take());
         let _ = std::fs::remove_file(&self.path);
+        if let Some(cleanup_dir) = &self.cleanup_dir {
+            let _ = std::fs::remove_dir(cleanup_dir);
+        }
     }
 }
 
@@ -680,7 +707,9 @@ mod tests {
 
         let staged = StagedBatches::create_in(&directory).unwrap();
         let path = staged.path.clone();
+        let cleanup_dir = staged.cleanup_dir.clone().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"RHBATCH1");
+        assert!(!acl_allows_nobody(&cleanup_dir));
         assert!(!acl_allows_nobody(&path));
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -688,6 +717,7 @@ mod tests {
         );
         drop(staged);
         assert!(!path.exists());
+        assert!(!cleanup_dir.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

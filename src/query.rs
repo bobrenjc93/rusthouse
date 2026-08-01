@@ -26,7 +26,9 @@ pub type QueryFuture<'a> =
 ///
 /// Implementations should periodically inspect `request.cancellation`, especially
 /// around expensive scans and blocking boundaries. The HTTP server signals it when
-/// a deadline expires or a bounded shutdown has to stop outstanding work.
+/// a deadline expires or a bounded shutdown has to stop outstanding work. A service
+/// that publishes mutations must call [`QueryCancellation::begin_publication`]
+/// immediately before its irreversible publication step.
 pub trait QueryService: Send + Sync + 'static {
     /// Executes one SQL statement and returns a materialized tabular result.
     ///
@@ -147,6 +149,33 @@ impl QueryCancellation {
         self.inner.is_cancelled()
     }
 
+    /// Atomically hands a mutation from cancellable execution to publication.
+    ///
+    /// Mutating [`QueryService`] implementations must call this immediately before
+    /// their irreversible commit or publication operation. A `false` result means
+    /// cancellation won the handoff and the mutation must not be published. Once
+    /// this returns `true`, an HTTP deadline reports `query_outcome_unknown` instead
+    /// of an ordinary retryable timeout.
+    #[must_use]
+    pub fn begin_publication(&self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        if self
+            .execution_state
+            .compare_exchange(
+                EXECUTION_ACTIVE,
+                EXECUTION_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        !self.is_cancelled()
+    }
+
     pub(crate) fn cancel(&self) -> CancellationOutcome {
         self.inner.cancel();
         match self.execution_state.compare_exchange(
@@ -172,22 +201,7 @@ impl ExecutionCancellation for QueryCancellation {
     }
 
     fn begin_publication(&self) -> bool {
-        if self.is_cancelled() {
-            return false;
-        }
-        if self
-            .execution_state
-            .compare_exchange(
-                EXECUTION_ACTIVE,
-                EXECUTION_PUBLISHING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
-        }
-        !self.is_cancelled()
+        QueryCancellation::begin_publication(self)
     }
 }
 
@@ -473,10 +487,10 @@ mod tests {
     fn cancellation_and_publication_have_an_atomic_handoff() {
         let cancelled = QueryCancellation::new(CancellationToken::new());
         assert_eq!(cancelled.cancel(), CancellationOutcome::Cancelled);
-        assert!(!ExecutionCancellation::begin_publication(&cancelled));
+        assert!(!cancelled.begin_publication());
 
         let publishing = QueryCancellation::new(CancellationToken::new());
-        assert!(ExecutionCancellation::begin_publication(&publishing));
+        assert!(publishing.begin_publication());
         assert_eq!(
             publishing.cancel(),
             CancellationOutcome::PublicationInProgress
