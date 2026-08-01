@@ -2,6 +2,9 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::thread;
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -12,10 +15,22 @@ use crate::sql::{
 use crate::storage::{Column, Table};
 use crate::value::{DataType, Value, ValueRef};
 
+const SCAN_MORSEL_ROWS: usize = 4_096;
+
 /// A reusable in-memory SQL database.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
+    worker_count: usize,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            catalog: Catalog::default(),
+            worker_count: thread::available_parallelism().map_or(1, usize::from),
+        }
+    }
 }
 
 /// Metadata for one column in a [`QueryResult`].
@@ -55,6 +70,33 @@ impl Database {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty database that uses at most `worker_count` scan workers.
+    ///
+    /// A worker count of zero is rejected. The engine may use fewer workers
+    /// when a query contains fewer fixed-size scan morsels than workers.
+    pub fn with_worker_count(worker_count: usize) -> Result<Self> {
+        validate_worker_count(worker_count)?;
+        Ok(Self {
+            catalog: Catalog::default(),
+            worker_count,
+        })
+    }
+
+    /// Returns the maximum number of scan workers used by a query.
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    /// Changes the maximum number of scan workers used by subsequent queries.
+    ///
+    /// A worker count of zero is rejected without changing the current value.
+    pub fn set_worker_count(&mut self, worker_count: usize) -> Result<()> {
+        validate_worker_count(worker_count)?;
+        self.worker_count = worker_count;
+        Ok(())
     }
 
     /// Returns the database's catalog for read-only schema and table inspection.
@@ -113,14 +155,6 @@ impl Database {
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
 
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
@@ -128,7 +162,13 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                predicate.as_ref(),
+                &group_columns,
+                &aggregate_specs,
+                self.worker_count,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -139,6 +179,8 @@ impl Database {
             );
             grouped.project(&selected_groups, &items)
         } else {
+            let mut matching_rows =
+                scan_matching_rows(table, predicate.as_ref(), self.worker_count);
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
             execute_projection(table, &matching_rows, &items)
         };
@@ -148,6 +190,87 @@ impl Database {
             rows,
         })
     }
+}
+
+fn validate_worker_count(worker_count: usize) -> Result<()> {
+    if worker_count == 0 {
+        return Err(Error::InvalidConfiguration(
+            "worker count must be at least 1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn scan_matching_rows(
+    table: &Table,
+    predicate: Option<&CompiledPredicate>,
+    worker_count: usize,
+) -> Vec<usize> {
+    execute_morsels(table.row_count(), worker_count, |rows| {
+        rows.filter(|row| predicate.is_none_or(|predicate| predicate.evaluate(table, *row)))
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn execute_morsels<T>(
+    row_count: usize,
+    worker_count: usize,
+    execute: impl Fn(Range<usize>) -> T + Sync,
+) -> Vec<T>
+where
+    T: Send,
+{
+    let morsel_count = row_count.div_ceil(SCAN_MORSEL_ROWS);
+    let active_workers = worker_count.min(morsel_count);
+    if active_workers <= 1 {
+        return (0..morsel_count)
+            .map(|morsel| execute(morsel_range(morsel, row_count)))
+            .collect();
+    }
+
+    let next_morsel = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(active_workers);
+        for _ in 0..active_workers {
+            let next_morsel = &next_morsel;
+            let execute = &execute;
+            handles.push(scope.spawn(move || {
+                let mut completed = Vec::new();
+                loop {
+                    let morsel = next_morsel.fetch_add(1, AtomicOrdering::Relaxed);
+                    if morsel >= morsel_count {
+                        break;
+                    }
+                    completed.push((morsel, execute(morsel_range(morsel, row_count))));
+                }
+                completed
+            }));
+        }
+
+        let mut ordered = std::iter::repeat_with(|| None)
+            .take(morsel_count)
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let completed = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (morsel, result) in completed {
+                ordered[morsel] = Some(result);
+            }
+        }
+        ordered
+            .into_iter()
+            .map(|result| result.expect("every morsel is completed by one worker"))
+            .collect()
+    })
+}
+
+fn morsel_range(morsel: usize, row_count: usize) -> Range<usize> {
+    let start = morsel * SCAN_MORSEL_ROWS;
+    start..(start + SCAN_MORSEL_ROWS).min(row_count)
 }
 
 #[derive(Debug)]
@@ -336,13 +459,33 @@ fn execute_projection(
 
 fn execute_grouped<'a>(
     table: &'a Table,
-    matching_rows: &[usize],
+    predicate: Option<&CompiledPredicate>,
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    worker_count: usize,
 ) -> Result<GroupedData<'a>> {
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+    let partials = execute_morsels(table.row_count(), worker_count, |rows| {
+        aggregate_morsel(table, rows, predicate, group_columns, aggregate_specs)
+    });
+
+    merge_aggregate_morsels(
+        group_columns.len(),
+        table.row_count(),
+        aggregate_specs,
+        partials,
+    )
+}
+
+fn aggregate_morsel<'a>(
+    table: &'a Table,
+    rows: Range<usize>,
+    predicate: Option<&CompiledPredicate>,
+    group_columns: &[usize],
+    aggregate_specs: &[AggregateSpec],
+) -> Result<PartialGroupedData<'a>> {
+    let mut groups = GroupIndex::new(group_columns.len(), rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
+    let initial_capacity = rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -354,8 +497,11 @@ fn execute_grouped<'a>(
         })
         .collect::<Vec<_>>();
 
-    for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+    for row in rows {
+        if predicate.is_some_and(|predicate| !predicate.evaluate(table, row)) {
+            continue;
+        }
+        let (group, inserted) = groups.find_or_insert(table, group_columns, row, group_count);
         if inserted {
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
@@ -364,7 +510,57 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(spec, table, row)?;
+        }
+    }
+
+    Ok(PartialGroupedData {
+        keys: groups.into_keys(group_count),
+        aggregate_states,
+    })
+}
+
+fn merge_aggregate_morsels<'a>(
+    group_column_count: usize,
+    row_count: usize,
+    aggregate_specs: &[AggregateSpec],
+    partials: Vec<Result<PartialGroupedData<'a>>>,
+) -> Result<GroupedData<'a>> {
+    let mut groups = GroupIndex::new(group_column_count, row_count);
+    let mut group_count = usize::from(group_column_count == 0);
+    let initial_capacity = row_count.min(1_024);
+    let mut aggregate_states = aggregate_specs
+        .iter()
+        .map(|spec| {
+            let mut states = Vec::with_capacity(initial_capacity);
+            if group_column_count == 0 {
+                states.push(AggregateState::new(spec));
+            }
+            states
+        })
+        .collect::<Vec<_>>();
+
+    for partial in partials {
+        let PartialGroupedData {
+            keys,
+            aggregate_states: partial_states,
+        } = partial?;
+        let mut merged_groups = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let (group, inserted) = groups.find_or_insert_key(key, group_count);
+            if inserted {
+                group_count += 1;
+                for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
+                    states.push(AggregateState::new(spec));
+                }
+            }
+            merged_groups.push(group);
+        }
+
+        for (states, partial_states) in aggregate_states.iter_mut().zip(partial_states) {
+            for (group, partial_state) in merged_groups.iter().copied().zip(partial_states) {
+                states[group].merge(partial_state)?;
+            }
         }
     }
 
@@ -379,6 +575,12 @@ fn execute_grouped<'a>(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(GroupedData { keys, aggregates })
+}
+
+#[derive(Debug)]
+struct PartialGroupedData<'a> {
+    keys: Vec<GroupKey<'a>>,
+    aggregate_states: Vec<Vec<AggregateState>>,
 }
 
 #[derive(Debug)]
@@ -430,6 +632,24 @@ impl<'a> GroupIndex<'a> {
                     .collect::<Vec<_>>();
                 find_or_insert_group(groups, &key, next_group)
             }
+        }
+    }
+
+    fn find_or_insert_key(&mut self, key: &GroupKey<'a>, next_group: usize) -> (usize, bool) {
+        match (self, key) {
+            (Self::Global, GroupKey::Empty) => (0, false),
+            (Self::One(groups), GroupKey::One(key)) => {
+                if let Some(group) = groups.get(key) {
+                    (*group, false)
+                } else {
+                    groups.insert(*key, next_group);
+                    (next_group, true)
+                }
+            }
+            (Self::Multiple(groups), GroupKey::Multiple(key)) => {
+                find_or_insert_group(groups, key, next_group)
+            }
+            _ => unreachable!("group index and key shapes are resolved together"),
         }
     }
 
@@ -635,6 +855,78 @@ impl AggregateState {
                     return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, partial: Self) -> Result<()> {
+        match (self, partial) {
+            (Self::Count(count), Self::Count(partial)) => {
+                *count = count
+                    .checked_add(partial)
+                    .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
+            }
+            (Self::SumInt(sum), Self::SumInt(partial)) => {
+                *sum = sum
+                    .checked_add(partial)
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+            }
+            (Self::SumFloat(sum), Self::SumFloat(partial)) => {
+                *sum += partial;
+                if !sum.is_finite() {
+                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
+                }
+            }
+            (Self::Min(current), Self::Min(partial)) => {
+                if let Some(partial) = partial {
+                    if current
+                        .as_ref()
+                        .is_none_or(|existing| partial.as_ref() < existing.as_ref())
+                    {
+                        *current = Some(partial);
+                    }
+                }
+            }
+            (Self::Max(current), Self::Max(partial)) => {
+                if let Some(partial) = partial {
+                    if current
+                        .as_ref()
+                        .is_none_or(|existing| partial.as_ref() > existing.as_ref())
+                    {
+                        *current = Some(partial);
+                    }
+                }
+            }
+            (
+                Self::AvgInt { sum, count },
+                Self::AvgInt {
+                    sum: partial_sum,
+                    count: partial_count,
+                },
+            ) => {
+                *sum = sum
+                    .checked_add(partial_sum)
+                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
+                *count = count
+                    .checked_add(partial_count)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            }
+            (
+                Self::AvgFloat { sum, count },
+                Self::AvgFloat {
+                    sum: partial_sum,
+                    count: partial_count,
+                },
+            ) => {
+                *sum += partial_sum;
+                *count = count
+                    .checked_add(partial_count)
+                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+                if !sum.is_finite() {
+                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
+                }
+            }
+            _ => unreachable!("aggregate states for one specification have the same variant"),
         }
         Ok(())
     }
@@ -960,5 +1252,143 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn small_scans_stay_on_the_calling_thread_and_worker_counts_are_validated() {
+        let caller = thread::current().id();
+        let threads = execute_morsels(SCAN_MORSEL_ROWS, 8, |_| thread::current().id());
+        assert_eq!(threads, vec![caller]);
+
+        let mut database = Database::with_worker_count(2).expect("valid worker count");
+        assert_eq!(database.worker_count(), 2);
+        assert!(matches!(
+            database.set_worker_count(0),
+            Err(Error::InvalidConfiguration(message))
+                if message == "worker count must be at least 1"
+        ));
+        assert_eq!(database.worker_count(), 2);
+    }
+
+    #[test]
+    fn filters_and_aggregates_are_equivalent_across_worker_counts() {
+        let row_count = SCAN_MORSEL_ROWS * 3 + 137;
+        let mut database = Database::with_worker_count(1).expect("valid worker count");
+        database
+            .execute(
+                "CREATE TABLE parallel_data (
+                    id Int64, bucket Int64, amount Int64,
+                    reading Float64, keep Bool, unique_key String
+                 );",
+            )
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("parallel_data")
+            .expect("table exists");
+        for row in 0..row_count {
+            table
+                .insert_row(vec![
+                    Value::Int64(row as i64),
+                    Value::Int64((row % 257) as i64),
+                    Value::Int64((row % 31) as i64 - 15),
+                    Value::Float64(((row % 19) as f64 - 9.0) * 0.25),
+                    Value::Bool(row % 3 != 0),
+                    Value::String(format!("key-{row:05}")),
+                ])
+                .expect("generated row is valid");
+        }
+
+        let statements = [
+            "SELECT id, unique_key FROM parallel_data
+             WHERE keep = true AND id >= 4000;",
+            "SELECT COUNT(*) AS rows, SUM(amount) AS total,
+                    MIN(reading) AS low, MAX(reading) AS high,
+                    AVG(reading) AS mean
+             FROM parallel_data WHERE keep = true;",
+            "SELECT bucket, COUNT(*) AS rows, SUM(amount) AS total,
+                    MIN(reading) AS low, MAX(reading) AS high,
+                    AVG(reading) AS mean
+             FROM parallel_data WHERE keep = true GROUP BY bucket;",
+            "SELECT unique_key, COUNT(*) AS rows, SUM(amount) AS total
+             FROM parallel_data WHERE keep = true GROUP BY unique_key;",
+        ];
+        let expected = statements
+            .iter()
+            .map(|statement| query(&mut database, statement))
+            .collect::<Vec<_>>();
+
+        assert_eq!(expected[1].rows.len(), 1);
+        assert_eq!(expected[2].rows.len(), 257);
+        assert_eq!(
+            expected[3].rows.len(),
+            (0..row_count).filter(|row| row % 3 != 0).count()
+        );
+        assert!(expected[3].rows.iter().all(|row| row[1] == Value::Int64(1)));
+
+        for worker_count in [2, 4] {
+            database
+                .set_worker_count(worker_count)
+                .expect("valid worker count");
+            for (statement, expected) in statements.iter().zip(&expected) {
+                assert_eq!(
+                    query(&mut database, statement),
+                    *expected,
+                    "query differed with {worker_count} workers: {statement}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_aggregate_overflow_is_propagated_from_workers_and_merges() {
+        let row_count = SCAN_MORSEL_ROWS * 3;
+        let mut database = Database::with_worker_count(4).expect("valid worker count");
+        database
+            .execute(
+                "CREATE TABLE overflow_data (
+                    group_key String, local_value Int64, merge_value Int64
+                 );",
+            )
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("overflow_data")
+            .expect("table exists");
+        for row in 0..row_count {
+            let local_value = match row {
+                value if value == SCAN_MORSEL_ROWS + 10 => i64::MAX,
+                value if value == SCAN_MORSEL_ROWS + 11 => 1,
+                _ => 0,
+            };
+            let merge_value = match row {
+                value if value == SCAN_MORSEL_ROWS - 1 => i64::MAX,
+                value if value == SCAN_MORSEL_ROWS => 1,
+                _ => 0,
+            };
+            table
+                .insert_row(vec![
+                    Value::String("all".to_owned()),
+                    Value::Int64(local_value),
+                    Value::Int64(merge_value),
+                ])
+                .expect("generated row is valid");
+        }
+
+        let worker_error = database
+            .execute("SELECT SUM(local_value) FROM overflow_data;")
+            .expect_err("overflow inside a worker morsel is returned");
+        assert_eq!(
+            worker_error,
+            Error::NumericOverflow("SUM(Int64)".to_owned())
+        );
+
+        let merge_error = database
+            .execute(
+                "SELECT group_key, SUM(merge_value)
+                 FROM overflow_data GROUP BY group_key;",
+            )
+            .expect_err("overflow while merging adjacent morsels is returned");
+        assert_eq!(merge_error, Error::NumericOverflow("SUM(Int64)".to_owned()));
     }
 }

@@ -11,6 +11,7 @@ RustHouse is a small, dependency-free analytical SQL engine written in Rust. It 
 - AND, OR, and parentheses in predicates (AND binds more tightly)
 - COUNT, SUM, MIN, MAX, and AVG
 - GROUP BY, output-column or alias ORDER BY with ASC/DESC, and LIMIT
+- parallel filtered scans and aggregation with deterministic result merging
 - semicolon-separated SQL batches
 - table, CSV, and JSON output from the CLI
 - SQL input from --execute or standard input
@@ -42,6 +43,15 @@ Choose table (the default), csv, or json:
 ~~~bash
 cargo run -- --format json --execute \
   "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT * FROM t ORDER BY id"
+~~~
+
+By default, scans use the process's available parallelism. Set an explicit
+maximum worker count with `--workers`; small inputs still run on the calling
+thread:
+
+~~~bash
+cargo run -- --workers 4 --execute \
+  "CREATE TABLE t (id Int64); INSERT INTO t VALUES (2), (1); SELECT COUNT(*) FROM t"
 ~~~
 
 Or pipe a batch through standard input:
@@ -78,6 +88,12 @@ assert_eq!(result.rows.len(), 1);
 
 # Ok::<(), rusthouse::Error>(())
 ~~~
+
+`Database::new()` uses the available parallelism reported by the operating
+system. `Database::with_worker_count` and `Database::set_worker_count` select an
+explicit positive maximum. Scans use fixed 4,096-row morsels; per-morsel
+aggregate states are merged in source order, so results are reproducible across
+worker counts. A scan that fits in one morsel does not create worker threads.
 
 ## Current boundaries
 

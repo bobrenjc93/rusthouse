@@ -16,6 +16,7 @@ USAGE:
 OPTIONS:
     -e, --execute <SQL>       Execute SQL supplied as an argument
     -f, --format <FORMAT>     Output format: table (default), csv, or json
+    -w, --workers <COUNT>     Maximum parallel scan workers
     -h, --help                Print this help
 
 With no --execute option, SQL is read to EOF from standard input.
@@ -49,7 +50,10 @@ fn run() -> Result<(), String> {
         sql
     };
 
-    let mut database = Database::new();
+    let mut database = config
+        .workers
+        .map_or_else(|| Ok(Database::new()), Database::with_worker_count)
+        .map_err(|error| error.to_string())?;
     let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let mut queries = Vec::new();
     for result in results {
@@ -96,11 +100,13 @@ fn render_query_results(results: &[QueryResult], format: OutputFormat) -> String
 struct Config {
     execute: Option<String>,
     format: OutputFormat,
+    workers: Option<usize>,
 }
 
 fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut execute = None;
     let mut format = OutputFormat::Table;
+    let mut workers = None;
     let mut arguments = arguments.peekable();
 
     while let Some(argument) = arguments.next() {
@@ -124,6 +130,15 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            "-w" | "--workers" => {
+                if workers.is_some() {
+                    return Err("--workers may only be supplied once".to_owned());
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("{argument} requires a worker count"))?;
+                workers = Some(parse_worker_count(&value)?);
+            }
             _ if argument.starts_with("--execute=") => {
                 if execute.is_some() {
                     return Err("--execute may only be supplied once".to_owned());
@@ -136,11 +151,31 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Option<Con
                     format!("unknown output format '{value}'; expected table, csv, or json")
                 })?;
             }
+            _ if argument.starts_with("--workers=") => {
+                if workers.is_some() {
+                    return Err("--workers may only be supplied once".to_owned());
+                }
+                workers = Some(parse_worker_count(&argument["--workers=".len()..])?);
+            }
             _ => return Err(format!("unknown argument '{argument}'; try --help")),
         }
     }
 
-    Ok(Some(Config { execute, format }))
+    Ok(Some(Config {
+        execute,
+        format,
+        workers,
+    }))
+}
+
+fn parse_worker_count(value: &str) -> Result<usize, String> {
+    let workers = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid worker count '{value}'; expected a positive integer"))?;
+    if workers == 0 {
+        return Err("invalid worker count '0'; expected a positive integer".to_owned());
+    }
+    Ok(workers)
 }
 
 #[cfg(test)]
@@ -159,6 +194,7 @@ mod tests {
         .expect("not help");
         assert_eq!(config.format, OutputFormat::Json);
         assert_eq!(config.execute.as_deref(), Some("SELECT * FROM t"));
+        assert_eq!(config.workers, None);
     }
 
     #[test]
@@ -166,6 +202,20 @@ mod tests {
         let error = parse_arguments(["--format", "xml"].into_iter().map(str::to_owned))
             .expect_err("unknown format");
         assert!(error.contains("table, csv, or json"));
+    }
+
+    #[test]
+    fn parses_and_validates_worker_counts() {
+        let config = parse_arguments(["--workers=4"].into_iter().map(str::to_owned))
+            .expect("valid arguments")
+            .expect("not help");
+        assert_eq!(config.workers, Some(4));
+
+        for value in ["0", "many"] {
+            let error = parse_arguments(["--workers", value].into_iter().map(str::to_owned))
+                .expect_err("worker count is invalid");
+            assert!(error.contains("expected a positive integer"));
+        }
     }
 
     #[test]
