@@ -1,12 +1,16 @@
 //! RustHouse is a compact analytical database with snapshot-isolated sessions.
 
-mod catalog;
+pub mod catalog;
 mod database;
 mod error;
 mod persistence;
 mod sql;
 pub mod storage;
 
+pub use catalog::{
+    CatalogImage, ColumnData, ColumnImage, Corruption, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC,
+    SchemaImage, SnapshotError, SnapshotLimits, SnapshotStore, TableImage,
+};
 pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};
 pub use storage::{ColumnDef, DataType, Value};
