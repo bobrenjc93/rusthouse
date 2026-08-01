@@ -802,14 +802,18 @@ fn morsel_range(morsel: usize, row_count: usize) -> Range<usize> {
 }
 
 fn morsel_execution_memory<T>(row_count: usize, worker_count: usize) -> usize {
+    morsel_result_memory::<T>(row_count)
+        .saturating_add(morsel_worker_memory(row_count, worker_count))
+}
+
+fn morsel_result_memory<T>(row_count: usize) -> usize {
     let morsels = row_count.div_ceil(SCAN_MORSEL_ROWS);
+    morsels.saturating_mul(size_of::<Option<T>>())
+}
+
+fn morsel_worker_memory(row_count: usize, worker_count: usize) -> usize {
     let workers = active_worker_count(row_count, worker_count);
-    morsels
-        .saturating_mul(size_of::<Option<T>>())
-        .saturating_add(
-            workers
-                .saturating_mul(SCAN_WORKER_STACK_BYTES.saturating_add(SCAN_WORKER_CONTROL_BYTES)),
-        )
+    workers.saturating_mul(SCAN_WORKER_STACK_BYTES.saturating_add(SCAN_WORKER_CONTROL_BYTES))
 }
 
 fn scan_matching_rows(
@@ -866,6 +870,8 @@ fn scan_rows(
             return Err(error);
         }
     };
+    let worker_memory = morsel_worker_memory(row_count, worker_count);
+    context.release_memory(worker_memory);
     let outcome = (|| {
         for (morsel, mask) in masks.iter().enumerate() {
             let range = morsel_range(morsel, row_count);
@@ -878,7 +884,7 @@ fn scan_rows(
         Ok(())
     })();
     drop(masks);
-    context.release_memory(reservation);
+    context.release_memory(reservation.saturating_sub(worker_memory));
     outcome
 }
 
@@ -971,16 +977,15 @@ fn execute_grouped(
         && reservation <= context.available_memory()
     {
         context.reserve_memory(reservation)?;
-        let outcome = execute_grouped_parallel(
+        return execute_grouped_parallel(
             table,
             predicate,
             group_columns,
             aggregate_specs,
             settings.worker_count,
             context,
+            reservation,
         );
-        context.release_memory(reservation);
-        return outcome;
     }
 
     execute_grouped_sequential(
@@ -1082,6 +1087,20 @@ struct PartialGroup {
     states: Vec<AggregateState>,
 }
 
+impl PartialGroup {
+    fn heap_memory_bytes(&self) -> usize {
+        self.states
+            .capacity()
+            .saturating_mul(size_of::<AggregateState>())
+            .saturating_add(
+                self.states
+                    .iter()
+                    .map(AggregateState::heap_memory_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+}
+
 #[derive(Debug)]
 struct PartialGroupedData {
     groups: Vec<PartialGroup>,
@@ -1122,6 +1141,7 @@ fn execute_grouped_parallel(
     aggregate_specs: &[AggregateSpec],
     worker_count: usize,
     context: &mut ExecutionContext<'_>,
+    reservation: usize,
 ) -> Result<GroupedData> {
     let partials = execute_morsels(table.row_count(), worker_count, |rows| {
         aggregate_morsel(table, rows, predicate, group_columns, aggregate_specs)
@@ -1150,38 +1170,55 @@ fn execute_grouped_parallel(
         }
     });
 
-    let mut data = GroupedData::default();
-    let mut groups = groups.into_iter();
-    let Some(mut current) = groups.next() else {
-        return Ok(data);
-    };
+    let mut consolidated: Vec<PartialGroup> = Vec::new();
     for partial in groups {
-        let same_group = group_columns.is_empty()
-            || compare_group_keys(table, group_columns, current.key_row, partial.key_row)
-                == Ordering::Equal;
+        let same_group = consolidated.last().is_some_and(|current| {
+            group_columns.is_empty()
+                || compare_group_keys(table, group_columns, current.key_row, partial.key_row)
+                    == Ordering::Equal
+        });
         if same_group {
-            merge_aggregates(&mut current.states, partial.states, aggregate_specs, table)?;
-            continue;
+            merge_aggregates(
+                &mut consolidated
+                    .last_mut()
+                    .expect("a matching consolidated group exists")
+                    .states,
+                partial.states,
+                aggregate_specs,
+                table,
+            )?;
+        } else {
+            consolidated.push(partial);
         }
-        push_partial_group(
-            &mut data,
-            current,
-            group_columns,
-            aggregate_specs,
-            table,
-            context,
-        )?;
-        current = partial;
     }
-    push_partial_group(
-        &mut data,
-        current,
-        group_columns,
-        aggregate_specs,
-        table,
-        context,
-    )?;
-    Ok(data)
+
+    let group_vector_memory = consolidated
+        .capacity()
+        .saturating_mul(size_of::<PartialGroup>());
+    let retained_memory = consolidated
+        .iter()
+        .map(PartialGroup::heap_memory_bytes)
+        .fold(group_vector_memory, usize::saturating_add);
+    context.adjust_memory_reservation(reservation, retained_memory)?;
+
+    let mut data = GroupedData::default();
+    let outcome = (|| {
+        for group in consolidated {
+            let group_memory = group.heap_memory_bytes();
+            push_partial_group(
+                &mut data,
+                group,
+                group_columns,
+                aggregate_specs,
+                table,
+                context,
+            )?;
+            context.release_memory(group_memory);
+        }
+        Ok(data)
+    })();
+    context.release_memory(group_vector_memory);
+    outcome
 }
 
 fn aggregate_morsel(
@@ -1660,6 +1697,19 @@ impl AggregateState {
                 sum: ExactFloatSum::new(),
                 count: 0,
             },
+        }
+    }
+
+    fn heap_memory_bytes(&self) -> usize {
+        match self {
+            Self::SumFloat(sum) | Self::AvgFloat { sum, .. } => {
+                sum.bins.capacity().saturating_mul(size_of::<(i16, i128)>())
+            }
+            Self::Count(_)
+            | Self::SumInt(_)
+            | Self::Min(_)
+            | Self::Max(_)
+            | Self::AvgInt { .. } => 0,
         }
     }
 
@@ -2689,6 +2739,75 @@ mod tests {
                     "query differed with {worker_count} workers: {statement}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn large_projection_succeeds_across_worker_counts_under_default_limits() {
+        let row_count = 700_000;
+        let mut database = Database::with_worker_count(1).expect("valid worker count");
+        database
+            .execute("CREATE TABLE large_projection (id Int64);")
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("large_projection")
+            .expect("table exists");
+        for row in 0..row_count {
+            table
+                .insert_row(vec![Value::Int64(row as i64)])
+                .expect("generated row is valid");
+        }
+
+        for worker_count in [1, MAX_SCAN_WORKERS] {
+            database
+                .set_worker_count(worker_count)
+                .expect("valid worker count");
+            let result = query(&mut database, "SELECT id FROM large_projection;");
+            assert_eq!(result.rows.len(), row_count);
+            assert_eq!(result.rows[0], vec![Value::Int64(0)]);
+            assert_eq!(
+                result.rows[row_count - 1],
+                vec![Value::Int64(row_count as i64 - 1)]
+            );
+            assert!(
+                database.last_execution_stats().peak_memory_bytes
+                    <= ExecutionLimits::default().max_memory_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_memory_success_is_monotonic_across_parallel_plan_threshold() {
+        let row_count = 5_000;
+        let mut database = Database::with_worker_count(4).expect("valid worker count");
+        database
+            .execute("CREATE TABLE threshold_groups (id Int64);")
+            .expect("create table");
+        let table = database
+            .catalog
+            .table_mut("threshold_groups")
+            .expect("table exists");
+        for row in 0..row_count {
+            table
+                .insert_row(vec![Value::Int64(row as i64)])
+                .expect("generated row is valid");
+        }
+
+        for max_memory_bytes in (4_700_000..=5_500_000).step_by(100_000) {
+            database.set_limits(ExecutionLimits {
+                max_memory_bytes,
+                ..ExecutionLimits::default()
+            });
+            let result = query(
+                &mut database,
+                "SELECT id, COUNT(*) FROM threshold_groups GROUP BY id;",
+            );
+            assert_eq!(result.rows.len(), row_count, "limit {max_memory_bytes}");
+            assert!(
+                database.last_execution_stats().peak_memory_bytes <= max_memory_bytes,
+                "limit {max_memory_bytes}"
+            );
         }
     }
 
