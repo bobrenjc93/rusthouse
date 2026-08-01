@@ -30,8 +30,10 @@ static FAIL_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
 #[derive(Debug)]
 pub(crate) enum StoreStatus {
     Durable,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     PublishedWithError(Error),
+    #[cfg(windows)]
+    RecoveryRequired(Error),
 }
 
 #[cfg(all(test, unix))]
@@ -279,8 +281,7 @@ fn replace_snapshot(temporary: &Path, destination: &Path, parent: &Path) -> Resu
 
 #[cfg(windows)]
 fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<StoreStatus> {
-    windows::replace_snapshot(temporary, destination)?;
-    Ok(StoreStatus::Durable)
+    windows::replace_snapshot(temporary, destination)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -289,14 +290,64 @@ fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Res
     Ok(StoreStatus::Durable)
 }
 
+#[cfg(any(test, windows))]
+#[derive(Debug)]
+enum WindowsRecoveryOutcome {
+    OriginalRestored,
+    CandidatePublished {
+        restore_error: std::io::Error,
+    },
+    ManualRecoveryRequired {
+        restore_error: std::io::Error,
+        publish_error: std::io::Error,
+    },
+}
+
+#[cfg(any(test, windows))]
+const WINDOWS_ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
+#[cfg(any(test, windows))]
+const WINDOWS_ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+
+#[cfg(any(test, windows))]
+fn windows_replacement_relocated_original(error_code: i32) -> bool {
+    match error_code {
+        WINDOWS_ERROR_UNABLE_TO_MOVE_REPLACEMENT => false,
+        WINDOWS_ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 => true,
+        _ => false,
+    }
+}
+
+#[cfg(any(test, windows))]
+fn recover_relocated_windows_snapshot<R, P>(restore: R, publish: P) -> WindowsRecoveryOutcome
+where
+    R: FnOnce() -> std::io::Result<()>,
+    P: FnOnce() -> std::io::Result<()>,
+{
+    match restore() {
+        Ok(()) => WindowsRecoveryOutcome::OriginalRestored,
+        Err(restore_error) => match publish() {
+            Ok(()) => WindowsRecoveryOutcome::CandidatePublished { restore_error },
+            Err(publish_error) => WindowsRecoveryOutcome::ManualRecoveryRequired {
+                restore_error,
+                publish_error,
+            },
+        },
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use std::ffi::c_void;
+    use std::fs;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::ptr;
 
+    use super::{
+        StoreStatus, WindowsRecoveryOutcome, recover_relocated_windows_snapshot,
+        windows_replacement_relocated_original,
+    };
     use crate::error::{Error, Result};
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -315,42 +366,95 @@ mod windows {
         ) -> i32;
     }
 
-    pub(super) fn replace_snapshot(temporary: &Path, destination: &Path) -> Result<()> {
-        let destination_exists = destination.exists();
-        let temporary = wide_path(temporary)?;
-        let destination = wide_path(destination)?;
+    pub(super) fn replace_snapshot(
+        temporary_path: &Path,
+        destination_path: &Path,
+    ) -> Result<StoreStatus> {
+        let backup_path = backup_path(temporary_path);
+        let destination_exists = destination_path.exists();
+        let temporary = wide_path(temporary_path)?;
+        let destination = wide_path(destination_path)?;
+        let backup = wide_path(&backup_path)?;
         if destination_exists {
             // ReplaceFileW retains the replaced file's ACL and other security metadata.
             let replaced = unsafe {
                 ReplaceFileW(
                     destination.as_ptr(),
                     temporary.as_ptr(),
-                    ptr::null(),
+                    backup.as_ptr(),
                     0,
                     ptr::null_mut(),
                     ptr::null_mut(),
                 )
             };
             if replaced != 0 {
-                return Ok(());
+                let _ = fs::remove_file(&backup_path);
+                return Ok(StoreStatus::Durable);
             }
             let error = io::Error::last_os_error();
+            if error
+                .raw_os_error()
+                .is_some_and(windows_replacement_relocated_original)
+            {
+                let replace_message = error.to_string();
+                return match recover_relocated_windows_snapshot(
+                    || move_file_write_through(&backup, &destination),
+                    || move_file_write_through(&temporary, &destination),
+                ) {
+                    WindowsRecoveryOutcome::OriginalRestored => {
+                        Err(Error::io("replace snapshot", error))
+                    }
+                    WindowsRecoveryOutcome::CandidatePublished { restore_error } => {
+                        Ok(StoreStatus::PublishedWithError(Error::Io {
+                            operation: "recover partial Windows snapshot replacement",
+                            message: format!(
+                                "ReplaceFileW failed ({replace_message}); restoring the old snapshot failed ({restore_error}); the candidate was published and the old snapshot remains at {}",
+                                backup_path.display()
+                            ),
+                        }))
+                    }
+                    WindowsRecoveryOutcome::ManualRecoveryRequired {
+                        restore_error,
+                        publish_error,
+                    } => Ok(StoreStatus::RecoveryRequired(Error::Io {
+                        operation: "recover partial Windows snapshot replacement",
+                        message: format!(
+                            "ReplaceFileW failed ({replace_message}); restoring {} failed ({restore_error}); publishing {} failed ({publish_error}); both recovery files were retained",
+                            backup_path.display(),
+                            temporary_path.display()
+                        ),
+                    })),
+                };
+            }
             if error.kind() != io::ErrorKind::NotFound {
                 return Err(Error::io("replace snapshot", error));
             }
         }
 
+        move_file_write_through(&temporary, &destination)
+            .map_err(|error| Error::io("replace snapshot", error))?;
+        Ok(StoreStatus::Durable)
+    }
+
+    fn backup_path(temporary: &Path) -> std::path::PathBuf {
+        let mut backup = temporary.as_os_str().to_os_string();
+        backup.push(".backup");
+        backup.into()
+    }
+
+    fn move_file_write_through(existing: &[u16], new: &[u16]) -> io::Result<()> {
         let moved = unsafe {
             MoveFileExW(
-                temporary.as_ptr(),
-                destination.as_ptr(),
+                existing.as_ptr(),
+                new.as_ptr(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
             )
         };
         if moved == 0 {
-            return Err(Error::io("replace snapshot", io::Error::last_os_error()));
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     fn wide_path(path: &Path) -> Result<Vec<u16>> {
@@ -954,6 +1058,25 @@ fn checksum(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    fn recovery_paths(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "rusthouse-windows-recovery-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        (
+            base.with_extension("destination"),
+            base.with_extension("candidate"),
+            base.with_extension("backup"),
+        )
+    }
+
+    fn remove_recovery_files(paths: &[&Path]) {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+
     #[test]
     fn snapshot_shape_limits_are_inclusive() {
         let decoder = Decoder::with_allocation(&[], 0).unwrap();
@@ -1031,5 +1154,71 @@ mod tests {
             Err(Error::CorruptSnapshot(message))
                 if message.contains("non-nullable column contains NULL")
         ));
+    }
+
+    #[test]
+    fn windows_partial_replace_error_codes_have_safe_layouts() {
+        assert!(!windows_replacement_relocated_original(1176));
+        assert!(windows_replacement_relocated_original(1177));
+    }
+
+    #[test]
+    fn windows_partial_replace_restores_old_snapshot_first() {
+        let (destination, candidate, backup) = recovery_paths("restore");
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::write(&backup, b"old").unwrap();
+
+        let outcome = recover_relocated_windows_snapshot(
+            || fs::rename(&backup, &destination),
+            || -> std::io::Result<()> { panic!("candidate fallback must not run") },
+        );
+        assert!(matches!(outcome, WindowsRecoveryOutcome::OriginalRestored));
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        assert_eq!(fs::read(&candidate).unwrap(), b"candidate");
+        remove_recovery_files(&[&destination, &candidate, &backup]);
+    }
+
+    #[test]
+    fn windows_partial_replace_publishes_candidate_if_restore_fails() {
+        let (destination, candidate, backup) = recovery_paths("publish");
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::write(&backup, b"old").unwrap();
+
+        let outcome = recover_relocated_windows_snapshot(
+            || Err(std::io::Error::other("injected restore failure")),
+            || fs::rename(&candidate, &destination),
+        );
+        let WindowsRecoveryOutcome::CandidatePublished { restore_error } = outcome else {
+            panic!("expected candidate publication");
+        };
+        assert_eq!(restore_error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(fs::read(&destination).unwrap(), b"candidate");
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
+        remove_recovery_files(&[&destination, &candidate, &backup]);
+    }
+
+    #[test]
+    fn windows_partial_replace_retains_both_files_if_recovery_fails() {
+        let (destination, candidate, backup) = recovery_paths("manual");
+        fs::write(&candidate, b"candidate").unwrap();
+        fs::write(&backup, b"old").unwrap();
+
+        let outcome = recover_relocated_windows_snapshot(
+            || Err(std::io::Error::other("injected restore failure")),
+            || Err(std::io::Error::other("injected publish failure")),
+        );
+        let WindowsRecoveryOutcome::ManualRecoveryRequired {
+            restore_error,
+            publish_error,
+        } = outcome
+        else {
+            panic!("expected retained recovery files");
+        };
+        assert_eq!(restore_error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(publish_error.kind(), std::io::ErrorKind::Other);
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&candidate).unwrap(), b"candidate");
+        assert_eq!(fs::read(&backup).unwrap(), b"old");
+        remove_recovery_files(&[&destination, &candidate, &backup]);
     }
 }

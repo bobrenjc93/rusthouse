@@ -46,6 +46,7 @@ pub enum Error {
         generation: u64,
         message: String,
     },
+    CommitRecoveryRequired(String),
     GenerationOverflow,
     CorruptSnapshot(String),
     SnapshotTooLarge {
@@ -126,6 +127,12 @@ impl fmt::Display for Error {
                 f,
                 "generation {generation} was published but its durability is uncertain: {message}"
             ),
+            Self::CommitRecoveryRequired(message) => {
+                write!(
+                    f,
+                    "commit was not published and requires recovery: {message}"
+                )
+            }
             Self::GenerationOverflow => f.write_str("catalog generation counter overflowed"),
             Self::CorruptSnapshot(message) => write!(f, "corrupt snapshot: {message}"),
             Self::SnapshotTooLarge { size, maximum } => write!(

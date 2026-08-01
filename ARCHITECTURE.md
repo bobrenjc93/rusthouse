@@ -30,6 +30,8 @@ post-rename sync error is reported as durability-uncertain after the in-memory h
 advanced, preventing a published generation from being retried as an active transaction. Windows uses
 native replacement calls: `ReplaceFileW` retains security metadata for existing files,
 while `MoveFileExW` provides write-through first publication without an invalid
-directory-sync step.
+directory-sync step. Replacement always supplies a unique backup name; documented
+partial-move failures restore the old file, fall back to publishing the candidate, or
+retain both artifacts and report manual recovery rather than deleting either snapshot.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.

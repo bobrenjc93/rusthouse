@@ -209,14 +209,23 @@ impl DatabaseInner {
         } else {
             StoreStatus::Durable
         };
-        state.head = Arc::new(candidate);
         match store_status {
-            StoreStatus::Durable => Ok(id),
-            #[cfg(unix)]
-            StoreStatus::PublishedWithError(error) => Err(Error::CommitDurabilityUncertain {
-                generation: id,
-                message: error.to_string(),
-            }),
+            StoreStatus::Durable => {
+                state.head = Arc::new(candidate);
+                Ok(id)
+            }
+            #[cfg(any(unix, windows))]
+            StoreStatus::PublishedWithError(error) => {
+                state.head = Arc::new(candidate);
+                Err(Error::CommitDurabilityUncertain {
+                    generation: id,
+                    message: error.to_string(),
+                })
+            }
+            #[cfg(windows)]
+            StoreStatus::RecoveryRequired(error) => {
+                Err(Error::CommitRecoveryRequired(error.to_string()))
+            }
         }
     }
 }

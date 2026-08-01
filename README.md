@@ -60,7 +60,10 @@ and FreeBSD), followed by a parent-directory sync. If that final sync fails, the
 returns `Error::CommitDurabilityUncertain` but installs the already-published generation
 in memory and ends the transaction. Windows uses `ReplaceFileW` for existing
 snapshots so ACL/security metadata is retained, and write-through `MoveFileExW` for
-first publication; it never attempts POSIX directory syncing.
+first publication; it never attempts POSIX directory syncing. `ReplaceFileW` receives
+a unique backup path. On its partial-move error, RustHouse restores the old snapshot
+first, otherwise publishes the candidate, and retains both recovery files if neither
+operation succeeds. Generic error cleanup therefore never deletes the only snapshot.
 
 `Database::execute` is only for one-shot autocommit DDL, DML, and queries. Transaction
 control requires a persistent session returned by `Database::session`.
