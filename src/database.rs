@@ -614,12 +614,31 @@ fn execute_virtual_rows<'a>(
             let projected_value_bytes = projection.iter().fold(0_usize, |bytes, column| {
                 bytes.saturating_add(value_owned_bytes(&row[*column]))
             });
-            let retained_row_bytes =
-                std::mem::size_of::<Vec<Value>>().saturating_add(projected_value_bytes);
-            let required = temporary_required.saturating_add(retained_row_bytes);
+            let old_capacity = output_rows.capacity();
+            let target_capacity =
+                next_virtual_row_capacity(old_capacity, output_rows.len().saturating_add(1));
+            let predicted_outer_growth = target_capacity
+                .saturating_sub(old_capacity)
+                .saturating_mul(std::mem::size_of::<Vec<Value>>());
+            let predicted_required = temporary_required
+                .saturating_add(predicted_outer_growth)
+                .saturating_add(projected_value_bytes);
+            enforce_result_limit(control, predicted_required)?;
+            if target_capacity > old_capacity {
+                output_rows.reserve_exact(target_capacity.saturating_sub(output_rows.len()));
+            }
+            let actual_outer_growth = output_rows
+                .capacity()
+                .saturating_sub(old_capacity)
+                .saturating_mul(std::mem::size_of::<Vec<Value>>());
+            let required = temporary_required
+                .saturating_add(actual_outer_growth)
+                .saturating_add(projected_value_bytes);
             enforce_result_limit(control, required)?;
             set_peak_memory(control, required);
-            result_bytes = result_bytes.saturating_add(retained_row_bytes);
+            result_bytes = result_bytes
+                .saturating_add(actual_outer_growth)
+                .saturating_add(projected_value_bytes);
             add_scan(control, 0, projected_value_bytes);
             output_rows.push(
                 projection
@@ -638,6 +657,16 @@ fn execute_virtual_rows<'a>(
         columns,
         rows: output_rows,
     }))
+}
+
+fn next_virtual_row_capacity(current: usize, required: usize) -> usize {
+    if required <= current {
+        return current;
+    }
+    if current == 0 {
+        return required.max(4);
+    }
+    current.saturating_mul(2).max(required)
 }
 
 fn decimal_len(mut value: u64) -> usize {
@@ -1386,6 +1415,66 @@ mod system_table_resource_tests {
             database.execute_controlled("SELECT name FROM system.tables", 128, &cancellation,),
             Err(Error::MemoryLimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn virtual_result_accounts_for_outer_capacity_at_growth_boundaries() {
+        let cancellation = CancelAfterChecks {
+            checks: AtomicUsize::new(0),
+            allowed_checks: usize::MAX,
+        };
+        for row_count in [1_usize, 4, 5, 8, 9] {
+            let expected_capacity = row_count.next_power_of_two().max(4);
+            let column_bytes = std::mem::size_of::<ColumnDef>() + "value".len();
+            let temporary_bytes = std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>();
+            let exact_limit = column_bytes
+                + expected_capacity * std::mem::size_of::<Vec<Value>>()
+                + row_count * std::mem::size_of::<Value>()
+                + temporary_bytes;
+            let control = Some(ExecutionControl {
+                max_result_bytes: exact_limit,
+                cancellation: &cancellation,
+                observation: None,
+            });
+            let result = execute_virtual_rows(
+                vec![int_column("value")],
+                (0..row_count).map(|value| {
+                    vec![VirtualValue::Int64(
+                        i64::try_from(value).expect("test row fits in i64"),
+                    )]
+                }),
+                None,
+                Vec::new(),
+                control,
+                0,
+            )
+            .unwrap()
+            .into_result_set()
+            .unwrap();
+            assert_eq!(result.rows.len(), row_count);
+            assert_eq!(result.rows.capacity(), expected_capacity);
+
+            let too_small = Some(ExecutionControl {
+                max_result_bytes: exact_limit - 1,
+                cancellation: &cancellation,
+                observation: None,
+            });
+            assert!(matches!(
+                execute_virtual_rows(
+                    vec![int_column("value")],
+                    (0..row_count).map(|value| {
+                        vec![VirtualValue::Int64(
+                            i64::try_from(value).expect("test row fits in i64"),
+                        )]
+                    }),
+                    None,
+                    Vec::new(),
+                    too_small,
+                    0,
+                ),
+                Err(Error::MemoryLimitExceeded { .. })
+            ));
+        }
     }
 }
 

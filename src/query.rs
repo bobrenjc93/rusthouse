@@ -6,8 +6,9 @@ use std::{
     io::{self, Write},
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU8, AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
     time::Instant,
 };
@@ -20,6 +21,8 @@ use crate::{Database, Error, ResultSet, StatementResult, Value, database::Execut
 const EXECUTION_ACTIVE: u8 = 0;
 const EXECUTION_CANCELLED: u8 = 1;
 const EXECUTION_PUBLISHING: u8 = 2;
+const QUERY_LOG_CHANNEL_CAPACITY: usize = 1_024;
+static QUERY_LOG_SENDER: OnceLock<SyncSender<Vec<u8>>> = OnceLock::new();
 
 /// Maximum number of per-query records retained for inspection at once.
 pub const MAX_ACTIVE_QUERY_ENTRIES: usize = 1_024;
@@ -415,24 +418,13 @@ struct QueryLog<'a> {
 }
 
 fn write_query_log(snapshot: &ActiveQuerySnapshot, succeeded: bool) {
-    let stderr = io::stderr();
-    let mut writer = stderr.lock();
-    write_query_log_ignoring_errors(&mut writer, snapshot, succeeded);
+    let Some(line) = serialize_query_log(snapshot, succeeded) else {
+        return;
+    };
+    let _ = query_log_sender().try_send(line);
 }
 
-fn write_query_log_ignoring_errors(
-    writer: &mut impl Write,
-    snapshot: &ActiveQuerySnapshot,
-    succeeded: bool,
-) {
-    let _ = write_query_log_to(writer, snapshot, succeeded);
-}
-
-fn write_query_log_to(
-    writer: &mut impl Write,
-    snapshot: &ActiveQuerySnapshot,
-    succeeded: bool,
-) -> io::Result<()> {
+fn serialize_query_log(snapshot: &ActiveQuerySnapshot, succeeded: bool) -> Option<Vec<u8>> {
     let log = QueryLog {
         event: "query_finished",
         outcome: if snapshot.cancelled {
@@ -444,9 +436,29 @@ fn write_query_log_to(
         },
         query: snapshot,
     };
-    let line = serde_json::to_vec(&log).map_err(io::Error::other)?;
-    writer.write_all(&line)?;
-    writer.write_all(b"\n")
+    let mut line = serde_json::to_vec(&log).ok()?;
+    line.push(b'\n');
+    Some(line)
+}
+
+fn query_log_sender() -> &'static SyncSender<Vec<u8>> {
+    QUERY_LOG_SENDER.get_or_init(|| spawn_query_logger(io::stderr(), QUERY_LOG_CHANNEL_CAPACITY))
+}
+
+fn spawn_query_logger(sink: impl Write + Send + 'static, capacity: usize) -> SyncSender<Vec<u8>> {
+    let (sender, receiver) = sync_channel(capacity);
+    let _ = std::thread::Builder::new()
+        .name("rusthouse-query-log".to_owned())
+        .spawn(move || query_log_worker(receiver, sink));
+    sender
+}
+
+fn query_log_worker(receiver: Receiver<Vec<u8>>, mut sink: impl Write) {
+    while let Ok(line) = receiver.recv() {
+        if sink.write_all(&line).is_err() {
+            break;
+        }
+    }
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -917,7 +929,8 @@ impl From<Error> for QueryError {
 #[cfg(test)]
 mod observability_tests {
     use std::io;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
 
     use super::*;
 
@@ -1023,11 +1036,20 @@ mod observability_tests {
         }
     }
 
-    struct FailingSink;
+    struct NonDrainingSink {
+        started: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        released: bool,
+    }
 
-    impl io::Write for FailingSink {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed log pipe"))
+    impl io::Write for NonDrainingSink {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if !self.released {
+                let _ = self.started.try_send(());
+                self.release.recv().unwrap();
+                self.released = true;
+            }
+            Ok(buffer.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -1036,7 +1058,7 @@ mod observability_tests {
     }
 
     #[test]
-    fn query_logging_ignores_sink_errors_without_panicking() {
+    fn query_logging_drops_on_a_full_channel_without_waiting_for_the_sink() {
         let snapshot = ActiveQuerySnapshot {
             query_id: 9,
             query: "CREATE TABLE committed (id Int64)".to_owned(),
@@ -1048,10 +1070,28 @@ mod observability_tests {
             spill_bytes: 0,
             cancelled: false,
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            write_query_log_ignoring_errors(&mut FailingSink, &snapshot, true);
-        }));
-        assert!(result.is_ok());
+        let line = serialize_query_log(&snapshot, true).unwrap();
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let sender = spawn_query_logger(
+            NonDrainingSink {
+                started: started_sender,
+                release: release_receiver,
+                released: false,
+            },
+            1,
+        );
+
+        sender.try_send(line.clone()).unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        sender.try_send(line.clone()).unwrap();
+        assert!(matches!(
+            sender.try_send(line),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        release_sender.send(()).unwrap();
     }
 }
 

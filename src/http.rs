@@ -591,8 +591,47 @@ async fn readiness(State(state): State<Arc<HttpState>>) -> Response {
 
 async fn metrics(State(state): State<Arc<HttpState>>) -> Response {
     let request_id = state.next_request_id();
-    match state.service.observability() {
-        Some(snapshot) => json_response(StatusCode::OK, request_id, &snapshot),
+    let _request_permit = match state.request_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::request_overloaded(state.config.max_concurrent_requests)
+                .into_response(request_id);
+        }
+    };
+    let query_permit = match state.query_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::overloaded(state.config.max_concurrent_queries)
+                .into_response(request_id);
+        }
+    };
+    let service = Arc::clone(&state.service);
+    let response_limit = state.config.max_response_bytes;
+    let task = tokio::task::spawn_blocking(move || {
+        let result = service
+            .observability()
+            .map(|snapshot| serialize_json_value(&snapshot, response_limit));
+        (query_permit, result)
+    });
+    let (query_permit, result) = match task.await {
+        Ok(output) => output,
+        Err(error) => {
+            return ApiError::blocking_task_failed("metrics serialization", error)
+                .into_response(request_id);
+        }
+    };
+    drop(query_permit);
+    match result {
+        Some(Ok(bytes)) => {
+            let mut response = Response::new(Body::from(bytes));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            insert_common_headers(&mut response, request_id);
+            response
+        }
+        Some(Err(error)) => error.into_response(request_id),
         None => ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
             "observability_unavailable",
@@ -1040,6 +1079,17 @@ fn serialize_result(
     }
     serialization
         .map_err(|error| ApiError::internal(format!("could not encode result: {error}")))?;
+    Ok(writer.bytes)
+}
+
+fn serialize_json_value(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, ApiError> {
+    let mut writer = LimitedWriter::new(limit);
+    let serialization = serde_json::to_writer(&mut writer, value);
+    if writer.exceeded {
+        return Err(ApiError::response_too_large(limit));
+    }
+    serialization
+        .map_err(|error| ApiError::internal(format!("could not encode metrics: {error}")))?;
     Ok(writer.bytes)
 }
 

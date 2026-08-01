@@ -32,6 +32,8 @@ Catalog metadata is streamed into the result rather than materialized as an inte
 Cancellation is checked before every metadata row, and the query result limit covers each
 temporary row together with already retained output. Table logical size is maintained when data is
 loaded or appended, so reading `system.tables` or `system.segments` does not traverse stored values.
+Result accounting charges the actual outer row-vector capacity, including spare slots created at
+geometric growth boundaries.
 
 `ordinal_position` is one-based. Integer values that exceed SQL `Int64` saturate at `Int64::MAX`;
 `query_id` is a decimal string so the full unsigned HTTP request ID remains representable.
@@ -54,9 +56,10 @@ that bound is exceeded, `tracked_active_queries` reports retained records, and
 
 ## Metrics and logs
 
-`GET /metrics` returns `application/json` with `active_queries` and `engine_metrics`. The active
-query objects use the same fields and bounds as `system.active_queries`. Engine metrics have these
-stable fields:
+`GET /metrics` returns `application/json` with `active_queries` and `engine_metrics`. Scrapes share
+the HTTP request and query admission limits, serialize on a blocking worker, and cannot exceed
+`max_response_bytes`. The active query objects use the same fields and bounds as
+`system.active_queries`. Engine metrics have these stable fields:
 
 - `active_queries` and `tracked_active_queries` are current gauges.
 - `queries_total`, `queries_succeeded_total`, `queries_failed_total`, and
@@ -70,8 +73,9 @@ Each query executed through `QueryService` also emits one JSON line to standard 
 `event: "query_finished"`, an `outcome` of `succeeded`, `failed`, or `cancelled`, and the same
 bounded query fields. Logs describe engine completion; HTTP result encoding can still fail
 afterward. SQL can contain sensitive literals, so operators must protect standard-error output as
-they protect query traffic. Log serialization and sink failures are best-effort and never change a
-query or mutation outcome.
+they protect query traffic. Serialized lines enter a nonblocking 1,024-entry channel serviced by a
+detached writer; full-channel, serialization, and sink failures drop log records and never change a
+query, mutation, or shutdown outcome.
 
 The endpoint and tables expose no labels derived from SQL, table names, or query IDs in aggregate
 metrics. Per-query cardinality is bounded to 1,024 records. Metadata cardinality is one row per
