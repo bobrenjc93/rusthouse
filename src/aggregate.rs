@@ -61,20 +61,31 @@ fn execute_global_with_block_size(
 ) -> Result<Vec<Value>> {
     assert!(block_size > 0, "aggregate block size must be non-zero");
 
-    let count =
-        i64::try_from(table.row_count()).map_err(|_| Error::NumericOverflow("COUNT".to_owned()))?;
+    let count = i64::try_from(table.row_count()).ok();
     let mut outputs = std::iter::repeat_with(|| None)
         .take(specs.len())
         .collect::<Vec<Option<Result<Value>>>>();
-    let plans = build_source_plans(specs, &mut outputs, count);
+    let mut overflows = Vec::new();
+    let plans = build_source_plans(specs, &mut outputs, count, &mut overflows);
 
     for plan in &plans {
         match &table.columns()[plan.source] {
-            Column::Int64(values) => execute_int64(values, plan, block_size, &mut outputs)?,
-            Column::Float64(values) => execute_float64(values, plan, block_size, &mut outputs)?,
+            Column::Int64(values) => {
+                execute_int64(values, plan, block_size, &mut outputs, &mut overflows);
+            }
+            Column::Float64(values) => {
+                execute_float64(values, plan, block_size, &mut outputs, &mut overflows);
+            }
             Column::Bool(values) => execute_bool(values, plan, block_size, &mut outputs),
             Column::String(values) => execute_string(values, plan, block_size, &mut outputs),
         }
+    }
+
+    if let Some(overflow) = overflows
+        .into_iter()
+        .min_by_key(|overflow| (overflow.row, overflow.output))
+    {
+        return Err(Error::NumericOverflow(overflow.operation.to_owned()));
     }
 
     outputs
@@ -116,15 +127,32 @@ struct SourcePlan {
     requested: Vec<RequestedOperation>,
 }
 
+#[derive(Debug)]
+struct OverflowAt {
+    row: usize,
+    output: usize,
+    operation: &'static str,
+}
+
 fn build_source_plans(
     specs: &[AggregateSpec],
     outputs: &mut [Option<Result<Value>>],
-    count: i64,
+    count: Option<i64>,
+    overflows: &mut Vec<OverflowAt>,
 ) -> Vec<SourcePlan> {
     let mut plans = Vec::<SourcePlan>::new();
     for (output, spec) in specs.iter().enumerate() {
         if spec.function == AggregateFunction::Count {
-            outputs[output] = Some(Ok(Value::Int64(count)));
+            if let Some(count) = count {
+                outputs[output] = Some(Ok(Value::Int64(count)));
+            } else {
+                outputs[output] = Some(Err(Error::NumericOverflow("COUNT".to_owned())));
+                overflows.push(OverflowAt {
+                    row: usize::try_from(i64::MAX).unwrap_or(usize::MAX),
+                    output,
+                    operation: "COUNT",
+                });
+            }
             continue;
         }
 
@@ -148,32 +176,66 @@ fn build_source_plans(
     plans
 }
 
+fn record_overflow(
+    plan: &SourcePlan,
+    row: usize,
+    function: AggregateFunction,
+    operation: &'static str,
+    overflows: &mut Vec<OverflowAt>,
+) {
+    if let Some(requested) = plan
+        .requested
+        .iter()
+        .find(|requested| requested.function == function)
+    {
+        overflows.push(OverflowAt {
+            row,
+            output: requested.output,
+            operation,
+        });
+    }
+}
+
 fn execute_int64(
     values: &[i64],
     plan: &SourcePlan,
     block_size: usize,
     outputs: &mut [Option<Result<Value>>],
-) -> Result<()> {
+    overflows: &mut Vec<OverflowAt>,
+) {
     let mut sum = 0_i64;
+    let mut sum_overflow = false;
     let mut avg_sum = 0_i128;
     let mut avg_count = 0_u64;
+    let mut avg_overflow = None;
     let mut min = None;
     let mut max = None;
+    let mut row = 0;
 
     for block in values.chunks(block_size) {
         for &value in block {
-            if plan.operations.sum {
-                sum = sum
-                    .checked_add(value)
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+            if plan.operations.sum && !sum_overflow {
+                if let Some(next) = sum.checked_add(value) {
+                    sum = next;
+                } else {
+                    sum_overflow = true;
+                    record_overflow(plan, row, AggregateFunction::Sum, "SUM(Int64)", overflows);
+                }
             }
-            if plan.operations.avg {
-                avg_sum = avg_sum
-                    .checked_add(i128::from(value))
-                    .ok_or_else(|| Error::NumericOverflow("AVG(Int64) sum".to_owned()))?;
-                avg_count = avg_count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            if plan.operations.avg && avg_overflow.is_none() {
+                if let Some(next) = avg_sum.checked_add(i128::from(value)) {
+                    avg_sum = next;
+                    if let Some(next) = avg_count.checked_add(1) {
+                        avg_count = next;
+                    } else {
+                        avg_overflow = Some("AVG count");
+                    }
+                } else {
+                    avg_overflow = Some("AVG(Int64) sum");
+                }
+                if let Some(operation) = avg_overflow {
+                    record_overflow(plan, row, AggregateFunction::Avg, operation, overflows);
+                }
             }
             update_ordered_extrema(
                 value,
@@ -182,23 +244,27 @@ fn execute_int64(
                 &mut min,
                 &mut max,
             );
+            row += 1;
         }
     }
 
     for requested in &plan.requested {
         let output = match requested.function {
+            AggregateFunction::Sum if sum_overflow => {
+                Err(Error::NumericOverflow("SUM(Int64)".to_owned()))
+            }
             AggregateFunction::Sum => Ok(Value::Int64(sum)),
             AggregateFunction::Min => min.map(Value::Int64).ok_or_else(empty_min_error),
             AggregateFunction::Max => max.map(Value::Int64).ok_or_else(empty_max_error),
-            AggregateFunction::Avg if avg_count > 0 => {
-                Ok(Value::Float64(avg_sum as f64 / avg_count as f64))
-            }
-            AggregateFunction::Avg => Err(empty_avg_error()),
+            AggregateFunction::Avg => match avg_overflow {
+                Some(operation) => Err(Error::NumericOverflow(operation.to_owned())),
+                None if avg_count > 0 => Ok(Value::Float64(avg_sum as f64 / avg_count as f64)),
+                None => Err(empty_avg_error()),
+            },
             AggregateFunction::Count => unreachable!("COUNT is filled without a column scan"),
         };
         outputs[requested.output] = Some(output);
     }
-    Ok(())
 }
 
 fn execute_float64(
@@ -206,34 +272,40 @@ fn execute_float64(
     plan: &SourcePlan,
     block_size: usize,
     outputs: &mut [Option<Result<Value>>],
-) -> Result<()> {
+    overflows: &mut Vec<OverflowAt>,
+) {
     let needs_sum = plan.operations.sum || plan.operations.avg;
     let mut sum = 0.0_f64;
     let mut count = 0_u64;
+    let mut sum_overflow = false;
+    let mut count_overflow = false;
     let mut min = None;
     let mut max = None;
+    let mut row = 0;
 
     for block in values.chunks(block_size) {
         for &value in block {
-            if needs_sum {
+            if needs_sum && !sum_overflow {
                 sum += value;
                 if !sum.is_finite() {
-                    let operation = plan
-                        .requested
-                        .iter()
-                        .find_map(|requested| match requested.function {
-                            AggregateFunction::Sum => Some("SUM(Float64)"),
-                            AggregateFunction::Avg => Some("AVG(Float64) sum"),
-                            _ => None,
-                        })
-                        .expect("a floating-point sum was requested");
-                    return Err(Error::NumericOverflow(operation.to_owned()));
+                    sum_overflow = true;
+                    record_overflow(plan, row, AggregateFunction::Sum, "SUM(Float64)", overflows);
+                    record_overflow(
+                        plan,
+                        row,
+                        AggregateFunction::Avg,
+                        "AVG(Float64) sum",
+                        overflows,
+                    );
                 }
             }
-            if plan.operations.avg {
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
+            if plan.operations.avg && !sum_overflow && !count_overflow {
+                if let Some(next) = count.checked_add(1) {
+                    count = next;
+                } else {
+                    count_overflow = true;
+                    record_overflow(plan, row, AggregateFunction::Avg, "AVG count", overflows);
+                }
             }
             update_float_extrema(
                 value,
@@ -242,21 +314,30 @@ fn execute_float64(
                 &mut min,
                 &mut max,
             );
+            row += 1;
         }
     }
 
     for requested in &plan.requested {
         let output = match requested.function {
+            AggregateFunction::Sum if sum_overflow => {
+                Err(Error::NumericOverflow("SUM(Float64)".to_owned()))
+            }
             AggregateFunction::Sum => Ok(Value::Float64(sum)),
             AggregateFunction::Min => min.map(Value::Float64).ok_or_else(empty_min_error),
             AggregateFunction::Max => max.map(Value::Float64).ok_or_else(empty_max_error),
+            AggregateFunction::Avg if sum_overflow => {
+                Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()))
+            }
+            AggregateFunction::Avg if count_overflow => {
+                Err(Error::NumericOverflow("AVG count".to_owned()))
+            }
             AggregateFunction::Avg if count > 0 => Ok(Value::Float64(sum / count as f64)),
             AggregateFunction::Avg => Err(empty_avg_error()),
             AggregateFunction::Count => unreachable!("COUNT is filled without a column scan"),
         };
         outputs[requested.output] = Some(output);
     }
-    Ok(())
 }
 
 fn execute_bool(
@@ -596,7 +677,8 @@ mod tests {
         let mut slots = std::iter::repeat_with(|| None)
             .take(specs.len())
             .collect::<Vec<_>>();
-        let plans = build_source_plans(&specs, &mut slots, 3);
+        let mut overflows = Vec::new();
+        let plans = build_source_plans(&specs, &mut slots, Some(3), &mut overflows);
         assert_eq!(plans.len(), 4);
         assert_eq!(
             plans

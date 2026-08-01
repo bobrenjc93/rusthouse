@@ -412,6 +412,31 @@ fn global_numeric_overflow_matches_the_filtered_fallback() {
 }
 
 #[test]
+fn global_overflow_precedence_is_row_major_across_source_columns() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE overflow_order (a Float64, b Float64);
+             INSERT INTO overflow_order VALUES
+                (1.7976931348623157e308, 1.7976931348623157e308),
+                (-1.7976931348623157e308, 1.7976931348623157e308),
+                (1.7976931348623157e308, 0.0),
+                (1.7976931348623157e308, 0.0);",
+        )
+        .expect("setup succeeds");
+
+    let expected = Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
+    assert_eq!(
+        database.execute("SELECT AVG(a), SUM(b) FROM overflow_order"),
+        expected
+    );
+    assert_eq!(
+        database.execute("SELECT AVG(a), SUM(b) FROM overflow_order WHERE a = a"),
+        expected
+    );
+}
+
+#[test]
 fn failed_multi_row_insert_is_atomic_and_actionable() {
     let mut database = Database::new();
     database
