@@ -88,6 +88,15 @@ impl Value {
         }
     }
 
+    pub(crate) fn logical_bytes(&self) -> usize {
+        match self {
+            Self::Null => 0,
+            Self::Int64(_) | Self::Float64(_) => 8,
+            Self::Bool(_) => 1,
+            Self::String(value) => value.len(),
+        }
+    }
+
     /// Applies SQL CAST rules. NULL remains NULL, integer conversion truncates
     /// finite floats toward zero, and malformed or out-of-range values fail.
     pub fn cast_to(&self, target: DataType) -> Result<Self> {
@@ -224,4 +233,18 @@ pub(crate) fn compare_int_float(integer: i64, float: f64) -> Option<Ordering> {
         Ordering::Equal if float.fract() < 0.0 => Ordering::Greater,
         ordering => ordering,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+
+    #[test]
+    fn logical_bytes_are_independent_of_value_representation() {
+        assert_eq!(Value::Null.logical_bytes(), 0);
+        assert_eq!(Value::Int64(i64::MIN).logical_bytes(), 8);
+        assert_eq!(Value::Float64(f64::MAX).logical_bytes(), 8);
+        assert_eq!(Value::Bool(true).logical_bytes(), 1);
+        assert_eq!(Value::String("éx".to_owned()).logical_bytes(), 3);
+    }
 }

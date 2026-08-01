@@ -43,10 +43,12 @@ geometric growth boundaries.
 The phase values are `queued`, `parsing`, `planning`, `scanning`, and `publishing`. Elapsed time is
 monotonic milliseconds since engine execution began. Scanned rows count rows considered by an
 engine table scan. Scanned bytes count logical value bytes accessed by predicates and projections,
-not filesystem or compressed bytes. Peak memory is the largest accounted materialized-result size;
-allocator metadata and HTTP serialization buffers are excluded. Spill bytes are zero until an
-execution operator uses spill storage. `cancelled` changes as soon as the cooperative cancellation
-token is signalled, including while an engine worker is still unwinding.
+not filesystem or compressed bytes: `Int64` and `Float64` are 8 bytes, `Bool` is 1 byte,
+`String` is its UTF-8 byte length, and `NULL` is 0 bytes. Value-container and allocator overhead is
+excluded. Peak memory is the largest accounted materialized-result size; allocator metadata and
+HTTP serialization buffers are excluded. Spill bytes are zero until an execution operator uses
+spill storage. `cancelled` changes as soon as the cooperative cancellation token is signalled,
+including while an engine worker is still unwinding.
 
 Active query records retain at most 4,096 UTF-8 bytes of SQL without splitting a code point. The
 registry retains at most 1,024 records. `active_queries` remains the exact running-query gauge when

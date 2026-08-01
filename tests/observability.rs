@@ -159,6 +159,57 @@ async fn http_metrics_exposes_the_engine_snapshot() {
 }
 
 #[tokio::test]
+async fn scanned_bytes_use_logical_value_widths() {
+    let database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE scan_values (integer_value Int64 NULL, float_value Float64 NULL, bool_value Bool NULL, string_value String NULL)",
+        )
+        .unwrap();
+    database
+        .execute("INSERT INTO scan_values VALUES (1, 1.5, true, 'éx'), (NULL, NULL, NULL, NULL)")
+        .unwrap();
+    let server = spawn_http_server(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(database),
+        ServerConfig::default(),
+    )
+    .await
+    .unwrap();
+    let url = format!("http://{}", server.local_addr());
+    let client = Client::new();
+
+    let response = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body(
+            "SELECT string_value, float_value FROM scan_values WHERE integer_value = 1 AND bool_value = true",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let metrics = client
+        .get(format!("{url}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .json::<JsonValue>()
+        .await
+        .unwrap();
+    assert_eq!(metrics["engine_metrics"]["scanned_rows_total"], 2);
+    // The non-NULL row reads Int64 + Bool predicates and String + Float64 projections.
+    // The second row contains only NULL values, whose logical payload width is zero.
+    assert_eq!(
+        metrics["engine_metrics"]["scanned_bytes_total"],
+        8 + 1 + 3 + 8
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn http_metrics_enforces_response_size_limit() {
     let config = ServerConfig {
         max_response_bytes: 64,

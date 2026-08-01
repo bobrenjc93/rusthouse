@@ -604,15 +604,18 @@ fn execute_virtual_rows<'a>(
             .collect::<Vec<_>>();
 
         let predicate_bytes = predicates.iter().fold(0_usize, |bytes, (column, _, _)| {
-            bytes.saturating_add(value_owned_bytes(&row[*column]))
+            bytes.saturating_add(row[*column].logical_bytes())
         });
         add_scan(control, 1, predicate_bytes);
         if predicates
             .iter()
             .all(|(column, comparison, value)| compare(&row[*column], value, *comparison))
         {
-            let projected_value_bytes = projection.iter().fold(0_usize, |bytes, column| {
+            let projected_owned_bytes = projection.iter().fold(0_usize, |bytes, column| {
                 bytes.saturating_add(value_owned_bytes(&row[*column]))
+            });
+            let projected_logical_bytes = projection.iter().fold(0_usize, |bytes, column| {
+                bytes.saturating_add(row[*column].logical_bytes())
             });
             let old_capacity = output_rows.capacity();
             let target_capacity =
@@ -622,7 +625,7 @@ fn execute_virtual_rows<'a>(
                 .saturating_mul(std::mem::size_of::<Vec<Value>>());
             let predicted_required = temporary_required
                 .saturating_add(predicted_outer_growth)
-                .saturating_add(projected_value_bytes);
+                .saturating_add(projected_owned_bytes);
             enforce_result_limit(control, predicted_required)?;
             if target_capacity > old_capacity {
                 output_rows.reserve_exact(target_capacity.saturating_sub(output_rows.len()));
@@ -633,13 +636,13 @@ fn execute_virtual_rows<'a>(
                 .saturating_mul(std::mem::size_of::<Vec<Value>>());
             let required = temporary_required
                 .saturating_add(actual_outer_growth)
-                .saturating_add(projected_value_bytes);
+                .saturating_add(projected_owned_bytes);
             enforce_result_limit(control, required)?;
             set_peak_memory(control, required);
             result_bytes = result_bytes
                 .saturating_add(actual_outer_growth)
-                .saturating_add(projected_value_bytes);
-            add_scan(control, 0, projected_value_bytes);
+                .saturating_add(projected_owned_bytes);
+            add_scan(control, 0, projected_logical_bytes);
             output_rows.push(
                 projection
                     .iter()
@@ -1071,7 +1074,7 @@ fn execute_read_table_parts(
     for row in 0..table.row_count() {
         check_cancellation(control)?;
         let predicate_bytes = predicates.iter().fold(0_usize, |bytes, (column, _, _)| {
-            bytes.saturating_add(table.owned_value_bytes(row, *column))
+            bytes.saturating_add(table.logical_value_bytes(row, *column))
         });
         add_scan(control, 1, predicate_bytes);
         if predicates.iter().all(|(column, comparison, value)| {
@@ -1091,7 +1094,7 @@ fn execute_read_table_parts(
             enforce_result_limit(control, required)?;
             result_bytes = required;
             let projected_bytes = projection.iter().fold(0_usize, |bytes, column| {
-                bytes.saturating_add(table.owned_value_bytes(row, *column))
+                bytes.saturating_add(table.logical_value_bytes(row, *column))
             });
             add_scan(control, 0, projected_bytes);
             set_peak_memory(control, result_bytes);

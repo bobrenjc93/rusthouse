@@ -97,6 +97,15 @@ impl ColumnData {
             }
     }
 
+    fn logical_value_bytes(&self, index: usize) -> usize {
+        match self {
+            Self::Int64(values) => values[index].map_or(0, |_| 8),
+            Self::Float64(values) => values[index].map_or(0, |_| 8),
+            Self::Bool(values) => values[index].map_or(0, |_| 1),
+            Self::String(values) => values[index].as_ref().map_or(0, String::len),
+        }
+    }
+
     fn logical_bytes(&self) -> usize {
         match self {
             Self::Int64(values) => values
@@ -231,6 +240,10 @@ impl Table {
 
     pub(crate) fn owned_value_bytes(&self, row: usize, column: usize) -> usize {
         self.columns[column].owned_value_bytes(row)
+    }
+
+    pub(crate) fn logical_value_bytes(&self, row: usize, column: usize) -> usize {
+        self.columns[column].logical_value_bytes(row)
     }
 
     pub(crate) fn columns(&self) -> &[ColumnData] {
