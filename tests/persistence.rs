@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::{Database, Error, StatementResult, Value};
@@ -16,9 +16,13 @@ fn temporary_path(name: &str) -> PathBuf {
 
 fn remove_database(path: &PathBuf) {
     let _ = fs::remove_file(path);
+    let _ = fs::remove_file(lock_path(path));
+}
+
+fn lock_path(path: &Path) -> PathBuf {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".rusthouse-lock");
-    let _ = fs::remove_file(PathBuf::from(lock));
+    PathBuf::from(lock)
 }
 
 #[test]
@@ -80,6 +84,42 @@ fn a_persisted_path_has_one_exclusive_owner() {
     ));
     drop(next_owner);
     remove_database(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_symlink_cannot_redirect_ownership_to_the_database() {
+    use std::os::unix::fs::symlink;
+
+    let path = temporary_path("lock-symlink");
+    let database = Database::open(&path).unwrap();
+    database.execute("CREATE TABLE intact (id Int64)").unwrap();
+    drop(database);
+
+    let lock = lock_path(&path);
+    fs::remove_file(&lock).unwrap();
+    symlink(&path, &lock).unwrap();
+    assert!(matches!(
+        Database::open(&path),
+        Err(Error::UnsafeLockPath(_))
+    ));
+    fs::remove_file(&lock).unwrap();
+
+    let reopened = Database::open(&path).unwrap();
+    assert!(matches!(
+        reopened.execute("SELECT * FROM intact"),
+        Ok(StatementResult::Query(_))
+    ));
+    drop(reopened);
+    remove_database(&path);
+}
+
+#[test]
+fn database_open_requires_an_existing_parent_directory() {
+    let missing_parent = temporary_path("missing-parent");
+    let path = missing_parent.join("database.db");
+    assert!(matches!(Database::open(&path), Err(Error::Io { .. })));
+    assert!(!missing_parent.exists());
 }
 
 #[test]

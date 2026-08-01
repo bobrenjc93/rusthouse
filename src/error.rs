@@ -42,6 +42,7 @@ pub enum Error {
     },
     DatabaseAlreadyOpen(String),
     ReservedDatabasePath(String),
+    UnsafeLockPath(String),
     CommitDurabilityUncertain {
         generation: u64,
         message: String,
@@ -120,6 +121,9 @@ impl fmt::Display for Error {
                 f,
                 "database path uses the reserved internal-file namespace: {path}"
             ),
+            Self::UnsafeLockPath(path) => {
+                write!(f, "database lock path is not a regular file: {path}")
+            }
             Self::CommitDurabilityUncertain {
                 generation,
                 message,

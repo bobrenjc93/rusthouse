@@ -60,13 +60,7 @@ impl Persistence {
         let mut lock_name = path.as_os_str().to_os_string();
         lock_name.push(LOCK_SUFFIX);
         let lock_path = PathBuf::from(lock_name);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| Error::io("open database lock", error))?;
+        let lock = open_database_lock(&lock_path)?;
         match lock.try_lock() {
             Ok(()) => Ok(Self { path, _lock: lock }),
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -122,8 +116,6 @@ impl Persistence {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .map_err(|error| Error::io("create snapshot directory", error))?;
 
         let temporary = next_temporary_snapshot_path(parent);
 
@@ -133,6 +125,48 @@ impl Persistence {
         }
         result
     }
+}
+
+fn open_database_lock(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error)
+            if fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+        {
+            return Err(Error::UnsafeLockPath(path.display().to_string()));
+        }
+        Err(error) => return Err(Error::io("open database lock", error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io("inspect database lock", error))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| Error::io("inspect database lock path", error))?;
+    if !metadata.is_file() || !path_metadata.is_file() || path_metadata.file_type().is_symlink() {
+        return Err(Error::UnsafeLockPath(path.display().to_string()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+            return Err(Error::UnsafeLockPath(path.display().to_string()));
+        }
+    }
+    Ok(file)
 }
 
 fn next_temporary_snapshot_path(parent: &Path) -> PathBuf {
@@ -152,7 +186,6 @@ fn normalize_path(path: &Path) -> Result<PathBuf> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| Error::io("create database directory", error))?;
     let parent =
         fs::canonicalize(parent).map_err(|error| Error::io("resolve database directory", error))?;
     Ok(parent.join(file_name))
@@ -220,17 +253,8 @@ fn write_and_replace(
         file.sync_all()
             .map_err(|error| Error::io("sync snapshot permissions", error))?;
     }
-    #[cfg(not(windows))]
-    {
-        drop(file);
-        replace_snapshot(temporary, destination, parent)
-    }
-    #[cfg(windows)]
-    {
-        let result = replace_snapshot(temporary, destination, parent);
-        drop(file);
-        result
-    }
+    drop(file);
+    replace_snapshot(temporary, destination, parent)
 }
 
 #[cfg(unix)]

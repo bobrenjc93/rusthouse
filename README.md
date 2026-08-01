@@ -50,7 +50,10 @@ directory before publishing the generation to other sessions. A canonical databa
 path has one exclusive in-process or cross-process owner; a second `Database::open`
 returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are dropped.
 Locks use a reserved `.rusthouse-lock` namespace; database paths ending in that suffix
-are rejected so no database can replace another database's active lock inode.
+are rejected so no database can replace another database's active lock inode. Lock
+files are opened without following symlinks and must resolve to the inode opened by the
+handle. The database parent directory must already exist; RustHouse never creates a
+directory tree whose ancestor entries fall outside its durability barrier.
 Candidates and recovery backups use the reserved `.rusthouse-tmp.` filename prefix,
 which `Database::open` also rejects after canonicalizing the path. A concurrent database
 therefore cannot adopt or replace another database's pending snapshot.
@@ -63,7 +66,8 @@ and FreeBSD), followed by a parent-directory sync. If that final sync fails, the
 returns `Error::CommitDurabilityUncertain` but installs the already-published generation
 in memory and ends the transaction. Windows uses `ReplaceFileW` for existing
 snapshots so ACL/security metadata is retained, and write-through `MoveFileExW` for
-first publication; it never attempts POSIX directory syncing. `ReplaceFileW` receives
+first publication; the synced temp handle is closed before either native operation and
+Windows never attempts POSIX directory syncing. `ReplaceFileW` receives
 a unique backup path. On its partial-move error, RustHouse restores the old snapshot
 first, otherwise publishes the candidate, and retains both recovery files if neither
 operation succeeds. Generic error cleanup therefore never deletes the only snapshot.

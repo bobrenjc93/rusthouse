@@ -20,7 +20,9 @@ latest catalog. This is snapshot isolation rather than full serializable isolati
 Persistent databases encode a complete catalog generation in a versioned, checksummed
 snapshot. Publication uses a synced temporary file, atomic rename, and parent-directory
 sync. A canonical-path sidecar lock in a reserved filename namespace gives one database
-handle exclusive ownership across processes. Temporary candidates and backups use a
+handle exclusive ownership across processes. Lock opens do not follow symlinks and
+validate the opened regular-file identity. Database parent directories must preexist,
+so publication only needs to sync the directory containing the snapshot. Temporary candidates and backups use a
 separate reserved filename prefix that cannot be opened as a database. Encoding validates the same table, column, row, string, and total-allocation
 bounds that decoding enforces. The decoder charges raw bytes, catalog/map nodes, table
 and `Arc` storage, schema and column vectors, strings, column values, and conservative
@@ -31,7 +33,8 @@ post-rename sync error is reported as durability-uncertain after the in-memory h
 advanced, preventing a published generation from being retried as an active transaction. Windows uses
 native replacement calls: `ReplaceFileW` retains security metadata for existing files,
 while `MoveFileExW` provides write-through first publication without an invalid
-directory-sync step. Replacement always supplies a unique backup name; documented
+directory-sync step. The temp handle is closed before these calls so Windows can obtain
+the required unshared access. Replacement always supplies a unique backup name; documented
 partial-move failures restore the old file, fall back to publishing the candidate, or
 retain both artifacts and report manual recovery rather than deleting either snapshot.
 
