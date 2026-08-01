@@ -83,35 +83,42 @@ fn write_table(writer: &mut impl Write, result: &QueryResult) -> io::Result<()> 
 }
 
 fn write_json(writer: &mut impl Write, result: &QueryResult) -> io::Result<()> {
-    writer.write_all(b"[")?;
+    writer.write_all(b"{\"columns\":[")?;
+    for (index, column) in result.columns.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        write_json_string(writer, column)?;
+    }
+    writer.write_all(b"],\"rows\":[")?;
     for (row_index, row) in result.rows.iter().enumerate() {
         if row_index > 0 {
             writer.write_all(b",")?;
         }
-        writer.write_all(b"{")?;
-        for (column_index, (column, value)) in result.columns.iter().zip(row).enumerate() {
-            if column_index > 0 {
+        writer.write_all(b"[")?;
+        for (value_index, value) in row.iter().enumerate() {
+            if value_index > 0 {
                 writer.write_all(b",")?;
             }
-            write_json_string(writer, column)?;
-            writer.write_all(b":")?;
-            match value {
-                Value::Null => writer.write_all(b"null")?,
-                Value::Int64(value) => write!(writer, "{value}")?,
-                Value::Float64(value) if value.is_finite() => write!(writer, "{value}")?,
-                Value::Float64(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "non-finite Float64 cannot be represented as JSON",
-                    ));
-                }
-                Value::Bool(value) => write!(writer, "{value}")?,
-                Value::String(value) => write_json_string(writer, value)?,
-            }
+            write_json_value(writer, value)?;
         }
-        writer.write_all(b"}")?;
+        writer.write_all(b"]")?;
     }
-    writer.write_all(b"]\n")
+    writer.write_all(b"]}\n")
+}
+
+fn write_json_value(writer: &mut impl Write, value: &Value) -> io::Result<()> {
+    match value {
+        Value::Null => writer.write_all(b"null"),
+        Value::Int64(value) => write!(writer, "{value}"),
+        Value::Float64(value) if value.is_finite() => write!(writer, "{value}"),
+        Value::Float64(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-finite Float64 cannot be represented as JSON",
+        )),
+        Value::Bool(value) => write!(writer, "{value}"),
+        Value::String(value) => write_json_string(writer, value),
+    }
 }
 
 fn write_json_string(writer: &mut impl Write, value: &str) -> io::Result<()> {
@@ -157,5 +164,19 @@ mod tests {
         let mut output = Vec::new();
         let error = write_result(&mut output, &result, OutputFormat::Json).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn json_preserves_duplicate_projection_columns() {
+        let result = QueryResult {
+            columns: vec!["x".into(), "x".into()],
+            rows: vec![vec![Value::Int64(1), Value::Int64(2)]],
+        };
+        let mut output = Vec::new();
+        write_result(&mut output, &result, OutputFormat::Json).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"columns\":[\"x\",\"x\"],\"rows\":[[1,2]]}\n"
+        );
     }
 }

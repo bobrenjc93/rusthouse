@@ -73,17 +73,7 @@ impl Value {
             (Self::Null, _) | (_, Self::Null) => Err(Error::Type(
                 "NULL ordering must be handled by the caller".into(),
             )),
-            (Self::Int64(left), Self::Int64(right)) => Ok(left.cmp(right)),
-            (Self::Float64(left), Self::Float64(right)) => Ok(left.total_cmp(right)),
-            (Self::Int64(left), Self::Float64(right)) => Ok((*left as f64).total_cmp(right)),
-            (Self::Float64(left), Self::Int64(right)) => Ok(left.total_cmp(&(*right as f64))),
-            (Self::Bool(left), Self::Bool(right)) => Ok(left.cmp(right)),
-            (Self::String(left), Self::String(right)) => Ok(left.cmp(right)),
-            (left, right) => Err(Error::Type(format!(
-                "cannot compare {} with {}",
-                left.type_name(),
-                right.type_name()
-            ))),
+            _ => self.sql_cmp(other),
         }
     }
 

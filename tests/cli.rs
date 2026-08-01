@@ -59,7 +59,8 @@ fn json_batches_are_one_valid_document() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "[[{\"n\":1}]\n,[{\"n\":2}]\n]\n"
+        "[{\"columns\":[\"n\"],\"rows\":[[1]]}\n,\
+         {\"columns\":[\"n\"],\"rows\":[[2]]}\n]\n"
     );
 }
 

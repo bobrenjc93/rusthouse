@@ -36,7 +36,7 @@ category,rows,total
 hardware,2,16
 ```
 
-`--format` accepts `table`, `csv`, or `json`. CSV output follows conventional quoting and represents `NULL` as an empty field. JSON output is one document whose outer array contains one row array per `SELECT`. Run `cargo run -- --help` for resource-limit flags.
+`--format` accepts `table`, `csv`, or `json`. CSV output follows conventional quoting and represents `NULL` as an empty field. JSON output is one document containing a `{ "columns": [...], "rows": [[...]] }` object per `SELECT`, preserving duplicate projection names. Run `cargo run -- --help` for resource-limit flags.
 
 ## SQL and storage
 
