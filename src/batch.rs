@@ -679,12 +679,30 @@ impl RecordBatch {
             });
         }
 
-        let columns = columns.into_boxed_slice();
-        let selection = SelectionMask::all(len, config.capacity)?;
-        let retained_bytes = schema.retained_bytes()
-            + columns.len() * size_of::<Column>()
-            + columns.iter().map(Column::retained_bytes).sum::<usize>()
-            + selection.retained_bytes();
+        let memory_overflow = || Error::MemoryLimitExceeded {
+            operator: "record batch",
+            required: usize::MAX,
+            limit: config.memory_limit_bytes,
+        };
+        let column_container_bytes = columns
+            .len()
+            .checked_mul(size_of::<Column>())
+            .ok_or_else(memory_overflow)?;
+        let column_payload_bytes = columns.iter().try_fold(0_usize, |total, column| {
+            total.checked_add(column.retained_bytes())
+        });
+        let column_payload_bytes = column_payload_bytes.ok_or_else(memory_overflow)?;
+        let selection_bytes = config
+            .capacity
+            .div_ceil(BITS_PER_WORD)
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(memory_overflow)?;
+        let retained_bytes = schema
+            .retained_bytes()
+            .checked_add(column_container_bytes)
+            .and_then(|bytes| bytes.checked_add(column_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(selection_bytes))
+            .ok_or_else(memory_overflow)?;
         if retained_bytes > config.memory_limit_bytes {
             return Err(Error::MemoryLimitExceeded {
                 operator: "record batch",
@@ -692,6 +710,10 @@ impl RecordBatch {
                 limit: config.memory_limit_bytes,
             });
         }
+
+        let columns = columns.into_boxed_slice();
+        let selection = SelectionMask::all(len, config.capacity)?;
+        debug_assert_eq!(selection.retained_bytes(), selection_bytes);
 
         Ok(Self {
             schema,

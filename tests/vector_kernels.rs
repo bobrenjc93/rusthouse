@@ -561,6 +561,23 @@ fn retained_byte_ceilings_are_exact_boundaries() {
 }
 
 #[test]
+fn oversized_empty_batch_is_rejected_before_selection_allocation() {
+    let expected = usize::MAX.div_ceil(u64::BITS as usize) * size_of::<u64>();
+    assert_eq!(
+        RecordBatch::try_new(
+            Schema::new(Vec::<Field>::new()),
+            Vec::new(),
+            BatchConfig::new(usize::MAX, 0),
+        ),
+        Err(Error::MemoryLimitExceeded {
+            operator: "record batch",
+            required: expected,
+            limit: 0,
+        })
+    );
+}
+
+#[test]
 fn group_peak_tracks_transient_growth_between_accumulators() {
     let capacity = 2;
     let batch = RecordBatch::try_new(
