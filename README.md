@@ -35,9 +35,11 @@ engine-independent `QueryService` trait. An engine implements that trait and
 returns a `QueryResult`; the frontend owns protocol parsing, output encoding,
 admission control, deadlines, cancellation, and shutdown.
 
-`POST /query` accepts UTF-8 SQL as `text/plain` or `application/sql`, or a JSON
-object such as `{"query":"SELECT 1"}`. Select an output with `Accept` or with
-`?format=`:
+`POST /query` accepts UTF-8 SQL as `application/sql`, or a JSON object such as
+`{"query":"SELECT 1"}` with `application/json`. A Content-Type is required and
+browser-originated requests are rejected; the endpoint intentionally does not
+accept browser-safelisted form or `text/plain` submissions. Select an output with
+`Accept` or with `?format=`:
 
 | Format | `Accept` value |
 | --- | --- |
@@ -50,11 +52,13 @@ request ID is returned in `x-request-id`. `GET /health/live` checks the process;
 `GET /health/ready` and `GET /health` report `QueryService::health()`.
 
 The server defaults to 1 MiB requests, 16 MiB encoded responses, 16 concurrent
-queries, a 30 second query deadline, and a 10 second graceful shutdown window.
-Busy execution slots fail immediately with `503` and `Retry-After`, so clients do
+queries, 64 concurrent HTTP query requests, a 10 second body-read deadline, a 30
+second query deadline, and a 10 second graceful shutdown window. Busy request or
+execution slots fail immediately with `503` and `Retry-After`, so slow clients do
 not create an unbounded queue. Query implementations should observe the supplied
 `QueryCancellation` while doing expensive work. It is signaled when a request is
-dropped, its deadline expires, or forced shutdown begins.
+dropped, its deadline expires, or forced shutdown begins. Ctrl-C and SIGTERM both
+use the bounded graceful-shutdown path.
 
 The executable currently has no SQL engine to attach, so its readiness check and
 queries report `503`; it is provided to exercise deployment and transport wiring:

@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -38,6 +38,10 @@ pub struct ServerConfig {
     pub max_response_bytes: usize,
     /// Maximum number of queries executing or encoding results at once.
     pub max_concurrent_queries: usize,
+    /// Maximum number of query requests being read or processed at once.
+    pub max_concurrent_requests: usize,
+    /// Maximum time allowed to read a complete query request body.
+    pub request_body_timeout: Duration,
     /// Maximum engine execution time for one query.
     pub query_timeout: Duration,
     /// Time allowed for active requests to finish during shutdown.
@@ -50,6 +54,8 @@ impl Default for ServerConfig {
             max_request_bytes: 1024 * 1024,
             max_response_bytes: 16 * 1024 * 1024,
             max_concurrent_queries: 16,
+            max_concurrent_requests: 64,
+            request_body_timeout: Duration::from_secs(10),
             query_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(10),
         }
@@ -72,6 +78,16 @@ impl ServerConfig {
         if self.max_concurrent_queries == 0 {
             return Err(ServerError::InvalidConfig(
                 "max_concurrent_queries must be greater than zero".into(),
+            ));
+        }
+        if self.max_concurrent_requests == 0 {
+            return Err(ServerError::InvalidConfig(
+                "max_concurrent_requests must be greater than zero".into(),
+            ));
+        }
+        if self.request_body_timeout.is_zero() {
+            return Err(ServerError::InvalidConfig(
+                "request_body_timeout must be greater than zero".into(),
             ));
         }
         if self.query_timeout.is_zero() {
@@ -120,14 +136,33 @@ impl From<io::Error> for ServerError {
 struct HttpState {
     service: Arc<dyn QueryService>,
     config: ServerConfig,
-    permits: Arc<Semaphore>,
+    request_permits: Arc<Semaphore>,
+    query_permits: Arc<Semaphore>,
     request_ids: AtomicU64,
     force_cancellation: CancellationToken,
+    query_admission: Arc<QueryAdmission>,
 }
 
 impl HttpState {
     fn next_request_id(&self) -> u64 {
         self.request_ids.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct QueryAdmission {
+    state: Mutex<bool>,
+}
+
+impl QueryAdmission {
+    fn enter(&self) -> Option<MutexGuard<'_, bool>> {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (!*guard).then_some(guard)
+    }
+
+    fn close(&self) {
+        let mut closed = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *closed = true;
     }
 }
 
@@ -139,6 +174,7 @@ pub struct ServerHandle {
     local_addr: SocketAddr,
     graceful_shutdown: CancellationToken,
     force_cancellation: CancellationToken,
+    query_admission: Arc<QueryAdmission>,
     shutdown_timeout: Duration,
     task: Option<JoinHandle<io::Result<()>>>,
 }
@@ -157,6 +193,7 @@ impl ServerHandle {
         match tokio::time::timeout(self.shutdown_timeout, &mut task).await {
             Ok(result) => result.map_err(ServerError::Task)?.map_err(ServerError::Io),
             Err(_) => {
+                self.query_admission.close();
                 self.force_cancellation.cancel();
                 match tokio::time::timeout(FORCE_CANCELLATION_WAIT, &mut task).await {
                     Ok(result) => result.map_err(ServerError::Task)?.map_err(ServerError::Io),
@@ -174,6 +211,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.graceful_shutdown.cancel();
+        self.query_admission.close();
         self.force_cancellation.cancel();
         if let Some(task) = &self.task {
             task.abort();
@@ -206,12 +244,15 @@ pub fn spawn_on_listener(
     let local_addr = listener.local_addr()?;
     let graceful_shutdown = CancellationToken::new();
     let force_cancellation = CancellationToken::new();
+    let query_admission = Arc::new(QueryAdmission::default());
     let state = Arc::new(HttpState {
         service,
-        permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
+        request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+        query_permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
         config: config.clone(),
         request_ids: AtomicU64::new(1),
         force_cancellation: force_cancellation.clone(),
+        query_admission: query_admission.clone(),
     });
 
     let app = Router::new()
@@ -234,6 +275,7 @@ pub fn spawn_on_listener(
         local_addr,
         graceful_shutdown,
         force_cancellation,
+        query_admission,
         shutdown_timeout: config.shutdown_timeout,
         task: Some(task),
     })
@@ -271,10 +313,19 @@ async fn readiness(State(state): State<Arc<HttpState>>) -> Response {
 
 async fn query(State(state): State<Arc<HttpState>>, request: Request) -> Response {
     let request_id = state.next_request_id();
-    match handle_query(&state, request_id, request).await {
+    let request_permit = match state.request_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::request_overloaded(state.config.max_concurrent_requests)
+                .into_response(request_id);
+        }
+    };
+    let response = match handle_query(&state, request_id, request).await {
         Ok(response) => response,
         Err(error) => error.into_response(request_id),
-    }
+    };
+    drop(request_permit);
+    response
 }
 
 async fn handle_query(
@@ -282,12 +333,21 @@ async fn handle_query(
     request_id: u64,
     request: Request,
 ) -> Result<Response, ApiError> {
+    if request.headers().contains_key(header::ORIGIN) {
+        return Err(ApiError::origin_not_allowed());
+    }
     let format = ResponseFormat::negotiate(request.uri().query(), request.headers())?;
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| ApiError::unsupported_media_type("non-UTF-8 Content-Type"))
+        })
+        .transpose()?;
+    let body_format = QueryBodyFormat::from_content_type(content_type.as_deref())?;
 
     if let Some(length) = request
         .headers()
@@ -299,17 +359,25 @@ async fn handle_query(
         return Err(ApiError::request_too_large(state.config.max_request_bytes));
     }
 
-    let body = to_bytes(request.into_body(), state.config.max_request_bytes)
-        .await
-        .map_err(|_| ApiError::request_too_large(state.config.max_request_bytes))?;
-    let sql = parse_query_body(&body, content_type.as_deref())?;
+    let body = tokio::time::timeout(
+        state.config.request_body_timeout,
+        to_bytes(request.into_body(), state.config.max_request_bytes),
+    )
+    .await
+    .map_err(|_| ApiError::request_timeout(state.config.request_body_timeout))?
+    .map_err(|_| ApiError::request_too_large(state.config.max_request_bytes))?;
+    let sql = parse_query_body(&body, body_format)?;
 
     let permit = state
-        .permits
+        .query_permits
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::overloaded(state.config.max_concurrent_queries))?;
 
+    let admission = state
+        .query_admission
+        .enter()
+        .ok_or_else(ApiError::shutting_down)?;
     let token = state.force_cancellation.child_token();
     let cancellation = QueryCancellation::new(token.clone());
     let mut cancel_on_drop = CancelOnDrop(Some(cancellation.clone()));
@@ -319,16 +387,18 @@ async fn handle_query(
         cancellation,
     };
     let execution = state.service.execute(query_request);
+    drop(admission);
 
     let result = tokio::select! {
+        biased;
+        () = state.force_cancellation.cancelled() => {
+            token.cancel();
+            return Err(ApiError::shutting_down());
+        }
         result = execution => result.map_err(ApiError::from_query_error)?,
         () = tokio::time::sleep(state.config.query_timeout) => {
             token.cancel();
             return Err(ApiError::timeout(state.config.query_timeout));
-        }
-        () = state.force_cancellation.cancelled() => {
-            token.cancel();
-            return Err(ApiError::shutting_down());
         }
     };
     cancel_on_drop.0 = None;
@@ -362,26 +432,41 @@ struct JsonQuery {
     query: String,
 }
 
-fn parse_query_body(body: &[u8], content_type: Option<&str>) -> Result<String, ApiError> {
-    let media_type = content_type
-        .unwrap_or("text/plain")
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let query = match media_type.as_str() {
-        "text/plain" | "application/sql" => std::str::from_utf8(body)
+#[derive(Debug, Clone, Copy)]
+enum QueryBodyFormat {
+    Sql,
+    Json,
+}
+
+impl QueryBodyFormat {
+    fn from_content_type(content_type: Option<&str>) -> Result<Self, ApiError> {
+        let media_type = content_type
+            .ok_or_else(ApiError::content_type_required)?
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match media_type.as_str() {
+            "application/sql" => Ok(Self::Sql),
+            "application/json" => Ok(Self::Json),
+            _ => Err(ApiError::unsupported_media_type(&media_type)),
+        }
+    }
+}
+
+fn parse_query_body(body: &[u8], format: QueryBodyFormat) -> Result<String, ApiError> {
+    let query = match format {
+        QueryBodyFormat::Sql => std::str::from_utf8(body)
             .map_err(|_| ApiError::bad_request("query body must be valid UTF-8"))?
             .to_owned(),
-        "application/json" => {
+        QueryBodyFormat::Json => {
             serde_json::from_slice::<JsonQuery>(body)
                 .map_err(|error| {
                     ApiError::bad_request(format!("invalid JSON query body: {error}"))
                 })?
                 .query
         }
-        _ => return Err(ApiError::unsupported_media_type(&media_type)),
     };
 
     if query.trim().is_empty() {
@@ -403,41 +488,21 @@ impl ResponseFormat {
             return Self::from_name(&format).ok_or_else(|| ApiError::not_acceptable(&format));
         }
 
-        let Some(accept) = headers.get(header::ACCEPT) else {
+        if !headers.contains_key(header::ACCEPT) {
             return Ok(Self::Json);
-        };
-        let accept = accept
-            .to_str()
-            .map_err(|_| ApiError::not_acceptable("non-UTF-8 Accept header"))?;
-        let mut best: Option<(u16, usize, Self)> = None;
-        for (index, item) in accept.split(',').enumerate() {
-            let mut pieces = item.trim().split(';');
-            let media_type = pieces.next().unwrap_or_default().trim();
-            let quality = pieces
-                .filter_map(|parameter| parameter.trim().strip_prefix("q="))
-                .next()
-                .map(parse_quality)
-                .unwrap_or(Some(1000));
-            let Some(quality) = quality else { continue };
-            if quality == 0 {
-                continue;
-            }
-            let format = match media_type {
-                "application/json" | "application/*" | "*/*" => Some(Self::Json),
-                "application/x-ndjson" | "application/ndjson" => Some(Self::Ndjson),
-                "text/csv" | "text/*" => Some(Self::Csv),
-                _ => None,
-            };
-            if let Some(format) = format
-                && best.is_none_or(|(best_quality, best_index, _)| {
-                    quality > best_quality || (quality == best_quality && index < best_index)
-                })
-            {
-                best = Some((quality, index, format));
-            }
         }
-        best.map(|(_, _, format)| format)
-            .ok_or_else(|| ApiError::not_acceptable(accept))
+        let (ranges, raw_accept) = parse_accept_ranges(headers)?;
+        [Self::Json, Self::Ndjson, Self::Csv]
+            .into_iter()
+            .filter_map(|format| {
+                format
+                    .accepted_quality(&ranges)
+                    .filter(|quality| *quality > 0)
+                    .map(|quality| (quality, format))
+            })
+            .max_by_key(|(quality, format)| (*quality, format.preference()))
+            .map(|(_, format)| format)
+            .ok_or_else(|| ApiError::not_acceptable(&raw_accept))
     }
 
     fn from_name(name: &str) -> Option<Self> {
@@ -456,6 +521,114 @@ impl ResponseFormat {
             Self::Csv => "text/csv; charset=utf-8",
         }
     }
+
+    fn media_type(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Json => ("application", "json"),
+            Self::Ndjson => ("application", "x-ndjson"),
+            Self::Csv => ("text", "csv"),
+        }
+    }
+
+    fn accepted_quality(self, ranges: &[MediaRange]) -> Option<u16> {
+        let (type_name, subtype) = self.media_type();
+        ranges
+            .iter()
+            .filter_map(|range| {
+                range
+                    .specificity(type_name, subtype)
+                    .map(|specificity| (specificity, range.quality, usize::MAX - range.order))
+            })
+            .max_by_key(|&(specificity, quality, reverse_order)| {
+                (specificity, quality, reverse_order)
+            })
+            .map(|(_, quality, _)| quality)
+    }
+
+    fn preference(self) -> u8 {
+        match self {
+            Self::Json => 3,
+            Self::Ndjson => 2,
+            Self::Csv => 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MediaRange {
+    type_name: String,
+    subtype: String,
+    quality: u16,
+    order: usize,
+}
+
+impl MediaRange {
+    fn specificity(&self, type_name: &str, subtype: &str) -> Option<u8> {
+        if self.type_name == "*" && self.subtype == "*" {
+            return Some(0);
+        }
+        if self.type_name != type_name {
+            return None;
+        }
+        if self.subtype == "*" {
+            return Some(1);
+        }
+        let requested_subtype = if type_name == "application" && self.subtype == "ndjson" {
+            "x-ndjson"
+        } else {
+            &self.subtype
+        };
+        (requested_subtype == subtype).then_some(2)
+    }
+}
+
+fn parse_accept_ranges(headers: &HeaderMap) -> Result<(Vec<MediaRange>, String), ApiError> {
+    let mut ranges = Vec::new();
+    let mut raw_values = Vec::new();
+    let mut order = 0;
+    for value in headers.get_all(header::ACCEPT) {
+        let value = value
+            .to_str()
+            .map_err(|_| ApiError::not_acceptable("non-UTF-8 Accept header"))?;
+        raw_values.push(value);
+        for item in value.split(',') {
+            if let Some(range) = parse_media_range(item, order) {
+                ranges.push(range);
+            }
+            order += 1;
+        }
+    }
+    Ok((ranges, raw_values.join(", ")))
+}
+
+fn parse_media_range(item: &str, order: usize) -> Option<MediaRange> {
+    let mut pieces = item.trim().split(';');
+    let (type_name, subtype) = pieces.next()?.trim().split_once('/')?;
+    let type_name = type_name.trim().to_ascii_lowercase();
+    let subtype = subtype.trim().to_ascii_lowercase();
+    if type_name.is_empty()
+        || subtype.is_empty()
+        || (type_name == "*" && subtype != "*")
+        || subtype.contains('*') && subtype != "*"
+    {
+        return None;
+    }
+
+    let mut quality = 1000;
+    for parameter in pieces {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("q") {
+            quality = parse_quality(value.trim())?;
+        }
+    }
+    Some(MediaRange {
+        type_name,
+        subtype,
+        quality,
+        order,
+    })
 }
 
 fn query_format(query: &str) -> Option<String> {
@@ -619,6 +792,7 @@ struct ApiError {
     code: &'static str,
     message: String,
     retry_after: Option<&'static str>,
+    close_connection: bool,
 }
 
 impl ApiError {
@@ -628,7 +802,13 @@ impl ApiError {
             code,
             message: message.into(),
             retry_after: None,
+            close_connection: false,
         }
+    }
+
+    fn close_connection(mut self) -> Self {
+        self.close_connection = true;
+        self
     }
 
     fn bad_request(message: impl Into<String>) -> Self {
@@ -641,6 +821,48 @@ impl ApiError {
             "request_too_large",
             format!("request body exceeds the {limit} byte limit"),
         )
+        .close_connection()
+    }
+
+    fn request_overloaded(limit: usize) -> Self {
+        let mut error = Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "request_overloaded",
+            format!("all {limit} HTTP query request slots are busy"),
+        )
+        .close_connection();
+        error.retry_after = Some("1");
+        error
+    }
+
+    fn request_timeout(duration: Duration) -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            format!(
+                "query request body was not received within {} ms",
+                duration.as_millis()
+            ),
+        )
+        .close_connection()
+    }
+
+    fn origin_not_allowed() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "browser-originated query requests are not allowed",
+        )
+        .close_connection()
+    }
+
+    fn content_type_required() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content_type_required",
+            "query requests require Content-Type application/sql or application/json",
+        )
+        .close_connection()
     }
 
     fn response_too_large(limit: usize) -> Self {
@@ -657,6 +879,7 @@ impl ApiError {
             "unsupported_media_type",
             format!("unsupported request content type: {media_type}"),
         )
+        .close_connection()
     }
 
     fn not_acceptable(value: &str) -> Self {
@@ -665,6 +888,7 @@ impl ApiError {
             "not_acceptable",
             format!("no supported response format matches: {value}"),
         )
+        .close_connection()
     }
 
     fn overloaded(limit: usize) -> Self {
@@ -711,6 +935,7 @@ impl ApiError {
 
     fn into_response(self, request_id: u64) -> Response {
         let retry_after = self.retry_after;
+        let close_connection = self.close_connection;
         let mut response = json_response(
             self.status,
             request_id,
@@ -726,6 +951,11 @@ impl ApiError {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static(value));
+        }
+        if close_connection {
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
         }
         response
     }
@@ -812,6 +1042,43 @@ mod tests {
             ResponseFormat::negotiate(None, &headers).unwrap(),
             ResponseFormat::Ndjson
         );
+    }
+
+    #[test]
+    fn exact_rejection_takes_precedence_over_wildcard() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json;q=0, */*;q=1"),
+        );
+
+        assert_eq!(
+            ResponseFormat::negotiate(None, &headers).unwrap(),
+            ResponseFormat::Ndjson
+        );
+    }
+
+    #[test]
+    fn negotiation_is_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("APPLICATION/JSON;Q=0.8, TEXT/CSV;Q=0.5"),
+        );
+
+        assert_eq!(
+            ResponseFormat::negotiate(None, &headers).unwrap(),
+            ResponseFormat::Json
+        );
+    }
+
+    #[test]
+    fn negotiation_rejects_formats_with_zero_quality() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_static("*/*;q=0"));
+
+        let error = ResponseFormat::negotiate(None, &headers).unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_ACCEPTABLE);
     }
 
     #[test]

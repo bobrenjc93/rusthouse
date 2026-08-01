@@ -16,6 +16,8 @@ Options:
   --max-request-bytes BYTES      Maximum SQL request size [default: 1048576]
   --max-response-bytes BYTES     Maximum encoded result size [default: 16777216]
   --max-concurrent-queries N     Query execution slots [default: 16]
+  --max-concurrent-requests N    HTTP query request slots [default: 64]
+  --request-body-timeout-ms MS   Request body deadline [default: 10000]
   --query-timeout-ms MS          Per-query deadline [default: 30000]
   --shutdown-timeout-ms MS       Graceful shutdown window [default: 10000]
   -h, --help                     Print help
@@ -90,6 +92,12 @@ async fn run() -> Result<(), String> {
             "--max-concurrent-queries" => {
                 config.max_concurrent_queries = parse_number(&option, &value)?;
             }
+            "--max-concurrent-requests" => {
+                config.max_concurrent_requests = parse_number(&option, &value)?;
+            }
+            "--request-body-timeout-ms" => {
+                config.request_body_timeout = Duration::from_millis(parse_number(&option, &value)?);
+            }
             "--query-timeout-ms" => {
                 config.query_timeout = Duration::from_millis(parse_number(&option, &value)?);
             }
@@ -100,6 +108,7 @@ async fn run() -> Result<(), String> {
         }
     }
 
+    let mut shutdown_signals = ShutdownSignals::new()?;
     let server = spawn_http_server(address, Arc::new(EngineNotInstalled), config)
         .await
         .map_err(|error| error.to_string())?;
@@ -107,10 +116,51 @@ async fn run() -> Result<(), String> {
         "RustHouse HTTP server listening on http://{}",
         server.local_addr()
     );
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|error| format!("could not listen for shutdown signal: {error}"))?;
+    shutdown_signals.wait().await?;
     server.shutdown().await.map_err(|error| error.to_string())
+}
+
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            let interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .map_err(|error| format!("could not listen for SIGINT: {error}"))?;
+            let terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .map_err(|error| format!("could not listen for SIGTERM: {error}"))?;
+            Ok(Self {
+                interrupt,
+                terminate,
+            })
+        }
+
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    async fn wait(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Ok(()),
+                _ = self.terminate.recv() => Ok(()),
+            }
+        }
+
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("could not listen for Ctrl-C: {error}"))
+    }
 }
 
 fn parse_number<T>(option: &str, value: &str) -> Result<T, String>

@@ -1,6 +1,6 @@
 //! Engine-independent query types used by frontends such as the HTTP server.
 
-use std::{future::Future, pin::Pin};
+use std::{collections::HashSet, future::Future, pin::Pin};
 
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +15,10 @@ pub type QueryFuture<'a> =
 /// a deadline expires or a bounded shutdown has to stop outstanding work.
 pub trait QueryService: Send + Sync + 'static {
     /// Executes one SQL statement and returns a materialized tabular result.
+    ///
+    /// This method must construct and return its future promptly. Blocking work
+    /// and query side effects belong inside the future so server deadlines,
+    /// cancellation, and shutdown admission remain effective.
     fn execute(&self, request: QueryRequest) -> QueryFuture<'_>;
 
     /// Returns current readiness. This method must not block.
@@ -77,6 +81,12 @@ impl QueryResult {
 
     /// Checks the transport-level invariants needed for row serialization.
     pub fn validate(&self) -> Result<(), QueryError> {
+        let mut names = HashSet::with_capacity(self.columns.len());
+        if let Some(column) = self.columns.iter().find(|column| !names.insert(*column)) {
+            return Err(QueryError::internal(format!(
+                "query service returned duplicate column name `{column}`"
+            )));
+        }
         if let Some((row_index, row)) = self
             .rows
             .iter()
@@ -221,5 +231,22 @@ impl ServiceHealth {
             is_ready: false,
             message: Some(message.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_duplicate_column_names_before_object_serialization() {
+        let result = QueryResult::new(
+            vec!["id".into(), "id".into()],
+            vec![vec![QueryValue::Int64(1), QueryValue::Int64(2)]],
+        );
+
+        let error = result.validate().unwrap_err();
+        assert_eq!(error.kind, QueryErrorKind::Internal);
+        assert!(error.message.contains("duplicate column name `id`"));
     }
 }

@@ -21,6 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 struct TestService {
+    execute_calls: AtomicUsize,
     active: AtomicUsize,
     max_active: AtomicUsize,
     started: Arc<Semaphore>,
@@ -33,6 +34,7 @@ struct TestService {
 impl TestService {
     fn new() -> Self {
         Self {
+            execute_calls: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
             started: Arc::new(Semaphore::new(0)),
@@ -71,6 +73,7 @@ impl Drop for ActiveQuery<'_> {
 
 impl QueryService for TestService {
     fn execute(&self, request: QueryRequest) -> QueryFuture<'_> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
         self.cancellations
             .lock()
             .unwrap()
@@ -195,6 +198,7 @@ async fn negotiates_formats_and_returns_structured_health_and_errors() {
 
     let ndjson = client
         .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
         .header("accept", "application/x-ndjson")
         .body("rows")
         .send()
@@ -210,6 +214,7 @@ async fn negotiates_formats_and_returns_structured_health_and_errors() {
 
     let error = client
         .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
         .body("bad sql")
         .send()
         .await
@@ -220,6 +225,51 @@ async fn negotiates_formats_and_returns_structured_health_and_errors() {
     assert_eq!(body["error"]["code"], "invalid_query");
     assert_eq!(body["error"]["message"], "test syntax error");
     assert_eq!(body["error"]["request_id"].to_string(), request_id);
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejects_browser_simple_and_originated_query_requests() {
+    let service = Arc::new(TestService::new());
+    let (server, url) = start(service.clone(), ServerConfig::default()).await;
+    let client = Client::new();
+
+    let missing_type = client
+        .post(format!("{url}/query"))
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        missing_type.json::<Value>().await.unwrap()["error"]["code"],
+        "content_type_required"
+    );
+
+    let simple_type = client
+        .post(format!("{url}/query"))
+        .header("content-type", "text/plain")
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(simple_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let browser_origin = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .header("origin", "https://attacker.example")
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(browser_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        browser_origin.json::<Value>().await.unwrap()["error"]["code"],
+        "origin_not_allowed"
+    );
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 0);
 
     server.shutdown().await.unwrap();
 }
@@ -242,6 +292,7 @@ async fn serves_queries_concurrently() {
         requests.push(tokio::spawn(async move {
             client
                 .post(endpoint)
+                .header("content-type", "application/sql")
                 .body("concurrent")
                 .send()
                 .await
@@ -271,13 +322,20 @@ async fn rejects_excess_work_without_queueing() {
         let client = client.clone();
         let endpoint = format!("{url}/query");
         running.push(tokio::spawn(async move {
-            client.post(endpoint).body("hold").send().await.unwrap()
+            client
+                .post(endpoint)
+                .header("content-type", "application/sql")
+                .body("hold")
+                .send()
+                .await
+                .unwrap()
         }));
     }
     service.wait_for_starts(2).await;
 
     let rejected = client
         .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
         .body("rows")
         .send()
         .await
@@ -307,6 +365,7 @@ async fn enforces_deadline_and_signals_cancellation() {
 
     let response = Client::new()
         .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
         .body("hold")
         .send()
         .await
@@ -334,6 +393,7 @@ async fn enforces_request_and_encoded_response_limits() {
 
     let request_error = client
         .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
         .body("a query that is too long")
         .send()
         .await
@@ -346,6 +406,7 @@ async fn enforces_request_and_encoded_response_limits() {
 
     let response_error = client
         .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
         .body("large")
         .send()
         .await
@@ -360,6 +421,63 @@ async fn enforces_request_and_encoded_response_limits() {
 }
 
 #[tokio::test]
+async fn bounds_and_times_out_stalled_request_bodies() {
+    const STALLED_REQUESTS: usize = 2;
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        max_concurrent_requests: STALLED_REQUESTS,
+        request_body_timeout: Duration::from_millis(500),
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(service.clone(), config).await;
+    let mut stalled = Vec::new();
+
+    for _ in 0..STALLED_REQUESTS {
+        let mut connection = TcpStream::connect(server.local_addr()).await.unwrap();
+        connection
+            .write_all(stalled_query_headers().as_bytes())
+            .await
+            .unwrap();
+        let interim = tokio::time::timeout(Duration::from_secs(1), read_http_head(&mut connection))
+            .await
+            .unwrap();
+        assert!(interim.starts_with("HTTP/1.1 100 Continue\r\n"));
+        stalled.push(connection);
+    }
+
+    let rejected = Client::new()
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        rejected.json::<Value>().await.unwrap()["error"]["code"],
+        "request_overloaded"
+    );
+
+    for mut connection in stalled {
+        let response = read_http_response(&mut connection).await;
+        assert!(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+        assert!(response.contains("\"code\":\"request_timeout\""));
+    }
+
+    let recovered = Client::new()
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("rows")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 1);
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn keeps_http_1_connection_alive_for_multiple_queries() {
     let service = Arc::new(TestService::new());
     let (server, _) = start(service, ServerConfig::default()).await;
@@ -367,7 +485,7 @@ async fn keeps_http_1_connection_alive_for_multiple_queries() {
     let request = concat!(
         "POST /query HTTP/1.1\r\n",
         "Host: localhost\r\n",
-        "Content-Type: text/plain\r\n",
+        "Content-Type: application/sql\r\n",
         "Content-Length: 4\r\n",
         "\r\n",
         "rows"
@@ -394,6 +512,7 @@ async fn client_disconnect_cancels_in_flight_query() {
             concat!(
                 "POST /query HTTP/1.1\r\n",
                 "Host: localhost\r\n",
+                "Content-Type: application/sql\r\n",
                 "Content-Length: 4\r\n",
                 "\r\n",
                 "hold"
@@ -429,6 +548,7 @@ async fn shutdown_is_bounded_and_cancels_work_after_grace_period() {
     let request = tokio::spawn(async move {
         Client::new()
             .post(format!("{url}/query"))
+            .header("content-type", "application/sql")
             .body("hold")
             .send()
             .await
@@ -443,14 +563,49 @@ async fn shutdown_is_bounded_and_cancels_work_after_grace_period() {
     let _ = request.await;
 }
 
+#[tokio::test]
+async fn forced_shutdown_closes_admission_before_a_stalled_body_can_execute() {
+    let service = Arc::new(TestService::new());
+    let config = ServerConfig {
+        request_body_timeout: Duration::from_secs(5),
+        shutdown_timeout: Duration::from_millis(40),
+        ..ServerConfig::default()
+    };
+    let (server, _) = start(service.clone(), config).await;
+    let mut connection = TcpStream::connect(server.local_addr()).await.unwrap();
+    connection
+        .write_all(stalled_query_headers().as_bytes())
+        .await
+        .unwrap();
+    let interim = read_http_head(&mut connection).await;
+    assert!(interim.starts_with("HTTP/1.1 100 Continue\r\n"));
+
+    let shutdown = tokio::spawn(server.shutdown());
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    connection.write_all(b"rows").await.unwrap();
+    let response = read_http_response(&mut connection).await;
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(response.contains("\"code\":\"shutting_down\""));
+
+    shutdown.await.unwrap().unwrap();
+    assert_eq!(service.execute_calls.load(Ordering::SeqCst), 0);
+}
+
+fn stalled_query_headers() -> String {
+    concat!(
+        "POST /query HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Content-Type: application/sql\r\n",
+        "Content-Length: 4\r\n",
+        "Expect: 100-continue\r\n",
+        "\r\n"
+    )
+    .to_owned()
+}
+
 async fn read_http_response(stream: &mut TcpStream) -> String {
-    let mut response = Vec::new();
-    while !response.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        stream.read_exact(&mut byte).await.unwrap();
-        response.push(byte[0]);
-    }
-    let headers = String::from_utf8(response.clone()).unwrap();
+    let headers = read_http_head(stream).await;
+    let mut response = headers.as_bytes().to_vec();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -462,5 +617,15 @@ async fn read_http_response(stream: &mut TcpStream) -> String {
     let mut body = vec![0; content_length];
     stream.read_exact(&mut body).await.unwrap();
     response.extend_from_slice(&body);
+    String::from_utf8(response).unwrap()
+}
+
+async fn read_http_head(stream: &mut TcpStream) -> String {
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).await.unwrap();
+        response.push(byte[0]);
+    }
     String::from_utf8(response).unwrap()
 }
