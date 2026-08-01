@@ -561,6 +561,51 @@ fn retained_byte_ceilings_are_exact_boundaries() {
 }
 
 #[test]
+fn group_peak_tracks_transient_growth_between_accumulators() {
+    let capacity = 2;
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![
+            Field::new("a", DataType::String, false),
+            Field::new("b", DataType::String, false),
+        ]),
+        vec![
+            Column::String(
+                DictionaryArray::from_options(capacity, [Some("a"), Some("aaaaaaaaaa")]).unwrap(),
+            ),
+            Column::String(
+                DictionaryArray::from_options(capacity, [Some("zzzzzzzzzz"), Some("z")]).unwrap(),
+            ),
+        ],
+        BatchConfig::unlimited(capacity),
+    )
+    .unwrap();
+    let expressions = [
+        AggregateExpr::new(AggregateKind::Max, 0),
+        AggregateExpr::new(AggregateKind::Min, 1),
+    ];
+
+    let unlimited = hash_group(&batch, &[], &expressions, GroupByConfig::unlimited(1)).unwrap();
+    let peak = unlimited.peak_retained_bytes();
+    assert_eq!(peak, unlimited.retained_bytes() + 9);
+
+    let exact = hash_group(&batch, &[], &expressions, GroupByConfig::new(1, peak)).unwrap();
+    assert_eq!(exact.peak_retained_bytes(), peak);
+    assert!(matches!(
+        hash_group(
+            &batch,
+            &[],
+            &expressions,
+            GroupByConfig::new(1, peak - 1),
+        ),
+        Err(Error::MemoryLimitExceeded {
+            operator: "hash grouping",
+            required,
+            limit,
+        }) if required == peak && limit == peak - 1
+    ));
+}
+
+#[test]
 fn fixed_capacity_and_group_limits_fail_cleanly() {
     let mut array = Int64Array::with_capacity(1);
     array.push(Some(1)).unwrap();

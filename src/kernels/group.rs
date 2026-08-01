@@ -372,6 +372,7 @@ fn update_existing(
         .as_mut()
         .expect("hash slot points at a group");
     let mut retained = result.retained_bytes;
+    let mut peak = result.peak_retained_bytes;
     for (accumulator, expression) in group.accumulators.iter_mut().zip(expressions) {
         retained = update_accumulator(
             accumulator,
@@ -381,9 +382,10 @@ fn update_existing(
             retained,
             result.memory_limit_bytes,
         )?;
+        peak = peak.max(retained);
     }
     result.retained_bytes = retained;
-    result.update_peak();
+    result.peak_retained_bytes = peak;
     Ok(())
 }
 
