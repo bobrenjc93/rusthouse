@@ -1,6 +1,17 @@
-//! RustHouse is an experimental, compact analytical database.
+//! RustHouse is a compact analytical database with snapshot-isolated sessions.
 
-/// Returns the product name while the first storage engine is being built.
+mod catalog;
+mod database;
+mod error;
+mod persistence;
+mod sql;
+mod storage;
+
+pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
+pub use error::{Error, LimitKind, Result};
+pub use storage::{ColumnDef, DataType, Value};
+
+/// Returns the product name.
 pub fn product_name() -> &'static str {
     "RustHouse"
 }
