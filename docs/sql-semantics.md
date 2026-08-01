@@ -144,7 +144,12 @@ preceding through the current row. Without it, the omitted frame covers the
 whole partition. Explicit `ROWS` frames accept unbounded, current-row, and
 nonnegative preceding/following bounds.
 
-`QueryLimits` rejects a query before a join build exceeds its row or
-conservatively accounted retained-byte ceiling. It also bounds every window
-partition by rows and retained bytes, bounds join expansion and final output
-rows, and reports these failures as resource-limit errors.
+Float64 running frames accumulate in order. Bounded frames are accumulated
+from their own rows instead of subtracting rounded floating-point prefixes.
+
+`QueryLimits` rejects a query before a join build exceeds its row ceiling or
+before build or expanded-output state exceeds the join byte ceiling. It bounds
+every window partition by rows and cumulatively accounts partition hash
+entries, index vectors, window output vectors, and temporary accumulators. Join
+expansion and final output rows are separately bounded. These failures are
+reported as resource-limit errors.

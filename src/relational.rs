@@ -81,7 +81,7 @@ enum BoundResultOrder {
 
 struct PartitionState {
     rows: Vec<usize>,
-    bytes: usize,
+    row_count: usize,
 }
 
 pub(crate) fn execute(
@@ -128,7 +128,7 @@ pub(crate) fn execute(
     };
     if !result_order.is_empty() {
         check_cancellation(control)?;
-        row_indexes.sort_by(|left, right| {
+        row_indexes.sort_unstable_by(|left, right| {
             compare_result_rows(
                 *left,
                 *right,
@@ -137,6 +137,7 @@ pub(crate) fn execute(
                 &window_values,
                 &result_order,
             )
+            .then_with(|| left.cmp(right))
         });
         check_cancellation(control)?;
     }
@@ -231,30 +232,55 @@ fn execute_join(
     }
 
     let mut rows = Vec::new();
+    let mut output_payload_bytes = 0usize;
     for left_row in &left.rows {
         check_cancellation(control)?;
         let indexes = equality.iter().map(|(left, _)| *left);
         let matches = join_key(left_row, indexes).and_then(|key| hash.get(&key));
         if let Some(matches) = matches {
             for right_index in matches {
+                check_cancellation(control)?;
                 enforce_row_limit(
                     "hash join output",
                     rows.len().saturating_add(1),
                     limits.max_output_rows,
                 )?;
-                let mut row = left_row.clone();
+                let row_bytes = estimated_join_row_bytes(
+                    left_row,
+                    Some(&right.rows[*right_index]),
+                    right.columns.len(),
+                );
+                prepare_join_output_row(
+                    &mut rows,
+                    output_payload_bytes,
+                    row_bytes,
+                    limits.max_join_build_bytes,
+                )?;
+                let mut row = Vec::with_capacity(combined_columns.len());
+                row.extend(left_row.iter().cloned());
                 row.extend(right.rows[*right_index].iter().cloned());
                 rows.push(row);
+                output_payload_bytes = output_payload_bytes.saturating_add(row_bytes);
             }
         } else if join.kind == JoinKind::Left {
+            check_cancellation(control)?;
             enforce_row_limit(
                 "hash join output",
                 rows.len().saturating_add(1),
                 limits.max_output_rows,
             )?;
-            let mut row = left_row.clone();
+            let row_bytes = estimated_join_row_bytes(left_row, None, right.columns.len());
+            prepare_join_output_row(
+                &mut rows,
+                output_payload_bytes,
+                row_bytes,
+                limits.max_join_build_bytes,
+            )?;
+            let mut row = Vec::with_capacity(combined_columns.len());
+            row.extend(left_row.iter().cloned());
             row.resize(left_width + right.columns.len(), Value::Null);
             rows.push(row);
+            output_payload_bytes = output_payload_bytes.saturating_add(row_bytes);
         }
     }
     right.rows.clear();
@@ -531,62 +557,154 @@ fn evaluate_windows(
     limits: QueryLimits,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<Vec<Option<Vec<Value>>>> {
-    projection
+    let has_windows = projection
         .iter()
-        .map(|projection| match projection {
-            BoundProjection::Source(_) => Ok(None),
+        .any(|projection| matches!(projection, BoundProjection::Window(_)));
+    let mut retained_bytes = if has_windows {
+        projection
+            .len()
+            .saturating_mul(size_of::<Option<Vec<Value>>>())
+    } else {
+        0
+    };
+    enforce_byte_limit(
+        "window partition",
+        retained_bytes,
+        limits.max_window_partition_bytes,
+    )?;
+
+    let mut values = Vec::with_capacity(projection.len());
+    for projection in projection {
+        match projection {
+            BoundProjection::Source(_) => values.push(None),
             BoundProjection::Window(window) => {
-                evaluate_window(source, window, limits, control).map(Some)
+                let output = evaluate_window(source, window, limits, retained_bytes, control)?;
+                retained_bytes = retained_bytes
+                    .saturating_add(output.capacity().saturating_mul(size_of::<Value>()));
+                enforce_byte_limit(
+                    "window partition",
+                    retained_bytes,
+                    limits.max_window_partition_bytes,
+                )?;
+                values.push(Some(output));
             }
-        })
-        .collect()
+        }
+    }
+    Ok(values)
 }
 
 fn evaluate_window(
     source: &Source,
     window: &BoundWindow,
     limits: QueryLimits,
+    retained_output_bytes: usize,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<Vec<Value>> {
     let mut partitions = HashMap::<ValueKey, PartitionState>::new();
+    let mut map_bytes = 0usize;
+    for row in &source.rows {
+        check_cancellation(control)?;
+        let key = partition_key(row, &window.partition_by);
+        if let Some(state) = partitions.get_mut(&key) {
+            let attempted = state.row_count.saturating_add(1);
+            enforce_row_limit(
+                "window partition",
+                attempted,
+                limits.max_window_partition_rows,
+            )?;
+            state.row_count = attempted;
+        } else {
+            enforce_row_limit("window partition", 1, limits.max_window_partition_rows)?;
+            let required = retained_output_bytes
+                .saturating_add(map_bytes)
+                .saturating_add(estimated_partition_entry_bytes(&key));
+            enforce_byte_limit(
+                "window partition",
+                required,
+                limits.max_window_partition_bytes,
+            )?;
+            map_bytes = required.saturating_sub(retained_output_bytes);
+            partitions.insert(
+                key,
+                PartitionState {
+                    rows: Vec::new(),
+                    row_count: 1,
+                },
+            );
+        }
+    }
+
+    let index_bytes = source.rows.len().saturating_mul(size_of::<usize>());
+    let output_bytes = source.rows.len().saturating_mul(size_of::<Value>());
+    let preflight_bytes = retained_output_bytes
+        .saturating_add(map_bytes)
+        .saturating_add(index_bytes)
+        .saturating_add(output_bytes);
+    enforce_byte_limit(
+        "window partition",
+        preflight_bytes,
+        limits.max_window_partition_bytes,
+    )?;
+    for state in partitions.values_mut() {
+        state.rows.reserve_exact(state.row_count);
+    }
+    let actual_index_bytes = partitions.values().fold(0usize, |bytes, state| {
+        bytes.saturating_add(state.rows.capacity().saturating_mul(size_of::<usize>()))
+    });
+    let reserved_bytes = retained_output_bytes
+        .saturating_add(map_bytes)
+        .saturating_add(actual_index_bytes)
+        .saturating_add(output_bytes);
+    enforce_byte_limit(
+        "window partition",
+        reserved_bytes,
+        limits.max_window_partition_bytes,
+    )?;
     for (row_index, row) in source.rows.iter().enumerate() {
         check_cancellation(control)?;
         let key = partition_key(row, &window.partition_by);
-        let state = partitions.entry(key).or_insert_with(|| PartitionState {
-            rows: Vec::new(),
-            bytes: 0,
+        partitions
+            .get_mut(&key)
+            .expect("counted window partition remains present")
+            .rows
+            .push(row_index);
+    }
+
+    let mut output = vec![Value::Null; source.rows.len()];
+    let operator_bytes = retained_output_bytes
+        .saturating_add(map_bytes)
+        .saturating_add(actual_index_bytes)
+        .saturating_add(output.capacity().saturating_mul(size_of::<Value>()));
+    enforce_byte_limit(
+        "window partition",
+        operator_bytes,
+        limits.max_window_partition_bytes,
+    )?;
+    for state in partitions.values_mut() {
+        check_cancellation(control)?;
+        state.rows.sort_unstable_by(|left, right| {
+            compare_source_rows(&source.rows[*left], &source.rows[*right], &window.order_by)
+                .then_with(|| left.cmp(right))
         });
-        enforce_row_limit(
-            "window partition",
-            state.rows.len().saturating_add(1),
-            limits.max_window_partition_rows,
-        )?;
-        let required = state.bytes.saturating_add(estimated_row_bytes(row));
+        check_cancellation(control)?;
+        let required = operator_bytes
+            .saturating_add(window_temporary_bytes(&window.function, state.rows.len()));
         enforce_byte_limit(
             "window partition",
             required,
             limits.max_window_partition_bytes,
         )?;
-        state.bytes = required;
-        state.rows.push(row_index);
-    }
-
-    let mut output = vec![Value::Null; source.rows.len()];
-    for state in partitions.values_mut() {
-        check_cancellation(control)?;
-        state.rows.sort_by(|left, right| {
-            compare_source_rows(&source.rows[*left], &source.rows[*right], &window.order_by)
-        });
-        check_cancellation(control)?;
         match window.function {
             BoundWindowFunction::RowNumber => {
                 for (position, row) in state.rows.iter().enumerate() {
+                    check_cancellation(control)?;
                     output[*row] = Value::Int64(position_to_i64(position)?);
                 }
             }
             BoundWindowFunction::Rank => {
                 let mut rank = 1usize;
                 for position in 0..state.rows.len() {
+                    check_cancellation(control)?;
                     if position > 0
                         && !source_rows_are_peers(
                             &source.rows[state.rows[position - 1]],
@@ -599,17 +717,36 @@ fn evaluate_window(
                     output[state.rows[position]] = Value::Int64(usize_to_i64(rank)?);
                 }
             }
-            BoundWindowFunction::Count(index) => {
-                evaluate_count(source, &state.rows, index, window.frame, &mut output)?
-            }
+            BoundWindowFunction::Count(index) => evaluate_count(
+                source,
+                &state.rows,
+                index,
+                window.frame,
+                &mut output,
+                control,
+            )?,
             BoundWindowFunction::Sum {
                 index,
                 data_type: DataType::Int64,
-            } => evaluate_int_sum(source, &state.rows, index, window.frame, &mut output)?,
+            } => evaluate_int_sum(
+                source,
+                &state.rows,
+                index,
+                window.frame,
+                &mut output,
+                control,
+            )?,
             BoundWindowFunction::Sum {
                 index,
                 data_type: DataType::Float64,
-            } => evaluate_float_sum(source, &state.rows, index, window.frame, &mut output)?,
+            } => evaluate_float_sum(
+                source,
+                &state.rows,
+                index,
+                window.frame,
+                &mut output,
+                control,
+            )?,
             BoundWindowFunction::Sum { .. } => unreachable!("SUM binding accepts numeric types"),
         }
     }
@@ -622,14 +759,17 @@ fn evaluate_count(
     index: Option<usize>,
     frame: WindowFrame,
     output: &mut [Value],
+    control: Option<ExecutionControl<'_>>,
 ) -> Result<()> {
     let mut prefix = Vec::with_capacity(rows.len() + 1);
     prefix.push(0u64);
     for row in rows {
+        check_cancellation(control)?;
         let included = index.is_none_or(|index| !source.rows[*row][index].is_null());
         prefix.push(prefix.last().copied().unwrap_or(0) + u64::from(included));
     }
     for (position, row) in rows.iter().enumerate() {
+        check_cancellation(control)?;
         let count = frame_range(position, rows.len(), frame)
             .map_or(0, |(start, end)| prefix[end] - prefix[start]);
         output[*row] = Value::Int64(i64::try_from(count).map_err(|_| Error::Overflow {
@@ -645,12 +785,14 @@ fn evaluate_int_sum(
     index: usize,
     frame: WindowFrame,
     output: &mut [Value],
+    control: Option<ExecutionControl<'_>>,
 ) -> Result<()> {
     let mut sums = Vec::with_capacity(rows.len() + 1);
     let mut counts = Vec::with_capacity(rows.len() + 1);
     sums.push(0i128);
     counts.push(0usize);
     for row in rows {
+        check_cancellation(control)?;
         let (value, included) = match source.rows[*row][index] {
             Value::Int64(value) => (i128::from(value), 1),
             Value::Null => (0, 0),
@@ -660,6 +802,7 @@ fn evaluate_int_sum(
         counts.push(counts.last().copied().unwrap_or(0) + included);
     }
     for (position, row) in rows.iter().enumerate() {
+        check_cancellation(control)?;
         output[*row] = match frame_range(position, rows.len(), frame) {
             Some((start, end)) if counts[end] > counts[start] => {
                 let sum = sums[end] - sums[start];
@@ -682,64 +825,84 @@ struct FloatAccumulator {
     values: usize,
 }
 
+impl FloatAccumulator {
+    fn add(&mut self, value: &Value) {
+        match value {
+            Value::Float64(value) if value.is_nan() => {
+                self.nan += 1;
+                self.values += 1;
+            }
+            Value::Float64(value) if *value == f64::INFINITY => {
+                self.positive_infinity += 1;
+                self.values += 1;
+            }
+            Value::Float64(value) if *value == f64::NEG_INFINITY => {
+                self.negative_infinity += 1;
+                self.values += 1;
+            }
+            Value::Float64(value) => {
+                self.finite += value;
+                self.values += 1;
+            }
+            Value::Null => {}
+            _ => unreachable!("bound Float64 column contains Float64 or NULL"),
+        }
+    }
+
+    fn finish(self) -> Value {
+        if self.values == 0 {
+            Value::Null
+        } else if self.nan > 0 || (self.positive_infinity > 0 && self.negative_infinity > 0) {
+            Value::Float64(f64::NAN)
+        } else if self.positive_infinity > 0 {
+            Value::Float64(f64::INFINITY)
+        } else if self.negative_infinity > 0 {
+            Value::Float64(f64::NEG_INFINITY)
+        } else {
+            Value::Float64(self.finite)
+        }
+    }
+}
+
 fn evaluate_float_sum(
     source: &Source,
     rows: &[usize],
     index: usize,
     frame: WindowFrame,
     output: &mut [Value],
+    control: Option<ExecutionControl<'_>>,
 ) -> Result<()> {
-    let mut prefix = Vec::with_capacity(rows.len() + 1);
-    prefix.push(FloatAccumulator::default());
-    for row in rows {
-        let mut state = prefix.last().copied().unwrap_or_default();
-        match source.rows[*row][index] {
-            Value::Float64(value) if value.is_nan() => {
-                state.nan += 1;
-                state.values += 1;
+    if frame.start == FrameBound::UnboundedPreceding {
+        let mut accumulator = FloatAccumulator::default();
+        let mut accumulated_end = 0usize;
+        for (position, row) in rows.iter().enumerate() {
+            check_cancellation(control)?;
+            if let Some((_, end)) = frame_range(position, rows.len(), frame) {
+                while accumulated_end < end {
+                    check_cancellation(control)?;
+                    accumulator.add(&source.rows[rows[accumulated_end]][index]);
+                    accumulated_end += 1;
+                }
+                output[*row] = accumulator.finish();
+            } else {
+                output[*row] = Value::Null;
             }
-            Value::Float64(value) if value == f64::INFINITY => {
-                state.positive_infinity += 1;
-                state.values += 1;
-            }
-            Value::Float64(value) if value == f64::NEG_INFINITY => {
-                state.negative_infinity += 1;
-                state.values += 1;
-            }
-            Value::Float64(value) => {
-                state.finite += value;
-                state.values += 1;
-            }
-            Value::Null => {}
-            _ => unreachable!("bound Float64 column contains Float64 or NULL"),
         }
-        prefix.push(state);
+        return Ok(());
     }
+
     for (position, row) in rows.iter().enumerate() {
-        output[*row] = frame_range(position, rows.len(), frame)
-            .map_or(Value::Null, |(start, end)| {
-                float_range_value(prefix[start], prefix[end])
-            });
+        check_cancellation(control)?;
+        let mut accumulator = FloatAccumulator::default();
+        if let Some((start, end)) = frame_range(position, rows.len(), frame) {
+            for framed_row in &rows[start..end] {
+                check_cancellation(control)?;
+                accumulator.add(&source.rows[*framed_row][index]);
+            }
+        }
+        output[*row] = accumulator.finish();
     }
     Ok(())
-}
-
-fn float_range_value(start: FloatAccumulator, end: FloatAccumulator) -> Value {
-    let values = end.values - start.values;
-    let nan = end.nan - start.nan;
-    let positive = end.positive_infinity - start.positive_infinity;
-    let negative = end.negative_infinity - start.negative_infinity;
-    if values == 0 {
-        Value::Null
-    } else if nan > 0 || (positive > 0 && negative > 0) {
-        Value::Float64(f64::NAN)
-    } else if positive > 0 {
-        Value::Float64(f64::INFINITY)
-    } else if negative > 0 {
-        Value::Float64(f64::NEG_INFINITY)
-    } else {
-        Value::Float64(end.finite - start.finite)
-    }
 }
 
 fn frame_range(position: usize, len: usize, frame: WindowFrame) -> Option<(usize, usize)> {
@@ -903,7 +1066,11 @@ fn compare_order_values(left: &Value, right: &Value, order: BoundOrder) -> Order
 }
 
 fn total_float_cmp(left: f64, right: f64) -> Ordering {
-    left.total_cmp(&right)
+    if left == 0.0 && right == 0.0 {
+        Ordering::Equal
+    } else {
+        left.total_cmp(&right)
+    }
 }
 
 fn resolve_column(columns: &[BoundColumn], column: &ColumnRef) -> Result<usize> {
@@ -967,10 +1134,74 @@ fn usize_to_i64(value: usize) -> Result<i64> {
     })
 }
 
-fn estimated_row_bytes(row: &[Value]) -> usize {
-    size_of::<Vec<Value>>()
-        .saturating_add(row.len().saturating_mul(size_of::<Value>()))
-        .saturating_add(variable_row_bytes(row))
+fn estimated_join_row_bytes(left: &[Value], right: Option<&[Value]>, right_width: usize) -> usize {
+    left.len()
+        .saturating_add(right_width)
+        .saturating_mul(size_of::<Value>())
+        .saturating_add(variable_row_bytes(left))
+        .saturating_add(right.map_or(0, variable_row_bytes))
+}
+
+fn prepare_join_output_row(
+    rows: &mut Vec<Vec<Value>>,
+    payload_bytes: usize,
+    row_bytes: usize,
+    limit: usize,
+) -> Result<()> {
+    let needed_capacity = if rows.len() == rows.capacity() {
+        rows.len().saturating_add(1)
+    } else {
+        rows.capacity()
+    };
+    let required = payload_bytes
+        .saturating_add(row_bytes)
+        .saturating_add(needed_capacity.saturating_mul(size_of::<Vec<Value>>()));
+    enforce_byte_limit("hash join output", required, limit)?;
+    if rows.len() == rows.capacity() {
+        rows.reserve_exact(1);
+        let retained = payload_bytes
+            .saturating_add(row_bytes)
+            .saturating_add(rows.capacity().saturating_mul(size_of::<Vec<Value>>()));
+        enforce_byte_limit("hash join output", retained, limit)?;
+    }
+    Ok(())
+}
+
+fn estimated_partition_entry_bytes(key: &ValueKey) -> usize {
+    let strings = key.0.iter().fold(0usize, |bytes, part| {
+        bytes.saturating_add(match part {
+            KeyPart::String(value) => value.capacity(),
+            _ => 0,
+        })
+    });
+    let entry = size_of::<ValueKey>()
+        .saturating_add(size_of::<PartitionState>())
+        .saturating_add(key.0.capacity().saturating_mul(size_of::<KeyPart>()))
+        .saturating_add(strings);
+    // Small hash tables retain several spare buckets; four entries per key is
+    // a conservative bound across both small and normally loaded tables.
+    entry.saturating_mul(4)
+}
+
+fn window_temporary_bytes(function: &BoundWindowFunction, rows: usize) -> usize {
+    let entries = rows.saturating_add(1);
+    let buffers = match function {
+        BoundWindowFunction::Count(_) => entries.saturating_mul(size_of::<u64>()),
+        BoundWindowFunction::Sum {
+            data_type: DataType::Int64,
+            ..
+        } => entries.saturating_mul(size_of::<i128>().saturating_add(size_of::<usize>())),
+        BoundWindowFunction::RowNumber
+        | BoundWindowFunction::Rank
+        | BoundWindowFunction::Sum {
+            data_type: DataType::Float64,
+            ..
+        } => 0,
+        BoundWindowFunction::Sum { .. } => 0,
+    };
+    // Prefix Vec allocations can retain allocator slack; charge twice the
+    // requested buffer before allocation.
+    buffers.saturating_mul(2)
 }
 
 fn variable_row_bytes(row: &[Value]) -> usize {

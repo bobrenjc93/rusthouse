@@ -24,11 +24,11 @@ pub(crate) struct ExecutionControl<'a> {
 pub struct QueryLimits {
     /// Maximum rows accepted from the build side of one hash join.
     pub max_join_build_rows: usize,
-    /// Maximum conservatively accounted retained bytes for one hash join build.
+    /// Maximum retained bytes for one hash join build or expanded output.
     pub max_join_build_bytes: usize,
     /// Maximum rows in one window partition.
     pub max_window_partition_rows: usize,
-    /// Maximum conservatively accounted retained bytes in one window partition.
+    /// Maximum retained bytes across window partitions, outputs, and accumulators.
     pub max_window_partition_bytes: usize,
     /// Maximum rows emitted by a join or returned by a query.
     pub max_output_rows: usize,
@@ -685,6 +685,21 @@ mod cancellation_commit_tests {
         publication_attempts: Arc<AtomicUsize>,
     }
 
+    struct CancelOnCheck {
+        checks: AtomicUsize,
+        cancel_on: usize,
+    }
+
+    impl ExecutionCancellation for CancelOnCheck {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_on
+        }
+
+        fn begin_publication(&self) -> bool {
+            true
+        }
+    }
+
     impl ExecutionCancellation for QueuedCancellation {
         fn is_cancelled(&self) -> bool {
             let cancelled = self.cancelled.load(Ordering::SeqCst);
@@ -761,6 +776,48 @@ mod cancellation_commit_tests {
             database.execute("SELECT * FROM cancelled_commit"),
             Err(Error::TableNotFound(_))
         ));
+    }
+
+    #[test]
+    fn relational_inner_loops_observe_controlled_query_cancellation() {
+        let limits = QueryLimits::new(usize::MAX, usize::MAX, usize::MAX, usize::MAX, 0);
+        let database = Database::with_query_limits(limits);
+        database.execute("CREATE TABLE left_t (id Int64)").unwrap();
+        database.execute("CREATE TABLE right_t (id Int64)").unwrap();
+        database.execute("INSERT INTO left_t VALUES (1)").unwrap();
+        database
+            .execute("INSERT INTO right_t VALUES (1), (1)")
+            .unwrap();
+
+        let join_cancellation = CancelOnCheck {
+            checks: AtomicUsize::new(0),
+            // Parsing/scan/build consume nine checks; the tenth is the first
+            // duplicate-match expansion.
+            cancel_on: 10,
+        };
+        assert_eq!(
+            database.execute_controlled(
+                "SELECT l.id FROM left_t l JOIN right_t r ON l.id = r.id",
+                usize::MAX,
+                &join_cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        );
+
+        let window_cancellation = CancelOnCheck {
+            checks: AtomicUsize::new(0),
+            // The twelfth check is the first RANK assignment after both
+            // partition passes and sorting.
+            cancel_on: 12,
+        };
+        assert_eq!(
+            database.execute_controlled(
+                "SELECT RANK() OVER (ORDER BY id) AS rnk FROM right_t",
+                usize::MAX,
+                &window_cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        );
     }
 }
 

@@ -205,6 +205,53 @@ fn rows_following_frames_and_default_running_frames_have_sql_empty_values() {
 }
 
 #[test]
+fn bounded_float_sum_does_not_subtract_rounded_prefixes() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE floats (seq Int64, value Float64)")
+        .unwrap();
+    database
+        .execute("INSERT INTO floats VALUES (1, 1e16), (2, 1.0), (3, -1e16)")
+        .unwrap();
+
+    assert_eq!(
+        query(
+            &database,
+            "SELECT seq, SUM(value) OVER (ORDER BY seq \
+             ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS framed \
+             FROM floats ORDER BY seq"
+        ),
+        vec![
+            vec![Value::Int64(1), Value::Float64(1e16)],
+            vec![Value::Int64(2), Value::Float64(1.0)],
+            vec![Value::Int64(3), Value::Float64(-1e16)],
+        ]
+    );
+}
+
+#[test]
+fn rank_treats_signed_float_zeroes_as_peers() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE zeroes (seq Int64, value Float64)")
+        .unwrap();
+    database
+        .execute("INSERT INTO zeroes VALUES (1, -0.0), (2, 0.0)")
+        .unwrap();
+
+    assert_eq!(
+        query(
+            &database,
+            "SELECT seq, RANK() OVER (ORDER BY value) AS rnk FROM zeroes ORDER BY seq"
+        ),
+        vec![
+            vec![Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Int64(1)],
+        ]
+    );
+}
+
+#[test]
 fn join_build_partition_and_output_limits_fail_explicitly() {
     let limits = QueryLimits::new(1, usize::MAX, 2, usize::MAX, 1);
     let database = Database::with_query_limits(limits);
@@ -269,6 +316,41 @@ fn duplicate_join_matches_are_bounded_before_result_materialization() {
 }
 
 #[test]
+fn join_expansion_is_bounded_even_when_the_final_projection_is_small() {
+    let database = Database::with_query_limits(QueryLimits::new(
+        usize::MAX,
+        1_024,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    ));
+    database
+        .execute("CREATE TABLE large_left (id Int64, payload String)")
+        .unwrap();
+    database
+        .execute("CREATE TABLE duplicate_right (id Int64)")
+        .unwrap();
+    database
+        .execute(&format!(
+            "INSERT INTO large_left VALUES (1, '{}')",
+            "x".repeat(800)
+        ))
+        .unwrap();
+    database
+        .execute("INSERT INTO duplicate_right VALUES (1), (1)")
+        .unwrap();
+
+    assert!(matches!(
+        database.execute("SELECT l.id FROM large_left l JOIN duplicate_right r ON l.id = r.id"),
+        Err(Error::MemoryLimitExceeded {
+            operator: "hash join output",
+            limit: 1_024,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn join_and_window_byte_state_limits_are_enforced() {
     let database =
         Database::with_query_limits(QueryLimits::new(usize::MAX, 0, usize::MAX, 0, usize::MAX));
@@ -290,6 +372,72 @@ fn join_and_window_byte_state_limits_are_enforced() {
         Err(Error::MemoryLimitExceeded {
             operator: "window partition",
             limit: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn window_limit_counts_cumulative_partitions_outputs_and_prefix_state() {
+    let database = Database::with_query_limits(QueryLimits::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        1_000,
+        usize::MAX,
+    ));
+    database
+        .execute("CREATE TABLE many_partitions (grp Int64, value Float64)")
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO many_partitions VALUES \
+             (1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0), (5, 5.0), (6, 6.0), (7, 7.0), (8, 8.0)",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        database.execute(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY grp ORDER BY value) AS rn \
+             FROM many_partitions"
+        ),
+        Err(Error::MemoryLimitExceeded {
+            operator: "window partition",
+            limit: 1_000,
+            ..
+        })
+    ));
+
+    let prefix_database = Database::with_query_limits(QueryLimits::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        650,
+        usize::MAX,
+    ));
+    prefix_database
+        .execute("CREATE TABLE narrow (value Float64)")
+        .unwrap();
+    prefix_database
+        .execute(
+            "INSERT INTO narrow VALUES (1.0), (2.0), (3.0), (4.0), (5.0), \
+             (6.0), (7.0), (8.0), (9.0), (10.0)",
+        )
+        .unwrap();
+    assert_eq!(
+        query(
+            &prefix_database,
+            "SELECT ROW_NUMBER() OVER (ORDER BY value) AS rn FROM narrow"
+        )
+        .len(),
+        10
+    );
+    assert!(matches!(
+        prefix_database
+            .execute("SELECT COUNT(*) OVER (ORDER BY value) AS running_count FROM narrow"),
+        Err(Error::MemoryLimitExceeded {
+            operator: "window partition",
+            limit: 650,
             ..
         })
     ));
