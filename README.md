@@ -48,7 +48,7 @@ hardware,2,16
 
 The engine deliberately rejects unsupported syntax with typed errors. Joins, subqueries, windows, persistence, transactions spanning statements, and concurrent service access are not implemented.
 
-Embedding starts with `rusthouse::Engine`. `EngineConfig` bounds SQL bytes, rows per insert, rows per table, emitted rows per query, and retained or intermediate query bytes. Before building an AST, parsing also rejects recursive SQL shapes over 1,024 tokens along an expression path, or over 128 nested delimiters. The byte budget covers expression results, filtering, grouping, aggregate and `DISTINCT` state, projected rows, and sort keys. `LIMIT 0` returns after binding without scanning, and plain unordered queries stop retaining scan candidates at their limit; ordered queries fail at the byte limit if their sort candidates cannot be retained safely. `execute_iter` yields one statement result at a time; the CLI uses it so multi-statement batches do not retain prior results. The collecting `execute` API gives each query only its remaining cumulative byte budget and preflights command-result capacity before `CREATE` or `INSERT` mutations. Each insert batch is validated before any column is changed.
+Embedding starts with `rusthouse::Engine`. `EngineConfig` bounds SQL bytes, rows per insert, rows per table, emitted rows per query, and retained or intermediate query bytes. Before building an AST, parsing also rejects batches over 500,000 tokens, 1,024 statements, or 1,024 projections per `SELECT`, recursive SQL shapes over 1,024 tokens along an expression path, and more than 128 nested delimiters. LIKE uses linear matching for literal segments and a fixed work bound for segments containing `_`. The byte budget covers expression results, filtering, grouping, aggregate and `DISTINCT` state, projected rows, and sort keys. `LIMIT 0` returns after binding without scanning, and plain unordered queries stop retaining scan candidates at their limit; ordered queries fail at the byte limit if their sort candidates cannot be retained safely. `execute_iter` yields one statement result at a time; the CLI uses it so multi-statement batches do not retain prior results. The collecting `execute` API gives each query only its remaining cumulative byte budget and preflights command-result capacity before `CREATE` or `INSERT` mutations. Each insert batch is validated before any column is changed.
 
 ## Product target
 
@@ -70,3 +70,10 @@ cargo run -- --help
 ```
 
 The deterministic boundary tests and randomized semantic tests run with `cargo test`.
+
+The `analytical` Criterion benchmark generates 50,000 deterministic rows and measures the supported grouped aggregate query shape. Save a local baseline, then compare later changes against it:
+
+```bash
+cargo bench --bench analytical -- --save-baseline main
+cargo bench --bench analytical -- --baseline main
+```

@@ -9,6 +9,7 @@ use sqlparser::ast::{
     TableFactor, UnaryOperator, Value as SqlValue, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -18,6 +19,11 @@ use crate::types::{DataType, Value};
 
 const MAX_SQL_EXPRESSION_TOKENS: usize = 1_024;
 const MAX_SQL_NESTING_DEPTH: usize = 128;
+const MAX_SQL_TOKENS: usize = 500_000;
+const MAX_SQL_STATEMENTS: usize = 1_024;
+const MAX_SELECT_PROJECTIONS: usize = 1_024;
+const LIKE_WORK_FACTOR: usize = 16;
+const MINIMUM_LIKE_WORK: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -716,10 +722,12 @@ impl Engine {
 }
 
 fn validate_sql_complexity(sql: &str) -> Result<()> {
+    validate_sql_lexical_size(sql)?;
     let dialect = GenericDialect {};
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize()
         .map_err(|error| Error::Sql(error.to_string()))?;
+    validate_sql_breadth(&tokens)?;
     let mut expression_base = [0usize; MAX_SQL_NESTING_DEPTH + 1];
     let mut expression_tokens = [0usize; MAX_SQL_NESTING_DEPTH + 1];
     let mut expression_max = [0usize; MAX_SQL_NESTING_DEPTH + 1];
@@ -767,6 +775,145 @@ fn validate_sql_complexity(sql: &str) -> Result<()> {
         grow_sql_expression_complexity(&mut expression_tokens[nesting_depth])?;
     }
     Ok(())
+}
+
+fn validate_sql_lexical_size(sql: &str) -> Result<()> {
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+    let mut units = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        units = units.saturating_add(1);
+        if units > MAX_SQL_TOKENS {
+            return Err(Error::ResourceLimit {
+                resource: "SQL lexical tokens",
+                limit: MAX_SQL_TOKENS,
+                actual: units,
+            });
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+            {
+                index += 1;
+            }
+        } else if byte.is_ascii_digit() {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn validate_sql_breadth(tokens: &[Token]) -> Result<()> {
+    let token_count = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::EOF))
+        .count();
+    if token_count > MAX_SQL_TOKENS {
+        return Err(Error::ResourceLimit {
+            resource: "SQL tokens",
+            limit: MAX_SQL_TOKENS,
+            actual: token_count,
+        });
+    }
+
+    let mut statement_count = 0usize;
+    let mut statement_has_tokens = false;
+    let mut nesting_depth = 0usize;
+    let mut projection_counts = [None::<usize>; MAX_SQL_NESTING_DEPTH + 1];
+    for token in tokens {
+        if matches!(token, Token::Whitespace(_) | Token::EOF) {
+            continue;
+        }
+        if matches!(token, Token::SemiColon) {
+            if statement_has_tokens {
+                statement_count = statement_count.saturating_add(1);
+                enforce_sql_statement_limit(statement_count)?;
+                statement_has_tokens = false;
+            }
+            projection_counts.fill(None);
+            continue;
+        }
+        statement_has_tokens = true;
+
+        if let Token::Word(word) = token {
+            if select_projection_terminator(word.keyword) {
+                projection_counts[nesting_depth] = None;
+            }
+            if word.keyword == Keyword::SELECT {
+                projection_counts[nesting_depth] = Some(1);
+            }
+        } else if matches!(token, Token::Comma)
+            && let Some(count) = &mut projection_counts[nesting_depth]
+        {
+            *count = (*count).saturating_add(1);
+            if *count > MAX_SELECT_PROJECTIONS {
+                return Err(Error::ResourceLimit {
+                    resource: "SELECT projections",
+                    limit: MAX_SELECT_PROJECTIONS,
+                    actual: *count,
+                });
+            }
+        }
+
+        match token {
+            Token::LParen | Token::LBracket | Token::LBrace
+                if nesting_depth < MAX_SQL_NESTING_DEPTH =>
+            {
+                nesting_depth += 1;
+                projection_counts[nesting_depth] = None;
+            }
+            Token::RParen | Token::RBracket | Token::RBrace if nesting_depth > 0 => {
+                projection_counts[nesting_depth] = None;
+                nesting_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if statement_has_tokens {
+        statement_count = statement_count.saturating_add(1);
+        enforce_sql_statement_limit(statement_count)?;
+    }
+    Ok(())
+}
+
+fn enforce_sql_statement_limit(statement_count: usize) -> Result<()> {
+    if statement_count > MAX_SQL_STATEMENTS {
+        return Err(Error::ResourceLimit {
+            resource: "SQL statements",
+            limit: MAX_SQL_STATEMENTS,
+            actual: statement_count,
+        });
+    }
+    Ok(())
+}
+
+fn select_projection_terminator(keyword: Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::FROM
+            | Keyword::INTO
+            | Keyword::WHERE
+            | Keyword::GROUP
+            | Keyword::HAVING
+            | Keyword::ORDER
+            | Keyword::LIMIT
+            | Keyword::QUALIFY
+            | Keyword::WINDOW
+            | Keyword::UNION
+            | Keyword::EXCEPT
+            | Keyword::INTERSECT
+    )
 }
 
 fn grow_sql_expression_complexity(complexity: &mut usize) -> Result<()> {
@@ -1349,15 +1496,15 @@ fn infer_expression_type(
         Expr::Between {
             expr, low, high, ..
         } => {
-            let value = infer_expression_type(expr, source, aliases)?;
-            ensure_comparable(value, infer_expression_type(low, source, aliases)?)?;
-            ensure_comparable(value, infer_expression_type(high, source, aliases)?)?;
+            let common = infer_expression_type(expr, source, aliases)?;
+            let common = common_type(common, infer_expression_type(low, source, aliases)?)?;
+            common_type(common, infer_expression_type(high, source, aliases)?)?;
             Ok(Some(DataType::Bool))
         }
         Expr::InList { expr, list, .. } => {
-            let value = infer_expression_type(expr, source, aliases)?;
+            let mut common = infer_expression_type(expr, source, aliases)?;
             for item in list {
-                ensure_comparable(value, infer_expression_type(item, source, aliases)?)?;
+                common = common_type(common, infer_expression_type(item, source, aliases)?)?;
             }
             Ok(Some(DataType::Bool))
         }
@@ -2446,8 +2593,17 @@ fn eval_like(
             std::mem::size_of::<Vec<char>>()
                 .saturating_add(value_char_count.saturating_mul(std::mem::size_of::<char>())),
         )?;
+        let scratch_len = tokens
+            .split(|token| *token == LikeToken::AnyMany)
+            .map(<[LikeToken]>::len)
+            .max()
+            .unwrap_or(0);
+        reservation.grow(
+            std::mem::size_of::<Vec<usize>>()
+                .saturating_add(scratch_len.saturating_mul(std::mem::size_of::<usize>())),
+        )?;
     }
-    let matched = like_matches(&value, &tokens, value_char_count, insensitive);
+    let matched = like_matches(&value, &tokens, value_char_count, insensitive)?;
     Ok(Value::Bool(if negated { !matched } else { matched }))
 }
 
@@ -2500,38 +2656,191 @@ fn like_matches(
     tokens: &[LikeToken],
     value_char_count: usize,
     insensitive: bool,
-) -> bool {
+) -> Result<bool> {
     let mut characters = Vec::with_capacity(value_char_count);
     characters.extend(value.chars());
-    let value = characters;
-    let (mut value_index, mut pattern_index) = (0, 0);
-    let (mut star, mut retry) = (None, 0);
-    while value_index < value.len() {
-        let literal_matches = matches!(tokens.get(pattern_index), Some(LikeToken::Literal(pattern))
-        if if insensitive {
-            pattern.to_lowercase().eq(value[value_index].to_lowercase())
-        } else {
-            *pattern == value[value_index]
-        });
-        if tokens.get(pattern_index) == Some(&LikeToken::AnyOne) || literal_matches {
-            value_index += 1;
-            pattern_index += 1;
-        } else if tokens.get(pattern_index) == Some(&LikeToken::AnyMany) {
-            star = Some(pattern_index);
-            pattern_index += 1;
-            retry = value_index;
-        } else if let Some(star_index) = star {
-            retry += 1;
-            value_index = retry;
-            pattern_index = star_index + 1;
-        } else {
-            return false;
+    let Some(first_star) = tokens.iter().position(|token| *token == LikeToken::AnyMany) else {
+        return Ok(characters.len() == tokens.len()
+            && like_segment_matches(&characters, tokens, 0, insensitive));
+    };
+    let last_star = tokens
+        .iter()
+        .rposition(|token| *token == LikeToken::AnyMany)
+        .expect("a LIKE wildcard exists");
+    let prefix = &tokens[..first_star];
+    let suffix = &tokens[last_star + 1..];
+    if characters.len() < prefix.len().saturating_add(suffix.len())
+        || !like_segment_matches(&characters, prefix, 0, insensitive)
+    {
+        return Ok(false);
+    }
+    let suffix_start = characters.len() - suffix.len();
+    if !like_segment_matches(&characters, suffix, suffix_start, insensitive) {
+        return Ok(false);
+    }
+
+    let mut value_start = prefix.len();
+    let mut segment_start = first_star + 1;
+    let mut failure = Vec::new();
+    let wildcard_work_limit = characters
+        .len()
+        .saturating_add(tokens.len())
+        .saturating_mul(LIKE_WORK_FACTOR)
+        .max(MINIMUM_LIKE_WORK);
+    let mut wildcard_work = LikeWork {
+        steps: 0,
+        limit: wildcard_work_limit,
+    };
+    for pattern_index in first_star + 1..=last_star {
+        if tokens[pattern_index] != LikeToken::AnyMany {
+            continue;
+        }
+        let segment = &tokens[segment_start..pattern_index];
+        if !segment.is_empty() {
+            let Some(found) = find_like_segment(
+                &characters,
+                segment,
+                value_start,
+                suffix_start,
+                insensitive,
+                &mut failure,
+                &mut wildcard_work,
+            )?
+            else {
+                return Ok(false);
+            };
+            value_start = found + segment.len();
+        }
+        segment_start = pattern_index + 1;
+    }
+    Ok(value_start <= suffix_start)
+}
+
+fn like_segment_matches(
+    value: &[char],
+    segment: &[LikeToken],
+    start: usize,
+    insensitive: bool,
+) -> bool {
+    start
+        .checked_add(segment.len())
+        .is_some_and(|end| end <= value.len())
+        && segment
+            .iter()
+            .zip(&value[start..start + segment.len()])
+            .all(|(token, value)| like_token_matches(*token, *value, insensitive))
+}
+
+fn find_like_segment(
+    value: &[char],
+    segment: &[LikeToken],
+    start: usize,
+    end: usize,
+    insensitive: bool,
+    failure: &mut Vec<usize>,
+    wildcard_work: &mut LikeWork,
+) -> Result<Option<usize>> {
+    if segment.is_empty() {
+        return Ok(Some(start));
+    }
+    if start > end || segment.len() > end.saturating_sub(start) {
+        return Ok(None);
+    }
+    if segment.contains(&LikeToken::AnyOne) {
+        return find_bounded_wildcard_segment(
+            value,
+            segment,
+            start,
+            end,
+            insensitive,
+            wildcard_work,
+        );
+    }
+    failure.clear();
+    failure.resize(segment.len(), 0);
+    for index in 1..segment.len() {
+        let mut prefix = failure[index - 1];
+        while prefix > 0 && !like_literals_equal(segment[prefix], segment[index], insensitive) {
+            prefix = failure[prefix - 1];
+        }
+        if like_literals_equal(segment[prefix], segment[index], insensitive) {
+            prefix += 1;
+        }
+        failure[index] = prefix;
+    }
+
+    let mut matched = 0usize;
+    for (offset, character) in value[start..end].iter().enumerate() {
+        while matched > 0 && !like_token_matches(segment[matched], *character, insensitive) {
+            matched = failure[matched - 1];
+        }
+        if like_token_matches(segment[matched], *character, insensitive) {
+            matched += 1;
+        }
+        if matched == segment.len() {
+            return Ok(Some(start + offset + 1 - segment.len()));
         }
     }
-    while tokens.get(pattern_index) == Some(&LikeToken::AnyMany) {
-        pattern_index += 1;
+    Ok(None)
+}
+
+fn find_bounded_wildcard_segment(
+    value: &[char],
+    segment: &[LikeToken],
+    start: usize,
+    end: usize,
+    insensitive: bool,
+    work: &mut LikeWork,
+) -> Result<Option<usize>> {
+    for candidate in start..=end - segment.len() {
+        let mut matched = true;
+        for (token, character) in segment.iter().zip(&value[candidate..]) {
+            work.steps = work.steps.saturating_add(1);
+            if work.steps > work.limit {
+                return Err(Error::ResourceLimit {
+                    resource: "LIKE match steps",
+                    limit: work.limit,
+                    actual: work.steps,
+                });
+            }
+            if !like_token_matches(*token, *character, insensitive) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return Ok(Some(candidate));
+        }
     }
-    pattern_index == tokens.len()
+    Ok(None)
+}
+
+struct LikeWork {
+    steps: usize,
+    limit: usize,
+}
+
+fn like_token_matches(token: LikeToken, value: char, insensitive: bool) -> bool {
+    match token {
+        LikeToken::AnyOne => true,
+        LikeToken::Literal(pattern) => characters_equal(pattern, value, insensitive),
+        LikeToken::AnyMany => unreachable!("LIKE segments exclude % tokens"),
+    }
+}
+
+fn like_literals_equal(left: LikeToken, right: LikeToken, insensitive: bool) -> bool {
+    let (LikeToken::Literal(left), LikeToken::Literal(right)) = (left, right) else {
+        unreachable!("literal LIKE segments exclude wildcard tokens");
+    };
+    characters_equal(left, right, insensitive)
+}
+
+fn characters_equal(left: char, right: char, insensitive: bool) -> bool {
+    if insensitive {
+        left.to_lowercase().eq(right.to_lowercase())
+    } else {
+        left == right
+    }
 }
 
 fn function_parts(function: &Function) -> Result<(String, &[FunctionArg], bool)> {
@@ -3391,6 +3700,51 @@ mod tests {
         }
     }
 
+    fn generated_strings(alphabet: &[char], maximum_length: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..maximum_length {
+            level = level
+                .iter()
+                .flat_map(|prefix| {
+                    alphabet.iter().map(move |character| {
+                        let mut value = prefix.clone();
+                        value.push(*character);
+                        value
+                    })
+                })
+                .collect();
+            all.extend(level.iter().cloned());
+        }
+        all
+    }
+
+    fn naive_like(value: &str, pattern: &str) -> bool {
+        let tokens = like_tokens(pattern, None, pattern.chars().count()).unwrap();
+        let value = value.chars().collect::<Vec<_>>();
+        let mut current = vec![false; value.len() + 1];
+        current[0] = true;
+        for token in tokens {
+            let mut next = vec![false; value.len() + 1];
+            match token {
+                LikeToken::AnyMany => {
+                    next[0] = current[0];
+                    for index in 1..=value.len() {
+                        next[index] = current[index] || next[index - 1];
+                    }
+                }
+                token => {
+                    for index in 1..=value.len() {
+                        next[index] = current[index - 1]
+                            && like_token_matches(token, value[index - 1], false);
+                    }
+                }
+            }
+            current = next;
+        }
+        current[value.len()]
+    }
+
     fn fixture() -> Engine {
         let mut engine = Engine::default();
         engine
@@ -3677,6 +4031,45 @@ mod tests {
     }
 
     #[test]
+    fn like_linear_matcher_agrees_with_dynamic_programming() {
+        let values = generated_strings(&['a', 'b'], 5);
+        let patterns = generated_strings(&['a', 'b', '_', '%'], 5);
+        for value in &values {
+            for pattern in &patterns {
+                let tokens = like_tokens(pattern, None, pattern.chars().count()).unwrap();
+                assert_eq!(
+                    like_matches(value, &tokens, value.chars().count(), false).unwrap(),
+                    naive_like(value, pattern),
+                    "value={value:?}, pattern={pattern:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn like_adversarial_suffix_is_bounded() {
+        let mut engine = Engine::default();
+        let value = "a".repeat(80_000);
+        let pattern = format!("%{}b", "a".repeat(40_000));
+        assert_eq!(
+            query(&mut engine, &format!("SELECT '{value}' LIKE '{pattern}'")).rows,
+            vec![vec![Value::Bool(false)]]
+        );
+
+        let wildcard_pattern = format!("%_{}b%", "a".repeat(5_000));
+        assert!(matches!(
+            engine.execute(&format!(
+                "SELECT '{}' LIKE '{wildcard_pattern}'",
+                "a".repeat(10_000)
+            )),
+            Err(Error::ResourceLimit {
+                resource: "LIKE match steps",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn validates_like_escape_width_at_all_cardinalities() {
         let mut engine = Engine::default();
         engine.execute("CREATE TABLE t (s String)").unwrap();
@@ -3728,6 +4121,24 @@ mod tests {
         ] {
             assert!(engine.execute(sql).is_err(), "{sql} unexpectedly succeeded");
         }
+    }
+
+    #[test]
+    fn null_predicates_fold_a_common_type_before_execution() {
+        let mut engine = Engine::default();
+        engine.execute("CREATE TABLE empty (n Int64)").unwrap();
+        for sql in [
+            "SELECT NULL BETWEEN 1 AND 'x'",
+            "SELECT NULL IN (1, 'x')",
+            "SELECT NULL BETWEEN n AND 'x' FROM empty",
+            "SELECT NULL IN (n, 'x') FROM empty",
+        ] {
+            assert!(matches!(engine.execute(sql), Err(Error::Type(_))), "{sql}");
+        }
+        assert_eq!(
+            query(&mut engine, "SELECT NULL BETWEEN 1 AND 2, NULL IN (1, 2)",).rows,
+            vec![vec![Value::Null, Value::Null]]
+        );
     }
 
     #[test]
@@ -4592,6 +5003,44 @@ mod tests {
             .execute(&format!("INSERT INTO bulk VALUES {values}"))
             .unwrap();
         assert_eq!(engine.table("bulk").unwrap().row_count(), 2_000);
+    }
+
+    #[test]
+    fn rejects_sql_breadth_before_building_an_ast() {
+        let mut engine = Engine::default();
+        let projections = std::iter::repeat_n("1", MAX_SELECT_PROJECTIONS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(matches!(
+            engine.execute(&format!("SELECT {projections}")),
+            Err(Error::ResourceLimit {
+                resource: "SELECT projections",
+                limit: MAX_SELECT_PROJECTIONS,
+                ..
+            })
+        ));
+
+        let statements = std::iter::repeat_n("SELECT 1", MAX_SQL_STATEMENTS + 1)
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(matches!(
+            engine.execute(&statements),
+            Err(Error::ResourceLimit {
+                resource: "SQL statements",
+                limit: MAX_SQL_STATEMENTS,
+                ..
+            })
+        ));
+
+        let lexical_tokens = "+".repeat(MAX_SQL_TOKENS + 1);
+        assert!(matches!(
+            engine.execute(&lexical_tokens),
+            Err(Error::ResourceLimit {
+                resource: "SQL lexical tokens",
+                limit: MAX_SQL_TOKENS,
+                ..
+            })
+        ));
     }
 
     #[test]
