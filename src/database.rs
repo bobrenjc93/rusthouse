@@ -7,7 +7,7 @@ use crate::catalog::CatalogGeneration;
 use crate::error::{Error, LimitKind, Result};
 use crate::persistence::{Persistence, StoreStatus};
 use crate::query::{
-    ActiveQuerySnapshot, EngineMetricsSnapshot, ObservabilitySnapshot, QueryCancellation,
+    ActiveSnapshotError, EngineMetricsSnapshot, ObservabilitySnapshot, QueryCancellation,
     QueryObservability, QueryObservation, QueryPhase,
 };
 use crate::sql::{Comparison, Predicate, Statement, parse};
@@ -247,17 +247,139 @@ impl DatabaseInner {
         Ok(Arc::clone(&self.lock()?.head))
     }
 
-    fn system_table(&self, name: &str) -> Result<Table> {
+    fn execute_system_read(
+        &self,
+        name: &str,
+        statement: Statement,
+        control: Option<ExecutionControl<'_>>,
+    ) -> Result<StatementResult> {
+        check_cancellation(control)?;
         let catalog = self.snapshot()?;
+        let Statement::Select {
+            columns,
+            predicates,
+            ..
+        } = statement
+        else {
+            return Err(Error::Unsupported("statement is not a query".to_owned()));
+        };
         match name {
-            "system.tables" => system_tables(&catalog),
-            "system.columns" => system_columns(&catalog),
-            "system.segments" => system_segments(&catalog),
+            "system.tables" => execute_virtual_rows(
+                system_tables_schema(),
+                catalog.tables.iter().map(|(name, table)| {
+                    vec![
+                        VirtualValue::BorrowedString("default"),
+                        VirtualValue::BorrowedString(name),
+                        VirtualValue::Int64(u64_to_i64(catalog.id)),
+                        VirtualValue::Int64(usize_to_i64(table.schema().len())),
+                        VirtualValue::Int64(usize_to_i64(table.row_count())),
+                        VirtualValue::Int64(usize_to_i64(table.logical_bytes())),
+                    ]
+                }),
+                columns,
+                predicates,
+                control,
+                0,
+            ),
+            "system.columns" => execute_virtual_rows(
+                system_columns_schema(),
+                catalog.tables.iter().flat_map(|(table_name, table)| {
+                    table
+                        .schema()
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, column)| {
+                            vec![
+                                VirtualValue::BorrowedString("default"),
+                                VirtualValue::BorrowedString(table_name),
+                                VirtualValue::BorrowedString(&column.name),
+                                VirtualValue::Int64(usize_to_i64(index.saturating_add(1))),
+                                VirtualValue::DataType(column.data_type),
+                                VirtualValue::Bool(column.nullable),
+                            ]
+                        })
+                }),
+                columns,
+                predicates,
+                control,
+                0,
+            ),
+            "system.segments" => execute_virtual_rows(
+                system_segments_schema(),
+                catalog.tables.iter().map(|(name, table)| {
+                    vec![
+                        VirtualValue::BorrowedString("default"),
+                        VirtualValue::BorrowedString(name),
+                        VirtualValue::SegmentId {
+                            generation: catalog.id,
+                            table: name,
+                        },
+                        VirtualValue::Int64(u64_to_i64(catalog.id)),
+                        VirtualValue::Int64(usize_to_i64(table.row_count())),
+                        VirtualValue::Int64(usize_to_i64(table.logical_bytes())),
+                    ]
+                }),
+                columns,
+                predicates,
+                control,
+                0,
+            ),
             "system.active_queries" => {
-                system_active_queries(&self.observability.snapshot().active_queries)
+                let limit = control.map_or(usize::MAX, |control| control.max_result_bytes);
+                let (queries, retained_bytes) = self
+                    .observability
+                    .bounded_active_queries(limit, || {
+                        control.is_some_and(|control| control.cancellation.is_cancelled())
+                    })
+                    .map_err(|error| match error {
+                        ActiveSnapshotError::Cancelled => Error::QueryCancelled,
+                        ActiveSnapshotError::LimitExceeded { required } => {
+                            Error::MemoryLimitExceeded {
+                                operator: "system.active_queries",
+                                required,
+                                limit,
+                            }
+                        }
+                    })?;
+                execute_virtual_rows(
+                    system_active_queries_schema(),
+                    queries.into_iter().map(|query| {
+                        vec![
+                            VirtualValue::U64String(query.query_id),
+                            VirtualValue::OwnedString(query.query),
+                            VirtualValue::BorrowedString(query.phase.as_str()),
+                            VirtualValue::Int64(u64_to_i64(query.elapsed_ms)),
+                            VirtualValue::Int64(u64_to_i64(query.scanned_rows)),
+                            VirtualValue::Int64(u64_to_i64(query.scanned_bytes)),
+                            VirtualValue::Int64(u64_to_i64(query.peak_memory_bytes)),
+                            VirtualValue::Int64(u64_to_i64(query.spill_bytes)),
+                            VirtualValue::Bool(query.cancelled),
+                        ]
+                    }),
+                    columns,
+                    predicates,
+                    control,
+                    retained_bytes,
+                )
             }
             "system.engine_metrics" => {
-                system_engine_metrics(self.observability.snapshot().engine_metrics)
+                check_cancellation(control)?;
+                let metrics = self.observability.current_engine_metrics();
+                execute_virtual_rows(
+                    system_engine_metrics_schema(),
+                    engine_metric_values(metrics)
+                        .into_iter()
+                        .map(|(name, value)| {
+                            vec![
+                                VirtualValue::BorrowedString(name),
+                                VirtualValue::Int64(u64_to_i64(value)),
+                            ]
+                        }),
+                    columns,
+                    predicates,
+                    control,
+                    0,
+                )
             }
             _ => Err(Error::TableNotFound(name.to_owned())),
         }
@@ -330,85 +452,41 @@ impl DatabaseInner {
     }
 }
 
-fn system_tables(catalog: &CatalogGeneration) -> Result<Table> {
-    let schema = vec![
+fn system_tables_schema() -> Vec<ColumnDef> {
+    vec![
         string_column("database"),
         string_column("name"),
         int_column("generation"),
         int_column("column_count"),
         int_column("row_count"),
         int_column("logical_bytes"),
-    ];
-    let rows = catalog
-        .tables
-        .iter()
-        .map(|(name, table)| {
-            vec![
-                Value::String("default".to_owned()),
-                Value::String(name.clone()),
-                Value::Int64(u64_to_i64(catalog.id)),
-                Value::Int64(usize_to_i64(table.schema().len())),
-                Value::Int64(usize_to_i64(table.row_count())),
-                Value::Int64(usize_to_i64(table.logical_bytes())),
-            ]
-        })
-        .collect();
-    table_from_rows(schema, rows)
+    ]
 }
 
-fn system_columns(catalog: &CatalogGeneration) -> Result<Table> {
-    let schema = vec![
+fn system_columns_schema() -> Vec<ColumnDef> {
+    vec![
         string_column("database"),
         string_column("table"),
         string_column("name"),
         int_column("ordinal_position"),
         string_column("data_type"),
         bool_column("nullable"),
-    ];
-    let mut rows = Vec::new();
-    for (table_name, table) in &catalog.tables {
-        for (index, column) in table.schema().iter().enumerate() {
-            rows.push(vec![
-                Value::String("default".to_owned()),
-                Value::String(table_name.clone()),
-                Value::String(column.name.clone()),
-                Value::Int64(usize_to_i64(index.saturating_add(1))),
-                Value::String(column.data_type.to_string()),
-                Value::Bool(column.nullable),
-            ]);
-        }
-    }
-    table_from_rows(schema, rows)
+    ]
 }
 
-fn system_segments(catalog: &CatalogGeneration) -> Result<Table> {
-    let schema = vec![
+fn system_segments_schema() -> Vec<ColumnDef> {
+    vec![
         string_column("database"),
         string_column("table"),
         string_column("segment_id"),
         int_column("generation"),
         int_column("row_count"),
         int_column("logical_bytes"),
-    ];
-    let rows = catalog
-        .tables
-        .iter()
-        .map(|(name, table)| {
-            vec![
-                Value::String("default".to_owned()),
-                Value::String(name.clone()),
-                Value::String(format!("{}:{name}", catalog.id)),
-                Value::Int64(u64_to_i64(catalog.id)),
-                Value::Int64(usize_to_i64(table.row_count())),
-                Value::Int64(usize_to_i64(table.logical_bytes())),
-            ]
-        })
-        .collect();
-    table_from_rows(schema, rows)
+    ]
 }
 
-fn system_active_queries(queries: &[ActiveQuerySnapshot]) -> Result<Table> {
-    let schema = vec![
+fn system_active_queries_schema() -> Vec<ColumnDef> {
+    vec![
         string_column("query_id"),
         string_column("query"),
         string_column("phase"),
@@ -418,29 +496,15 @@ fn system_active_queries(queries: &[ActiveQuerySnapshot]) -> Result<Table> {
         int_column("peak_memory_bytes"),
         int_column("spill_bytes"),
         bool_column("cancelled"),
-    ];
-    let rows = queries
-        .iter()
-        .map(|query| {
-            vec![
-                Value::String(query.query_id.to_string()),
-                Value::String(query.query.clone()),
-                Value::String(query.phase.as_str().to_owned()),
-                Value::Int64(u64_to_i64(query.elapsed_ms)),
-                Value::Int64(u64_to_i64(query.scanned_rows)),
-                Value::Int64(u64_to_i64(query.scanned_bytes)),
-                Value::Int64(u64_to_i64(query.peak_memory_bytes)),
-                Value::Int64(u64_to_i64(query.spill_bytes)),
-                Value::Bool(query.cancelled),
-            ]
-        })
-        .collect();
-    table_from_rows(schema, rows)
+    ]
 }
 
-fn system_engine_metrics(metrics: EngineMetricsSnapshot) -> Result<Table> {
-    let schema = vec![string_column("metric"), int_column("value")];
-    let values = [
+fn system_engine_metrics_schema() -> Vec<ColumnDef> {
+    vec![string_column("metric"), int_column("value")]
+}
+
+fn engine_metric_values(metrics: EngineMetricsSnapshot) -> [(&'static str, u64); 11] {
+    [
         ("active_queries", metrics.active_queries),
         ("tracked_active_queries", metrics.tracked_active_queries),
         ("queries_total", metrics.queries_total),
@@ -455,23 +519,151 @@ fn system_engine_metrics(metrics: EngineMetricsSnapshot) -> Result<Table> {
             "dropped_active_query_records_total",
             metrics.dropped_active_query_records_total,
         ),
-    ];
-    let rows = values
-        .into_iter()
-        .map(|(name, value)| {
-            vec![
-                Value::String(name.to_owned()),
-                Value::Int64(u64_to_i64(value)),
-            ]
-        })
-        .collect();
-    table_from_rows(schema, rows)
+    ]
 }
 
-fn table_from_rows(schema: Vec<ColumnDef>, rows: Vec<Vec<Value>>) -> Result<Table> {
-    let mut table = Table::new(schema)?;
-    table.append_rows(&rows)?;
-    Ok(table)
+enum VirtualValue<'a> {
+    BorrowedString(&'a str),
+    OwnedString(String),
+    SegmentId { generation: u64, table: &'a str },
+    U64String(u64),
+    DataType(DataType),
+    Int64(i64),
+    Bool(bool),
+}
+
+impl VirtualValue<'_> {
+    fn materialized_bytes(&self) -> usize {
+        std::mem::size_of::<Value>()
+            + match self {
+                Self::BorrowedString(value) => value.len(),
+                Self::OwnedString(value) => value.len(),
+                Self::SegmentId { generation, table } => decimal_len(*generation)
+                    .saturating_add(1)
+                    .saturating_add(table.len()),
+                Self::U64String(value) => decimal_len(*value),
+                Self::DataType(data_type) => data_type_name(*data_type).len(),
+                Self::Int64(_) | Self::Bool(_) => 0,
+            }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::BorrowedString(value) => Value::String(value.to_owned()),
+            Self::OwnedString(value) => Value::String(value),
+            Self::SegmentId { generation, table } => Value::String(format!("{generation}:{table}")),
+            Self::U64String(value) => Value::String(value.to_string()),
+            Self::DataType(data_type) => Value::String(data_type_name(data_type).to_owned()),
+            Self::Int64(value) => Value::Int64(value),
+            Self::Bool(value) => Value::Bool(value),
+        }
+    }
+}
+
+fn execute_virtual_rows<'a>(
+    schema: Vec<ColumnDef>,
+    rows: impl IntoIterator<Item = Vec<VirtualValue<'a>>>,
+    columns: Option<Vec<String>>,
+    predicates: Vec<Predicate>,
+    control: Option<ExecutionControl<'_>>,
+    base_retained_bytes: usize,
+) -> Result<StatementResult> {
+    set_phase(control, QueryPhase::Scanning);
+    let projection = prepare_projection(&schema, columns)?;
+    let predicates = prepare_predicates_schema(&schema, &predicates)?;
+    let column_bytes = projected_column_bytes(&schema, &projection);
+    let mut result_bytes = column_bytes;
+    enforce_result_limit(control, base_retained_bytes.saturating_add(result_bytes))?;
+    set_peak_memory(control, base_retained_bytes.saturating_add(result_bytes));
+
+    let mut output_rows = Vec::new();
+    let mut rows = rows.into_iter();
+    loop {
+        check_cancellation(control)?;
+        let Some(virtual_row) = rows.next() else {
+            break;
+        };
+        if virtual_row.len() != schema.len() {
+            return Err(Error::InvalidRow(
+                "system table row does not match its schema".to_owned(),
+            ));
+        }
+        let temporary_bytes = std::mem::size_of::<Vec<Value>>().saturating_add(
+            virtual_row.iter().fold(0_usize, |bytes, value| {
+                bytes.saturating_add(value.materialized_bytes())
+            }),
+        );
+        let temporary_required = base_retained_bytes
+            .saturating_add(result_bytes)
+            .saturating_add(temporary_bytes);
+        enforce_result_limit(control, temporary_required)?;
+        set_peak_memory(control, temporary_required);
+        let row = virtual_row
+            .into_iter()
+            .map(VirtualValue::into_value)
+            .collect::<Vec<_>>();
+
+        let predicate_bytes = predicates.iter().fold(0_usize, |bytes, (column, _, _)| {
+            bytes.saturating_add(value_owned_bytes(&row[*column]))
+        });
+        add_scan(control, 1, predicate_bytes);
+        if predicates
+            .iter()
+            .all(|(column, comparison, value)| compare(&row[*column], value, *comparison))
+        {
+            let projected_value_bytes = projection.iter().fold(0_usize, |bytes, column| {
+                bytes.saturating_add(value_owned_bytes(&row[*column]))
+            });
+            let retained_row_bytes =
+                std::mem::size_of::<Vec<Value>>().saturating_add(projected_value_bytes);
+            let required = temporary_required.saturating_add(retained_row_bytes);
+            enforce_result_limit(control, required)?;
+            set_peak_memory(control, required);
+            result_bytes = result_bytes.saturating_add(retained_row_bytes);
+            add_scan(control, 0, projected_value_bytes);
+            output_rows.push(
+                projection
+                    .iter()
+                    .map(|column| row[*column].clone())
+                    .collect(),
+            );
+        }
+    }
+
+    let columns = projection
+        .iter()
+        .map(|index| schema[*index].clone())
+        .collect();
+    Ok(StatementResult::Query(ResultSet {
+        columns,
+        rows: output_rows,
+    }))
+}
+
+fn decimal_len(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 10 {
+        value /= 10;
+        length += 1;
+    }
+    length
+}
+
+fn data_type_name(data_type: DataType) -> &'static str {
+    match data_type {
+        DataType::Int64 => "Int64",
+        DataType::Float64 => "Float64",
+        DataType::Bool => "Bool",
+        DataType::String => "String",
+    }
+}
+
+fn value_owned_bytes(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::String(value) => value.len(),
+            _ => 0,
+        }
 }
 
 fn string_column(name: &str) -> ColumnDef {
@@ -560,13 +752,6 @@ impl Session {
         statement: Statement,
         control: Option<ExecutionControl<'_>>,
     ) -> Result<StatementResult> {
-        if let Statement::Select { table, .. } = &statement
-            && table.starts_with("system.")
-        {
-            set_phase(control, QueryPhase::Scanning);
-            let system_table = self.database.inner.system_table(table)?;
-            return execute_read_table(&system_table, statement, control);
-        }
         match statement {
             Statement::Begin => {
                 let generation = self.begin()?;
@@ -581,12 +766,32 @@ impl Session {
                 Ok(StatementResult::TransactionRolledBack)
             }
             statement @ Statement::Select { .. } => {
+                let table_name = match &statement {
+                    Statement::Select { table, .. } => table.clone(),
+                    _ => unreachable!("the match arm guarantees SELECT"),
+                };
                 let tables = if let Some(transaction) = &self.transaction {
                     &transaction.tables
                 } else {
                     let snapshot = self.database.inner.snapshot()?;
+                    if table_name.starts_with("system.")
+                        && !snapshot.tables.contains_key(&table_name)
+                    {
+                        return self.database.inner.execute_system_read(
+                            &table_name,
+                            statement,
+                            control,
+                        );
+                    }
                     return execute_read(&snapshot.tables, statement, control);
                 };
+                if table_name.starts_with("system.") && !tables.contains_key(&table_name) {
+                    return self.database.inner.execute_system_read(
+                        &table_name,
+                        statement,
+                        control,
+                    );
+                }
                 execute_read(tables, statement, control)
             }
             statement => {
@@ -664,12 +869,17 @@ impl Session {
 }
 
 fn execute_write(transaction: &mut Transaction, statement: Statement) -> Result<StatementResult> {
-    let target = match &statement {
-        Statement::CreateTable { name, .. } | Statement::DropTable { name } => Some(name),
-        Statement::Insert { table, .. } => Some(table),
-        _ => None,
+    let targets_virtual_system_table = match &statement {
+        Statement::CreateTable { name, .. } => name.starts_with("system."),
+        Statement::DropTable { name } => {
+            name.starts_with("system.") && !transaction.tables.contains_key(name)
+        }
+        Statement::Insert { table, .. } => {
+            table.starts_with("system.") && !transaction.tables.contains_key(table)
+        }
+        _ => false,
     };
-    if target.is_some_and(|name| name.starts_with("system.")) {
+    if targets_virtual_system_table {
         return Err(Error::Unsupported("system tables are read-only".to_owned()));
     }
     match statement {
@@ -796,22 +1006,6 @@ fn execute_read(
     execute_read_table_parts(table, columns, predicates, control)
 }
 
-fn execute_read_table(
-    table: &Table,
-    statement: Statement,
-    control: Option<ExecutionControl<'_>>,
-) -> Result<StatementResult> {
-    let Statement::Select {
-        columns,
-        predicates,
-        ..
-    } = statement
-    else {
-        return Err(Error::Unsupported("statement is not a query".to_owned()));
-    };
-    execute_read_table_parts(table, columns, predicates, control)
-}
-
 fn execute_read_table_parts(
     table: &Table,
     columns: Option<Vec<String>>,
@@ -819,30 +1013,9 @@ fn execute_read_table_parts(
     control: Option<ExecutionControl<'_>>,
 ) -> Result<StatementResult> {
     set_phase(control, QueryPhase::Scanning);
-    let projection = match columns {
-        Some(columns) => {
-            let mut projection = Vec::with_capacity(columns.len());
-            for (position, name) in columns.iter().enumerate() {
-                if columns[..position].contains(name) {
-                    return Err(Error::DuplicateColumn(name.clone()));
-                }
-                projection.push(
-                    table
-                        .column_index(name)
-                        .ok_or_else(|| Error::ColumnNotFound(name.clone()))?,
-                );
-            }
-            projection
-        }
-        None => (0..table.schema().len()).collect(),
-    };
-    let predicates = prepare_predicates(table, &predicates)?;
-    let column_bytes = projection.iter().fold(
-        projection
-            .len()
-            .saturating_mul(std::mem::size_of::<ColumnDef>()),
-        |bytes, index| bytes.saturating_add(table.schema()[*index].name.len()),
-    );
+    let projection = prepare_projection(table.schema(), columns)?;
+    let predicates = prepare_predicates_schema(table.schema(), &predicates)?;
+    let column_bytes = projected_column_bytes(table.schema(), &projection);
     enforce_result_limit(control, column_bytes)?;
     let row_fixed_bytes = std::mem::size_of::<Vec<Value>>().saturating_add(
         projection
@@ -960,17 +1133,48 @@ fn enforce_result_limit(control: Option<ExecutionControl<'_>>, required: usize) 
     Ok(())
 }
 
-fn prepare_predicates(
-    table: &Table,
+fn prepare_projection(schema: &[ColumnDef], columns: Option<Vec<String>>) -> Result<Vec<usize>> {
+    match columns {
+        Some(columns) => {
+            let mut projection = Vec::with_capacity(columns.len());
+            for (position, name) in columns.iter().enumerate() {
+                if columns[..position].contains(name) {
+                    return Err(Error::DuplicateColumn(name.clone()));
+                }
+                projection.push(
+                    schema
+                        .iter()
+                        .position(|column| column.name == *name)
+                        .ok_or_else(|| Error::ColumnNotFound(name.clone()))?,
+                );
+            }
+            Ok(projection)
+        }
+        None => Ok((0..schema.len()).collect()),
+    }
+}
+
+fn projected_column_bytes(schema: &[ColumnDef], projection: &[usize]) -> usize {
+    projection.iter().fold(
+        projection
+            .len()
+            .saturating_mul(std::mem::size_of::<ColumnDef>()),
+        |bytes, index| bytes.saturating_add(schema[*index].name.len()),
+    )
+}
+
+fn prepare_predicates_schema(
+    schema: &[ColumnDef],
     predicates: &[Predicate],
 ) -> Result<Vec<(usize, Comparison, Value)>> {
     predicates
         .iter()
         .map(|predicate| {
-            let index = table
-                .column_index(&predicate.column)
+            let index = schema
+                .iter()
+                .position(|column| column.name == predicate.column)
                 .ok_or_else(|| Error::ColumnNotFound(predicate.column.clone()))?;
-            let column = &table.schema()[index];
+            let column = &schema[index];
             if let Some(value_type) = predicate.value.data_type()
                 && value_type != column.data_type
                 && !(value_type.is_numeric() && column.data_type.is_numeric())
@@ -1122,16 +1326,81 @@ mod cancellation_commit_tests {
     }
 }
 
+#[cfg(test)]
+mod system_table_resource_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct CancelAfterChecks {
+        checks: AtomicUsize,
+        allowed_checks: usize,
+    }
+
+    impl ExecutionCancellation for CancelAfterChecks {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) >= self.allowed_checks
+        }
+
+        fn begin_publication(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn system_metadata_stream_checks_cancellation_between_rows() {
+        let database = Database::new();
+        for index in 0..20 {
+            database
+                .execute(&format!("CREATE TABLE table_{index} (id Int64)"))
+                .unwrap();
+        }
+        let cancellation = CancelAfterChecks {
+            checks: AtomicUsize::new(0),
+            allowed_checks: 5,
+        };
+
+        assert!(matches!(
+            database.execute_controlled(
+                "SELECT name FROM system.tables",
+                usize::MAX,
+                &cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        ));
+    }
+
+    #[test]
+    fn system_metadata_row_is_budgeted_before_string_cloning() {
+        let database = Database::new();
+        let name = "x".repeat(1_024);
+        database
+            .execute(&format!("CREATE TABLE \"{name}\" (id Int64)"))
+            .unwrap();
+        let cancellation = CancelAfterChecks {
+            checks: AtomicUsize::new(0),
+            allowed_checks: usize::MAX,
+        };
+
+        assert!(matches!(
+            database.execute_controlled("SELECT name FROM system.tables", 128, &cancellation,),
+            Err(Error::MemoryLimitExceeded { .. })
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod persistence_commit_tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::persistence::fail_next_directory_sync;
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+    static PERSISTENCE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn temporary_path() -> PathBuf {
         let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
@@ -1150,6 +1419,7 @@ mod persistence_commit_tests {
 
     #[test]
     fn post_rename_sync_failure_keeps_memory_and_disk_aligned() {
+        let _test_guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
         let path = temporary_path();
         let database = Database::open(&path).unwrap();
         let mut session = database.session();
@@ -1178,6 +1448,47 @@ mod persistence_commit_tests {
             reopened.execute("SELECT * FROM published"),
             Ok(StatementResult::Query(_))
         ));
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn legacy_system_named_table_remains_accessible_until_migrated() {
+        let _test_guard = PERSISTENCE_TEST_LOCK.lock().unwrap();
+        let path = temporary_path();
+        let database = Database::open(&path).unwrap();
+        let snapshot = database.inner.snapshot().unwrap();
+        let mut transaction = Transaction::new(snapshot, TransactionLimits::default());
+        let mut legacy = Table::new(vec![ColumnDef::new("id", DataType::Int64, false)]).unwrap();
+        legacy.append_rows(&[vec![Value::Int64(7)]]).unwrap();
+        transaction
+            .tables
+            .insert("system.tables".to_owned(), Arc::new(legacy));
+        transaction
+            .touched_tables
+            .insert("system.tables".to_owned());
+        database.inner.commit(&transaction, None).unwrap();
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        let rows = reopened
+            .execute("SELECT * FROM \"system.tables\"")
+            .unwrap()
+            .into_result_set()
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec![Value::Int64(7)]]);
+        reopened
+            .execute("INSERT INTO \"system.tables\" VALUES (8)")
+            .unwrap();
+        reopened.execute("DROP TABLE \"system.tables\"").unwrap();
+
+        let virtual_table = reopened
+            .execute("SELECT * FROM system.tables")
+            .unwrap()
+            .into_result_set()
+            .unwrap();
+        assert_eq!(virtual_table.columns[0].name, "database");
+        assert!(virtual_table.rows.is_empty());
         drop(reopened);
         remove_database(&path);
     }

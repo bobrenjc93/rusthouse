@@ -17,7 +17,8 @@ fn oversized_concurrency_is_reported_without_panicking() {
 #[cfg(unix)]
 mod unix {
     use std::{
-        io::{BufRead, BufReader},
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpStream,
         process::{Child, Command, Stdio},
         sync::mpsc,
         thread,
@@ -78,5 +79,46 @@ mod unix {
         };
         child.0.take();
         assert!(status.success(), "server exited with {status}");
+    }
+
+    #[test]
+    fn closed_stderr_does_not_change_committed_mutation_response() {
+        let child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .args(["serve", "--bind", "127.0.0.1:0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(Some(child));
+        let stderr = child.0.as_mut().unwrap().stderr.take().unwrap();
+        let mut stderr = BufReader::new(stderr);
+        let mut ready_line = String::new();
+        stderr.read_line(&mut ready_line).unwrap();
+        let address = ready_line
+            .trim()
+            .strip_prefix("RustHouse HTTP server listening on http://")
+            .expect("server did not report its listening address")
+            .to_owned();
+        drop(stderr);
+
+        let sql = "CREATE TABLE committed_after_log_failure (id Int64)";
+        let request = format!(
+            "POST /query HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/sql\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sql}",
+            sql.len()
+        );
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response after log failure: {response}"
+        );
+        let _ = child.0.as_mut().unwrap().kill();
+        let status = child.0.as_mut().unwrap().wait().unwrap();
+        child.0.take();
+        assert!(!status.success(), "the test terminates the server process");
     }
 }

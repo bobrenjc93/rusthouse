@@ -124,6 +124,7 @@ pub struct Table {
     schema: Vec<ColumnDef>,
     columns: Vec<ColumnData>,
     row_count: usize,
+    logical_bytes: usize,
 }
 
 impl Table {
@@ -150,10 +151,12 @@ impl Table {
             .iter()
             .map(|column| ColumnData::new(column.data_type))
             .collect();
+        let logical_bytes = schema_logical_bytes(&schema);
         Ok(Self {
             schema,
             columns,
             row_count: 0,
+            logical_bytes,
         })
     }
 
@@ -166,16 +169,7 @@ impl Table {
     }
 
     pub(crate) fn logical_bytes(&self) -> usize {
-        self.schema
-            .iter()
-            .fold(0_usize, |bytes, column| {
-                bytes
-                    .saturating_add(std::mem::size_of::<ColumnDef>())
-                    .saturating_add(column.name.len())
-            })
-            .saturating_add(self.columns.iter().fold(0_usize, |bytes, column| {
-                bytes.saturating_add(column.logical_bytes())
-            }))
+        self.logical_bytes
     }
 
     pub(crate) fn column_index(&self, name: &str) -> Option<usize> {
@@ -190,12 +184,16 @@ impl Table {
         for row in rows {
             self.validate_row(row)?;
         }
+        let additional_logical_bytes = rows.iter().fold(0_usize, |bytes, row| {
+            bytes.saturating_add(row_logical_bytes(&self.schema, row))
+        });
         for row in rows {
             for (column, value) in self.columns.iter_mut().zip(row) {
                 column.push(value);
             }
         }
         self.row_count = row_count;
+        self.logical_bytes = self.logical_bytes.saturating_add(additional_logical_bytes);
         Ok(())
     }
 
@@ -267,10 +265,43 @@ impl Table {
                 ));
             }
         }
+        let logical_bytes = schema_logical_bytes(&schema).saturating_add(
+            columns.iter().fold(0_usize, |bytes, column| {
+                bytes.saturating_add(column.logical_bytes())
+            }),
+        );
         Ok(Self {
             schema,
             columns,
             row_count,
+            logical_bytes,
         })
     }
+}
+
+fn schema_logical_bytes(schema: &[ColumnDef]) -> usize {
+    schema.iter().fold(0_usize, |bytes, column| {
+        bytes
+            .saturating_add(std::mem::size_of::<ColumnDef>())
+            .saturating_add(column.name.len())
+    })
+}
+
+fn row_logical_bytes(schema: &[ColumnDef], row: &[Value]) -> usize {
+    schema
+        .iter()
+        .zip(row)
+        .fold(0_usize, |bytes, (column, value)| {
+            let fixed = match column.data_type {
+                DataType::Int64 => std::mem::size_of::<Option<i64>>(),
+                DataType::Float64 => std::mem::size_of::<Option<f64>>(),
+                DataType::Bool => std::mem::size_of::<Option<bool>>(),
+                DataType::String => std::mem::size_of::<Option<String>>(),
+            };
+            let owned = match value {
+                Value::String(value) => value.len(),
+                _ => 0,
+            };
+            bytes.saturating_add(fixed).saturating_add(owned)
+        })
 }

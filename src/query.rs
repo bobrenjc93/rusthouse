@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
+    io::{self, Write},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -246,6 +247,15 @@ impl QueryObservability {
     }
 
     pub(crate) fn snapshot(&self) -> ObservabilitySnapshot {
+        let active_queries = self.active_queries_snapshot();
+        let tracked_active_queries = active_queries.len() as u64;
+        ObservabilitySnapshot {
+            engine_metrics: self.engine_metrics_snapshot(tracked_active_queries),
+            active_queries,
+        }
+    }
+
+    fn active_queries_snapshot(&self) -> Vec<ActiveQuerySnapshot> {
         let states = self
             .inner
             .active
@@ -254,30 +264,79 @@ impl QueryObservability {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let active_queries = states
-            .iter()
-            .map(|state| state.snapshot())
+        states.iter().map(|state| state.snapshot()).collect()
+    }
+
+    pub(crate) fn bounded_active_queries(
+        &self,
+        max_bytes: usize,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(Vec<ActiveQuerySnapshot>, usize), ActiveSnapshotError> {
+        let states = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
             .collect::<Vec<_>>();
+        let mut retained_bytes = states
+            .len()
+            .saturating_mul(std::mem::size_of::<ActiveQuerySnapshot>());
+        for state in &states {
+            if is_cancelled() {
+                return Err(ActiveSnapshotError::Cancelled);
+            }
+            retained_bytes = retained_bytes.saturating_add(state.query.len());
+            if retained_bytes > max_bytes {
+                return Err(ActiveSnapshotError::LimitExceeded {
+                    required: retained_bytes,
+                });
+            }
+        }
+        let mut queries = Vec::with_capacity(states.len());
+        for state in states {
+            if is_cancelled() {
+                return Err(ActiveSnapshotError::Cancelled);
+            }
+            queries.push(state.snapshot());
+        }
+        Ok((queries, retained_bytes))
+    }
+
+    pub(crate) fn current_engine_metrics(&self) -> EngineMetricsSnapshot {
+        let tracked_active_queries = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len() as u64;
+        self.engine_metrics_snapshot(tracked_active_queries)
+    }
+
+    fn engine_metrics_snapshot(&self, tracked_active_queries: u64) -> EngineMetricsSnapshot {
         let counters = &self.inner.counters;
-        ObservabilitySnapshot {
-            engine_metrics: EngineMetricsSnapshot {
-                active_queries: counters.active_queries.load(Ordering::Relaxed),
-                tracked_active_queries: active_queries.len() as u64,
-                queries_total: counters.queries_total.load(Ordering::Relaxed),
-                queries_succeeded_total: counters.queries_succeeded.load(Ordering::Relaxed),
-                queries_failed_total: counters.queries_failed.load(Ordering::Relaxed),
-                queries_cancelled_total: counters.queries_cancelled.load(Ordering::Relaxed),
-                scanned_rows_total: counters.scanned_rows.load(Ordering::Relaxed),
-                scanned_bytes_total: counters.scanned_bytes.load(Ordering::Relaxed),
-                peak_memory_bytes: counters.peak_memory_bytes.load(Ordering::Relaxed),
-                spill_bytes_total: counters.spill_bytes.load(Ordering::Relaxed),
-                dropped_active_query_records_total: counters
-                    .dropped_active_query_records
-                    .load(Ordering::Relaxed),
-            },
-            active_queries,
+        EngineMetricsSnapshot {
+            active_queries: counters.active_queries.load(Ordering::Relaxed),
+            tracked_active_queries,
+            queries_total: counters.queries_total.load(Ordering::Relaxed),
+            queries_succeeded_total: counters.queries_succeeded.load(Ordering::Relaxed),
+            queries_failed_total: counters.queries_failed.load(Ordering::Relaxed),
+            queries_cancelled_total: counters.queries_cancelled.load(Ordering::Relaxed),
+            scanned_rows_total: counters.scanned_rows.load(Ordering::Relaxed),
+            scanned_bytes_total: counters.scanned_bytes.load(Ordering::Relaxed),
+            peak_memory_bytes: counters.peak_memory_bytes.load(Ordering::Relaxed),
+            spill_bytes_total: counters.spill_bytes.load(Ordering::Relaxed),
+            dropped_active_query_records_total: counters
+                .dropped_active_query_records
+                .load(Ordering::Relaxed),
         }
     }
+}
+
+pub(crate) enum ActiveSnapshotError {
+    Cancelled,
+    LimitExceeded { required: usize },
 }
 
 pub(crate) struct QueryObservation {
@@ -356,6 +415,24 @@ struct QueryLog<'a> {
 }
 
 fn write_query_log(snapshot: &ActiveQuerySnapshot, succeeded: bool) {
+    let stderr = io::stderr();
+    let mut writer = stderr.lock();
+    write_query_log_ignoring_errors(&mut writer, snapshot, succeeded);
+}
+
+fn write_query_log_ignoring_errors(
+    writer: &mut impl Write,
+    snapshot: &ActiveQuerySnapshot,
+    succeeded: bool,
+) {
+    let _ = write_query_log_to(writer, snapshot, succeeded);
+}
+
+fn write_query_log_to(
+    writer: &mut impl Write,
+    snapshot: &ActiveQuerySnapshot,
+    succeeded: bool,
+) -> io::Result<()> {
     let log = QueryLog {
         event: "query_finished",
         outcome: if snapshot.cancelled {
@@ -367,9 +444,9 @@ fn write_query_log(snapshot: &ActiveQuerySnapshot, succeeded: bool) {
         },
         query: snapshot,
     };
-    if let Ok(line) = serde_json::to_string(&log) {
-        eprintln!("{line}");
-    }
+    let line = serde_json::to_vec(&log).map_err(io::Error::other)?;
+    writer.write_all(&line)?;
+    writer.write_all(b"\n")
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -839,6 +916,7 @@ impl From<Error> for QueryError {
 
 #[cfg(test)]
 mod observability_tests {
+    use std::io;
     use std::sync::{Arc, Barrier};
 
     use super::*;
@@ -943,6 +1021,37 @@ mod observability_tests {
         for observation in observations {
             observation.finish(true);
         }
+    }
+
+    struct FailingSink;
+
+    impl io::Write for FailingSink {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed log pipe"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn query_logging_ignores_sink_errors_without_panicking() {
+        let snapshot = ActiveQuerySnapshot {
+            query_id: 9,
+            query: "CREATE TABLE committed (id Int64)".to_owned(),
+            phase: QueryPhase::Publishing,
+            elapsed_ms: 1,
+            scanned_rows: 0,
+            scanned_bytes: 0,
+            peak_memory_bytes: 0,
+            spill_bytes: 0,
+            cancelled: false,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_query_log_ignoring_errors(&mut FailingSink, &snapshot, true);
+        }));
+        assert!(result.is_ok());
     }
 }
 

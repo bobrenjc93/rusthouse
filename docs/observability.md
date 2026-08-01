@@ -1,8 +1,13 @@
 # System metadata and observability
 
 RustHouse exposes read-only metadata through SQL and a bounded engine snapshot through HTTP.
-The `system` namespace is reserved: `CREATE`, `INSERT`, and `DROP` against `system.*` fail.
-All system-table reads use one committed catalog snapshot.
+The `system` namespace is reserved: `CREATE` in that namespace fails, as do `INSERT` and `DROP`
+against a virtual system table. All system-table reads use one committed catalog snapshot.
+
+Snapshots written by older RustHouse versions can contain a quoted table whose literal name starts
+with `system.`. Such a real catalog table takes precedence over the virtual table after upgrade and
+remains selectable, insertable, and droppable. New colliding tables cannot be created. Dropping the
+legacy object completes migration and reveals the virtual table at that name.
 
 ## System tables
 
@@ -22,6 +27,11 @@ added in minor releases.
 immutable logical segment, so `system.segments` contains one row per committed table and its ID is
 `<catalog generation>:<table name>`. `logical_bytes` includes schema and owned logical column
 storage; it excludes allocator metadata and snapshot-file framing.
+
+Catalog metadata is streamed into the result rather than materialized as an intermediate table.
+Cancellation is checked before every metadata row, and the query result limit covers each
+temporary row together with already retained output. Table logical size is maintained when data is
+loaded or appended, so reading `system.tables` or `system.segments` does not traverse stored values.
 
 `ordinal_position` is one-based. Integer values that exceed SQL `Int64` saturate at `Int64::MAX`;
 `query_id` is a decimal string so the full unsigned HTTP request ID remains representable.
@@ -60,7 +70,8 @@ Each query executed through `QueryService` also emits one JSON line to standard 
 `event: "query_finished"`, an `outcome` of `succeeded`, `failed`, or `cancelled`, and the same
 bounded query fields. Logs describe engine completion; HTTP result encoding can still fail
 afterward. SQL can contain sensitive literals, so operators must protect standard-error output as
-they protect query traffic.
+they protect query traffic. Log serialization and sink failures are best-effort and never change a
+query or mutation outcome.
 
 The endpoint and tables expose no labels derived from SQL, table names, or query IDs in aggregate
 metrics. Per-query cardinality is bounded to 1,024 records. Metadata cardinality is one row per
