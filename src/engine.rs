@@ -276,9 +276,19 @@ impl Engine {
                     .append_rows(rows)?;
                 Ok(StatementResult::Command { affected_rows })
             }
-            Statement::Query(query) => self
-                .execute_query(*query, result_byte_budget)
-                .map(StatementResult::Query),
+            Statement::Query(query) => {
+                let wrapper_bytes = std::mem::size_of::<StatementResult>()
+                    .saturating_sub(std::mem::size_of::<QueryResult>());
+                if wrapper_bytes > result_byte_budget {
+                    return Err(Error::ResourceLimit {
+                        resource: "result bytes",
+                        limit: result_byte_budget,
+                        actual: wrapper_bytes,
+                    });
+                }
+                self.execute_query(*query, result_byte_budget - wrapper_bytes)
+                    .map(StatementResult::Query)
+            }
             other => Err(Error::Unsupported(other.to_string())),
         }
     }
@@ -396,10 +406,12 @@ impl Engine {
                 "aggregate functions are not allowed in WHERE".into(),
             ));
         }
-        let alias_expressions = projections
-            .iter()
-            .map(|projection| (normalize_identifier(&projection.header), &projection.expr))
-            .collect::<HashMap<_, _>>();
+        let mut alias_expressions = HashMap::new();
+        for projection in &projections {
+            alias_expressions
+                .entry(normalize_identifier(&projection.header))
+                .or_insert(&projection.expr);
+        }
         for projection in &projections {
             validate_expression_references(&projection.expr, &source, &HashMap::new())?;
         }
@@ -421,11 +433,12 @@ impl Engine {
             .iter()
             .map(|projection| infer_expression_type(&projection.expr, &source, &empty_type_aliases))
             .collect::<Result<Vec<_>>>()?;
-        let alias_types = projections
-            .iter()
-            .zip(&projection_types)
-            .map(|(projection, data_type)| (normalize_identifier(&projection.header), *data_type))
-            .collect::<HashMap<_, _>>();
+        let mut alias_types = HashMap::new();
+        for (projection, data_type) in projections.iter().zip(&projection_types) {
+            alias_types
+                .entry(normalize_identifier(&projection.header))
+                .or_insert(*data_type);
+        }
         if let Some(selection) = &select.selection {
             ensure_type(
                 infer_expression_type(selection, &source, &empty_type_aliases)?,
@@ -612,11 +625,12 @@ impl Engine {
                     },
                 );
                 let _alias_memory = memory.reserve(alias_bytes)?;
-                let aliases = columns
-                    .iter()
-                    .zip(&row.values)
-                    .map(|(name, value)| (normalize_identifier(name), value.clone()))
-                    .collect::<HashMap<_, _>>();
+                let mut aliases = HashMap::new();
+                for (name, value) in columns.iter().zip(&row.values) {
+                    aliases
+                        .entry(normalize_identifier(name))
+                        .or_insert_with(|| value.clone());
+                }
                 let mut sort_memory =
                     memory.reserve(std::mem::size_of::<Vec<Value>>().saturating_add(
                         order_by.len().saturating_mul(std::mem::size_of::<Value>()),
@@ -899,17 +913,26 @@ fn validate_insert_options(insert: &Insert) -> Result<()> {
 fn result_retained_bytes(result: &StatementResult) -> usize {
     match result {
         StatementResult::Command { .. } => std::mem::size_of::<StatementResult>(),
-        StatementResult::Query(result) => query_result_retained_bytes(result),
+        StatementResult::Query(result) => {
+            std::mem::size_of::<StatementResult>().saturating_add(query_result_heap_bytes(result))
+        }
     }
 }
 
 fn query_result_retained_bytes(result: &QueryResult) -> usize {
-    result
-        .rows
-        .iter()
-        .fold(columns_retained_bytes(&result.columns), |size, row| {
-            size.saturating_add(row_retained_bytes(row))
-        })
+    std::mem::size_of::<QueryResult>().saturating_add(query_result_heap_bytes(result))
+}
+
+fn query_result_heap_bytes(result: &QueryResult) -> usize {
+    result.rows.iter().fold(
+        columns_retained_bytes(&result.columns).saturating_add(
+            result
+                .rows
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<Value>>()),
+        ),
+        |size, row| size.saturating_add(row_retained_bytes(row)),
+    )
 }
 
 fn enforce_result_byte_limit(result: &QueryResult, limit: usize) -> Result<()> {
@@ -925,15 +948,25 @@ fn enforce_result_byte_limit(result: &QueryResult, limit: usize) -> Result<()> {
     }
 }
 
-fn columns_retained_bytes(columns: &[String]) -> usize {
-    columns.iter().fold(0_usize, |size, column| {
-        size.saturating_add(std::mem::size_of::<String>())
-            .saturating_add(column.len())
-    })
+fn columns_retained_bytes(columns: &Vec<String>) -> usize {
+    columns.iter().fold(
+        columns
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>()),
+        |size, column| size.saturating_add(column.capacity()),
+    )
 }
 
-fn row_retained_bytes(row: &[Value]) -> usize {
-    std::mem::size_of::<Vec<Value>>().saturating_add(values_retained_payload_bytes(row))
+fn row_retained_bytes(row: &Vec<Value>) -> usize {
+    row.iter().fold(
+        row.capacity().saturating_mul(std::mem::size_of::<Value>()),
+        |size, value| {
+            size.saturating_add(match value {
+                Value::String(value) => value.capacity(),
+                _ => 0,
+            })
+        },
+    )
 }
 
 fn values_retained_payload_bytes(values: &[Value]) -> usize {
@@ -944,7 +977,7 @@ fn values_retained_payload_bytes(values: &[Value]) -> usize {
 
 fn value_retained_payload_bytes(value: &Value) -> usize {
     std::mem::size_of::<Value>().saturating_add(match value {
-        Value::String(value) => value.len(),
+        Value::String(value) => value.capacity(),
         _ => 0,
     })
 }
@@ -1779,9 +1812,9 @@ fn eval_row_with_memory(
             eval_unary(op, eval_row_with_memory(expr, source, row, memory)?)
         }
         Expr::BinaryOp { left, op, right } => {
-            let left = eval_row_with_memory(left, source, row, memory)?;
-            let right = eval_row_with_memory(right, source, row, memory)?;
-            eval_binary_with_memory(left, op, right, memory)
+            eval_binary_operands(left, right, op, memory, |expr| {
+                eval_row_with_memory(expr, source, row, memory)
+            })
         }
         Expr::IsNull(expr) => Ok(Value::Bool(
             eval_row_with_memory(expr, source, row, memory)?.is_null(),
@@ -1994,6 +2027,31 @@ fn eval_unary(operator: &UnaryOperator, value: Value) -> Result<Value> {
             value.type_name()
         ))),
     }
+}
+
+fn eval_binary_operands(
+    left_expr: &Expr,
+    right_expr: &Expr,
+    operator: &BinaryOperator,
+    memory: Option<&MemoryTracker>,
+    mut evaluate: impl FnMut(&Expr) -> Result<Value>,
+) -> Result<Value> {
+    let mut operand_memory = memory
+        .map(|memory| memory.reserve(std::mem::size_of::<Value>().saturating_mul(2)))
+        .transpose()?;
+    let left = evaluate(left_expr)?;
+    if let Some(reservation) = &mut operand_memory
+        && let Value::String(value) = &left
+    {
+        reservation.grow(value.len())?;
+    }
+    let right = evaluate(right_expr)?;
+    if let Some(reservation) = &mut operand_memory
+        && let Value::String(value) = &right
+    {
+        reservation.grow(value.len())?;
+    }
+    eval_binary_with_memory(left, operator, right, memory)
 }
 
 fn eval_binary_with_memory(
@@ -2600,28 +2658,19 @@ fn eval_group(
                 })
             }
         }
-        Expr::BinaryOp { left, op, right } => eval_binary_with_memory(
-            eval_group(
-                left,
-                source,
-                rows,
-                aliases,
-                lazy_aliases,
-                alias_types,
-                memory,
-            )?,
-            op,
-            eval_group(
-                right,
-                source,
-                rows,
-                aliases,
-                lazy_aliases,
-                alias_types,
-                memory,
-            )?,
-            Some(memory),
-        ),
+        Expr::BinaryOp { left, op, right } => {
+            eval_binary_operands(left, right, op, Some(memory), |expr| {
+                eval_group(
+                    expr,
+                    source,
+                    rows,
+                    aliases,
+                    lazy_aliases,
+                    alias_types,
+                    memory,
+                )
+            })
+        }
         Expr::UnaryOp { op, expr } => {
             if let Some(value) = minimum_int_literal(op, expr) {
                 return Ok(value);
@@ -3440,6 +3489,25 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_small_results_include_owning_structures() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 1_000,
+            ..EngineConfig::default()
+        });
+        let one = "SELECT 1 AS n";
+        assert_eq!(query(&mut engine, one).rows, vec![vec![Value::Int64(1)]]);
+        let batch = std::iter::repeat_n(one, 20).collect::<Vec<_>>().join(";");
+        assert!(matches!(
+            engine.execute(&batch),
+            Err(Error::ResourceLimit {
+                resource: "batch result bytes",
+                limit: 1_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn evaluates_aggregates_inside_scalar_functions_and_casts() {
         let mut engine = Engine::default();
         engine
@@ -3880,6 +3948,76 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn string_binary_operands_remain_charged_until_completion() {
+        let values = format!("('{}', '{}')", "x".repeat(1_000), "y".repeat(1_000));
+        let mut constrained = Engine::new(EngineConfig {
+            max_batch_result_bytes: 1_300,
+            ..EngineConfig::default()
+        });
+        constrained
+            .execute("CREATE TABLE t (left_value String, right_value String)")
+            .unwrap();
+        constrained
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+        for sql in [
+            "SELECT 1 FROM t WHERE left_value = right_value",
+            "SELECT left_value || right_value AS combined FROM t",
+        ] {
+            assert!(matches!(
+                constrained.execute(sql),
+                Err(Error::ResourceLimit {
+                    resource: "intermediate result bytes",
+                    limit: 1_300,
+                    ..
+                })
+            ));
+        }
+
+        let mut sufficient = Engine::new(EngineConfig {
+            max_batch_result_bytes: 5_000,
+            ..EngineConfig::default()
+        });
+        sufficient
+            .execute("CREATE TABLE t (left_value String, right_value String)")
+            .unwrap();
+        sufficient
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+        assert_eq!(
+            query(
+                &mut sufficient,
+                "SELECT left_value = right_value, LENGTH(left_value || right_value) FROM t",
+            )
+            .rows,
+            vec![vec![Value::Bool(false), Value::Int64(2_000)]]
+        );
+    }
+
+    #[test]
+    fn duplicate_order_aliases_resolve_to_the_first_projection() {
+        let mut engine = Engine::default();
+        engine
+            .execute(
+                "CREATE TABLE t (a Int64, b Int64);
+                 INSERT INTO t VALUES (1, 2), (2, 1);",
+            )
+            .unwrap();
+        let expected = vec![
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(2), Value::Int64(1)],
+        ];
+        assert_eq!(
+            query(&mut engine, "SELECT a AS x, b AS x FROM t ORDER BY x").rows,
+            expected
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT a AS x, b AS x FROM t ORDER BY (x)").rows,
+            expected
+        );
     }
 
     #[test]
