@@ -24,21 +24,22 @@ impl Identifier {
 
     pub(crate) fn lookup_key(&self) -> String {
         if self.quoted {
-            format!("q:{}", self.value)
+            self.value.clone()
         } else {
-            format!("u:{}", self.value.to_ascii_lowercase())
+            self.value.to_ascii_lowercase()
         }
     }
 }
 
 impl PartialEq for Identifier {
     fn eq(&self, other: &Self) -> bool {
-        self.quoted == other.quoted
-            && if self.quoted {
-                self.value == other.value
-            } else {
-                self.value.eq_ignore_ascii_case(&other.value)
-            }
+        if self.quoted {
+            self.value == other.lookup_key()
+        } else if other.quoted {
+            self.lookup_key() == other.value
+        } else {
+            self.value.eq_ignore_ascii_case(&other.value)
+        }
     }
 }
 
@@ -46,7 +47,6 @@ impl Eq for Identifier {}
 
 impl Hash for Identifier {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.quoted.hash(state);
         if self.quoted {
             self.value.hash(state);
         } else {

@@ -214,3 +214,43 @@ fn invalid_order_by_ordinals_are_rejected() {
         );
     }
 }
+
+#[test]
+fn explicit_aliases_resolve_consistently_when_columns_share_the_name() {
+    let result = Database::new()
+        .execute(
+            "CREATE TABLE t (id Int64); INSERT INTO t VALUES (7);
+             SELECT true AS id, id, count(*) AS n
+             FROM t GROUP BY id HAVING id;",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Bool(true), Value::Int64(7), Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn quoting_preserves_case_without_creating_a_separate_namespace() {
+    let mut database = Database::new();
+    let result = database
+        .execute(
+            "CREATE TABLE \"foo\" (\"bar\" Int64);
+             INSERT INTO foo (bar) VALUES (9);
+             SELECT bar FROM foo;",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Int64(9)]]);
+
+    let error = database
+        .execute("CREATE TABLE duplicate (id Int64, \"id\" String);")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Catalog(message) if message.contains("duplicate column")
+    ));
+}

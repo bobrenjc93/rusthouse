@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use crate::MAX_INPUT_BYTES;
 use crate::ast::{BinaryOp, Expr, OrderItem, Select, SelectItem, Statement, UnaryOp};
 use crate::error::{Error, Result};
 use crate::identifier::{Identifier, ObjectName};
@@ -42,6 +43,7 @@ impl Database {
     /// CREATE and INSERT statements mutate this database. One result is returned
     /// for each SELECT, in statement order.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
+        ensure_sql_input_limit(sql.len())?;
         let statements = parser::parse(sql)?;
         let mut results = Vec::new();
         let mut result_bytes = 0_usize;
@@ -87,6 +89,7 @@ impl Database {
             .map(|name| self.catalog.table(name))
             .transpose()?;
         query.projection = expand_wildcard(query.projection, table)?;
+        let projection_names = projection_names(&query.projection)?;
 
         let aggregate_query = !query.group_by.is_empty()
             || query
@@ -99,8 +102,8 @@ impl Database {
                 .iter()
                 .any(|item| item.expr.contains_aggregate());
 
-        validate_aggregate_query(&query, aggregate_query)?;
-        let projection_types = bind_query(&query, table)?;
+        validate_aggregate_query(&query, aggregate_query, &projection_names)?;
+        let projection_types = bind_query(&query, table, &projection_names)?;
 
         let mut filtered_rows = Vec::new();
         let input_rows = table.map_or(1, Table::row_count);
@@ -130,6 +133,13 @@ impl Database {
             .len()
             .saturating_mul(std::mem::size_of::<usize>());
         ensure_materialized_limit(materialized_bytes, byte_limit)?;
+        let evaluator = RecordEvaluator {
+            query: &query,
+            table,
+            aggregate_query,
+            projection_names: &projection_names,
+            byte_limit,
+        };
         if aggregate_query {
             let groups = if query.group_by.is_empty() {
                 vec![filtered_rows]
@@ -143,15 +153,9 @@ impl Database {
                 )?
             };
             for group in groups {
-                if let Some(record) = evaluate_record(
-                    &query,
-                    table,
-                    &group,
-                    true,
-                    records.len(),
-                    materialized_bytes,
-                    byte_limit,
-                )? {
+                if let Some(record) =
+                    evaluate_record(&evaluator, &group, records.len(), materialized_bytes)?
+                {
                     push_record(&mut records, record, &mut materialized_bytes, byte_limit)?;
                 }
             }
@@ -165,13 +169,10 @@ impl Database {
                     break;
                 }
                 if let Some(record) = evaluate_record(
-                    &query,
-                    table,
+                    &evaluator,
                     std::slice::from_ref(&row),
-                    false,
                     records.len(),
                     materialized_bytes,
-                    byte_limit,
                 )? {
                     push_record(&mut records, record, &mut materialized_bytes, byte_limit)?;
                 }
@@ -215,46 +216,67 @@ impl Database {
     }
 }
 
-fn evaluate_record(
-    query: &Select,
-    table: Option<&Table>,
-    group: &[usize],
+fn ensure_sql_input_limit(bytes: usize) -> Result<()> {
+    if bytes > MAX_INPUT_BYTES {
+        return Err(Error::Limit {
+            resource: "SQL input bytes",
+            limit: MAX_INPUT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+struct RecordEvaluator<'a> {
+    query: &'a Select,
+    table: Option<&'a Table>,
     aggregate_query: bool,
+    projection_names: &'a HashMap<String, usize>,
+    byte_limit: usize,
+}
+
+fn evaluate_record(
+    evaluator: &RecordEvaluator<'_>,
+    group: &[usize],
     sequence: usize,
     materialized_bytes: usize,
-    byte_limit: usize,
 ) -> Result<Option<Record>> {
     let base_context = EvalContext {
-        table,
+        table: evaluator.table,
         row: group.first().copied(),
-        group: aggregate_query.then_some(group),
+        group: evaluator.aggregate_query.then_some(group),
         aliases: None,
     };
     let mut pending_bytes = std::mem::size_of::<Record>().saturating_mul(2);
-    let mut values = Vec::with_capacity(query.projection.len());
-    for item in &query.projection {
+    let mut values = Vec::with_capacity(evaluator.query.projection.len());
+    for item in &evaluator.query.projection {
         let value = eval_expr(&item.expr, &base_context)?;
         pending_bytes = pending_bytes.saturating_add(value_size(&value));
-        ensure_materialized_limit(materialized_bytes.saturating_add(pending_bytes), byte_limit)?;
+        ensure_materialized_limit(
+            materialized_bytes.saturating_add(pending_bytes),
+            evaluator.byte_limit,
+        )?;
         values.push(value);
     }
-    let aliases = result_aliases(&query.projection, &values);
+    let aliases = result_aliases(evaluator.projection_names, &values);
     let context = EvalContext {
         aliases: Some(&aliases),
         ..base_context
     };
-    if let Some(having) = &query.having
+    if let Some(having) = &evaluator.query.having
         && !eval_expr(having, &context)?
             .as_bool("HAVING")?
             .unwrap_or(false)
     {
         return Ok(None);
     }
-    let mut order_values = Vec::with_capacity(query.order_by.len());
-    for item in &query.order_by {
+    let mut order_values = Vec::with_capacity(evaluator.query.order_by.len());
+    for item in &evaluator.query.order_by {
         let value = eval_order_expr(item, &context, &values)?;
         pending_bytes = pending_bytes.saturating_add(value_size(&value));
-        ensure_materialized_limit(materialized_bytes.saturating_add(pending_bytes), byte_limit)?;
+        ensure_materialized_limit(
+            materialized_bytes.saturating_add(pending_bytes),
+            evaluator.byte_limit,
+        )?;
         order_values.push(value);
     }
     Ok(Some(Record {
@@ -381,17 +403,46 @@ struct ExprType {
     nullable: bool,
 }
 
-fn bind_query(query: &Select, table: Option<&Table>) -> Result<Vec<ExprType>> {
-    let table_name = query.table.as_ref();
-    let aliases = query
-        .projection
+fn projection_names(items: &[SelectItem]) -> Result<HashMap<String, usize>> {
+    let mut names = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Some(alias) = &item.alias
+            && names.insert(alias.lookup_key(), index).is_some()
+        {
+            return Err(Error::execution(format!(
+                "ambiguous projection alias '{}'",
+                alias.value
+            )));
+        }
+    }
+    for (index, item) in items.iter().enumerate() {
+        if item.alias.is_none()
+            && let Expr::Column(parts) = &item.expr
+            && parts.len() == 1
+        {
+            names.entry(parts[0].lookup_key()).or_insert(index);
+        }
+    }
+    Ok(names)
+}
+
+fn projection_expr_aliases<'a>(
+    query: &'a Select,
+    projection_names: &HashMap<String, usize>,
+) -> HashMap<String, &'a Expr> {
+    projection_names
         .iter()
-        .filter_map(|item| {
-            item.alias
-                .as_ref()
-                .map(|alias| (alias.lookup_key(), &item.expr))
-        })
-        .collect::<HashMap<_, _>>();
+        .map(|(name, index)| (name.clone(), &query.projection[*index].expr))
+        .collect()
+}
+
+fn bind_query(
+    query: &Select,
+    table: Option<&Table>,
+    projection_names: &HashMap<String, usize>,
+) -> Result<Vec<ExprType>> {
+    let table_name = query.table.as_ref();
+    let aliases = projection_expr_aliases(query, projection_names);
     let no_aliases = HashMap::new();
 
     let projection_types = query
@@ -756,7 +807,11 @@ fn build_groups(
     Ok(groups)
 }
 
-fn validate_aggregate_query(query: &Select, aggregate_query: bool) -> Result<()> {
+fn validate_aggregate_query(
+    query: &Select,
+    aggregate_query: bool,
+    projection_names: &HashMap<String, usize>,
+) -> Result<()> {
     if query
         .selection
         .as_ref()
@@ -775,15 +830,7 @@ fn validate_aggregate_query(query: &Select, aggregate_query: bool) -> Result<()>
         return Ok(());
     }
 
-    let aliases = query
-        .projection
-        .iter()
-        .filter_map(|item| {
-            item.alias
-                .as_ref()
-                .map(|alias| (alias.lookup_key(), &item.expr))
-        })
-        .collect::<HashMap<_, _>>();
+    let aliases = projection_expr_aliases(query, projection_names);
     for item in &query.projection {
         validate_group_expression(&item.expr, &query.group_by, &aliases, false, false)?;
     }
@@ -1185,17 +1232,13 @@ fn eval_group_argument(expression: &Expr, row: usize, context: &EvalContext<'_>)
     )
 }
 
-fn result_aliases<'a>(items: &[SelectItem], values: &'a [Value]) -> HashMap<String, &'a Value> {
-    items
+fn result_aliases<'a>(
+    projection_names: &HashMap<String, usize>,
+    values: &'a [Value],
+) -> HashMap<String, &'a Value> {
+    projection_names
         .iter()
-        .zip(values)
-        .filter_map(|(item, value)| {
-            let identifier = item.alias.as_ref().or_else(|| match &item.expr {
-                Expr::Column(parts) if parts.len() == 1 => parts.first(),
-                _ => None,
-            })?;
-            Some((identifier.lookup_key(), value))
-        })
+        .map(|(name, index)| (name.clone(), &values[*index]))
         .collect()
 }
 
@@ -1256,6 +1299,18 @@ fn compare_records(left: &Record, right: &Record, ordering: &[OrderItem]) -> Ord
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_sql_input_limit_checks_the_exact_boundary() {
+        assert!(ensure_sql_input_limit(MAX_INPUT_BYTES).is_ok());
+        assert!(matches!(
+            ensure_sql_input_limit(MAX_INPUT_BYTES + 1),
+            Err(Error::Limit {
+                resource: "SQL input bytes",
+                limit: MAX_INPUT_BYTES
+            })
+        ));
+    }
 
     #[test]
     fn group_intermediates_obey_the_materialization_budget() {
