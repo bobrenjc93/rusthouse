@@ -16,39 +16,27 @@
   "evaluations": {
     "eval_d50af811": {
       "name": "Analytical database capability",
-      "color": "#c2410c",
-      "dash": "",
-      "introducedAt": "2026-08-01T04:51:10.030Z"
+      "color": "#c2410c"
     },
     "eval_07c39ba3": {
       "name": "Rust engineering quality",
-      "color": "#2563eb",
-      "dash": "10 4",
-      "introducedAt": "2026-08-01T04:51:10.284Z"
+      "color": "#2563eb"
     },
     "eval_001eeb44": {
       "name": "ClickHouse sustained parity",
-      "color": "#15803d",
-      "dash": "3 3",
-      "introducedAt": "2026-08-01T04:51:10.545Z"
+      "color": "#15803d"
     },
     "eval_6eb16503": {
       "name": "Benchmark integrity and anti-gaming",
-      "color": "#7e22ce",
-      "dash": "12 4 3 4",
-      "introducedAt": "2026-08-01T04:51:10.838Z"
+      "color": "#7e22ce"
     },
     "eval_0e1ec381": {
       "name": "ClickHouse feature comprehensiveness",
-      "color": "#be123c",
-      "dash": "8 3",
-      "introducedAt": "2026-08-01T04:51:11.137Z"
+      "color": "#be123c"
     },
     "eval_4f18ff4d": {
       "name": "Evaluation progress accounting",
-      "color": "#0f766e",
-      "dash": "2 3",
-      "introducedAt": "2026-08-01T04:51:11.407Z"
+      "color": "#0f766e"
     }
   },
   "points": [
@@ -76,6 +64,37 @@
           "eval_0e1ec381": "evalrun_cbb0a125",
           "eval_4f18ff4d": "evalrun_91bf44df"
         }
+      }
+    },
+    {
+      "key": "base:a915131d85a32ced9ee26ad9de4cbe927ff32cd8",
+      "recordedAt": "2026-08-01T18:07:20.146Z",
+      "label": "base a915131",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_d50af811": 0,
+        "eval_07c39ba3": 25,
+        "eval_001eeb44": 0,
+        "eval_6eb16503": 80,
+        "eval_0e1ec381": 0,
+        "eval_4f18ff4d": 20
+      }
+    },
+    {
+      "key": "pr:152",
+      "recordedAt": "2026-08-01T18:07:20.146Z",
+      "label": "PR #152",
+      "kind": "composite",
+      "prNumber": 152,
+      "title": "YOLO generation 1: 8 reviewed improvements",
+      "scores": {
+        "eval_d50af811": 70,
+        "eval_07c39ba3": 75,
+        "eval_001eeb44": 0,
+        "eval_6eb16503": 95,
+        "eval_0e1ec381": 35,
+        "eval_4f18ff4d": 95
       }
     }
   ]
