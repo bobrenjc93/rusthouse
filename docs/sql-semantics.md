@@ -147,9 +147,18 @@ nonnegative preceding/following bounds.
 Float64 running frames accumulate in order. Bounded frames are accumulated
 from their own rows instead of subtracting rounded floating-point prefixes.
 
-`QueryLimits` rejects a query before a join build exceeds its row ceiling or
-before build or expanded-output state exceeds the join byte ceiling. It bounds
-every window partition by rows and cumulatively accounts partition hash
-entries, index vectors, window output vectors, and temporary accumulators. Join
-expansion and final output rows are separately bounded. These failures are
-reported as resource-limit errors.
+Binding resolves every source column before table data is copied. Materialized
+scans retain only columns needed by predicates, joins, projections, windows, or
+ordering and are bounded by `max_source_bytes`; unused string payloads are not
+cloned. `QueryLimits` also rejects a query before a join build exceeds its row
+ceiling or before conservatively reserved key buckets, match vectors, build
+rows, or expanded output exceed the join byte ceiling. Every window partition
+is bounded by rows, with cumulative accounting for partition hash entries,
+index vectors, output vectors, and temporary accumulators. Join expansion and
+final output rows are separately bounded. These failures are reported as
+resource-limit errors.
+
+Outer and window ordering use an in-place heapsort that polls query
+cancellation while building and draining the heap. Explicit source-row indexes
+break otherwise equal sort keys, preserving deterministic SQL output without
+an uninterruptible library sort.

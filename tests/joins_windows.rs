@@ -316,10 +316,10 @@ fn duplicate_join_matches_are_bounded_before_result_materialization() {
 }
 
 #[test]
-fn join_expansion_is_bounded_even_when_the_final_projection_is_small() {
+fn join_prunes_unprojected_payloads_and_bounds_projected_expansion() {
     let database = Database::with_query_limits(QueryLimits::new(
         usize::MAX,
-        1_024,
+        1_500,
         usize::MAX,
         usize::MAX,
         usize::MAX,
@@ -340,11 +340,51 @@ fn join_expansion_is_bounded_even_when_the_final_projection_is_small() {
         .execute("INSERT INTO duplicate_right VALUES (1), (1)")
         .unwrap();
 
+    assert_eq!(
+        query(
+            &database,
+            "SELECT l.id FROM large_left l JOIN duplicate_right r ON l.id = r.id"
+        ),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(1)]]
+    );
     assert!(matches!(
-        database.execute("SELECT l.id FROM large_left l JOIN duplicate_right r ON l.id = r.id"),
+        database
+            .execute("SELECT l.payload FROM large_left l JOIN duplicate_right r ON l.id = r.id"),
         Err(Error::MemoryLimitExceeded {
             operator: "hash join output",
-            limit: 1_024,
+            limit: 1_500,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn source_scan_is_bounded_after_binding_and_skips_large_unused_strings() {
+    let limits = QueryLimits::default().with_source_bytes(128);
+    let database = Database::with_query_limits(limits);
+    database
+        .execute("CREATE TABLE payloads (id Int64, payload String)")
+        .unwrap();
+    database
+        .execute(&format!(
+            "INSERT INTO payloads VALUES (1, '{}')",
+            "x".repeat(4 * 1024)
+        ))
+        .unwrap();
+
+    assert_eq!(
+        query(&database, "SELECT id FROM payloads WHERE id = 2"),
+        Vec::<Vec<Value>>::new()
+    );
+    assert!(matches!(
+        database.execute("SELECT missing FROM payloads"),
+        Err(Error::ColumnNotFound(column)) if column == "missing"
+    ));
+    assert!(matches!(
+        database.execute("SELECT payload FROM payloads"),
+        Err(Error::MemoryLimitExceeded {
+            operator: "table scan",
+            limit: 128,
             ..
         })
     ));
@@ -374,6 +414,49 @@ fn join_and_window_byte_state_limits_are_enforced() {
             limit: 0,
             ..
         })
+    ));
+}
+
+#[test]
+fn hash_build_limit_accounts_unique_key_buckets_and_index_vectors() {
+    let database = Database::new();
+    database.execute("CREATE TABLE probe (id Int64)").unwrap();
+    database.execute("CREATE TABLE build (id Int64)").unwrap();
+    database.execute("INSERT INTO probe VALUES (1)").unwrap();
+    database
+        .execute(
+            "INSERT INTO build VALUES (1), (2), (3), (4), (5), \
+             (6), (7), (8), (9), (10)",
+        )
+        .unwrap();
+
+    let mut session = database.session();
+    session.set_query_limits(QueryLimits::new(
+        usize::MAX,
+        2_000,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    ));
+    assert!(matches!(
+        session.execute("SELECT p.id FROM probe p JOIN build b ON p.id = b.id"),
+        Err(Error::MemoryLimitExceeded {
+            operator: "hash join build",
+            limit: 2_000,
+            ..
+        })
+    ));
+
+    session.set_query_limits(QueryLimits::new(
+        usize::MAX,
+        10_000,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    ));
+    assert!(matches!(
+        session.execute("SELECT p.id FROM probe p JOIN build b ON p.id = b.id"),
+        Ok(StatementResult::Query(result)) if result.rows == vec![vec![Value::Int64(1)]]
     ));
 }
 

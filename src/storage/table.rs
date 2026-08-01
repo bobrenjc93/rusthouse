@@ -197,15 +197,8 @@ impl Table {
         self.columns[column].value(row)
     }
 
-    pub(crate) fn estimated_row_bytes(&self, row: usize) -> usize {
-        self.columns.iter().fold(
-            std::mem::size_of::<Vec<Value>>().saturating_add(
-                self.columns
-                    .len()
-                    .saturating_mul(std::mem::size_of::<Value>()),
-            ),
-            |bytes, column| bytes.saturating_add(column.variable_value_bytes(row)),
-        )
+    pub(crate) fn variable_value_bytes(&self, row: usize, column: usize) -> usize {
+        self.columns[column].variable_value_bytes(row)
     }
 
     pub(crate) fn columns(&self) -> &[ColumnData] {

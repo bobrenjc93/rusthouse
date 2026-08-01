@@ -22,6 +22,8 @@ pub(crate) struct ExecutionControl<'a> {
 /// Resource bounds for relational query operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLimits {
+    /// Maximum retained bytes for one materialized table scan.
+    pub max_source_bytes: usize,
     /// Maximum rows accepted from the build side of one hash join.
     pub max_join_build_rows: usize,
     /// Maximum retained bytes for one hash join build or expanded output.
@@ -35,7 +37,7 @@ pub struct QueryLimits {
 }
 
 impl QueryLimits {
-    /// Constructs relational operator limits.
+    /// Constructs relational operator limits with a 256 MiB source-scan ceiling.
     pub const fn new(
         max_join_build_rows: usize,
         max_join_build_bytes: usize,
@@ -44,12 +46,19 @@ impl QueryLimits {
         max_output_rows: usize,
     ) -> Self {
         Self {
+            max_source_bytes: 256 * 1024 * 1024,
             max_join_build_rows,
             max_join_build_bytes,
             max_window_partition_rows,
             max_window_partition_bytes,
             max_output_rows,
         }
+    }
+
+    /// Overrides the table-scan materialization ceiling.
+    pub const fn with_source_bytes(mut self, max_source_bytes: usize) -> Self {
+        self.max_source_bytes = max_source_bytes;
+        self
     }
 }
 
@@ -685,14 +694,14 @@ mod cancellation_commit_tests {
         publication_attempts: Arc<AtomicUsize>,
     }
 
-    struct CancelOnCheck {
+    struct CancelExactlyOnCheck {
         checks: AtomicUsize,
         cancel_on: usize,
     }
 
-    impl ExecutionCancellation for CancelOnCheck {
+    impl ExecutionCancellation for CancelExactlyOnCheck {
         fn is_cancelled(&self) -> bool {
-            self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_on
+            self.checks.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_on
         }
 
         fn begin_publication(&self) -> bool {
@@ -789,11 +798,11 @@ mod cancellation_commit_tests {
             .execute("INSERT INTO right_t VALUES (1), (1)")
             .unwrap();
 
-        let join_cancellation = CancelOnCheck {
+        let join_cancellation = CancelExactlyOnCheck {
             checks: AtomicUsize::new(0),
-            // Parsing/scan/build consume nine checks; the tenth is the first
+            // Parsing/scan/build consume twelve checks; the thirteenth is the first
             // duplicate-match expansion.
-            cancel_on: 10,
+            cancel_on: 13,
         };
         assert_eq!(
             database.execute_controlled(
@@ -804,17 +813,41 @@ mod cancellation_commit_tests {
             Err(Error::QueryCancelled)
         );
 
-        let window_cancellation = CancelOnCheck {
+        let sort_limits = QueryLimits::new(usize::MAX, usize::MAX, usize::MAX, 340, usize::MAX);
+        let sort_database = Database::with_query_limits(sort_limits);
+        sort_database
+            .execute("CREATE TABLE sort_t (id Int64)")
+            .unwrap();
+        sort_database
+            .execute("INSERT INTO sort_t VALUES (2), (1)")
+            .unwrap();
+
+        let outer_sort_cancellation = CancelExactlyOnCheck {
             checks: AtomicUsize::new(0),
-            // The twelfth check is the first RANK assignment after both
-            // partition passes and sorting.
-            cancel_on: 12,
+            // The tenth check is inside the first heap sift. Without sort
+            // polling, the zero result-byte limit wins instead.
+            cancel_on: 10,
         };
         assert_eq!(
-            database.execute_controlled(
-                "SELECT RANK() OVER (ORDER BY id) AS rnk FROM right_t",
+            sort_database.execute_controlled(
+                "SELECT id FROM sort_t ORDER BY id",
+                0,
+                &outer_sort_cancellation,
+            ),
+            Err(Error::QueryCancelled)
+        );
+
+        let window_sort_cancellation = CancelExactlyOnCheck {
+            checks: AtomicUsize::new(0),
+            // The fifteenth check is inside the window heap sift. Without
+            // sort polling, the 340-byte prefix-state ceiling wins instead.
+            cancel_on: 15,
+        };
+        assert_eq!(
+            sort_database.execute_controlled(
+                "SELECT COUNT(*) OVER (ORDER BY id) AS count_rows FROM sort_t",
                 usize::MAX,
-                &window_cancellation,
+                &window_sort_cancellation,
             ),
             Err(Error::QueryCancelled)
         );

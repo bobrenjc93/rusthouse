@@ -65,6 +65,14 @@ struct BoundWindow {
     frame: WindowFrame,
 }
 
+struct BoundJoin {
+    kind: JoinKind,
+    table: TableRef,
+    equality: Vec<(usize, usize)>,
+    right_offset: usize,
+    right_columns: Vec<BoundColumn>,
+}
+
 enum BoundProjection {
     Source(usize),
     Window(BoundWindow),
@@ -102,22 +110,31 @@ pub(crate) fn execute(
         return Err(Error::Unsupported("statement is not a query".to_owned()));
     };
 
-    let mut qualifiers = HashSet::new();
-    let mut source = load_table(tables, &from, false, control)?;
-    qualifiers.insert(table_qualifier(&from).to_owned());
-    for join in joins {
-        let qualifier = table_qualifier(&join.table);
-        if !qualifiers.insert(qualifier.to_owned()) {
-            return Err(Error::DuplicateTableAlias(qualifier.to_owned()));
-        }
-        source = execute_join(tables, source, join, limits, control)?;
-    }
+    let (source_columns, bound_joins, base_width) = bind_sources(tables, &from, joins)?;
+    let predicates = bind_predicates(&source_columns, &predicates)?;
+    let (bound_projection, columns) = bind_projection(&source_columns, &projection)?;
+    let result_order = bind_result_order(&source_columns, &columns, &order_by)?;
+    let required_columns = required_columns(
+        source_columns.len(),
+        &predicates,
+        &bound_projection,
+        &result_order,
+        &bound_joins,
+    );
 
-    let predicates = bind_predicates(&source.columns, &predicates)?;
+    let mut source = load_table(
+        tables,
+        &from,
+        false,
+        &required_columns[..base_width],
+        limits.max_source_bytes,
+        control,
+    )?;
+    for join in bound_joins {
+        source = execute_join(tables, source, join, &required_columns, limits, control)?;
+    }
     source.rows = filter_rows(source.rows, &predicates, control)?;
 
-    let (bound_projection, columns) = bind_projection(&source.columns, &projection)?;
-    let result_order = bind_result_order(&source.columns, &columns, &order_by)?;
     let window_values = evaluate_windows(&source, &bound_projection, limits, control)?;
     let output_count = limit.map_or(source.rows.len(), |limit| limit.min(source.rows.len()));
     enforce_row_limit("query output", output_count, limits.max_output_rows)?;
@@ -127,19 +144,17 @@ pub(crate) fn execute(
         (0..source.rows.len()).collect::<Vec<_>>()
     };
     if !result_order.is_empty() {
-        check_cancellation(control)?;
-        row_indexes.sort_unstable_by(|left, right| {
+        cancellable_sort_by(&mut row_indexes, control, |left, right| {
             compare_result_rows(
-                *left,
-                *right,
+                left,
+                right,
                 &source,
                 &bound_projection,
                 &window_values,
                 &result_order,
             )
-            .then_with(|| left.cmp(right))
-        });
-        check_cancellation(control)?;
+            .then_with(|| left.cmp(&right))
+        })?;
     }
     if let Some(limit) = limit {
         row_indexes.truncate(limit);
@@ -156,25 +171,121 @@ pub(crate) fn execute(
     Ok(QueryOutput { columns, rows })
 }
 
+fn bind_sources(
+    tables: &std::collections::BTreeMap<String, Arc<Table>>,
+    from: &TableRef,
+    joins: Vec<Join>,
+) -> Result<(Vec<BoundColumn>, Vec<BoundJoin>, usize)> {
+    let base = tables
+        .get(&from.name)
+        .ok_or_else(|| Error::TableNotFound(from.name.clone()))?;
+    let mut columns = table_columns(base, from, false);
+    let base_width = columns.len();
+    let mut qualifiers = HashSet::new();
+    qualifiers.insert(table_qualifier(from).to_owned());
+    let mut bound_joins = Vec::with_capacity(joins.len());
+
+    for join in joins {
+        let qualifier = table_qualifier(&join.table);
+        if !qualifiers.insert(qualifier.to_owned()) {
+            return Err(Error::DuplicateTableAlias(qualifier.to_owned()));
+        }
+        let table = tables
+            .get(&join.table.name)
+            .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
+        let right_columns = table_columns(table, &join.table, join.kind == JoinKind::Left);
+        let right_offset = columns.len();
+        let mut combined = columns.clone();
+        combined.extend(right_columns.iter().cloned());
+        let equality = bind_join_keys(&combined, right_offset, &join.equality)?;
+        columns = combined;
+        bound_joins.push(BoundJoin {
+            kind: join.kind,
+            table: join.table,
+            equality,
+            right_offset,
+            right_columns,
+        });
+    }
+    Ok((columns, bound_joins, base_width))
+}
+
+fn required_columns(
+    column_count: usize,
+    predicates: &[(usize, Comparison, Value)],
+    projection: &[BoundProjection],
+    result_order: &[BoundResultOrder],
+    joins: &[BoundJoin],
+) -> Vec<bool> {
+    let mut required = vec![false; column_count];
+    for (index, _, _) in predicates {
+        required[*index] = true;
+    }
+    for projection in projection {
+        match projection {
+            BoundProjection::Source(index) => required[*index] = true,
+            BoundProjection::Window(window) => {
+                for index in &window.partition_by {
+                    required[*index] = true;
+                }
+                for order in &window.order_by {
+                    required[order.index] = true;
+                }
+                match window.function {
+                    BoundWindowFunction::Sum { index, .. }
+                    | BoundWindowFunction::Count(Some(index)) => required[index] = true,
+                    BoundWindowFunction::RowNumber
+                    | BoundWindowFunction::Rank
+                    | BoundWindowFunction::Count(None) => {}
+                }
+            }
+        }
+    }
+    for order in result_order {
+        if let BoundResultOrder::Source(order) = order {
+            required[order.index] = true;
+        }
+    }
+    for join in joins {
+        for (left, right) in &join.equality {
+            required[*left] = true;
+            required[join.right_offset + *right] = true;
+        }
+    }
+    required
+}
+
 fn load_table(
     tables: &std::collections::BTreeMap<String, Arc<Table>>,
     table_ref: &TableRef,
     nullable: bool,
+    required_columns: &[bool],
+    byte_limit: usize,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<Source> {
     let table = tables
         .get(&table_ref.name)
         .ok_or_else(|| Error::TableNotFound(table_ref.name.clone()))?;
     let columns = table_columns(table, table_ref, nullable);
+    debug_assert_eq!(required_columns.len(), columns.len());
+    let retained_bytes = estimated_scan_bytes(table, required_columns, control)?;
+    enforce_byte_limit("table scan", retained_bytes, byte_limit)?;
     let mut rows = Vec::with_capacity(table.row_count());
     for row_index in 0..table.row_count() {
         check_cancellation(control)?;
-        rows.push(
-            (0..table.schema().len())
-                .map(|column| table.value(row_index, column))
-                .collect(),
-        );
+        let mut row = vec![Value::Null; table.schema().len()];
+        for (column, required) in required_columns.iter().enumerate() {
+            if *required {
+                row[column] = table.value(row_index, column);
+            }
+        }
+        rows.push(row);
     }
+    enforce_byte_limit(
+        "table scan",
+        retained_rows_bytes(&rows, rows.capacity()),
+        byte_limit,
+    )?;
     Ok(Source { columns, rows })
 }
 
@@ -201,41 +312,53 @@ fn table_qualifier(table: &TableRef) -> &str {
 fn execute_join(
     tables: &std::collections::BTreeMap<String, Arc<Table>>,
     left: Source,
-    join: Join,
+    join: BoundJoin,
+    required_columns: &[bool],
     limits: QueryLimits,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<Source> {
-    let build_table = tables
-        .get(&join.table.name)
-        .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
-    let right_columns = table_columns(build_table, &join.table, join.kind == JoinKind::Left);
     let left_width = left.columns.len();
     let mut combined_columns = left.columns.clone();
-    combined_columns.extend(right_columns.iter().cloned());
-    let equality = bind_join_keys(&combined_columns, left_width, &join.equality)?;
+    combined_columns.extend(join.right_columns.iter().cloned());
+    let right_required = &required_columns
+        [join.right_offset..join.right_offset.saturating_add(join.right_columns.len())];
+    let mut right = load_table(
+        tables,
+        &join.table,
+        join.kind == JoinKind::Left,
+        right_required,
+        limits.max_source_bytes,
+        control,
+    )?;
     enforce_row_limit(
         "hash join build",
-        build_table.row_count(),
+        right.rows.len(),
         limits.max_join_build_rows,
     )?;
-    let build_bytes = estimated_table_bytes(build_table, control)?;
+    let (build_bytes, hash_capacity) = estimated_hash_build_bytes(&right, &join.equality, control)?;
     enforce_byte_limit("hash join build", build_bytes, limits.max_join_build_bytes)?;
-    let mut right = load_table(tables, &join.table, join.kind == JoinKind::Left, control)?;
 
-    let mut hash = HashMap::<ValueKey, Vec<usize>>::new();
+    let mut hash = HashMap::<ValueKey, Vec<usize>>::with_capacity(hash_capacity);
     for (row_index, row) in right.rows.iter().enumerate() {
         check_cancellation(control)?;
-        let indexes = equality.iter().map(|(_, right)| *right);
+        let indexes = join.equality.iter().map(|(_, right)| *right);
         if let Some(key) = join_key(row, indexes) {
             hash.entry(key).or_default().push(row_index);
         }
     }
+    let actual_build_bytes = retained_rows_bytes(&right.rows, right.rows.capacity())
+        .saturating_add(retained_hash_bytes(&hash));
+    enforce_byte_limit(
+        "hash join build",
+        actual_build_bytes,
+        limits.max_join_build_bytes,
+    )?;
 
     let mut rows = Vec::new();
     let mut output_payload_bytes = 0usize;
     for left_row in &left.rows {
         check_cancellation(control)?;
-        let indexes = equality.iter().map(|(left, _)| *left);
+        let indexes = join.equality.iter().map(|(left, _)| *left);
         let matches = join_key(left_row, indexes).and_then(|key| hash.get(&key));
         if let Some(matches) = matches {
             for right_index in matches {
@@ -682,11 +805,10 @@ fn evaluate_window(
     )?;
     for state in partitions.values_mut() {
         check_cancellation(control)?;
-        state.rows.sort_unstable_by(|left, right| {
-            compare_source_rows(&source.rows[*left], &source.rows[*right], &window.order_by)
-                .then_with(|| left.cmp(right))
-        });
-        check_cancellation(control)?;
+        cancellable_sort_by(&mut state.rows, control, |left, right| {
+            compare_source_rows(&source.rows[left], &source.rows[right], &window.order_by)
+                .then_with(|| left.cmp(&right))
+        })?;
         let required = operator_bytes
             .saturating_add(window_temporary_bytes(&window.function, state.rows.len()));
         enforce_byte_limit(
@@ -959,6 +1081,61 @@ fn project_rows(
     Ok(result)
 }
 
+fn cancellable_sort_by<F>(
+    values: &mut [usize],
+    control: Option<ExecutionControl<'_>>,
+    compare: F,
+) -> Result<()>
+where
+    F: Fn(usize, usize) -> Ordering,
+{
+    check_cancellation(control)?;
+    if values.len() < 2 {
+        return Ok(());
+    }
+
+    for root in (0..values.len() / 2).rev() {
+        check_cancellation(control)?;
+        sift_down(values, root, values.len(), control, &compare)?;
+    }
+    for end in (1..values.len()).rev() {
+        check_cancellation(control)?;
+        values.swap(0, end);
+        sift_down(values, 0, end, control, &compare)?;
+    }
+    Ok(())
+}
+
+fn sift_down<F>(
+    values: &mut [usize],
+    mut root: usize,
+    end: usize,
+    control: Option<ExecutionControl<'_>>,
+    compare: &F,
+) -> Result<()>
+where
+    F: Fn(usize, usize) -> Ordering,
+{
+    loop {
+        check_cancellation(control)?;
+        let left = root.saturating_mul(2).saturating_add(1);
+        if left >= end {
+            return Ok(());
+        }
+        let right = left + 1;
+        let child = if right < end && compare(values[left], values[right]) == Ordering::Less {
+            right
+        } else {
+            left
+        };
+        if compare(values[root], values[child]) != Ordering::Less {
+            return Ok(());
+        }
+        values.swap(root, child);
+        root = child;
+    }
+}
+
 fn compare_result_rows(
     left: usize,
     right: usize,
@@ -1207,23 +1384,94 @@ fn window_temporary_bytes(function: &BoundWindowFunction, rows: usize) -> usize 
 fn variable_row_bytes(row: &[Value]) -> usize {
     row.iter().fold(0usize, |bytes, value| {
         bytes.saturating_add(match value {
-            Value::String(value) => value.len(),
+            Value::String(value) => value.capacity(),
             _ => 0,
         })
     })
 }
 
-fn estimated_table_bytes(table: &Table, control: Option<ExecutionControl<'_>>) -> Result<usize> {
-    let mut total = 0usize;
+fn estimated_scan_bytes(
+    table: &Table,
+    required_columns: &[bool],
+    control: Option<ExecutionControl<'_>>,
+) -> Result<usize> {
+    let row_fixed = size_of::<Vec<Value>>()
+        .saturating_add(table.schema().len().saturating_mul(size_of::<Value>()));
+    let mut total = table.row_count().saturating_mul(row_fixed);
     for row in 0..table.row_count() {
         check_cancellation(control)?;
-        // The build owns both row values and hash keys/bucket entries. Charging
-        // twice the row size is conservative for fixed-width and string keys.
-        total = total
-            .saturating_add(table.estimated_row_bytes(row).saturating_mul(2))
-            .saturating_add(size_of::<usize>().saturating_mul(2));
+        for (column, required) in required_columns.iter().enumerate() {
+            if *required {
+                total = total.saturating_add(table.variable_value_bytes(row, column));
+            }
+        }
     }
     Ok(total)
+}
+
+fn retained_rows_bytes(rows: &[Vec<Value>], outer_capacity: usize) -> usize {
+    outer_capacity
+        .saturating_mul(size_of::<Vec<Value>>())
+        .saturating_add(rows.iter().fold(0usize, |bytes, row| {
+            bytes
+                .saturating_add(row.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(variable_row_bytes(row))
+        }))
+}
+
+fn estimated_hash_build_bytes(
+    source: &Source,
+    equality: &[(usize, usize)],
+    control: Option<ExecutionControl<'_>>,
+) -> Result<(usize, usize)> {
+    let mut bytes = retained_rows_bytes(&source.rows, source.rows.capacity());
+    let mut key_count = 0usize;
+    for row in &source.rows {
+        check_cancellation(control)?;
+        let indexes = equality.iter().map(|(_, right)| *right);
+        if let Some(key) = join_key(row, indexes) {
+            key_count = key_count.saturating_add(1);
+            bytes = bytes.saturating_add(estimated_hash_entry_bytes(&key));
+        }
+    }
+    Ok((bytes, key_count))
+}
+
+fn estimated_hash_entry_bytes(key: &ValueKey) -> usize {
+    let key_strings = key.0.iter().fold(0usize, |bytes, part| {
+        bytes.saturating_add(match part {
+            KeyPart::String(value) => value.capacity(),
+            _ => 0,
+        })
+    });
+    let entry = size_of::<ValueKey>()
+        .saturating_add(size_of::<Vec<usize>>())
+        .saturating_add(key.0.capacity().saturating_mul(size_of::<KeyPart>()))
+        .saturating_add(key_strings)
+        .saturating_add(size_of::<usize>());
+    // Reserving for every non-NULL build row avoids rehash growth. Charging
+    // four complete entries per row covers bucket slack and duplicate-index
+    // Vec growth without depending on HashMap's allocator layout.
+    entry.saturating_mul(4)
+}
+
+fn retained_hash_bytes(hash: &HashMap<ValueKey, Vec<usize>>) -> usize {
+    let buckets = hash.capacity().saturating_mul(
+        size_of::<ValueKey>()
+            .saturating_add(size_of::<Vec<usize>>())
+            .saturating_add(1),
+    );
+    hash.iter().fold(buckets, |bytes, (key, matches)| {
+        bytes
+            .saturating_add(key.0.capacity().saturating_mul(size_of::<KeyPart>()))
+            .saturating_add(key.0.iter().fold(0usize, |strings, part| {
+                strings.saturating_add(match part {
+                    KeyPart::String(value) => value.capacity(),
+                    _ => 0,
+                })
+            }))
+            .saturating_add(matches.capacity().saturating_mul(size_of::<usize>()))
+    })
 }
 
 fn enforce_row_limit(operator: &'static str, attempted: usize, limit: usize) -> Result<()> {
