@@ -84,6 +84,7 @@ fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>
             let line = line?;
             if !line.trim().is_empty() {
                 write_result(&mut output, session.execute(&line)?, options.format)?;
+                output.flush()?;
             }
         }
     } else {

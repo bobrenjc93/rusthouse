@@ -1,8 +1,13 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
+use std::thread;
+use std::time::Duration;
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -90,6 +95,47 @@ fn csv_format_matches_clickhouse_csv_with_names() {
         "\"id\",\"label\",\"active\",\"detail\"\n\
          1,\"hello, world\",true,\"quote: \"\"yes\"\"\"\n\
          2,\"\\N\",false,\\N\n"
+    );
+}
+
+#[test]
+fn stdin_query_output_is_flushed_before_eof() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .args(["--format", "csv"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+
+    input
+        .write_all(
+            b"CREATE TABLE live_output (value Int64)\n\
+              INSERT INTO live_output VALUES (7)\n\
+              SELECT value FROM live_output\n",
+        )
+        .unwrap();
+    input.flush().unwrap();
+    let response = receiver.recv_timeout(Duration::from_secs(5));
+
+    drop(input);
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+
+    assert!(status.success());
+    assert_eq!(
+        response
+            .expect("query output was not flushed while stdin remained open")
+            .unwrap(),
+        "\"value\"\n"
     );
 }
 
