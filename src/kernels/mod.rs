@@ -10,6 +10,6 @@ pub use aggregate::{
 };
 pub use group::{GroupByConfig, GroupKey, GroupView, GroupedResults, hash_group};
 pub use predicate::{
-    ComparisonOp, compare_bool, compare_columns, compare_f64, compare_i64, compare_string,
-    is_not_null, is_null,
+    ComparisonOp, compare_bool, compare_columns, compare_f64, compare_f64_i64, compare_i64,
+    compare_i64_f64, compare_string, is_not_null, is_null,
 };

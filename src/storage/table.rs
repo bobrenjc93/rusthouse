@@ -1,3 +1,7 @@
+use crate::batch::{
+    BatchConfig, BooleanArray, Column as BatchColumn, DataType as BatchDataType, DictionaryArray,
+    Field, Float64Array, Int64Array, RecordBatch, Schema,
+};
 use crate::error::{Error, Result};
 use crate::{DataType, Value};
 
@@ -76,25 +80,6 @@ impl ColumnData {
             (Self::String(values), Value::Null) => values.push(None),
             _ => unreachable!("values are validated before they are appended"),
         }
-    }
-
-    pub(crate) fn value(&self, index: usize) -> Value {
-        match self {
-            Self::Int64(values) => values[index].map_or(Value::Null, Value::Int64),
-            Self::Float64(values) => values[index].map_or(Value::Null, Value::Float64),
-            Self::Bool(values) => values[index].map_or(Value::Null, Value::Bool),
-            Self::String(values) => values[index]
-                .as_ref()
-                .map_or(Value::Null, |value| Value::String(value.clone())),
-        }
-    }
-
-    fn owned_value_bytes(&self, index: usize) -> usize {
-        std::mem::size_of::<Value>()
-            + match self {
-                Self::String(values) => values[index].as_ref().map_or(0, String::len),
-                _ => 0,
-            }
     }
 }
 
@@ -194,12 +179,51 @@ impl Table {
         Ok(())
     }
 
-    pub(crate) fn value(&self, row: usize, column: usize) -> Value {
-        self.columns[column].value(row)
-    }
-
-    pub(crate) fn owned_value_bytes(&self, row: usize, column: usize) -> usize {
-        self.columns[column].owned_value_bytes(row)
+    pub(crate) fn record_batch(&self, start: usize, capacity: usize) -> Result<RecordBatch> {
+        debug_assert!(start < self.row_count);
+        debug_assert!(capacity > 0);
+        let end = start.saturating_add(capacity).min(self.row_count);
+        let schema = Schema::new(
+            self.schema
+                .iter()
+                .map(|column| {
+                    Field::new(
+                        column.name.as_str(),
+                        match column.data_type {
+                            DataType::Int64 => BatchDataType::Int64,
+                            DataType::Float64 => BatchDataType::Float64,
+                            DataType::Bool => BatchDataType::Boolean,
+                            DataType::String => BatchDataType::String,
+                        },
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| match column {
+                ColumnData::Int64(values) => {
+                    Int64Array::from_options(capacity, values[start..end].iter().copied())
+                        .map(BatchColumn::Int64)
+                }
+                ColumnData::Float64(values) => {
+                    Float64Array::from_options(capacity, values[start..end].iter().copied())
+                        .map(BatchColumn::Float64)
+                }
+                ColumnData::Bool(values) => {
+                    BooleanArray::from_options(capacity, values[start..end].iter().copied())
+                        .map(BatchColumn::Boolean)
+                }
+                ColumnData::String(values) => DictionaryArray::from_options(
+                    capacity,
+                    values[start..end].iter().map(Option::as_deref),
+                )
+                .map(BatchColumn::String),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(schema, columns, BatchConfig::unlimited(capacity))
     }
 
     pub(crate) fn columns(&self) -> &[ColumnData] {

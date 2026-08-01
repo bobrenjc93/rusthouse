@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 
 use crate::batch::{Bitmap, Column, RecordBatch, SelectionMask};
 use crate::error::{Error, Result};
+use crate::value::compare_int_float;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOp {
@@ -26,13 +27,17 @@ impl ComparisonOp {
     }
 
     fn evaluate_ordering(self, ordering: Ordering) -> bool {
+        self.evaluate_optional_ordering(Some(ordering))
+    }
+
+    fn evaluate_optional_ordering(self, ordering: Option<Ordering>) -> bool {
         match self {
-            Self::Eq => ordering == Ordering::Equal,
-            Self::NotEq => ordering != Ordering::Equal,
-            Self::Less => ordering == Ordering::Less,
-            Self::LessEq => ordering != Ordering::Greater,
-            Self::Greater => ordering == Ordering::Greater,
-            Self::GreaterEq => ordering != Ordering::Less,
+            Self::Eq => ordering == Some(Ordering::Equal),
+            Self::NotEq => ordering != Some(Ordering::Equal),
+            Self::Less => ordering == Some(Ordering::Less),
+            Self::LessEq => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+            Self::Greater => ordering == Some(Ordering::Greater),
+            Self::GreaterEq => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
         }
     }
 }
@@ -98,6 +103,50 @@ pub fn compare_f64(
     };
     selected_predicate(batch, array.validity(), |row| {
         op.evaluate(&array.values()[row], &value)
+    })
+}
+
+pub fn compare_i64_f64(
+    batch: &RecordBatch,
+    column: usize,
+    op: ComparisonOp,
+    value: f64,
+) -> Result<SelectionMask> {
+    let array = match batch.column(column)? {
+        Column::Int64(array) => array,
+        actual => {
+            return Err(Error::BatchTypeMismatch {
+                column,
+                expected: "Int64",
+                actual: actual.data_type().name(),
+            });
+        }
+    };
+    selected_predicate(batch, array.validity(), |row| {
+        op.evaluate_optional_ordering(compare_int_float(array.values()[row], value))
+    })
+}
+
+pub fn compare_f64_i64(
+    batch: &RecordBatch,
+    column: usize,
+    op: ComparisonOp,
+    value: i64,
+) -> Result<SelectionMask> {
+    let array = match batch.column(column)? {
+        Column::Float64(array) => array,
+        actual => {
+            return Err(Error::BatchTypeMismatch {
+                column,
+                expected: "Float64",
+                actual: actual.data_type().name(),
+            });
+        }
+    };
+    selected_predicate(batch, array.validity(), |row| {
+        op.evaluate_optional_ordering(
+            compare_int_float(value, array.values()[row]).map(Ordering::reverse),
+        )
     })
 }
 
