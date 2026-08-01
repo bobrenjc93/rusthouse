@@ -149,7 +149,11 @@ impl Persistence {
         decode_snapshot(&bytes)
     }
 
-    pub(crate) fn store(&self, generation: &CatalogGeneration) -> Result<StoreStatus> {
+    pub(crate) fn store(
+        &self,
+        generation: &CatalogGeneration,
+        before_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<StoreStatus> {
         let bytes = encode_snapshot(generation)?;
         #[cfg(unix)]
         {
@@ -160,6 +164,7 @@ impl Persistence {
                 &self.file_name,
                 &self.path,
                 &bytes,
+                before_publish,
             )
         }
         #[cfg(not(unix))]
@@ -172,7 +177,7 @@ impl Persistence {
 
             let temporary = next_temporary_snapshot_path(parent);
 
-            let result = write_and_replace(&temporary, &self.path, parent, &bytes);
+            let result = write_and_replace(&temporary, &self.path, parent, &bytes, before_publish);
             if result.is_err() {
                 let _ = fs::remove_file(&temporary);
             }
@@ -423,6 +428,7 @@ fn write_and_replace(
     destination: &Path,
     parent: &Path,
     bytes: &[u8],
+    before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<StoreStatus> {
     let destination_metadata = match fs::metadata(destination) {
         Ok(metadata) => Some(metadata),
@@ -469,6 +475,7 @@ fn write_and_replace(
             .map_err(|error| Error::io("sync snapshot permissions", error))?;
     }
     drop(file);
+    before_publish()?;
     replace_snapshot(temporary, destination, parent)
 }
 
@@ -479,6 +486,7 @@ fn write_and_replace_at(
     destination_name: &std::ffi::OsStr,
     display_path: &Path,
     bytes: &[u8],
+    before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<StoreStatus> {
     use rustix::fs::AtFlags;
 
@@ -511,6 +519,7 @@ fn write_and_replace_at(
         file.sync_all()
             .map_err(|error| Error::io("sync snapshot permissions", error))?;
         drop(file);
+        before_publish()?;
 
         rustix::fs::renameat(&staging_dir, "snapshot", parent_dir, destination_name)
             .map_err(|error| rustix_error("replace snapshot", error))

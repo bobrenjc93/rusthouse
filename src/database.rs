@@ -205,8 +205,13 @@ impl DatabaseInner {
         Ok(Arc::clone(&self.lock()?.head))
     }
 
-    fn commit(&self, transaction: &Transaction) -> Result<u64> {
+    fn commit(
+        &self,
+        transaction: &Transaction,
+        control: Option<ExecutionControl<'_>>,
+    ) -> Result<u64> {
         let mut state = self.lock()?;
+        check_cancellation(control)?;
         let current = Arc::clone(&state.head);
         if transaction.touched_tables.is_empty() {
             return Ok(current.id);
@@ -241,8 +246,9 @@ impl DatabaseInner {
         }
         let candidate = CatalogGeneration { id, tables };
         let store_status = if let Some(persistence) = &self.persistence {
-            persistence.store(&candidate)?
+            persistence.store(&candidate, || begin_publication(control))?
         } else {
+            begin_publication(control)?;
             StoreStatus::Durable
         };
         match store_status {
@@ -362,10 +368,7 @@ impl Session {
                     let mut transaction = Transaction::new(snapshot, self.limits);
                     let result = execute_write(&mut transaction, statement)?;
                     check_cancellation(control)?;
-                    if control.is_some_and(|control| !control.cancellation.begin_publication()) {
-                        return Err(Error::QueryCancelled);
-                    }
-                    self.database.inner.commit(&transaction)?;
+                    self.database.inner.commit(&transaction, control)?;
                     Ok(result)
                 }
             }
@@ -386,7 +389,7 @@ impl Session {
     /// Atomically publishes all staged table replacements.
     pub fn commit(&mut self) -> Result<u64> {
         let transaction = self.transaction.take().ok_or(Error::NoActiveTransaction)?;
-        match self.database.inner.commit(&transaction) {
+        match self.database.inner.commit(&transaction, None) {
             Ok(generation) => Ok(generation),
             Err(error)
                 if matches!(
@@ -640,6 +643,14 @@ fn check_cancellation(control: Option<ExecutionControl<'_>>) -> Result<()> {
     }
 }
 
+fn begin_publication(control: Option<ExecutionControl<'_>>) -> Result<()> {
+    if control.is_some_and(|control| !control.cancellation.begin_publication()) {
+        Err(Error::QueryCancelled)
+    } else {
+        Ok(())
+    }
+}
+
 fn enforce_result_limit(control: Option<ExecutionControl<'_>>, required: usize) -> Result<()> {
     if let Some(control) = control
         && required > control.max_result_bytes
@@ -703,6 +714,115 @@ fn compare(left: &Value, right: &Value, comparison: Comparison) -> bool {
         Comparison::GreaterOrEqual => {
             matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_commit_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    struct BlockingPublication {
+        barrier: Arc<Barrier>,
+    }
+
+    impl ExecutionCancellation for BlockingPublication {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn begin_publication(&self) -> bool {
+            self.barrier.wait();
+            self.barrier.wait();
+            true
+        }
+    }
+
+    struct QueuedCancellation {
+        cancelled: Arc<AtomicBool>,
+        checks: AtomicUsize,
+        ready: Arc<Barrier>,
+        publication_attempts: Arc<AtomicUsize>,
+    }
+
+    impl ExecutionCancellation for QueuedCancellation {
+        fn is_cancelled(&self) -> bool {
+            let cancelled = self.cancelled.load(Ordering::SeqCst);
+            if self.checks.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                self.ready.wait();
+                self.ready.wait();
+            }
+            cancelled
+        }
+
+        fn begin_publication(&self) -> bool {
+            self.publication_attempts.fetch_add(1, Ordering::SeqCst);
+            !self.cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn writer_cancelled_behind_slow_commit_never_enters_publication() {
+        let database = Database::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Barrier::new(2));
+        let publication_attempts = Arc::new(AtomicUsize::new(0));
+        let queued_database = database.clone();
+        let queued_cancelled = Arc::clone(&cancelled);
+        let queued_ready = Arc::clone(&ready);
+        let queued_attempts = Arc::clone(&publication_attempts);
+        let queued_writer = std::thread::spawn(move || {
+            let cancellation = QueuedCancellation {
+                cancelled: queued_cancelled,
+                checks: AtomicUsize::new(0),
+                ready: queued_ready,
+                publication_attempts: queued_attempts,
+            };
+            queued_database.execute_controlled(
+                "CREATE TABLE cancelled_commit (id Int64)",
+                usize::MAX,
+                &cancellation,
+            )
+        });
+        ready.wait();
+
+        let slow_barrier = Arc::new(Barrier::new(2));
+        let slow_database = database.clone();
+        let slow_cancellation = BlockingPublication {
+            barrier: Arc::clone(&slow_barrier),
+        };
+        let slow_writer = std::thread::spawn(move || {
+            slow_database.execute_controlled(
+                "CREATE TABLE slow_commit (id Int64)",
+                usize::MAX,
+                &slow_cancellation,
+            )
+        });
+        slow_barrier.wait();
+
+        cancelled.store(true, Ordering::SeqCst);
+        ready.wait();
+        slow_barrier.wait();
+
+        assert!(matches!(
+            slow_writer.join().unwrap(),
+            Ok(StatementResult::TableCreated)
+        ));
+        assert!(matches!(
+            queued_writer.join().unwrap(),
+            Err(Error::QueryCancelled)
+        ));
+        assert_eq!(publication_attempts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            database.execute("SELECT * FROM slow_commit"),
+            Ok(StatementResult::Query(_))
+        ));
+        assert!(matches!(
+            database.execute("SELECT * FROM cancelled_commit"),
+            Err(Error::TableNotFound(_))
+        ));
     }
 }
 

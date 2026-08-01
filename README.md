@@ -365,7 +365,9 @@ execution slot until they actually exit. Configured timeouts are capped at 365
 days so deadline arithmetic remains representable. The production database adapter
 also applies the response-byte ceiling while materializing rows. Mutation cancellation
 and publication use an atomic handoff: cancellation before publication prevents the
-commit, while a timeout after publication starts returns `query_outcome_unknown`
+commit, including while a writer waits behind another commit. The database enters
+publication only after commit serialization, conflict checks, and persisted-candidate
+preparation. A timeout after publication starts returns `query_outcome_unknown`
 instead of claiming that the mutation failed. Once execution confirms publication,
 an encoding limit or encoding deadline falls back to a bounded `204 No Content`
 success response rather than reporting a failed mutation. A database durability
