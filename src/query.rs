@@ -1,10 +1,22 @@
 //! Engine-independent query types used by frontends such as the HTTP server.
 
-use std::{collections::HashSet, future::Future, pin::Pin};
+use std::{
+    collections::HashSet,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{Database, Error, ResultSet, StatementResult, Value};
+use crate::{Database, Error, ResultSet, StatementResult, Value, database::ExecutionCancellation};
+
+const EXECUTION_ACTIVE: u8 = 0;
+const EXECUTION_CANCELLED: u8 = 1;
+const EXECUTION_PUBLISHING: u8 = 2;
 
 /// The boxed future returned by [`QueryService`].
 pub type QueryFuture<'a> =
@@ -38,7 +50,13 @@ impl QueryService for Database {
                 return Err(QueryError::unavailable("query was cancelled"));
             }
 
-            let result = Database::execute(self, &request.sql).map_err(QueryError::from)?;
+            let result = self
+                .execute_controlled(
+                    &request.sql,
+                    request.max_result_bytes,
+                    &request.cancellation,
+                )
+                .map_err(QueryError::from)?;
             if request.cancellation.is_cancelled() {
                 return Err(QueryError::unavailable("query was cancelled"));
             }
@@ -94,17 +112,29 @@ pub struct QueryRequest {
     pub request_id: u64,
     /// Signal set if the transport no longer needs the result.
     pub cancellation: QueryCancellation,
+    /// Maximum retained bytes the engine may materialize for this result.
+    pub max_result_bytes: usize,
 }
 
 /// A cooperative cancellation signal scoped to one query.
 #[derive(Debug, Clone)]
 pub struct QueryCancellation {
     inner: CancellationToken,
+    execution_state: Arc<AtomicU8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancellationOutcome {
+    Cancelled,
+    PublicationInProgress,
 }
 
 impl QueryCancellation {
     pub(crate) fn new(inner: CancellationToken) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            execution_state: Arc::new(AtomicU8::new(EXECUTION_ACTIVE)),
+        }
     }
 
     /// Waits until the server cancels this query.
@@ -117,8 +147,43 @@ impl QueryCancellation {
         self.inner.is_cancelled()
     }
 
-    pub(crate) fn cancel(&self) {
+    pub(crate) fn cancel(&self) -> CancellationOutcome {
         self.inner.cancel();
+        match self.execution_state.compare_exchange(
+            EXECUTION_ACTIVE,
+            EXECUTION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(EXECUTION_CANCELLED) => CancellationOutcome::Cancelled,
+            Err(EXECUTION_PUBLISHING) => CancellationOutcome::PublicationInProgress,
+            Err(_) => CancellationOutcome::Cancelled,
+        }
+    }
+}
+
+impl ExecutionCancellation for QueryCancellation {
+    fn is_cancelled(&self) -> bool {
+        QueryCancellation::is_cancelled(self)
+    }
+
+    fn begin_publication(&self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        if self
+            .execution_state
+            .compare_exchange(
+                EXECUTION_ACTIVE,
+                EXECUTION_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        !self.is_cancelled()
     }
 }
 
@@ -336,6 +401,7 @@ impl From<Error> for QueryError {
             Error::DatabaseAlreadyOpen(_) | Error::CommitRecoveryRequired(_) => {
                 QueryErrorKind::Unavailable
             }
+            Error::QueryCancelled => QueryErrorKind::Unavailable,
             Error::ReservedDatabasePath(_)
             | Error::UnsafeLockPath(_)
             | Error::CommitDurabilityUncertain { .. }
@@ -389,5 +455,19 @@ mod tests {
         let error = result.validate().unwrap_err();
         assert_eq!(error.kind, QueryErrorKind::Internal);
         assert!(error.message.contains("duplicate column name `id`"));
+    }
+
+    #[test]
+    fn cancellation_and_publication_have_an_atomic_handoff() {
+        let cancelled = QueryCancellation::new(CancellationToken::new());
+        assert_eq!(cancelled.cancel(), CancellationOutcome::Cancelled);
+        assert!(!ExecutionCancellation::begin_publication(&cancelled));
+
+        let publishing = QueryCancellation::new(CancellationToken::new());
+        assert!(ExecutionCancellation::begin_publication(&publishing));
+        assert_eq!(
+            publishing.cancel(),
+            CancellationOutcome::PublicationInProgress
+        );
     }
 }

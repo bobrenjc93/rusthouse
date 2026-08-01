@@ -88,6 +88,14 @@ impl ColumnData {
                 .map_or(Value::Null, |value| Value::String(value.clone())),
         }
     }
+
+    fn owned_value_bytes(&self, index: usize) -> usize {
+        std::mem::size_of::<Value>()
+            + match self {
+                Self::String(values) => values[index].as_ref().map_or(0, String::len),
+                _ => 0,
+            }
+    }
 }
 
 /// An immutable-on-commit, typed columnar table.
@@ -188,6 +196,10 @@ impl Table {
 
     pub(crate) fn value(&self, row: usize, column: usize) -> Value {
         self.columns[column].value(row)
+    }
+
+    pub(crate) fn owned_value_bytes(&self, row: usize, column: usize) -> usize {
+        self.columns[column].owned_value_bytes(row)
     }
 
     pub(crate) fn columns(&self) -> &[ColumnData] {

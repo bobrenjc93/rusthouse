@@ -36,8 +36,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::query::{
-    QueryCancellation, QueryError, QueryErrorKind, QueryRequest, QueryResult, QueryService,
-    QueryValue,
+    CancellationOutcome, QueryCancellation, QueryError, QueryErrorKind, QueryRequest, QueryResult,
+    QueryService, QueryValue,
 };
 
 const FORCE_CANCELLATION_WAIT: Duration = Duration::from_millis(250);
@@ -657,7 +657,8 @@ async fn handle_query(
     let query_request = QueryRequest {
         sql,
         request_id,
-        cancellation,
+        cancellation: cancellation.clone(),
+        max_result_bytes: state.config.max_response_bytes,
     };
     let service = state.service.clone();
     let query_admission = state.query_admission.clone();
@@ -678,14 +679,20 @@ async fn handle_query(
     let output = tokio::select! {
         biased;
         () = state.force_cancellation.cancelled() => {
-            token.cancel();
+            let cancellation_outcome = cancellation.cancel();
             execution.abort();
-            return Err(ApiError::shutting_down());
+            return Err(match cancellation_outcome {
+                CancellationOutcome::Cancelled => ApiError::shutting_down(),
+                CancellationOutcome::PublicationInProgress => ApiError::query_outcome_unknown(),
+            });
         }
         () = tokio::time::sleep_until(deadline) => {
-            token.cancel();
+            let cancellation_outcome = cancellation.cancel();
             execution.abort();
-            return Err(ApiError::timeout(state.config.query_timeout));
+            return Err(match cancellation_outcome {
+                CancellationOutcome::Cancelled => ApiError::timeout(state.config.query_timeout),
+                CancellationOutcome::PublicationInProgress => ApiError::query_outcome_unknown(),
+            });
         }
         output = &mut execution => output
             .map_err(|error| ApiError::blocking_task_failed("query execution", error))?,
@@ -750,7 +757,7 @@ struct CancelOnDrop(Option<QueryCancellation>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if let Some(cancellation) = &self.0 {
-            cancellation.cancel();
+            let _ = cancellation.cancel();
         }
     }
 }
@@ -1030,10 +1037,9 @@ fn write_json_value(writer: &mut impl Write, value: &QueryValue) -> io::Result<(
         QueryValue::Boolean(value) => writer.write_all(if *value { b"true" } else { b"false" }),
         QueryValue::Int64(value) => write!(writer, "{value}"),
         QueryValue::Float64(value) if value.is_finite() => write!(writer, "{value}"),
-        QueryValue::Float64(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "JSON cannot represent a non-finite float",
-        )),
+        QueryValue::Float64(value) if value.is_nan() => writer.write_all(b"\"NaN\""),
+        QueryValue::Float64(value) if value.is_sign_positive() => writer.write_all(b"\"Infinity\""),
+        QueryValue::Float64(_) => writer.write_all(b"\"-Infinity\""),
         QueryValue::String(value) => serde_json::to_writer(writer, value).map_err(io::Error::other),
     }
 }
@@ -1245,6 +1251,14 @@ impl ApiError {
         )
     }
 
+    fn query_outcome_unknown() -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "query_outcome_unknown",
+            "the request timed out after mutation publication began; its commit outcome is unknown",
+        )
+    }
+
     fn shutting_down() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1368,6 +1382,23 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             "a,b\n\"one,two\",\"say \"\"hi\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn json_uses_stable_strings_for_non_finite_floats() {
+        let result = QueryResult::new(
+            vec!["nan".into(), "positive".into(), "negative".into()],
+            vec![vec![
+                QueryValue::Float64(f64::NAN),
+                QueryValue::Float64(f64::INFINITY),
+                QueryValue::Float64(f64::NEG_INFINITY),
+            ]],
+        );
+        let bytes = serialize_result(&result, ResponseFormat::Json, 1024).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"[{"nan":"NaN","positive":"Infinity","negative":"-Infinity"}]"#
         );
     }
 

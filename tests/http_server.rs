@@ -164,7 +164,8 @@ async fn start(service: Arc<dyn QueryService>, config: ServerConfig) -> (ServerH
 
 #[tokio::test]
 async fn executes_sql_against_the_database_engine() {
-    let (server, url) = start(Arc::new(Database::new()), ServerConfig::default()).await;
+    let database = Database::new();
+    let (server, url) = start(Arc::new(database.clone()), ServerConfig::default()).await;
     let client = Client::new();
 
     let create = client
@@ -238,6 +239,120 @@ async fn executes_sql_against_the_database_engine() {
         "invalid_query"
     );
 
+    database
+        .execute("CREATE TABLE special_floats (value Float64)")
+        .unwrap();
+    database
+        .execute("INSERT INTO special_floats VALUES (1e999), (-1e999)")
+        .unwrap();
+    let non_finite = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("SELECT * FROM special_floats")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(non_finite.status(), StatusCode::OK);
+    assert_eq!(
+        non_finite.json::<Value>().await.unwrap(),
+        json!([{"value": "Infinity"}, {"value": "-Infinity"}])
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn production_database_bounds_result_materialization() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE payloads (value String)")
+        .unwrap();
+    database
+        .execute(&format!(
+            "INSERT INTO payloads VALUES ('{}')",
+            "x".repeat(1024)
+        ))
+        .unwrap();
+    let config = ServerConfig {
+        max_response_bytes: 128,
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(Arc::new(database), config).await;
+    let response = Client::new()
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("SELECT * FROM payloads")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "resource_limit"
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn timed_out_database_mutation_cannot_publish_after_cancellation() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE cancelled_insert (id Int64)")
+        .unwrap();
+    let config = ServerConfig {
+        max_request_bytes: 4 * 1024 * 1024,
+        max_concurrent_queries: 1,
+        query_timeout: Duration::from_millis(1),
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(Arc::new(database.clone()), config).await;
+    let values = (0..250_000)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = Client::new()
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body(format!("INSERT INTO cancelled_insert VALUES {values}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "query_timeout"
+    );
+
+    let client = Client::new();
+    let completion_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let probe = client
+            .post(format!("{url}/query"))
+            .header("content-type", "application/sql")
+            .body("SELECT * FROM cancelled_insert")
+            .send()
+            .await
+            .unwrap();
+        if probe.status() == StatusCode::OK {
+            assert_eq!(probe.json::<Value>().await.unwrap(), json!([]));
+            break;
+        }
+        assert!(
+            matches!(
+                probe.status(),
+                StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+            ),
+            "unexpected probe status {}",
+            probe.status()
+        );
+        assert!(
+            Instant::now() < completion_deadline,
+            "mutation did not stop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(database.current_generation().unwrap(), 1);
     server.shutdown().await.unwrap();
 }
 

@@ -344,11 +344,18 @@ not create an unbounded queue. Transient accept errors are retried with capped
 backoff, and owners can await unexpected server-task termination. Query futures
 and result encoding run on bounded blocking workers; timed-out jobs retain their
 execution slot until they actually exit. Configured timeouts are capped at 365
-days so deadline arithmetic remains representable.
+days so deadline arithmetic remains representable. The production database adapter
+also applies the response-byte ceiling while materializing rows. Mutation cancellation
+and publication use an atomic handoff: cancellation before publication prevents the
+commit, while a timeout after publication starts returns `query_outcome_unknown`
+instead of claiming that the mutation failed.
 Query implementations should observe the supplied `QueryCancellation` while doing
 expensive work. It is signaled when a request is dropped, its deadline expires, or
 forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown
 path.
+
+JSON and NDJSON encode non-finite `Float64` values as the strings `"NaN"`,
+`"Infinity"`, and `"-Infinity"`; finite floats remain JSON numbers.
 
 The executable attaches the HTTP service to the same autocommit database used by
 the CLI. It uses an in-memory database by default; pass `--database FILE` to serve

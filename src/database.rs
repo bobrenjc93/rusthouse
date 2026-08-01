@@ -10,6 +10,17 @@ use crate::sql::{Comparison, Predicate, Statement, parse};
 use crate::storage::{ColumnDef, EngineTable as Table, Value};
 use crate::value::compare_int_float;
 
+pub(crate) trait ExecutionCancellation {
+    fn is_cancelled(&self) -> bool;
+    fn begin_publication(&self) -> bool;
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionControl<'a> {
+    max_result_bytes: usize,
+    cancellation: &'a dyn ExecutionCancellation,
+}
+
 /// Per-transaction bounds for staged inserts and their encoded value sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransactionLimits {
@@ -137,6 +148,29 @@ impl Database {
 
     /// Executes one autocommit statement in a temporary session.
     pub fn execute(&self, sql: &str) -> Result<StatementResult> {
+        self.execute_inner(sql, None)
+    }
+
+    pub(crate) fn execute_controlled(
+        &self,
+        sql: &str,
+        max_result_bytes: usize,
+        cancellation: &dyn ExecutionCancellation,
+    ) -> Result<StatementResult> {
+        self.execute_inner(
+            sql,
+            Some(ExecutionControl {
+                max_result_bytes,
+                cancellation,
+            }),
+        )
+    }
+
+    fn execute_inner(
+        &self,
+        sql: &str,
+        control: Option<ExecutionControl<'_>>,
+    ) -> Result<StatementResult> {
         let statement = parse(sql)?;
         if matches!(
             statement,
@@ -146,7 +180,8 @@ impl Database {
                 "transaction control requires a persistent Session".to_owned(),
             ));
         }
-        self.session().execute_statement(statement)
+        check_cancellation(control)?;
+        self.session().execute_statement(statement, control)
     }
 
     /// Returns the current committed catalog generation.
@@ -289,10 +324,14 @@ impl Transaction {
 impl Session {
     /// Executes one SQL statement, using the active snapshot when inside a transaction.
     pub fn execute(&mut self, sql: &str) -> Result<StatementResult> {
-        self.execute_statement(parse(sql)?)
+        self.execute_statement(parse(sql)?, None)
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    fn execute_statement(
+        &mut self,
+        statement: Statement,
+        control: Option<ExecutionControl<'_>>,
+    ) -> Result<StatementResult> {
         match statement {
             Statement::Begin => {
                 let generation = self.begin()?;
@@ -311,9 +350,9 @@ impl Session {
                     &transaction.tables
                 } else {
                     let snapshot = self.database.inner.snapshot()?;
-                    return execute_read(&snapshot.tables, statement);
+                    return execute_read(&snapshot.tables, statement, control);
                 };
-                execute_read(tables, statement)
+                execute_read(tables, statement, control)
             }
             statement => {
                 if let Some(transaction) = &mut self.transaction {
@@ -322,6 +361,10 @@ impl Session {
                     let snapshot = self.database.inner.snapshot()?;
                     let mut transaction = Transaction::new(snapshot, self.limits);
                     let result = execute_write(&mut transaction, statement)?;
+                    check_cancellation(control)?;
+                    if control.is_some_and(|control| !control.cancellation.begin_publication()) {
+                        return Err(Error::QueryCancelled);
+                    }
                     self.database.inner.commit(&transaction)?;
                     Ok(result)
                 }
@@ -497,6 +540,7 @@ fn estimate_insert_bytes(table: &str, rows: &[Vec<Value>]) -> usize {
 fn execute_read(
     tables: &BTreeMap<String, Arc<Table>>,
     statement: Statement,
+    control: Option<ExecutionControl<'_>>,
 ) -> Result<StatementResult> {
     let Statement::Select {
         table,
@@ -527,11 +571,52 @@ fn execute_read(
         None => (0..table.schema().len()).collect(),
     };
     let predicates = prepare_predicates(table, &predicates)?;
-    let mut rows = Vec::new();
+    let column_bytes = projection.iter().fold(
+        projection
+            .len()
+            .saturating_mul(std::mem::size_of::<ColumnDef>()),
+        |bytes, index| bytes.saturating_add(table.schema()[*index].name.len()),
+    );
+    enforce_result_limit(control, column_bytes)?;
+    let row_fixed_bytes = std::mem::size_of::<Vec<Value>>().saturating_add(
+        projection
+            .len()
+            .saturating_mul(std::mem::size_of::<Value>()),
+    );
+    let row_capacity = control.map_or(0, |control| {
+        control
+            .max_result_bytes
+            .saturating_sub(column_bytes)
+            .checked_div(row_fixed_bytes.max(1))
+            .unwrap_or(0)
+            .min(table.row_count())
+    });
+    let mut rows = if control.is_some() {
+        Vec::with_capacity(row_capacity)
+    } else {
+        Vec::new()
+    };
+    let mut result_bytes =
+        column_bytes.saturating_add(row_capacity.saturating_mul(std::mem::size_of::<Vec<Value>>()));
+    enforce_result_limit(control, result_bytes)?;
     for row in 0..table.row_count() {
+        check_cancellation(control)?;
         if predicates.iter().all(|(column, comparison, value)| {
             compare(&table.value(row, *column), value, *comparison)
         }) {
+            let row_bytes = projection.iter().fold(0usize, |bytes, column| {
+                bytes.saturating_add(table.owned_value_bytes(row, *column))
+            });
+            let additional_outer_bytes = if control.is_some() && rows.len() == row_capacity {
+                std::mem::size_of::<Vec<Value>>()
+            } else {
+                0
+            };
+            let required = result_bytes
+                .saturating_add(additional_outer_bytes)
+                .saturating_add(row_bytes);
+            enforce_result_limit(control, required)?;
+            result_bytes = required;
             rows.push(
                 projection
                     .iter()
@@ -545,6 +630,27 @@ fn execute_read(
         .map(|index| table.schema()[*index].clone())
         .collect();
     Ok(StatementResult::Query(ResultSet { columns, rows }))
+}
+
+fn check_cancellation(control: Option<ExecutionControl<'_>>) -> Result<()> {
+    if control.is_some_and(|control| control.cancellation.is_cancelled()) {
+        Err(Error::QueryCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn enforce_result_limit(control: Option<ExecutionControl<'_>>, required: usize) -> Result<()> {
+    if let Some(control) = control
+        && required > control.max_result_bytes
+    {
+        return Err(Error::MemoryLimitExceeded {
+            operator: "query result",
+            required,
+            limit: control.max_result_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn prepare_predicates(

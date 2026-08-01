@@ -1254,7 +1254,10 @@ fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
 }
 
 #[cfg(unix)]
-fn prepare_temp_security(temp: &File, existing: Option<&File>) -> Result<(), SnapshotError> {
+pub(crate) fn prepare_temp_security(
+    temp: &File,
+    existing: Option<&File>,
+) -> Result<(), SnapshotError> {
     use std::os::unix::fs::MetadataExt;
 
     if let Some(existing) = existing {

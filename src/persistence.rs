@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,6 +51,10 @@ pub(crate) fn fail_next_directory_sync() {
 #[derive(Debug)]
 pub(crate) struct Persistence {
     path: PathBuf,
+    #[cfg(unix)]
+    parent_dir: File,
+    #[cfg(unix)]
+    file_name: std::ffi::OsString,
     _lock: File,
 }
 
@@ -61,20 +67,50 @@ impl Persistence {
         }) {
             return Err(Error::ReservedDatabasePath(path.display().to_string()));
         }
-        let mut lock_name = path.as_os_str().to_os_string();
-        lock_name.push(LOCK_SUFFIX);
-        let lock_path = PathBuf::from(lock_name);
+        let mut lock_path_name = path.as_os_str().to_os_string();
+        lock_path_name.push(LOCK_SUFFIX);
+        let lock_path = PathBuf::from(lock_path_name);
+        #[cfg(unix)]
+        let parent_dir = File::open(path.parent().expect("normalized path has a parent"))
+            .map_err(|error| Error::io("open database directory", error))?;
+        #[cfg(unix)]
+        let file_name = path
+            .file_name()
+            .expect("normalized path has a filename")
+            .to_owned();
+        #[cfg(unix)]
+        let lock = {
+            let mut lock_name = file_name.clone();
+            lock_name.push(LOCK_SUFFIX);
+            open_database_lock_at(&parent_dir, &lock_name, &lock_path, &path)?
+        };
+        #[cfg(not(unix))]
         let lock = open_database_lock(&lock_path, &path)?;
-        Ok(Self { path, _lock: lock })
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            parent_dir,
+            #[cfg(unix)]
+            file_name,
+            _lock: lock,
+        })
     }
 
     pub(crate) fn load(&self) -> Result<CatalogGeneration> {
+        #[cfg(unix)]
+        let file = open_snapshot_at(&self.parent_dir, &self.file_name, &self.path)?;
+        #[cfg(not(unix))]
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(CatalogGeneration::empty());
             }
             Err(error) => return Err(Error::io("open snapshot", error)),
+        };
+        #[cfg(unix)]
+        let mut file = match file {
+            Some(file) => file,
+            None => return Ok(CatalogGeneration::empty()),
         };
         let size = file
             .metadata()
@@ -109,22 +145,45 @@ impl Persistence {
 
     pub(crate) fn store(&self, generation: &CatalogGeneration) -> Result<StoreStatus> {
         let bytes = encode_snapshot(generation)?;
-        let parent = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-
-        let temporary = next_temporary_snapshot_path(parent);
-
-        let result = write_and_replace(&temporary, &self.path, parent, &bytes);
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+        #[cfg(unix)]
+        {
+            let temporary_name = next_temporary_snapshot_name();
+            let result = write_and_replace_at(
+                &self.parent_dir,
+                &temporary_name,
+                &self.file_name,
+                &self.path,
+                &bytes,
+            );
+            if result.is_err() {
+                let _ = rustix::fs::unlinkat(
+                    &self.parent_dir,
+                    &temporary_name,
+                    rustix::fs::AtFlags::empty(),
+                );
+            }
+            result
         }
-        result
+        #[cfg(not(unix))]
+        {
+            let parent = self
+                .path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+
+            let temporary = next_temporary_snapshot_path(parent);
+
+            let result = write_and_replace(&temporary, &self.path, parent, &bytes);
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+            }
+            result
+        }
     }
 }
 
+#[cfg(not(unix))]
 fn open_database_lock(path: &Path, database_path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -198,9 +257,135 @@ fn open_database_lock(path: &Path, database_path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn next_temporary_snapshot_path(parent: &Path) -> PathBuf {
+#[cfg(unix)]
+fn open_database_lock_at(
+    parent_dir: &File,
+    lock_name: &std::ffi::OsStr,
+    lock_path: &Path,
+    database_path: &Path,
+) -> Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let descriptor = match rustix::fs::openat(
+        parent_dir,
+        lock_name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::LOOP => {
+            return Err(Error::UnsafeLockPath(lock_path.display().to_string()));
+        }
+        Err(error) => return Err(rustix_error("open database lock", error)),
+    };
+    let file = File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io("inspect database lock", error))?;
+    if !metadata.is_file() {
+        return Err(Error::UnsafeLockPath(lock_path.display().to_string()));
+    }
+
+    #[cfg(test)]
+    {
+        let mut replacement = REPLACE_LOCK_BEFORE_ACQUIRE
+            .lock()
+            .expect("lock replacement test hook must not be poisoned");
+        if replacement.as_deref() == Some(lock_path) {
+            *replacement = None;
+            fs::remove_file(lock_path)
+                .map_err(|error| Error::io("inject lock replacement", error))?;
+            File::create(lock_path).map_err(|error| Error::io("inject lock replacement", error))?;
+        }
+    }
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(Error::DatabaseAlreadyOpen(
+                database_path.display().to_string(),
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(Error::io("lock database", error));
+        }
+    }
+
+    let current = rustix::fs::openat(
+        parent_dir,
+        lock_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| Error::UnsafeLockPath(lock_path.display().to_string()))?;
+    let current_metadata = current
+        .metadata()
+        .map_err(|error| Error::io("inspect database lock path", error))?;
+    if !metadata.is_file()
+        || !current_metadata.is_file()
+        || metadata.dev() != current_metadata.dev()
+        || metadata.ino() != current_metadata.ino()
+    {
+        return Err(Error::UnsafeLockPath(lock_path.display().to_string()));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_snapshot_at(
+    parent_dir: &File,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<Option<File>> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = match rustix::fs::openat(
+        parent_dir,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) if error == rustix::io::Errno::LOOP => {
+            return Err(Error::CorruptSnapshot(format!(
+                "snapshot path is a symbolic link: {}",
+                display_path.display()
+            )));
+        }
+        Err(error) => return Err(rustix_error("open snapshot", error)),
+    };
+    let file = File::from(descriptor);
+    if !file
+        .metadata()
+        .map_err(|error| Error::io("inspect snapshot", error))?
+        .is_file()
+    {
+        return Err(Error::CorruptSnapshot(
+            "snapshot path is not a regular file".to_owned(),
+        ));
+    }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn rustix_error(operation: &'static str, error: rustix::io::Errno) -> Error {
+    Error::io(
+        operation,
+        std::io::Error::from_raw_os_error(error.raw_os_error()),
+    )
+}
+
+fn next_temporary_snapshot_name() -> std::ffi::OsString {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!("{TEMP_PREFIX}{}.{}", std::process::id(), sequence))
+    format!("{TEMP_PREFIX}{}.{}", std::process::id(), sequence).into()
+}
+
+#[cfg(any(test, not(unix)))]
+fn next_temporary_snapshot_path(parent: &Path) -> PathBuf {
+    parent.join(next_temporary_snapshot_name())
 }
 
 fn normalize_path(path: &Path) -> Result<PathBuf> {
@@ -220,6 +405,7 @@ fn normalize_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
+#[cfg(not(unix))]
 fn write_and_replace(
     temporary: &Path,
     destination: &Path,
@@ -287,30 +473,38 @@ fn write_and_replace(
 }
 
 #[cfg(unix)]
-fn preserve_snapshot_ownership(file: &File, uid: u32, gid: u32) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
+fn write_and_replace_at(
+    parent_dir: &File,
+    temporary_name: &std::ffi::OsStr,
+    destination_name: &std::ffi::OsStr,
+    display_path: &Path,
+    bytes: &[u8],
+) -> Result<StoreStatus> {
+    use rustix::fs::{Mode, OFlags};
 
-    let metadata = file
-        .metadata()
-        .map_err(|error| Error::io("inspect temporary snapshot ownership", error))?;
-    if metadata.uid() == uid && metadata.gid() == gid {
-        return Ok(());
-    }
-    // The descriptor refers to the private temp file and remains open through publication.
-    let result = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
-    if result != 0 {
-        return Err(Error::io(
-            "preserve snapshot ownership",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
-}
+    let existing = open_snapshot_at(parent_dir, destination_name, display_path)?;
+    let descriptor = rustix::fs::openat(
+        parent_dir,
+        temporary_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| rustix_error("create private temporary snapshot", error))?;
+    let mut file = File::from(descriptor);
+    file.write_all(bytes)
+        .map_err(|error| Error::io("write temporary snapshot", error))?;
+    file.sync_all()
+        .map_err(|error| Error::io("sync temporary snapshot", error))?;
+    crate::catalog::prepare_temp_security(&file, existing.as_ref()).map_err(|error| Error::Io {
+        operation: "preserve snapshot security metadata",
+        message: error.to_string(),
+    })?;
+    file.sync_all()
+        .map_err(|error| Error::io("sync snapshot permissions", error))?;
+    drop(file);
 
-#[cfg(unix)]
-fn replace_snapshot(temporary: &Path, destination: &Path, parent: &Path) -> Result<StoreStatus> {
-    fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))?;
+    rustix::fs::renameat(parent_dir, temporary_name, parent_dir, destination_name)
+        .map_err(|error| rustix_error("replace snapshot", error))?;
     #[cfg(test)]
     if FAIL_DIRECTORY_SYNC.swap(false, Ordering::SeqCst) {
         return Ok(StoreStatus::PublishedWithError(Error::Io {
@@ -318,7 +512,7 @@ fn replace_snapshot(temporary: &Path, destination: &Path, parent: &Path) -> Resu
             message: "injected directory sync failure".to_owned(),
         }));
     }
-    match File::open(parent).and_then(|directory| directory.sync_all()) {
+    match parent_dir.sync_all() {
         Ok(()) => Ok(StoreStatus::Durable),
         Err(error) => Ok(StoreStatus::PublishedWithError(Error::io(
             "sync snapshot directory",

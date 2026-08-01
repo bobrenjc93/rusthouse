@@ -64,6 +64,7 @@ pub enum Error {
         message: String,
     },
     LockPoisoned,
+    QueryCancelled,
     InvalidCapacity {
         capacity: usize,
     },
@@ -240,6 +241,7 @@ impl fmt::Display for Error {
             ),
             Self::Io { operation, message } => write!(f, "{operation}: {message}"),
             Self::LockPoisoned => f.write_str("database state lock is poisoned"),
+            Self::QueryCancelled => f.write_str("query was cancelled before publication"),
             Self::InvalidCapacity { capacity } => {
                 write!(f, "capacity {capacity} is not representable by this array")
             }

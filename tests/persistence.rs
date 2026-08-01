@@ -88,6 +88,57 @@ fn a_persisted_path_has_one_exclusive_owner() {
 
 #[cfg(unix)]
 #[test]
+fn parent_replacement_keeps_database_writers_and_snapshots_isolated() {
+    let root = temporary_path("parent-replacement").with_extension("dir");
+    let active_parent = root.join("active");
+    let moved_parent = root.join("moved");
+    fs::create_dir_all(&active_parent).unwrap();
+    let active_path = active_parent.join("database.db");
+    let moved_path = moved_parent.join("database.db");
+    let first = Database::open(&active_path).unwrap();
+
+    fs::rename(&active_parent, &moved_parent).unwrap();
+    assert!(matches!(
+        Database::open(&moved_path),
+        Err(Error::DatabaseAlreadyOpen(_))
+    ));
+    fs::create_dir(&active_parent).unwrap();
+    let second = Database::open(&active_path).unwrap();
+
+    first.execute("CREATE TABLE original (id Int64)").unwrap();
+    second
+        .execute("CREATE TABLE replacement (id Int64)")
+        .unwrap();
+    drop(first);
+    drop(second);
+
+    let original = Database::open(&moved_path).unwrap();
+    assert!(matches!(
+        original.execute("SELECT * FROM original"),
+        Ok(StatementResult::Query(_))
+    ));
+    assert!(matches!(
+        original.execute("SELECT * FROM replacement"),
+        Err(Error::TableNotFound(_))
+    ));
+    drop(original);
+
+    let replacement = Database::open(&active_path).unwrap();
+    assert!(matches!(
+        replacement.execute("SELECT * FROM replacement"),
+        Ok(StatementResult::Query(_))
+    ));
+    assert!(matches!(
+        replacement.execute("SELECT * FROM original"),
+        Err(Error::TableNotFound(_))
+    ));
+    drop(replacement);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn lock_symlink_cannot_redirect_ownership_to_the_database() {
     use std::os::unix::fs::symlink;
 

@@ -22,7 +22,9 @@ snapshot. Publication uses a synced temporary file, atomic rename, and parent-di
 sync. A canonical-path sidecar lock in a reserved filename namespace gives one database
 handle exclusive ownership across processes. Lock opens do not follow symlinks and
 acquire the advisory lock before comparing the opened regular-file identity with the
-current path using native file IDs. Database parent directories must preexist,
+current path using native file IDs. On Unix, the parent directory is pinned and all
+snapshot and sidecar operations are relative to that descriptor, so renaming and
+replacing its pathname cannot redirect an existing writer. Database parent directories must preexist,
 so publication only needs to sync the directory containing the snapshot. Temporary candidates and backups use a
 separate reserved filename prefix that cannot be opened as a database. Encoding validates the same table, column, row, string, and total-allocation
 bounds that decoding enforces. The decoder charges raw bytes, catalog/map nodes, table
