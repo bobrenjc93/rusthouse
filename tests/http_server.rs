@@ -225,6 +225,19 @@ async fn executes_sql_against_the_database_engine() {
         "not_found"
     );
 
+    let duplicate_projection = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("SELECT id, id FROM events")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_projection.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        duplicate_projection.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_query"
+    );
+
     server.shutdown().await.unwrap();
 }
 

@@ -8,6 +8,7 @@ use crate::error::{Error, LimitKind, Result};
 use crate::persistence::{Persistence, StoreStatus};
 use crate::sql::{Comparison, Predicate, Statement, parse};
 use crate::storage::{ColumnDef, EngineTable as Table, Value};
+use crate::value::compare_int_float;
 
 /// Per-transaction bounds for staged inserts and their encoded value sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,14 +510,20 @@ fn execute_read(
         .get(&table)
         .ok_or_else(|| Error::TableNotFound(table.clone()))?;
     let projection = match columns {
-        Some(columns) => columns
-            .iter()
-            .map(|name| {
-                table
-                    .column_index(name)
-                    .ok_or_else(|| Error::ColumnNotFound(name.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?,
+        Some(columns) => {
+            let mut projection = Vec::with_capacity(columns.len());
+            for (position, name) in columns.iter().enumerate() {
+                if columns[..position].contains(name) {
+                    return Err(Error::DuplicateColumn(name.clone()));
+                }
+                projection.push(
+                    table
+                        .column_index(name)
+                        .ok_or_else(|| Error::ColumnNotFound(name.clone()))?,
+                );
+            }
+            projection
+        }
         None => (0..table.schema().len()).collect(),
     };
     let predicates = prepare_predicates(table, &predicates)?;
@@ -551,8 +558,9 @@ fn prepare_predicates(
                 .column_index(&predicate.column)
                 .ok_or_else(|| Error::ColumnNotFound(predicate.column.clone()))?;
             let column = &table.schema()[index];
-            if predicate.value != Value::Null
-                && predicate.value.data_type() != Some(column.data_type)
+            if let Some(value_type) = predicate.value.data_type()
+                && value_type != column.data_type
+                && !(value_type.is_numeric() && column.data_type.is_numeric())
             {
                 return Err(Error::TypeMismatch {
                     column: column.name.clone(),
@@ -571,14 +579,18 @@ fn compare(left: &Value, right: &Value, comparison: Comparison) -> bool {
     }
     let ordering = match (left, right) {
         (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
+        (Value::Int64(left), Value::Float64(right)) => compare_int_float(*left, *right),
+        (Value::Float64(left), Value::Int64(right)) => {
+            compare_int_float(*right, *left).map(Ordering::reverse)
+        }
         (Value::Float64(left), Value::Float64(right)) => left.partial_cmp(right),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
         (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
         _ => None,
     };
     match comparison {
-        Comparison::Equal => left == right,
-        Comparison::NotEqual => left != right,
+        Comparison::Equal => ordering == Some(Ordering::Equal),
+        Comparison::NotEqual => ordering != Some(Ordering::Equal),
         Comparison::Less => ordering == Some(Ordering::Less),
         Comparison::LessOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
         Comparison::Greater => ordering == Some(Ordering::Greater),

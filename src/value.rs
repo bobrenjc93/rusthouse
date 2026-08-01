@@ -11,6 +11,13 @@ pub enum DataType {
     String,
 }
 
+impl DataType {
+    /// Returns whether this type participates in SQL numeric promotion.
+    pub const fn is_numeric(self) -> bool {
+        matches!(self, Self::Int64 | Self::Float64)
+    }
+}
+
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

@@ -228,3 +228,44 @@ fn one_shot_execute_rejects_transaction_control() {
     }
     assert_eq!(database.current_generation().unwrap(), 0);
 }
+
+#[test]
+fn engine_predicates_follow_shared_numeric_and_projection_semantics() {
+    let database = Database::new();
+    let mut session = database.session();
+    session
+        .execute("CREATE TABLE numbers (integer_value Int64, float_value Float64 NULL)")
+        .unwrap();
+    session
+        .execute(
+            "INSERT INTO numbers VALUES (2, 2.0), (9007199254740993, 9007199254740992.0), (3, NULL)",
+        )
+        .unwrap();
+
+    assert_eq!(
+        query(
+            &mut session,
+            "SELECT integer_value FROM numbers WHERE integer_value = 2.0",
+        ),
+        vec![vec![Value::Int64(2)]]
+    );
+    assert!(
+        query(
+            &mut session,
+            "SELECT integer_value FROM numbers WHERE float_value = 9007199254740993",
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        query(
+            &mut session,
+            "SELECT integer_value FROM numbers WHERE float_value <> 9007199254740993",
+        ),
+        vec![vec![Value::Int64(2)], vec![Value::Int64(9007199254740993)]]
+    );
+
+    assert!(matches!(
+        session.execute("SELECT integer_value, integer_value FROM numbers"),
+        Err(Error::DuplicateColumn(column)) if column == "integer_value"
+    ));
+}

@@ -43,14 +43,21 @@ pub(crate) enum Statement {
 }
 
 pub(crate) fn parse(sql: &str) -> Result<Statement> {
-    let tokens = tokenize(sql)?;
+    let Tokenized {
+        tokens,
+        positions,
+        end_position,
+    } = tokenize(sql)?;
     let mut parser = Parser {
         tokens,
+        positions,
+        end_position,
         position: 0,
+        last_position: None,
     };
     let statement = parser.statement()?;
     if parser.consume_symbol(';') && parser.consume_symbol(';') {
-        return Err(parser.error("only one trailing semicolon is allowed"));
+        return Err(parser.error_at_last("only one trailing semicolon is allowed"));
     }
     if parser.peek().is_some() {
         return Err(parser.error("unexpected tokens after statement"));
@@ -67,9 +74,21 @@ enum Token {
     Comparison(Comparison),
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>> {
+struct Tokenized {
+    tokens: Vec<Token>,
+    positions: Vec<usize>,
+    end_position: usize,
+}
+
+fn tokenize(input: &str) -> Result<Tokenized> {
     let chars: Vec<char> = input.chars().collect();
+    let byte_positions = input
+        .char_indices()
+        .map(|(position, _)| position)
+        .chain(std::iter::once(input.len()))
+        .collect::<Vec<_>>();
     let mut tokens = Vec::new();
+    let mut positions = Vec::new();
     let mut position = 0;
     while position < chars.len() {
         let character = chars[position];
@@ -77,15 +96,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             position += 1;
             continue;
         }
+        let token_position = byte_positions[position];
         if character == '\'' {
-            let (value, next) = quoted(&chars, position, '\'', true)?;
+            let (value, next) = quoted(&chars, &byte_positions, position, '\'', true)?;
             tokens.push(Token::String(value));
+            positions.push(token_position);
             position = next;
             continue;
         }
         if character == '"' {
-            let (value, next) = quoted(&chars, position, '"', false)?;
+            let (value, next) = quoted(&chars, &byte_positions, position, '"', false)?;
             tokens.push(Token::Word(value));
+            positions.push(token_position);
             position = next;
             continue;
         }
@@ -103,6 +125,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                     .collect::<String>()
                     .to_ascii_lowercase(),
             ));
+            positions.push(token_position);
             continue;
         }
         if character.is_ascii_digit()
@@ -131,24 +154,28 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 if exponent_start == position {
                     return Err(Error::Parse {
                         message: "invalid numeric exponent".to_owned(),
-                        position,
+                        position: byte_positions[position],
                     });
                 }
             }
             tokens.push(Token::Number(chars[start..position].iter().collect()));
+            positions.push(token_position);
             continue;
         }
         match character {
             '(' | ')' | ',' | '*' | ';' => {
                 tokens.push(Token::Symbol(character));
+                positions.push(token_position);
                 position += 1;
             }
             '=' => {
                 tokens.push(Token::Comparison(Comparison::Equal));
+                positions.push(token_position);
                 position += 1;
             }
             '!' if chars.get(position + 1) == Some(&'=') => {
                 tokens.push(Token::Comparison(Comparison::NotEqual));
+                positions.push(token_position);
                 position += 2;
             }
             '<' => {
@@ -162,6 +189,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Comparison(Comparison::Less));
                     position += 1;
                 }
+                positions.push(token_position);
             }
             '>' => {
                 if chars.get(position + 1) == Some(&'=') {
@@ -171,14 +199,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Comparison(Comparison::Greater));
                     position += 1;
                 }
+                positions.push(token_position);
             }
             _ => {
                 return Err(Error::Parse {
-                    message: format!(
-                        "unexpected character {character:?} at character {}",
-                        position + 1
-                    ),
-                    position,
+                    message: format!("unexpected character {character:?}"),
+                    position: token_position,
                 });
             }
         }
@@ -189,11 +215,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             position: 0,
         });
     }
-    Ok(tokens)
+    Ok(Tokenized {
+        tokens,
+        positions,
+        end_position: input.len(),
+    })
 }
 
 fn quoted(
     chars: &[char],
+    byte_positions: &[usize],
     start: usize,
     delimiter: char,
     backslash_escapes: bool,
@@ -212,7 +243,7 @@ fn quoted(
         if backslash_escapes && chars[position] == '\\' {
             let escaped = chars.get(position + 1).ok_or_else(|| Error::Parse {
                 message: "unterminated escape in string literal".to_owned(),
-                position,
+                position: byte_positions[position],
             })?;
             value.push(match escaped {
                 'n' => '\n',
@@ -237,13 +268,16 @@ fn quoted(
                 "quoted identifier"
             }
         ),
-        position: start,
+        position: byte_positions[start],
     })
 }
 
 struct Parser {
     tokens: Vec<Token>,
+    positions: Vec<usize>,
+    end_position: usize,
     position: usize,
+    last_position: Option<usize>,
 }
 
 impl Parser {
@@ -381,7 +415,7 @@ impl Parser {
                 let column = self.identifier()?;
                 let comparison = match self.next() {
                     Some(Token::Comparison(comparison)) => comparison,
-                    _ => return Err(self.error("expected a comparison operator")),
+                    _ => return Err(self.error_at_last("expected a comparison operator")),
                 };
                 let value = self.literal()?;
                 predicates.push(Predicate {
@@ -413,7 +447,7 @@ impl Parser {
             Some(Token::Word(value)) if value == "string" || value == "text" => {
                 Ok(DataType::String)
             }
-            _ => Err(self.error("expected Int64, Float64, Bool, or String")),
+            _ => Err(self.error_at_last("expected Int64, Float64, Bool, or String")),
         }
     }
 
@@ -423,22 +457,22 @@ impl Parser {
             Some(Token::Number(value)) if value.contains(['.', 'e', 'E']) => value
                 .parse::<f64>()
                 .map(Value::Float64)
-                .map_err(|_| self.error("invalid Float64 literal")),
+                .map_err(|_| self.error_at_last("invalid Float64 literal")),
             Some(Token::Number(value)) => value
                 .parse::<i64>()
                 .map(Value::Int64)
-                .map_err(|_| self.error("invalid Int64 literal")),
+                .map_err(|_| self.error_at_last("invalid Int64 literal")),
             Some(Token::Word(value)) if value == "true" => Ok(Value::Bool(true)),
             Some(Token::Word(value)) if value == "false" => Ok(Value::Bool(false)),
             Some(Token::Word(value)) if value == "null" => Ok(Value::Null),
-            _ => Err(self.error("expected a literal value")),
+            _ => Err(self.error_at_last("expected a literal value")),
         }
     }
 
     fn identifier(&mut self) -> Result<String> {
         match self.next() {
             Some(Token::Word(value)) => Ok(value),
-            _ => Err(self.error("expected an identifier")),
+            _ => Err(self.error_at_last("expected an identifier")),
         }
     }
 
@@ -452,7 +486,7 @@ impl Parser {
 
     fn consume_keyword(&mut self, expected: &str) -> bool {
         if matches!(self.peek(), Some(Token::Word(value)) if value == expected) {
-            self.position += 1;
+            self.advance();
             true
         } else {
             false
@@ -469,7 +503,7 @@ impl Parser {
 
     fn consume_symbol(&mut self, expected: char) -> bool {
         if self.peek() == Some(&Token::Symbol(expected)) {
-            self.position += 1;
+            self.advance();
             true
         } else {
             false
@@ -482,14 +516,36 @@ impl Parser {
 
     fn next(&mut self) -> Option<Token> {
         let token = self.tokens.get(self.position).cloned();
-        self.position += usize::from(token.is_some());
+        if token.is_some() {
+            self.advance();
+        } else {
+            self.last_position = Some(self.end_position);
+        }
         token
     }
 
+    fn advance(&mut self) {
+        self.last_position = self.positions.get(self.position).copied();
+        self.position += 1;
+    }
+
     fn error(&self, message: &str) -> Error {
+        let position = self
+            .positions
+            .get(self.position)
+            .copied()
+            .unwrap_or(self.end_position);
+        Self::parse_error(message, position)
+    }
+
+    fn error_at_last(&self, message: &str) -> Error {
+        Self::parse_error(message, self.last_position.unwrap_or(self.end_position))
+    }
+
+    fn parse_error(message: &str, position: usize) -> Error {
         Error::Parse {
-            message: format!("{message} at token {}", self.position.saturating_add(1)),
-            position: 0,
+            message: message.to_owned(),
+            position,
         }
     }
 }
@@ -518,5 +574,25 @@ mod tests {
     fn rejects_trailing_input() {
         assert!(parse("BEGIN nope").is_err());
         assert!(parse("SELECT * FROM t;;").is_err());
+    }
+
+    #[test]
+    fn reports_statement_parse_errors_at_byte_offsets() {
+        for (sql, expected) in [
+            ("SELECT * nope", "nope"),
+            ("SELECT * FROM t WHERE id nope 1", "nope"),
+            ("SELECT * FROM \"é\" @", "@"),
+        ] {
+            let Error::Parse { position, .. } = parse(sql).unwrap_err() else {
+                panic!("expected a parse error for {sql:?}");
+            };
+            assert_eq!(position, sql.find(expected).unwrap(), "{sql:?}");
+        }
+
+        let sql = "SELECT * FROM";
+        let Error::Parse { position, .. } = parse(sql).unwrap_err() else {
+            panic!("expected a parse error");
+        };
+        assert_eq!(position, sql.len());
     }
 }
