@@ -35,7 +35,7 @@ The repository begins as a deliberately tiny seed. Substantial functionality sho
 
 ![Burner evaluation progress graph](docs/burner-evaluation-progress.svg)
 
-Burner updates this graph only after the `burner_evaluation_completed` workflow verifies that the referenced pull request is merged into the default branch. Exact dispatch retries are no-ops; incomplete scores or conflicting PR and merge keys fail the workflow.
+Burner updates this graph only after the `burner_evaluation_completed` workflow authenticates the configured Burner actor and verifies that the referenced pull request is merged into the default branch. Exact dispatch retries are no-ops; untrusted senders, incomplete scores, or conflicting PR and merge keys fail the workflow.
 
 [Raw versioned history and update contract](docs/burner-evaluation-history.json)
 <!-- burner-progress:end -->

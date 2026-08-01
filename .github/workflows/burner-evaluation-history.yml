@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Verify, regenerate, and push with conflict retries
+      - name: Authenticate, verify, regenerate, and push with conflict retries
         env:
           GITHUB_TOKEN: ${{ github.token }}
         shell: bash

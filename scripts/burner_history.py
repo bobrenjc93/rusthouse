@@ -35,6 +35,7 @@ RUN_ID_RE = re.compile(r"evalrun_[0-9a-f]{8}")
 COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9-]+(?:\[bot\])?")
 SAFE_REF_RE = re.compile(r"(?!-)(?!.*\.\.)(?!.*[~^:?*\[\\])[^\s]+")
 
 
@@ -121,7 +122,8 @@ def validate_history(history: Any, *, check_svg_capacity: bool = True) -> None:
     tracking = history["tracking"]
     require(isinstance(tracking, dict), "history.tracking must be an object")
     exact_keys(tracking, {
-        "repository", "defaultBranch", "startedAt", "rootCommit", "dispatchEvent", "updatePolicy"
+        "repository", "defaultBranch", "startedAt", "rootCommit", "dispatchEvent",
+        "dispatchActor", "updatePolicy"
     }, "history.tracking")
     require(isinstance(tracking["repository"], str)
             and REPOSITORY_RE.fullmatch(tracking["repository"]) is not None,
@@ -135,6 +137,16 @@ def validate_history(history: Any, *, check_svg_capacity: bool = True) -> None:
             "history.tracking.rootCommit must be a full lowercase commit SHA")
     require(tracking["dispatchEvent"] == DISPATCH_EVENT,
             f"history.tracking.dispatchEvent must be {DISPATCH_EVENT!r}")
+    dispatch_actor = tracking["dispatchActor"]
+    require(isinstance(dispatch_actor, dict),
+            "history.tracking.dispatchActor must be an object")
+    exact_keys(dispatch_actor, {"login", "id"}, "history.tracking.dispatchActor")
+    require(isinstance(dispatch_actor["login"], str)
+            and 1 <= len(dispatch_actor["login"]) <= 100
+            and GITHUB_LOGIN_RE.fullmatch(dispatch_actor["login"]) is not None,
+            "history.tracking.dispatchActor.login must be a GitHub login")
+    require(type(dispatch_actor["id"]) is int and 0 < dispatch_actor["id"] <= 9_223_372_036_854_775_807,
+            "history.tracking.dispatchActor.id must be a positive 64-bit integer")
     require(isinstance(tracking["updatePolicy"], str) and 20 <= len(tracking["updatePolicy"]) <= 1000,
             "history.tracking.updatePolicy must explain automatic updates")
 
@@ -408,7 +420,7 @@ def readme_block() -> str:
 
 ![Burner evaluation progress graph]({SVG_PATH.as_posix()})
 
-Burner updates this graph only after the `{DISPATCH_EVENT}` workflow verifies that the referenced pull request is merged into the default branch. Exact dispatch retries are no-ops; incomplete scores or conflicting PR and merge keys fail the workflow.
+Burner updates this graph only after the `{DISPATCH_EVENT}` workflow authenticates the configured Burner actor and verifies that the referenced pull request is merged into the default branch. Exact dispatch retries are no-ops; untrusted senders, incomplete scores, or conflicting PR and merge keys fail the workflow.
 
 [Raw versioned history and update contract]({HISTORY_PATH.as_posix()})
 {END_MARKER}'''
@@ -601,11 +613,24 @@ def record_merge(
     return updated, True
 
 
-def load_dispatch_event(path: Path) -> tuple[dict[str, Any], str, str]:
+def load_dispatch_event(path: Path, trusted_actor: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
     event = load_json_file(path, MAX_EVENT_BYTES)
     require(isinstance(event, dict), "repository_dispatch event must be an object")
     require(event.get("action") == DISPATCH_EVENT,
             f"repository_dispatch action must be {DISPATCH_EVENT!r}")
+    sender = event.get("sender")
+    require(isinstance(sender, dict), "repository_dispatch is missing authenticated sender metadata")
+    sender_login = sender.get("login")
+    sender_id = sender.get("id")
+    require(isinstance(sender_login, str)
+            and 1 <= len(sender_login) <= 100
+            and GITHUB_LOGIN_RE.fullmatch(sender_login) is not None,
+            "repository_dispatch sender.login is invalid")
+    require(type(sender_id) is int and sender_id > 0,
+            "repository_dispatch sender.id is invalid")
+    require(sender_login.casefold() == trusted_actor["login"].casefold()
+            and sender_id == trusted_actor["id"],
+            f"repository_dispatch sender {sender_login!r} ({sender_id}) is not the trusted Burner actor")
     repository = event.get("repository")
     require(isinstance(repository, dict), "repository_dispatch is missing repository metadata")
     full_name = repository.get("full_name")
@@ -650,11 +675,13 @@ def verify_default_branch_ancestry(root: Path, commit: str, default_branch: str)
 
 
 def dispatch(root: Path, event_path: Path, api_url: str, expected_repository: str | None) -> bool:
-    payload, repository, default_branch = load_dispatch_event(event_path)
+    history = load_history(root)
+    payload, repository, default_branch = load_dispatch_event(
+        event_path, history["tracking"]["dispatchActor"]
+    )
     if expected_repository is not None:
         require(repository == expected_repository,
                 f"event repository {repository} does not match {expected_repository}")
-    history = load_history(root)
     require(repository == history["tracking"]["repository"],
             "event repository does not match history.tracking.repository")
     require(default_branch == history["tracking"]["defaultBranch"],

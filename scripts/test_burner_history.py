@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as element_tree
@@ -189,6 +190,41 @@ class BurnerHistoryTests(unittest.TestCase):
             history_tool.verify_pull_request(
                 self.payload(), wrong_commit, "bobrenjc93/rusthouse", "main"
             )
+
+    def test_dispatch_event_rejects_untrusted_sender(self) -> None:
+        event = {
+            "action": history_tool.DISPATCH_EVENT,
+            "client_payload": self.payload(),
+            "repository": {
+                "full_name": "bobrenjc93/rusthouse",
+                "default_branch": "main",
+            },
+            "sender": {"login": "bobrenjc93", "id": 1324201},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "event.json"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            payload, repository, branch = history_tool.load_dispatch_event(
+                event_path, self.history["tracking"]["dispatchActor"]
+            )
+            self.assertEqual(self.payload(), payload)
+            self.assertEqual("bobrenjc93/rusthouse", repository)
+            self.assertEqual("main", branch)
+
+            event["sender"]["login"] = "untrusted-collaborator"
+            event["sender"]["id"] = 987654321
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            with self.assertRaisesRegex(history_tool.HistoryError, "not the trusted Burner actor"):
+                history_tool.load_dispatch_event(
+                    event_path, self.history["tracking"]["dispatchActor"]
+                )
+
+            event["sender"]["login"] = "bobrenjc93"
+            event_path.write_text(json.dumps(event), encoding="utf-8")
+            with self.assertRaisesRegex(history_tool.HistoryError, "not the trusted Burner actor"):
+                history_tool.load_dispatch_event(
+                    event_path, self.history["tracking"]["dispatchActor"]
+                )
 
     def test_svg_has_accessible_labels_and_fixed_scale(self) -> None:
         svg = history_tool.render_svg(self.history)
