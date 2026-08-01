@@ -348,3 +348,13 @@ remains available only through a persistent library or CLI session:
 cargo run -- serve --database demo.db --bind 127.0.0.1:8080 \
   --max-concurrent-queries 8
 ```
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress graph](docs/burner-evaluation-progress.svg)
+
+Burner updates this graph only after the `burner_evaluation_completed` workflow authenticates the configured Burner actor and verifies that the referenced pull request is merged into the default branch. Exact dispatch retries are no-ops; untrusted senders, incomplete scores, or conflicting PR and merge keys fail the workflow.
+
+[Raw versioned history and update contract](docs/burner-evaluation-history.json)
+<!-- burner-progress:end -->
