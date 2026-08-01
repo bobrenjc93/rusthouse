@@ -13,3 +13,5 @@ RustHouse should evolve through narrow modules with explicit boundaries:
 The initial engine can be single-process and single-node. Public interfaces should leave room for immutable parts, parallel scans, compression, and a write-ahead log, but those are later experiments rather than premature abstractions.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.
+
+Bulk formats are a query-independent exception to the future SQL boundary: schema-driven readers emit bounded typed column batches. Transactional ingestion stages those batches in a private binary temporary file and only mutates a destination after the entire source validates; replay rolls back to the original row count on failure. The staging encoding is internal and is not a persistence format.

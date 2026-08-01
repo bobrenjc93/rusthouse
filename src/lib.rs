@@ -1,5 +1,10 @@
 //! RustHouse is an experimental, compact analytical database.
 
+pub mod formats;
+pub mod storage;
+
+pub use storage::{Column, ColumnBatch, DataType, Field, Schema, Table};
+
 /// Returns the product name while the first storage engine is being built.
 pub fn product_name() -> &'static str {
     "RustHouse"
