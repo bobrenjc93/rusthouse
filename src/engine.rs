@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinaryOp, Expr, OrderItem, Select, SelectItem, Statement, UnaryOp};
 use crate::error::{Error, Result};
-use crate::identifier::Identifier;
+use crate::identifier::{Identifier, ObjectName};
 use crate::parser;
 use crate::storage::{Catalog, Table};
 use crate::value::{DataType, Value};
@@ -88,6 +88,20 @@ impl Database {
             .transpose()?;
         query.projection = expand_wildcard(query.projection, table)?;
 
+        let aggregate_query = !query.group_by.is_empty()
+            || query
+                .projection
+                .iter()
+                .any(|item| item.expr.contains_aggregate())
+            || query.having.as_ref().is_some_and(Expr::contains_aggregate)
+            || query
+                .order_by
+                .iter()
+                .any(|item| item.expr.contains_aggregate());
+
+        validate_aggregate_query(&query, aggregate_query)?;
+        let projection_types = bind_query(&query, table)?;
+
         let mut filtered_rows = Vec::new();
         let input_rows = table.map_or(1, Table::row_count);
         for row in 0..input_rows {
@@ -111,19 +125,6 @@ impl Database {
             }
         }
 
-        let aggregate_query = !query.group_by.is_empty()
-            || query
-                .projection
-                .iter()
-                .any(|item| item.expr.contains_aggregate())
-            || query.having.as_ref().is_some_and(Expr::contains_aggregate)
-            || query
-                .order_by
-                .iter()
-                .any(|item| item.expr.contains_aggregate());
-
-        validate_aggregate_query(&query, aggregate_query)?;
-
         let mut records = Vec::new();
         let mut materialized_bytes = filtered_rows
             .len()
@@ -142,7 +143,15 @@ impl Database {
                 )?
             };
             for group in groups {
-                if let Some(record) = evaluate_record(&query, table, &group, true, records.len())? {
+                if let Some(record) = evaluate_record(
+                    &query,
+                    table,
+                    &group,
+                    true,
+                    records.len(),
+                    materialized_bytes,
+                    byte_limit,
+                )? {
                     push_record(&mut records, record, &mut materialized_bytes, byte_limit)?;
                 }
             }
@@ -161,6 +170,8 @@ impl Database {
                     std::slice::from_ref(&row),
                     false,
                     records.len(),
+                    materialized_bytes,
+                    byte_limit,
                 )? {
                     push_record(&mut records, record, &mut materialized_bytes, byte_limit)?;
                 }
@@ -187,20 +198,20 @@ impl Database {
         let columns = query
             .projection
             .iter()
-            .map(|item| {
-                let expression_type = infer_expr_type(&item.expr, table)?;
-                Ok(ResultColumn {
-                    name: item
-                        .alias
-                        .as_ref()
-                        .map(|alias| alias.value.clone())
-                        .unwrap_or_else(|| item.expr.display_name()),
-                    data_type: expression_type.data_type,
-                    nullable: expression_type.nullable,
-                })
+            .zip(projection_types)
+            .map(|(item, expression_type)| ResultColumn {
+                name: item
+                    .alias
+                    .as_ref()
+                    .map(|alias| alias.value.clone())
+                    .unwrap_or_else(|| item.expr.display_name()),
+                data_type: expression_type.data_type,
+                nullable: expression_type.nullable,
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(QueryResult { columns, rows })
+            .collect::<Vec<_>>();
+        let result = QueryResult { columns, rows };
+        ensure_materialized_limit(result_size(&result), byte_limit)?;
+        Ok(result)
     }
 }
 
@@ -210,6 +221,8 @@ fn evaluate_record(
     group: &[usize],
     aggregate_query: bool,
     sequence: usize,
+    materialized_bytes: usize,
+    byte_limit: usize,
 ) -> Result<Option<Record>> {
     let base_context = EvalContext {
         table,
@@ -217,11 +230,14 @@ fn evaluate_record(
         group: aggregate_query.then_some(group),
         aliases: None,
     };
-    let values = query
-        .projection
-        .iter()
-        .map(|item| eval_expr(&item.expr, &base_context))
-        .collect::<Result<Vec<_>>>()?;
+    let mut pending_bytes = std::mem::size_of::<Record>().saturating_mul(2);
+    let mut values = Vec::with_capacity(query.projection.len());
+    for item in &query.projection {
+        let value = eval_expr(&item.expr, &base_context)?;
+        pending_bytes = pending_bytes.saturating_add(value_size(&value));
+        ensure_materialized_limit(materialized_bytes.saturating_add(pending_bytes), byte_limit)?;
+        values.push(value);
+    }
     let aliases = result_aliases(&query.projection, &values);
     let context = EvalContext {
         aliases: Some(&aliases),
@@ -234,11 +250,13 @@ fn evaluate_record(
     {
         return Ok(None);
     }
-    let order_values = query
-        .order_by
-        .iter()
-        .map(|item| eval_order_expr(item, &context, &values))
-        .collect::<Result<Vec<_>>>()?;
+    let mut order_values = Vec::with_capacity(query.order_by.len());
+    for item in &query.order_by {
+        let value = eval_order_expr(item, &context, &values)?;
+        pending_bytes = pending_bytes.saturating_add(value_size(&value));
+        ensure_materialized_limit(materialized_bytes.saturating_add(pending_bytes), byte_limit)?;
+        order_values.push(value);
+    }
     Ok(Some(Record {
         values,
         order_values,
@@ -312,7 +330,9 @@ fn row_key_size(key: &RowKey) -> usize {
     key.0
         .iter()
         .map(|value| match value {
-            KeyValue::String(value) => value.len().saturating_add(std::mem::size_of::<KeyValue>()),
+            KeyValue::String(value) => value
+                .capacity()
+                .saturating_add(std::mem::size_of::<KeyValue>()),
             _ => std::mem::size_of::<KeyValue>(),
         })
         .fold(0_usize, usize::saturating_add)
@@ -320,23 +340,39 @@ fn row_key_size(key: &RowKey) -> usize {
 
 fn value_size(value: &Value) -> usize {
     match value {
-        Value::String(value) => value.len().saturating_add(std::mem::size_of::<String>()),
+        Value::String(value) => value
+            .capacity()
+            .saturating_add(std::mem::size_of::<Value>()),
         _ => std::mem::size_of::<Value>(),
     }
 }
 
 fn result_size(result: &QueryResult) -> usize {
-    result
-        .columns
-        .iter()
-        .map(|column| column.name.len())
-        .chain(
-            result
-                .rows
-                .iter()
-                .flat_map(|row| row.iter().map(value_size)),
-        )
-        .fold(0_usize, usize::saturating_add)
+    let mut bytes = std::mem::size_of::<QueryResult>().saturating_mul(2);
+    bytes = bytes.saturating_add(
+        result
+            .columns
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ResultColumn>()),
+    );
+    for column in &result.columns {
+        bytes = bytes.saturating_add(column.name.capacity());
+    }
+    bytes = bytes.saturating_add(
+        result
+            .rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<Value>>()),
+    );
+    for row in &result.rows {
+        bytes = bytes.saturating_add(row.capacity().saturating_mul(std::mem::size_of::<Value>()));
+        for value in row {
+            if let Value::String(value) = value {
+                bytes = bytes.saturating_add(value.capacity());
+            }
+        }
+    }
+    bytes
 }
 
 #[derive(Clone, Copy)]
@@ -345,7 +381,53 @@ struct ExprType {
     nullable: bool,
 }
 
-fn infer_expr_type(expression: &Expr, table: Option<&Table>) -> Result<ExprType> {
+fn bind_query(query: &Select, table: Option<&Table>) -> Result<Vec<ExprType>> {
+    let table_name = query.table.as_ref();
+    let aliases = query
+        .projection
+        .iter()
+        .filter_map(|item| {
+            item.alias
+                .as_ref()
+                .map(|alias| (alias.lookup_key(), &item.expr))
+        })
+        .collect::<HashMap<_, _>>();
+    let no_aliases = HashMap::new();
+
+    let projection_types = query
+        .projection
+        .iter()
+        .map(|item| bind_expr(&item.expr, table, table_name, &no_aliases, false))
+        .collect::<Result<Vec<_>>>()?;
+
+    if let Some(selection) = &query.selection {
+        let expression_type = bind_expr(selection, table, table_name, &no_aliases, false)?;
+        require_bool(expression_type, "WHERE")?;
+    }
+    for expression in &query.group_by {
+        bind_expr(expression, table, table_name, &no_aliases, false)?;
+    }
+    if let Some(having) = &query.having {
+        let expression_type = bind_expr(having, table, table_name, &aliases, true)?;
+        require_bool(expression_type, "HAVING")?;
+    }
+    for item in &query.order_by {
+        if let Expr::Literal(Value::Int64(position)) = &item.expr {
+            order_position(*position, query.projection.len())?;
+        } else {
+            bind_expr(&item.expr, table, table_name, &aliases, true)?;
+        }
+    }
+    Ok(projection_types)
+}
+
+fn bind_expr(
+    expression: &Expr,
+    table: Option<&Table>,
+    table_name: Option<&ObjectName>,
+    aliases: &HashMap<String, &Expr>,
+    resolve_alias: bool,
+) -> Result<ExprType> {
     match expression {
         Expr::Literal(value) => Ok(ExprType {
             data_type: value.data_type(),
@@ -355,6 +437,14 @@ fn infer_expr_type(expression: &Expr, table: Option<&Table>) -> Result<ExprType>
             let identifier = parts
                 .last()
                 .ok_or_else(|| Error::execution("empty column reference"))?;
+            if resolve_alias
+                && parts.len() == 1
+                && let Some(aliased) = aliases.get(&identifier.lookup_key())
+                && *aliased != expression
+            {
+                return bind_expr(aliased, table, table_name, aliases, false);
+            }
+            validate_qualifier(parts, table_name)?;
             let table = table.ok_or_else(|| {
                 Error::execution(format!("column '{}' requires a table", identifier.value))
             })?;
@@ -364,71 +454,205 @@ fn infer_expr_type(expression: &Expr, table: Option<&Table>) -> Result<ExprType>
                 nullable: column.nullable,
             })
         }
-        Expr::Wildcard => Err(Error::execution("wildcard has no scalar result metadata")),
+        Expr::Wildcard => Err(Error::execution(
+            "wildcard is only valid in SELECT or COUNT",
+        )),
         Expr::Unary { op, expr } => {
-            let mut expression_type = infer_expr_type(expr, table)?;
-            if matches!(op, UnaryOp::Not) {
-                expression_type.data_type = Some(DataType::Bool);
+            let expression_type = bind_expr(expr, table, table_name, aliases, resolve_alias)?;
+            match op {
+                UnaryOp::Plus | UnaryOp::Minus => {
+                    require_numeric(expression_type, "unary +/-")?;
+                    Ok(expression_type)
+                }
+                UnaryOp::Not => {
+                    require_bool(expression_type, "NOT")?;
+                    Ok(ExprType {
+                        data_type: Some(DataType::Bool),
+                        nullable: expression_type.nullable,
+                    })
+                }
             }
-            Ok(expression_type)
         }
         Expr::Binary { left, op, right } => {
-            let left = infer_expr_type(left, table)?;
-            let right = infer_expr_type(right, table)?;
+            let left = bind_expr(left, table, table_name, aliases, resolve_alias)?;
+            let right = bind_expr(right, table, table_name, aliases, resolve_alias)?;
             let nullable = left.nullable || right.nullable;
-            let data_type = match op {
+            match op {
                 BinaryOp::Add
                 | BinaryOp::Subtract
                 | BinaryOp::Multiply
                 | BinaryOp::Divide
                 | BinaryOp::Modulo => {
-                    if matches!(left.data_type, Some(DataType::Float64))
+                    require_numeric(left, "arithmetic")?;
+                    require_numeric(right, "arithmetic")?;
+                    let data_type = if matches!(left.data_type, Some(DataType::Float64))
                         || matches!(right.data_type, Some(DataType::Float64))
                     {
                         Some(DataType::Float64)
+                    } else if left.data_type.is_none() && right.data_type.is_none() {
+                        None
                     } else {
                         Some(DataType::Int64)
-                    }
+                    };
+                    Ok(ExprType {
+                        data_type,
+                        nullable,
+                    })
                 }
                 BinaryOp::Equal
                 | BinaryOp::NotEqual
                 | BinaryOp::Less
                 | BinaryOp::LessEqual
                 | BinaryOp::Greater
-                | BinaryOp::GreaterEqual
-                | BinaryOp::And
-                | BinaryOp::Or => Some(DataType::Bool),
-            };
+                | BinaryOp::GreaterEqual => {
+                    require_comparable(left, right)?;
+                    Ok(ExprType {
+                        data_type: Some(DataType::Bool),
+                        nullable,
+                    })
+                }
+                BinaryOp::And | BinaryOp::Or => {
+                    require_bool(left, "AND/OR")?;
+                    require_bool(right, "AND/OR")?;
+                    Ok(ExprType {
+                        data_type: Some(DataType::Bool),
+                        nullable,
+                    })
+                }
+            }
+        }
+        Expr::Function { name, args } => bind_aggregate(name, args, table, table_name, aliases),
+        Expr::IsNull { expr, .. } => {
+            bind_expr(expr, table, table_name, aliases, resolve_alias)?;
             Ok(ExprType {
-                data_type,
-                nullable,
+                data_type: Some(DataType::Bool),
+                nullable: false,
             })
         }
-        Expr::Function { name, args } => match name.to_ascii_lowercase().as_str() {
-            "count" => Ok(ExprType {
+    }
+}
+
+fn bind_aggregate(
+    name: &str,
+    args: &[Expr],
+    table: Option<&Table>,
+    table_name: Option<&ObjectName>,
+    aliases: &HashMap<String, &Expr>,
+) -> Result<ExprType> {
+    let normalized = name.to_ascii_lowercase();
+    if !is_aggregate_function(&normalized) {
+        return Err(Error::execution(format!("unsupported function '{name}'")));
+    }
+    if normalized == "count" && args.is_empty() {
+        return Ok(ExprType {
+            data_type: Some(DataType::Int64),
+            nullable: false,
+        });
+    }
+    if args.len() != 1 {
+        return Err(Error::execution(format!(
+            "aggregate '{name}' expects exactly one argument"
+        )));
+    }
+    if matches!(args[0], Expr::Wildcard) {
+        return if normalized == "count" {
+            Ok(ExprType {
                 data_type: Some(DataType::Int64),
                 nullable: false,
-            }),
-            "avg" => Ok(ExprType {
-                data_type: Some(DataType::Float64),
-                nullable: true,
-            }),
-            "sum" | "min" | "max" => {
-                let argument = args.first().ok_or_else(|| {
-                    Error::execution(format!("aggregate '{name}' requires an argument"))
-                })?;
-                let argument_type = infer_expr_type(argument, table)?;
-                Ok(ExprType {
-                    data_type: argument_type.data_type,
-                    nullable: true,
-                })
-            }
-            _ => Err(Error::execution(format!("unsupported function '{name}'"))),
-        },
-        Expr::IsNull { .. } => Ok(ExprType {
-            data_type: Some(DataType::Bool),
+            })
+        } else {
+            Err(Error::execution(format!("'{name}(*)' is not supported")))
+        };
+    }
+
+    let argument = bind_expr(&args[0], table, table_name, aliases, false)?;
+    match normalized.as_str() {
+        "count" => Ok(ExprType {
+            data_type: Some(DataType::Int64),
             nullable: false,
         }),
+        "sum" => {
+            require_numeric(argument, "SUM")?;
+            Ok(ExprType {
+                data_type: argument.data_type,
+                nullable: true,
+            })
+        }
+        "avg" => {
+            require_numeric(argument, "AVG")?;
+            Ok(ExprType {
+                data_type: Some(DataType::Float64),
+                nullable: true,
+            })
+        }
+        "min" | "max" => Ok(ExprType {
+            data_type: argument.data_type,
+            nullable: true,
+        }),
+        _ => unreachable!(),
+    }
+}
+
+fn validate_qualifier(parts: &[Identifier], table_name: Option<&ObjectName>) -> Result<()> {
+    if parts.len() <= 1 {
+        return Ok(());
+    }
+    let qualifier = &parts[..parts.len() - 1];
+    if table_name.is_some_and(|name| name.0.as_slice() == qualifier) {
+        return Ok(());
+    }
+    Err(Error::execution(format!(
+        "column qualifier '{}' does not match the selected table",
+        qualifier
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<Vec<_>>()
+            .join(".")
+    )))
+}
+
+fn require_numeric(expression_type: ExprType, context: &str) -> Result<()> {
+    if expression_type.data_type.is_none()
+        || matches!(
+            expression_type.data_type,
+            Some(DataType::Int64 | DataType::Float64)
+        )
+    {
+        Ok(())
+    } else {
+        Err(Error::Type(format!(
+            "{context} requires a numeric expression"
+        )))
+    }
+}
+
+fn require_bool(expression_type: ExprType, context: &str) -> Result<()> {
+    if expression_type.data_type.is_none()
+        || matches!(expression_type.data_type, Some(DataType::Bool))
+    {
+        Ok(())
+    } else {
+        Err(Error::Type(format!("{context} requires a Bool expression")))
+    }
+}
+
+fn require_comparable(left: ExprType, right: ExprType) -> Result<()> {
+    let compatible = match (left.data_type, right.data_type) {
+        (None, _) | (_, None) => true,
+        (Some(left), Some(right)) if left == right => true,
+        (Some(DataType::Int64 | DataType::Float64), Some(DataType::Int64 | DataType::Float64)) => {
+            true
+        }
+        (Some(DataType::Bool), Some(DataType::Int64))
+        | (Some(DataType::Int64), Some(DataType::Bool)) => true,
+        _ => false,
+    };
+    if compatible {
+        Ok(())
+    } else {
+        Err(Error::Type(
+            "comparison operands have incompatible types".to_owned(),
+        ))
     }
 }
 
@@ -647,7 +871,7 @@ struct EvalContext<'a> {
     table: Option<&'a Table>,
     row: Option<usize>,
     group: Option<&'a [usize]>,
-    aliases: Option<&'a HashMap<String, Value>>,
+    aliases: Option<&'a HashMap<String, &'a Value>>,
 }
 
 fn eval_expr(expression: &Expr, context: &EvalContext<'_>) -> Result<Value> {
@@ -662,7 +886,7 @@ fn eval_expr(expression: &Expr, context: &EvalContext<'_>) -> Result<Value> {
                     .aliases
                     .and_then(|aliases| aliases.get(&identifier.lookup_key()))
             {
-                return Ok(value.clone());
+                return Ok((*value).clone());
             }
             let table = context.table.ok_or_else(|| {
                 Error::execution(format!("column '{}' requires a table", identifier.value))
@@ -848,25 +1072,12 @@ fn eval_function(name: &str, args: &[Expr], context: &EvalContext<'_>) -> Result
         return Err(Error::execution(format!("'{name}(*)' is not supported")));
     }
 
-    let mut values = Vec::with_capacity(group.len());
-    for &row in group {
-        let row_context = EvalContext {
-            table: context.table,
-            row: Some(row),
-            group: None,
-            aliases: None,
-        };
-        let value = eval_expr(&args[0], &row_context)?;
-        if value != Value::Null {
-            values.push(value);
-        }
-    }
     match normalized.as_str() {
-        "count" => count_to_value(values.len()),
-        "sum" => aggregate_sum(&values),
-        "min" => aggregate_extreme(&values, false),
-        "max" => aggregate_extreme(&values, true),
-        "avg" => aggregate_avg(&values),
+        "count" => aggregate_count(group, &args[0], context),
+        "sum" => aggregate_sum(group, &args[0], context),
+        "min" => aggregate_extreme(group, &args[0], context, false),
+        "max" => aggregate_extreme(group, &args[0], context, true),
+        "avg" => aggregate_avg(group, &args[0], context),
         _ => unreachable!(),
     }
 }
@@ -877,74 +1088,104 @@ fn count_to_value(count: usize) -> Result<Value> {
         .map_err(|_| Error::execution("COUNT exceeds Int64"))
 }
 
-fn aggregate_sum(values: &[Value]) -> Result<Value> {
-    if values.is_empty() {
-        return Ok(Value::Null);
-    }
-    match values[0] {
-        Value::Int64(_) => {
-            let mut sum = 0_i64;
-            for value in values {
-                let Value::Int64(value) = value else {
-                    return Err(Error::Type("SUM received mixed numeric types".to_owned()));
-                };
-                sum = sum
-                    .checked_add(*value)
-                    .ok_or_else(|| Error::execution("Int64 overflow in SUM"))?;
-            }
-            Ok(Value::Int64(sum))
+fn aggregate_count(group: &[usize], expression: &Expr, context: &EvalContext<'_>) -> Result<Value> {
+    let mut count = 0_usize;
+    for &row in group {
+        if eval_group_argument(expression, row, context)? != Value::Null {
+            count += 1;
         }
-        Value::Float64(_) => {
-            let mut sum = 0.0;
-            for value in values {
-                let Value::Float64(value) = value else {
-                    return Err(Error::Type("SUM received mixed numeric types".to_owned()));
-                };
-                sum += value;
-            }
-            if !sum.is_finite() {
-                return Err(Error::execution("non-finite Float64 SUM"));
-            }
-            Ok(Value::Float64(sum))
-        }
-        _ => Err(Error::Type("SUM requires a numeric argument".to_owned())),
     }
+    count_to_value(count)
 }
 
-fn aggregate_avg(values: &[Value]) -> Result<Value> {
-    if values.is_empty() {
-        return Ok(Value::Null);
+fn aggregate_sum(group: &[usize], expression: &Expr, context: &EvalContext<'_>) -> Result<Value> {
+    let mut result: Option<Value> = None;
+    for &row in group {
+        let value = eval_group_argument(expression, row, context)?;
+        if value == Value::Null {
+            continue;
+        }
+        result = Some(match (result, value) {
+            (None, value @ (Value::Int64(_) | Value::Float64(_))) => value,
+            (Some(Value::Int64(sum)), Value::Int64(value)) => Value::Int64(
+                sum.checked_add(value)
+                    .ok_or_else(|| Error::execution("Int64 overflow in SUM"))?,
+            ),
+            (Some(Value::Float64(sum)), Value::Float64(value)) => {
+                let sum = sum + value;
+                if !sum.is_finite() {
+                    return Err(Error::execution("non-finite Float64 SUM"));
+                }
+                Value::Float64(sum)
+            }
+            _ => return Err(Error::Type("SUM requires one numeric type".to_owned())),
+        });
     }
+    Ok(result.unwrap_or(Value::Null))
+}
+
+fn aggregate_avg(group: &[usize], expression: &Expr, context: &EvalContext<'_>) -> Result<Value> {
     let mut sum = 0.0;
-    for value in values {
-        match value {
-            Value::Int64(value) => sum += *value as f64,
+    let mut count = 0_usize;
+    for &row in group {
+        match eval_group_argument(expression, row, context)? {
+            Value::Null => continue,
+            Value::Int64(value) => sum += value as f64,
             Value::Float64(value) => sum += value,
             _ => return Err(Error::Type("AVG requires a numeric argument".to_owned())),
         }
+        if !sum.is_finite() {
+            return Err(Error::execution("non-finite Float64 AVG"));
+        }
+        count += 1;
     }
-    let average = sum / values.len() as f64;
-    if !average.is_finite() {
-        return Err(Error::execution("non-finite Float64 AVG"));
+    if count == 0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Float64(sum / count as f64))
     }
-    Ok(Value::Float64(average))
 }
 
-fn aggregate_extreme(values: &[Value], maximum: bool) -> Result<Value> {
-    let Some(first) = values.first() else {
-        return Ok(Value::Null);
-    };
-    let mut result = first.clone();
-    for value in &values[1..] {
-        let ordering = value.sql_cmp(&result)?.expect("aggregate skips NULL");
-        if (maximum && ordering == Ordering::Greater) || (!maximum && ordering == Ordering::Less) {
-            result = value.clone();
+fn aggregate_extreme(
+    group: &[usize],
+    expression: &Expr,
+    context: &EvalContext<'_>,
+    maximum: bool,
+) -> Result<Value> {
+    let mut result: Option<Value> = None;
+    for &row in group {
+        let value = eval_group_argument(expression, row, context)?;
+        if value == Value::Null {
+            continue;
+        }
+        let replace = if let Some(current) = &result {
+            let ordering = value
+                .sql_cmp(current)?
+                .ok_or_else(|| Error::execution("aggregate comparison returned NULL"))?;
+            (maximum && ordering == Ordering::Greater) || (!maximum && ordering == Ordering::Less)
+        } else {
+            true
+        };
+        if replace {
+            result = Some(value);
         }
     }
-    Ok(result)
+    Ok(result.unwrap_or(Value::Null))
 }
 
-fn result_aliases(items: &[SelectItem], values: &[Value]) -> HashMap<String, Value> {
+fn eval_group_argument(expression: &Expr, row: usize, context: &EvalContext<'_>) -> Result<Value> {
+    eval_expr(
+        expression,
+        &EvalContext {
+            table: context.table,
+            row: Some(row),
+            group: None,
+            aliases: None,
+        },
+    )
+}
+
+fn result_aliases<'a>(items: &[SelectItem], values: &'a [Value]) -> HashMap<String, &'a Value> {
     items
         .iter()
         .zip(values)
@@ -953,19 +1194,28 @@ fn result_aliases(items: &[SelectItem], values: &[Value]) -> HashMap<String, Val
                 Expr::Column(parts) if parts.len() == 1 => parts.first(),
                 _ => None,
             })?;
-            Some((identifier.lookup_key(), value.clone()))
+            Some((identifier.lookup_key(), value))
         })
         .collect()
 }
 
 fn eval_order_expr(item: &OrderItem, context: &EvalContext<'_>, values: &[Value]) -> Result<Value> {
-    if let Expr::Literal(Value::Int64(position)) = &item.expr
-        && *position > 0
-        && *position as usize <= values.len()
-    {
-        return Ok(values[*position as usize - 1].clone());
+    if let Expr::Literal(Value::Int64(position)) = &item.expr {
+        return Ok(values[order_position(*position, values.len())?].clone());
     }
     eval_expr(&item.expr, context)
+}
+
+fn order_position(position: i64, projection_len: usize) -> Result<usize> {
+    let ordinal = position;
+    let position = usize::try_from(position)
+        .ok()
+        .filter(|position| *position >= 1 && *position <= projection_len);
+    position.map(|position| position - 1).ok_or_else(|| {
+        Error::execution(format!(
+            "ORDER BY position {ordinal} is outside the projection"
+        ))
+    })
 }
 
 struct Record {
@@ -1029,5 +1279,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn retained_result_size_includes_row_vectors_and_string_capacity() {
+        let mut string = String::with_capacity(4_096);
+        string.push('x');
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "value".to_owned(),
+                data_type: Some(DataType::String),
+                nullable: false,
+            }],
+            rows: vec![vec![Value::String(string)]],
+        };
+        assert!(result_size(&result) > 4_096 + std::mem::size_of::<Vec<Value>>());
+    }
+
+    #[test]
+    fn aggregate_scans_fit_without_a_group_sized_value_buffer() {
+        let mut database = Database::new();
+        let mut sql = String::from("CREATE TABLE t (value Int64); INSERT INTO t VALUES ");
+        for value in 0..1_000 {
+            if value > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({value})"));
+        }
+        database.execute(&sql).unwrap();
+        let Statement::Select(select) = parser::parse("SELECT sum(value) FROM t;")
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let result = database.select(select, 16_000).unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Int64(499_500)]]);
     }
 }

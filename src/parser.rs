@@ -25,6 +25,7 @@ struct Parser {
 
 const MAX_EXPRESSION_DEPTH: usize = 256;
 const MAX_EXPRESSION_NODES: usize = 1_024;
+const MAX_DATA_TYPE_DEPTH: usize = 64;
 
 impl Parser {
     fn parse_script(&mut self) -> Result<Vec<Statement>> {
@@ -109,10 +110,20 @@ impl Parser {
     }
 
     fn parse_data_type(&mut self) -> Result<(DataType, bool)> {
+        self.parse_data_type_inner(0)
+    }
+
+    fn parse_data_type_inner(&mut self, depth: usize) -> Result<(DataType, bool)> {
+        if depth >= MAX_DATA_TYPE_DEPTH {
+            return Err(Error::Limit {
+                resource: "SQL data type nesting",
+                limit: MAX_DATA_TYPE_DEPTH,
+            });
+        }
         let name = self.parse_word_identifier()?;
         if name.eq_ignore_ascii_case("nullable") {
             self.expect(TokenKind::LeftParen, "'('")?;
-            let (kind, nested_nullable) = self.parse_data_type()?;
+            let (kind, nested_nullable) = self.parse_data_type_inner(depth + 1)?;
             if nested_nullable {
                 return Err(self.expected("a non-nested Nullable type"));
             }

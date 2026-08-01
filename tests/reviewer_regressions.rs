@@ -135,3 +135,82 @@ fn select_accepts_both_int64_boundaries() {
         vec![vec![Value::Int64(i64::MIN), Value::Int64(i64::MAX)]]
     );
 }
+
+#[test]
+fn deeply_nested_nullable_types_hit_a_typed_limit() {
+    let sql = format!(
+        "CREATE TABLE t (value {}Int64{});",
+        "Nullable(".repeat(20_000),
+        ")".repeat(20_000)
+    );
+    let error = Database::new().execute(&sql).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Limit {
+            resource: "SQL data type nesting",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn empty_tables_do_not_hide_invalid_expression_types_or_functions() {
+    let setup = "CREATE TABLE t (id Int64, s String);";
+    for query in [
+        "SELECT id + s FROM t;",
+        "SELECT sum(s) FROM t;",
+        "SELECT id FROM t WHERE mystery(id);",
+        "SELECT count(*) FROM t GROUP BY mystery(id);",
+        "SELECT id FROM t ORDER BY mystery(id);",
+    ] {
+        let mut database = Database::new();
+        database.execute(setup).unwrap();
+        let error = database.execute(query).unwrap_err();
+        assert!(
+            matches!(error, Error::Type(_) | Error::Execution(_)),
+            "query unexpectedly produced a different error: {query}: {error}"
+        );
+    }
+}
+
+#[test]
+fn qualified_columns_must_match_the_selected_table() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE t (id Int64); INSERT INTO t VALUES (7);")
+        .unwrap();
+    let valid = database.execute("SELECT t.id FROM t;").unwrap();
+    assert_eq!(valid[0].rows, vec![vec![Value::Int64(7)]]);
+    assert!(matches!(
+        database.execute("SELECT bogus.id FROM t;"),
+        Err(Error::Execution(message)) if message.contains("qualifier")
+    ));
+}
+
+#[test]
+fn composite_table_names_cannot_alias_quoted_dotted_names() {
+    let results = Database::new()
+        .execute(
+            "CREATE TABLE \"a.q:b\" (id Int64);
+             CREATE TABLE \"a\".\"b\" (id Int64);
+             INSERT INTO \"a.q:b\" VALUES (1);
+             INSERT INTO \"a\".\"b\" VALUES (2);
+             SELECT id FROM \"a.q:b\";
+             SELECT id FROM \"a\".\"b\";",
+        )
+        .unwrap();
+    assert_eq!(results[0].rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(results[1].rows, vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn invalid_order_by_ordinals_are_rejected() {
+    for ordinal in [0, 2] {
+        let error = Database::new()
+            .execute(&format!("SELECT 1 AS value ORDER BY {ordinal};"))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Execution(message) if message.contains("outside the projection"))
+        );
+    }
+}

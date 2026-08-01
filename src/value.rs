@@ -85,12 +85,8 @@ impl Value {
                 .ok_or_else(|| Error::Type("cannot compare NaN values".to_owned()))
                 .map(Some),
             (Self::Bool(left), Self::Bool(right)) => Ok(Some(left.cmp(right))),
-            (Self::Bool(left), Self::Int64(right)) if matches!(right, 0 | 1) => {
-                Ok(Some((*left as i64).cmp(right)))
-            }
-            (Self::Int64(left), Self::Bool(right)) if matches!(left, 0 | 1) => {
-                Ok(Some(left.cmp(&(*right as i64))))
-            }
+            (Self::Bool(left), Self::Int64(right)) => Ok(Some((*left as i64).cmp(right))),
+            (Self::Int64(left), Self::Bool(right)) => Ok(Some(left.cmp(&(*right as i64)))),
             (Self::String(left), Self::String(right)) => Ok(Some(left.cmp(right))),
             _ => Err(Error::Type(format!(
                 "cannot compare {} and {}",

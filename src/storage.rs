@@ -206,7 +206,7 @@ impl Table {
 /// Owns the set of in-memory tables for a database session.
 #[derive(Debug, Default)]
 pub struct Catalog {
-    tables: HashMap<String, Table>,
+    tables: HashMap<ObjectName, Table>,
 }
 
 impl Catalog {
@@ -216,8 +216,7 @@ impl Catalog {
         schema: Vec<ColumnSchema>,
         if_not_exists: bool,
     ) -> Result<()> {
-        let key = name.lookup_key();
-        if self.tables.contains_key(&key) {
+        if self.tables.contains_key(&name) {
             return if if_not_exists {
                 Ok(())
             } else {
@@ -233,19 +232,19 @@ impl Catalog {
                 limit: MAX_TABLES,
             });
         }
-        self.tables.insert(key, Table::new(schema)?);
+        self.tables.insert(name, Table::new(schema)?);
         Ok(())
     }
 
     pub(crate) fn table(&self, name: &ObjectName) -> Result<&Table> {
         self.tables
-            .get(&name.lookup_key())
+            .get(name)
             .ok_or_else(|| Error::Catalog(format!("unknown table '{}'", name.display())))
     }
 
     pub(crate) fn table_mut(&mut self, name: &ObjectName) -> Result<&mut Table> {
         self.tables
-            .get_mut(&name.lookup_key())
+            .get_mut(name)
             .ok_or_else(|| Error::Catalog(format!("unknown table '{}'", name.display())))
     }
 }

@@ -59,14 +59,6 @@ impl Hash for Identifier {
 pub(crate) struct ObjectName(pub Vec<Identifier>);
 
 impl ObjectName {
-    pub(crate) fn lookup_key(&self) -> String {
-        self.0
-            .iter()
-            .map(Identifier::lookup_key)
-            .collect::<Vec<_>>()
-            .join(".")
-    }
-
     pub(crate) fn display(&self) -> String {
         self.0
             .iter()
