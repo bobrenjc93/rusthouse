@@ -22,6 +22,8 @@ pub(crate) struct ExecutionControl<'a> {
 /// Resource bounds for relational query operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLimits {
+    /// Maximum retained bytes for bound source-schema metadata.
+    pub max_binding_bytes: usize,
     /// Maximum joined tables in one SELECT.
     pub max_joins: usize,
     /// Maximum retained bytes for one materialized table scan.
@@ -34,12 +36,14 @@ pub struct QueryLimits {
     pub max_window_partition_rows: usize,
     /// Maximum retained bytes across window partitions, outputs, and accumulators.
     pub max_window_partition_bytes: usize,
+    /// Maximum Float64 input-row visits across one bounded window frame evaluation.
+    pub max_window_frame_work: usize,
     /// Maximum rows emitted by a join or returned by a query.
     pub max_output_rows: usize,
 }
 
 impl QueryLimits {
-    /// Constructs relational operator limits with a 256 MiB source-scan ceiling.
+    /// Constructs limits with 64 MiB binding, 256 MiB scan, and 10M frame-work defaults.
     pub const fn new(
         max_join_build_rows: usize,
         max_join_build_bytes: usize,
@@ -48,12 +52,14 @@ impl QueryLimits {
         max_output_rows: usize,
     ) -> Self {
         Self {
+            max_binding_bytes: 64 * 1024 * 1024,
             max_joins: 64,
             max_source_bytes: 256 * 1024 * 1024,
             max_join_build_rows,
             max_join_build_bytes,
             max_window_partition_rows,
             max_window_partition_bytes,
+            max_window_frame_work: 10_000_000,
             max_output_rows,
         }
     }
@@ -67,6 +73,18 @@ impl QueryLimits {
     /// Overrides the joined-table complexity ceiling.
     pub const fn with_max_joins(mut self, max_joins: usize) -> Self {
         self.max_joins = max_joins;
+        self
+    }
+
+    /// Overrides the source-schema binding-state ceiling.
+    pub const fn with_binding_bytes(mut self, max_binding_bytes: usize) -> Self {
+        self.max_binding_bytes = max_binding_bytes;
+        self
+    }
+
+    /// Overrides the cumulative Float64 bounded-frame row-visit ceiling.
+    pub const fn with_window_frame_work(mut self, max_window_frame_work: usize) -> Self {
+        self.max_window_frame_work = max_window_frame_work;
         self
     }
 }

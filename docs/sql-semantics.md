@@ -152,12 +152,16 @@ nonnegative preceding/following bounds.
 Float64 running frames accumulate in order. Bounded frames are accumulated
 from their own rows instead of subtracting rounded floating-point prefixes.
 IEEE overflow and subsequent infinities are applied in that same order, so
-opposing infinities produce NaN.
+opposing infinities produce NaN. Non-prefix frames preflight the sum of their
+frame widths across all partitions and reject work above
+`max_window_frame_work` before adding rows from an over-budget partition.
 
-Binding resolves every source column before table data is copied. Materialized
-scans retain only columns needed by predicates, joins, projections, windows, or
-ordering and are bounded by `max_source_bytes`; unused string payloads are not
-cloned. `QueryLimits` also rejects a query before a build table is materialized
+Binding resolves every source column before table data is copied. It preflights
+column definitions, expanded qualifiers, schema vectors, and join metadata
+against `max_binding_bytes` before cloning them. Materialized scans retain only
+columns needed by predicates, joins, projections, windows, or ordering and are
+bounded by `max_source_bytes`; unused string payloads are not cloned.
+`QueryLimits` also rejects a query before a build table is materialized
 when its stored row count or conservatively reserved row/key/bucket/index state
 exceeds the join ceiling. Expanded join output has a separate retained-state
 check. Every window partition is bounded by rows, with cumulative accounting

@@ -72,7 +72,7 @@ struct BoundJoin {
     table: TableRef,
     equality: Vec<(usize, usize)>,
     right_offset: usize,
-    right_columns: Vec<BoundColumn>,
+    right_width: usize,
 }
 
 enum BoundProjection {
@@ -114,6 +114,8 @@ pub(crate) fn execute(
 
     enforce_row_limit("query joins", joins.len(), limits.max_joins)?;
     check_cancellation(control)?;
+    let binding_bytes = estimated_binding_bytes(tables, &from, &joins, control)?;
+    enforce_byte_limit("query binding", binding_bytes, limits.max_binding_bytes)?;
     let (source_columns, bound_joins, base_width) = bind_sources(tables, &from, joins, control)?;
     let predicates = bind_predicates(&source_columns, &predicates)?;
     let (bound_projection, columns) = bind_projection(&source_columns, &projection)?;
@@ -175,6 +177,62 @@ pub(crate) fn execute(
     Ok(QueryOutput { columns, rows })
 }
 
+fn estimated_binding_bytes(
+    tables: &std::collections::BTreeMap<String, Arc<Table>>,
+    from: &TableRef,
+    joins: &[Join],
+    control: Option<ExecutionControl<'_>>,
+) -> Result<usize> {
+    let mut bytes = joins
+        .len()
+        .saturating_mul(size_of::<BoundJoin>())
+        .saturating_mul(2);
+    let base = tables
+        .get(&from.name)
+        .ok_or_else(|| Error::TableNotFound(from.name.clone()))?;
+    bytes = bytes.saturating_add(estimated_bound_source_bytes(base, from));
+    bytes = bytes.saturating_add(estimated_qualifier_entry_bytes(from));
+
+    for join in joins {
+        check_cancellation(control)?;
+        let table = tables
+            .get(&join.table.name)
+            .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
+        bytes = bytes
+            .saturating_add(estimated_bound_source_bytes(table, &join.table))
+            .saturating_add(estimated_qualifier_entry_bytes(&join.table))
+            .saturating_add(
+                join.equality
+                    .len()
+                    .saturating_mul(size_of::<(usize, usize)>())
+                    .saturating_mul(2),
+            );
+    }
+    Ok(bytes)
+}
+
+fn estimated_bound_source_bytes(table: &Table, table_ref: &TableRef) -> usize {
+    let qualifier_bytes = table_qualifier(table_ref).len();
+    let fixed = table
+        .schema()
+        .len()
+        .saturating_mul(size_of::<BoundColumn>());
+    table
+        .schema()
+        .iter()
+        .fold(fixed.saturating_mul(4), |bytes, column| {
+            bytes
+                .saturating_add(column.name.len().saturating_mul(2))
+                .saturating_add(qualifier_bytes)
+        })
+}
+
+fn estimated_qualifier_entry_bytes(table_ref: &TableRef) -> usize {
+    size_of::<String>()
+        .saturating_add(table_qualifier(table_ref).len())
+        .saturating_mul(4)
+}
+
 fn bind_sources(
     tables: &std::collections::BTreeMap<String, Arc<Table>>,
     from: &TableRef,
@@ -200,15 +258,16 @@ fn bind_sources(
             .get(&join.table.name)
             .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
         let right_columns = table_columns(table, &join.table, join.kind == JoinKind::Left);
+        let right_width = right_columns.len();
         let right_offset = columns.len();
-        columns.extend(right_columns.iter().cloned());
+        columns.extend(right_columns);
         let equality = bind_join_keys(&columns, right_offset, &join.equality, control)?;
         bound_joins.push(BoundJoin {
             kind: join.kind,
             table: join.table,
             equality,
             right_offset,
-            right_columns,
+            right_width,
         });
     }
     Ok((columns, bound_joins, base_width))
@@ -270,10 +329,12 @@ fn load_table(
     let table = tables
         .get(&table_ref.name)
         .ok_or_else(|| Error::TableNotFound(table_ref.name.clone()))?;
-    let columns = table_columns(table, table_ref, nullable);
-    debug_assert_eq!(required_columns.len(), columns.len());
-    let retained_bytes = estimated_scan_bytes(table, required_columns, control)?;
+    debug_assert_eq!(required_columns.len(), table.schema().len());
+    let schema_bytes = estimated_bound_source_bytes(table, table_ref);
+    let retained_bytes =
+        schema_bytes.saturating_add(estimated_scan_bytes(table, required_columns, control)?);
     enforce_byte_limit("table scan", retained_bytes, byte_limit)?;
+    let columns = table_columns(table, table_ref, nullable);
     let mut rows = Vec::with_capacity(table.row_count());
     for row_index in 0..table.row_count() {
         check_cancellation(control)?;
@@ -287,7 +348,7 @@ fn load_table(
     }
     enforce_byte_limit(
         "table scan",
-        retained_rows_bytes(&rows, rows.capacity()),
+        schema_bytes.saturating_add(retained_rows_bytes(&rows, rows.capacity())),
         byte_limit,
     )?;
     Ok(Source { columns, rows })
@@ -327,9 +388,8 @@ fn execute_join(
         rows: left_rows,
     } = left;
     let left_width = combined_columns.len();
-    combined_columns.extend(join.right_columns.iter().cloned());
-    let right_required = &required_columns
-        [join.right_offset..join.right_offset.saturating_add(join.right_columns.len())];
+    let right_required =
+        &required_columns[join.right_offset..join.right_offset.saturating_add(join.right_width)];
     let build_table = tables
         .get(&join.table.name)
         .ok_or_else(|| Error::TableNotFound(join.table.name.clone()))?;
@@ -353,6 +413,7 @@ fn execute_join(
         limits.max_source_bytes,
         control,
     )?;
+    combined_columns.append(&mut right.columns);
     let (build_bytes, hash_capacity) = estimated_hash_build_bytes(&right, &join.equality, control)?;
     enforce_byte_limit("hash join build", build_bytes, limits.max_join_build_bytes)?;
 
@@ -389,7 +450,7 @@ fn execute_join(
                 let row_bytes = estimated_join_row_bytes(
                     left_row,
                     Some(&right.rows[*right_index]),
-                    right.columns.len(),
+                    join.right_width,
                 );
                 prepare_join_output_row(
                     &mut rows,
@@ -410,7 +471,7 @@ fn execute_join(
                 rows.len().saturating_add(1),
                 limits.max_output_rows,
             )?;
-            let row_bytes = estimated_join_row_bytes(left_row, None, right.columns.len());
+            let row_bytes = estimated_join_row_bytes(left_row, None, join.right_width);
             prepare_join_output_row(
                 &mut rows,
                 output_payload_bytes,
@@ -419,7 +480,7 @@ fn execute_join(
             )?;
             let mut row = Vec::with_capacity(combined_columns.len());
             row.extend(left_row.iter().cloned());
-            row.resize(left_width + right.columns.len(), Value::Null);
+            row.resize(left_width + join.right_width, Value::Null);
             rows.push(row);
             output_payload_bytes = output_payload_bytes.saturating_add(row_bytes);
         }
@@ -789,6 +850,10 @@ fn evaluate_window(
         preflight_bytes,
         limits.max_window_partition_bytes,
     )?;
+    let mut float_frame_work = FloatFrameWork {
+        used: 0,
+        limit: limits.max_window_frame_work,
+    };
     for state in partitions.values_mut() {
         state.rows.reserve_exact(state.row_count);
     }
@@ -888,6 +953,7 @@ fn evaluate_window(
                 index,
                 window.frame,
                 &mut output,
+                &mut float_frame_work,
                 control,
             )?,
             BoundWindowFunction::Sum { .. } => unreachable!("SUM binding accepts numeric types"),
@@ -990,14 +1056,24 @@ impl FloatAccumulator {
     }
 }
 
+struct FloatFrameWork {
+    used: usize,
+    limit: usize,
+}
+
 fn evaluate_float_sum(
     source: &Source,
     rows: &[usize],
     index: usize,
     frame: WindowFrame,
     output: &mut [Value],
+    work: &mut FloatFrameWork,
     control: Option<ExecutionControl<'_>>,
 ) -> Result<()> {
+    let partition_work = estimated_float_frame_work(rows.len(), frame, control)?;
+    let attempted_work = work.used.saturating_add(partition_work);
+    enforce_row_limit("Float64 window frame work", attempted_work, work.limit)?;
+    work.used = attempted_work;
     if frame.start == FrameBound::UnboundedPreceding {
         let mut accumulator = FloatAccumulator::default();
         let mut accumulated_end = 0usize;
@@ -1029,6 +1105,24 @@ fn evaluate_float_sum(
         output[*row] = accumulator.finish();
     }
     Ok(())
+}
+
+fn estimated_float_frame_work(
+    rows: usize,
+    frame: WindowFrame,
+    control: Option<ExecutionControl<'_>>,
+) -> Result<usize> {
+    if frame.start == FrameBound::UnboundedPreceding {
+        return Ok(rows);
+    }
+    let mut work = 0usize;
+    for position in 0..rows {
+        check_cancellation(control)?;
+        if let Some((start, end)) = frame_range(position, rows, frame) {
+            work = work.saturating_add(end - start);
+        }
+    }
+    Ok(work)
 }
 
 fn frame_range(position: usize, len: usize, frame: WindowFrame) -> Option<(usize, usize)> {

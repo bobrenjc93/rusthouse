@@ -338,6 +338,31 @@ fn join_count_limit_rejects_schema_expansion_before_execution() {
 }
 
 #[test]
+fn binding_limit_rejects_empty_wide_schemas_and_expanded_aliases() {
+    let database = Database::with_query_limits(QueryLimits::default().with_binding_bytes(4096));
+    let columns = (0..16)
+        .map(|index| format!("c{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    database
+        .execute(&format!("CREATE TABLE wide_empty ({columns})"))
+        .unwrap();
+    assert!(database.execute("SELECT a.c0 FROM wide_empty AS a").is_ok());
+    let alias = "a".repeat(256);
+
+    assert!(matches!(
+        database.execute(&format!(
+            "SELECT \"{alias}\".c0 FROM wide_empty AS \"{alias}\""
+        )),
+        Err(Error::MemoryLimitExceeded {
+            operator: "query binding",
+            limit: 4096,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn join_build_limits_preflight_before_the_right_scan() {
     let database = Database::new();
     database.execute("CREATE TABLE probe (id Int64)").unwrap();
@@ -354,7 +379,7 @@ fn join_build_limits_preflight_before_the_right_scan() {
     let mut session = database.session();
 
     session.set_query_limits(
-        QueryLimits::new(0, usize::MAX, usize::MAX, usize::MAX, usize::MAX).with_source_bytes(0),
+        QueryLimits::new(0, usize::MAX, usize::MAX, usize::MAX, usize::MAX).with_source_bytes(400),
     );
     assert!(matches!(
         session.execute(sql),
@@ -366,7 +391,7 @@ fn join_build_limits_preflight_before_the_right_scan() {
     ));
 
     session.set_query_limits(
-        QueryLimits::new(usize::MAX, 0, usize::MAX, usize::MAX, usize::MAX).with_source_bytes(0),
+        QueryLimits::new(usize::MAX, 0, usize::MAX, usize::MAX, usize::MAX).with_source_bytes(400),
     );
     assert!(matches!(
         session.execute(sql),
@@ -444,7 +469,7 @@ fn join_prunes_unprojected_payloads_and_bounds_projected_expansion() {
 
 #[test]
 fn source_scan_is_bounded_after_binding_and_skips_large_unused_strings() {
-    let limits = QueryLimits::default().with_source_bytes(128);
+    let limits = QueryLimits::default().with_source_bytes(1024);
     let database = Database::with_query_limits(limits);
     database
         .execute("CREATE TABLE payloads (id Int64, payload String)")
@@ -468,7 +493,7 @@ fn source_scan_is_bounded_after_binding_and_skips_large_unused_strings() {
         database.execute("SELECT payload FROM payloads"),
         Err(Error::MemoryLimitExceeded {
             operator: "table scan",
-            limit: 128,
+            limit: 1024,
             ..
         })
     ));
@@ -608,4 +633,48 @@ fn window_limit_counts_cumulative_partitions_outputs_and_prefix_state() {
             ..
         })
     ));
+}
+
+#[test]
+fn bounded_float_frames_enforce_cumulative_row_visit_work() {
+    let database = Database::new();
+    database
+        .execute("CREATE TABLE suffix_values (group_id Int64, seq Int64, value Float64)")
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO suffix_values VALUES \
+             (1, 1, 1.0), (1, 2, 2.0), (1, 3, 3.0), \
+             (2, 1, 1.0), (2, 2, 2.0), (2, 3, 3.0)",
+        )
+        .unwrap();
+    let sql = "SELECT group_id, seq, SUM(value) OVER (PARTITION BY group_id ORDER BY seq \
+               ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS suffix \
+               FROM suffix_values ORDER BY group_id, seq";
+    let mut session = database.session();
+    session.set_query_limits(QueryLimits::default().with_window_frame_work(11));
+    assert!(matches!(
+        session.execute(sql),
+        Err(Error::ExecutionRowLimitExceeded {
+            operator: "Float64 window frame work",
+            limit: 11,
+            attempted: 12,
+        })
+    ));
+
+    session.set_query_limits(QueryLimits::default().with_window_frame_work(12));
+    let StatementResult::Query(result) = session.execute(sql).unwrap() else {
+        panic!("expected query result");
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(1), Value::Int64(1), Value::Float64(6.0)],
+            vec![Value::Int64(1), Value::Int64(2), Value::Float64(5.0)],
+            vec![Value::Int64(1), Value::Int64(3), Value::Float64(3.0)],
+            vec![Value::Int64(2), Value::Int64(1), Value::Float64(6.0)],
+            vec![Value::Int64(2), Value::Int64(2), Value::Float64(5.0)],
+            vec![Value::Int64(2), Value::Int64(3), Value::Float64(3.0)],
+        ]
+    );
 }
