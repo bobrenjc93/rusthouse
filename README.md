@@ -49,12 +49,16 @@ It writes and syncs a temporary file, atomically renames it, and syncs the paren
 directory before publishing the generation to other sessions. A canonical database
 path has one exclusive in-process or cross-process owner; a second `Database::open`
 returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are dropped.
+Locks use a reserved `.rusthouse-lock` namespace; database paths ending in that suffix
+are rejected so no database can replace another database's active lock inode.
 Writer-side validation guarantees every committed catalog satisfies the decoder's
 table, column, row, string, file-size, and total-allocation bounds.
 
 Snapshot temporary files start owner-only and are synced before publication. Existing
-Unix modes and ACLs are copied before the atomic rename (ACLs on macOS, Linux, and
-FreeBSD), followed by a parent-directory sync. Windows uses `ReplaceFileW` for existing
+Unix UID/GID, modes, and ACLs are copied before the atomic rename (ACLs on macOS, Linux,
+and FreeBSD), followed by a parent-directory sync. If that final sync fails, the API
+returns `Error::CommitDurabilityUncertain` but installs the already-published generation
+in memory and ends the transaction. Windows uses `ReplaceFileW` for existing
 snapshots so ACL/security metadata is retained, and write-through `MoveFileExW` for
 first publication; it never attempts POSIX directory syncing.
 

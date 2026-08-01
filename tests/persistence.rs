@@ -17,7 +17,7 @@ fn temporary_path(name: &str) -> PathBuf {
 fn remove_database(path: &PathBuf) {
     let _ = fs::remove_file(path);
     let mut lock = path.as_os_str().to_os_string();
-    lock.push(".lock");
+    lock.push(".rusthouse-lock");
     let _ = fs::remove_file(PathBuf::from(lock));
 }
 
@@ -79,6 +79,33 @@ fn a_persisted_path_has_one_exclusive_owner() {
         Ok(StatementResult::Query(_))
     ));
     drop(next_owner);
+    remove_database(&path);
+}
+
+#[test]
+fn database_names_cannot_replace_another_databases_lock() {
+    let path = temporary_path("lock-namespace");
+    let lock_named_database = path.with_extension("db.lock");
+    let owner = Database::open(&path).unwrap();
+    let other = Database::open(&lock_named_database).unwrap();
+    other
+        .execute("CREATE TABLE independent (id Int64)")
+        .unwrap();
+
+    assert!(matches!(
+        Database::open(&path),
+        Err(Error::DatabaseAlreadyOpen(_))
+    ));
+    let mut reserved = path.as_os_str().to_os_string();
+    reserved.push(".rusthouse-lock");
+    assert!(matches!(
+        Database::open(PathBuf::from(reserved)),
+        Err(Error::ReservedDatabasePath(_))
+    ));
+
+    drop(other);
+    drop(owner);
+    remove_database(&lock_named_database);
     remove_database(&path);
 }
 
@@ -185,6 +212,44 @@ fn replacement_is_private_and_preserves_existing_mode() {
             expected_mode
         );
     }
+    drop(database);
+    remove_database(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn replacement_preserves_owner_and_group() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = temporary_path("ownership");
+    let database = Database::open(&path).unwrap();
+    database
+        .execute("CREATE TABLE owned_data (id Int64)")
+        .unwrap();
+
+    let original = fs::metadata(&path).unwrap();
+    if unsafe { libc::geteuid() } == 0 {
+        let alternate_gid = if original.gid() == 250 { 251 } else { 250 };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Root-only coverage reproduces a destination group unlike the process group.
+        assert_eq!(
+            unsafe { libc::fchown(file.as_raw_fd(), original.uid(), alternate_gid) },
+            0
+        );
+    }
+    let expected = fs::metadata(&path).unwrap();
+
+    database
+        .execute("INSERT INTO owned_data VALUES (1)")
+        .unwrap();
+    let actual = fs::metadata(&path).unwrap();
+    assert_eq!(actual.uid(), expected.uid());
+    assert_eq!(actual.gid(), expected.gid());
     drop(database);
     remove_database(&path);
 }

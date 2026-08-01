@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::catalog::CatalogGeneration;
 use crate::error::{Error, LimitKind, Result};
-use crate::persistence::Persistence;
+use crate::persistence::{Persistence, StoreStatus};
 use crate::sql::{Comparison, Predicate, Statement, parse};
 use crate::storage::{ColumnDef, Table, Value};
 
@@ -204,11 +204,20 @@ impl DatabaseInner {
             }
         }
         let candidate = CatalogGeneration { id, tables };
-        if let Some(persistence) = &self.persistence {
-            persistence.store(&candidate)?;
-        }
+        let store_status = if let Some(persistence) = &self.persistence {
+            persistence.store(&candidate)?
+        } else {
+            StoreStatus::Durable
+        };
         state.head = Arc::new(candidate);
-        Ok(id)
+        match store_status {
+            StoreStatus::Durable => Ok(id),
+            #[cfg(unix)]
+            StoreStatus::PublishedWithError(error) => Err(Error::CommitDurabilityUncertain {
+                generation: id,
+                message: error.to_string(),
+            }),
+        }
     }
 }
 
@@ -326,7 +335,14 @@ impl Session {
         let transaction = self.transaction.take().ok_or(Error::NoActiveTransaction)?;
         match self.database.inner.commit(&transaction) {
             Ok(generation) => Ok(generation),
-            Err(error @ Error::Conflict { .. }) => Err(error),
+            Err(error)
+                if matches!(
+                    &error,
+                    Error::Conflict { .. } | Error::CommitDurabilityUncertain { .. }
+                ) =>
+            {
+                Err(error)
+            }
             Err(error) => {
                 self.transaction = Some(transaction);
                 Err(error)
@@ -560,5 +576,66 @@ fn compare(left: &Value, right: &Value, comparison: Comparison) -> bool {
         Comparison::GreaterOrEqual => {
             matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod persistence_commit_tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::persistence::fail_next_directory_sync;
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_path() -> PathBuf {
+        let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rusthouse-directory-sync-{}-{sequence}.db",
+            std::process::id()
+        ))
+    }
+
+    fn remove_database(path: &Path) {
+        let _ = fs::remove_file(path);
+        let mut lock = path.as_os_str().to_os_string();
+        lock.push(".rusthouse-lock");
+        let _ = fs::remove_file(PathBuf::from(lock));
+    }
+
+    #[test]
+    fn post_rename_sync_failure_keeps_memory_and_disk_aligned() {
+        let path = temporary_path();
+        let database = Database::open(&path).unwrap();
+        let mut session = database.session();
+        session.begin().unwrap();
+        session
+            .execute("CREATE TABLE published (id Int64)")
+            .unwrap();
+
+        fail_next_directory_sync();
+        assert!(matches!(
+            session.commit(),
+            Err(Error::CommitDurabilityUncertain { generation: 1, .. })
+        ));
+        assert!(!session.in_transaction());
+        assert_eq!(database.current_generation().unwrap(), 1);
+        assert!(matches!(
+            database.execute("SELECT * FROM published"),
+            Ok(StatementResult::Query(_))
+        ));
+        drop(session);
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.current_generation().unwrap(), 1);
+        assert!(matches!(
+            reopened.execute("SELECT * FROM published"),
+            Ok(StatementResult::Query(_))
+        ));
+        drop(reopened);
+        remove_database(&path);
     }
 }

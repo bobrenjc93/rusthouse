@@ -16,7 +16,7 @@ fn database_path() -> PathBuf {
 fn remove_database(path: &PathBuf) {
     let _ = fs::remove_file(path);
     let mut lock = path.as_os_str().to_os_string();
-    lock.push(".lock");
+    lock.push(".rusthouse-lock");
     let _ = fs::remove_file(PathBuf::from(lock));
 }
 

@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::CatalogGeneration;
@@ -20,7 +22,22 @@ const MAX_ROWS_PER_TABLE: usize = 10_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const TABLE_MAP_ENTRY_ALLOCATION: usize = 512;
 const HEAP_ALLOCATION_OVERHEAD: usize = 64;
+const LOCK_SUFFIX: &str = ".rusthouse-lock";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(test, unix))]
+static FAIL_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+pub(crate) enum StoreStatus {
+    Durable,
+    #[cfg(unix)]
+    PublishedWithError(Error),
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_directory_sync() {
+    FAIL_DIRECTORY_SYNC.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug)]
 pub(crate) struct Persistence {
@@ -31,8 +48,15 @@ pub(crate) struct Persistence {
 impl Persistence {
     pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
         let path = normalize_path(&path)?;
+        if path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(LOCK_SUFFIX)
+        }) {
+            return Err(Error::ReservedDatabasePath(path.display().to_string()));
+        }
         let mut lock_name = path.as_os_str().to_os_string();
-        lock_name.push(".lock");
+        lock_name.push(LOCK_SUFFIX);
         let lock_path = PathBuf::from(lock_name);
         let lock = OpenOptions::new()
             .read(true)
@@ -89,7 +113,7 @@ impl Persistence {
         decode_snapshot(&bytes)
     }
 
-    pub(crate) fn store(&self, generation: &CatalogGeneration) -> Result<()> {
+    pub(crate) fn store(&self, generation: &CatalogGeneration) -> Result<StoreStatus> {
         let bytes = encode_snapshot(generation)?;
         let parent = self
             .path
@@ -142,14 +166,20 @@ fn write_and_replace(
     destination: &Path,
     parent: &Path,
     bytes: &[u8],
-) -> Result<()> {
-    let destination_permissions = match fs::metadata(destination) {
-        Ok(metadata) => Some(metadata.permissions()),
+) -> Result<StoreStatus> {
+    let destination_metadata = match fs::metadata(destination) {
+        Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(Error::io("inspect snapshot permissions", error)),
     };
+    let destination_permissions = destination_metadata.as_ref().map(fs::Metadata::permissions);
+    #[cfg(unix)]
+    let destination_ownership = destination_metadata.as_ref().map(|metadata| {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.uid(), metadata.gid())
+    });
     #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
-    let destination_acl = if destination_permissions.is_some() {
+    let destination_acl = if destination_metadata.is_some() {
         match exacl::getfacl(destination, None) {
             Ok(acl) => Some(acl),
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
@@ -178,6 +208,10 @@ fn write_and_replace(
         .map_err(|error| Error::io("write temporary snapshot", error))?;
     file.sync_all()
         .map_err(|error| Error::io("sync temporary snapshot", error))?;
+    #[cfg(unix)]
+    if let Some((uid, gid)) = destination_ownership {
+        preserve_snapshot_ownership(&file, uid, gid)?;
+    }
     if let Some(permissions) = destination_permissions {
         file.set_permissions(permissions)
             .map_err(|error| Error::io("preserve snapshot permissions", error))?;
@@ -203,22 +237,56 @@ fn write_and_replace(
 }
 
 #[cfg(unix)]
-fn replace_snapshot(temporary: &Path, destination: &Path, parent: &Path) -> Result<()> {
-    fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| Error::io("sync snapshot directory", error))?;
+fn preserve_snapshot_ownership(file: &File, uid: u32, gid: u32) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io("inspect temporary snapshot ownership", error))?;
+    if metadata.uid() == uid && metadata.gid() == gid {
+        return Ok(());
+    }
+    // The descriptor refers to the private temp file and remains open through publication.
+    let result = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+    if result != 0 {
+        return Err(Error::io(
+            "preserve snapshot ownership",
+            std::io::Error::last_os_error(),
+        ));
+    }
     Ok(())
 }
 
+#[cfg(unix)]
+fn replace_snapshot(temporary: &Path, destination: &Path, parent: &Path) -> Result<StoreStatus> {
+    fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))?;
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC.swap(false, Ordering::SeqCst) {
+        return Ok(StoreStatus::PublishedWithError(Error::Io {
+            operation: "sync snapshot directory",
+            message: "injected directory sync failure".to_owned(),
+        }));
+    }
+    match File::open(parent).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(StoreStatus::Durable),
+        Err(error) => Ok(StoreStatus::PublishedWithError(Error::io(
+            "sync snapshot directory",
+            error,
+        ))),
+    }
+}
+
 #[cfg(windows)]
-fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<()> {
-    windows::replace_snapshot(temporary, destination)
+fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<StoreStatus> {
+    windows::replace_snapshot(temporary, destination)?;
+    Ok(StoreStatus::Durable)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<()> {
-    fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))
+fn replace_snapshot(temporary: &Path, destination: &Path, _parent: &Path) -> Result<StoreStatus> {
+    fs::rename(temporary, destination).map_err(|error| Error::io("replace snapshot", error))?;
+    Ok(StoreStatus::Durable)
 }
 
 #[cfg(windows)]

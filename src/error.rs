@@ -41,6 +41,11 @@ pub enum Error {
         attempted: usize,
     },
     DatabaseAlreadyOpen(String),
+    ReservedDatabasePath(String),
+    CommitDurabilityUncertain {
+        generation: u64,
+        message: String,
+    },
     GenerationOverflow,
     CorruptSnapshot(String),
     SnapshotTooLarge {
@@ -110,6 +115,17 @@ impl fmt::Display for Error {
             Self::DatabaseAlreadyOpen(path) => {
                 write!(f, "database is already open by another handle: {path}")
             }
+            Self::ReservedDatabasePath(path) => write!(
+                f,
+                "database path uses the reserved lock-file namespace: {path}"
+            ),
+            Self::CommitDurabilityUncertain {
+                generation,
+                message,
+            } => write!(
+                f,
+                "generation {generation} was published but its durability is uncertain: {message}"
+            ),
             Self::GenerationOverflow => f.write_str("catalog generation counter overflowed"),
             Self::CorruptSnapshot(message) => write!(f, "corrupt snapshot: {message}"),
             Self::SnapshotTooLarge { size, maximum } => write!(
