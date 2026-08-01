@@ -1,0 +1,67 @@
+name: Record Burner evaluation history
+
+on:
+  repository_dispatch:
+    types: [burner_evaluation_completed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: burner-evaluation-history-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    name: Verify merge and record scores
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Verify dispatch and regenerate artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/burner_history.py dispatch
+          --event "$GITHUB_EVENT_PATH"
+          --repository "$GITHUB_REPOSITORY"
+
+      - name: Validate generated artifacts
+        run: python3 scripts/burner_history.py validate
+
+      - name: Detect an idempotent retry
+        id: changes
+        shell: bash
+        run: |
+          if git diff --quiet -- README.md docs/burner-evaluation-history.json docs/burner-evaluation-progress.svg; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit the merge point
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- README.md docs/burner-evaluation-history.json docs/burner-evaluation-progress.svg
+          git diff --cached --check
+          git commit -m "docs: record Burner evaluation for PR #${PR_NUMBER}"
+
+      - name: Rebase and push the atomic update
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git pull --rebase origin "$DEFAULT_BRANCH"
+          python3 scripts/burner_history.py validate
+          git push origin "HEAD:${DEFAULT_BRANCH}"

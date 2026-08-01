@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import copy
+import tempfile
+import unittest
+from pathlib import Path
+
+from scripts import burner_history as history_tool
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+MERGE_A = "b" * 40
+MERGE_B = "c" * 40
+
+
+class BurnerHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.history = history_tool.load_json_file(REPOSITORY_ROOT / history_tool.HISTORY_PATH)
+        history_tool.validate_history(self.history)
+
+    def scores(self, start: int = 10) -> dict[str, int]:
+        return {
+            evaluation_id: start + index
+            for index, evaluation_id in enumerate(self.history["evaluations"])
+        }
+
+    def payload(self, pr_number: int = 143, merge_commit: str = MERGE_A) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "pr_number": pr_number,
+            "merge_commit": merge_commit,
+            "scores": self.scores(),
+        }
+
+    def pull(
+        self,
+        pr_number: int = 143,
+        merge_commit: str = MERGE_A,
+        merged_at: str = "2026-08-02T10:00:00Z",
+    ) -> dict[str, object]:
+        return {
+            "number": pr_number,
+            "state": "closed",
+            "merged": True,
+            "merged_at": merged_at,
+            "merge_commit_sha": merge_commit,
+            "title": "Implement the analytical slice",
+            "html_url": f"https://github.com/bobrenjc93/rusthouse/pull/{pr_number}",
+            "base": {
+                "ref": "main",
+                "repo": {"full_name": "bobrenjc93/rusthouse"},
+            },
+        }
+
+    def test_seed_registers_all_six_complete_baseline_scores(self) -> None:
+        self.assertEqual(1, self.history["version"])
+        self.assertEqual(6, len(self.history["evaluations"]))
+        baseline = self.history["points"][0]
+        self.assertEqual("a915131d85a32ced9ee26ad9de4cbe927ff32cd8", baseline["commit"])
+        self.assertEqual(set(self.history["evaluations"]), set(baseline["scores"]))
+        self.assertEqual(
+            [0, 25, 0, 80, 0, 20],
+            list(baseline["scores"].values()),
+        )
+
+    def test_score_sets_must_be_complete_and_in_range(self) -> None:
+        missing = copy.deepcopy(self.history)
+        missing["points"][0]["scores"].pop("eval_4f18ff4d")
+        with self.assertRaisesRegex(history_tool.HistoryError, "exactly the active evaluations"):
+            history_tool.validate_history(missing)
+
+        out_of_range = copy.deepcopy(self.history)
+        out_of_range["points"][0]["scores"]["eval_4f18ff4d"] = 101
+        with self.assertRaisesRegex(history_tool.HistoryError, "between 0 and 100"):
+            history_tool.validate_history(out_of_range)
+
+        boolean = copy.deepcopy(self.history)
+        boolean["points"][0]["scores"]["eval_4f18ff4d"] = True
+        with self.assertRaisesRegex(history_tool.HistoryError, "must be a number"):
+            history_tool.validate_history(boolean)
+
+    def test_merge_recording_is_idempotent_and_conflicts_fail(self) -> None:
+        updated, changed = history_tool.record_merge(
+            copy.deepcopy(self.history), self.payload(), self.pull()
+        )
+        self.assertTrue(changed)
+        self.assertEqual(2, len(updated["points"]))
+
+        retried, changed = history_tool.record_merge(updated, self.payload(), self.pull())
+        self.assertFalse(changed)
+        self.assertEqual(2, len(retried["points"]))
+
+        conflict = self.payload()
+        conflict["scores"] = self.scores(20)
+        with self.assertRaisesRegex(history_tool.HistoryError, "conflicting retry"):
+            history_tool.record_merge(retried, conflict, self.pull())
+
+    def test_delayed_dispatches_are_sorted_and_reversed_history_fails(self) -> None:
+        updated, _ = history_tool.record_merge(
+            copy.deepcopy(self.history),
+            self.payload(145, MERGE_A),
+            self.pull(145, MERGE_A, "2026-08-04T10:00:00Z"),
+        )
+        updated, _ = history_tool.record_merge(
+            updated,
+            self.payload(144, MERGE_B),
+            self.pull(144, MERGE_B, "2026-08-03T10:00:00Z"),
+        )
+        self.assertEqual([144, 145], [point["prNumber"] for point in updated["points"][1:]])
+        history_tool.validate_history(updated)
+
+        updated["points"][1], updated["points"][2] = updated["points"][2], updated["points"][1]
+        with self.assertRaisesRegex(history_tool.HistoryError, "chronological order"):
+            history_tool.validate_history(updated)
+
+    def test_duplicate_pr_and_merge_keys_fail(self) -> None:
+        updated, _ = history_tool.record_merge(
+            copy.deepcopy(self.history), self.payload(), self.pull()
+        )
+        duplicate_pr = copy.deepcopy(updated["points"][1])
+        duplicate_pr["key"] = f"merge:{MERGE_B}"
+        duplicate_pr["mergeCommit"] = MERGE_B
+        duplicate_pr["recordedAt"] = "2026-08-03T10:00:00Z"
+        updated["points"].append(duplicate_pr)
+        with self.assertRaisesRegex(history_tool.HistoryError, "duplicate PR number"):
+            history_tool.validate_history(updated)
+
+        duplicate_key = copy.deepcopy(self.history)
+        point = copy.deepcopy(duplicate_pr)
+        point["prNumber"] = 144
+        point["label"] = "PR #144"
+        point["mergeCommit"] = MERGE_A
+        point["key"] = f"merge:{MERGE_A}"
+        point["url"] = "https://github.com/bobrenjc93/rusthouse/pull/144"
+        duplicate_key["points"].extend([copy.deepcopy(point), copy.deepcopy(point)])
+        with self.assertRaisesRegex(history_tool.HistoryError, "duplicate point key"):
+            history_tool.validate_history(duplicate_key)
+
+    def test_unmerged_or_mismatched_pull_request_fails(self) -> None:
+        unmerged = self.pull()
+        unmerged["merged"] = False
+        unmerged["state"] = "open"
+        with self.assertRaisesRegex(history_tool.HistoryError, "is not merged"):
+            history_tool.verify_pull_request(
+                self.payload(), unmerged, "bobrenjc93/rusthouse", "main"
+            )
+
+        wrong_commit = self.pull()
+        wrong_commit["merge_commit_sha"] = MERGE_B
+        with self.assertRaisesRegex(history_tool.HistoryError, "does not match"):
+            history_tool.verify_pull_request(
+                self.payload(), wrong_commit, "bobrenjc93/rusthouse", "main"
+            )
+
+    def test_svg_has_accessible_labels_and_fixed_scale(self) -> None:
+        svg = history_tool.render_svg(self.history)
+        self.assertIn('role="img"', svg)
+        self.assertIn('aria-labelledby="burner-title burner-desc"', svg)
+        self.assertIn("Score (0-100)", svg)
+        self.assertIn("0</text>", svg)
+        self.assertIn("100</text>", svg)
+        for evaluation in self.history["evaluations"].values():
+            self.assertIn(evaluation["name"], svg)
+
+    def test_invalid_input_does_not_replace_generated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "README.md").write_text("# Test\n", encoding="utf-8")
+            history_tool.write_artifacts(root, copy.deepcopy(self.history), include_history=True)
+            original_history = (root / history_tool.HISTORY_PATH).read_bytes()
+            original_svg = (root / history_tool.SVG_PATH).read_bytes()
+            original_readme = (root / "README.md").read_bytes()
+
+            invalid = copy.deepcopy(self.history)
+            invalid["points"][0]["scores"].pop("eval_4f18ff4d")
+            with self.assertRaises(history_tool.HistoryError):
+                history_tool.write_artifacts(root, invalid, include_history=True)
+
+            self.assertEqual(original_history, (root / history_tool.HISTORY_PATH).read_bytes())
+            self.assertEqual(original_svg, (root / history_tool.SVG_PATH).read_bytes())
+            self.assertEqual(original_readme, (root / "README.md").read_bytes())
+
+    def test_readme_rejects_multiple_managed_sections(self) -> None:
+        block = history_tool.readme_block()
+        with self.assertRaisesRegex(history_tool.HistoryError, "at most one"):
+            history_tool.update_readme(f"# Test\n{block}\n{block}\n", allow_create=True)
+
+    def test_json_parser_rejects_duplicate_keys_and_nonfinite_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            duplicate = Path(temporary) / "duplicate.json"
+            duplicate.write_text('{"version": 1, "version": 1}', encoding="utf-8")
+            with self.assertRaisesRegex(history_tool.HistoryError, "duplicate JSON key"):
+                history_tool.load_json_file(duplicate)
+
+            nonfinite = Path(temporary) / "nonfinite.json"
+            nonfinite.write_text('{"score": NaN}', encoding="utf-8")
+            with self.assertRaisesRegex(history_tool.HistoryError, "non-finite"):
+                history_tool.load_json_file(nonfinite)
+
+
+if __name__ == "__main__":
+    unittest.main()

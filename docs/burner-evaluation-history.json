@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "description": "Versioned source data for the Burner evaluation graph. The root baseline is preserved here, and verified merged pull requests are appended automatically by the repository dispatch workflow.",
+  "tracking": {
+    "repository": "bobrenjc93/rusthouse",
+    "defaultBranch": "main",
+    "startedAt": "2026-08-01T04:52:01.438Z",
+    "rootCommit": "a915131d85a32ced9ee26ad9de4cbe927ff32cd8",
+    "dispatchEvent": "burner_evaluation_completed",
+    "updatePolicy": "After Burner finishes every enabled evaluation for a merged PR, it sends one version-1 repository dispatch containing the PR number, merge commit, and complete score set. The workflow verifies GitHub merge evidence and default-branch ancestry before recording the point; exact retries do not add another point and conflicting retries fail."
+  },
+  "evaluations": {
+    "eval_d50af811": {
+      "name": "Analytical database capability",
+      "color": "#c2410c",
+      "dash": "",
+      "introducedAt": "2026-08-01T04:51:10.030Z"
+    },
+    "eval_07c39ba3": {
+      "name": "Rust engineering quality",
+      "color": "#2563eb",
+      "dash": "10 4",
+      "introducedAt": "2026-08-01T04:51:10.284Z"
+    },
+    "eval_001eeb44": {
+      "name": "ClickHouse sustained parity",
+      "color": "#15803d",
+      "dash": "3 3",
+      "introducedAt": "2026-08-01T04:51:10.545Z"
+    },
+    "eval_6eb16503": {
+      "name": "Benchmark integrity and anti-gaming",
+      "color": "#7e22ce",
+      "dash": "12 4 3 4",
+      "introducedAt": "2026-08-01T04:51:10.838Z"
+    },
+    "eval_0e1ec381": {
+      "name": "ClickHouse feature comprehensiveness",
+      "color": "#be123c",
+      "dash": "8 3",
+      "introducedAt": "2026-08-01T04:51:11.137Z"
+    },
+    "eval_4f18ff4d": {
+      "name": "Evaluation progress accounting",
+      "color": "#0f766e",
+      "dash": "2 3",
+      "introducedAt": "2026-08-01T04:51:11.407Z"
+    }
+  },
+  "points": [
+    {
+      "key": "baseline:a915131d85a32ced9ee26ad9de4cbe927ff32cd8",
+      "kind": "baseline",
+      "recordedAt": "2026-08-01T04:52:01.438Z",
+      "label": "Baseline a915131",
+      "commit": "a915131d85a32ced9ee26ad9de4cbe927ff32cd8",
+      "scores": {
+        "eval_d50af811": 0,
+        "eval_07c39ba3": 25,
+        "eval_001eeb44": 0,
+        "eval_6eb16503": 80,
+        "eval_0e1ec381": 0,
+        "eval_4f18ff4d": 20
+      },
+      "evidence": {
+        "source": "Burner baseline evaluation",
+        "runs": {
+          "eval_d50af811": "evalrun_9a3e6a91",
+          "eval_07c39ba3": "evalrun_25841808",
+          "eval_001eeb44": "evalrun_a26ac5cc",
+          "eval_6eb16503": "evalrun_4e11be0d",
+          "eval_0e1ec381": "evalrun_cbb0a125",
+          "eval_4f18ff4d": "evalrun_91bf44df"
+        }
+      }
+    }
+  ]
+}
