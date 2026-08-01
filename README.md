@@ -49,18 +49,21 @@ resource-constrained inputs. Limits cover the complete file, object counts,
 rows, total values, names, individual strings, and total string bytes. Counts
 and lengths are checked before allocation, allocation is fallible, and invalid
 images are rejected before the current snapshot is changed. Only one store may
-hold the nonblocking writer lock for a path at a time; concurrent commits made
-through one shared store handle are serialized in process. Snapshot filenames
+hold the nonblocking writer lock for a snapshot in one pinned parent directory;
+concurrent commits made through one shared store handle are serialized in
+process. Snapshot filenames
 matching the generated `.<name>.lock` or `.<name>.tmp` sidecar namespace are
-rejected, including case and trailing-dot/space aliases.
+rejected, including case aliases. Windows also rejects all snapshot names with
+trailing dots or spaces because Win32 resolves them as aliases of trimmed names.
 
 Snapshot persistence supports Windows, macOS, and Linux. Other Unix targets,
 including FreeBSD filesystems with either POSIX.1e or NFSv4 ACLs, compile but
 return `SnapshotError::UnsupportedPlatform` before creating sidecars because
 their ACL semantics are not implemented. Existing or dangling final-component
 symbolic links are rejected. On Unix, each subsequent read, metadata copy, and
-publication is relative to the parent directory handle opened by the store, so
-replacing that final component after open cannot redirect snapshot access.
+sidecar operation is relative to the parent directory handle opened by the
+store. Publication and directory fsync use that same handle, so replacing the
+parent path or final component after open cannot redirect snapshot access.
 
 ### Version 1 binary format
 
