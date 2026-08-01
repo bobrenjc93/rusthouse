@@ -1309,7 +1309,7 @@ fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
 pub(crate) fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, WRITE_DAC, WRITE_OWNER,
     };
@@ -1322,7 +1322,7 @@ pub(crate) fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
-            GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
             0,
             &attributes,
             CREATE_NEW,

@@ -13,9 +13,11 @@ pub use ndjson::{
 use crate::storage::{Column, ColumnBatch, DataType, Schema, StorageError, Table};
 use std::error::Error;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -117,6 +119,7 @@ impl fmt::Display for LimitKind {
 #[derive(Debug)]
 pub enum FormatError {
     Io(io::Error),
+    UnsupportedPlatform(&'static str),
     InvalidOption(String),
     LimitExceeded {
         kind: LimitKind,
@@ -174,6 +177,9 @@ impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "format I/O failed: {error}"),
+            Self::UnsupportedPlatform(message) => {
+                write!(f, "format staging is unsupported: {message}")
+            }
             Self::InvalidOption(message) => write!(f, "invalid format option: {message}"),
             Self::LimitExceeded { kind, limit, row } => match row {
                 Some(row) => write!(f, "{kind} limit {limit} exceeded at row {row}"),
@@ -358,6 +364,11 @@ struct StagedBatches {
 impl StagedBatches {
     fn create() -> Result<Self, FormatError> {
         let directory = std::env::temp_dir();
+        Self::create_in(&directory)
+    }
+
+    fn create_in(directory: &Path) -> Result<Self, FormatError> {
+        ensure_private_spool_platform()?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -368,14 +379,7 @@ impl StagedBatches {
                 "rusthouse-ingest-{}-{timestamp}-{sequence}.tmp",
                 std::process::id()
             ));
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&path) {
+            match create_private_spool_file(&path) {
                 Ok(mut file) => {
                     let result = file.write_all(b"RHBATCH1");
                     if let Err(error) = result {
@@ -510,6 +514,57 @@ impl StagedBatches {
     }
 }
 
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn ensure_private_spool_platform() -> Result<(), FormatError> {
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn ensure_private_spool_platform() -> Result<(), FormatError> {
+    Err(FormatError::UnsupportedPlatform(
+        "private temporary files require Windows, macOS, or Linux ACL semantics",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_private_spool_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(error) = crate::catalog::protect_temp_security(&file) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(io::Error::other(format!(
+            "could not protect ingestion spool: {error}"
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_private_spool_file(path: &Path) -> io::Result<File> {
+    match crate::catalog::create_secure_temp(path) {
+        Ok(file) => Ok(file),
+        Err(crate::catalog::SnapshotError::Io(error)) => Err(error),
+        Err(error) => Err(io::Error::other(format!(
+            "could not protect ingestion spool: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn create_private_spool_file(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private temporary files require Windows, macOS, or Linux ACL semantics",
+    ))
+}
+
 impl Drop for StagedBatches {
     fn drop(&mut self) {
         drop(self.file.take());
@@ -560,4 +615,143 @@ fn read_array<const N: usize>(reader: &mut File) -> Result<[u8; N], FormatError>
     let mut bytes = [0_u8; N];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusthouse-format-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "macos")]
+    fn install_inheritable_test_acl(path: &Path) {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let acl = [AclEntry::allow_user(
+            "nobody",
+            Perm::READ | Perm::EXECUTE,
+            Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT,
+        )];
+        exacl::setfacl(&[path], &acl, None).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_inheritable_test_acl(path: &Path) {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let mut acl = exacl::getfacl(path, None).unwrap();
+        acl.extend([
+            AclEntry::allow_user("", Perm::READ | Perm::WRITE | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_user("nobody", Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_group("", Perm::empty(), Flag::DEFAULT),
+            AclEntry::allow_mask(Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+            AclEntry::allow_other(Perm::empty(), Flag::DEFAULT),
+        ]);
+        exacl::setfacl(&[path], &acl, None).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn acl_allows_nobody(path: &Path) -> bool {
+        exacl::getfacl(path, None)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name.ends_with("nobody") && entry.perms.contains(exacl::Perm::READ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ingestion_spool_clears_inherited_acl_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("private-spool");
+        install_inheritable_test_acl(&directory);
+        let probe = directory.join("probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        assert!(acl_allows_nobody(&probe));
+        std::fs::remove_file(probe).unwrap();
+
+        let staged = StagedBatches::create_in(&directory).unwrap();
+        let path = staged.path.clone();
+        assert_eq!(std::fs::read(&path).unwrap(), b"RHBATCH1");
+        assert!(!acl_allows_nobody(&path));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(staged);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ingestion_spool_has_a_protected_dacl() {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, GetSecurityDescriptorControl,
+            PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        };
+
+        let directory = test_directory("private-spool");
+        let staged = StagedBatches::create_in(&directory).unwrap();
+        let file = staged.file.as_ref().unwrap();
+        let mut needed = 0_u32;
+        unsafe {
+            GetKernelObjectSecurity(
+                file.as_raw_handle() as HANDLE,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        assert!(needed > 0);
+        let mut descriptor = vec![0_u8; needed as usize];
+        let descriptor_ptr: PSECURITY_DESCRIPTOR = descriptor.as_mut_ptr().cast();
+        assert_ne!(
+            unsafe {
+                GetKernelObjectSecurity(
+                    file.as_raw_handle() as HANDLE,
+                    DACL_SECURITY_INFORMATION,
+                    descriptor_ptr,
+                    needed,
+                    &mut needed,
+                )
+            },
+            0
+        );
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor_ptr, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        let path = staged.path.clone();
+        drop(staged);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn ingestion_spool_rejects_unsupported_acl_platform_before_creation() {
+        let directory = test_directory("unsupported-spool");
+        assert!(matches!(
+            StagedBatches::create_in(&directory),
+            Err(FormatError::UnsupportedPlatform(_))
+        ));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

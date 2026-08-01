@@ -10,7 +10,7 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -340,6 +340,7 @@ pub enum SegmentWriteOutcome {
 #[derive(Debug)]
 pub enum SegmentError {
     Io(io::Error),
+    UnsupportedPlatform(&'static str),
     InvalidInput(String),
     Corrupt(String),
     UnsupportedVersion(u16),
@@ -359,6 +360,9 @@ impl fmt::Display for SegmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "segment I/O error: {error}"),
+            Self::UnsupportedPlatform(message) => {
+                write!(formatter, "segment persistence is unsupported: {message}")
+            }
             Self::InvalidInput(message) => write!(formatter, "invalid segment input: {message}"),
             Self::Corrupt(message) => write!(formatter, "corrupt segment: {message}"),
             Self::UnsupportedVersion(version) => {
@@ -1152,7 +1156,7 @@ enum PublicationFailure {
     DirectorySync,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn publish_segment_bytes_with_failure(
     path: &Path,
     bytes: &[u8],
@@ -1167,6 +1171,7 @@ fn publish_segment_bytes_inner(
     before_publish: impl FnOnce(),
     failure: Option<PublicationFailure>,
 ) -> Result<SegmentWriteOutcome, SegmentError> {
+    ensure_private_segment_platform()?;
     let file_name = path.file_name().ok_or_else(|| {
         SegmentError::InvalidInput("segment path must include a file name".into())
     })?;
@@ -1183,6 +1188,18 @@ fn publish_segment_bytes_inner(
     before_publish();
 
     publish_temporary_file(&temporary_path, path, parent, &mut cleanup, failure)
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn ensure_private_segment_platform() -> Result<(), SegmentError> {
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn ensure_private_segment_platform() -> Result<(), SegmentError> {
+    Err(SegmentError::UnsupportedPlatform(
+        "private immutable files require Windows, macOS, or Linux ACL semantics",
+    ))
 }
 
 #[cfg(unix)]
@@ -1328,7 +1345,7 @@ fn create_temporary_file(parent: &Path, file_name: &OsStr) -> io::Result<(PathBu
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_private_segment_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1346,9 +1363,13 @@ fn create_private_segment_file(path: &Path) -> io::Result<File> {
     crate::catalog::create_secure_temp(path).map_err(io::Error::other)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn create_private_segment_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+    let _ = path;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private immutable files require Windows, macOS, or Linux ACL semantics",
+    ))
 }
 
 #[cfg(unix)]
@@ -3223,7 +3244,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn immutable_segment_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -3282,7 +3303,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn post_publication_failures_return_an_uncertain_outcome() {
         let directory = test_directory("publication-uncertainty");
@@ -3315,6 +3336,25 @@ mod tests {
             ));
         }
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn segment_publication_rejects_unsupported_acl_platform_before_creation() {
+        let directory = test_directory("unsupported-segment");
+        let path = directory.join("segment.rhs");
+        assert!(matches!(
+            write_segment(
+                &path,
+                &test_schema(),
+                &test_columns(),
+                &WriteOptions::default(),
+            ),
+            Err(SegmentError::UnsupportedPlatform(_))
+        ));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
