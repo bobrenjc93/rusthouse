@@ -68,6 +68,7 @@ pub(crate) fn parse(sql: &str) -> Result<Statement> {
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     Word(String),
+    QuotedIdentifier(String),
     String(String),
     Number(String),
     Symbol(char),
@@ -106,7 +107,7 @@ fn tokenize(input: &str) -> Result<Tokenized> {
         }
         if character == '"' {
             let (value, next) = quoted(&chars, &byte_positions, position, '"', false)?;
-            tokens.push(Token::Word(value));
+            tokens.push(Token::QuotedIdentifier(value));
             positions.push(token_position);
             position = next;
             continue;
@@ -471,7 +472,7 @@ impl Parser {
 
     fn identifier(&mut self) -> Result<String> {
         match self.next() {
-            Some(Token::Word(value)) => Ok(value),
+            Some(Token::Word(value) | Token::QuotedIdentifier(value)) => Ok(value),
             _ => Err(self.error_at_last("expected an identifier")),
         }
     }
@@ -568,6 +569,27 @@ mod tests {
             }
             _ => panic!("expected insert"),
         }
+    }
+
+    #[test]
+    fn quoted_identifiers_are_not_keywords() {
+        for sql in [
+            "\"begin\"",
+            "\"commit\"",
+            "\"rollback\"",
+            "\"start\" \"transaction\"",
+            "\"create\" \"table\" t (id Int64)",
+        ] {
+            assert!(matches!(parse(sql), Err(Error::Parse { .. })), "{sql:?}");
+        }
+
+        let Statement::CreateTable { name, columns } =
+            parse("CREATE TABLE \"create\" (\"select\" Int64)").unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(name, "create");
+        assert_eq!(columns[0].name, "select");
     }
 
     #[test]

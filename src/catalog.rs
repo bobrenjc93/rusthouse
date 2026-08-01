@@ -18,6 +18,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
+use crate::sidecar::open_parent_directory_guard;
 use crate::sidecar::{is_reserved_name, lock_path};
 pub use crate::storage::DataType;
 use crate::storage::EngineTable as Table;
@@ -29,6 +31,8 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"RHCAT\0\r\n";
 pub const SNAPSHOT_FORMAT_VERSION: u16 = 1;
 
 const HEADER_LEN: usize = 32;
+#[cfg(all(test, unix))]
+static REPLACE_LOCK_BEFORE_ACQUIRE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// An immutable database catalog view identified by a monotonically increasing number.
 #[derive(Debug)]
@@ -514,8 +518,9 @@ impl SnapshotStore {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(alias_path)?;
+                .open(&alias_path)?;
             lock_snapshot_file(&lock, &path)?;
+            verify_lock_file_path(&lock, &alias_path)?;
             lock
         };
         #[cfg(unix)]
@@ -534,7 +539,13 @@ impl SnapshotStore {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
+        #[cfg(all(test, unix))]
+        inject_lock_replacement(&lock_path)?;
         lock_snapshot_file(&lock, &path)?;
+        #[cfg(unix)]
+        verify_lock_file_at(&parent_dir, lock_name, &lock, &lock_path)?;
+        #[cfg(windows)]
+        verify_lock_file_path(&lock, &lock_path)?;
 
         #[cfg(windows)]
         drop(open_snapshot_file_path(&path)?);
@@ -723,35 +734,64 @@ fn lock_snapshot_file(lock: &File, path: &Path) -> Result<(), SnapshotError> {
     }
 }
 
-#[cfg(windows)]
-fn open_parent_directory_guard(path: &Path) -> Result<File, SnapshotError> {
-    use std::os::windows::io::FromRawHandle;
-    use std::ptr;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-
-    let wide_path = wide_path(path);
-    // SAFETY: `wide_path` is NUL-terminated. Omitting FILE_SHARE_DELETE keeps
-    // the parent directory name stable until the returned handle is dropped.
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        Err(io::Error::last_os_error().into())
-    } else {
-        // SAFETY: CreateFileW returned a new owned handle.
-        Ok(unsafe { File::from_raw_handle(handle) })
+#[cfg(all(test, unix))]
+fn inject_lock_replacement(path: &Path) -> Result<(), SnapshotError> {
+    let mut replacement = REPLACE_LOCK_BEFORE_ACQUIRE
+        .lock()
+        .expect("lock replacement test hook must not be poisoned");
+    if replacement.as_deref() == Some(path) {
+        *replacement = None;
+        fs::remove_file(path)?;
+        File::create(path)?;
     }
+    Ok(())
+}
+
+fn changed_lock_error(path: &Path) -> SnapshotError {
+    SnapshotError::InvalidImage(format!(
+        "snapshot lock path changed while acquiring ownership: {}",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn verify_lock_file_at(
+    parent_dir: &File,
+    lock_name: &std::ffi::OsStr,
+    lock: &File,
+    lock_path: &Path,
+) -> Result<(), SnapshotError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = lock.metadata()?;
+    let current = rustix::fs::openat(
+        parent_dir,
+        lock_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| changed_lock_error(lock_path))?;
+    let current = current.metadata()?;
+    if !opened.is_file()
+        || !current.is_file()
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+    {
+        return Err(changed_lock_error(lock_path));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_lock_file_path(lock: &File, lock_path: &Path) -> Result<(), SnapshotError> {
+    if !lock.metadata()?.is_file()
+        || !crate::sidecar::same_file(lock, lock_path).map_err(|_| changed_lock_error(lock_path))?
+    {
+        return Err(changed_lock_error(lock_path));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1062,8 +1102,7 @@ fn create_secure_temp_at(staging_dir: &File) -> Result<File, SnapshotError> {
     )
     .map_err(rustix_io_error)?;
     let file = File::from(descriptor);
-    set_private_unix_acl(&file, false)?;
-    rustix::fs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(rustix_io_error)?;
+    protect_temp_security(&file)?;
     Ok(file)
 }
 
@@ -1168,6 +1207,15 @@ fn set_private_unix_acl(file: &File, _is_directory: bool) -> Result<(), Snapshot
     install_macos_acl(file, acl)
 }
 
+#[cfg(unix)]
+pub(crate) fn protect_temp_security(file: &File) -> Result<(), SnapshotError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    set_private_unix_acl(file, false)?;
+    rustix::fs::fchmod(file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
+        .map_err(rustix_io_error)?;
+    Ok(())
+}
+
 #[cfg(windows)]
 struct PrivateSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
 
@@ -1237,7 +1285,7 @@ fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
 }
 
 #[cfg(windows)]
-fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
+pub(crate) fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
     use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
@@ -2362,6 +2410,24 @@ mod tests {
         ));
         drop(first);
         SnapshotStore::open(&path).expect("lock released with store");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lock_replacement_between_open_and_acquire_is_rejected() {
+        let directory = TestDirectory::new();
+        let path = directory.snapshot();
+        let lock = lock_path(&absolute_normalized_path(&path).unwrap());
+        *REPLACE_LOCK_BEFORE_ACQUIRE
+            .lock()
+            .expect("lock replacement test hook must not be poisoned") = Some(lock.clone());
+
+        assert!(matches!(
+            SnapshotStore::open(&path),
+            Err(SnapshotError::InvalidImage(message))
+                if message.contains("lock path changed")
+        ));
+        assert!(!path.exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

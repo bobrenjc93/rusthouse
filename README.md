@@ -140,7 +140,9 @@ checksum mismatch.
 For `catalog.rhcat`, the store holds an OS advisory lock on
 `catalog.rhcat.rusthouse-lock`. This is the same lock namespace used by
 `Database`, so the two persistence APIs cannot concurrently publish incompatible
-formats to one path. While holding it, a commit validates and encodes the
+formats to one path. After locking, the store reopens the sidecar and verifies
+its native file identity; Windows also pins the parent directory without delete
+sharing for the handle's lifetime. While holding it, a commit validates and encodes the
 image, creates `.catalog.rhcat.tmp` as a private staging directory inside the
 snapshot directory, writes and calls `sync_all` on its `snapshot` file, then
 atomically renames that file over `catalog.rhcat`. Unix creates the staging
@@ -237,6 +239,8 @@ cargo run -- --help
 The library exposes `Database` and independent `Session` handles. A session accepts
 `BEGIN`, `COMMIT`, and `ROLLBACK` alongside `CREATE TABLE`, `DROP TABLE`, `INSERT
 INTO ... VALUES`, and simple `SELECT` projections and predicates.
+Double-quoted tokens are identifiers only and are never interpreted as these
+statement keywords.
 
 Transactions pin an immutable catalog generation. Reads use that generation plus the
 session's staged table replacements, so readers remain stable and writers read their
@@ -260,14 +264,18 @@ paths ending in that suffix or beginning with `.` are rejected so neither persis
 API can replace another writer's active lock or staging path. Lock files are opened
 without following symlinks and, after locking, must resolve to the same native file
 identity as the opened handle. The database parent directory must already exist; RustHouse never creates a
-directory tree whose ancestor entries fall outside its durability barrier.
+directory tree whose ancestor entries fall outside its durability barrier. On Windows,
+the opened database retains a no-delete-share parent handle so that path cannot be
+renamed and replaced while the writer remains active.
 Candidates and recovery backups use the reserved `.rusthouse-tmp.` filename prefix,
 which `Database::open` also rejects after canonicalizing the path. A concurrent database
 therefore cannot adopt or replace another database's pending snapshot.
 Writer-side validation guarantees every committed catalog satisfies the decoder's
 table, column, row, string, file-size, and total-allocation bounds.
 
-Snapshot temporary files start owner-only and are synced before publication. Existing
+Snapshot temporary files are protected owner-only before any catalog bytes are written
+and are synced before publication. Unix removes inherited ACL entries and Windows uses
+a protected DACL granting access only to the owner and system. Existing
 Unix UID/GID, modes, and ACLs are copied before the atomic rename (ACLs on macOS, Linux,
 and FreeBSD), followed by a parent-directory sync. If that final sync fails, the API
 returns `Error::CommitDurabilityUncertain` but installs the already-published generation

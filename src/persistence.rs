@@ -15,6 +15,8 @@ use crate::catalog::CatalogGeneration;
 use crate::error::{Error, Result};
 #[cfg(unix)]
 use crate::sidecar::lock_name;
+#[cfg(windows)]
+use crate::sidecar::open_parent_directory_guard;
 use crate::sidecar::{TEMP_PREFIX, is_reserved_name, lock_path};
 use crate::storage::{ColumnData, ColumnDef, DataType, EngineTable as Table};
 
@@ -56,6 +58,8 @@ pub(crate) struct Persistence {
     parent_dir: File,
     #[cfg(unix)]
     file_name: std::ffi::OsString,
+    #[cfg(windows)]
+    _parent_guard: File,
     _lock: File,
 }
 
@@ -69,6 +73,10 @@ impl Persistence {
         #[cfg(unix)]
         let parent_dir = File::open(path.parent().expect("normalized path has a parent"))
             .map_err(|error| Error::io("open database directory", error))?;
+        #[cfg(windows)]
+        let parent_guard =
+            open_parent_directory_guard(path.parent().expect("normalized path has a parent"))
+                .map_err(|error| Error::io("open database directory", error))?;
         #[cfg(unix)]
         let file_name = path
             .file_name()
@@ -87,6 +95,8 @@ impl Persistence {
             parent_dir,
             #[cfg(unix)]
             file_name,
+            #[cfg(windows)]
+            _parent_guard: parent_guard,
             _lock: lock,
         })
     }
@@ -245,7 +255,9 @@ fn open_database_lock(path: &Path, database_path: &Path) -> Result<File> {
     }
     #[cfg(windows)]
     {
-        if !windows::same_file(&file, path)? {
+        if !crate::sidecar::same_file(&file, path)
+            .map_err(|error| Error::io("inspect database lock identity", error))?
+        {
             return Err(Error::UnsafeLockPath(path.display().to_string()));
         }
     }
@@ -428,22 +440,10 @@ fn write_and_replace(
     } else {
         None
     };
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        options.share_mode(FILE_SHARE_DELETE);
-    }
-    let mut file = options
-        .open(temporary)
-        .map_err(|error| Error::io("create private temporary snapshot", error))?;
+    let mut file = crate::catalog::create_secure_temp(temporary).map_err(|error| Error::Io {
+        operation: "create private temporary snapshot",
+        message: error.to_string(),
+    })?;
     file.write_all(bytes)
         .map_err(|error| Error::io("write temporary snapshot", error))?;
     file.sync_all()
@@ -486,6 +486,10 @@ fn write_and_replace_at(
     )
     .map_err(|error| rustix_error("create private temporary snapshot", error))?;
     let mut file = File::from(descriptor);
+    crate::catalog::protect_temp_security(&file).map_err(|error| Error::Io {
+        operation: "protect temporary snapshot",
+        message: error.to_string(),
+    })?;
     file.write_all(bytes)
         .map_err(|error| Error::io("write temporary snapshot", error))?;
     file.sync_all()
@@ -584,12 +588,9 @@ where
 #[cfg(windows)]
 mod windows {
     use std::ffi::c_void;
-    use std::fs::{self, File, OpenOptions};
+    use std::fs;
     use std::io;
-    use std::mem::MaybeUninit;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::ptr;
 
@@ -601,35 +602,10 @@ mod windows {
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-    #[repr(C)]
-    struct FileTime {
-        low_date_time: u32,
-        high_date_time: u32,
-    }
-
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        file_attributes: u32,
-        creation_time: FileTime,
-        last_access_time: FileTime,
-        last_write_time: FileTime,
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
 
     #[link(name = "Kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-        fn GetFileInformationByHandle(
-            file: *mut c_void,
-            information: *mut ByHandleFileInformation,
-        ) -> i32;
         fn ReplaceFileW(
             replaced: *const u16,
             replacement: *const u16,
@@ -638,44 +614,6 @@ mod windows {
             exclude: *mut c_void,
             reserved: *mut c_void,
         ) -> i32;
-    }
-
-    pub(super) fn same_file(opened: &File, path: &Path) -> Result<bool> {
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        let current = match options.open(path) {
-            Ok(file) => file,
-            Err(_) => return Ok(false),
-        };
-        if current
-            .metadata()
-            .map_err(|error| Error::io("inspect database lock path", error))?
-            .file_type()
-            .is_symlink()
-        {
-            return Ok(false);
-        }
-        Ok(file_identity(opened)? == file_identity(&current)?)
-    }
-
-    fn file_identity(file: &File) -> Result<(u32, u64)> {
-        let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
-        // The handle is live and the output points to storage for the documented C struct.
-        let succeeded =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
-        if succeeded == 0 {
-            return Err(Error::io(
-                "inspect database lock identity",
-                io::Error::last_os_error(),
-            ));
-        }
-        // GetFileInformationByHandle initializes the structure when it succeeds.
-        let information = unsafe { information.assume_init() };
-        let file_index =
-            (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
-        Ok((information.volume_serial_number, file_index))
     }
 
     pub(super) fn replace_snapshot(

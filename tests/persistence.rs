@@ -25,6 +25,41 @@ fn lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock)
 }
 
+#[cfg(target_os = "macos")]
+fn install_inheritable_test_acl(path: &Path) {
+    use exacl::{AclEntry, Flag, Perm};
+
+    let acl = [AclEntry::allow_user(
+        "nobody",
+        Perm::READ | Perm::EXECUTE,
+        Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT,
+    )];
+    exacl::setfacl(&[path], &acl, None).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn install_inheritable_test_acl(path: &Path) {
+    use exacl::{AclEntry, Flag, Perm};
+
+    let mut acl = exacl::getfacl(path, None).unwrap();
+    acl.extend([
+        AclEntry::allow_user("", Perm::READ | Perm::WRITE | Perm::EXECUTE, Flag::DEFAULT),
+        AclEntry::allow_user("nobody", Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+        AclEntry::allow_group("", Perm::empty(), Flag::DEFAULT),
+        AclEntry::allow_mask(Perm::READ | Perm::EXECUTE, Flag::DEFAULT),
+        AclEntry::allow_other(Perm::empty(), Flag::DEFAULT),
+    ]);
+    exacl::setfacl(&[path], &acl, None).unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn acl_allows_nobody(path: &Path) -> bool {
+    exacl::getfacl(path, None)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.name.ends_with("nobody") && entry.perms.contains(exacl::Perm::READ))
+}
+
 #[test]
 fn committed_generation_reopens_with_schema_and_rows() {
     let path = temporary_path("reopen");
@@ -170,6 +205,37 @@ fn parent_replacement_keeps_database_writers_and_snapshots_isolated() {
     ));
     drop(replacement);
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_parent_directory_replacement_is_blocked_until_drop() {
+    let root = temporary_path("windows-parent-guard").with_extension("dir");
+    let active_parent = root.join("active");
+    let moved_parent = root.join("moved");
+    fs::create_dir_all(&active_parent).unwrap();
+    let active_path = active_parent.join("database.db");
+    let moved_path = moved_parent.join("database.db");
+    let database = Database::open(&active_path).unwrap();
+
+    assert!(fs::rename(&active_parent, &moved_parent).is_err());
+    assert!(active_parent.exists());
+    assert!(!moved_parent.exists());
+    database.execute("CREATE TABLE guarded (id Int64)").unwrap();
+    assert!(matches!(
+        database.execute("SELECT * FROM guarded"),
+        Ok(StatementResult::Query(_))
+    ));
+
+    drop(database);
+    fs::rename(&active_parent, &moved_parent).unwrap();
+    let reopened = Database::open(&moved_path).unwrap();
+    assert!(matches!(
+        reopened.execute("SELECT * FROM guarded"),
+        Ok(StatementResult::Query(_))
+    ));
+    drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -365,6 +431,28 @@ fn replacement_is_private_and_preserves_existing_mode() {
     }
     drop(database);
     remove_database(&path);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn inherited_parent_acl_does_not_reach_first_database_snapshot() {
+    let root = temporary_path("inherited-security").with_extension("dir");
+    fs::create_dir(&root).unwrap();
+    install_inheritable_test_acl(&root);
+    let probe = root.join("probe");
+    fs::write(&probe, b"probe").unwrap();
+    assert!(acl_allows_nobody(&probe));
+    fs::remove_file(probe).unwrap();
+
+    let path = root.join("database.db");
+    let database = Database::open(&path).unwrap();
+    database
+        .execute("CREATE TABLE private_data (id Int64)")
+        .unwrap();
+    assert!(!acl_allows_nobody(&path));
+
+    drop(database);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]

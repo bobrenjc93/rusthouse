@@ -230,6 +230,38 @@ fn one_shot_execute_rejects_transaction_control() {
 }
 
 #[test]
+fn quoted_transaction_keywords_do_not_control_the_session() {
+    let database = Database::new();
+    let mut session = database.session();
+    session.execute("BEGIN").unwrap();
+    session.execute("CREATE TABLE staged (id Int64)").unwrap();
+
+    for statement in [
+        "\"begin\"",
+        "\"commit\"",
+        "\"rollback\"",
+        "\"start\" \"transaction\"",
+    ] {
+        assert!(matches!(
+            session.execute(statement),
+            Err(Error::Parse { .. })
+        ));
+        assert!(session.in_transaction());
+        assert!(matches!(
+            session.execute("SELECT * FROM staged"),
+            Ok(StatementResult::Query(_))
+        ));
+    }
+
+    session.execute("ROLLBACK").unwrap();
+    assert!(!session.in_transaction());
+    assert!(matches!(
+        session.execute("SELECT * FROM staged"),
+        Err(Error::TableNotFound(_))
+    ));
+}
+
+#[test]
 fn engine_predicates_follow_shared_numeric_and_projection_semantics() {
     let database = Database::new();
     let mut session = database.session();
