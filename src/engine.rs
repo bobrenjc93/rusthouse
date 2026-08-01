@@ -340,7 +340,7 @@ impl Engine {
                 return Err(Error::Unsupported("GROUP BY ALL".into()));
             }
         };
-        let group_by = resolve_group_by(&group_by, &projections)?;
+        let group_by = resolve_group_by(&group_by, &projections, &source)?;
         if group_by.iter().any(contains_aggregate) {
             return Err(Error::Constraint(
                 "aggregate functions are not allowed in GROUP BY".into(),
@@ -399,7 +399,7 @@ impl Engine {
             || projections
                 .iter()
                 .any(|item| contains_aggregate(&item.expr))
-            || select.having.as_ref().is_some_and(contains_aggregate)
+            || select.having.is_some()
             || order_by.iter().any(|item| contains_aggregate(&item.expr));
         if grouped {
             for projection in &projections {
@@ -836,7 +836,11 @@ fn expand_projections(items: &[SelectItem], source: &EvalSource<'_>) -> Result<V
     Ok(projections)
 }
 
-fn resolve_group_by(group_by: &[Expr], projections: &[Projection]) -> Result<Vec<Expr>> {
+fn resolve_group_by(
+    group_by: &[Expr],
+    projections: &[Projection],
+    source: &EvalSource<'_>,
+) -> Result<Vec<Expr>> {
     group_by
         .iter()
         .map(|expr| {
@@ -848,7 +852,15 @@ fn resolve_group_by(group_by: &[Expr], projections: &[Projection]) -> Result<Vec
             {
                 return Err(Error::Unsupported("quoted identifiers".into()));
             }
-            if let Expr::Identifier(identifier) = expr
+            let source_has_column = if let Expr::Identifier(identifier) = expr {
+                source
+                    .table
+                    .is_some_and(|table| table.schema().index_of(&identifier.value).is_ok())
+            } else {
+                false
+            };
+            if !source_has_column
+                && let Expr::Identifier(identifier) = expr
                 && let Some(projection) = projections.iter().find(|projection| {
                     normalize_identifier(&projection.header)
                         == normalize_identifier(&identifier.value)
@@ -1076,6 +1088,11 @@ fn infer_function_type(
     let (name, arguments, distinct) = function_parts(function)?;
     if is_aggregate_name(&name) {
         if name == "count" && arguments.is_empty() {
+            if distinct {
+                return Err(Error::Constraint(
+                    "COUNT(DISTINCT) requires an expression".into(),
+                ));
+            }
             return Ok(Some(DataType::Int64));
         }
         if arguments.len() != 1 {
@@ -1084,6 +1101,11 @@ fn infer_function_type(
         let argument = unnamed_argument(&arguments[0])?;
         let data_type = match argument {
             FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => {
+                if distinct {
+                    return Err(Error::Constraint(
+                        "COUNT(DISTINCT *) is not supported".into(),
+                    ));
+                }
                 if name == "count" {
                     return Ok(Some(DataType::Int64));
                 }
@@ -2242,6 +2264,11 @@ fn eval_group(
 fn eval_aggregate(function: &Function, source: &EvalSource<'_>, rows: &[usize]) -> Result<Value> {
     let (name, arguments, distinct) = function_parts(function)?;
     if name == "count" && arguments.is_empty() {
+        if distinct {
+            return Err(Error::Constraint(
+                "COUNT(DISTINCT) requires an expression".into(),
+            ));
+        }
         return Ok(Value::Int64(rows.len() as i64));
     }
     if arguments.len() != 1 {
@@ -2252,6 +2279,11 @@ fn eval_aggregate(function: &Function, source: &EvalSource<'_>, rows: &[usize]) 
         argument,
         FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_)
     ) {
+        if distinct {
+            return Err(Error::Constraint(
+                "COUNT(DISTINCT *) is not supported".into(),
+            ));
+        }
         return if name == "count" {
             Ok(Value::Int64(rows.len() as i64))
         } else {
@@ -2929,6 +2961,59 @@ mod tests {
                 Value::Int64(2),
                 Value::Float64(0.5),
             ]]
+        );
+    }
+
+    #[test]
+    fn having_without_group_by_uses_one_implicit_group() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Int64); INSERT INTO t VALUES (1), (2)")
+            .unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT 1 AS x FROM t HAVING TRUE").rows,
+            vec![vec![Value::Int64(1)]]
+        );
+        assert!(
+            query(&mut engine, "SELECT 1 AS x FROM t HAVING FALSE")
+                .rows
+                .is_empty()
+        );
+        assert!(engine.execute("SELECT n FROM t HAVING TRUE").is_err());
+        assert!(engine.execute("SELECT 1 FROM t HAVING n > 0").is_err());
+    }
+
+    #[test]
+    fn group_by_source_columns_take_precedence_over_aliases() {
+        let mut engine = Engine::default();
+        engine
+            .execute(
+                "CREATE TABLE t (a Int64, b Int64);
+                 INSERT INTO t VALUES (1, 10), (1, 20);",
+            )
+            .unwrap();
+        assert!(
+            engine
+                .execute("SELECT a AS b, SUM(b) FROM t GROUP BY b")
+                .is_err()
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT COUNT(*) AS b FROM t GROUP BY b").rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(1)]]
+        );
+    }
+
+    #[test]
+    fn rejects_distinct_wildcard_counts() {
+        let mut engine = Engine::default();
+        engine
+            .execute("CREATE TABLE t (n Int64); INSERT INTO t VALUES (1), (1), (2)")
+            .unwrap();
+        assert!(engine.execute("SELECT COUNT(DISTINCT *) FROM t").is_err());
+        assert!(engine.execute("SELECT COUNT(DISTINCT t.*) FROM t").is_err());
+        assert_eq!(
+            query(&mut engine, "SELECT COUNT(*), COUNT(DISTINCT n) FROM t").rows,
+            vec![vec![Value::Int64(3), Value::Int64(2)]]
         );
     }
 
