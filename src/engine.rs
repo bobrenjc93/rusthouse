@@ -10,10 +10,14 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::error::{Error, Result};
 use crate::storage::{Field, Schema, Table, normalize_identifier};
 use crate::types::{DataType, Value};
+
+const MAX_SQL_EXPRESSION_TOKENS: usize = 1_024;
+const MAX_SQL_NESTING_DEPTH: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -161,6 +165,7 @@ impl Engine {
                 actual: sql.len(),
             });
         }
+        validate_sql_complexity(sql)?;
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| Error::Sql(error.to_string()))
     }
 
@@ -708,6 +713,72 @@ impl Engine {
         enforce_result_byte_limit(&result, result_byte_budget)?;
         Ok(result)
     }
+}
+
+fn validate_sql_complexity(sql: &str) -> Result<()> {
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|error| Error::Sql(error.to_string()))?;
+    let mut expression_base = [0usize; MAX_SQL_NESTING_DEPTH + 1];
+    let mut expression_tokens = [0usize; MAX_SQL_NESTING_DEPTH + 1];
+    let mut expression_max = [0usize; MAX_SQL_NESTING_DEPTH + 1];
+    let mut nesting_depth = 0usize;
+
+    for token in tokens {
+        match token {
+            Token::Whitespace(_) => continue,
+            Token::Comma | Token::SemiColon => {
+                if nesting_depth == 0 {
+                    expression_tokens[0] = 0;
+                    expression_max[0] = 0;
+                } else {
+                    expression_max[nesting_depth] =
+                        expression_max[nesting_depth].max(expression_tokens[nesting_depth]);
+                    expression_tokens[nesting_depth] = expression_base[nesting_depth];
+                }
+                continue;
+            }
+            Token::LParen | Token::LBracket | Token::LBrace => {
+                grow_sql_expression_complexity(&mut expression_tokens[nesting_depth])?;
+                let child_depth = nesting_depth.saturating_add(1);
+                if child_depth > MAX_SQL_NESTING_DEPTH {
+                    return Err(Error::ResourceLimit {
+                        resource: "SQL nesting depth",
+                        limit: MAX_SQL_NESTING_DEPTH,
+                        actual: child_depth,
+                    });
+                }
+                expression_base[child_depth] = expression_tokens[nesting_depth];
+                expression_tokens[child_depth] = expression_tokens[nesting_depth];
+                expression_max[child_depth] = expression_tokens[nesting_depth];
+                nesting_depth = child_depth;
+                continue;
+            }
+            Token::RParen | Token::RBracket | Token::RBrace if nesting_depth > 0 => {
+                let nested_complexity =
+                    expression_max[nesting_depth].max(expression_tokens[nesting_depth]);
+                nesting_depth -= 1;
+                expression_tokens[nesting_depth] =
+                    expression_tokens[nesting_depth].max(nested_complexity);
+            }
+            _ => {}
+        }
+        grow_sql_expression_complexity(&mut expression_tokens[nesting_depth])?;
+    }
+    Ok(())
+}
+
+fn grow_sql_expression_complexity(complexity: &mut usize) -> Result<()> {
+    *complexity = complexity.saturating_add(1);
+    if *complexity > MAX_SQL_EXPRESSION_TOKENS {
+        return Err(Error::ResourceLimit {
+            resource: "SQL expression tokens",
+            limit: MAX_SQL_EXPRESSION_TOKENS,
+            actual: *complexity,
+        });
+    }
+    Ok(())
 }
 
 struct EvalSource<'a> {
@@ -3223,6 +3294,10 @@ fn parse_limit(expr: &Expr) -> Result<usize> {
 }
 
 fn order_ordinal(expr: &Expr, column_count: usize) -> Result<Option<usize>> {
+    let mut expr = expr;
+    while let Expr::Nested(nested) = expr {
+        expr = nested;
+    }
     let Expr::Value(SqlValue::Number(value, _)) = expr else {
         return Ok(None);
     };
@@ -3878,6 +3953,36 @@ mod tests {
     }
 
     #[test]
+    fn resolves_parenthesized_projection_ordinals() {
+        let mut engine = Engine::default();
+        engine
+            .execute(
+                "CREATE TABLE t (n Int64);
+                 INSERT INTO t VALUES (2), (1), (1);",
+            )
+            .unwrap();
+        assert_eq!(
+            query(&mut engine, "SELECT n FROM t ORDER BY (1)").rows,
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(1)],
+                vec![Value::Int64(2)],
+            ]
+        );
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT n, COUNT(*) FROM t GROUP BY (1) ORDER BY (1)",
+            )
+            .rows,
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(2), Value::Int64(1)],
+            ]
+        );
+    }
+
+    #[test]
     fn result_byte_limit_uses_rows_after_distinct_and_limit() {
         let mut engine = Engine::new(EngineConfig {
             max_batch_result_bytes: 1_000,
@@ -4445,6 +4550,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn rejects_recursive_sql_shapes_before_building_an_ast() {
+        let mut engine = Engine::default();
+        for term in ["1", "(1, 2)", "COALESCE(1, 2)", "[1, 2]"] {
+            let expression = std::iter::repeat_n(term, 10_000)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            assert!(matches!(
+                engine.execute(&format!("SELECT {expression}")),
+                Err(Error::ResourceLimit {
+                    resource: "SQL expression tokens",
+                    limit: MAX_SQL_EXPRESSION_TOKENS,
+                    ..
+                })
+            ));
+        }
+
+        let nested = format!(
+            "SELECT {}1{}",
+            "(".repeat(MAX_SQL_NESTING_DEPTH + 1),
+            ")".repeat(MAX_SQL_NESTING_DEPTH + 1)
+        );
+        assert!(matches!(
+            engine.execute(&nested),
+            Err(Error::ResourceLimit {
+                resource: "SQL nesting depth",
+                limit: MAX_SQL_NESTING_DEPTH,
+                ..
+            })
+        ));
+
+        engine.execute("CREATE TABLE bulk (n Int64)").unwrap();
+        let values = (0..2_000)
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO bulk VALUES {values}"))
+            .unwrap();
+        assert_eq!(engine.table("bulk").unwrap().row_count(), 2_000);
     }
 
     #[test]
