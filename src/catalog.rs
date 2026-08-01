@@ -425,6 +425,10 @@ impl From<io::Error> for SnapshotError {
 /// handle is dropped.
 pub struct SnapshotStore {
     path: PathBuf,
+    #[cfg(unix)]
+    parent_dir: File,
+    #[cfg(unix)]
+    file_name: std::ffi::OsString,
     temp_dir: PathBuf,
     temp_path: PathBuf,
     limits: SnapshotLimits,
@@ -461,6 +465,17 @@ impl SnapshotStore {
         ensure_platform_supported()?;
         limits.validate()?;
         let path = absolute_normalized_path(path.as_ref())?;
+        #[cfg(unix)]
+        let parent_dir = File::open(path.parent().expect("normalized path has a parent"))?;
+        #[cfg(unix)]
+        let file_name = path
+            .file_name()
+            .expect("normalized path has a filename")
+            .to_owned();
+        #[cfg(unix)]
+        drop(open_snapshot_file_at(&parent_dir, &file_name, &path)?);
+        #[cfg(windows)]
+        drop(open_snapshot_file_path(&path)?);
         let (lock_path, temp_dir) = sidecar_paths(&path)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -481,6 +496,10 @@ impl SnapshotStore {
 
         Ok(Self {
             path,
+            #[cfg(unix)]
+            parent_dir,
+            #[cfg(unix)]
+            file_name,
             temp_dir,
             temp_path,
             limits,
@@ -503,10 +522,9 @@ impl SnapshotStore {
 
     /// Reads, validates, and decodes the current image.
     pub fn load(&self) -> Result<Option<CatalogImage>, SnapshotError> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let file = match self.open_current_snapshot()? {
+            Some(file) => file,
+            None => return Ok(None),
         };
         let file_len = file.metadata()?.len();
         check_limit("snapshot bytes", file_len, self.limits.max_snapshot_bytes)?;
@@ -551,6 +569,7 @@ impl SnapshotStore {
             .commit_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = self.open_current_snapshot()?;
 
         cleanup_staging(&self.temp_dir, &self.path)?;
         create_secure_staging_dir(&self.temp_dir)?;
@@ -563,7 +582,7 @@ impl SnapshotStore {
             return Err(SnapshotError::InjectedFailure("after temp sync"));
         }
 
-        prepare_temp_security(&temp, &self.temp_path, &self.path)?;
+        prepare_temp_security(&temp, &self.temp_path, existing.as_ref())?;
         temp.sync_all()?;
 
         #[cfg(test)]
@@ -572,7 +591,7 @@ impl SnapshotStore {
         }
 
         drop(temp);
-        publish_temp(&self.temp_path, &self.path)?;
+        self.publish_staged()?;
 
         #[cfg(test)]
         if failpoint == Some(Failpoint::Renamed) {
@@ -582,6 +601,122 @@ impl SnapshotStore {
         let _ = fs::remove_dir(&self.temp_dir);
         sync_parent(&self.path)
     }
+
+    #[cfg(unix)]
+    fn open_current_snapshot(&self) -> Result<Option<File>, SnapshotError> {
+        open_snapshot_file_at(&self.parent_dir, &self.file_name, &self.path)
+    }
+
+    #[cfg(windows)]
+    fn open_current_snapshot(&self) -> Result<Option<File>, SnapshotError> {
+        open_snapshot_file_path(&self.path)
+    }
+
+    #[cfg(unix)]
+    fn publish_staged(&self) -> Result<(), SnapshotError> {
+        let staging_dir = File::open(&self.temp_dir)?;
+        rustix::fs::renameat(&staging_dir, "snapshot", &self.parent_dir, &self.file_name)
+            .map_err(rustix_io_error)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn publish_staged(&self) -> Result<(), SnapshotError> {
+        publish_temp(&self.temp_path, &self.path)
+    }
+}
+
+#[cfg(unix)]
+fn rustix_io_error(error: rustix::io::Errno) -> SnapshotError {
+    io::Error::from_raw_os_error(error.raw_os_error()).into()
+}
+
+#[cfg(unix)]
+fn open_snapshot_file_at(
+    parent_dir: &File,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<Option<File>, SnapshotError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = match rustix::fs::openat(
+        parent_dir,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+        Err(error) if error == rustix::io::Errno::LOOP => {
+            return Err(SnapshotError::SymlinkSnapshot(display_path.to_owned()));
+        }
+        Err(error) => return Err(rustix_io_error(error)),
+    };
+    let file = File::from(descriptor);
+    if !file.metadata()?.file_type().is_file() {
+        return Err(SnapshotError::InvalidImage(
+            "snapshot path must identify a regular file".to_owned(),
+        ));
+    }
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
+fn open_snapshot_file_path(path: &Path) -> Result<Option<File>, SnapshotError> {
+    use std::mem;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
+    };
+
+    let wide_path = wide_path(path);
+    // SAFETY: `wide_path` is NUL-terminated. OPEN_REPARSE_POINT opens the final
+    // component itself, and the returned handle is either invalid or owned.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error().map(|code| code as u32) {
+            Some(code) if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => Ok(None),
+            _ => Err(error.into()),
+        };
+    }
+    // SAFETY: CreateFileW returned a new owned handle. File closes it exactly
+    // once, including all error returns below.
+    let file = unsafe { File::from_raw_handle(handle) };
+    let mut tag_info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: The file handle is valid and `tag_info` is a correctly sized,
+    // writable FILE_ATTRIBUTE_TAG_INFO buffer.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileAttributeTagInfo,
+            (&raw mut tag_info).cast(),
+            mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    if tag_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(SnapshotError::SymlinkSnapshot(path.to_owned()));
+    }
+    Ok(Some(file))
 }
 
 fn absolute_normalized_path(path: &Path) -> Result<PathBuf, SnapshotError> {
@@ -602,34 +737,18 @@ fn absolute_normalized_path(path: &Path) -> Result<PathBuf, SnapshotError> {
         SnapshotError::InvalidImage("snapshot path must have a parent directory".to_owned())
     })?;
     let canonical_parent = parent.canonicalize()?;
-    let path = canonical_parent.join(file_name);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(SnapshotError::SymlinkSnapshot(path))
-        }
-        Ok(_) => Ok(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
-        Err(error) => Err(error.into()),
-    }
+    Ok(canonical_parent.join(file_name))
 }
 
-#[cfg(any(
-    windows,
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd"
-))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn ensure_platform_supported() -> Result<(), SnapshotError> {
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
-))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn ensure_platform_supported() -> Result<(), SnapshotError> {
     Err(SnapshotError::UnsupportedPlatform(
-        "requires Windows, macOS, Linux, or FreeBSD ACL semantics",
+        "requires Windows, macOS, or Linux ACL semantics",
     ))
 }
 
@@ -674,10 +793,7 @@ fn cleanup_staging(temp_dir: &Path, path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
-))]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
@@ -688,18 +804,12 @@ fn create_secure_staging_dir(path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
-))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn create_secure_staging_dir(_path: &Path) -> Result<(), SnapshotError> {
     ensure_platform_supported()
 }
 
-#[cfg(all(
-    unix,
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
-))]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -713,10 +823,7 @@ fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
     Ok(file)
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
-))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn create_secure_temp(_path: &Path) -> Result<File, SnapshotError> {
     ensure_platform_supported()?;
     unreachable!("unsupported platforms return an error")
@@ -728,7 +835,7 @@ fn set_private_unix_acl(path: &Path, _is_directory: bool) -> Result<(), Snapshot
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 fn set_private_unix_acl(path: &Path, is_directory: bool) -> Result<(), SnapshotError> {
     use exacl::{AclEntry, Perm};
 
@@ -850,66 +957,114 @@ fn create_secure_temp(path: &Path) -> Result<File, SnapshotError> {
 }
 
 #[cfg(unix)]
-fn prepare_temp_security(temp: &File, temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+fn prepare_temp_security(
+    temp: &File,
+    temp_path: &Path,
+    existing: Option<&File>,
+) -> Result<(), SnapshotError> {
     use std::os::unix::fs::MetadataExt;
 
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            rustix::fs::fchown(
-                temp,
-                Some(rustix::fs::Uid::from_raw(metadata.uid())),
-                Some(rustix::fs::Gid::from_raw(metadata.gid())),
-            )
-            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
-            copy_unix_acl(temp_path, path)?;
-            temp.set_permissions(metadata.permissions())?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    if let Some(existing) = existing {
+        let metadata = existing.metadata()?;
+        rustix::fs::fchown(
+            temp,
+            Some(rustix::fs::Uid::from_raw(metadata.uid())),
+            Some(rustix::fs::Gid::from_raw(metadata.gid())),
+        )
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        copy_unix_acl(temp, temp_path, existing)?;
+        temp.set_permissions(metadata.permissions())?;
     }
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
-))]
-fn copy_unix_acl(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
-    let acl = exacl::getfacl(path, None)?;
+#[cfg(target_os = "linux")]
+fn copy_unix_acl(_temp: &File, temp_path: &Path, existing: &File) -> Result<(), SnapshotError> {
+    use std::os::fd::AsRawFd;
+
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", existing.as_raw_fd()));
+    let acl = exacl::getfacl(descriptor_path, None)?;
     exacl::setfacl(&[temp_path], &acl, None)?;
     Ok(())
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
-))]
-fn copy_unix_acl(_temp_path: &Path, _path: &Path) -> Result<(), SnapshotError> {
+#[cfg(target_os = "macos")]
+fn copy_unix_acl(temp: &File, _temp_path: &Path, existing: &File) -> Result<(), SnapshotError> {
+    use std::ffi::{c_int, c_uint, c_void};
+    use std::os::fd::AsRawFd;
+
+    const ACL_TYPE_EXTENDED: c_uint = 256;
+
+    unsafe extern "C" {
+        fn acl_free(object: *mut c_void) -> c_int;
+        fn acl_get_fd_np(file_descriptor: c_int, acl_type: c_uint) -> *mut c_void;
+        fn acl_set_fd_np(file_descriptor: c_int, acl: *mut c_void, acl_type: c_uint) -> c_int;
+    }
+
+    // SAFETY: Both descriptors are live for the duration of this function.
+    // acl_get_fd_np returns an owned ACL object or null and sets errno.
+    let acl = unsafe { acl_get_fd_np(existing.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error.into())
+        };
+    }
+
+    // SAFETY: `acl` is the valid object returned above and `temp` remains open.
+    let set_result = unsafe { acl_set_fd_np(temp.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
+    let set_error = (set_result != 0).then(io::Error::last_os_error);
+    // SAFETY: `acl` is owned and has not yet been freed.
+    let free_result = unsafe { acl_free(acl) };
+    if let Some(error) = set_error {
+        return Err(error.into());
+    }
+    if free_result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn copy_unix_acl(_temp: &File, _temp_path: &Path, _existing: &File) -> Result<(), SnapshotError> {
     Ok(())
 }
 
 #[cfg(windows)]
-fn prepare_temp_security(temp: &File, _temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
+fn prepare_temp_security(
+    temp: &File,
+    _temp_path: &Path,
+    existing: Option<&File>,
+) -> Result<(), SnapshotError> {
     use std::os::windows::io::AsRawHandle;
     use std::ptr;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
         GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
         SetKernelObjectSecurity, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    if !path.try_exists()? {
+    let Some(existing) = existing else {
         return Ok(());
-    }
-    let path = wide_path(path);
+    };
     let requested =
         OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut needed = 0u32;
     // SAFETY: The first call intentionally supplies no output buffer so Win32
     // reports the required self-relative security descriptor length.
-    unsafe { GetFileSecurityW(path.as_ptr(), requested, ptr::null_mut(), 0, &mut needed) };
+    unsafe {
+        GetKernelObjectSecurity(
+            existing.as_raw_handle() as HANDLE,
+            requested,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
     if needed == 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -923,8 +1078,8 @@ fn prepare_temp_security(temp: &File, _temp_path: &Path, path: &Path) -> Result<
     // SAFETY: `descriptor` has the exact writable size requested by the first
     // call and both path and buffer remain valid for the duration of the call.
     if unsafe {
-        GetFileSecurityW(
-            path.as_ptr(),
+        GetKernelObjectSecurity(
+            existing.as_raw_handle() as HANDLE,
             requested,
             descriptor_ptr,
             needed,
@@ -938,7 +1093,7 @@ fn prepare_temp_security(temp: &File, _temp_path: &Path, path: &Path) -> Result<
     let mut control = 0u16;
     let mut revision = 0u32;
     // SAFETY: `descriptor_ptr` contains a validated security descriptor
-    // returned by GetFileSecurityW; both output pointers are valid.
+    // returned by GetKernelObjectSecurity; both output pointers are valid.
     if unsafe { GetSecurityDescriptorControl(descriptor_ptr, &mut control, &mut revision) } == 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -971,12 +1126,6 @@ fn wide_path(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(iter::once(0))
         .collect()
-}
-
-#[cfg(unix)]
-fn publish_temp(temp_path: &Path, path: &Path) -> Result<(), SnapshotError> {
-    fs::rename(temp_path, path)?;
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -1914,6 +2063,55 @@ mod tests {
         assert_eq!(reopened.load().expect("load target image"), Some(image));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rejects_final_component_symlink_substitution_after_open() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let path = directory.snapshot();
+        let outside_path = directory.0.join("outside.rhcat");
+        let original = sample_image(5);
+        let outside = sample_image(6);
+        let store = SnapshotStore::open(&path).expect("open protected store");
+        store.commit(&original).expect("commit protected image");
+        let outside_store = SnapshotStore::open(&outside_path).expect("open outside store");
+        outside_store
+            .commit(&outside)
+            .expect("commit outside image");
+        drop(outside_store);
+
+        fs::remove_file(&path).expect("remove protected snapshot");
+        symlink(&outside_path, &path).expect("substitute final component");
+        assert!(matches!(
+            store.load(),
+            Err(SnapshotError::SymlinkSnapshot(_))
+        ));
+        assert!(matches!(
+            store.commit(&sample_image(7)),
+            Err(SnapshotError::SymlinkSnapshot(_))
+        ));
+        assert!(!store.temp_dir.exists());
+
+        let outside_store = SnapshotStore::open(&outside_path).expect("reopen outside store");
+        assert_eq!(
+            outside_store.load().expect("load outside image"),
+            Some(outside)
+        );
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_is_rejected_before_sidecar_creation() {
+        let directory = TestDirectory::new();
+        let path = directory.snapshot();
+        assert!(matches!(
+            SnapshotStore::open(&path),
+            Err(SnapshotError::UnsupportedPlatform(_))
+        ));
+        assert!(!directory.0.join(".catalog.rhcat.lock").exists());
+    }
+
     #[test]
     fn rejects_snapshot_names_that_overlap_live_sidecars() {
         let directory = TestDirectory::new();
@@ -2172,7 +2370,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn preserves_unix_security_metadata_and_keeps_failed_staging_private() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2193,15 +2391,15 @@ mod tests {
             rustix::fs::chown(&path, None, Some(group)).expect("set non-default group");
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            #[cfg(target_os = "linux")]
             use exacl::AclEntryKind;
             use exacl::{AclEntry, Perm};
 
             let mut acl = exacl::getfacl(&path, None).expect("read original ACL");
             acl.push(AclEntry::allow_user("nobody", Perm::READ, None));
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            #[cfg(target_os = "linux")]
             if let Some(mask) = acl
                 .iter_mut()
                 .find(|entry| entry.kind == AclEntryKind::Mask)
@@ -2215,7 +2413,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
             .expect("set non-default snapshot mode");
         let expected_metadata = fs::metadata(&path).expect("original metadata");
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let expected_acl = exacl::getfacl(&path, None).expect("read expected ACL");
 
         store
@@ -2225,7 +2423,7 @@ mod tests {
         assert_eq!(replaced_metadata.mode() & 0o777, 0o640);
         assert_eq!(replaced_metadata.uid(), expected_metadata.uid());
         assert_eq!(replaced_metadata.gid(), expected_metadata.gid());
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_eq!(
             exacl::getfacl(&path, None).expect("read replacement ACL"),
             expected_acl

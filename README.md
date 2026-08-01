@@ -54,11 +54,13 @@ through one shared store handle are serialized in process. Snapshot filenames
 matching the generated `.<name>.lock` or `.<name>.tmp` sidecar namespace are
 rejected, including case and trailing-dot/space aliases.
 
-Snapshot persistence supports Windows, macOS, Linux, and FreeBSD. Other Unix
-targets compile but return `SnapshotError::UnsupportedPlatform` before creating
-sidecars because their ACL semantics are not implemented. Existing or dangling
-final-component symbolic links are rejected so reads, locks, and publication
-cannot address different filesystem objects.
+Snapshot persistence supports Windows, macOS, and Linux. Other Unix targets,
+including FreeBSD filesystems with either POSIX.1e or NFSv4 ACLs, compile but
+return `SnapshotError::UnsupportedPlatform` before creating sidecars because
+their ACL semantics are not implemented. Existing or dangling final-component
+symbolic links are rejected. On Unix, each subsequent read, metadata copy, and
+publication is relative to the parent directory handle opened by the store, so
+replacing that final component after open cannot redirect snapshot access.
 
 ### Version 1 binary format
 
