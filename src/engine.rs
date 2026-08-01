@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -419,7 +420,9 @@ impl Engine {
             }
         }
 
+        let memory = MemoryTracker::new(self.config.max_batch_result_bytes);
         let mut filtered_rows = Vec::new();
+        let mut filtered_memory = memory.reserve(std::mem::size_of::<Vec<usize>>())?;
         let source_rows = source.table.map_or(1, Table::row_count);
         for row in 0..source_rows {
             if let Some(predicate) = &select.selection
@@ -427,13 +430,15 @@ impl Engine {
             {
                 continue;
             }
+            filtered_memory.grow(std::mem::size_of::<usize>())?;
             filtered_rows.push(row);
         }
-        let groups = if grouped {
-            make_groups(&source, filtered_rows, &group_by)?
+        let (groups, group_memory) = if grouped {
+            make_groups(&source, filtered_rows, &group_by, &memory)?
         } else {
-            filtered_rows.into_iter().map(|row| vec![row]).collect()
+            make_single_row_groups(filtered_rows, &memory)?
         };
+        drop(filtered_memory);
 
         let columns = projections
             .iter()
@@ -442,10 +447,15 @@ impl Engine {
         let limit = limit.map(parse_limit).transpose()?.unwrap_or(usize::MAX);
         let ordered = !order_by.is_empty();
         let distinct = select.distinct.is_some();
-        let mut materialized_bytes = columns_retained_bytes(&columns);
-        enforce_materialization_limit(materialized_bytes, self.config.max_batch_result_bytes)?;
+        let mut projected_memory = memory.reserve(
+            columns_retained_bytes(&columns)
+                .saturating_add(std::mem::size_of::<Vec<ProjectedRow>>()),
+        )?;
         let mut projected = Vec::new();
         let mut seen = HashSet::new();
+        let seen_memory =
+            distinct.then(|| memory.reserve(std::mem::size_of::<HashSet<Vec<KeyValue>>>()));
+        let mut seen_memory = seen_memory.transpose()?;
         for rows in groups {
             if !ordered && projected.len() >= limit {
                 break;
@@ -458,6 +468,7 @@ impl Engine {
                     &HashMap::new(),
                     &alias_expressions,
                     &alias_types,
+                    &memory,
                 )?
                 .sql_bool()?
                     != Some(true)
@@ -473,16 +484,33 @@ impl Engine {
                     &HashMap::new(),
                     &HashMap::new(),
                     &empty_type_aliases,
+                    &memory,
                 )?);
             }
-            if distinct && !seen.insert(row_key(&values)) {
-                continue;
+            if distinct {
+                let key = row_key(&values);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen_memory
+                    .as_mut()
+                    .expect("DISTINCT reservation exists")
+                    .grow(key_retained_bytes(&key).saturating_add(std::mem::size_of::<usize>()))?;
+                seen.insert(key);
             }
-            materialized_bytes = materialized_bytes.saturating_add(row_retained_bytes(&values));
-            enforce_materialization_limit(materialized_bytes, self.config.max_batch_result_bytes)?;
+            let source_rows = if ordered { rows } else { Vec::new() };
+            projected_memory.grow(
+                std::mem::size_of::<ProjectedRow>()
+                    .saturating_add(values_retained_payload_bytes(&values))
+                    .saturating_add(
+                        source_rows
+                            .len()
+                            .saturating_mul(std::mem::size_of::<usize>()),
+                    ),
+            )?;
             projected.push(ProjectedRow {
                 values,
-                source_rows: rows,
+                source_rows,
                 sort_keys: Vec::new(),
             });
             if !ordered && projected.len() > self.config.max_result_rows {
@@ -493,6 +521,7 @@ impl Engine {
                 });
             }
         }
+        drop(group_memory);
 
         if ordered {
             for row in &mut projected {
@@ -524,15 +553,11 @@ impl Engine {
                             &aliases,
                             &alias_expressions,
                             &alias_types,
+                            &memory,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
-                materialized_bytes =
-                    materialized_bytes.saturating_add(values_retained_payload_bytes(&sort_keys));
-                enforce_materialization_limit(
-                    materialized_bytes,
-                    self.config.max_batch_result_bytes,
-                )?;
+                projected_memory.grow(values_retained_payload_bytes(&sort_keys))?;
                 row.sort_keys = sort_keys;
             }
             validate_sort_types(&projected)?;
@@ -591,6 +616,58 @@ struct ProjectedRow {
     values: Vec<Value>,
     source_rows: Vec<usize>,
     sort_keys: Vec<Value>,
+}
+
+struct MemoryTracker {
+    limit: usize,
+    current: Cell<usize>,
+}
+
+impl MemoryTracker {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            current: Cell::new(0),
+        }
+    }
+
+    fn reserve(&self, bytes: usize) -> Result<MemoryReservation<'_>> {
+        let mut reservation = MemoryReservation {
+            tracker: self,
+            bytes: 0,
+        };
+        reservation.grow(bytes)?;
+        Ok(reservation)
+    }
+}
+
+struct MemoryReservation<'a> {
+    tracker: &'a MemoryTracker,
+    bytes: usize,
+}
+
+impl MemoryReservation<'_> {
+    fn grow(&mut self, bytes: usize) -> Result<()> {
+        let actual = self.tracker.current.get().saturating_add(bytes);
+        if actual > self.tracker.limit {
+            return Err(Error::ResourceLimit {
+                resource: "intermediate result bytes",
+                limit: self.tracker.limit,
+                actual,
+            });
+        }
+        self.tracker.current.set(actual);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+impl Drop for MemoryReservation<'_> {
+    fn drop(&mut self) {
+        self.tracker
+            .current
+            .set(self.tracker.current.get().saturating_sub(self.bytes));
+    }
 }
 
 fn validate_statement_options(statement: &Statement) -> Result<()> {
@@ -756,24 +833,15 @@ fn row_retained_bytes(row: &[Value]) -> usize {
 
 fn values_retained_payload_bytes(values: &[Value]) -> usize {
     values.iter().fold(0_usize, |size, value| {
-        size.saturating_add(std::mem::size_of::<Value>())
-            .saturating_add(match value {
-                Value::String(value) => value.len(),
-                _ => 0,
-            })
+        size.saturating_add(value_retained_payload_bytes(value))
     })
 }
 
-fn enforce_materialization_limit(actual: usize, limit: usize) -> Result<()> {
-    if actual > limit {
-        Err(Error::ResourceLimit {
-            resource: "intermediate result bytes",
-            limit,
-            actual,
-        })
-    } else {
-        Ok(())
-    }
+fn value_retained_payload_bytes(value: &Value) -> usize {
+    std::mem::size_of::<Value>().saturating_add(match value {
+        Value::String(value) => value.len(),
+        _ => 0,
+    })
 }
 
 fn object_name(name: &ObjectName) -> Result<String> {
@@ -2217,6 +2285,7 @@ fn eval_group(
     aliases: &HashMap<String, Value>,
     lazy_aliases: &HashMap<String, &Expr>,
     alias_types: &HashMap<String, Option<DataType>>,
+    memory: &MemoryTracker,
 ) -> Result<Value> {
     if let Expr::Identifier(identifier) = expr
         && let Some(value) = aliases.get(&normalize_identifier(&identifier.value))
@@ -2233,6 +2302,7 @@ fn eval_group(
             &HashMap::new(),
             &HashMap::new(),
             alias_types,
+            memory,
         );
     }
     match expr {
@@ -2243,18 +2313,42 @@ fn eval_group(
         Expr::Function(function) => {
             let name = object_name(&function.name)?.to_ascii_lowercase();
             if is_aggregate_name(&name) {
-                eval_aggregate(function, source, rows)
+                eval_aggregate(function, source, rows, memory)
             } else {
                 let result_type = infer_function_type(function, source, alias_types)?;
                 eval_scalar_function_with(function, result_type, |expr| {
-                    eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)
+                    eval_group(
+                        expr,
+                        source,
+                        rows,
+                        aliases,
+                        lazy_aliases,
+                        alias_types,
+                        memory,
+                    )
                 })
             }
         }
         Expr::BinaryOp { left, op, right } => eval_binary(
-            eval_group(left, source, rows, aliases, lazy_aliases, alias_types)?,
+            eval_group(
+                left,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
             op,
-            eval_group(right, source, rows, aliases, lazy_aliases, alias_types)?,
+            eval_group(
+                right,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
         ),
         Expr::UnaryOp { op, expr } => {
             if let Some(value) = minimum_int_literal(op, expr) {
@@ -2262,30 +2356,100 @@ fn eval_group(
             }
             eval_unary(
                 op,
-                eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?,
+                eval_group(
+                    expr,
+                    source,
+                    rows,
+                    aliases,
+                    lazy_aliases,
+                    alias_types,
+                    memory,
+                )?,
             )
         }
-        Expr::Nested(expr) => eval_group(expr, source, rows, aliases, lazy_aliases, alias_types),
+        Expr::Nested(expr) => eval_group(
+            expr,
+            source,
+            rows,
+            aliases,
+            lazy_aliases,
+            alias_types,
+            memory,
+        ),
         Expr::IsNull(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?.is_null(),
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?
+            .is_null(),
         )),
         Expr::IsNotNull(expr) => Ok(Value::Bool(
-            !eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?.is_null(),
+            !eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?
+            .is_null(),
         )),
         Expr::IsTrue(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?.sql_bool()?
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?
+            .sql_bool()?
                 == Some(true),
         )),
         Expr::IsFalse(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?.sql_bool()?
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?
+            .sql_bool()?
                 == Some(false),
         )),
         Expr::IsNotTrue(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?.sql_bool()?
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?
+            .sql_bool()?
                 != Some(true),
         )),
         Expr::IsNotFalse(expr) => Ok(Value::Bool(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?.sql_bool()?
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?
+            .sql_bool()?
                 != Some(false),
         )),
         Expr::Between {
@@ -2294,16 +2458,40 @@ fn eval_group(
             low,
             high,
         } => {
-            let value = eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?;
+            let value = eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?;
             let lower = eval_binary(
                 value.clone(),
                 &BinaryOperator::GtEq,
-                eval_group(low, source, rows, aliases, lazy_aliases, alias_types)?,
+                eval_group(
+                    low,
+                    source,
+                    rows,
+                    aliases,
+                    lazy_aliases,
+                    alias_types,
+                    memory,
+                )?,
             )?;
             let upper = eval_binary(
                 value,
                 &BinaryOperator::LtEq,
-                eval_group(high, source, rows, aliases, lazy_aliases, alias_types)?,
+                eval_group(
+                    high,
+                    source,
+                    rows,
+                    aliases,
+                    lazy_aliases,
+                    alias_types,
+                    memory,
+                )?,
             )?;
             let result = eval_binary(lower, &BinaryOperator::And, upper)?;
             if *negated {
@@ -2317,13 +2505,29 @@ fn eval_group(
             list,
             negated,
         } => {
-            let needle = eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?;
+            let needle = eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?;
             let mut result = Value::Bool(false);
             for item in list {
                 let equal = eval_binary(
                     needle.clone(),
                     &BinaryOperator::Eq,
-                    eval_group(item, source, rows, aliases, lazy_aliases, alias_types)?,
+                    eval_group(
+                        item,
+                        source,
+                        rows,
+                        aliases,
+                        lazy_aliases,
+                        alias_types,
+                        memory,
+                    )?,
                 )?;
                 if equal == Value::Bool(true) {
                     result = equal;
@@ -2345,8 +2549,24 @@ fn eval_group(
             pattern,
             escape_char,
         } => eval_like(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?,
-            eval_group(pattern, source, rows, aliases, lazy_aliases, alias_types)?,
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
+            eval_group(
+                pattern,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
             *negated,
             false,
             escape_char.as_deref(),
@@ -2357,8 +2577,24 @@ fn eval_group(
             pattern,
             escape_char,
         } => eval_like(
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?,
-            eval_group(pattern, source, rows, aliases, lazy_aliases, alias_types)?,
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
+            eval_group(
+                pattern,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
             *negated,
             true,
             escape_char.as_deref(),
@@ -2371,14 +2607,27 @@ fn eval_group(
         } => eval_cast(
             kind,
             format.as_ref(),
-            eval_group(expr, source, rows, aliases, lazy_aliases, alias_types)?,
+            eval_group(
+                expr,
+                source,
+                rows,
+                aliases,
+                lazy_aliases,
+                alias_types,
+                memory,
+            )?,
             parse_data_type(&data_type.to_string())?.0,
         ),
         _ => Err(Error::Unsupported(format!("expression {expr}"))),
     }
 }
 
-fn eval_aggregate(function: &Function, source: &EvalSource<'_>, rows: &[usize]) -> Result<Value> {
+fn eval_aggregate(
+    function: &Function,
+    source: &EvalSource<'_>,
+    rows: &[usize],
+    memory: &MemoryTracker,
+) -> Result<Value> {
     let (name, arguments, distinct) = function_parts(function)?;
     if name == "count" && arguments.is_empty() {
         if distinct {
@@ -2410,21 +2659,37 @@ fn eval_aggregate(function: &Function, source: &EvalSource<'_>, rows: &[usize]) 
     let FunctionArgExpr::Expr(argument) = argument else {
         unreachable!();
     };
-    let mut values = Vec::with_capacity(rows.len());
+    let mut values = Vec::new();
+    let mut values_memory = memory.reserve(std::mem::size_of::<Vec<Value>>())?;
     let mut seen = HashSet::new();
+    let mut seen_memory = distinct
+        .then(|| memory.reserve(std::mem::size_of::<HashSet<KeyValue>>()))
+        .transpose()?;
     for row in rows {
         let value = eval_row(argument, source, Some(*row))?;
         if value.is_null() {
             continue;
         }
-        if !distinct || seen.insert(value_key(&value)) {
-            values.push(value);
+        if distinct {
+            let key = value_key(&value);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen_memory
+                .as_mut()
+                .expect("DISTINCT reservation exists")
+                .grow(
+                    key_value_retained_bytes(&key).saturating_add(std::mem::size_of::<usize>()),
+                )?;
+            seen.insert(key);
         }
+        values_memory.grow(value_retained_payload_bytes(&value))?;
+        values.push(value);
     }
     match name.as_str() {
         "count" => Ok(Value::Int64(values.len() as i64)),
         "sum" => aggregate_sum(&values),
-        "avg" => aggregate_avg(&values),
+        "avg" => aggregate_avg(&values, memory),
         "min" => aggregate_extreme(&values, false),
         "max" => aggregate_extreme(&values, true),
         _ => unreachable!(),
@@ -2470,10 +2735,14 @@ fn aggregate_sum(values: &[Value]) -> Result<Value> {
     }
 }
 
-fn aggregate_avg(values: &[Value]) -> Result<Value> {
+fn aggregate_avg(values: &[Value], memory: &MemoryTracker) -> Result<Value> {
     if values.is_empty() {
         return Ok(Value::Null);
     }
+    let _numeric_values_memory = memory.reserve(
+        std::mem::size_of::<Vec<f64>>()
+            .saturating_add(values.len().saturating_mul(std::mem::size_of::<f64>())),
+    )?;
     let numeric_values = values
         .iter()
         .map(|value| match value {
@@ -2552,29 +2821,73 @@ fn row_key(values: &[Value]) -> Vec<KeyValue> {
     values.iter().map(value_key).collect()
 }
 
-fn make_groups(
+fn key_retained_bytes(key: &[KeyValue]) -> usize {
+    key.iter()
+        .fold(std::mem::size_of::<Vec<KeyValue>>(), |size, value| {
+            size.saturating_add(key_value_retained_bytes(value))
+        })
+}
+
+fn key_value_retained_bytes(value: &KeyValue) -> usize {
+    std::mem::size_of::<KeyValue>().saturating_add(match value {
+        KeyValue::String(value) => value.len(),
+        _ => 0,
+    })
+}
+
+fn make_groups<'a>(
     source: &EvalSource<'_>,
     rows: Vec<usize>,
     group_by: &[Expr],
-) -> Result<Vec<Vec<usize>>> {
+    memory: &'a MemoryTracker,
+) -> Result<(Vec<Vec<usize>>, MemoryReservation<'a>)> {
+    let mut group_memory = memory.reserve(std::mem::size_of::<Vec<Vec<usize>>>())?;
     if group_by.is_empty() {
-        return Ok(vec![rows]);
+        group_memory.grow(
+            std::mem::size_of::<Vec<usize>>()
+                .saturating_add(rows.len().saturating_mul(std::mem::size_of::<usize>())),
+        )?;
+        return Ok((vec![rows], group_memory));
     }
     let mut indexes = HashMap::<Vec<KeyValue>, usize>::new();
+    let mut index_memory = memory.reserve(std::mem::size_of::<HashMap<Vec<KeyValue>, usize>>())?;
     let mut groups = Vec::<Vec<usize>>::new();
     for row in rows {
         let key = group_by
             .iter()
             .map(|expr| eval_row(expr, source, Some(row)).map(|value| value_key(&value)))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(index) = indexes.get(&key) {
-            groups[*index].push(row);
+        let key_bytes = key_retained_bytes(&key);
+        let key_memory = memory.reserve(key_bytes)?;
+        if let Some(index) = indexes.get(&key).copied() {
+            group_memory.grow(std::mem::size_of::<usize>())?;
+            groups[index].push(row);
         } else {
+            drop(key_memory);
+            index_memory
+                .grow(key_bytes.saturating_add(std::mem::size_of::<usize>().saturating_mul(2)))?;
+            group_memory.grow(
+                std::mem::size_of::<Vec<usize>>().saturating_add(std::mem::size_of::<usize>()),
+            )?;
             indexes.insert(key, groups.len());
             groups.push(vec![row]);
         }
     }
-    Ok(groups)
+    Ok((groups, group_memory))
+}
+
+fn make_single_row_groups(
+    rows: Vec<usize>,
+    memory: &MemoryTracker,
+) -> Result<(Vec<Vec<usize>>, MemoryReservation<'_>)> {
+    let mut group_memory = memory.reserve(std::mem::size_of::<Vec<Vec<usize>>>())?;
+    let mut groups = Vec::new();
+    for row in rows {
+        group_memory
+            .grow(std::mem::size_of::<Vec<usize>>().saturating_add(std::mem::size_of::<usize>()))?;
+        groups.push(vec![row]);
+    }
+    Ok((groups, group_memory))
 }
 
 fn parse_limit(expr: &Expr) -> Result<usize> {
@@ -3027,7 +3340,7 @@ mod tests {
     #[test]
     fn having_discarded_groups_do_not_consume_result_bytes() {
         let mut engine = Engine::new(EngineConfig {
-            max_batch_result_bytes: 100,
+            max_batch_result_bytes: 2_000,
             ..EngineConfig::default()
         });
         engine.execute("CREATE TABLE t (n Int64)").unwrap();
@@ -3188,7 +3501,7 @@ mod tests {
     #[test]
     fn result_byte_limit_uses_rows_after_distinct_and_limit() {
         let mut engine = Engine::new(EngineConfig {
-            max_batch_result_bytes: 100,
+            max_batch_result_bytes: 1_000,
             ..EngineConfig::default()
         });
         engine.execute("CREATE TABLE t (n Int64)").unwrap();
@@ -3208,7 +3521,7 @@ mod tests {
     #[test]
     fn bounds_intermediate_projection_materialization() {
         let mut engine = Engine::new(EngineConfig {
-            max_batch_result_bytes: 512,
+            max_batch_result_bytes: 1_024,
             ..EngineConfig::default()
         });
         engine.execute("CREATE TABLE t (payload String)").unwrap();
@@ -3236,6 +3549,38 @@ mod tests {
                 engine.execute(sql),
                 Err(Error::ResourceLimit {
                     resource: "intermediate result bytes",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn enforces_memory_budget_across_analytical_intermediates() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 100,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (n Int64)").unwrap();
+        let values = (0..10_000)
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+
+        for sql in [
+            "SELECT COUNT(n) FROM t",
+            "SELECT n, COUNT(*) FROM t GROUP BY n",
+            "SELECT COUNT(DISTINCT n) FROM t",
+            "SELECT DISTINCT n FROM t",
+        ] {
+            assert!(matches!(
+                engine.execute(sql),
+                Err(Error::ResourceLimit {
+                    resource: "intermediate result bytes",
+                    limit: 100,
                     ..
                 })
             ));
