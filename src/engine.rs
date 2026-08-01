@@ -1839,55 +1839,16 @@ fn eval_row_with_memory(
             negated,
             low,
             high,
-        } => {
-            let value = eval_row_with_memory(expr, source, row, memory)?;
-            let lower = eval_binary_with_memory(
-                value.clone(),
-                &BinaryOperator::GtEq,
-                eval_row_with_memory(low, source, row, memory)?,
-                memory,
-            )?;
-            let upper = eval_binary_with_memory(
-                value,
-                &BinaryOperator::LtEq,
-                eval_row_with_memory(high, source, row, memory)?,
-                memory,
-            )?;
-            let result = eval_binary_with_memory(lower, &BinaryOperator::And, upper, memory)?;
-            if *negated {
-                eval_unary(&UnaryOperator::Not, result)
-            } else {
-                Ok(result)
-            }
-        }
+        } => eval_between_operands(expr, low, high, *negated, memory, |expr| {
+            eval_row_with_memory(expr, source, row, memory)
+        }),
         Expr::InList {
             expr,
             list,
             negated,
-        } => {
-            let needle = eval_row_with_memory(expr, source, row, memory)?;
-            let mut result = Value::Bool(false);
-            for item in list {
-                let equal = eval_binary_with_memory(
-                    needle.clone(),
-                    &BinaryOperator::Eq,
-                    eval_row_with_memory(item, source, row, memory)?,
-                    memory,
-                )?;
-                if equal == Value::Bool(true) {
-                    result = equal;
-                    break;
-                }
-                if equal.is_null() {
-                    result = Value::Null;
-                }
-            }
-            if *negated {
-                eval_unary(&UnaryOperator::Not, result)
-            } else {
-                Ok(result)
-            }
-        }
+        } => eval_in_list_operands(expr, list, *negated, memory, |expr| {
+            eval_row_with_memory(expr, source, row, memory)
+        }),
         Expr::Like {
             negated,
             expr,
@@ -2052,6 +2013,89 @@ fn eval_binary_operands(
         reservation.grow(value.len())?;
     }
     eval_binary_with_memory(left, operator, right, memory)
+}
+
+fn eval_between_operands(
+    value_expr: &Expr,
+    low_expr: &Expr,
+    high_expr: &Expr,
+    negated: bool,
+    memory: Option<&MemoryTracker>,
+    mut evaluate: impl FnMut(&Expr) -> Result<Value>,
+) -> Result<Value> {
+    let mut operand_memory = memory
+        .map(|memory| memory.reserve(std::mem::size_of::<Value>().saturating_mul(3)))
+        .transpose()?;
+    let value = evaluate(value_expr)?;
+    grow_string_reservation(&mut operand_memory, &value)?;
+    let low = evaluate(low_expr)?;
+    grow_string_reservation(&mut operand_memory, &low)?;
+    let high = evaluate(high_expr)?;
+    grow_string_reservation(&mut operand_memory, &high)?;
+
+    let value_clone_memory = memory
+        .map(|memory| memory.reserve(value_retained_payload_bytes(&value)))
+        .transpose()?;
+    let lower = eval_binary_with_memory(value.clone(), &BinaryOperator::GtEq, low, memory)?;
+    drop(value_clone_memory);
+    let upper = eval_binary_with_memory(value, &BinaryOperator::LtEq, high, memory)?;
+    let result = eval_binary_with_memory(lower, &BinaryOperator::And, upper, memory)?;
+    if negated {
+        eval_unary(&UnaryOperator::Not, result)
+    } else {
+        Ok(result)
+    }
+}
+
+fn eval_in_list_operands(
+    needle_expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    memory: Option<&MemoryTracker>,
+    mut evaluate: impl FnMut(&Expr) -> Result<Value>,
+) -> Result<Value> {
+    let mut needle_memory = memory
+        .map(|memory| memory.reserve(std::mem::size_of::<Value>()))
+        .transpose()?;
+    let needle = evaluate(needle_expr)?;
+    grow_string_reservation(&mut needle_memory, &needle)?;
+    let mut result = Value::Bool(false);
+    for item_expr in list {
+        let mut item_memory = memory
+            .map(|memory| memory.reserve(std::mem::size_of::<Value>()))
+            .transpose()?;
+        let item = evaluate(item_expr)?;
+        grow_string_reservation(&mut item_memory, &item)?;
+        let needle_clone_memory = memory
+            .map(|memory| memory.reserve(value_retained_payload_bytes(&needle)))
+            .transpose()?;
+        let equal = eval_binary_with_memory(needle.clone(), &BinaryOperator::Eq, item, memory)?;
+        drop(needle_clone_memory);
+        if equal == Value::Bool(true) {
+            result = equal;
+            break;
+        }
+        if equal.is_null() {
+            result = Value::Null;
+        }
+    }
+    if negated {
+        eval_unary(&UnaryOperator::Not, result)
+    } else {
+        Ok(result)
+    }
+}
+
+fn grow_string_reservation(
+    reservation: &mut Option<MemoryReservation<'_>>,
+    value: &Value,
+) -> Result<()> {
+    if let Some(reservation) = reservation
+        && let Value::String(value) = value
+    {
+        reservation.grow(value.capacity())?;
+    }
+    Ok(())
 }
 
 fn eval_binary_with_memory(
@@ -2488,10 +2532,14 @@ fn eval_scalar_function_with(
             ));
         }
         for argument in arguments {
+            let mut argument_memory = memory
+                .map(|memory| memory.reserve(std::mem::size_of::<Value>()))
+                .transpose()?;
             let FunctionArgExpr::Expr(expr) = unnamed_argument(argument)? else {
                 return Err(Error::Unsupported("wildcard argument to coalesce".into()));
             };
             let value = evaluate(expr)?;
+            grow_string_reservation(&mut argument_memory, &value)?;
             if !value.is_null() {
                 return match result_type {
                     Some(data_type) => cast_value(value, data_type),
@@ -2501,13 +2549,23 @@ fn eval_scalar_function_with(
         }
         return Ok(Value::Null);
     }
-    let values = arguments
-        .iter()
-        .map(|argument| match unnamed_argument(argument)? {
-            FunctionArgExpr::Expr(expr) => evaluate(expr),
-            _ => Err(Error::Unsupported(format!("wildcard argument to {name}"))),
+    let mut values_memory = memory
+        .map(|memory| {
+            memory.reserve(
+                std::mem::size_of::<Vec<Value>>()
+                    .saturating_add(arguments.len().saturating_mul(std::mem::size_of::<Value>())),
+            )
         })
-        .collect::<Result<Vec<_>>>()?;
+        .transpose()?;
+    let mut values = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let value = match unnamed_argument(argument)? {
+            FunctionArgExpr::Expr(expr) => evaluate(expr)?,
+            _ => return Err(Error::Unsupported(format!("wildcard argument to {name}"))),
+        };
+        grow_string_reservation(&mut values_memory, &value)?;
+        values.push(value);
+    }
     match (name.as_str(), values.as_slice()) {
         ("abs", [Value::Int64(value)]) => value
             .checked_abs()
@@ -2778,8 +2836,8 @@ fn eval_group(
             negated,
             low,
             high,
-        } => {
-            let value = eval_group(
+        } => eval_between_operands(expr, low, high, *negated, Some(memory), |expr| {
+            eval_group(
                 expr,
                 source,
                 rows,
@@ -2787,48 +2845,14 @@ fn eval_group(
                 lazy_aliases,
                 alias_types,
                 memory,
-            )?;
-            let lower = eval_binary_with_memory(
-                value.clone(),
-                &BinaryOperator::GtEq,
-                eval_group(
-                    low,
-                    source,
-                    rows,
-                    aliases,
-                    lazy_aliases,
-                    alias_types,
-                    memory,
-                )?,
-                Some(memory),
-            )?;
-            let upper = eval_binary_with_memory(
-                value,
-                &BinaryOperator::LtEq,
-                eval_group(
-                    high,
-                    source,
-                    rows,
-                    aliases,
-                    lazy_aliases,
-                    alias_types,
-                    memory,
-                )?,
-                Some(memory),
-            )?;
-            let result = eval_binary_with_memory(lower, &BinaryOperator::And, upper, Some(memory))?;
-            if *negated {
-                eval_unary(&UnaryOperator::Not, result)
-            } else {
-                Ok(result)
-            }
-        }
+            )
+        }),
         Expr::InList {
             expr,
             list,
             negated,
-        } => {
-            let needle = eval_group(
+        } => eval_in_list_operands(expr, list, *negated, Some(memory), |expr| {
+            eval_group(
                 expr,
                 source,
                 rows,
@@ -2836,37 +2860,8 @@ fn eval_group(
                 lazy_aliases,
                 alias_types,
                 memory,
-            )?;
-            let mut result = Value::Bool(false);
-            for item in list {
-                let equal = eval_binary_with_memory(
-                    needle.clone(),
-                    &BinaryOperator::Eq,
-                    eval_group(
-                        item,
-                        source,
-                        rows,
-                        aliases,
-                        lazy_aliases,
-                        alias_types,
-                        memory,
-                    )?,
-                    Some(memory),
-                )?;
-                if equal == Value::Bool(true) {
-                    result = equal;
-                    break;
-                }
-                if equal.is_null() {
-                    result = Value::Null;
-                }
-            }
-            if *negated {
-                eval_unary(&UnaryOperator::Not, result)
-            } else {
-                Ok(result)
-            }
-        }
+            )
+        }),
         Expr::Like {
             negated,
             expr,
@@ -3570,6 +3565,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_numeric_comparisons_preserve_integer_precision() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            query(
+                &mut engine,
+                "SELECT
+                    9007199254740993 = 9007199254740992.0,
+                    9007199254740993 > 9007199254740992.0,
+                    9007199254740992.0 < 9007199254740993,
+                    9223372036854775807 = 9223372036854775808.0,
+                    9223372036854775807 < 9223372036854775808.0,
+                    9223372036854775808.0 > 9223372036854775807,
+                    -9223372036854775808 = -9223372036854775808.0",
+            )
+            .rows,
+            vec![vec![
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+            ]]
+        );
+    }
+
+    #[test]
     fn like_matches_unicode_and_honors_escape() {
         let mut engine = Engine::default();
         assert_eq!(
@@ -3994,6 +4017,54 @@ mod tests {
             )
             .rows,
             vec![vec![Value::Bool(false), Value::Int64(2_000)]]
+        );
+    }
+
+    #[test]
+    fn string_predicate_and_scalar_operands_remain_charged() {
+        let value = "x".repeat(1_000);
+        let mut constrained = Engine::new(EngineConfig {
+            max_batch_result_bytes: 1_300,
+            ..EngineConfig::default()
+        });
+        constrained.execute("CREATE TABLE t (s String)").unwrap();
+        constrained
+            .execute(&format!("INSERT INTO t VALUES ('{value}')"))
+            .unwrap();
+        for sql in [
+            "SELECT 1 FROM t WHERE s BETWEEN s AND s",
+            "SELECT 1 FROM t WHERE s IN (s)",
+            "SELECT LOWER(s) FROM t",
+        ] {
+            assert!(matches!(
+                constrained.execute(sql),
+                Err(Error::ResourceLimit {
+                    resource: "intermediate result bytes",
+                    limit: 1_300,
+                    ..
+                })
+            ));
+        }
+
+        let mut sufficient = Engine::new(EngineConfig {
+            max_batch_result_bytes: 5_000,
+            ..EngineConfig::default()
+        });
+        sufficient.execute("CREATE TABLE t (s String)").unwrap();
+        sufficient
+            .execute(&format!("INSERT INTO t VALUES ('{value}')"))
+            .unwrap();
+        assert_eq!(
+            query(
+                &mut sufficient,
+                "SELECT s BETWEEN s AND s, s IN (s), LENGTH(LOWER(s)) FROM t",
+            )
+            .rows,
+            vec![vec![
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Int64(1_000),
+            ]]
         );
     }
 

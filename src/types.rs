@@ -83,12 +83,10 @@ impl Value {
             (Self::Float64(left), Self::Float64(right)) => left
                 .partial_cmp(right)
                 .ok_or_else(|| Error::Type("NaN cannot be compared".into())),
-            (Self::Int64(left), Self::Float64(right)) => (*left as f64)
-                .partial_cmp(right)
-                .ok_or_else(|| Error::Type("NaN cannot be compared".into())),
-            (Self::Float64(left), Self::Int64(right)) => left
-                .partial_cmp(&(*right as f64))
-                .ok_or_else(|| Error::Type("NaN cannot be compared".into())),
+            (Self::Int64(left), Self::Float64(right)) => compare_i64_f64(*left, *right),
+            (Self::Float64(left), Self::Int64(right)) => {
+                compare_i64_f64(*right, *left).map(Ordering::reverse)
+            }
             (Self::Bool(left), Self::Bool(right)) => Ok(left.cmp(right)),
             (Self::String(left), Self::String(right)) => Ok(left.cmp(right)),
             (left, right) => Err(Error::Type(format!(
@@ -97,6 +95,27 @@ impl Value {
                 right.type_name()
             ))),
         }
+    }
+}
+
+fn compare_i64_f64(integer: i64, float: f64) -> Result<Ordering> {
+    if float.is_nan() {
+        return Err(Error::Type("NaN cannot be compared".into()));
+    }
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    const I64_MINIMUM: f64 = -9_223_372_036_854_775_808.0;
+    if float >= I64_UPPER_EXCLUSIVE {
+        return Ok(Ordering::Less);
+    }
+    if float < I64_MINIMUM {
+        return Ok(Ordering::Greater);
+    }
+
+    let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() > 0.0 => Ok(Ordering::Less),
+        Ordering::Equal if float.fract() < 0.0 => Ok(Ordering::Greater),
+        ordering => Ok(ordering),
     }
 }
 
