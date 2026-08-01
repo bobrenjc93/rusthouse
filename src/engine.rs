@@ -439,8 +439,17 @@ impl Engine {
             .iter()
             .map(|projection| projection.header.clone())
             .collect::<Vec<_>>();
+        let limit = limit.map(parse_limit).transpose()?.unwrap_or(usize::MAX);
+        let ordered = !order_by.is_empty();
+        let distinct = select.distinct.is_some();
+        let mut materialized_bytes = columns_retained_bytes(&columns);
+        enforce_materialization_limit(materialized_bytes, self.config.max_batch_result_bytes)?;
         let mut projected = Vec::new();
+        let mut seen = HashSet::new();
         for rows in groups {
+            if !ordered && projected.len() >= limit {
+                break;
+            }
             if let Some(having) = &select.having
                 && eval_group(
                     having,
@@ -466,19 +475,26 @@ impl Engine {
                     &empty_type_aliases,
                 )?);
             }
+            if distinct && !seen.insert(row_key(&values)) {
+                continue;
+            }
+            materialized_bytes = materialized_bytes.saturating_add(row_retained_bytes(&values));
+            enforce_materialization_limit(materialized_bytes, self.config.max_batch_result_bytes)?;
             projected.push(ProjectedRow {
                 values,
                 source_rows: rows,
                 sort_keys: Vec::new(),
             });
+            if !ordered && projected.len() > self.config.max_result_rows {
+                return Err(Error::ResourceLimit {
+                    resource: "result rows",
+                    limit: self.config.max_result_rows,
+                    actual: projected.len(),
+                });
+            }
         }
 
-        if select.distinct.is_some() {
-            let mut seen = HashSet::new();
-            projected.retain(|row| seen.insert(row_key(&row.values)));
-        }
-
-        if !order_by.is_empty() {
+        if ordered {
             for row in &mut projected {
                 let aliases = columns
                     .iter()
@@ -486,7 +502,7 @@ impl Engine {
                     .zip(row.values.iter().cloned())
                     .map(|(name, value)| (normalize_identifier(&name), value))
                     .collect::<HashMap<_, _>>();
-                row.sort_keys = order_by
+                let sort_keys = order_by
                     .iter()
                     .map(|order| {
                         if let Some(index) = order_ordinal(&order.expr, columns.len())? {
@@ -511,12 +527,18 @@ impl Engine {
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
+                materialized_bytes =
+                    materialized_bytes.saturating_add(values_retained_payload_bytes(&sort_keys));
+                enforce_materialization_limit(
+                    materialized_bytes,
+                    self.config.max_batch_result_bytes,
+                )?;
+                row.sort_keys = sort_keys;
             }
             validate_sort_types(&projected)?;
             projected.sort_by(|left, right| compare_projected(left, right, order_by));
         }
 
-        let limit = limit.map(parse_limit).transpose()?.unwrap_or(usize::MAX);
         projected.truncate(limit);
         if projected.len() > self.config.max_result_rows {
             return Err(Error::ResourceLimit {
@@ -729,14 +751,29 @@ fn columns_retained_bytes(columns: &[String]) -> usize {
 }
 
 fn row_retained_bytes(row: &[Value]) -> usize {
-    row.iter()
-        .fold(std::mem::size_of::<Vec<Value>>(), |size, value| {
-            size.saturating_add(std::mem::size_of::<Value>())
-                .saturating_add(match value {
-                    Value::String(value) => value.len(),
-                    _ => 0,
-                })
+    std::mem::size_of::<Vec<Value>>().saturating_add(values_retained_payload_bytes(row))
+}
+
+fn values_retained_payload_bytes(values: &[Value]) -> usize {
+    values.iter().fold(0_usize, |size, value| {
+        size.saturating_add(std::mem::size_of::<Value>())
+            .saturating_add(match value {
+                Value::String(value) => value.len(),
+                _ => 0,
+            })
+    })
+}
+
+fn enforce_materialization_limit(actual: usize, limit: usize) -> Result<()> {
+    if actual > limit {
+        Err(Error::ResourceLimit {
+            resource: "intermediate result bytes",
+            limit,
+            actual,
         })
+    } else {
+        Ok(())
+    }
 }
 
 fn object_name(name: &ObjectName) -> Result<String> {
@@ -1033,7 +1070,19 @@ fn infer_expression_type(
             }
             Ok(Some(DataType::Bool))
         }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | Expr::ILike {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            like_escape_char(escape_char.as_deref())?;
             ensure_type(
                 infer_expression_type(expr, source, aliases)?,
                 DataType::String,
@@ -1692,10 +1741,10 @@ fn minimum_int_literal(operator: &UnaryOperator, expr: &Expr) -> Option<Value> {
     if !matches!(operator, UnaryOperator::Minus) {
         return None;
     }
-    let expr = match expr {
-        Expr::Nested(expr) => expr.as_ref(),
-        expr => expr,
-    };
+    let mut expr = expr;
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
     match expr {
         Expr::Value(SqlValue::Number(value, _)) if value == "9223372036854775808" => {
             Some(Value::Int64(i64::MIN))
@@ -1934,20 +1983,7 @@ fn eval_like(
     let (Value::String(mut value), Value::String(pattern)) = (value, pattern) else {
         return Err(Error::Type("LIKE expects String operands".into()));
     };
-    let escape = escape
-        .map(|escape| {
-            let mut characters = escape.chars();
-            let character = characters
-                .next()
-                .ok_or_else(|| Error::Constraint("LIKE ESCAPE must be one character".into()))?;
-            if characters.next().is_some() {
-                return Err(Error::Constraint(
-                    "LIKE ESCAPE must be one character".into(),
-                ));
-            }
-            Ok(character)
-        })
-        .transpose()?;
+    let escape = like_escape_char(escape)?;
     let mut tokens = like_tokens(&pattern, escape)?;
     if insensitive {
         value = value.to_lowercase();
@@ -1964,6 +2000,23 @@ fn eval_like(
     }
     let matched = like_matches(&value, &tokens);
     Ok(Value::Bool(if negated { !matched } else { matched }))
+}
+
+fn like_escape_char(escape: Option<&str>) -> Result<Option<char>> {
+    escape
+        .map(|escape| {
+            let mut characters = escape.chars();
+            let character = characters
+                .next()
+                .ok_or_else(|| Error::Constraint("LIKE ESCAPE must be one character".into()))?;
+            if characters.next().is_some() {
+                return Err(Error::Constraint(
+                    "LIKE ESCAPE must be one character".into(),
+                ));
+            }
+            Ok(character)
+        })
+        .transpose()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2867,6 +2920,28 @@ mod tests {
     }
 
     #[test]
+    fn validates_like_escape_width_at_all_cardinalities() {
+        let mut engine = Engine::default();
+        engine.execute("CREATE TABLE t (s String)").unwrap();
+        let invalid_queries = [
+            "SELECT s LIKE 'a' ESCAPE 'xx' FROM t",
+            "SELECT s ILIKE 'a' ESCAPE '' FROM t",
+        ];
+        for sql in invalid_queries {
+            assert!(matches!(engine.execute(sql), Err(Error::Constraint(_))));
+        }
+
+        engine.execute("INSERT INTO t VALUES ('a')").unwrap();
+        for sql in invalid_queries {
+            assert!(matches!(engine.execute(sql), Err(Error::Constraint(_))));
+        }
+        assert_eq!(
+            query(&mut engine, "SELECT s LIKE 'a' ESCAPE 'é' FROM t").rows,
+            vec![vec![Value::Bool(true)]]
+        );
+    }
+
+    #[test]
     fn scalar_string_functions_propagate_null() {
         let mut engine = Engine::default();
         assert_eq!(
@@ -2981,13 +3056,19 @@ mod tests {
     #[test]
     fn supports_the_minimum_int64_literal() {
         let mut engine = Engine::default();
-        assert_eq!(
-            query(&mut engine, "SELECT -9223372036854775808").rows,
-            vec![vec![Value::Int64(i64::MIN)]]
-        );
+        for sql in [
+            "SELECT -9223372036854775808",
+            "SELECT -(9223372036854775808)",
+            "SELECT -((9223372036854775808))",
+        ] {
+            assert_eq!(
+                query(&mut engine, sql).rows,
+                vec![vec![Value::Int64(i64::MIN)]]
+            );
+        }
         engine.execute("CREATE TABLE t (n Int64)").unwrap();
         engine
-            .execute("INSERT INTO t VALUES (-9223372036854775808)")
+            .execute("INSERT INTO t VALUES (-((9223372036854775808)))")
             .unwrap();
         assert_eq!(
             query(&mut engine, "SELECT n FROM t").rows,
@@ -3122,6 +3203,43 @@ mod tests {
             query(&mut engine, "SELECT DISTINCT n FROM t").rows,
             vec![vec![Value::Int64(1)]]
         );
+    }
+
+    #[test]
+    fn bounds_intermediate_projection_materialization() {
+        let mut engine = Engine::new(EngineConfig {
+            max_batch_result_bytes: 512,
+            ..EngineConfig::default()
+        });
+        engine.execute("CREATE TABLE t (payload String)").unwrap();
+        let payload = "x".repeat(128);
+        let values = std::iter::repeat_n(format!("('{payload}')"), 10)
+            .collect::<Vec<_>>()
+            .join(", ");
+        engine
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+
+        assert_eq!(
+            query(&mut engine, "SELECT payload FROM t LIMIT 1").rows,
+            vec![vec![Value::String(payload.clone())]]
+        );
+        assert_eq!(
+            query(&mut engine, "SELECT DISTINCT payload FROM t").rows,
+            vec![vec![Value::String(payload)]]
+        );
+        for sql in [
+            "SELECT payload FROM t",
+            "SELECT payload FROM t ORDER BY payload LIMIT 1",
+        ] {
+            assert!(matches!(
+                engine.execute(sql),
+                Err(Error::ResourceLimit {
+                    resource: "intermediate result bytes",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

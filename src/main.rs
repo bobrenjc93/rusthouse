@@ -139,7 +139,7 @@ fn print_help() {
            --max-rows-per-insert <N>       Maximum rows in one INSERT\n  \
            --max-rows-per-table <N>        Maximum rows stored in a table\n  \
            --max-result-rows <N>           Maximum emitted rows per SELECT\n  \
-           --max-batch-result-bytes <N>    Maximum retained result bytes\n  \
+           --max-batch-result-bytes <N>    Maximum retained/intermediate result bytes\n  \
          -h, --help                        Print help",
         name = rusthouse::product_name(),
         binary = env!("CARGO_PKG_NAME")
