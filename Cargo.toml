@@ -7,3 +7,28 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+axum = "0.8.4"
+fs4 = "1.1.0"
+hyper = { version = "1.6.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.15", features = ["service", "tokio"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.45.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7.15"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[target.'cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))'.dependencies]
+exacl = "0.13.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
+[[bench]]
+name = "vector_kernels"
+harness = false
+
+[dev-dependencies]
+reqwest = { version = "0.12.20", default-features = false, features = ["json"] }
