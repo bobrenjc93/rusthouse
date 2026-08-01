@@ -254,3 +254,42 @@ fn quoting_preserves_case_without_creating_a_separate_namespace() {
         Error::Catalog(message) if message.contains("duplicate column")
     ));
 }
+
+#[test]
+fn reserved_literal_and_operator_names_require_quoting() {
+    for name in ["null", "true", "false", "not"] {
+        let error = Database::new()
+            .execute(&format!("CREATE TABLE t ({name} Int64);"))
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Parse { ref message, .. } if message.contains("must be quoted")),
+            "unquoted reserved name was not rejected: {name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn mixed_numeric_comparisons_are_exact_beyond_float_integer_precision() {
+    let result = Database::new()
+        .execute(
+            "SELECT
+                9007199254740993 > 9007199254740992.0 AS above_2_53,
+                9007199254740993 = 9007199254740992.0 AS unequal_2_53,
+                9007199254740992.0 < 9007199254740993 AS reverse_order,
+                9223372036854775807 < 9223372036854775808.0 AS below_upper_edge,
+                -9223372036854775808 = -9223372036854775808.0 AS exact_lower_edge;",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]]
+    );
+}

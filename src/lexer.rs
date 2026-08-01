@@ -31,7 +31,29 @@ pub(crate) struct Token {
     pub position: usize,
 }
 
+pub(crate) const MAX_SQL_TOKENS: usize = 2_000_000;
+
+fn push_token(
+    tokens: &mut Vec<Token>,
+    kind: TokenKind,
+    position: usize,
+    token_limit: usize,
+) -> Result<()> {
+    if tokens.len() >= token_limit {
+        return Err(Error::Limit {
+            resource: "SQL tokens",
+            limit: token_limit,
+        });
+    }
+    tokens.push(Token { kind, position });
+    Ok(())
+}
+
 pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
+    lex_with_token_limit(input, MAX_SQL_TOKENS)
+}
+
+fn lex_with_token_limit(input: &str, token_limit: usize) -> Result<Vec<Token>> {
     let bytes = input.as_bytes();
     let mut position = 0;
     let mut tokens = Vec::new();
@@ -121,10 +143,7 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                         message: "unterminated string literal".to_owned(),
                     });
                 }
-                tokens.push(Token {
-                    kind: TokenKind::String(value),
-                    position: start,
-                });
+                push_token(&mut tokens, TokenKind::String(value), start, token_limit)?;
             }
             b'`' | b'"' => {
                 let start = position;
@@ -157,10 +176,12 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                         message: "unterminated quoted identifier".to_owned(),
                     });
                 }
-                tokens.push(Token {
-                    kind: TokenKind::QuotedWord(value),
-                    position: start,
-                });
+                push_token(
+                    &mut tokens,
+                    TokenKind::QuotedWord(value),
+                    start,
+                    token_limit,
+                )?;
             }
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
                 let start = position;
@@ -171,10 +192,12 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                 {
                     position += 1;
                 }
-                tokens.push(Token {
-                    kind: TokenKind::Word(input[start..position].to_owned()),
-                    position: start,
-                });
+                push_token(
+                    &mut tokens,
+                    TokenKind::Word(input[start..position].to_owned()),
+                    start,
+                    token_limit,
+                )?;
             }
             byte if byte.is_ascii_digit() => {
                 let start = position;
@@ -207,10 +230,12 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                         });
                     }
                 }
-                tokens.push(Token {
-                    kind: TokenKind::Number(input[start..position].to_owned()),
-                    position: start,
-                });
+                push_token(
+                    &mut tokens,
+                    TokenKind::Number(input[start..position].to_owned()),
+                    start,
+                    token_limit,
+                )?;
             }
             byte => {
                 let start = position;
@@ -252,10 +277,7 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
                         });
                     }
                 };
-                tokens.push(Token {
-                    kind,
-                    position: start,
-                });
+                push_token(&mut tokens, kind, start, token_limit)?;
             }
         }
     }
@@ -264,4 +286,22 @@ pub(crate) fn lex(input: &str) -> Result<Vec<Token>> {
         position: input.len(),
     });
     Ok(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adversarial_punctuation_stops_at_the_token_budget() {
+        let input = ";".repeat(4_097);
+        let error = lex_with_token_limit(&input, 4_096).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Limit {
+                resource: "SQL tokens",
+                limit: 4_096
+            }
+        ));
+    }
 }

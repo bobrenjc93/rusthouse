@@ -526,6 +526,12 @@ impl Parser {
     fn parse_identifier(&mut self) -> Result<Identifier> {
         match self.current().kind.clone() {
             TokenKind::Word(name) => {
+                if is_reserved_identifier(&name) {
+                    return Err(Error::parse(
+                        self.current().position,
+                        format!("reserved keyword '{name}' must be quoted as an identifier"),
+                    ));
+                }
                 self.index += 1;
                 Ok(Identifier::unquoted(name))
             }
@@ -565,21 +571,7 @@ impl Parser {
 
     fn current_is_alias(&self) -> bool {
         match &self.current().kind {
-            TokenKind::Word(word) => !matches!(
-                word.to_ascii_lowercase().as_str(),
-                "from"
-                    | "where"
-                    | "group"
-                    | "having"
-                    | "order"
-                    | "limit"
-                    | "format"
-                    | "asc"
-                    | "desc"
-                    | "and"
-                    | "or"
-                    | "is"
-            ),
+            TokenKind::Word(word) => !is_reserved_identifier(word),
             TokenKind::QuotedWord(_) => true,
             _ => false,
         }
@@ -652,6 +644,41 @@ impl Parser {
             ),
         )
     }
+}
+
+fn is_reserved_identifier(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "create"
+            | "table"
+            | "if"
+            | "not"
+            | "exists"
+            | "engine"
+            | "insert"
+            | "into"
+            | "values"
+            | "select"
+            | "distinct"
+            | "as"
+            | "from"
+            | "where"
+            | "group"
+            | "by"
+            | "having"
+            | "order"
+            | "asc"
+            | "desc"
+            | "limit"
+            | "offset"
+            | "format"
+            | "null"
+            | "true"
+            | "false"
+            | "and"
+            | "or"
+            | "is"
+    )
 }
 
 fn parse_number(text: &str, position: usize, negative: bool) -> Result<Value> {

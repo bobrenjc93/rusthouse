@@ -75,15 +75,16 @@ impl Value {
         match (self, other) {
             (Self::Null, _) | (_, Self::Null) => Ok(None),
             (Self::Int64(left), Self::Int64(right)) => Ok(Some(left.cmp(right))),
-            (Self::Float64(left), Self::Float64(right)) => Ok(left.partial_cmp(right)),
-            (Self::Int64(left), Self::Float64(right)) => (*left as f64)
+            (Self::Float64(left), Self::Float64(right)) => left
                 .partial_cmp(right)
                 .ok_or_else(|| Error::Type("cannot compare NaN values".to_owned()))
                 .map(Some),
-            (Self::Float64(left), Self::Int64(right)) => left
-                .partial_cmp(&(*right as f64))
-                .ok_or_else(|| Error::Type("cannot compare NaN values".to_owned()))
-                .map(Some),
+            (Self::Int64(left), Self::Float64(right)) => {
+                compare_i64_to_f64(*left, *right).map(Some)
+            }
+            (Self::Float64(left), Self::Int64(right)) => {
+                compare_i64_to_f64(*right, *left).map(|ordering| Some(ordering.reverse()))
+            }
             (Self::Bool(left), Self::Bool(right)) => Ok(Some(left.cmp(right))),
             (Self::Bool(left), Self::Int64(right)) => Ok(Some((*left as i64).cmp(right))),
             (Self::Int64(left), Self::Bool(right)) => Ok(Some(left.cmp(&(*right as i64)))),
@@ -104,5 +105,30 @@ impl Value {
             Self::Bool(_) => "Bool",
             Self::String(_) => "String",
         }
+    }
+}
+
+fn compare_i64_to_f64(integer: i64, float: f64) -> Result<Ordering> {
+    if float.is_nan() {
+        return Err(Error::Type("cannot compare NaN values".to_owned()));
+    }
+    if float < i64::MIN as f64 {
+        return Ok(Ordering::Greater);
+    }
+    // i64::MAX rounds up to 2^63 as Float64, so this boundary is exclusive
+    // for every Int64 even though a direct `as f64` comparison is not.
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Ok(Ordering::Less);
+    }
+
+    let truncated = float.trunc() as i64;
+    let ordering = integer.cmp(&truncated);
+    if ordering != Ordering::Equal || float.fract() == 0.0 {
+        return Ok(ordering);
+    }
+    if float.is_sign_positive() {
+        Ok(Ordering::Less)
+    } else {
+        Ok(Ordering::Greater)
     }
 }
