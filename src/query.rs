@@ -160,6 +160,10 @@ impl QueryCancellation {
             Err(_) => CancellationOutcome::Cancelled,
         }
     }
+
+    pub(crate) fn publication_started(&self) -> bool {
+        self.execution_state.load(Ordering::Acquire) == EXECUTION_PUBLISHING
+    }
 }
 
 impl ExecutionCancellation for QueryCancellation {

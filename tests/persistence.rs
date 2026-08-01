@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rusthouse::{Database, Error, StatementResult, Value};
+use rusthouse::{Database, Error, SnapshotError, SnapshotStore, StatementResult, Value};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
@@ -83,6 +83,42 @@ fn a_persisted_path_has_one_exclusive_owner() {
         Ok(StatementResult::Query(_))
     ));
     drop(next_owner);
+    remove_database(&path);
+}
+
+#[test]
+fn database_and_snapshot_store_share_lock_and_reserved_namespaces() {
+    let path = temporary_path("cross-api-lock");
+    let lock = lock_path(&path);
+    let database = Database::open(&path).unwrap();
+    assert!(matches!(
+        SnapshotStore::open(&path),
+        Err(SnapshotError::Locked(_))
+    ));
+    assert!(matches!(
+        SnapshotStore::open(&lock),
+        Err(SnapshotError::ReservedSnapshotName(_))
+    ));
+    assert!(matches!(
+        Database::open(&lock),
+        Err(Error::ReservedDatabasePath(_))
+    ));
+    drop(database);
+
+    let snapshot = SnapshotStore::open(&path).unwrap();
+    assert!(matches!(
+        Database::open(&path),
+        Err(Error::DatabaseAlreadyOpen(_))
+    ));
+    let catalog_temp = path.parent().unwrap().join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(matches!(
+        Database::open(&catalog_temp),
+        Err(Error::ReservedDatabasePath(_))
+    ));
+    drop(snapshot);
     remove_database(&path);
 }
 

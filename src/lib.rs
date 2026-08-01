@@ -14,6 +14,7 @@ pub mod http;
 pub mod kernels;
 mod persistence;
 pub mod query;
+mod sidecar;
 mod sql;
 pub mod storage;
 mod value;

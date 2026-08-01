@@ -295,6 +295,45 @@ async fn production_database_bounds_result_materialization() {
 }
 
 #[tokio::test]
+async fn published_mutation_remains_successful_when_response_cannot_fit() {
+    let database = Database::new();
+    let config = ServerConfig {
+        max_response_bytes: 1,
+        ..ServerConfig::default()
+    };
+    let (server, url) = start(Arc::new(database.clone()), config).await;
+    let client = Client::new();
+
+    let created = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("CREATE TABLE committed (id Int64)")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::NO_CONTENT);
+    assert!(created.bytes().await.unwrap().is_empty());
+    assert!(matches!(
+        database.execute("SELECT * FROM committed"),
+        Ok(rusthouse::StatementResult::Query(_))
+    ));
+
+    let repeated = client
+        .post(format!("{url}/query"))
+        .header("content-type", "application/sql")
+        .body("CREATE TABLE committed (id Int64)")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        repeated.json::<Value>().await.unwrap()["error"]["code"],
+        "conflict"
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn timed_out_database_mutation_cannot_publish_after_cancellation() {
     let database = Database::new();
     database

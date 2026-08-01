@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::CatalogGeneration;
 use crate::error::{Error, Result};
+#[cfg(unix)]
+use crate::sidecar::lock_name;
+use crate::sidecar::{TEMP_PREFIX, is_reserved_name, lock_path};
 use crate::storage::{ColumnData, ColumnDef, DataType, EngineTable as Table};
 
 const MAGIC: &[u8; 10] = b"RUSTHOUSE\0";
@@ -26,8 +29,6 @@ const MAX_ROWS_PER_TABLE: usize = 10_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const TABLE_MAP_ENTRY_ALLOCATION: usize = 512;
 const HEAP_ALLOCATION_OVERHEAD: usize = 64;
-const LOCK_SUFFIX: &str = ".rusthouse-lock";
-const TEMP_PREFIX: &str = ".rusthouse-tmp.";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(test, unix))]
 static FAIL_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
@@ -61,15 +62,10 @@ pub(crate) struct Persistence {
 impl Persistence {
     pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
         let path = normalize_path(&path)?;
-        if path.file_name().is_some_and(|name| {
-            let name = name.to_string_lossy().to_ascii_lowercase();
-            name.ends_with(LOCK_SUFFIX) || name.starts_with(TEMP_PREFIX)
-        }) {
+        if path.file_name().is_some_and(is_reserved_name) {
             return Err(Error::ReservedDatabasePath(path.display().to_string()));
         }
-        let mut lock_path_name = path.as_os_str().to_os_string();
-        lock_path_name.push(LOCK_SUFFIX);
-        let lock_path = PathBuf::from(lock_path_name);
+        let lock_path = lock_path(&path);
         #[cfg(unix)]
         let parent_dir = File::open(path.parent().expect("normalized path has a parent"))
             .map_err(|error| Error::io("open database directory", error))?;
@@ -80,8 +76,7 @@ impl Persistence {
             .to_owned();
         #[cfg(unix)]
         let lock = {
-            let mut lock_name = file_name.clone();
-            lock_name.push(LOCK_SUFFIX);
+            let lock_name = lock_name(&file_name);
             open_database_lock_at(&parent_dir, &lock_name, &lock_path, &path)?
         };
         #[cfg(not(unix))]
@@ -224,14 +219,14 @@ fn open_database_lock(path: &Path, database_path: &Path) -> Result<File> {
         }
     }
 
-    match file.try_lock() {
+    match fs4::FileExt::try_lock(&file) {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
+        Err(fs4::TryLockError::WouldBlock) => {
             return Err(Error::DatabaseAlreadyOpen(
                 database_path.display().to_string(),
             ));
         }
-        Err(std::fs::TryLockError::Error(error)) => {
+        Err(fs4::TryLockError::Error(error)) => {
             return Err(Error::io("lock database", error));
         }
     }
@@ -300,14 +295,14 @@ fn open_database_lock_at(
         }
     }
 
-    match file.try_lock() {
+    match fs4::FileExt::try_lock(&file) {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
+        Err(fs4::TryLockError::WouldBlock) => {
             return Err(Error::DatabaseAlreadyOpen(
                 database_path.display().to_string(),
             ));
         }
-        Err(std::fs::TryLockError::Error(error)) => {
+        Err(fs4::TryLockError::Error(error)) => {
             return Err(Error::io("lock database", error));
         }
     }
@@ -1456,7 +1451,7 @@ mod tests {
         ));
         let normalized = normalize_path(&database).unwrap();
         let mut lock_name = normalized.as_os_str().to_os_string();
-        lock_name.push(LOCK_SUFFIX);
+        lock_name.push(crate::sidecar::LOCK_SUFFIX);
         let lock = PathBuf::from(lock_name);
         *REPLACE_LOCK_BEFORE_ACQUIRE
             .lock()

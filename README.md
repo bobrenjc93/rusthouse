@@ -51,7 +51,7 @@ let store = SnapshotStore::open("catalog.rhcat")?;
 store.commit(&image)?;
 assert_eq!(store.load()?, Some(image));
 # std::fs::remove_file("catalog.rhcat")?;
-# std::fs::remove_file(".catalog.rhcat.lock")?;
+# std::fs::remove_file("catalog.rhcat.rusthouse-lock")?;
 # Ok(())
 # }
 ```
@@ -138,7 +138,9 @@ checksum mismatch.
 ### Commit and recovery contract
 
 For `catalog.rhcat`, the store holds an OS advisory lock on
-`.catalog.rhcat.lock`. While holding it, a commit validates and encodes the
+`catalog.rhcat.rusthouse-lock`. This is the same lock namespace used by
+`Database`, so the two persistence APIs cannot concurrently publish incompatible
+formats to one path. While holding it, a commit validates and encodes the
 image, creates `.catalog.rhcat.tmp` as a private staging directory inside the
 snapshot directory, writes and calls `sync_all` on its `snapshot` file, then
 atomically renames that file over `catalog.rhcat`. Unix creates the staging
@@ -253,10 +255,11 @@ It writes and syncs a temporary file, atomically renames it, and syncs the paren
 directory before publishing the generation to other sessions. A canonical database
 path has one exclusive in-process or cross-process owner; a second `Database::open`
 returns `Error::DatabaseAlreadyOpen` until the first handle and its clones are dropped.
-Locks use a reserved `.rusthouse-lock` namespace; database paths ending in that suffix
-are rejected so no database can replace another database's active lock inode. Lock
-files are opened without following symlinks and, after locking, must resolve to the same
-native file identity as the opened handle. The database parent directory must already exist; RustHouse never creates a
+Locks use the same reserved `.rusthouse-lock` namespace as `SnapshotStore`; database
+paths ending in that suffix or beginning with `.` are rejected so neither persistence
+API can replace another writer's active lock or staging path. Lock files are opened
+without following symlinks and, after locking, must resolve to the same native file
+identity as the opened handle. The database parent directory must already exist; RustHouse never creates a
 directory tree whose ancestor entries fall outside its durability barrier.
 Candidates and recovery backups use the reserved `.rusthouse-tmp.` filename prefix,
 which `Database::open` also rejects after canonicalizing the path. A concurrent database
@@ -348,7 +351,9 @@ days so deadline arithmetic remains representable. The production database adapt
 also applies the response-byte ceiling while materializing rows. Mutation cancellation
 and publication use an atomic handoff: cancellation before publication prevents the
 commit, while a timeout after publication starts returns `query_outcome_unknown`
-instead of claiming that the mutation failed.
+instead of claiming that the mutation failed. Once execution confirms publication,
+an encoding limit or encoding deadline falls back to a bounded `204 No Content`
+success response rather than reporting a failed mutation.
 Query implementations should observe the supplied `QueryCancellation` while doing
 expensive work. It is signaled when a request is dropped, its deadline expires, or
 forced shutdown begins. Ctrl-C and SIGTERM both use the bounded graceful-shutdown

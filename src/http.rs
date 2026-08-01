@@ -709,6 +709,7 @@ async fn handle_query(
         EngineTaskOutput::Finished(permit, result) => (permit, result),
     };
     let result = result.map_err(ApiError::from_query_error)?;
+    let mutation_published = cancellation.publication_started();
 
     let response_limit = state.config.max_response_bytes;
     let mut encoding = tokio::task::spawn_blocking(move || {
@@ -723,18 +724,41 @@ async fn handle_query(
         () = state.force_cancellation.cancelled() => {
             token.cancel();
             encoding.abort();
+            if mutation_published {
+                cancel_on_drop.0 = None;
+                return Ok(published_mutation_response(request_id));
+            }
             return Err(ApiError::shutting_down());
         }
         () = tokio::time::sleep_until(deadline) => {
             token.cancel();
             encoding.abort();
+            if mutation_published {
+                cancel_on_drop.0 = None;
+                return Ok(published_mutation_response(request_id));
+            }
             return Err(ApiError::timeout(state.config.query_timeout));
         }
-        output = &mut encoding => output
-            .map_err(|error| ApiError::blocking_task_failed("result encoding", error))?,
+        output = &mut encoding => match output {
+            Ok(output) => output,
+            Err(_) if mutation_published => {
+                cancel_on_drop.0 = None;
+                return Ok(published_mutation_response(request_id));
+            }
+            Err(error) => {
+                return Err(ApiError::blocking_task_failed("result encoding", error));
+            }
+        },
     };
     drop(permit);
-    let bytes = bytes?;
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(_) if mutation_published => {
+            cancel_on_drop.0 = None;
+            return Ok(published_mutation_response(request_id));
+        }
+        Err(error) => return Err(error),
+    };
     cancel_on_drop.0 = None;
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
@@ -744,6 +768,13 @@ async fn handle_query(
     );
     insert_common_headers(&mut response, request_id);
     Ok(response)
+}
+
+fn published_mutation_response(request_id: u64) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    insert_common_headers(&mut response, request_id);
+    response
 }
 
 enum EngineTaskOutput {

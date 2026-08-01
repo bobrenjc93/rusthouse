@@ -18,6 +18,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::sidecar::{is_reserved_name, lock_path};
 pub use crate::storage::DataType;
 use crate::storage::EngineTable as Table;
 
@@ -447,6 +448,8 @@ pub struct SnapshotStore {
     temp_name: std::ffi::OsString,
     #[cfg(windows)]
     _parent_guard: File,
+    #[cfg(windows)]
+    _alias_lock: File,
     temp_dir: PathBuf,
     temp_path: PathBuf,
     limits: SnapshotLimits,
@@ -500,6 +503,21 @@ impl SnapshotStore {
             open_parent_directory_guard(path.parent().expect("normalized path has a parent"))?;
         #[cfg(windows)]
         drop(open_snapshot_file_path(&path)?);
+        #[cfg(windows)]
+        let alias_lock = {
+            let alias_path = path
+                .parent()
+                .expect("normalized path has a parent")
+                .join(".rusthouse-catalog.lock");
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(alias_path)?;
+            lock_snapshot_file(&lock, &path)?;
+            lock
+        };
         #[cfg(unix)]
         let lock_name = lock_path.file_name().expect("sidecar path has a filename");
         #[cfg(unix)]
@@ -516,13 +534,7 @@ impl SnapshotStore {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        match fs4::FileExt::try_lock(&lock) {
-            Ok(()) => {}
-            Err(fs4::TryLockError::WouldBlock) => {
-                return Err(SnapshotError::Locked(path));
-            }
-            Err(fs4::TryLockError::Error(error)) => return Err(SnapshotError::Io(error)),
-        }
+        lock_snapshot_file(&lock, &path)?;
 
         #[cfg(windows)]
         drop(open_snapshot_file_path(&path)?);
@@ -542,6 +554,8 @@ impl SnapshotStore {
             temp_name,
             #[cfg(windows)]
             _parent_guard: parent_guard,
+            #[cfg(windows)]
+            _alias_lock: alias_lock,
             temp_dir,
             temp_path,
             limits,
@@ -698,6 +712,14 @@ impl SnapshotStore {
     #[cfg(windows)]
     fn publish_staged(&self) -> Result<(), SnapshotError> {
         publish_temp(&self.temp_path, &self.path)
+    }
+}
+
+fn lock_snapshot_file(lock: &File, path: &Path) -> Result<(), SnapshotError> {
+    match fs4::FileExt::try_lock(lock) {
+        Ok(()) => Ok(()),
+        Err(fs4::TryLockError::WouldBlock) => Err(SnapshotError::Locked(path.to_owned())),
+        Err(fs4::TryLockError::Error(error)) => Err(SnapshotError::Io(error)),
     }
 }
 
@@ -935,17 +957,13 @@ fn sidecar_paths(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
     if file_name.trim_end_matches([' ', '.']) != file_name {
         return Err(SnapshotError::ReservedSnapshotName(path.to_owned()));
     }
-    if file_name.starts_with('.') {
+    if is_reserved_name(path.file_name().expect("snapshot path has a filename")) {
         return Err(SnapshotError::ReservedSnapshotName(path.to_owned()));
     }
     let parent = path.parent().ok_or_else(|| {
         SnapshotError::InvalidImage("snapshot path must have a parent directory".to_owned())
     })?;
-    #[cfg(unix)]
-    let lock_path = parent.join(format!(".{file_name}.lock"));
-    #[cfg(windows)]
-    let lock_path = parent.join(".rusthouse-catalog.lock");
-    Ok((lock_path, parent.join(format!(".{file_name}.tmp"))))
+    Ok((lock_path(path), parent.join(format!(".{file_name}.tmp"))))
 }
 
 #[cfg(unix)]
@@ -2364,7 +2382,7 @@ mod tests {
             SnapshotStore::open(&link),
             Err(SnapshotError::SymlinkSnapshot(_))
         ));
-        assert!(!directory.0.join(".link.rhcat.lock").exists());
+        assert!(!directory.0.join("link.rhcat.rusthouse-lock").exists());
         let reopened = SnapshotStore::open(&target).expect("reopen target store");
         assert_eq!(reopened.load().expect("load target image"), Some(image));
     }
@@ -2477,7 +2495,7 @@ mod tests {
             SnapshotStore::open(&path),
             Err(SnapshotError::UnsupportedPlatform(_))
         ));
-        assert!(!directory.0.join(".catalog.rhcat.lock").exists());
+        assert!(!directory.0.join("catalog.rhcat.rusthouse-lock").exists());
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -2550,8 +2568,8 @@ mod tests {
             .expect("create canonical snapshot");
 
         for (alias, lock_name) in [
-            ("catalog.rhcat.", ".catalog.rhcat..lock"),
-            ("catalog.rhcat ", ".catalog.rhcat .lock"),
+            ("catalog.rhcat.", "catalog.rhcat..rusthouse-lock"),
+            ("catalog.rhcat ", "catalog.rhcat .rusthouse-lock"),
         ] {
             assert!(matches!(
                 SnapshotStore::open(directory.0.join(alias)),
