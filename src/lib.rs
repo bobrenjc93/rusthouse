@@ -3,6 +3,7 @@
 pub mod catalog;
 mod database;
 mod error;
+pub mod formats;
 mod persistence;
 mod sql;
 pub mod storage;
@@ -13,7 +14,7 @@ pub use catalog::{
 };
 pub use database::{Database, ResultSet, Session, StatementResult, TransactionLimits};
 pub use error::{Error, LimitKind, Result};
-pub use storage::{ColumnDef, DataType, Value};
+pub use storage::{Column, ColumnBatch, ColumnDef, DataType, Field, Schema, Table, Value};
 
 /// Returns the product name.
 pub fn product_name() -> &'static str {

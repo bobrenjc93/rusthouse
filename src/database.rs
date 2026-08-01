@@ -7,7 +7,7 @@ use crate::catalog::CatalogGeneration;
 use crate::error::{Error, LimitKind, Result};
 use crate::persistence::{Persistence, StoreStatus};
 use crate::sql::{Comparison, Predicate, Statement, parse};
-use crate::storage::{ColumnDef, Table, Value};
+use crate::storage::{ColumnDef, EngineTable as Table, Value};
 
 /// Per-transaction bounds for staged inserts and their encoded value sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

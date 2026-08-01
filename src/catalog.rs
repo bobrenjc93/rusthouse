@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub use crate::storage::DataType;
-use crate::storage::Table;
+use crate::storage::EngineTable as Table;
 
 /// The eight bytes that identify a RustHouse catalog snapshot.
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"RHCAT\0\r\n";

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::catalog::CatalogGeneration;
 use crate::error::{Error, Result};
-use crate::storage::{ColumnData, ColumnDef, DataType, Table};
+use crate::storage::{ColumnData, ColumnDef, DataType, EngineTable as Table};
 
 const MAGIC: &[u8; 10] = b"RUSTHOUSE\0";
 const FORMAT_VERSION: u32 = 1;
