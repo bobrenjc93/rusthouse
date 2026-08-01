@@ -177,6 +177,16 @@ pub fn compare_string(
     op: ComparisonOp,
     value: &str,
 ) -> Result<SelectionMask> {
+    compare_string_controlled(batch, column, op, value, || Ok(()))
+}
+
+pub fn compare_string_controlled(
+    batch: &RecordBatch,
+    column: usize,
+    op: ComparisonOp,
+    value: &str,
+    mut check_cancellation: impl FnMut() -> Result<()>,
+) -> Result<SelectionMask> {
     let array = match batch.column(column)? {
         Column::String(array) => array,
         actual => {
@@ -187,9 +197,88 @@ pub fn compare_string(
             });
         }
     };
-    selected_predicate(batch, array.validity(), |row| {
-        op.evaluate_ordering(array.value(row).expect("candidate is valid").cmp(value))
-    })
+    let mut dictionary_matches = vec![None; array.dictionary().len()];
+    let mut result = SelectionMask::none(batch.len(), batch.capacity())?;
+    for word_index in 0..batch.selection().word_count() {
+        let mut candidates = batch.selection().word(word_index) & array.validity().word(word_index);
+        let mut matched = 0_u64;
+        while candidates != 0 {
+            check_cancellation()?;
+            let bit = candidates.trailing_zeros() as usize;
+            let row = word_index * u64::BITS as usize + bit;
+            let key = array.key(row).expect("candidate is valid") as usize;
+            let is_match = match dictionary_matches[key] {
+                Some(is_match) => is_match,
+                None => {
+                    let is_match = op.evaluate_ordering(compare_strings_controlled(
+                        array.value(row).expect("candidate is valid"),
+                        value,
+                        &mut check_cancellation,
+                    )?);
+                    dictionary_matches[key] = Some(is_match);
+                    is_match
+                }
+            };
+            if is_match {
+                matched |= 1_u64 << bit;
+            }
+            candidates &= candidates - 1;
+        }
+        result.set_word(word_index, matched);
+    }
+    Ok(result)
+}
+
+pub(crate) fn compare_string_values<'a>(
+    selection: &SelectionMask,
+    op: ComparisonOp,
+    value: &str,
+    mut value_at: impl FnMut(usize) -> Option<&'a str>,
+    mut check_cancellation: impl FnMut() -> Result<()>,
+) -> Result<SelectionMask> {
+    let mut result = SelectionMask::none(selection.len(), selection.capacity())?;
+    for word_index in 0..selection.word_count() {
+        let mut candidates = selection.word(word_index);
+        let mut matched = 0_u64;
+        while candidates != 0 {
+            check_cancellation()?;
+            let bit = candidates.trailing_zeros() as usize;
+            let row = word_index * u64::BITS as usize + bit;
+            if let Some(candidate) = value_at(row)
+                && op.evaluate_ordering(compare_strings_controlled(
+                    candidate,
+                    value,
+                    &mut check_cancellation,
+                )?)
+            {
+                matched |= 1_u64 << bit;
+            }
+            candidates &= candidates - 1;
+        }
+        result.set_word(word_index, matched);
+    }
+    Ok(result)
+}
+
+const STRING_COMPARISON_CHUNK_BYTES: usize = 64 * 1024;
+
+fn compare_strings_controlled(
+    left: &str,
+    right: &str,
+    check_cancellation: &mut impl FnMut() -> Result<()>,
+) -> Result<Ordering> {
+    let common_len = left.len().min(right.len());
+    let mut offset = 0;
+    while offset < common_len {
+        check_cancellation()?;
+        let end = (offset + STRING_COMPARISON_CHUNK_BYTES).min(common_len);
+        let ordering = left.as_bytes()[offset..end].cmp(&right.as_bytes()[offset..end]);
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+        offset = end;
+    }
+    Ok(left.len().cmp(&right.len()))
 }
 
 pub fn compare_columns(

@@ -8,7 +8,8 @@ use rusthouse::batch::{
 use rusthouse::kernels::{
     AggregateExpr, AggregateKind, AggregateResult, ComparisonOp, GroupByConfig, GroupKey,
     ScalarValue, SumValue, aggregate, avg, compare_bool, compare_columns, compare_f64, compare_i64,
-    compare_string, count, hash_group, is_not_null, is_null, max, min, sum,
+    compare_string, compare_string_controlled, count, hash_group, is_not_null, is_null, max, min,
+    sum,
 };
 use rusthouse::{Error, Result};
 
@@ -134,6 +135,33 @@ fn assert_mask(mask: &SelectionMask, expected: impl Fn(usize) -> bool) {
     for row in 0..LEN {
         assert_eq!(mask.is_selected(row), expected(row), "row {row}");
     }
+}
+
+#[test]
+fn string_kernel_checks_cancellation_inside_large_comparisons() {
+    let value = "x".repeat(256 * 1024);
+    let batch = RecordBatch::try_new(
+        Schema::new(vec![Field::new("value", DataType::String, false)]),
+        vec![Column::String(
+            DictionaryArray::from_options(CAPACITY, std::iter::repeat_n(Some(value.as_str()), LEN))
+                .unwrap(),
+        )],
+        BatchConfig::unlimited(CAPACITY),
+    )
+    .unwrap();
+    let mut checks = 0;
+
+    let result = compare_string_controlled(&batch, 0, ComparisonOp::Eq, &value, || {
+        checks += 1;
+        if checks == 3 {
+            Err(Error::QueryCancelled)
+        } else {
+            Ok(())
+        }
+    });
+
+    assert!(matches!(result, Err(Error::QueryCancelled)));
+    assert_eq!(checks, 3);
 }
 
 #[test]

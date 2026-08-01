@@ -1,8 +1,6 @@
-use std::mem::size_of;
-
 use crate::batch::{
-    BatchConfig, BooleanArray, Column as BatchColumn, DataType as BatchDataType, DictionaryArray,
-    Field, Float64Array, Int64Array, RecordBatch, Schema,
+    BatchConfig, BooleanArray, Column as BatchColumn, DataType as BatchDataType, Field,
+    Float64Array, Int64Array, RecordBatch, Schema, SelectionMask,
 };
 use crate::error::{Error, Result};
 use crate::{DataType, Value};
@@ -208,12 +206,19 @@ impl Table {
         self.columns[column].owned_value_bytes(row)
     }
 
+    pub(crate) fn string_value(&self, row: usize, column: usize) -> Option<&str> {
+        match &self.columns[column] {
+            ColumnData::String(values) => values[row].as_deref(),
+            _ => unreachable!("string predicate type was validated against the table schema"),
+        }
+    }
+
     pub(crate) fn record_batch(
         &self,
         start: usize,
         capacity: usize,
         column: usize,
-        memory_limit_bytes: usize,
+        selection: &SelectionMask,
         mut check_cancellation: impl FnMut() -> Result<()>,
     ) -> Result<RecordBatch> {
         debug_assert!(start < self.row_count);
@@ -221,93 +226,63 @@ impl Table {
         debug_assert!(column < self.columns.len());
         check_cancellation()?;
         let end = start.saturating_add(capacity).min(self.row_count);
+        selection.validate_shape(end - start, capacity)?;
         let definition = &self.schema[column];
         let data = &self.columns[column];
-        let bitmap_bytes = capacity
-            .div_ceil(u64::BITS as usize)
-            .saturating_mul(size_of::<u64>());
-        let common_bytes = size_of::<Field>()
-            .saturating_add(definition.name.len())
-            .saturating_add(size_of::<BatchColumn>())
-            .saturating_add(bitmap_bytes);
-        let mut peak_bytes = common_bytes.saturating_add(match data {
-            ColumnData::Int64(_) => capacity
-                .saturating_mul(size_of::<i64>())
-                .saturating_add(bitmap_bytes),
-            ColumnData::Float64(_) => capacity
-                .saturating_mul(size_of::<f64>())
-                .saturating_add(bitmap_bytes),
-            ColumnData::Bool(_) => bitmap_bytes.saturating_mul(2),
-            ColumnData::String(_) => capacity
-                .saturating_mul(size_of::<u32>())
-                .saturating_add(capacity.saturating_mul(size_of::<Option<Box<str>>>()))
-                .saturating_add(bitmap_bytes)
-                .saturating_add(
-                    DictionaryArray::build_workspace_bytes(capacity).unwrap_or(usize::MAX),
-                ),
-        });
-        enforce_batch_memory_limit(peak_bytes, memory_limit_bytes)?;
-        if let ColumnData::String(values) = data {
-            for value in values[start..end].iter().filter_map(Option::as_deref) {
-                check_cancellation()?;
-                enforce_batch_memory_limit(
-                    peak_bytes.saturating_add(value.len()),
-                    memory_limit_bytes,
-                )?;
-            }
-        }
-
         let schema = Schema::new(vec![Field::new(
-            definition.name.as_str(),
+            "",
             match definition.data_type {
                 DataType::Int64 => BatchDataType::Int64,
                 DataType::Float64 => BatchDataType::Float64,
                 DataType::Bool => BatchDataType::Boolean,
-                DataType::String => BatchDataType::String,
+                DataType::String => {
+                    unreachable!("string predicates use a borrowed selection kernel")
+                }
             },
-            definition.nullable,
+            true,
         )]);
         let batch_column = match data {
             ColumnData::Int64(values) => {
                 let mut array = Int64Array::with_capacity(capacity);
-                for value in &values[start..end] {
+                for (row, value) in values[start..end].iter().enumerate() {
                     check_cancellation()?;
-                    array.push(*value)?;
+                    array.push(if selection.is_selected(row) {
+                        *value
+                    } else {
+                        None
+                    })?;
                 }
                 BatchColumn::Int64(array)
             }
             ColumnData::Float64(values) => {
                 let mut array = Float64Array::with_capacity(capacity);
-                for value in &values[start..end] {
+                for (row, value) in values[start..end].iter().enumerate() {
                     check_cancellation()?;
-                    array.push(*value)?;
+                    array.push(if selection.is_selected(row) {
+                        *value
+                    } else {
+                        None
+                    })?;
                 }
                 BatchColumn::Float64(array)
             }
             ColumnData::Bool(values) => {
                 let mut array = BooleanArray::with_capacity(capacity);
-                for value in &values[start..end] {
+                for (row, value) in values[start..end].iter().enumerate() {
                     check_cancellation()?;
-                    array.push(*value)?;
+                    array.push(if selection.is_selected(row) {
+                        *value
+                    } else {
+                        None
+                    })?;
                 }
                 BatchColumn::Boolean(array)
             }
-            ColumnData::String(values) => DictionaryArray::from_options_controlled(
-                capacity,
-                values[start..end].iter().map(Option::as_deref),
-                check_cancellation,
-                |string_bytes| {
-                    peak_bytes = peak_bytes.saturating_add(string_bytes);
-                    enforce_batch_memory_limit(peak_bytes, memory_limit_bytes)
-                },
-            )
-            .map(BatchColumn::String)?,
+            ColumnData::String(_) => {
+                unreachable!("string predicates use a borrowed selection kernel")
+            }
         };
-        RecordBatch::try_new(
-            schema,
-            vec![batch_column],
-            BatchConfig::new(capacity, memory_limit_bytes),
-        )
+        RecordBatch::try_new(schema, vec![batch_column], BatchConfig::unlimited(capacity))
     }
 
     pub(crate) fn columns(&self) -> &[ColumnData] {
@@ -347,17 +322,5 @@ impl Table {
             columns,
             row_count,
         })
-    }
-}
-
-fn enforce_batch_memory_limit(required: usize, limit: usize) -> Result<()> {
-    if required > limit {
-        Err(Error::MemoryLimitExceeded {
-            operator: "SELECT batch",
-            required,
-            limit,
-        })
-    } else {
-        Ok(())
     }
 }

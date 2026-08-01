@@ -1,7 +1,4 @@
-use std::{
-    hash::{DefaultHasher, Hasher},
-    mem::size_of,
-};
+use std::mem::size_of;
 
 use crate::error::{Error, Result};
 
@@ -470,72 +467,6 @@ impl DictionaryArray {
         Ok(array)
     }
 
-    pub(crate) fn from_options_controlled<'a>(
-        capacity: usize,
-        values: impl IntoIterator<Item = Option<&'a str>>,
-        mut check_cancellation: impl FnMut() -> Result<()>,
-        mut reserve_string_bytes: impl FnMut(usize) -> Result<()>,
-    ) -> Result<Self> {
-        let index_slots = Self::build_index_slots(capacity)?;
-        let mut array = Self::with_capacity(capacity)?;
-        let mut dictionary_index = vec![u32::MAX; index_slots].into_boxed_slice();
-        for value in values {
-            check_cancellation()?;
-            if array.len == capacity {
-                return Err(Error::CapacityExceeded { capacity });
-            }
-            let key = match value {
-                None => 0,
-                Some(value) => {
-                    let mut slot = controlled_string_hash(value, &mut check_cancellation)? as usize
-                        & (index_slots - 1);
-                    loop {
-                        check_cancellation()?;
-                        let key = dictionary_index[slot];
-                        if key == u32::MAX {
-                            reserve_string_bytes(value.len())?;
-                            let key = u32::try_from(array.dictionary_len)
-                                .map_err(|_| Error::InvalidCapacity { capacity })?;
-                            array.dictionary[array.dictionary_len] =
-                                Some(clone_string_controlled(value, &mut check_cancellation)?);
-                            array.dictionary_len += 1;
-                            dictionary_index[slot] = key;
-                            break key;
-                        }
-                        if strings_equal_controlled(
-                            array.dictionary[key as usize]
-                                .as_deref()
-                                .expect("dictionary index points to a populated value"),
-                            value,
-                            &mut check_cancellation,
-                        )? {
-                            break key;
-                        }
-                        slot = (slot + 1) & (index_slots - 1);
-                    }
-                }
-            };
-            array.keys[array.len] = key;
-            array.validity.push(value.is_some())?;
-            array.len += 1;
-        }
-        Ok(array)
-    }
-
-    pub(crate) fn build_workspace_bytes(capacity: usize) -> Result<usize> {
-        Self::build_index_slots(capacity)?
-            .checked_mul(size_of::<u32>())
-            .ok_or(Error::InvalidCapacity { capacity })
-    }
-
-    fn build_index_slots(capacity: usize) -> Result<usize> {
-        capacity
-            .max(1)
-            .checked_mul(2)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or(Error::InvalidCapacity { capacity })
-    }
-
     pub fn push(&mut self, value: Option<&str>) -> Result<()> {
         if self.len == self.capacity() {
             return Err(Error::CapacityExceeded {
@@ -606,56 +537,6 @@ impl DictionaryArray {
     pub(crate) fn validity(&self) -> &Bitmap {
         &self.validity
     }
-}
-
-const CONTROLLED_STRING_CHUNK_BYTES: usize = 64 * 1024;
-
-fn controlled_string_hash(
-    value: &str,
-    check_cancellation: &mut impl FnMut() -> Result<()>,
-) -> Result<u64> {
-    let mut hasher = DefaultHasher::new();
-    hasher.write_usize(value.len());
-    for chunk in value.as_bytes().chunks(CONTROLLED_STRING_CHUNK_BYTES) {
-        check_cancellation()?;
-        hasher.write(chunk);
-    }
-    Ok(hasher.finish())
-}
-
-fn strings_equal_controlled(
-    left: &str,
-    right: &str,
-    check_cancellation: &mut impl FnMut() -> Result<()>,
-) -> Result<bool> {
-    if left.len() != right.len() {
-        return Ok(false);
-    }
-    for (left, right) in left
-        .as_bytes()
-        .chunks(CONTROLLED_STRING_CHUNK_BYTES)
-        .zip(right.as_bytes().chunks(CONTROLLED_STRING_CHUNK_BYTES))
-    {
-        check_cancellation()?;
-        if left != right {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn clone_string_controlled(
-    value: &str,
-    check_cancellation: &mut impl FnMut() -> Result<()>,
-) -> Result<Box<str>> {
-    let mut clone = Vec::with_capacity(value.len());
-    for chunk in value.as_bytes().chunks(CONTROLLED_STRING_CHUNK_BYTES) {
-        check_cancellation()?;
-        clone.extend_from_slice(chunk);
-    }
-    Ok(String::from_utf8(clone)
-        .expect("copying an existing UTF-8 string preserves validity")
-        .into_boxed_str())
 }
 
 #[derive(Debug, Clone, PartialEq)]
