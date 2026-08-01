@@ -1,6 +1,6 @@
 use rusthouse::formats::{
-    CsvBatchReader, CsvExportOptions, CsvOptions, FormatError, LimitKind, NdjsonOptions,
-    export_csv, export_ndjson, ingest_csv, ingest_ndjson,
+    CsvBatchReader, CsvExportOptions, CsvOptions, FormatError, LimitKind, MAX_JSON_NESTING_DEPTH,
+    NdjsonOptions, export_csv, export_ndjson, ingest_csv, ingest_ndjson,
 };
 use rusthouse::{Column, ColumnBatch, DataType, Field, Schema, Table};
 use std::io::Cursor;
@@ -112,6 +112,33 @@ fn readers_emit_fixed_size_typed_batches() {
         vec![2, 2, 1]
     );
     assert_eq!(batches[2].columns()[0], Column::Int64(vec![Some(5)]));
+}
+
+#[test]
+fn extreme_batch_size_allocates_only_for_rows_read() {
+    let fields = (0..1_024)
+        .map(|index| Field::new(format!("field_{index}"), DataType::String, true))
+        .collect();
+    let schema = Schema::new(fields).unwrap();
+
+    let mut csv_options = CsvOptions {
+        has_header: false,
+        ..CsvOptions::default()
+    };
+    csv_options.limits.batch_rows = usize::MAX;
+    let mut csv_table = Table::new(schema.clone());
+    assert_eq!(
+        ingest_csv(Cursor::new(&[]), &mut csv_table, csv_options).unwrap(),
+        0
+    );
+
+    let mut json_options = NdjsonOptions::default();
+    json_options.limits.batch_rows = usize::MAX;
+    let mut json_table = Table::new(schema);
+    assert_eq!(
+        ingest_ndjson(Cursor::new(&[]), &mut json_table, json_options).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -318,6 +345,34 @@ fn json_field_count_depth_and_decoded_string_boundaries_are_enforced() {
             kind: LimitKind::FieldsPerRow,
             ..
         }
+    ));
+}
+
+#[test]
+fn json_nesting_configuration_is_stack_safe() {
+    let schema = Schema::new(vec![Field::new("v", DataType::String, true)]).unwrap();
+    let mut excessive = NdjsonOptions::default();
+    excessive.limits.max_nesting_depth = 100_000;
+    let error =
+        ingest_ndjson(Cursor::new(&[]), &mut Table::new(schema.clone()), excessive).unwrap_err();
+    assert!(matches!(error, FormatError::InvalidOption(_)));
+
+    let mut at_ceiling = NdjsonOptions::default();
+    at_ceiling.limits.max_nesting_depth = MAX_JSON_NESTING_DEPTH;
+    let nested = format!(
+        "{{\"v\":{}null{}}}\n",
+        "[".repeat(MAX_JSON_NESTING_DEPTH),
+        "]".repeat(MAX_JSON_NESTING_DEPTH)
+    );
+    let error =
+        ingest_ndjson(Cursor::new(nested), &mut Table::new(schema), at_ceiling).unwrap_err();
+    assert!(matches!(
+        error,
+        FormatError::LimitExceeded {
+            kind: LimitKind::NestingDepth,
+            limit,
+            ..
+        } if limit == MAX_JSON_NESTING_DEPTH as u64
     ));
 }
 

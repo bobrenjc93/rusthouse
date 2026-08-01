@@ -430,7 +430,7 @@ impl<R: BufRead> Iterator for CsvBatchReader<R> {
             return Some(Err(error));
         }
 
-        let mut columns = empty_columns(&self.schema, self.options.limits.batch_rows);
+        let mut columns = empty_columns(&self.schema);
         let mut batch_rows = 0_usize;
         while batch_rows < self.options.limits.batch_rows {
             let row = self.rows_read + 1;

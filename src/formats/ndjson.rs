@@ -427,7 +427,7 @@ pub struct NdjsonBatchReader<R> {
 
 impl<R: BufRead> NdjsonBatchReader<R> {
     pub fn new(input: R, schema: &Schema, options: NdjsonOptions) -> Result<Self, FormatError> {
-        options.limits.validate(schema)?;
+        options.limits.validate_json(schema)?;
         Ok(Self {
             stream: NdjsonStream::new(input, &options),
             schema: schema.clone(),
@@ -512,7 +512,7 @@ impl<R: BufRead> Iterator for NdjsonBatchReader<R> {
         if self.finished {
             return None;
         }
-        let mut columns = empty_columns(&self.schema, self.options.limits.batch_rows);
+        let mut columns = empty_columns(&self.schema);
         let mut batch_rows = 0_usize;
         while batch_rows < self.options.limits.batch_rows {
             let row = self.rows_read + 1;

@@ -200,12 +200,12 @@ impl Column {
         }
     }
 
-    pub(crate) fn empty(data_type: DataType, capacity: usize) -> Self {
+    pub(crate) fn empty(data_type: DataType) -> Self {
         match data_type {
-            DataType::Int64 => Self::Int64(Vec::with_capacity(capacity)),
-            DataType::Float64 => Self::Float64(Vec::with_capacity(capacity)),
-            DataType::Bool => Self::Bool(Vec::with_capacity(capacity)),
-            DataType::String => Self::String(Vec::with_capacity(capacity)),
+            DataType::Int64 => Self::Int64(Vec::new()),
+            DataType::Float64 => Self::Float64(Vec::new()),
+            DataType::Bool => Self::Bool(Vec::new()),
+            DataType::String => Self::String(Vec::new()),
         }
     }
 
@@ -312,7 +312,7 @@ impl Table {
         let columns = schema
             .fields()
             .iter()
-            .map(|field| Column::empty(field.data_type(), 0))
+            .map(|field| Column::empty(field.data_type()))
             .collect();
         Self {
             schema,

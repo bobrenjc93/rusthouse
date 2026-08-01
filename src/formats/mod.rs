@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Highest supported JSON container depth for the recursive parser.
+pub const MAX_JSON_NESTING_DEPTH: usize = 128;
+
 /// Independent bounds applied while decoding a streaming input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatLimits {
@@ -69,6 +72,16 @@ impl FormatLimits {
                 limit: self.max_fields_per_row as u64,
                 row: None,
             });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_json(&self, schema: &Schema) -> Result<(), FormatError> {
+        self.validate(schema)?;
+        if self.max_nesting_depth > MAX_JSON_NESTING_DEPTH {
+            return Err(FormatError::InvalidOption(format!(
+                "max_nesting_depth cannot exceed {MAX_JSON_NESTING_DEPTH}"
+            )));
         }
         Ok(())
     }
@@ -270,11 +283,11 @@ impl<R: BufRead> LimitedInput<R> {
     }
 }
 
-pub(crate) fn empty_columns(schema: &Schema, capacity: usize) -> Vec<Column> {
+pub(crate) fn empty_columns(schema: &Schema) -> Vec<Column> {
     schema
         .fields()
         .iter()
-        .map(|field| Column::empty(field.data_type(), capacity))
+        .map(|field| Column::empty(field.data_type()))
         .collect()
 }
 
@@ -448,7 +461,7 @@ impl StagedBatches {
         };
         let rows = usize::try_from(rows)
             .map_err(|_| FormatError::Staging("batch row count is too large".to_owned()))?;
-        let mut columns = empty_columns(schema, rows);
+        let mut columns = empty_columns(schema);
         for column in &mut columns {
             for _ in 0..rows {
                 let present = read_presence(file)?;
