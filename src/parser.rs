@@ -12,14 +12,7 @@ pub(crate) fn parse(sql: &str) -> Result<Selection, QueryError> {
         return Err(QueryError::EmptyQuery);
     }
 
-    parser.expect_keyword("SELECT")?;
-    parser.require_whitespace("expected a literal after SELECT")?;
-    let value = parser.parse_literal()?;
-    parser.require_whitespace("expected AS after the literal")?;
-    parser.expect_keyword("AS")?;
-    parser.require_whitespace("expected an identifier after AS")?;
-    let identifier = parser.parse_identifier()?;
-
+    let selection = parser.parse_selection()?;
     parser.skip_whitespace();
     if parser.consume_byte(b';') {
         parser.skip_whitespace();
@@ -28,7 +21,47 @@ pub(crate) fn parse(sql: &str) -> Result<Selection, QueryError> {
         return Err(parser.error("expected the end of the statement"));
     }
 
-    Ok(Selection { identifier, value })
+    Ok(selection)
+}
+
+pub(crate) fn parse_batch(sql: &str) -> Result<Vec<Selection>, QueryError> {
+    let mut parser = Parser::new(sql);
+    parser.skip_separators();
+    if parser.is_at_end() {
+        return Err(QueryError::EmptyQuery);
+    }
+
+    let mut selections = Vec::new();
+    loop {
+        selections.push(parser.parse_selection()?);
+        parser.skip_whitespace();
+
+        if parser.is_at_end() {
+            return Ok(selections);
+        }
+        if !parser.consume_byte(b';') {
+            return Err(parser.error("expected ';' or the end of the batch"));
+        }
+
+        parser.skip_separators();
+        if parser.is_at_end() {
+            return Ok(selections);
+        }
+    }
+}
+
+impl Parser<'_> {
+    fn parse_selection(&mut self) -> Result<Selection, QueryError> {
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("expected a literal after SELECT")?;
+        let value = self.parse_literal()?;
+        self.require_whitespace("expected AS after the literal")?;
+        self.expect_keyword("AS")?;
+        self.require_whitespace("expected an identifier after AS")?;
+        let identifier = self.parse_identifier()?;
+
+        Ok(Selection { identifier, value })
+    }
 }
 
 struct Parser<'a> {
@@ -62,6 +95,13 @@ impl<'a> Parser<'a> {
             self.position += character.len_utf8();
         }
         self.position != start
+    }
+
+    fn skip_separators(&mut self) {
+        self.skip_whitespace();
+        while self.consume_byte(b';') {
+            self.skip_whitespace();
+        }
     }
 
     fn require_whitespace(&mut self, message: &'static str) -> Result<(), QueryError> {

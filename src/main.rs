@@ -4,14 +4,14 @@ use std::fmt;
 use std::io::{self, BufWriter, Read, Write};
 use std::process::ExitCode;
 
-use rusthouse::{MAX_QUERY_BYTES, execute, write_csv};
+use rusthouse::{MAX_QUERY_BYTES, execute_batch, write_csv};
 
 const HELP: &str = "\
 RustHouse literal query CLI
 
 Usage: rusthouse [OPTIONS]
 
-Reads one SQL statement from standard input and writes its result.
+Reads semicolon-delimited SQL statements from standard input and writes each result.
 
 Options:
       --format <FORMAT>  Output format [default: csv] [possible values: csv]
@@ -41,9 +41,11 @@ fn run() -> Result<(), CliError> {
         }
         Action::Execute(Format::Csv) => {
             let query = read_query(io::stdin().lock())?;
-            let result = execute(&query).map_err(CliError::Query)?;
+            let results = execute_batch(&query).map_err(CliError::Query)?;
             let mut output = BufWriter::new(io::stdout().lock());
-            write_csv(&result, &mut output).map_err(CliError::Output)?;
+            for result in &results {
+                write_csv(result, &mut output).map_err(CliError::Output)?;
+            }
             output.flush().map_err(CliError::Output)
         }
     }

@@ -104,6 +104,36 @@ fn csv_serializes_each_literal_type() {
 }
 
 #[test]
+fn csv_serializes_batch_results_in_order() {
+    let output = run(
+        &["--format=csv"],
+        b"SELECT 1 AS first; SELECT 'two' AS second; SELECT TRUE AS third",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "first\n1\nsecond\ntwo\nthird\ntrue\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn csv_batch_preserves_embedded_semicolons_and_skips_empty_separators() {
+    let output = run(
+        &["--format", "csv"],
+        b";;SELECT 'a;b' AS \"first;name\";;; SELECT 2 AS second;;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "first;name\na;b\nsecond\n2\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn malformed_sql_fails_without_stdout() {
     let output = run(&["--format", "csv"], b"SELECT 1");
 
@@ -114,6 +144,25 @@ fn malformed_sql_fails_without_stdout() {
             .unwrap()
             .contains("invalid SQL")
     );
+}
+
+#[test]
+fn malformed_batch_fails_without_partial_stdout() {
+    for sql in [
+        &b"SELECT 1 AS valid; SELECT AS invalid"[..],
+        &b"SELECT 1 AS valid SELECT 2 AS missing_separator"[..],
+        &b"SELECT 1 AS valid; SELECT 'unterminated AS invalid"[..],
+    ] {
+        let output = run(&["--format", "csv"], sql);
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("invalid SQL")
+        );
+    }
 }
 
 #[test]

@@ -1,8 +1,9 @@
 //! RustHouse is an experimental, compact analytical database.
 //!
 //! The current query surface deliberately consists of one statement shape:
-//! `SELECT <literal> AS <identifier>`. Use [`execute`] to evaluate a statement
-//! and [`write_csv`] to serialize its result.
+//! `SELECT <literal> AS <identifier>`. Use [`execute`] to evaluate one statement,
+//! [`execute_batch`] to evaluate semicolon-delimited statements, and [`write_csv`]
+//! to serialize a result.
 
 mod csv;
 mod error;
@@ -39,6 +40,32 @@ pub const MAX_QUERY_BYTES: usize = 1024 * 1024;
 pub fn execute(sql: &str) -> Result<QueryResult, QueryError> {
     let selection = parser::parse(sql)?;
     Ok(QueryResult::single(selection.identifier, selection.value))
+}
+
+/// Executes a batch of semicolon-delimited literal `SELECT` statements.
+///
+/// Empty separators are ignored. Semicolons inside single-quoted strings or
+/// double-quoted identifiers are part of those values rather than separators.
+/// The complete batch is parsed before any results are returned.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{Value, execute_batch};
+///
+/// let results = execute_batch("SELECT 'a;b' AS text; SELECT 42 AS answer")?;
+/// assert_eq!(results.len(), 2);
+/// assert_eq!(results[0].rows, vec![vec![Value::String("a;b".to_owned())]]);
+/// assert_eq!(results[1].rows, vec![vec![Value::Int64(42)]]);
+/// # Ok::<(), rusthouse::QueryError>(())
+/// ```
+pub fn execute_batch(sql: &str) -> Result<Vec<QueryResult>, QueryError> {
+    parser::parse_batch(sql).map(|selections| {
+        selections
+            .into_iter()
+            .map(|selection| QueryResult::single(selection.identifier, selection.value))
+            .collect()
+    })
 }
 
 /// Returns the product name.
