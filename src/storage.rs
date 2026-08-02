@@ -15,10 +15,20 @@ pub struct ColumnDefinition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     columns: Vec<ColumnDefinition>,
+    quoted: Vec<bool>,
 }
 
 impl Schema {
     pub fn new(columns: Vec<ColumnDefinition>, limits: &Limits) -> Result<Self, DatabaseError> {
+        let quoted = vec![false; columns.len()];
+        Self::new_with_quoted(columns, quoted, limits)
+    }
+
+    pub(crate) fn new_with_quoted(
+        columns: Vec<ColumnDefinition>,
+        quoted: Vec<bool>,
+        limits: &Limits,
+    ) -> Result<Self, DatabaseError> {
         if columns.is_empty() {
             return Err(DatabaseError::invalid(
                 "a table must have at least one column",
@@ -32,14 +42,15 @@ impl Schema {
             });
         }
 
+        debug_assert_eq!(columns.len(), quoted.len());
         let mut names = HashSet::with_capacity(columns.len());
-        for column in &columns {
-            let normalized = normalize_identifier(&column.name);
+        for (column, quoted) in columns.iter().zip(&quoted) {
+            let normalized = identifier_key(&column.name, *quoted);
             if !names.insert(normalized) {
                 return Err(DatabaseError::ColumnAlreadyExists(column.name.clone()));
             }
         }
-        Ok(Self { columns })
+        Ok(Self { columns, quoted })
     }
 
     pub fn columns(&self) -> &[ColumnDefinition] {
@@ -47,10 +58,21 @@ impl Schema {
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        let normalized = normalize_identifier(name);
+        self.column_index_bound(name, false)
+    }
+
+    pub(crate) fn column_index_bound(&self, name: &str, quoted: bool) -> Option<usize> {
+        let normalized = identifier_key(name, quoted);
         self.columns
             .iter()
-            .position(|column| normalize_identifier(&column.name) == normalized)
+            .zip(&self.quoted)
+            .position(|(column, column_quoted)| {
+                identifier_key(&column.name, *column_quoted) == normalized
+            })
+    }
+
+    pub(crate) fn column_is_quoted(&self, index: usize) -> bool {
+        self.quoted[index]
     }
 }
 
@@ -95,13 +117,14 @@ impl Column {
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
     pub(crate) name: String,
+    pub(crate) name_quoted: bool,
     pub(crate) schema: Schema,
     columns: Vec<Column>,
     row_count: usize,
 }
 
 impl Table {
-    pub(crate) fn new(name: String, schema: Schema) -> Self {
+    pub(crate) fn new(name: String, name_quoted: bool, schema: Schema) -> Self {
         let columns = schema
             .columns()
             .iter()
@@ -109,6 +132,7 @@ impl Table {
             .collect();
         Self {
             name,
+            name_quoted,
             schema,
             columns,
             row_count: 0,
@@ -197,6 +221,19 @@ pub(crate) fn normalize_identifier(name: &str) -> String {
     name.case_fold().collect()
 }
 
-pub(crate) fn identifiers_equal(left: &str, right: &str) -> bool {
-    normalize_identifier(left) == normalize_identifier(right)
+pub(crate) fn identifier_key(name: &str, quoted: bool) -> String {
+    if quoted {
+        name.to_owned()
+    } else {
+        normalize_identifier(name)
+    }
+}
+
+pub(crate) fn identifiers_equal(
+    left: &str,
+    left_quoted: bool,
+    right: &str,
+    right_quoted: bool,
+) -> bool {
+    identifier_key(left, left_quoted) == identifier_key(right, right_quoted)
 }

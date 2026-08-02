@@ -18,7 +18,8 @@ RustHouse supports:
 
 Identifiers can be unquoted, double quoted, or backtick quoted. Unquoted SQL
 keywords and identifiers are case-insensitive; identifier matching uses full
-non-Turkic Unicode case folding. The four storage types are non-nullable;
+non-Turkic Unicode case folding. Quoted identifiers preserve exact case, so
+`"CaseName"` and `"casename"` are distinct. The four storage types are non-nullable;
 `NULL` is rejected instead of being silently coerced. `COUNT` over an empty
 input returns zero. `SUM`, `MIN`, `MAX`, and `AVG` over an empty input return a
 typed `EmptyAggregate` error because the engine cannot represent SQL `NULL`.
@@ -58,15 +59,18 @@ assert_eq!(result.rows[0][0], Value::Int64(2));
 # Ok::<(), rusthouse::DatabaseError>(())
 ```
 
-`Database::with_limits` configures input bytes, expression depth, rows per
+`Database::with_limits` configures input bytes, expression depth and node count, rows per
 insert, rows per table, returned and intermediate rows, result and intermediate
 bytes, columns per table, and bytes per string value (including query
 literals). Limit failures, parse failures, catalog errors, type errors, and
 arithmetic failures are distinct `DatabaseError` variants. An insert batch is
 fully evaluated and validated before any column is changed. Unordered queries
 apply `OFFSET`/`LIMIT` before projection; ordered queries retain a bounded top-k
-working set. Expression depth is hard-capped at 64 to keep parser and evaluator
-stack use safe even when a caller supplies a larger configured value.
+working set. Projection and ordering budgets are charged after each scalar, so
+a single wide row cannot bypass byte limits. Expression depth is hard-capped at 64 to keep parser and evaluator
+stack use safe even when a caller supplies a larger configured value. The
+separate node-count bound limits expression memory without treating balanced
+trees as deeply nested.
 
 ## Development
 

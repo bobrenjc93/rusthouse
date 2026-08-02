@@ -3,10 +3,10 @@ use std::collections::{BinaryHeap, HashMap};
 use std::mem::{size_of, size_of_val};
 
 use crate::sql::{
-    AggregateFunction, BinaryOperator, ColumnReference, Expr, MAX_SAFE_EXPRESSION_DEPTH, OrderBy,
-    Select, SelectItem, Statement, UnaryOperator, parse,
+    AggregateFunction, BinaryOperator, ColumnReference, Expr, Identifier,
+    MAX_SAFE_EXPRESSION_DEPTH, OrderBy, Select, SelectItem, Statement, UnaryOperator, parse,
 };
-use crate::storage::{Schema, Table, identifiers_equal, normalize_identifier};
+use crate::storage::{Schema, Table, identifier_key, identifiers_equal, normalize_identifier};
 use crate::{ColumnDefinition, DataType, DatabaseError, LimitKind, Value};
 
 /// Resource limits enforced by parsing, storage, and query execution.
@@ -19,6 +19,7 @@ pub struct Limits {
     pub max_columns_per_table: usize,
     pub max_string_bytes: usize,
     pub max_expression_depth: usize,
+    pub max_expression_nodes: usize,
     pub max_intermediate_rows: usize,
     pub max_intermediate_bytes: usize,
     pub max_result_bytes: usize,
@@ -34,6 +35,7 @@ impl Default for Limits {
             max_columns_per_table: 1_024,
             max_string_bytes: 1024 * 1024,
             max_expression_depth: MAX_SAFE_EXPRESSION_DEPTH,
+            max_expression_nodes: 1_024,
             max_intermediate_rows: 1_000_000,
             max_intermediate_bytes: 128 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
@@ -102,6 +104,7 @@ impl Database {
         parse(
             sql,
             self.limits.max_expression_depth,
+            self.limits.max_expression_nodes,
             self.limits.max_string_bytes,
         )
     }
@@ -140,16 +143,26 @@ impl Database {
                 if_not_exists,
                 columns,
             } => {
-                let key = normalize_identifier(&name);
+                let key = identifier_key(&name.value, name.quoted);
                 if self.tables.contains_key(&key) {
                     if if_not_exists {
-                        return Ok(ExecutionResult::TableCreated { table: name });
+                        return Ok(ExecutionResult::TableCreated { table: name.value });
                     }
-                    return Err(DatabaseError::TableAlreadyExists(name));
+                    return Err(DatabaseError::TableAlreadyExists(name.value));
                 }
-                let schema = Schema::new(columns, &self.limits)?;
-                self.tables.insert(key, Table::new(name.clone(), schema));
-                Ok(ExecutionResult::TableCreated { table: name })
+                let quoted = columns.iter().map(|column| column.name.quoted).collect();
+                let columns = columns
+                    .into_iter()
+                    .map(|column| ColumnDefinition {
+                        name: column.name.value,
+                        data_type: column.data_type,
+                    })
+                    .collect();
+                let schema = Schema::new_with_quoted(columns, quoted, &self.limits)?;
+                let table_name = name.value;
+                self.tables
+                    .insert(key, Table::new(table_name.clone(), name.quoted, schema));
+                Ok(ExecutionResult::TableCreated { table: table_name })
             }
             Statement::Insert {
                 table,
@@ -162,8 +175,8 @@ impl Database {
 
     fn insert(
         &mut self,
-        table_name: String,
-        insert_columns: Option<Vec<String>>,
+        table_name: Identifier,
+        insert_columns: Option<Vec<Identifier>>,
         expressions: Vec<Vec<Expr>>,
     ) -> Result<ExecutionResult, DatabaseError> {
         if expressions.len() > self.limits.max_rows_per_insert {
@@ -173,11 +186,11 @@ impl Database {
                 actual: expressions.len(),
             });
         }
-        let key = normalize_identifier(&table_name);
+        let key = identifier_key(&table_name.value, table_name.quoted);
         let table = self
             .tables
             .get_mut(&key)
-            .ok_or_else(|| DatabaseError::TableNotFound(table_name.clone()))?;
+            .ok_or_else(|| DatabaseError::TableNotFound(table_name.value.clone()))?;
 
         let column_order = if let Some(columns) = insert_columns {
             if columns.len() != table.schema.columns().len() {
@@ -193,10 +206,10 @@ impl Database {
             for name in columns {
                 let index = table
                     .schema
-                    .column_index(&name)
-                    .ok_or_else(|| DatabaseError::ColumnNotFound(name.clone()))?;
+                    .column_index_bound(&name.value, name.quoted)
+                    .ok_or_else(|| DatabaseError::ColumnNotFound(name.value.clone()))?;
                 if seen[index] {
-                    return Err(DatabaseError::ColumnAlreadyExists(name));
+                    return Err(DatabaseError::ColumnAlreadyExists(name.value));
                 }
                 seen[index] = true;
                 order.push(index);
@@ -237,7 +250,7 @@ impl Database {
         let inserted = rows.len();
         table.append_rows(&rows, &self.limits)?;
         Ok(ExecutionResult::RowsInserted {
-            table: table_name,
+            table: table_name.value,
             rows: inserted,
         })
     }
@@ -246,8 +259,8 @@ impl Database {
         let table = match &select.from {
             Some(name) => Some(
                 self.tables
-                    .get(&normalize_identifier(name))
-                    .ok_or_else(|| DatabaseError::TableNotFound(name.clone()))?,
+                    .get(&identifier_key(&name.value, name.quoted))
+                    .ok_or_else(|| DatabaseError::TableNotFound(name.value.clone()))?,
             ),
             None => None,
         };
@@ -262,14 +275,15 @@ impl Database {
 
         let items = expand_wildcards(&select.items, schema, table.is_some())?;
         for expression in &mut select.group_by {
-            resolve_projection_alias(expression, &items);
+            resolve_projection_alias(expression, &items)?;
         }
+        let output_identifiers: Vec<_> = items.iter().map(output_identifier).collect();
         let has_aggregate = items.iter().any(|item| item.expr.contains_aggregate())
             || select
                 .order_by
                 .iter()
                 .any(|order| order.expr.contains_aggregate());
-        validate_select(&select, &items, has_aggregate, schema)?;
+        validate_select(&select, &items, &output_identifiers, has_aggregate, schema)?;
         for item in &items {
             validate_column_references(&item.expr, table)?;
         }
@@ -289,7 +303,7 @@ impl Database {
             infer_type(expression, schema)?;
         }
         for order in &select.order_by {
-            if !is_projection_alias(&order.expr, &items) {
+            if output_reference_index(&order.expr, &output_identifiers)?.is_none() {
                 validate_column_references(&order.expr, table)?;
                 infer_type(&order.expr, schema)?;
             }
@@ -300,11 +314,15 @@ impl Database {
             .iter()
             .map(|item| {
                 Ok(ColumnDefinition {
-                    name: item.alias.clone().unwrap_or_else(|| item.expr.label()),
+                    name: item
+                        .alias
+                        .as_ref()
+                        .map_or_else(|| item.expr.label(), |alias| alias.value.clone()),
                     data_type: infer_type(&item.expr, schema)?,
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
+        let result_base_bytes = estimate_result_base(&columns);
 
         let source_rows = table.map_or(1, Table::row_count);
         let groups = if grouped {
@@ -334,7 +352,15 @@ impl Database {
 
         let rows = if select.order_by.is_empty() {
             if grouped {
-                collect_unordered_groups(&groups, &items, table, schema, &select, &self.limits)?
+                collect_unordered_groups(
+                    &groups,
+                    &items,
+                    table,
+                    schema,
+                    &select,
+                    result_base_bytes,
+                    &self.limits,
+                )?
             } else {
                 collect_unordered_rows(
                     source_rows,
@@ -342,6 +368,7 @@ impl Database {
                     table,
                     select.filter.as_ref(),
                     &select,
+                    result_base_bytes,
                     &self.limits,
                 )?
             }
@@ -352,18 +379,23 @@ impl Database {
                     if collector.is_empty_limit() {
                         break;
                     }
-                    let values = items
-                        .iter()
-                        .map(|item| eval_group_expr(&item.expr, table, &group.rows, schema))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut budgets =
+                        ordered_projection_budgets(&collector, result_base_bytes, &self.limits);
+                    let values = evaluate_projection(&items, &mut budgets, |expr| {
+                        eval_group_expr(expr, table, &group.rows, schema)
+                    })?;
+                    let mut order_budget = budgets[0];
                     let order = evaluate_order(
                         &select.order_by,
-                        &columns,
+                        &output_identifiers,
                         &values,
-                        table,
-                        group.rows.first().copied(),
-                        Some(&group.rows),
-                        schema,
+                        OrderSource {
+                            table,
+                            row: group.rows.first().copied(),
+                            group: Some(&group.rows),
+                            schema,
+                        },
+                        &mut order_budget,
                     )?;
                     collector.push(Record {
                         values,
@@ -380,18 +412,23 @@ impl Database {
                     if collector.is_empty_limit() {
                         break;
                     }
-                    let values = items
-                        .iter()
-                        .map(|item| eval_row_expr(&item.expr, table, Some(row)))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut budgets =
+                        ordered_projection_budgets(&collector, result_base_bytes, &self.limits);
+                    let values = evaluate_projection(&items, &mut budgets, |expr| {
+                        eval_row_expr(expr, table, Some(row))
+                    })?;
+                    let mut order_budget = budgets[0];
                     let order = evaluate_order(
                         &select.order_by,
-                        &columns,
+                        &output_identifiers,
                         &values,
-                        table,
-                        Some(row),
-                        None,
-                        schema,
+                        OrderSource {
+                            table,
+                            row: Some(row),
+                            group: None,
+                            schema,
+                        },
+                        &mut order_budget,
                     )?;
                     collector.push(Record {
                         values,
@@ -411,7 +448,79 @@ impl Database {
 #[derive(Debug)]
 struct Projection {
     expr: Expr,
-    alias: Option<String>,
+    alias: Option<Identifier>,
+}
+
+#[derive(Clone, Copy)]
+struct ByteBudget {
+    kind: LimitKind,
+    bytes: usize,
+    limit: usize,
+}
+
+impl ByteBudget {
+    fn charge(&mut self, bytes: usize) -> Result<(), DatabaseError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        check_byte_limit(self.kind, self.limit, self.bytes)
+    }
+}
+
+fn evaluate_projection(
+    items: &[Projection],
+    budgets: &mut [ByteBudget],
+    mut evaluate: impl FnMut(&Expr) -> Result<Value, DatabaseError>,
+) -> Result<Vec<Value>, DatabaseError> {
+    let fixed_bytes = size_of::<Vec<Value>>().saturating_add(
+        items
+            .len()
+            .saturating_mul(size_of::<Value>())
+            .saturating_mul(2),
+    );
+    for budget in &mut *budgets {
+        budget.charge(fixed_bytes)?;
+    }
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let value = evaluate(&item.expr)?;
+        let value_bytes = estimate_value(&value);
+        for budget in &mut *budgets {
+            budget.charge(value_bytes)?;
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn ordered_projection_budgets(
+    collector: &TopKCollector,
+    result_base_bytes: usize,
+    limits: &Limits,
+) -> [ByteBudget; 2] {
+    let row_container_bytes = size_of::<Vec<Value>>().saturating_mul(2);
+    [
+        ByteBudget {
+            kind: LimitKind::IntermediateBytes,
+            bytes: collector
+                .used_bytes()
+                .saturating_add(size_of::<Record>().saturating_mul(2)),
+            limit: limits.max_intermediate_bytes,
+        },
+        ByteBudget {
+            kind: LimitKind::ResultBytes,
+            bytes: result_base_bytes.saturating_add(row_container_bytes),
+            limit: limits.max_result_bytes,
+        },
+    ]
+}
+
+fn output_identifier(item: &Projection) -> Identifier {
+    if let Some(alias) = &item.alias {
+        alias.clone()
+    } else if let Expr::Column(reference) = &item.expr {
+        reference.name.clone()
+    } else {
+        Identifier::unquoted(item.expr.label())
+    }
 }
 
 fn row_matches_filter(
@@ -431,11 +540,12 @@ fn collect_unordered_rows(
     table: Option<&Table>,
     filter: Option<&Expr>,
     select: &Select,
+    result_base_bytes: usize,
     limits: &Limits,
 ) -> Result<Vec<Vec<Value>>, DatabaseError> {
     let mut rows = Vec::new();
     let mut matched = 0_usize;
-    let mut result_bytes = 0_usize;
+    let mut result_bytes = result_base_bytes;
     for row in 0..source_rows {
         if !row_matches_filter(filter, table, row)? {
             continue;
@@ -455,16 +565,15 @@ fn collect_unordered_rows(
                 actual: rows.len() + 1,
             });
         }
-        let values = items
-            .iter()
-            .map(|item| eval_row_expr(&item.expr, table, Some(row)))
-            .collect::<Result<Vec<_>, _>>()?;
-        result_bytes = result_bytes.saturating_add(estimate_values(&values));
-        check_byte_limit(
-            LimitKind::ResultBytes,
-            limits.max_result_bytes,
-            result_bytes,
-        )?;
+        let mut budgets = [ByteBudget {
+            kind: LimitKind::ResultBytes,
+            bytes: result_bytes.saturating_add(size_of::<Vec<Value>>().saturating_mul(2)),
+            limit: limits.max_result_bytes,
+        }];
+        let values = evaluate_projection(items, &mut budgets, |expr| {
+            eval_row_expr(expr, table, Some(row))
+        })?;
+        result_bytes = budgets[0].bytes;
         rows.push(values);
         matched += 1;
     }
@@ -477,10 +586,11 @@ fn collect_unordered_groups(
     table: Option<&Table>,
     schema: &Schema,
     select: &Select,
+    result_base_bytes: usize,
     limits: &Limits,
 ) -> Result<Vec<Vec<Value>>, DatabaseError> {
     let mut rows = Vec::new();
-    let mut result_bytes = 0_usize;
+    let mut result_bytes = result_base_bytes;
     for (ordinal, group) in groups.iter().enumerate() {
         if ordinal < select.offset {
             continue;
@@ -496,16 +606,15 @@ fn collect_unordered_groups(
                 actual: rows.len() + 1,
             });
         }
-        let values = items
-            .iter()
-            .map(|item| eval_group_expr(&item.expr, table, &group.rows, schema))
-            .collect::<Result<Vec<_>, _>>()?;
-        result_bytes = result_bytes.saturating_add(estimate_values(&values));
-        check_byte_limit(
-            LimitKind::ResultBytes,
-            limits.max_result_bytes,
-            result_bytes,
-        )?;
+        let mut budgets = [ByteBudget {
+            kind: LimitKind::ResultBytes,
+            bytes: result_bytes.saturating_add(size_of::<Vec<Value>>().saturating_mul(2)),
+            limit: limits.max_result_bytes,
+        }];
+        let values = evaluate_projection(items, &mut budgets, |expr| {
+            eval_group_expr(expr, table, &group.rows, schema)
+        })?;
+        result_bytes = budgets[0].bytes;
         rows.push(values);
     }
     Ok(rows)
@@ -539,6 +648,10 @@ impl TopKCollector {
 
     fn is_empty_limit(&self) -> bool {
         self.retain == 0
+    }
+
+    fn used_bytes(&self) -> usize {
+        self.bytes
     }
 
     fn push(&mut self, record: Record) -> Result<(), DatabaseError> {
@@ -611,21 +724,26 @@ fn validate_result_bytes(
     rows: &[Vec<Value>],
     limits: &Limits,
 ) -> Result<(), DatabaseError> {
-    let column_bytes = size_of::<Vec<ColumnDefinition>>()
+    let bytes = rows
+        .iter()
+        .fold(estimate_result_base(columns), |bytes, row| {
+            bytes
+                .saturating_add(size_of::<Vec<Value>>().saturating_mul(2))
+                .saturating_add(estimate_values(row))
+        });
+    check_byte_limit(LimitKind::ResultBytes, limits.max_result_bytes, bytes)
+}
+
+fn estimate_result_base(columns: &[ColumnDefinition]) -> usize {
+    size_of::<Vec<ColumnDefinition>>()
         .saturating_add(size_of_val(columns).saturating_mul(2))
         .saturating_add(
             columns
                 .iter()
                 .map(|column| column.name.capacity())
                 .sum::<usize>(),
-        );
-    let bytes = rows.iter().fold(
-        column_bytes
-            .saturating_add(size_of::<Vec<Vec<Value>>>())
-            .saturating_add(size_of_val(rows).saturating_mul(2)),
-        |bytes, row| bytes.saturating_add(estimate_values(row)),
-    );
-    check_byte_limit(LimitKind::ResultBytes, limits.max_result_bytes, bytes)
+        )
+        .saturating_add(size_of::<Vec<Vec<Value>>>())
 }
 
 fn expand_wildcards(
@@ -640,9 +758,14 @@ fn expand_wildcards(
                 return Err(DatabaseError::invalid("SELECT * requires a FROM table"));
             }
             SelectItem::Wildcard => {
-                expanded.extend(schema.columns().iter().map(|column| Projection {
-                    expr: Expr::Column(ColumnReference::unqualified(column.name.clone())),
-                    alias: None,
+                expanded.extend(schema.columns().iter().enumerate().map(|(index, column)| {
+                    Projection {
+                        expr: Expr::Column(ColumnReference::unqualified(
+                            column.name.clone(),
+                            schema.column_is_quoted(index),
+                        )),
+                        alias: None,
+                    }
                 }))
             }
             SelectItem::Expr { expr, alias } => expanded.push(Projection {
@@ -657,6 +780,7 @@ fn expand_wildcards(
 fn validate_select(
     select: &Select,
     items: &[Projection],
+    output_identifiers: &[Identifier],
     has_aggregate: bool,
     schema: &Schema,
 ) -> Result<(), DatabaseError> {
@@ -675,7 +799,7 @@ fn validate_select(
             validate_group_expression(&item.expr, &select.group_by, false, schema)?;
         }
         for order in &select.order_by {
-            if !is_projection_alias(&order.expr, items) {
+            if output_reference_index(&order.expr, output_identifiers)?.is_none() {
                 validate_group_expression(&order.expr, &select.group_by, false, schema)?;
             }
         }
@@ -729,8 +853,8 @@ fn equivalent_expr(left: &Expr, right: &Expr, schema: &Schema) -> bool {
         (Expr::Literal(left), Expr::Literal(right)) => left == right,
         (Expr::Column(left), Expr::Column(right)) => {
             match (
-                schema.column_index(&left.name),
-                schema.column_index(&right.name),
+                schema.column_index_bound(&left.name.value, left.name.quoted),
+                schema.column_index_bound(&right.name.value, right.name.quoted),
             ) {
                 (Some(left), Some(right)) => left == right,
                 _ => false,
@@ -783,33 +907,62 @@ fn equivalent_expr(left: &Expr, right: &Expr, schema: &Schema) -> bool {
     }
 }
 
-fn is_projection_alias(expr: &Expr, items: &[Projection]) -> bool {
+fn projection_alias_index(
+    expr: &Expr,
+    items: &[Projection],
+) -> Result<Option<usize>, DatabaseError> {
     let Expr::Column(reference) = expr else {
-        return false;
+        return Ok(None);
     };
     if reference.qualifier.is_some() {
-        return false;
+        return Ok(None);
     }
-    items.iter().any(|item| {
-        item.alias
-            .as_ref()
-            .is_some_and(|alias| identifiers_equal(alias, &reference.name))
-    })
+    unique_identifier_match(
+        &reference.name,
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.alias.as_ref().map(|alias| (index, alias))),
+    )
 }
 
-fn resolve_projection_alias(expr: &mut Expr, items: &[Projection]) {
+fn resolve_projection_alias(expr: &mut Expr, items: &[Projection]) -> Result<(), DatabaseError> {
+    if let Some(index) = projection_alias_index(expr, items)? {
+        *expr = items[index].expr.clone();
+    }
+    Ok(())
+}
+
+fn output_reference_index(
+    expr: &Expr,
+    outputs: &[Identifier],
+) -> Result<Option<usize>, DatabaseError> {
     let Expr::Column(reference) = expr else {
-        return;
+        return Ok(None);
     };
     if reference.qualifier.is_some() {
-        return;
+        return Ok(None);
     }
-    if let Some(item) = items.iter().find(|item| {
-        item.alias
-            .as_ref()
-            .is_some_and(|alias| identifiers_equal(alias, &reference.name))
-    }) {
-        *expr = item.expr.clone();
+    unique_identifier_match(&reference.name, outputs.iter().enumerate())
+}
+
+fn unique_identifier_match<'a>(
+    reference: &Identifier,
+    candidates: impl Iterator<Item = (usize, &'a Identifier)>,
+) -> Result<Option<usize>, DatabaseError> {
+    let mut matches = candidates.filter(|(_, candidate)| {
+        identifiers_equal(
+            &candidate.value,
+            candidate.quoted,
+            &reference.value,
+            reference.quoted,
+        )
+    });
+    let first = matches.next().map(|(index, _)| index);
+    if matches.next().is_some() {
+        Err(DatabaseError::AmbiguousColumn(reference.value.clone()))
+    } else {
+        Ok(first)
     }
 }
 
@@ -933,6 +1086,11 @@ fn eval_aggregate(
     schema: &Schema,
 ) -> Result<Value, DatabaseError> {
     if function == AggregateFunction::Count {
+        if let Some(argument) = argument {
+            for &row in rows {
+                eval_row_expr(argument, table, Some(row))?;
+            }
+        }
         let count = i64::try_from(rows.len())
             .map_err(|_| DatabaseError::ArithmeticOverflow("COUNT exceeds Int64".into()))?;
         return Ok(Value::Int64(count));
@@ -1018,13 +1176,18 @@ fn eval_row_expr(
                 ))
             })?;
             if let Some(qualifier) = &reference.qualifier
-                && !identifiers_equal(qualifier, &table.name)
+                && !identifiers_equal(
+                    &qualifier.value,
+                    qualifier.quoted,
+                    &table.name,
+                    table.name_quoted,
+                )
             {
                 return Err(DatabaseError::ColumnNotFound(reference.label()));
             }
             let index = table
                 .schema
-                .column_index(&reference.name)
+                .column_index_bound(&reference.name.value, reference.name.quoted)
                 .ok_or_else(|| DatabaseError::ColumnNotFound(reference.label()))?;
             let row = row.ok_or_else(|| DatabaseError::invalid("missing source row"))?;
             Ok(table.value(index, row))
@@ -1261,7 +1424,7 @@ fn infer_type(expr: &Expr, schema: &Schema) -> Result<DataType, DatabaseError> {
     match expr {
         Expr::Literal(value) => Ok(value.data_type()),
         Expr::Column(reference) => schema
-            .column_index(&reference.name)
+            .column_index_bound(&reference.name.value, reference.name.quoted)
             .map(|index| schema.columns()[index].data_type)
             .ok_or_else(|| DatabaseError::ColumnNotFound(reference.label())),
         Expr::Aggregate { function, argument } => match function {
@@ -1390,13 +1553,18 @@ fn validate_column_references(expr: &Expr, table: Option<&Table>) -> Result<(), 
                 ))
             })?;
             if let Some(qualifier) = &reference.qualifier
-                && !identifiers_equal(qualifier, &table.name)
+                && !identifiers_equal(
+                    &qualifier.value,
+                    qualifier.quoted,
+                    &table.name,
+                    table.name_quoted,
+                )
             {
                 return Err(DatabaseError::ColumnNotFound(reference.label()));
             }
             table
                 .schema
-                .column_index(&reference.name)
+                .column_index_bound(&reference.name.value, reference.name.quoted)
                 .map(|_| ())
                 .ok_or_else(|| DatabaseError::ColumnNotFound(reference.label()))
         }
@@ -1412,36 +1580,40 @@ fn validate_column_references(expr: &Expr, table: Option<&Table>) -> Result<(), 
     }
 }
 
+struct OrderSource<'a> {
+    table: Option<&'a Table>,
+    row: Option<usize>,
+    group: Option<&'a [usize]>,
+    schema: &'a Schema,
+}
+
 fn evaluate_order(
     order_by: &[OrderBy],
-    columns: &[ColumnDefinition],
+    output_identifiers: &[Identifier],
     values: &[Value],
-    table: Option<&Table>,
-    row: Option<usize>,
-    group: Option<&[usize]>,
-    schema: &Schema,
+    source: OrderSource<'_>,
+    budget: &mut ByteBudget,
 ) -> Result<Vec<OrderValue>, DatabaseError> {
-    order_by
-        .iter()
-        .map(|order| {
-            let value = if let Expr::Column(reference) = &order.expr
-                && reference.qualifier.is_none()
-                && let Some(index) = columns
-                    .iter()
-                    .position(|column| identifiers_equal(&column.name, &reference.name))
-            {
-                Ok(values[index].clone())
-            } else if let Some(group) = group {
-                eval_group_expr(&order.expr, table, group, schema)
-            } else {
-                eval_row_expr(&order.expr, table, row)
-            }?;
-            Ok(OrderValue {
-                value,
-                descending: order.descending,
-            })
-        })
-        .collect()
+    budget.charge(
+        size_of::<Vec<OrderValue>>()
+            .saturating_add(order_by.len().saturating_mul(size_of::<OrderValue>())),
+    )?;
+    let mut order_values = Vec::with_capacity(order_by.len());
+    for order in order_by {
+        let value = if let Some(index) = output_reference_index(&order.expr, output_identifiers)? {
+            Ok(values[index].clone())
+        } else if let Some(group) = source.group {
+            eval_group_expr(&order.expr, source.table, group, source.schema)
+        } else {
+            eval_row_expr(&order.expr, source.table, source.row)
+        }?;
+        budget.charge(estimate_value(&value))?;
+        order_values.push(OrderValue {
+            value,
+            descending: order.descending,
+        });
+    }
+    Ok(order_values)
 }
 
 #[derive(Debug)]

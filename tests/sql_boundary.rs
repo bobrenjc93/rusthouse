@@ -153,7 +153,7 @@ fn deeply_nested_and_flat_expressions_return_typed_errors_without_crashing() {
     assert!(matches!(
         database.execute_one(&flat),
         Err(DatabaseError::LimitExceeded {
-            kind: LimitKind::ExpressionDepth,
+            kind: LimitKind::ExpressionNodes,
             ..
         })
     ));
@@ -410,4 +410,119 @@ fn mixed_numeric_comparisons_preserve_int64_precision() {
             Value::Bool(true),
         ]]
     );
+}
+
+#[test]
+fn wide_projection_byte_limits_are_enforced_before_late_expressions() {
+    let payload = "x".repeat(32 * 1024);
+    let mut database = Database::with_limits(Limits {
+        max_result_bytes: 128 * 1024,
+        max_string_bytes: 64 * 1024,
+        ..Limits::default()
+    });
+    database
+        .execute(&format!(
+            "CREATE TABLE wide_values (id Int64, payload String);
+             INSERT INTO wide_values VALUES (1, '{payload}')"
+        ))
+        .unwrap();
+    let mut projections = vec!["payload"; 100];
+    projections.push("1 / (id - id) AS late_failure");
+    let projection_sql = projections.join(", ");
+
+    for suffix in ["", " ORDER BY id"] {
+        assert!(matches!(
+            database.execute_one(&format!("SELECT {projection_sql} FROM wide_values{suffix}")),
+            Err(DatabaseError::LimitExceeded {
+                kind: LimitKind::ResultBytes,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn count_expression_propagates_runtime_errors() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE count_values (id Int64);
+             INSERT INTO count_values VALUES (1)",
+        )
+        .unwrap();
+    assert!(matches!(
+        database.execute_one("SELECT COUNT(1 / (id - 1)) FROM count_values"),
+        Err(DatabaseError::InvalidValue(message)) if message == "division by zero"
+    ));
+    assert!(matches!(
+        database.execute_one("SELECT COUNT(id + 9223372036854775807) FROM count_values"),
+        Err(DatabaseError::ArithmeticOverflow(_))
+    ));
+    assert_eq!(
+        query(&mut database, "SELECT COUNT(*) FROM count_values").rows,
+        vec![vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
+fn quoted_identifiers_preserve_exact_case() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE \"CaseTable\" (\"CaseName\" Int64, \"casename\" String);
+             CREATE TABLE \"casetable\" (id Int64);
+             INSERT INTO \"CaseTable\" (\"CaseName\", \"casename\") VALUES (7, 'lower')",
+        )
+        .unwrap();
+    let result = query(
+        &mut database,
+        "SELECT \"CaseTable\".\"CaseName\", \"CaseTable\".\"casename\"
+         FROM \"CaseTable\"",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(7), Value::String("lower".into())]]
+    );
+    assert!(matches!(
+        database.execute_one("SELECT \"CASENAME\" FROM \"CaseTable\""),
+        Err(DatabaseError::ColumnNotFound(_))
+    ));
+}
+
+fn balanced_sum(terms: usize) -> String {
+    if terms == 1 {
+        return "1".into();
+    }
+    let left = terms / 2;
+    format!("({} + {})", balanced_sum(left), balanced_sum(terms - left))
+}
+
+#[test]
+fn balanced_expressions_use_depth_and_a_separate_node_limit() {
+    let mut database = Database::new();
+    let result = query(&mut database, &format!("SELECT {}", balanced_sum(66)));
+    assert_eq!(result.rows, vec![vec![Value::Int64(66)]]);
+
+    assert!(matches!(
+        database.execute_one(&format!("SELECT {}", balanced_sum(1_100))),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::ExpressionNodes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn order_by_rejects_ambiguous_output_names() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE alias_collision (a Int64, b Int64);
+             INSERT INTO alias_collision VALUES (2, 1), (1, 2)",
+        )
+        .unwrap();
+    assert!(matches!(
+        database.execute_one("SELECT a, b AS a FROM alias_collision ORDER BY a"),
+        Err(DatabaseError::AmbiguousColumn(name)) if name == "a"
+    ));
 }

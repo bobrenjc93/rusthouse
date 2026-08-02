@@ -1,20 +1,41 @@
-use crate::{ColumnDefinition, DataType, DatabaseError, LimitKind, Value};
+use crate::{DataType, DatabaseError, LimitKind, Value};
 
 pub(crate) const MAX_SAFE_EXPRESSION_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Statement {
     CreateTable {
-        name: String,
+        name: Identifier,
         if_not_exists: bool,
-        columns: Vec<ColumnDefinition>,
+        columns: Vec<CreateColumn>,
     },
     Insert {
-        table: String,
-        columns: Option<Vec<String>>,
+        table: Identifier,
+        columns: Option<Vec<Identifier>>,
         rows: Vec<Vec<Expr>>,
     },
     Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Identifier {
+    pub(crate) value: String,
+    pub(crate) quoted: bool,
+}
+
+impl Identifier {
+    pub(crate) fn unquoted(value: String) -> Self {
+        Self {
+            value,
+            quoted: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateColumn {
+    pub(crate) name: Identifier,
+    pub(crate) data_type: DataType,
 }
 
 fn validate_expression_depth(statement: &Statement, max_depth: usize) -> Result<(), DatabaseError> {
@@ -68,7 +89,7 @@ fn validate_expression_depth(statement: &Statement, max_depth: usize) -> Result<
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Select {
     pub(crate) items: Vec<SelectItem>,
-    pub(crate) from: Option<String>,
+    pub(crate) from: Option<Identifier>,
     pub(crate) filter: Option<Expr>,
     pub(crate) group_by: Vec<Expr>,
     pub(crate) order_by: Vec<OrderBy>,
@@ -79,7 +100,10 @@ pub(crate) struct Select {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SelectItem {
     Wildcard,
-    Expr { expr: Expr, alias: Option<String> },
+    Expr {
+        expr: Expr,
+        alias: Option<Identifier>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,22 +178,25 @@ pub(crate) enum Expr {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnReference {
-    pub(crate) qualifier: Option<String>,
-    pub(crate) name: String,
+    pub(crate) qualifier: Option<Identifier>,
+    pub(crate) name: Identifier,
 }
 
 impl ColumnReference {
-    pub(crate) fn unqualified(name: String) -> Self {
+    pub(crate) fn unqualified(name: String, quoted: bool) -> Self {
         Self {
             qualifier: None,
-            name,
+            name: Identifier {
+                value: name,
+                quoted,
+            },
         }
     }
 
     pub(crate) fn label(&self) -> String {
         self.qualifier.as_ref().map_or_else(
-            || self.name.clone(),
-            |table| format!("{table}.{}", self.name),
+            || self.name.value.clone(),
+            |table| format!("{}.{}", table.value, self.name.value),
         )
     }
 }
@@ -262,10 +289,16 @@ struct Token {
 pub(crate) fn parse(
     input: &str,
     max_expression_depth: usize,
+    max_expression_nodes: usize,
     max_string_bytes: usize,
 ) -> Result<Vec<Statement>, DatabaseError> {
     let tokens = Lexer::new(input, max_string_bytes).tokenize()?;
-    Parser::new(tokens, max_expression_depth.min(MAX_SAFE_EXPRESSION_DEPTH)).parse_statements()
+    Parser::new(
+        tokens,
+        max_expression_depth.min(MAX_SAFE_EXPRESSION_DEPTH),
+        max_expression_nodes,
+    )
+    .parse_statements()
 }
 
 struct Lexer<'a> {
@@ -457,16 +490,18 @@ struct Parser {
     expression_depth: usize,
     expression_nodes: usize,
     max_expression_depth: usize,
+    max_expression_nodes: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, max_expression_depth: usize) -> Self {
+    fn new(tokens: Vec<Token>, max_expression_depth: usize, max_expression_nodes: usize) -> Self {
         Self {
             tokens,
             position: 0,
             expression_depth: 0,
             expression_nodes: 0,
             max_expression_depth,
+            max_expression_nodes,
         }
     }
 
@@ -517,14 +552,16 @@ impl Parser {
         loop {
             let name = self.parse_identifier()?;
             let type_name = self.parse_identifier()?;
-            let data_type = match type_name.to_ascii_uppercase().as_str() {
+            let data_type = match type_name.value.to_ascii_uppercase().as_str() {
                 "INT64" | "BIGINT" => DataType::Int64,
                 "FLOAT64" | "DOUBLE" => DataType::Float64,
                 "BOOL" | "BOOLEAN" => DataType::Bool,
                 "STRING" | "TEXT" => DataType::String,
-                _ => return Err(self.error(format!("unsupported data type {type_name}"))),
+                _ => {
+                    return Err(self.error(format!("unsupported data type {}", type_name.value)));
+                }
             };
-            columns.push(ColumnDefinition { name, data_type });
+            columns.push(CreateColumn { name, data_type });
             if !self.consume(&TokenKind::Comma) {
                 break;
             }
@@ -805,6 +842,7 @@ impl Parser {
                     let number = format!("-{value}").parse::<i64>().map_err(|_| {
                         DatabaseError::parse(format!("invalid Int64 literal -{value}"), offset)
                     })?;
+                    self.record_expression_node()?;
                     return Ok(Expr::Literal(Value::Int64(number)));
                 }
                 operators.push(UnaryOperator::Negate);
@@ -833,6 +871,7 @@ impl Parser {
         }
         if let TokenKind::String(value) = self.current().kind.clone() {
             self.advance();
+            self.record_expression_node()?;
             return Ok(Expr::Literal(Value::String(value)));
         }
         if let TokenKind::Number(value) = self.current().kind.clone() {
@@ -845,17 +884,21 @@ impl Parser {
                 if !number.is_finite() {
                     return Err(DatabaseError::parse("float must be finite", offset));
                 }
+                self.record_expression_node()?;
                 return Ok(Expr::Literal(Value::Float64(number)));
             }
             let number = value.parse::<i64>().map_err(|_| {
                 DatabaseError::parse(format!("invalid Int64 literal {value}"), offset)
             })?;
+            self.record_expression_node()?;
             return Ok(Expr::Literal(Value::Int64(number)));
         }
         if self.consume_keyword("TRUE") {
+            self.record_expression_node()?;
             return Ok(Expr::Literal(Value::Bool(true)));
         }
         if self.consume_keyword("FALSE") {
+            self.record_expression_node()?;
             return Ok(Expr::Literal(Value::Bool(false)));
         }
         if self.peek_keyword("NULL") {
@@ -864,13 +907,13 @@ impl Parser {
 
         let name = self.parse_identifier()?;
         if self.consume(&TokenKind::LeftParen) {
-            let function = match name.to_ascii_uppercase().as_str() {
+            let function = match name.value.to_ascii_uppercase().as_str() {
                 "COUNT" => AggregateFunction::Count,
                 "SUM" => AggregateFunction::Sum,
                 "MIN" => AggregateFunction::Min,
                 "MAX" => AggregateFunction::Max,
                 "AVG" => AggregateFunction::Avg,
-                _ => return Err(self.error(format!("unsupported function {name}"))),
+                _ => return Err(self.error(format!("unsupported function {}", name.value))),
             };
             let argument = if self.consume(&TokenKind::Star) {
                 None
@@ -901,15 +944,26 @@ impl Parser {
             } else {
                 (None, name)
             };
+            self.record_expression_node()?;
             Ok(Expr::Column(ColumnReference { qualifier, name }))
         }
     }
 
-    fn parse_identifier(&mut self) -> Result<String, DatabaseError> {
+    fn parse_identifier(&mut self) -> Result<Identifier, DatabaseError> {
         match self.current().kind.clone() {
-            TokenKind::Word(name) | TokenKind::QuotedIdentifier(name) => {
+            TokenKind::Word(value) => {
                 self.advance();
-                Ok(name)
+                Ok(Identifier {
+                    value,
+                    quoted: false,
+                })
+            }
+            TokenKind::QuotedIdentifier(value) => {
+                self.advance();
+                Ok(Identifier {
+                    value,
+                    quoted: true,
+                })
             }
             _ => Err(self.error("expected an identifier")),
         }
@@ -917,10 +971,10 @@ impl Parser {
 
     fn record_expression_node(&mut self) -> Result<(), DatabaseError> {
         self.expression_nodes += 1;
-        if self.expression_nodes > self.max_expression_depth {
+        if self.expression_nodes > self.max_expression_nodes {
             Err(DatabaseError::LimitExceeded {
-                kind: LimitKind::ExpressionDepth,
-                limit: self.max_expression_depth,
+                kind: LimitKind::ExpressionNodes,
+                limit: self.max_expression_nodes,
                 actual: self.expression_nodes,
             })
         } else {
@@ -1026,8 +1080,9 @@ mod tests {
              INSERT INTO `Odd Table` VALUES ('a;''b', -2);\n\
              SELECT `Group` AS g, SUM(n) total FROM `Odd Table` \
              WHERE n >= -2 AND (`Group` = 'x' OR `Group` = 'a;''b') \
-             GROUP BY `Group` ORDER BY total DESC LIMIT 3;",
+            GROUP BY `Group` ORDER BY total DESC LIMIT 3;",
             256,
+            1024,
             1024 * 1024,
         )
         .unwrap();
@@ -1042,7 +1097,13 @@ mod tests {
 
     #[test]
     fn rejects_trailing_unparsed_tokens() {
-        let error = parse("SELECT 1 nonsense FROM t unexpected", 256, 1024 * 1024).unwrap_err();
+        let error = parse(
+            "SELECT 1 nonsense FROM t unexpected",
+            256,
+            1024,
+            1024 * 1024,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("expected ';'"));
     }
 }
