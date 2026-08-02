@@ -1,4 +1,4 @@
-//! A bounded parser for the supported `CREATE TABLE` syntax.
+//! Bounded parsers for the supported SQL statements.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,6 +21,12 @@ pub struct CreateTable {
     pub columns: Vec<ColumnDefinition>,
 }
 
+/// The syntax tree for `SELECT * FROM <identifier>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectAll {
+    pub table_name: String,
+}
+
 /// A named column and its declared type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDefinition {
@@ -33,6 +39,8 @@ pub struct ColumnDefinition {
 pub enum Keyword {
     Create,
     Table,
+    Select,
+    From,
 }
 
 /// A parse error with a zero-based UTF-8 byte offset into the input.
@@ -50,6 +58,7 @@ pub enum ParseErrorKind {
     TooManyColumns { limit: usize },
     UnexpectedCharacter { character: char },
     ExpectedKeyword { keyword: Keyword },
+    ExpectedAsterisk,
     ExpectedIdentifier,
     ExpectedLeftParenthesis,
     ExpectedColumnType,
@@ -87,6 +96,9 @@ impl fmt::Display for ParseError {
                 "expected keyword {keyword} at byte {}",
                 self.position
             ),
+            ParseErrorKind::ExpectedAsterisk => {
+                write!(formatter, "expected '*' at byte {}", self.position)
+            }
             ParseErrorKind::ExpectedIdentifier => {
                 write!(formatter, "expected identifier at byte {}", self.position)
             }
@@ -126,6 +138,8 @@ impl fmt::Display for Keyword {
         match self {
             Self::Create => formatter.write_str("CREATE"),
             Self::Table => formatter.write_str("TABLE"),
+            Self::Select => formatter.write_str("SELECT"),
+            Self::From => formatter.write_str("FROM"),
         }
     }
 }
@@ -158,12 +172,40 @@ pub fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
     }
 
     let tokens = tokenize(input)?;
-    Parser::new(tokens).parse()
+    Parser::new(tokens).parse_create_table()
+}
+
+/// Parses exactly one bounded `SELECT * FROM <identifier>` statement.
+///
+/// Keywords are ASCII case-insensitive. The table name is an unquoted
+/// identifier using `[A-Za-z_][A-Za-z0-9_]*`. One final semicolon is optional.
+///
+/// ```
+/// use rusthouse::parse_select_all;
+///
+/// let statement = parse_select_all("SELECT * FROM events;")?;
+/// assert_eq!(statement.table_name, "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_select_all(input: &str) -> Result<SelectAll, ParseError> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(ParseError {
+            kind: ParseErrorKind::InputTooLong {
+                limit: MAX_INPUT_BYTES,
+                actual: input.len(),
+            },
+            position: MAX_INPUT_BYTES,
+        });
+    }
+
+    let tokens = tokenize(input)?;
+    Parser::new(tokens).parse_select_all()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenKind<'a> {
     Word(&'a str),
+    Asterisk,
     LeftParenthesis,
     RightParenthesis,
     Comma,
@@ -201,6 +243,7 @@ fn tokenize(input: &str) -> Result<Vec<Token<'_>>, ParseError> {
         } else {
             position += 1;
             match byte {
+                b'*' => TokenKind::Asterisk,
                 b'(' => TokenKind::LeftParenthesis,
                 b')' => TokenKind::RightParenthesis,
                 b',' => TokenKind::Comma,
@@ -244,7 +287,7 @@ impl<'a> Parser<'a> {
         Self { tokens, current: 0 }
     }
 
-    fn parse(mut self) -> Result<CreateTable, ParseError> {
+    fn parse_create_table(mut self) -> Result<CreateTable, ParseError> {
         self.expect_keyword("CREATE", Keyword::Create)?;
         self.expect_keyword("TABLE", Keyword::Table)?;
         let (table_name, _) = self.parse_identifier()?;
@@ -311,6 +354,18 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_select_all(mut self) -> Result<SelectAll, ParseError> {
+        self.expect_keyword("SELECT", Keyword::Select)?;
+        self.expect_asterisk()?;
+        self.expect_keyword("FROM", Keyword::From)?;
+        let (table_name, _) = self.parse_identifier()?;
+        self.expect_end()?;
+
+        Ok(SelectAll {
+            table_name: table_name.to_owned(),
+        })
+    }
+
     fn expect_keyword(&mut self, expected: &str, keyword: Keyword) -> Result<(), ParseError> {
         if matches!(self.current_token().kind, TokenKind::Word(word) if word.eq_ignore_ascii_case(expected))
         {
@@ -341,6 +396,31 @@ impl<'a> Parser<'a> {
             kind: ParseErrorKind::ExpectedIdentifier,
             position: token.position,
         })
+    }
+
+    fn expect_asterisk(&mut self) -> Result<(), ParseError> {
+        if self.current_token().kind == TokenKind::Asterisk {
+            self.advance();
+            Ok(())
+        } else {
+            Err(ParseError {
+                kind: ParseErrorKind::ExpectedAsterisk,
+                position: self.current_token().position,
+            })
+        }
+    }
+
+    fn expect_end(&mut self) -> Result<(), ParseError> {
+        if self.current_token().kind == TokenKind::Semicolon {
+            self.advance();
+        }
+        if self.current_token().kind != TokenKind::End {
+            return Err(ParseError {
+                kind: ParseErrorKind::TrailingInput,
+                position: self.current_token().position,
+            });
+        }
+        Ok(())
     }
 
     fn expect_left_parenthesis(&mut self) -> Result<(), ParseError> {
