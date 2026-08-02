@@ -4,7 +4,7 @@ pub mod catalog;
 pub mod parser;
 pub mod storage;
 
-pub use catalog::{Catalog, CatalogError, CatalogLimits};
+pub use catalog::{Catalog, CatalogError, CatalogLimits, IdentifierError};
 pub use parser::{
     ColumnDefinition, ColumnType, CreateTable, Keyword, MAX_COLUMNS, MAX_INPUT_BYTES, MAX_TOKENS,
     ParseError, ParseErrorKind, parse_create_table,

@@ -1,6 +1,6 @@
 use rusthouse::{
-    Catalog, CatalogError, CatalogLimits, ColumnDefinition, ColumnType, CreateTable, SchemaError,
-    parse_create_table,
+    Catalog, CatalogError, CatalogLimits, ColumnDefinition, ColumnType, CreateTable,
+    IdentifierError, MAX_COLUMNS, MAX_INPUT_BYTES, SchemaError, parse_create_table,
 };
 
 #[test]
@@ -113,9 +113,191 @@ fn reports_schema_errors_for_manually_constructed_invalid_asts() {
     };
     assert_eq!(
         catalog.create_table(invalid),
-        Err(CatalogError::InvalidSchema(SchemaError::EmptyColumnName {
-            column: 0
-        }))
+        Err(CatalogError::InvalidColumnName {
+            column: 0,
+            reason: IdentifierError::Empty,
+        })
+    );
+    assert!(catalog.is_empty());
+}
+
+#[test]
+fn forged_asts_enforce_the_exact_column_count_boundary() {
+    let columns = (0..MAX_COLUMNS)
+        .map(|index| ColumnDefinition {
+            name: format!("c{index}"),
+            column_type: ColumnType::Int64,
+        })
+        .collect::<Vec<_>>();
+    let mut catalog = Catalog::new();
+
+    catalog
+        .create_table(CreateTable {
+            name: "at_limit".to_owned(),
+            columns: columns.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        catalog.table("at_limit").unwrap().schema().len(),
+        MAX_COLUMNS
+    );
+
+    let mut over_limit = columns;
+    over_limit.push(ColumnDefinition {
+        name: "extra".to_owned(),
+        column_type: ColumnType::Int64,
+    });
+    let error = catalog
+        .create_table(CreateTable {
+            name: "over_limit".to_owned(),
+            columns: over_limit,
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CatalogError::TooManyColumns {
+            limit: MAX_COLUMNS,
+            actual: MAX_COLUMNS + 1,
+        }
+    );
+    assert!(catalog.table("over_limit").is_none());
+}
+
+#[test]
+fn forged_asts_enforce_the_exact_definition_size_boundary() {
+    let fixed_bytes =
+        "CREATE TABLE ".len() + "t".len() + "(".len() + " ".len() + "Int64".len() + ")".len();
+    let at_limit_name = "c".repeat(MAX_INPUT_BYTES - fixed_bytes);
+    let mut catalog = Catalog::new();
+
+    catalog
+        .create_table(CreateTable {
+            name: "t".to_owned(),
+            columns: vec![ColumnDefinition {
+                name: at_limit_name.clone(),
+                column_type: ColumnType::Int64,
+            }],
+        })
+        .unwrap();
+
+    let error = catalog
+        .create_table(CreateTable {
+            name: "u".to_owned(),
+            columns: vec![ColumnDefinition {
+                name: format!("{at_limit_name}c"),
+                column_type: ColumnType::Int64,
+            }],
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CatalogError::DefinitionTooLong {
+            limit: MAX_INPUT_BYTES,
+            actual: MAX_INPUT_BYTES + 1,
+        }
+    );
+    assert!(catalog.table("u").is_none());
+}
+
+#[test]
+fn forged_asts_reject_invalid_identifiers() {
+    let cases = [
+        (
+            "",
+            CatalogError::InvalidTableName {
+                reason: IdentifierError::Empty,
+            },
+        ),
+        (
+            "1table",
+            CatalogError::InvalidTableName {
+                reason: IdentifierError::InvalidStart { character: '1' },
+            },
+        ),
+        (
+            "bad-name",
+            CatalogError::InvalidTableName {
+                reason: IdentifierError::InvalidCharacter {
+                    character: '-',
+                    position: 3,
+                },
+            },
+        ),
+        (
+            "café",
+            CatalogError::InvalidTableName {
+                reason: IdentifierError::InvalidCharacter {
+                    character: 'é',
+                    position: 3,
+                },
+            },
+        ),
+    ];
+
+    for (name, expected) in cases {
+        let mut catalog = Catalog::new();
+        let error = catalog
+            .create_table(CreateTable {
+                name: name.to_owned(),
+                columns: vec![ColumnDefinition {
+                    name: "id".to_owned(),
+                    column_type: ColumnType::Int64,
+                }],
+            })
+            .unwrap_err();
+        assert_eq!(error, expected);
+        assert!(catalog.is_empty());
+    }
+
+    let mut catalog = Catalog::new();
+    let error = catalog
+        .create_table(CreateTable {
+            name: "valid_table".to_owned(),
+            columns: vec![ColumnDefinition {
+                name: "bad column".to_owned(),
+                column_type: ColumnType::Int64,
+            }],
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CatalogError::InvalidColumnName {
+            column: 0,
+            reason: IdentifierError::InvalidCharacter {
+                character: ' ',
+                position: 3,
+            },
+        }
+    );
+    assert!(catalog.is_empty());
+}
+
+#[test]
+fn forged_asts_reject_case_insensitive_duplicate_columns() {
+    let mut catalog = Catalog::new();
+    let error = catalog
+        .create_table(CreateTable {
+            name: "duplicates".to_owned(),
+            columns: vec![
+                ColumnDefinition {
+                    name: "UserId".to_owned(),
+                    column_type: ColumnType::Int64,
+                },
+                ColumnDefinition {
+                    name: "userid".to_owned(),
+                    column_type: ColumnType::String,
+                },
+            ],
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        CatalogError::DuplicateColumn {
+            name: "userid".to_owned(),
+            first_column: 0,
+            duplicate_column: 1,
+        }
     );
     assert!(catalog.is_empty());
 }
