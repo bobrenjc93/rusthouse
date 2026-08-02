@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="640" viewBox="0 0 1120 640" role="img" aria-labelledby="burner-history-title burner-history-description">
+  <title id="burner-history-title">Burner evaluation progress</title>
+  <desc id="burner-history-description">1 chronological evaluation point(s), scored from 0 to 100. Latest scores: Analytical database capability: 0; Rust engineering quality: 25; ClickHouse sustained parity: 0; Benchmark integrity and anti-gaming: 85; ClickHouse feature comprehensiveness: 0; Evaluation progress accounting: 0.</desc>
+  <rect width="1120" height="640" fill="#FFFFFF"/>
+  <text x="82" y="34" fill="#17202A" font-family="system-ui, sans-serif" font-size="22" font-weight="700">Burner evaluation progress</text>
+  <text x="82" y="58" fill="#4D5966" font-family="system-ui, sans-serif" font-size="13">1 chronological point(s) | fixed score range 0-100</text>
+  <g aria-label="Score grid">
+    <line x1="82" y1="522" x2="700" y2="522" stroke="#D9DEE3" stroke-width="1"/>
+    <text x="68" y="526" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">0</text>
+    <line x1="82" y1="434" x2="700" y2="434" stroke="#D9DEE3" stroke-width="1"/>
+    <text x="68" y="438" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">20</text>
+    <line x1="82" y1="346" x2="700" y2="346" stroke="#D9DEE3" stroke-width="1"/>
+    <text x="68" y="350" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">40</text>
+    <line x1="82" y1="258" x2="700" y2="258" stroke="#D9DEE3" stroke-width="1"/>
+    <text x="68" y="262" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">60</text>
+    <line x1="82" y1="170" x2="700" y2="170" stroke="#D9DEE3" stroke-width="1"/>
+    <text x="68" y="174" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">80</text>
+    <line x1="82" y1="82" x2="700" y2="82" stroke="#D9DEE3" stroke-width="1"/>
+    <text x="68" y="86" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">100</text>
+  </g>
+  <text x="20" y="302" transform="rotate(-90 20 302)" text-anchor="middle" fill="#303942" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Score (0-100)</text>
+  <line x1="82" y1="82" x2="82" y2="522" stroke="#69737D" stroke-width="1.5"/>
+  <line x1="82" y1="522" x2="700" y2="522" stroke="#69737D" stroke-width="1.5"/>
+  <g role="group" aria-label="Analytical database capability score series">
+    <title>Analytical database capability</title>
+  </g>
+  <g role="group" aria-label="Rust engineering quality score series">
+    <title>Rust engineering quality</title>
+  </g>
+  <g role="group" aria-label="ClickHouse sustained parity score series">
+    <title>ClickHouse sustained parity</title>
+  </g>
+  <g role="group" aria-label="Benchmark integrity and anti-gaming score series">
+    <title>Benchmark integrity and anti-gaming</title>
+  </g>
+  <g role="group" aria-label="ClickHouse feature comprehensiveness score series">
+    <title>ClickHouse feature comprehensiveness</title>
+  </g>
+  <g role="group" aria-label="Evaluation progress accounting score series">
+    <title>Evaluation progress accounting</title>
+  </g>
+  <circle cx="391" cy="522" r="10.5" fill="#0072B2" stroke="#FFFFFF" stroke-width="1"><title>Analytical database capability: 0 at 0eb0644 baseline</title></circle>
+  <circle cx="391" cy="522" r="8.5" fill="#009E73" stroke="#FFFFFF" stroke-width="1"><title>ClickHouse sustained parity: 0 at 0eb0644 baseline</title></circle>
+  <circle cx="391" cy="522" r="6.5" fill="#CC79A7" stroke="#FFFFFF" stroke-width="1"><title>ClickHouse feature comprehensiveness: 0 at 0eb0644 baseline</title></circle>
+  <circle cx="391" cy="522" r="4.5" fill="#56B4E9" stroke="#FFFFFF" stroke-width="1"><title>Evaluation progress accounting: 0 at 0eb0644 baseline</title></circle>
+  <circle cx="391" cy="412" r="4.5" fill="#D55E00" stroke="#FFFFFF" stroke-width="1"><title>Rust engineering quality: 25 at 0eb0644 baseline</title></circle>
+  <circle cx="391" cy="148" r="4.5" fill="#E69F00" stroke="#FFFFFF" stroke-width="1"><title>Benchmark integrity and anti-gaming: 85 at 0eb0644 baseline</title></circle>
+  <line x1="391" y1="522" x2="391" y2="528" stroke="#69737D" stroke-width="1"/>
+  <text x="391" y="545" text-anchor="middle" fill="#303942" font-family="system-ui, sans-serif" font-size="11">0eb0644 baseline</text>
+  <text x="391" y="582" text-anchor="middle" fill="#303942" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Burner baseline and merged pull requests</text>
+  <line x1="720" y1="82" x2="720" y2="522" stroke="#D9DEE3" stroke-width="1"/>
+  <text x="738" y="102" fill="#17202A" font-family="system-ui, sans-serif" font-size="14" font-weight="700">Evaluations</text>
+  <text x="1080" y="102" text-anchor="end" fill="#4D5966" font-family="system-ui, sans-serif" font-size="12">Latest</text>
+  <line x1="738" y1="136" x2="762" y2="136" stroke="#0072B2" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="750" cy="136" r="4" fill="#0072B2" stroke="#FFFFFF" stroke-width="1"/>
+  <text x="772" y="140" fill="#303942" font-family="system-ui, sans-serif" font-size="12">Analytical database capability</text>
+  <text x="1080" y="140" text-anchor="end" fill="#17202A" font-family="system-ui, sans-serif" font-size="12" font-weight="700">0</text>
+  <line x1="738" y1="195" x2="762" y2="195" stroke="#D55E00" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="750" cy="195" r="4" fill="#D55E00" stroke="#FFFFFF" stroke-width="1"/>
+  <text x="772" y="199" fill="#303942" font-family="system-ui, sans-serif" font-size="12">Rust engineering quality</text>
+  <text x="1080" y="199" text-anchor="end" fill="#17202A" font-family="system-ui, sans-serif" font-size="12" font-weight="700">25</text>
+  <line x1="738" y1="254" x2="762" y2="254" stroke="#009E73" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="750" cy="254" r="4" fill="#009E73" stroke="#FFFFFF" stroke-width="1"/>
+  <text x="772" y="258" fill="#303942" font-family="system-ui, sans-serif" font-size="12">ClickHouse sustained parity</text>
+  <text x="1080" y="258" text-anchor="end" fill="#17202A" font-family="system-ui, sans-serif" font-size="12" font-weight="700">0</text>
+  <line x1="738" y1="313" x2="762" y2="313" stroke="#E69F00" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="750" cy="313" r="4" fill="#E69F00" stroke="#FFFFFF" stroke-width="1"/>
+  <text x="772" y="317" fill="#303942" font-family="system-ui, sans-serif" font-size="12">Benchmark integrity and anti-gaming</text>
+  <text x="1080" y="317" text-anchor="end" fill="#17202A" font-family="system-ui, sans-serif" font-size="12" font-weight="700">85</text>
+  <line x1="738" y1="372" x2="762" y2="372" stroke="#CC79A7" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="750" cy="372" r="4" fill="#CC79A7" stroke="#FFFFFF" stroke-width="1"/>
+  <text x="772" y="376" fill="#303942" font-family="system-ui, sans-serif" font-size="12">ClickHouse feature comprehensiveness</text>
+  <text x="1080" y="376" text-anchor="end" fill="#17202A" font-family="system-ui, sans-serif" font-size="12" font-weight="700">0</text>
+  <line x1="738" y1="431" x2="762" y2="431" stroke="#56B4E9" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="750" cy="431" r="4" fill="#56B4E9" stroke="#FFFFFF" stroke-width="1"/>
+  <text x="772" y="435" fill="#303942" font-family="system-ui, sans-serif" font-size="12">Evaluation progress accounting</text>
+  <text x="1080" y="435" text-anchor="end" fill="#17202A" font-family="system-ui, sans-serif" font-size="12" font-weight="700">0</text>
+  <text x="738" y="514" fill="#4D5966" font-family="system-ui, sans-serif" font-size="11">Latest: 0eb0644 baseline</text>
+</svg>

@@ -29,3 +29,13 @@ cargo run -- --help
 ```
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation scores over time on a fixed 0 to 100 scale](docs/burner-evaluation-history.svg)
+
+[Raw versioned evaluation history](docs/burner-evaluation-history.json)
+
+Burner automatically appends one complete point after each Burner-managed pull request merges, keyed by both PR number and merge commit, and regenerates this graph from the raw history. Merge retries cannot create a second point: validation fails on duplicate PRs or commits, missing evaluation scores, malformed values, or scores outside 0-100. Run `python3 scripts/render_burner_evaluation_history.py --check` to verify the committed graph.
+<!-- burner-progress:end -->
