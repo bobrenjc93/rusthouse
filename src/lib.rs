@@ -205,6 +205,7 @@ impl std::error::Error for SqlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
             SqlErrorKind::InvalidRow { source, .. } => Some(source),
+            SqlErrorKind::InvalidSchema { error, .. } => Some(error),
             _ => None,
         }
     }

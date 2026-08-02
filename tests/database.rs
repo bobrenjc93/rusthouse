@@ -315,10 +315,15 @@ fn schema_limit_errors_are_typed_positioned_and_preserve_catalog() {
     ] {
         let mut database = database_with_seed();
         let before = database.clone();
+        let expected_source = expected_error.to_string();
 
         let error = database.execute(&sql).unwrap_err();
 
         assert_eq!(error.byte_offset(), expected_offset);
+        assert_eq!(
+            std::error::Error::source(&error).map(ToString::to_string),
+            Some(expected_source)
+        );
         assert_eq!(
             error.kind(),
             &SqlErrorKind::InvalidSchema {
@@ -332,6 +337,25 @@ fn schema_limit_errors_are_typed_positioned_and_preserve_catalog() {
         );
         assert_eq!(database, before);
     }
+}
+
+#[test]
+fn schema_limit_failure_rolls_back_an_earlier_staged_insert() {
+    let mut database = database_with_seed();
+    let before = database.clone();
+    let long_field = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
+    let sql = format!("INSERT INTO seed VALUES (1); CREATE TABLE invalid ({long_field} String);");
+
+    let error = database.execute(&sql).unwrap_err();
+
+    assert!(matches!(
+        error.kind(),
+        SqlErrorKind::InvalidSchema {
+            error: SchemaError::IdentifierTooLong { .. },
+            ..
+        }
+    ));
+    assert_eq!(database, before);
 }
 
 #[test]
