@@ -98,7 +98,8 @@ impl fmt::Display for ParseError {
         write!(
             formatter,
             " at bytes {}..{}",
-            self.span.start, self.span.end
+            self.span.start(),
+            self.span.end()
         )
     }
 }

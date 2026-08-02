@@ -1,5 +1,7 @@
 # RustHouse
 
+[![Rust quality](https://github.com/bobrenjc93/rusthouse/actions/workflows/quality.yml/badge.svg)](https://github.com/bobrenjc93/rusthouse/actions/workflows/quality.yml)
+
 RustHouse is a from-scratch analytical database in Rust, inspired by the useful core of ClickHouse: typed columnar data, fast scans and aggregations, a practical SQL surface, and an operational interface that is easy to embed and understand.
 
 This is intentionally not a wire-compatible ClickHouse clone. The goal is to grow a credible small competitor through measured, reviewed iterations while keeping the implementation approachable.
@@ -29,6 +31,12 @@ RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burn
 cargo test
 cargo run -- --help
 ```
+
+The binary currently supports help (`-h`, `--help`) and version (`-V`,
+`--version`) output. It does not execute SQL yet. The supported operations are
+library APIs: bounded SQL lexing and `CREATE TABLE` parsing, validated columnar
+table construction and transactional row-batch insertion, and bounded
+streaming CSV formatting.
 
 RustHouse uses Rust 1.85.0, the minimum toolchain supporting edition 2024.
 `rustup` reads the checked-in toolchain file and installs rustfmt and Clippy.

@@ -1,3 +1,17 @@
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![deny(
+    rust_2018_idioms,
+    unreachable_pub,
+    clippy::dbg_macro,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)
+)]
+
 //! RustHouse is an experimental, compact analytical database.
 //!
 //! Its storage layer provides validated, in-memory columnar tables with four
@@ -12,7 +26,7 @@ mod value;
 pub mod csv;
 pub use csv::{CsvError, CsvFormatter, CsvLimits, CsvRecord};
 pub use error::{Error, Result};
-pub use storage::{Column, ColumnDef, Table};
+pub use storage::{Column, ColumnDef, StorageLimits, Table};
 pub use value::{DataType, Value};
 
 pub mod sql;

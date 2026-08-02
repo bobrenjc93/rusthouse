@@ -9,6 +9,13 @@ pub enum Error {
     EmptySchema,
     /// A schema contained the same column name more than once, ignoring case.
     DuplicateColumn(String),
+    /// A table schema contained more columns than configured.
+    ColumnLimitExceeded {
+        /// The configured maximum number of columns.
+        limit: usize,
+        /// The number of columns supplied by the caller.
+        actual: usize,
+    },
     /// A requested column does not exist in the table.
     ColumnNotFound {
         /// The table that was searched.
@@ -43,6 +50,35 @@ pub enum Error {
         /// The column receiving the value.
         column: String,
     },
+    /// A string value was larger than the configured per-value limit.
+    StringValueLimitExceeded {
+        /// The table receiving the value.
+        table: String,
+        /// The column receiving the value.
+        column: String,
+        /// The configured maximum UTF-8 byte length.
+        limit: usize,
+        /// The supplied string's UTF-8 byte length.
+        actual: usize,
+    },
+    /// An insert would exceed the configured row limit.
+    RowLimitExceeded {
+        /// The table receiving the rows.
+        table: String,
+        /// The configured maximum row count.
+        limit: usize,
+        /// The row count that the insert attempted to reach.
+        actual: usize,
+    },
+    /// An insert would exceed the configured aggregate value-byte limit.
+    ValueStorageLimitExceeded {
+        /// The table receiving the values.
+        table: String,
+        /// The configured maximum aggregate value bytes.
+        limit: usize,
+        /// The aggregate byte count that the insert attempted to reach.
+        actual: usize,
+    },
     /// A row in a batch failed validation.
     BatchRow {
         /// The zero-based position of the invalid row within the batch.
@@ -60,6 +96,10 @@ impl fmt::Display for Error {
         match self {
             Self::EmptySchema => formatter.write_str("a table must contain at least one column"),
             Self::DuplicateColumn(column) => write!(formatter, "duplicate column '{column}'"),
+            Self::ColumnLimitExceeded { limit, actual } => write!(
+                formatter,
+                "table schema has {actual} columns, exceeding the {limit}-column limit"
+            ),
             Self::ColumnNotFound { table, column } => {
                 write!(
                     formatter,
@@ -86,6 +126,31 @@ impl fmt::Display for Error {
             Self::NonFiniteFloat { table, column } => write!(
                 formatter,
                 "column '{table}.{column}' cannot store a non-finite Float64"
+            ),
+            Self::StringValueLimitExceeded {
+                table,
+                column,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "string for column '{table}.{column}' is {actual} bytes, exceeding the {limit}-byte value limit"
+            ),
+            Self::RowLimitExceeded {
+                table,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "insert would grow table '{table}' to {actual} rows, exceeding the {limit}-row limit"
+            ),
+            Self::ValueStorageLimitExceeded {
+                table,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "insert would grow table '{table}' to {actual} value bytes, exceeding the {limit}-byte storage limit"
             ),
             Self::BatchRow { row_index, source } => {
                 write!(formatter, "batch row {row_index} is invalid: {source}")

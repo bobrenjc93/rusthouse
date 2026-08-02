@@ -221,6 +221,49 @@ fn validates_and_writes_the_same_as_ref_snapshot() {
     assert_eq!(calls.get(), 1);
 }
 
+#[test]
+fn enforces_total_output_limits_before_writing_each_record() {
+    let mut output = Vec::new();
+    let header_error = CsvFormatter::new(CsvLimits::new(1, 16).with_max_output_bytes(2))
+        .write(&mut output, &["h"], std::iter::empty::<[&str; 1]>())
+        .unwrap_err();
+
+    assert!(matches!(
+        header_error,
+        CsvError::OutputLimitExceeded {
+            record: CsvRecord::Header,
+            limit: 2,
+            actual: 3,
+        }
+    ));
+    assert!(output.is_empty());
+
+    let row_error = CsvFormatter::new(CsvLimits::new(1, 16).with_max_output_bytes(8))
+        .write(&mut output, &["h"], [["x"], ["y"]])
+        .unwrap_err();
+
+    assert!(matches!(
+        row_error,
+        CsvError::OutputLimitExceeded {
+            record: CsvRecord::Row(1),
+            limit: 8,
+            actual: 9,
+        }
+    ));
+    assert_eq!(output, b"h\r\nx\r\n");
+}
+
+#[test]
+fn total_output_limit_accepts_the_exact_encoded_boundary() {
+    let mut output = Vec::new();
+
+    CsvFormatter::new(CsvLimits::new(1, 16).with_max_output_bytes(7))
+        .write(&mut output, &[""], [["x"]])
+        .unwrap();
+
+    assert_eq!(output, b"\"\"\r\nx\r\n");
+}
+
 struct FailingWriter {
     writes: Rc<Cell<usize>>,
 }

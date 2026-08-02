@@ -2,6 +2,54 @@ use std::collections::HashSet;
 
 use crate::{DataType, Error, Result, Value};
 
+/// Configurable resource limits for one in-memory [`Table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageLimits {
+    /// Maximum number of physical columns.
+    pub max_columns: usize,
+    /// Maximum number of stored rows.
+    pub max_rows: usize,
+    /// Maximum UTF-8 byte length of one string value.
+    pub max_string_bytes: usize,
+    /// Maximum aggregate bytes in stored scalar values.
+    ///
+    /// This accounts for scalar payloads, not `Vec` capacities or allocator
+    /// metadata.
+    pub max_total_value_bytes: usize,
+}
+
+impl StorageLimits {
+    /// Bounded defaults used by [`Table::new`].
+    pub const DEFAULT: Self = Self {
+        max_columns: 100_000,
+        max_rows: 10_000_000,
+        max_string_bytes: 1024 * 1024,
+        max_total_value_bytes: 1024 * 1024 * 1024,
+    };
+
+    /// Creates explicit column, row, string, and aggregate value-byte limits.
+    #[must_use]
+    pub const fn new(
+        max_columns: usize,
+        max_rows: usize,
+        max_string_bytes: usize,
+        max_total_value_bytes: usize,
+    ) -> Self {
+        Self {
+            max_columns,
+            max_rows,
+            max_string_bytes,
+            max_total_value_bytes,
+        }
+    }
+}
+
+impl Default for StorageLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// A named, typed field in a [`Table`] schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -108,6 +156,8 @@ pub struct Table {
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
     row_count: usize,
+    value_bytes: usize,
+    limits: StorageLimits,
 }
 
 impl Table {
@@ -115,9 +165,25 @@ impl Table {
     ///
     /// Returns [`Error::EmptySchema`] for a schema without fields and
     /// [`Error::DuplicateColumn`] when names repeat, ignoring ASCII case.
+    /// [`StorageLimits::DEFAULT`] bounds the table's columns and values.
     pub fn new(name: impl Into<String>, schema: Vec<ColumnDef>) -> Result<Self> {
+        Self::new_with_limits(name, schema, StorageLimits::default())
+    }
+
+    /// Creates an empty table with a validated schema and explicit limits.
+    pub fn new_with_limits(
+        name: impl Into<String>,
+        schema: Vec<ColumnDef>,
+        limits: StorageLimits,
+    ) -> Result<Self> {
         if schema.is_empty() {
             return Err(Error::EmptySchema);
+        }
+        if schema.len() > limits.max_columns {
+            return Err(Error::ColumnLimitExceeded {
+                limit: limits.max_columns,
+                actual: schema.len(),
+            });
         }
 
         let mut normalized_names = HashSet::with_capacity(schema.len());
@@ -137,6 +203,8 @@ impl Table {
             schema,
             columns,
             row_count: 0,
+            value_bytes: 0,
+            limits,
         })
     }
 
@@ -176,6 +244,20 @@ impl Table {
         self.row_count == 0
     }
 
+    /// Returns the configured resource limits.
+    #[must_use]
+    pub const fn limits(&self) -> StorageLimits {
+        self.limits
+    }
+
+    /// Returns the aggregate bytes in stored scalar values.
+    ///
+    /// This excludes vector capacities and allocator metadata.
+    #[must_use]
+    pub const fn value_bytes(&self) -> usize {
+        self.value_bytes
+    }
+
     /// Finds a column position by its ASCII case-insensitive name.
     pub fn column_index(&self, name: &str) -> Result<usize> {
         self.schema
@@ -194,8 +276,16 @@ impl Table {
         self.column(column)?.value(row)
     }
 
-    /// Validates a row without changing the table.
+    /// Validates that a row could be inserted without changing the table.
+    ///
+    /// This checks its shape, value types, and the table's row and value-byte
+    /// limits as though it were the next inserted row.
     pub fn validate_row(&self, row: &[Value]) -> Result<()> {
+        let row_bytes = self.validate_row_values(row)?;
+        self.ensure_insert_capacity(1, row_bytes)
+    }
+
+    fn validate_row_values(&self, row: &[Value]) -> Result<usize> {
         if row.len() != self.schema.len() {
             return Err(Error::RowLength {
                 table: self.name.clone(),
@@ -220,6 +310,40 @@ impl Table {
                     column: field.name.clone(),
                 });
             }
+            if let Value::String(string) = value {
+                if string.len() > self.limits.max_string_bytes {
+                    return Err(Error::StringValueLimitExceeded {
+                        table: self.name.clone(),
+                        column: field.name.clone(),
+                        limit: self.limits.max_string_bytes,
+                        actual: string.len(),
+                    });
+                }
+            }
+        }
+
+        Ok(row.iter().fold(0usize, |total, value| {
+            total.saturating_add(value.storage_bytes())
+        }))
+    }
+
+    fn ensure_insert_capacity(&self, rows: usize, value_bytes: usize) -> Result<()> {
+        let row_count = self.row_count.saturating_add(rows);
+        if row_count > self.limits.max_rows {
+            return Err(Error::RowLimitExceeded {
+                table: self.name.clone(),
+                limit: self.limits.max_rows,
+                actual: row_count,
+            });
+        }
+
+        let total_value_bytes = self.value_bytes.saturating_add(value_bytes);
+        if total_value_bytes > self.limits.max_total_value_bytes {
+            return Err(Error::ValueStorageLimitExceeded {
+                table: self.name.clone(),
+                limit: self.limits.max_total_value_bytes,
+                actual: total_value_bytes,
+            });
         }
 
         Ok(())
@@ -229,27 +353,36 @@ impl Table {
     ///
     /// No column is changed when validation returns an error.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
-        self.validate_row(&row)?;
+        let row_bytes = self.validate_row_values(&row)?;
+        self.ensure_insert_capacity(1, row_bytes)?;
         self.append_row(row);
+        self.value_bytes += row_bytes;
         Ok(())
     }
 
     /// Validates and appends a batch of complete rows to the table.
     ///
-    /// All rows are validated before any value is appended. On failure,
-    /// [`Error::BatchRow`] reports the zero-based batch row index and the
-    /// underlying validation error, and the table remains unchanged.
+    /// All rows are validated before any value is appended. [`Error::BatchRow`]
+    /// reports the zero-based index of a row with invalid values. Batch-wide
+    /// row or aggregate value-byte limit errors are returned directly. Every
+    /// failure leaves the table unchanged.
     pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<()> {
+        let mut batch_value_bytes = 0usize;
         for (row_index, row) in rows.iter().enumerate() {
-            self.validate_row(row).map_err(|source| Error::BatchRow {
-                row_index,
-                source: Box::new(source),
-            })?;
+            let row_bytes = self
+                .validate_row_values(row)
+                .map_err(|source| Error::BatchRow {
+                    row_index,
+                    source: Box::new(source),
+                })?;
+            batch_value_bytes = batch_value_bytes.saturating_add(row_bytes);
         }
+        self.ensure_insert_capacity(rows.len(), batch_value_bytes)?;
 
         for row in rows {
             self.append_row(row);
         }
+        self.value_bytes += batch_value_bytes;
         Ok(())
     }
 

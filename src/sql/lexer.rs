@@ -10,19 +10,42 @@ use std::fmt;
 /// A half-open byte range in the original SQL input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
+    start: usize,
+    end: usize,
 }
 
 impl Span {
+    /// Creates a half-open span from validated byte offsets.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `start` is greater than `end`.
+    #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
+        assert!(start <= end, "a span cannot end before it starts");
         Self { start, end }
     }
 
+    /// Returns the inclusive starting byte offset.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.start
+    }
+
+    /// Returns the exclusive ending byte offset.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.end
+    }
+
+    /// Returns the number of bytes covered by the span.
+    #[must_use]
     pub const fn len(self) -> usize {
         self.end - self.start
     }
 
+    /// Returns `true` when the span covers no bytes.
+    #[must_use]
     pub const fn is_empty(self) -> bool {
         self.start == self.end
     }
@@ -31,51 +54,80 @@ impl Span {
 /// A token and its byte location in the original SQL input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
+    /// The lexical category and decoded value.
     pub kind: TokenKind,
+    /// The token's byte range in the original SQL input.
     pub span: Span,
 }
 
 /// The lexical token types accepted by the SQL front end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
+    /// An unquoted identifier.
     Identifier(String),
+    /// An integer literal, preserved as source text.
     Integer(String),
+    /// A floating-point literal, preserved as source text.
     Float(String),
+    /// A decoded single-quoted string literal.
     String(String),
+    /// A case-insensitive `TRUE` or `FALSE` literal.
     Boolean(bool),
+    /// `(`.
     LeftParen,
+    /// `)`.
     RightParen,
+    /// `,`.
     Comma,
+    /// `.`.
     Dot,
+    /// `*`.
     Star,
+    /// `+`.
     Plus,
+    /// `-`.
     Minus,
+    /// `/`.
     Slash,
+    /// `%`.
     Percent,
+    /// `=`.
     Equal,
+    /// `!=` or `<>`.
     NotEqual,
+    /// `<`.
     LessThan,
+    /// `<=`.
     LessThanOrEqual,
+    /// `>`.
     GreaterThan,
+    /// `>=`.
     GreaterThanOrEqual,
+    /// `;`.
     StatementTerminator,
 }
 
 /// Resource limits applied by [`tokenize`] and [`Lexer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LexerLimits {
+    /// Maximum UTF-8 byte length of the complete input.
     pub max_input_bytes: usize,
+    /// Maximum number of tokens, including statement terminators.
     pub max_tokens: usize,
+    /// Maximum number of non-empty, semicolon-delimited statements.
     pub max_statements: usize,
 }
 
 impl LexerLimits {
+    /// Default limits used by [`LexerLimits::default`].
     pub const DEFAULT: Self = Self {
         max_input_bytes: 1024 * 1024,
         max_tokens: 100_000,
         max_statements: 1_000,
     };
 
+    /// Creates explicit input-byte, token, and statement limits.
+    #[must_use]
     pub const fn new(max_input_bytes: usize, max_tokens: usize, max_statements: usize) -> Self {
         Self {
             max_input_bytes,
@@ -94,26 +146,57 @@ impl Default for LexerLimits {
 /// Why a numeric token could not be formed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidNumberReason {
+    /// An `e` or `E` exponent marker was not followed by digits.
     MissingExponentDigits,
+    /// Identifier characters followed an otherwise valid number.
     IdentifierSuffix,
 }
 
 /// A typed lexical failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexErrorKind {
-    InputLimitExceeded { limit: usize, actual: usize },
-    TokenLimitExceeded { limit: usize },
-    StatementLimitExceeded { limit: usize },
-    InvalidNumber { reason: InvalidNumberReason },
-    InvalidOperator { character: char },
+    /// The complete input exceeded its configured UTF-8 byte limit.
+    InputLimitExceeded {
+        /// The configured maximum input bytes.
+        limit: usize,
+        /// The supplied input's UTF-8 byte length.
+        actual: usize,
+    },
+    /// Scanning another token would exceed the configured token limit.
+    TokenLimitExceeded {
+        /// The configured maximum token count.
+        limit: usize,
+    },
+    /// Scanning another statement would exceed the statement limit.
+    StatementLimitExceeded {
+        /// The configured maximum statement count.
+        limit: usize,
+    },
+    /// A numeric literal was malformed.
+    InvalidNumber {
+        /// The reason the numeric literal is invalid.
+        reason: InvalidNumberReason,
+    },
+    /// A comparison operator prefix was not followed by a valid suffix.
+    InvalidOperator {
+        /// The invalid operator's first character.
+        character: char,
+    },
+    /// A single-quoted string reached the end of input before closing.
     UnterminatedString,
-    UnexpectedCharacter { character: char },
+    /// The lexer does not recognize a source character.
+    UnexpectedCharacter {
+        /// The unsupported source character.
+        character: char,
+    },
 }
 
 /// A lexical failure and its byte location in the original SQL input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexError {
+    /// The typed reason tokenization failed.
     pub kind: LexErrorKind,
+    /// The offending source range.
     pub span: Span,
 }
 
@@ -181,6 +264,8 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    /// Creates a lexer over `input` with explicit resource limits.
+    #[must_use]
     pub fn new(input: &'a str, limits: LexerLimits) -> Self {
         Self {
             input,
@@ -473,10 +558,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn current_character(&self) -> char {
-        self.remaining()
-            .chars()
-            .next()
-            .expect("current character is only read before end of input")
+        match self.remaining().chars().next() {
+            Some(character) => character,
+            None => unreachable!("current character is only read before end of input"),
+        }
     }
 
     fn current_character_span(&self) -> Span {

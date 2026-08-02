@@ -48,4 +48,13 @@ impl Value {
             Self::String(_) => DataType::String,
         }
     }
+
+    pub(crate) fn storage_bytes(&self) -> usize {
+        match self {
+            Self::Int64(_) => size_of::<i64>(),
+            Self::Float64(_) => size_of::<f64>(),
+            Self::Bool(_) => size_of::<bool>(),
+            Self::String(value) => value.len(),
+        }
+    }
 }
