@@ -1,11 +1,15 @@
 //! Parsing for the first executable SQL query shape.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
 use crate::catalog::{Catalog, TableNotFoundError};
 use crate::lexer::{Delimiter, LexError, LexerLimits, Literal, Operator, Token, TokenKind, lex};
-use crate::storage::{Column, ColumnSchema, Value};
+use crate::storage::{Column, ColumnSchema, Table, Value};
+
+/// Maximum estimated heap allocation for one materialized table projection.
+pub const MAX_TABLE_SELECT_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// The result of parsing a single scalar `SELECT` statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -194,6 +198,13 @@ pub enum TableSelectError {
     TableNotFound(TableNotFoundError),
     /// A projected column is not present in the source table.
     ColumnNotFound(ColumnNotFoundError),
+    /// Materializing the complete result would exceed the memory budget.
+    ResultSizeLimitExceeded {
+        /// Estimated bytes required by the materialized headers and rows.
+        estimated_bytes: usize,
+        /// Maximum estimated bytes allowed for one result.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for TableSelectError {
@@ -212,6 +223,13 @@ impl fmt::Display for TableSelectError {
             ),
             Self::TableNotFound(error) => error.fmt(formatter),
             Self::ColumnNotFound(error) => error.fmt(formatter),
+            Self::ResultSizeLimitExceeded {
+                estimated_bytes,
+                limit,
+            } => write!(
+                formatter,
+                "query result requires an estimated {estimated_bytes} bytes, limit is {limit}"
+            ),
         }
     }
 }
@@ -251,7 +269,6 @@ pub fn execute_table_select(
     let projection = parse_table_select(input)?;
     let table = catalog.table(&projection.table_name)?;
 
-    let mut headers = Vec::with_capacity(projection.column_names.len());
     let mut columns = Vec::with_capacity(projection.column_names.len());
     for column_name in &projection.column_names {
         let Some(column_index) = table
@@ -266,31 +283,95 @@ pub fn execute_table_select(
             }));
         };
 
-        headers.push(
-            table
+        columns.push(ResolvedColumn {
+            index: column_index,
+            schema: table
                 .schema()
                 .column(column_index)
-                .expect("resolved schema column index remains valid")
-                .clone(),
-        );
-        columns.push(
-            table
+                .expect("resolved schema column index remains valid"),
+            values: table
                 .column(column_index)
                 .expect("table columns correspond to schema columns"),
-        );
+        });
     }
 
+    enforce_result_size_limit(table, &columns, MAX_TABLE_SELECT_RESULT_BYTES)?;
+
+    let headers = columns.iter().map(|column| column.schema.clone()).collect();
     let mut rows = Vec::with_capacity(table.row_count());
     for row_index in 0..table.row_count() {
         rows.push(
             columns
                 .iter()
-                .map(|column| value_at(column, row_index))
+                .map(|column| value_at(column.values, row_index))
                 .collect(),
         );
     }
 
     Ok(TableSelectResult { headers, rows })
+}
+
+struct ResolvedColumn<'a> {
+    index: usize,
+    schema: &'a ColumnSchema,
+    values: &'a Column,
+}
+
+fn enforce_result_size_limit(
+    table: &Table,
+    columns: &[ResolvedColumn<'_>],
+    limit: usize,
+) -> Result<(), TableSelectError> {
+    let estimated_bytes = estimate_result_bytes(table, columns);
+    if estimated_bytes > limit {
+        Err(TableSelectError::ResultSizeLimitExceeded {
+            estimated_bytes,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn estimate_result_bytes(table: &Table, columns: &[ResolvedColumn<'_>]) -> usize {
+    let header_bytes = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<ColumnSchema>())
+        .saturating_add(
+            columns
+                .iter()
+                .map(|column| column.schema.name().len())
+                .fold(0usize, usize::saturating_add),
+        );
+    let row_vector_bytes = table
+        .row_count()
+        .saturating_mul(std::mem::size_of::<Vec<Value>>());
+    let row_value_bytes = table
+        .row_count()
+        .saturating_mul(columns.len())
+        .saturating_mul(std::mem::size_of::<Value>());
+
+    let mut string_bytes_by_column = HashMap::new();
+    let string_payload_bytes = columns.iter().fold(0usize, |total, column| {
+        let bytes = *string_bytes_by_column
+            .entry(column.index)
+            .or_insert_with(|| {
+                let bytes = match column.values {
+                    Column::String(values) => values
+                        .iter()
+                        .map(String::len)
+                        .fold(0usize, usize::saturating_add),
+                    _ => 0,
+                };
+                bytes
+            });
+        total.saturating_add(bytes)
+    });
+
+    header_bytes
+        .saturating_add(row_vector_bytes)
+        .saturating_add(row_value_bytes)
+        .saturating_add(string_payload_bytes)
 }
 
 struct TableProjection {
@@ -652,5 +733,34 @@ mod tests {
         ));
         assert!(parse_scalar_select("SELECT 1 + 2").is_err());
         assert!(parse_scalar_select("SELECT NULL").is_err());
+    }
+
+    #[test]
+    fn result_size_accounting_enforces_the_exact_boundary() {
+        let schema =
+            crate::Schema::new(vec![ColumnSchema::new("payload", crate::DataType::String)])
+                .unwrap();
+        let mut table = Table::new(schema);
+        table
+            .insert_row(vec![Value::String("boundary".to_owned())])
+            .unwrap();
+        let columns = [ResolvedColumn {
+            index: 0,
+            schema: table.schema().column(0).unwrap(),
+            values: table.column(0).unwrap(),
+        }];
+        let estimated_bytes = estimate_result_bytes(&table, &columns);
+
+        assert_eq!(
+            enforce_result_size_limit(&table, &columns, estimated_bytes),
+            Ok(())
+        );
+        assert_eq!(
+            enforce_result_size_limit(&table, &columns, estimated_bytes - 1),
+            Err(TableSelectError::ResultSizeLimitExceeded {
+                estimated_bytes,
+                limit: estimated_bytes - 1,
+            })
+        );
     }
 }

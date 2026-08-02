@@ -1,6 +1,6 @@
 use rusthouse::{
-    Catalog, ColumnNotFoundError, ColumnSchema, DataType, Schema, TableNotFoundError,
-    TableSelectError, Value, execute_table_select,
+    Catalog, ColumnNotFoundError, ColumnSchema, DataType, MAX_TABLE_SELECT_RESULT_BYTES, Schema,
+    TableNotFoundError, TableSelectError, Value, execute_table_select,
 };
 
 fn all_types_catalog() -> Catalog {
@@ -120,4 +120,33 @@ fn rejects_wildcards_aliases_filters_ordering_and_multiple_statements() {
             "unsupported query succeeded: {sql}"
         );
     }
+}
+
+#[test]
+fn rejects_repeated_large_strings_before_materializing_the_result() {
+    let mut catalog = Catalog::new();
+    let schema = Schema::new(vec![ColumnSchema::new("payload", DataType::String)])
+        .expect("test schema is valid");
+    catalog
+        .create_table("events", schema)
+        .expect("table name is available");
+    catalog
+        .table_mut("events")
+        .unwrap()
+        .insert_row(vec![Value::String("x".repeat(1024 * 1024))])
+        .expect("row is valid");
+    let columns = std::iter::repeat_n("payload", 100)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let error = execute_table_select(&catalog, &format!("SELECT {columns} FROM events"))
+        .expect_err("result exceeds the materialization budget");
+
+    assert!(matches!(
+        error,
+        TableSelectError::ResultSizeLimitExceeded {
+            estimated_bytes,
+            limit: MAX_TABLE_SELECT_RESULT_BYTES,
+        } if estimated_bytes > MAX_TABLE_SELECT_RESULT_BYTES
+    ));
 }

@@ -9,8 +9,8 @@ pub mod storage;
 pub use catalog::{Catalog, CreateTableError, TableNotFoundError};
 pub use formats::{CsvWithNamesError, CsvWithNamesWriter};
 pub use query::{
-    ColumnNotFoundError, ScalarSelect, ScalarSelectError, TableSelectError, TableSelectResult,
-    execute_table_select, parse_scalar_select,
+    ColumnNotFoundError, MAX_TABLE_SELECT_RESULT_BYTES, ScalarSelect, ScalarSelectError,
+    TableSelectError, TableSelectResult, execute_table_select, parse_scalar_select,
 };
 pub use storage::{
     BatchInsertError, Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table,
