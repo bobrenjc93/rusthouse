@@ -48,8 +48,9 @@ impl From<io::Error> for CsvWithNamesError {
 /// Writes ClickHouse-style `CSVWithNames` output without collecting the result.
 ///
 /// Construction writes the column-name record. Each call to [`Self::write_row`]
-/// then validates and writes one result row. Fields containing a comma, quote,
-/// carriage return, or line feed are quoted, with embedded quotes doubled.
+/// then validates and writes one result row. Every string field is quoted so
+/// leading whitespace, trailing whitespace, and empty strings round-trip.
+/// Embedded quotes are doubled.
 ///
 /// # Examples
 ///
@@ -64,7 +65,7 @@ impl From<io::Error> for CsvWithNamesError {
 ///
 /// assert_eq!(
 ///     String::from_utf8(output)?,
-///     "city,description\nSeattle,\"rain, then sun\"\nNew York,\"the \"\"Big Apple\"\"\"\n"
+///     "\"city\",\"description\"\n\"Seattle\",\"rain, then sun\"\n\"New York\",\"the \"\"Big Apple\"\"\"\n"
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -140,14 +141,6 @@ impl<W: Write> CsvWithNamesWriter<W> {
 }
 
 fn write_field(writer: &mut impl Write, field: &str) -> io::Result<()> {
-    if !field
-        .as_bytes()
-        .iter()
-        .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'))
-    {
-        return writer.write_all(field.as_bytes());
-    }
-
     writer.write_all(b"\"")?;
     let mut remainder = field;
     while let Some(quote_index) = remainder.find('"') {
@@ -171,7 +164,7 @@ mod tests {
             let _csv = CsvWithNamesWriter::new(&mut output, ["first", "second"]).unwrap();
         }
 
-        assert_eq!(output, b"first,second\n");
+        assert_eq!(output, b"\"first\",\"second\"\n");
     }
 
     #[test]
@@ -193,10 +186,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(csv.into_inner()).unwrap(),
             concat!(
-                "plain,\"with,comma\",\"with\"\"quote\",\"with\rreturn\",\"with\nline\"\n",
-                ",\",\",\"\"\"\",\"\r\",\"\r\n\"\n"
+                "\"plain\",\"with,comma\",\"with\"\"quote\",\"with\rreturn\",\"with\nline\"\n",
+                "\"\",\",\",\"\"\"\",\"\r\",\"\r\n\"\n"
             )
         );
+    }
+
+    #[test]
+    fn round_trips_boundary_whitespace_and_a_single_column_empty_value() {
+        let fields = ["value", " padded ", "\ttabbed\t", ""];
+        let mut csv = CsvWithNamesWriter::new(Vec::new(), [fields[0]]).unwrap();
+        for field in &fields[1..] {
+            csv.write_row([field]).unwrap();
+        }
+
+        let output = String::from_utf8(csv.into_inner()).unwrap();
+        let decoded: Vec<_> = output
+            .lines()
+            .map(|record| {
+                record
+                    .strip_prefix('"')
+                    .and_then(|record| record.strip_suffix('"'))
+                    .expect("single string field should be quoted")
+                    .replace("\"\"", "\"")
+            })
+            .collect();
+
+        assert_eq!(decoded, fields);
+        assert!(output.ends_with("\"\"\n"));
     }
 
     #[test]
@@ -219,7 +236,7 @@ mod tests {
         ));
         csv.write_row(["one", "two"]).unwrap();
 
-        assert_eq!(csv.into_inner(), b"a,b\none,two\n");
+        assert_eq!(csv.into_inner(), b"\"a\",\"b\"\n\"one\",\"two\"\n");
     }
 
     #[test]
