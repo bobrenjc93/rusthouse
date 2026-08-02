@@ -29,6 +29,13 @@ optional trailing semicolon, and output is ClickHouse-style `CSVWithNames`.
 printf "SELECT 42 AS answer\n" | cargo run -- --format csv
 ```
 
+## Library DDL
+
+The library can create in-memory catalog tables with
+`execute_create_table(&mut catalog, sql)`. The supported DDL shape is exactly
+`CREATE TABLE name (column type [, column type ...])`, using `Int64`,
+`Float64`, `Bool`, or `String`, with an optional trailing semicolon.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
