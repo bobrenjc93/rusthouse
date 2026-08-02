@@ -43,6 +43,13 @@ pub enum Error {
         /// The column receiving the value.
         column: String,
     },
+    /// A row in a batch failed validation.
+    BatchRow {
+        /// The zero-based position of the invalid row within the batch.
+        row_index: usize,
+        /// The validation error produced for the invalid row.
+        source: Box<Error>,
+    },
 }
 
 /// A result returned by RustHouse's columnar storage APIs.
@@ -80,8 +87,18 @@ impl fmt::Display for Error {
                 formatter,
                 "column '{table}.{column}' cannot store a non-finite Float64"
             ),
+            Self::BatchRow { row_index, source } => {
+                write!(formatter, "batch row {row_index} is invalid: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BatchRow { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
