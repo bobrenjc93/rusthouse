@@ -1,9 +1,11 @@
 //! RustHouse is an experimental, compact analytical database.
 
+mod catalog;
 pub mod csv;
 pub mod sql;
 mod table;
 
+pub use catalog::{Catalog, CatalogError};
 pub use table::{Column, ColumnSchema, DataType, Schema, Table, TableError, TableLimits, Value};
 
 /// Returns the product name while the first storage engine is being built.
