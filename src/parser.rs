@@ -27,6 +27,13 @@ pub struct SelectAll {
     pub table_name: String,
 }
 
+/// The syntax tree for one `INSERT INTO <identifier> VALUES (...)` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertInto {
+    pub table_name: String,
+    pub values: Vec<crate::storage::Value>,
+}
+
 /// A named column and its declared type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDefinition {
@@ -41,6 +48,9 @@ pub enum Keyword {
     Table,
     Select,
     From,
+    Insert,
+    Into,
+    Values,
 }
 
 /// A parse error with a zero-based UTF-8 byte offset into the input.
@@ -62,6 +72,11 @@ pub enum ParseErrorKind {
     ExpectedIdentifier,
     ExpectedLeftParenthesis,
     ExpectedColumnType,
+    ExpectedValue,
+    InvalidIntegerLiteral { found: String },
+    InvalidFloatLiteral { found: String },
+    NonFiniteFloatLiteral { found: String },
+    UnterminatedString,
     UnknownColumnType { found: String },
     ExpectedCommaOrRightParenthesis,
     DuplicateColumn { name: String, first_position: usize },
@@ -108,6 +123,31 @@ impl fmt::Display for ParseError {
             ParseErrorKind::ExpectedColumnType => {
                 write!(formatter, "expected column type at byte {}", self.position)
             }
+            ParseErrorKind::ExpectedValue => {
+                write!(formatter, "expected value at byte {}", self.position)
+            }
+            ParseErrorKind::InvalidIntegerLiteral { found } => write!(
+                formatter,
+                "invalid Int64 literal {found:?} at byte {}",
+                self.position
+            ),
+            ParseErrorKind::InvalidFloatLiteral { found } => write!(
+                formatter,
+                "invalid Float64 literal {found:?} at byte {}",
+                self.position
+            ),
+            ParseErrorKind::NonFiniteFloatLiteral { found } => write!(
+                formatter,
+                "Float64 literal {found:?} is not finite at byte {}",
+                self.position
+            ),
+            ParseErrorKind::UnterminatedString => {
+                write!(
+                    formatter,
+                    "unterminated string literal at byte {}",
+                    self.position
+                )
+            }
             ParseErrorKind::UnknownColumnType { found } => write!(
                 formatter,
                 "unknown column type {found:?} at byte {}",
@@ -140,6 +180,9 @@ impl fmt::Display for Keyword {
             Self::Table => formatter.write_str("TABLE"),
             Self::Select => formatter.write_str("SELECT"),
             Self::From => formatter.write_str("FROM"),
+            Self::Insert => formatter.write_str("INSERT"),
+            Self::Into => formatter.write_str("INTO"),
+            Self::Values => formatter.write_str("VALUES"),
         }
     }
 }
@@ -188,6 +231,44 @@ pub fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
 /// # Ok::<(), rusthouse::ParseError>(())
 /// ```
 pub fn parse_select_all(input: &str) -> Result<SelectAll, ParseError> {
+    let tokens = tokenize_bounded(input)?;
+    Parser::new(tokens).parse_select_all()
+}
+
+/// Parses exactly one bounded `INSERT INTO <identifier> VALUES (...)` statement.
+///
+/// The statement contains one schema-ordered tuple. Integer, finite floating
+/// point, Boolean, string, and NULL literals are supported. Strings use single
+/// quotes and escape a quote by doubling it. One final semicolon is optional.
+///
+/// ```
+/// use rusthouse::{Value, parse_insert};
+///
+/// let statement = parse_insert("INSERT INTO events VALUES (7, 'it''s ready', true)")?;
+/// assert_eq!(statement.table_name, "events");
+/// assert_eq!(statement.values[0], Value::Int64(7));
+/// assert_eq!(statement.values[1], Value::from("it's ready"));
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_insert(input: &str) -> Result<InsertInto, ParseError> {
+    let tokens = tokenize_bounded(input)?;
+    Parser::new(tokens).parse_insert()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind<'a> {
+    Word(&'a str),
+    Number(&'a str),
+    String(&'a str),
+    Asterisk,
+    LeftParenthesis,
+    RightParenthesis,
+    Comma,
+    Semicolon,
+    End,
+}
+
+fn tokenize_bounded(input: &str) -> Result<Vec<Token<'_>>, ParseError> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(ParseError {
             kind: ParseErrorKind::InputTooLong {
@@ -198,19 +279,7 @@ pub fn parse_select_all(input: &str) -> Result<SelectAll, ParseError> {
         });
     }
 
-    let tokens = tokenize(input)?;
-    Parser::new(tokens).parse_select_all()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenKind<'a> {
-    Word(&'a str),
-    Asterisk,
-    LeftParenthesis,
-    RightParenthesis,
-    Comma,
-    Semicolon,
-    End,
+    tokenize(input)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +301,21 @@ fn tokenize(input: &str) -> Result<Vec<Token<'_>>, ParseError> {
         }
 
         let token_position = position;
-        let kind = if byte.is_ascii_alphanumeric() || byte == b'_' {
+        let kind = if byte.is_ascii_digit()
+            || ((byte == b'+' || byte == b'-' || byte == b'.')
+                && bytes
+                    .get(position + 1)
+                    .is_some_and(|next| next.is_ascii_digit()))
+        {
+            position += 1;
+            while position < bytes.len()
+                && !bytes[position].is_ascii_whitespace()
+                && !matches!(bytes[position], b',' | b'(' | b')' | b';' | b'\'')
+            {
+                position += 1;
+            }
+            TokenKind::Number(&input[token_position..position])
+        } else if byte.is_ascii_alphanumeric() || byte == b'_' {
             position += 1;
             while position < bytes.len()
                 && (bytes[position].is_ascii_alphanumeric() || bytes[position] == b'_')
@@ -240,6 +323,28 @@ fn tokenize(input: &str) -> Result<Vec<Token<'_>>, ParseError> {
                 position += 1;
             }
             TokenKind::Word(&input[token_position..position])
+        } else if byte == b'\'' {
+            position += 1;
+            let contents_start = position;
+            loop {
+                if position == bytes.len() {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::UnterminatedString,
+                        position: token_position,
+                    });
+                }
+                if bytes[position] == b'\'' {
+                    if bytes.get(position + 1) == Some(&b'\'') {
+                        position += 2;
+                        continue;
+                    }
+
+                    let contents = &input[contents_start..position];
+                    position += 1;
+                    break TokenKind::String(contents);
+                }
+                position += 1;
+            }
         } else {
             position += 1;
             match byte {
@@ -366,6 +471,38 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_insert(mut self) -> Result<InsertInto, ParseError> {
+        self.expect_keyword("INSERT", Keyword::Insert)?;
+        self.expect_keyword("INTO", Keyword::Into)?;
+        let (table_name, _) = self.parse_identifier()?;
+        self.expect_keyword("VALUES", Keyword::Values)?;
+        self.expect_left_parenthesis()?;
+
+        let mut values = Vec::new();
+        if self.current_token().kind != TokenKind::RightParenthesis {
+            loop {
+                values.push(self.parse_value()?);
+                match self.current_token().kind {
+                    TokenKind::Comma => self.advance(),
+                    TokenKind::RightParenthesis => break,
+                    _ => {
+                        return Err(ParseError {
+                            kind: ParseErrorKind::ExpectedCommaOrRightParenthesis,
+                            position: self.current_token().position,
+                        });
+                    }
+                }
+            }
+        }
+        self.advance();
+        self.expect_end()?;
+
+        Ok(InsertInto {
+            table_name: table_name.to_owned(),
+            values,
+        })
+    }
+
     fn expect_keyword(&mut self, expected: &str, keyword: Keyword) -> Result<(), ParseError> {
         if matches!(self.current_token().kind, TokenKind::Word(word) if word.eq_ignore_ascii_case(expected))
         {
@@ -465,6 +602,54 @@ impl<'a> Parser<'a> {
         Ok(column_type)
     }
 
+    fn parse_value(&mut self) -> Result<crate::storage::Value, ParseError> {
+        use crate::storage::Value;
+
+        let token = *self.current_token();
+        let value = match token.kind {
+            TokenKind::Word(word) if word.eq_ignore_ascii_case("NULL") => Value::Null,
+            TokenKind::Word(word) if word.eq_ignore_ascii_case("TRUE") => Value::Bool(true),
+            TokenKind::Word(word) if word.eq_ignore_ascii_case("FALSE") => Value::Bool(false),
+            TokenKind::String(contents) => Value::String(unescape_string(contents)),
+            TokenKind::Number(number)
+                if number.contains('.') || number.contains('e') || number.contains('E') =>
+            {
+                let parsed = number.parse::<f64>().map_err(|_| ParseError {
+                    kind: ParseErrorKind::InvalidFloatLiteral {
+                        found: number.to_owned(),
+                    },
+                    position: token.position,
+                })?;
+                if !parsed.is_finite() {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::NonFiniteFloatLiteral {
+                            found: number.to_owned(),
+                        },
+                        position: token.position,
+                    });
+                }
+                Value::Float64(parsed)
+            }
+            TokenKind::Number(number) => {
+                Value::Int64(number.parse::<i64>().map_err(|_| ParseError {
+                    kind: ParseErrorKind::InvalidIntegerLiteral {
+                        found: number.to_owned(),
+                    },
+                    position: token.position,
+                })?)
+            }
+            _ => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::ExpectedValue,
+                    position: token.position,
+                });
+            }
+        };
+
+        self.advance();
+        Ok(value)
+    }
+
     fn current_token(&self) -> &Token<'a> {
         &self.tokens[self.current]
     }
@@ -472,4 +657,16 @@ impl<'a> Parser<'a> {
     fn advance(&mut self) {
         self.current += 1;
     }
+}
+
+fn unescape_string(contents: &str) -> String {
+    let mut value = String::with_capacity(contents.len());
+    let mut remaining = contents;
+    while let Some(position) = remaining.find("''") {
+        value.push_str(&remaining[..position]);
+        value.push('\'');
+        remaining = &remaining[position + 2..];
+    }
+    value.push_str(remaining);
+    value
 }

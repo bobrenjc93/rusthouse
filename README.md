@@ -19,6 +19,33 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Current insertion API
+
+The library executes exactly one schema-ordered tuple per
+`INSERT INTO <table> VALUES (...)` statement against a `Catalog`:
+
+```rust
+use rusthouse::{Catalog, execute_insert, parse_create_table};
+
+# fn insert() -> Result<(), Box<dyn std::error::Error>> {
+let mut catalog = Catalog::new();
+catalog.create_table(parse_create_table(
+    "CREATE TABLE events (id Int64, score Float64, active Bool, label String)",
+)?)?;
+execute_insert(
+    "INSERT INTO events VALUES (7, 1.25, true, 'it''s ready')",
+    &mut catalog,
+)?;
+# Ok(())
+# }
+```
+
+Literals are strongly typed as `Int64`, finite `Float64`, `Bool`, `String`, or
+`NULL`; strings use SQL doubled-quote escaping. Parsing and catalog lookup are
+bounded, and row shape, schema types, nullability, and table resource limits are
+validated atomically before the table changes. Column lists, expressions, and
+multiple tuples are not supported.
+
 ## Current query API
 
 The library can execute the deliberately narrow `SELECT * FROM <identifier>`
