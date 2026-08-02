@@ -19,6 +19,17 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Current SQL surface
+
+The CLI and `Database` API execute batches containing scalar `SELECT` and
+`CREATE TABLE name (field type, ...)` statements. Table fields support `Int64`,
+`Float64`, `Bool`, and `String`; they are currently non-nullable. DDL produces
+no CSV output.
+
+Catalog tables are in-memory and each is capped at 1,000,000 rows. The public
+catalog API exposes immutable table lookup; row ingestion and persistence are
+not SQL features yet.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.

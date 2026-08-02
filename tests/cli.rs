@@ -34,7 +34,10 @@ fn help_describes_the_csv_interface() {
 fn executes_every_statement_received_before_eof() {
     let output = run(
         &["--format", "csv"],
-        "SELECT 7 AS first;\nSELECT -2.5 AS second;\nSELECT TRUE;\n",
+        "SELECT 7 AS first;\n\
+         CREATE TABLE readings (captured_at Int64, value Float64);\n\
+         SELECT -2.5 AS second;\n\
+         SELECT TRUE;\n",
     );
 
     assert!(output.status.success());
@@ -42,6 +45,18 @@ fn executes_every_statement_received_before_eof() {
         String::from_utf8(output.stdout).unwrap(),
         "first\n7\nsecond\n-2.5\nTRUE\ntrue\n"
     );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn create_table_without_select_produces_no_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "CREATE TABLE events (id Int64, active Bool, label String);",
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
 
@@ -116,6 +131,9 @@ fn rejects_malformed_sql_without_partial_csv() {
         "SELECT 1e999;",
         "SELECT 1AS alias;",
         "SELECT 1; SELECT nope;",
+        "CREATE TABLE empty ();",
+        "CREATE TABLE duplicate (id Int64, id String);",
+        "CREATE TABLE unknown (value Decimal);",
     ] {
         let output = run(&["--format", "csv"], sql);
 
