@@ -65,6 +65,7 @@ impl Default for InsertParseLimits {
 /// Resource limits applied while parsing a SELECT statement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SelectParseLimits {
+    /// Maximum accepted statement length, in bytes.
     pub max_sql_bytes: usize,
 }
 
@@ -109,6 +110,7 @@ pub struct InsertStatement {
 /// The typed result of parsing one `SELECT * FROM ...` statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectStatement {
+    /// The source table name exactly as it appeared in the statement.
     pub table_name: String,
 }
 
@@ -384,6 +386,11 @@ pub fn parse_insert_with_limits(
 /// letter or underscore followed by ASCII letters, digits, or underscores.
 /// One optional trailing semicolon is accepted.
 ///
+/// # Errors
+///
+/// Returns [`ParseError`] when the input exceeds the default resource limit or
+/// does not match the supported `SELECT * FROM <table>` grammar.
+///
 /// # Examples
 ///
 /// ```
@@ -399,6 +406,11 @@ pub fn parse_select(sql: &str) -> Result<SelectStatement, ParseError> {
 
 /// Parses one `SELECT * FROM <table>` statement using caller-provided
 /// resource limits.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the input exceeds `limits` or does not match the
+/// supported `SELECT * FROM <table>` grammar.
 pub fn parse_select_with_limits(
     sql: &str,
     limits: SelectParseLimits,

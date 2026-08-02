@@ -94,6 +94,11 @@ impl Catalog {
     /// The result retains the table's schema, columnar storage, and insertion
     /// order and can be passed directly to streaming formats such as
     /// [`crate::csv::write_csv`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::TableNotFound`] if the statement's source table
+    /// is not in the catalog.
     pub fn select(&self, statement: SelectStatement) -> Result<&Table, CatalogError> {
         self.table(&statement.table_name)
     }

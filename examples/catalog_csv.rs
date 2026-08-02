@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rusthouse::Catalog;
 use rusthouse::csv::write_csv;
-use rusthouse::sql::{parse_create_table, parse_insert};
+use rusthouse::sql::{parse_create_table, parse_insert, parse_select};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut catalog = Catalog::default();
@@ -14,7 +14,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?)?;
 
     let mut output = Vec::new();
-    write_csv(catalog.table("events")?, &mut output)?;
+    write_csv(
+        catalog.select(parse_select("SELECT * FROM events")?)?,
+        &mut output,
+    )?;
     print!("{}", String::from_utf8(output)?);
     Ok(())
 }

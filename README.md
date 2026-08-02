@@ -21,15 +21,15 @@ The early implementation should favor Rust's standard library and a small depend
 
 ## Quick start
 
-The bundled example parses `CREATE TABLE` and `INSERT INTO ... VALUES`, applies
-both statements to a catalog, looks the table up, and streams it as CSV:
+The bundled example parses `CREATE TABLE`, `INSERT INTO ... VALUES`, and
+`SELECT *`, applies them to a catalog, and streams the selected table as CSV:
 
 ```rust
 use std::error::Error;
 
 use rusthouse::Catalog;
 use rusthouse::csv::write_csv;
-use rusthouse::sql::{parse_create_table, parse_insert};
+use rusthouse::sql::{parse_create_table, parse_insert, parse_select};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut catalog = Catalog::default();
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?)?;
 
     let mut output = Vec::new();
-    write_csv(catalog.table("events")?, &mut output)?;
+    write_csv(catalog.select(parse_select("SELECT * FROM events")?)?, &mut output)?;
     print!("{}", String::from_utf8(output)?);
     Ok(())
 }
