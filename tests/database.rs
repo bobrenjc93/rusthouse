@@ -188,6 +188,93 @@ fn comparisons_execute_alongside_catalog_changes() {
 }
 
 #[test]
+fn counts_rows_from_committed_and_staged_tables_case_insensitively() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE Events (id Int64); INSERT INTO events VALUES (1);")
+        .unwrap();
+
+    let results = database
+        .execute(
+            "SELECT COUNT(*) AS committed FROM eVeNtS;\n\
+             INSERT INTO EVENTS VALUES (2), (3);\n\
+             SELECT count(*) AS staged_rows FROM events;\n\
+             CREATE TABLE Empty_Table (value String);\n\
+             SELECT COUNT(*) FROM EMPTY_TABLE;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        results,
+        vec![
+            rusthouse::QueryResult {
+                header: "committed".into(),
+                value: ScalarValue::Integer(1),
+            },
+            rusthouse::QueryResult {
+                header: "staged_rows".into(),
+                value: ScalarValue::Integer(3),
+            },
+            rusthouse::QueryResult {
+                header: "COUNT(*)".into(),
+                value: ScalarValue::Integer(0),
+            },
+        ]
+    );
+    assert_eq!(database.table("events").unwrap().row_count(), 3);
+    assert_eq!(database.table("empty_table").unwrap().row_count(), 0);
+}
+
+#[test]
+fn unknown_count_table_is_positioned_and_rolls_back_the_batch() {
+    let mut database = database_with_seed();
+    database.execute("INSERT INTO seed VALUES (1);").unwrap();
+    let before = database.clone();
+    let sql = "INSERT INTO seed VALUES (2);\n\
+               CREATE TABLE staged (id Int64);\n\
+               SELECT COUNT(*) AS total FROM Missing_Table;";
+
+    let error = database.execute(sql).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::UnknownTable {
+            table: "Missing_Table".into(),
+        }
+    );
+    assert_eq!(error.byte_offset(), sql.find("Missing_Table").unwrap());
+    assert_eq!((error.line(), error.column()), (3, 31));
+    assert_eq!(database, before);
+    assert!(database.table("staged").is_none());
+}
+
+#[test]
+fn rejects_unsupported_count_forms_without_mutating_the_catalog() {
+    for sql in [
+        "SELECT COUNT() FROM seed;",
+        "SELECT COUNT(id) FROM seed;",
+        "SELECT COUNT(*) seed;",
+        "SELECT COUNT(*) FROM;",
+        "SELECT COUNT(*) FROM seed",
+        "SELECT COUNT(*) FROM seed WHERE id = 1;",
+        "SELECT SUM(*) FROM seed;",
+        "SELECT COUNT(*), 1 FROM seed;",
+        "SELECT 1, COUNT(*) FROM seed;",
+    ] {
+        let mut database = database_with_seed();
+        let before = database.clone();
+
+        let error = database.execute(sql).unwrap_err();
+
+        assert!(
+            matches!(error.kind(), SqlErrorKind::Syntax { .. }),
+            "SQL: {sql}, error: {error}"
+        );
+        assert_eq!(database, before, "SQL: {sql}");
+    }
+}
+
+#[test]
 fn comparison_errors_roll_back_earlier_catalog_changes() {
     let mut database = database_with_seed();
     let before = database.clone();

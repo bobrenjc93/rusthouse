@@ -76,6 +76,24 @@ fn inserts_schema_ordered_literals_and_escaped_strings_without_csv() {
 }
 
 #[test]
+fn counts_empty_and_staged_rows_as_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "CREATE TABLE Events (id Int64);\n\
+         SELECT COUNT(*) AS empty_rows FROM events;\n\
+         INSERT INTO EVENTS VALUES (1), (2), (3);\n\
+         SELECT COUNT(*) FROM eVeNtS;",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "empty_rows\n0\nCOUNT(*)\n3\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn late_invalid_insert_row_rolls_back_without_partial_csv() {
     let output = run(
         &["--format", "csv"],

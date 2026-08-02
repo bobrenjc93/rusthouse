@@ -30,16 +30,16 @@ impl Database {
         Self::default()
     }
 
-    /// Executes a batch of scalar `SELECT`, `CREATE TABLE`, and `INSERT`
-    /// statements.
+    /// Executes a batch of scalar `SELECT`, table-backed `SELECT COUNT(*)`,
+    /// `CREATE TABLE`, and `INSERT` statements.
     ///
     /// Supported definitions have the form
     /// `CREATE TABLE name (field type, ...);`, where `type` is one of `Int64`,
     /// `Float64`, `Bool`, or `String`. Positional inserts have the form
     /// `INSERT INTO name VALUES (...), (...);` and must supply one literal per
     /// schema field in schema order. Created fields are non-nullable. DDL and
-    /// inserts produce no query result, so only scalar `SELECT` statements are
-    /// returned for CSV rendering.
+    /// inserts produce no query result, so only `SELECT` statements are returned
+    /// for CSV rendering.
     ///
     /// The complete batch is parsed and catalog changes are staged before they
     /// are published. Therefore any returned error leaves the catalog
@@ -66,6 +66,30 @@ impl Database {
             let outcome = match event {
                 DatabaseEvent::Select(result) => {
                     results.push(result);
+                    DatabaseEventOutcome::Continue
+                }
+                DatabaseEvent::CountRows(query) => {
+                    let normalized_name = normalize_identifier(&query.table.value);
+                    let row_count = if let Some(staged) = staged_tables.get(&normalized_name) {
+                        staged.row_count()
+                    } else if let Some(table) = self.tables.get(&normalized_name) {
+                        table.row_count()
+                    } else {
+                        return Err(SqlError::at(
+                            input,
+                            query.table.byte_offset,
+                            SqlErrorKind::UnknownTable {
+                                table: query.table.value,
+                            },
+                        ));
+                    };
+                    results.push(QueryResult {
+                        header: query.header,
+                        value: crate::ScalarValue::Integer(
+                            i64::try_from(row_count)
+                                .expect("SQL table row limits fit within an Int64"),
+                        ),
+                    });
                     DatabaseEventOutcome::Continue
                 }
                 DatabaseEvent::CreateTable(definition) => {
@@ -204,6 +228,17 @@ impl StagedTable {
         match self {
             Self::Created(table) => table.schema().len(),
             Self::Existing { delta, .. } => delta.schema().len(),
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match self {
+            Self::Created(table) => table.row_count(),
+            Self::Existing {
+                delta,
+                base_row_count,
+                ..
+            } => base_row_count + delta.row_count(),
         }
     }
 }
