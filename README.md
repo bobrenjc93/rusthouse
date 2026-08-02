@@ -28,4 +28,17 @@ cargo test
 cargo run -- --help
 ```
 
+RustHouse uses Rust 1.85.0, the minimum toolchain supporting edition 2024.
+`rustup` reads the checked-in toolchain file and installs rustfmt and Clippy.
+Run the same quality checks as CI from the repository root with:
+
+```bash
+cargo fmt --all --check && \
+  cargo build --all-targets --all-features --locked && \
+  cargo clippy --all-targets --all-features --locked -- -D warnings && \
+  cargo test --all-targets --all-features --locked && \
+  cargo test --doc --all-features --locked && \
+  RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --locked
+```
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
