@@ -311,6 +311,15 @@ impl Column {
             _ => unreachable!("row values are validated before columns are mutated"),
         }
     }
+
+    fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::Int64(values) => values.reserve(additional),
+            Self::Float64(values) => values.reserve(additional),
+            Self::Bool(values) => values.reserve(additional),
+            Self::String(values) => values.reserve(additional),
+        }
+    }
 }
 
 /// A table that stores each typed field in its own contiguous vector.
@@ -375,6 +384,36 @@ impl Table {
         Ok(())
     }
 
+    /// Inserts a batch of rows as one transactional operation.
+    ///
+    /// Every row is validated before any physical column is changed. If a row
+    /// is invalid, the error identifies its zero-based index in the batch and
+    /// the table remains unchanged. An empty batch is a no-op.
+    pub fn insert_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<(), BatchInsertError> {
+        for (batch_index, row) in rows.iter().enumerate() {
+            self.validate_row(row).map_err(|source| BatchInsertError {
+                batch_index,
+                source,
+            })?;
+        }
+
+        let batch_size = rows.len();
+        if batch_size == 0 {
+            return Ok(());
+        }
+
+        for column in &mut self.columns {
+            column.reserve(batch_size);
+        }
+        for row in rows {
+            for (column, value) in self.columns.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        self.row_count += batch_size;
+        Ok(())
+    }
+
     fn validate_row(&self, row: &[Value]) -> Result<(), InsertError> {
         if row.len() != self.schema.len() {
             return Err(InsertError::RowWidth {
@@ -394,14 +433,14 @@ impl Table {
                 });
             }
 
-            if let Value::Float64(value) = value
-                && !value.is_finite()
-            {
-                return Err(InsertError::NonFiniteFloat {
-                    column_index: index,
-                    column_name: column.name.clone(),
-                    value: *value,
-                });
+            if let Value::Float64(value) = value {
+                if !value.is_finite() {
+                    return Err(InsertError::NonFiniteFloat {
+                        column_index: index,
+                        column_name: column.name.clone(),
+                        value: *value,
+                    });
+                }
             }
         }
 
@@ -472,3 +511,28 @@ impl fmt::Display for InsertError {
 }
 
 impl Error for InsertError {}
+
+/// An error returned when a row in a batch cannot be inserted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchInsertError {
+    /// The zero-based index of the invalid row within the supplied batch.
+    pub batch_index: usize,
+    /// The validation error for the invalid row.
+    pub source: InsertError,
+}
+
+impl fmt::Display for BatchInsertError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "row at batch index {} is invalid: {}",
+            self.batch_index, self.source
+        )
+    }
+}
+
+impl Error for BatchInsertError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}

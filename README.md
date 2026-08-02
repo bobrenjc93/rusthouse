@@ -19,13 +19,32 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Current CLI
+
+The CLI executes one bounded scalar query from standard input. The supported
+shape is `SELECT <Int64|Float64|Bool|String literal> [AS identifier]`, with an
+optional trailing semicolon, and output is ClickHouse-style `CSVWithNames`.
+
+```bash
+printf "SELECT 42 AS answer\n" | cargo run -- --format csv
+```
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
 
+## Local quality gates
+
+The checked-in `rust-toolchain.toml` selects Rust 1.85.0, the package's minimum
+supported Rust version, and installs its matching `rustfmt` and Clippy
+components. With [rustup](https://rustup.rs/) installed, run the same checks as
+CI from the repository root:
+
 ```bash
-cargo test
-cargo run -- --help
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
 ```
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
