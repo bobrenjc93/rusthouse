@@ -4,7 +4,7 @@ RustHouse is a from-scratch analytical database in Rust, inspired by the useful 
 
 This is intentionally not a wire-compatible ClickHouse clone. The goal is to grow a credible small competitor through measured, reviewed iterations while keeping the implementation approachable.
 
-The current SQL foundation includes a bounded lexer with byte-positioned tokens and errors. Callers explicitly provide input-byte, token-count, and statement-count limits.
+The current SQL foundation includes a bounded lexer with byte-positioned tokens and errors, plus a typed parser for one `CREATE TABLE` definition. Callers explicitly provide input-byte, token-count, and statement-count limits.
 
 ## Product target
 
