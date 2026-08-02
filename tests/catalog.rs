@@ -1,4 +1,5 @@
-use rusthouse::sql::{CreateTableStatement, parse_create_table};
+use rusthouse::csv::write_csv;
+use rusthouse::sql::{CreateTableStatement, parse_create_table, parse_insert};
 use rusthouse::{Catalog, CatalogError, DataType, TableError, TableLimits, Value};
 
 fn limits(max_columns: usize, max_rows: usize, max_string_bytes: usize) -> TableLimits {
@@ -216,5 +217,24 @@ fn catalog_accepts_the_parsers_typed_statement_result() {
     assert_eq!(
         catalog.table("direct").unwrap().schema().columns()[0].data_type(),
         DataType::Bool
+    );
+}
+
+#[test]
+fn parsed_statements_flow_through_the_catalog_to_csv() {
+    let mut catalog = Catalog::default();
+    catalog
+        .create_table(parse_create_table("CREATE TABLE Events (id Int64, label String)").unwrap())
+        .unwrap();
+
+    catalog
+        .insert(parse_insert("INSERT INTO eVeNtS VALUES (1, 'first'), (2, 'with,comma')").unwrap())
+        .unwrap();
+
+    let mut output = Vec::new();
+    write_csv(catalog.table("EVENTS").unwrap(), &mut output).unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "id,label\r\n1,first\r\n2,\"with,comma\"\r\n"
     );
 }

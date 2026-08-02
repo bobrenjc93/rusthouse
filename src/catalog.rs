@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::sql::CreateTableStatement;
+use crate::sql::{CreateTableStatement, InsertStatement};
 use crate::{ColumnSchema, Schema, Table, TableError, TableLimits, Value};
 
 /// An in-memory collection of named [`Table`]s.
@@ -77,6 +77,12 @@ impl Catalog {
             .ok_or_else(|| CatalogError::TableNotFound {
                 name: name.to_owned(),
             })
+    }
+
+    /// Atomically applies a parsed `INSERT INTO ... VALUES` statement.
+    pub fn insert(&mut self, statement: InsertStatement) -> Result<(), CatalogError> {
+        let InsertStatement { table_name, rows } = statement;
+        self.insert_batch(&table_name, rows)
     }
 
     /// Atomically inserts a batch into a named table.
