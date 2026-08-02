@@ -12,6 +12,8 @@ pub use error::{Error, Result};
 pub use storage::{Column, ColumnDef, Table};
 pub use value::{DataType, Value};
 
+pub mod sql;
+
 /// Returns the product name while the first storage engine is being built.
 pub fn product_name() -> &'static str {
     "RustHouse"
