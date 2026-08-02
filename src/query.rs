@@ -1,10 +1,15 @@
 //! Parsing for the first executable SQL query shape.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::Value;
+use crate::catalog::{Catalog, TableNotFoundError};
 use crate::lexer::{Delimiter, LexError, LexerLimits, Literal, Operator, Token, TokenKind, lex};
+use crate::storage::{Column, ColumnSchema, Table, Value};
+
+/// Maximum estimated heap allocation for one materialized table projection.
+pub const MAX_TABLE_SELECT_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// The result of parsing a single scalar `SELECT` statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +123,390 @@ impl Error for ScalarSelectError {
 impl From<LexError> for ScalarSelectError {
     fn from(error: LexError) -> Self {
         Self::Lex(error)
+    }
+}
+
+/// The materialized result of a table projection.
+///
+/// Headers follow projection order and retain each catalog column's logical
+/// type. Rows follow insertion order and contain values in header order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableSelectResult {
+    headers: Vec<ColumnSchema>,
+    rows: Vec<Vec<Value>>,
+}
+
+impl TableSelectResult {
+    /// Returns the projected names and logical types in query order.
+    #[must_use]
+    pub fn headers(&self) -> &[ColumnSchema] {
+        &self.headers
+    }
+
+    /// Returns the materialized rows in table insertion order.
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+
+    /// Consumes the result and returns its materialized rows.
+    #[must_use]
+    pub fn into_rows(self) -> Vec<Vec<Value>> {
+        self.rows
+    }
+}
+
+/// A column requested by a projection does not exist in its source table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnNotFoundError {
+    /// The exact table name resolved by the query.
+    pub table_name: String,
+    /// The exact requested column name.
+    pub column_name: String,
+}
+
+impl fmt::Display for ColumnNotFoundError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "column `{}` was not found in table `{}`",
+            self.column_name, self.table_name
+        )
+    }
+}
+
+impl Error for ColumnNotFoundError {}
+
+/// An error returned while parsing or executing a table projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TableSelectError {
+    /// Tokenization failed.
+    Lex(LexError),
+    /// The token sequence does not match the supported statement shape.
+    Syntax {
+        /// Zero-based byte position at which parsing stopped.
+        position: usize,
+        /// Description of the expected syntax.
+        expected: &'static str,
+    },
+    /// More than one semicolon-delimited statement was supplied.
+    MultipleStatements {
+        /// Zero-based byte position at which the extra statement begins.
+        position: usize,
+    },
+    /// The source table is not present in the catalog.
+    TableNotFound(TableNotFoundError),
+    /// A projected column is not present in the source table.
+    ColumnNotFound(ColumnNotFoundError),
+    /// Materializing the complete result would exceed the memory budget.
+    ResultSizeLimitExceeded {
+        /// Estimated bytes required by the materialized headers and rows.
+        estimated_bytes: usize,
+        /// Maximum estimated bytes allowed for one result.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for TableSelectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lex(error) => error.fmt(formatter),
+            Self::Syntax { position, expected } => {
+                write!(
+                    formatter,
+                    "SQL parse error at byte {position}: expected {expected}"
+                )
+            }
+            Self::MultipleStatements { position } => write!(
+                formatter,
+                "SQL parse error at byte {position}: only one statement is allowed"
+            ),
+            Self::TableNotFound(error) => error.fmt(formatter),
+            Self::ColumnNotFound(error) => error.fmt(formatter),
+            Self::ResultSizeLimitExceeded {
+                estimated_bytes,
+                limit,
+            } => write!(
+                formatter,
+                "query result requires an estimated {estimated_bytes} bytes, limit is {limit}"
+            ),
+        }
+    }
+}
+
+impl Error for TableSelectError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Lex(error) => Some(error),
+            Self::TableNotFound(error) => Some(error),
+            Self::ColumnNotFound(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<LexError> for TableSelectError {
+    fn from(error: LexError) -> Self {
+        Self::Lex(error)
+    }
+}
+
+impl From<TableNotFoundError> for TableSelectError {
+    fn from(error: TableNotFoundError) -> Self {
+        Self::TableNotFound(error)
+    }
+}
+
+/// Executes `SELECT column [, column ...] FROM table` against a catalog.
+///
+/// One optional trailing semicolon is accepted. Names are resolved exactly
+/// and case-sensitively, matching the catalog and schema storage boundaries.
+/// All requested columns are resolved before any result rows are materialized.
+pub fn execute_table_select(
+    catalog: &Catalog,
+    input: &str,
+) -> Result<TableSelectResult, TableSelectError> {
+    let projection = parse_table_select(input)?;
+    let table = catalog.table(&projection.table_name)?;
+    let column_indices: HashMap<&str, usize> = table
+        .schema()
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.name(), index))
+        .collect();
+
+    let mut columns = Vec::with_capacity(projection.column_names.len());
+    for column_name in &projection.column_names {
+        let Some(column_index) = column_indices.get(column_name.as_str()).copied() else {
+            return Err(TableSelectError::ColumnNotFound(ColumnNotFoundError {
+                table_name: projection.table_name,
+                column_name: column_name.clone(),
+            }));
+        };
+
+        columns.push(ResolvedColumn {
+            index: column_index,
+            schema: table
+                .schema()
+                .column(column_index)
+                .expect("resolved schema column index remains valid"),
+            values: table
+                .column(column_index)
+                .expect("table columns correspond to schema columns"),
+        });
+    }
+
+    enforce_result_size_limit(table, &columns, MAX_TABLE_SELECT_RESULT_BYTES)?;
+
+    let headers = columns.iter().map(|column| column.schema.clone()).collect();
+    let mut rows = Vec::with_capacity(table.row_count());
+    for row_index in 0..table.row_count() {
+        rows.push(
+            columns
+                .iter()
+                .map(|column| value_at(column.values, row_index))
+                .collect(),
+        );
+    }
+
+    Ok(TableSelectResult { headers, rows })
+}
+
+struct ResolvedColumn<'a> {
+    index: usize,
+    schema: &'a ColumnSchema,
+    values: &'a Column,
+}
+
+fn enforce_result_size_limit(
+    table: &Table,
+    columns: &[ResolvedColumn<'_>],
+    limit: usize,
+) -> Result<(), TableSelectError> {
+    let estimated_bytes = estimate_result_bytes(table, columns);
+    if estimated_bytes > limit {
+        Err(TableSelectError::ResultSizeLimitExceeded {
+            estimated_bytes,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn estimate_result_bytes(table: &Table, columns: &[ResolvedColumn<'_>]) -> usize {
+    let header_bytes = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<ColumnSchema>())
+        .saturating_add(
+            columns
+                .iter()
+                .map(|column| column.schema.name().len())
+                .fold(0usize, usize::saturating_add),
+        );
+    let row_vector_bytes = table
+        .row_count()
+        .saturating_mul(std::mem::size_of::<Vec<Value>>());
+    let row_value_bytes = table
+        .row_count()
+        .saturating_mul(columns.len())
+        .saturating_mul(std::mem::size_of::<Value>());
+
+    let mut string_bytes_by_column = HashMap::new();
+    let string_payload_bytes = columns.iter().fold(0usize, |total, column| {
+        let bytes = *string_bytes_by_column
+            .entry(column.index)
+            .or_insert_with(|| {
+                let bytes = match column.values {
+                    Column::String(values) => values
+                        .iter()
+                        .map(String::len)
+                        .fold(0usize, usize::saturating_add),
+                    _ => 0,
+                };
+                bytes
+            });
+        total.saturating_add(bytes)
+    });
+
+    header_bytes
+        .saturating_add(row_vector_bytes)
+        .saturating_add(row_value_bytes)
+        .saturating_add(string_payload_bytes)
+}
+
+struct TableProjection {
+    column_names: Vec<String>,
+    table_name: String,
+}
+
+fn parse_table_select(input: &str) -> Result<TableProjection, TableSelectError> {
+    let tokens = lex(input, LexerLimits::default())?;
+    let mut cursor = TableSelectCursor::new(input, &tokens);
+
+    cursor.expect_keyword("SELECT", "SELECT")?;
+    let mut column_names = vec![cursor.take_identifier("a column name")?];
+    while cursor.take_comma() {
+        column_names.push(cursor.take_identifier("a column name after `,`")?);
+    }
+    cursor.expect_keyword("FROM", "`,` or FROM")?;
+    let table_name = cursor.take_identifier("a table name after FROM")?;
+    cursor.finish()?;
+
+    Ok(TableProjection {
+        column_names,
+        table_name,
+    })
+}
+
+fn value_at(column: &Column, row_index: usize) -> Value {
+    match column {
+        Column::Int64(values) => Value::Int64(values[row_index]),
+        Column::Float64(values) => Value::Float64(values[row_index]),
+        Column::Bool(values) => Value::Bool(values[row_index]),
+        Column::String(values) => Value::String(values[row_index].clone()),
+    }
+}
+
+struct TableSelectCursor<'a> {
+    input: &'a str,
+    tokens: &'a [Token],
+    index: usize,
+}
+
+impl<'a> TableSelectCursor<'a> {
+    const fn new(input: &'a str, tokens: &'a [Token]) -> Self {
+        Self {
+            input,
+            tokens,
+            index: 0,
+        }
+    }
+
+    fn position(&self) -> usize {
+        self.tokens
+            .get(self.index)
+            .map_or(self.input.len(), |token| token.span.start)
+    }
+
+    fn syntax(&self, expected: &'static str) -> TableSelectError {
+        TableSelectError::Syntax {
+            position: self.position(),
+            expected,
+        }
+    }
+
+    fn expect_keyword(
+        &mut self,
+        keyword: &str,
+        expected: &'static str,
+    ) -> Result<(), TableSelectError> {
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax(expected))?;
+        match &token.kind {
+            TokenKind::Identifier(identifier) if identifier.eq_ignore_ascii_case(keyword) => {
+                self.index += 1;
+                Ok(())
+            }
+            _ => Err(TableSelectError::Syntax {
+                position: token.span.start,
+                expected,
+            }),
+        }
+    }
+
+    fn take_identifier(&mut self, expected: &'static str) -> Result<String, TableSelectError> {
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax(expected))?;
+        let identifier = match &token.kind {
+            TokenKind::Identifier(identifier) | TokenKind::QuotedIdentifier(identifier)
+                if !identifier.is_empty() =>
+            {
+                identifier.clone()
+            }
+            _ => {
+                return Err(TableSelectError::Syntax {
+                    position: token.span.start,
+                    expected,
+                });
+            }
+        };
+        self.index += 1;
+        Ok(identifier)
+    }
+
+    fn take_comma(&mut self) -> bool {
+        if matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Delimiter(Delimiter::Comma))
+        ) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), TableSelectError> {
+        if matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Delimiter(Delimiter::Semicolon))
+        ) {
+            self.index += 1;
+            if self.index != self.tokens.len() {
+                return Err(TableSelectError::MultipleStatements {
+                    position: self.position(),
+                });
+            }
+        } else if self.index != self.tokens.len() {
+            return Err(self.syntax("`;` or the end of the statement"));
+        }
+        Ok(())
     }
 }
 
@@ -346,5 +735,34 @@ mod tests {
         ));
         assert!(parse_scalar_select("SELECT 1 + 2").is_err());
         assert!(parse_scalar_select("SELECT NULL").is_err());
+    }
+
+    #[test]
+    fn result_size_accounting_enforces_the_exact_boundary() {
+        let schema =
+            crate::Schema::new(vec![ColumnSchema::new("payload", crate::DataType::String)])
+                .unwrap();
+        let mut table = Table::new(schema);
+        table
+            .insert_row(vec![Value::String("boundary".to_owned())])
+            .unwrap();
+        let columns = [ResolvedColumn {
+            index: 0,
+            schema: table.schema().column(0).unwrap(),
+            values: table.column(0).unwrap(),
+        }];
+        let estimated_bytes = estimate_result_bytes(&table, &columns);
+
+        assert_eq!(
+            enforce_result_size_limit(&table, &columns, estimated_bytes),
+            Ok(())
+        );
+        assert_eq!(
+            enforce_result_size_limit(&table, &columns, estimated_bytes - 1),
+            Err(TableSelectError::ResultSizeLimitExceeded {
+                estimated_bytes,
+                limit: estimated_bytes - 1,
+            })
+        );
     }
 }
