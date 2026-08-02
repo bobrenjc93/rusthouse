@@ -213,3 +213,28 @@ fn collecting_batches_are_cumulative_but_streaming_batches_do_not_retain() {
     }
     assert_eq!(streamed_count, 3);
 }
+
+#[test]
+fn collecting_batches_enforce_cumulative_materialized_bytes() {
+    let config = DatabaseConfig::new(4096, 2)
+        .with_result_limits(4, 4)
+        .with_result_byte_limits(usize::MAX, 1);
+    let mut database = Database::with_config(config);
+    database
+        .execute_batch(
+            "CREATE TABLE events (id Int64); \
+             INSERT INTO events VALUES (1);",
+        )
+        .expect("setup batch");
+
+    let error = database
+        .execute_batch("SELECT id FROM events")
+        .expect_err("one materialized row exceeds a one-byte batch limit");
+    assert!(matches!(
+        error,
+        Error::BatchResultBytesTooLarge {
+            actual,
+            maximum: 1
+        } if actual > 1
+    ));
+}

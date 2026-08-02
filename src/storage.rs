@@ -210,6 +210,15 @@ impl Column {
         }
     }
 
+    pub(crate) fn cloned_string_bytes(&self) -> usize {
+        match self {
+            Self::String(values) => values
+                .iter()
+                .fold(0_usize, |total, value| total.saturating_add(value.len())),
+            Self::Int64(_) | Self::Float64(_) | Self::Bool(_) => 0,
+        }
+    }
+
     pub fn as_int64(&self) -> Option<&[i64]> {
         match self {
             Self::Int64(values) => Some(values),

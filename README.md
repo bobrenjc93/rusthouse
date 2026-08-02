@@ -74,8 +74,10 @@ grammar. SQL keywords, identifiers, and the four type names are
 case-insensitive. By default, an input may contain at most 1 MiB and a table
 or projection may contain at most 1,024 columns. One materialized query and
 all query results retained by `execute_batch` are each limited to 1,048,576
-cells. These limits can be changed with `DatabaseConfig` and
-`DatabaseConfig::with_result_limits`.
+cells and an estimated 64 MiB of materialized memory. The byte estimate
+includes cloned string payloads for every occurrence in a projection. These
+limits can be changed with `DatabaseConfig`, `DatabaseConfig::with_result_limits`,
+and `DatabaseConfig::with_result_byte_limits`.
 
 The CLI reads one complete valid semicolon-separated batch from stdin and
 rejects oversized input as soon as it crosses the byte limit. It streams each

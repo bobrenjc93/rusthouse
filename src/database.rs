@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::iter::FusedIterator;
+use std::mem;
 use std::vec;
 
 use crate::sql::{Projection, Statement};
@@ -17,6 +18,12 @@ pub const DEFAULT_MAX_RESULT_CELLS: usize = 1024 * 1024;
 /// Default maximum number of query-result cells retained by one batch call.
 pub const DEFAULT_MAX_BATCH_RESULT_CELLS: usize = 1024 * 1024;
 
+/// Default maximum estimated memory used by one materialized query result.
+pub const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default maximum estimated memory retained by one collecting batch call.
+pub const DEFAULT_MAX_BATCH_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Resource limits applied while parsing and executing SQL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DatabaseConfig {
@@ -24,6 +31,8 @@ pub struct DatabaseConfig {
     pub max_columns_per_table: usize,
     pub max_result_cells: usize,
     pub max_batch_result_cells: usize,
+    pub max_result_bytes: usize,
+    pub max_batch_result_bytes: usize,
 }
 
 impl DatabaseConfig {
@@ -34,6 +43,8 @@ impl DatabaseConfig {
             max_columns_per_table,
             max_result_cells: DEFAULT_MAX_RESULT_CELLS,
             max_batch_result_cells: DEFAULT_MAX_BATCH_RESULT_CELLS,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+            max_batch_result_bytes: DEFAULT_MAX_BATCH_RESULT_BYTES,
         }
     }
 
@@ -46,6 +57,18 @@ impl DatabaseConfig {
     ) -> Self {
         self.max_result_cells = max_result_cells;
         self.max_batch_result_cells = max_batch_result_cells;
+        self
+    }
+
+    /// Override per-query and cumulative collecting-batch byte limits.
+    #[must_use]
+    pub const fn with_result_byte_limits(
+        mut self,
+        max_result_bytes: usize,
+        max_batch_result_bytes: usize,
+    ) -> Self {
+        self.max_result_bytes = max_result_bytes;
+        self.max_batch_result_bytes = max_batch_result_bytes;
         self
     }
 }
@@ -61,6 +84,7 @@ impl Default for DatabaseConfig {
 pub struct QueryResult {
     columns: Vec<ColumnSchema>,
     rows: Vec<Vec<Value>>,
+    materialized_bytes: usize,
 }
 
 impl QueryResult {
@@ -88,6 +112,12 @@ impl QueryResult {
     #[must_use]
     pub fn cell_count(&self) -> usize {
         self.rows.len().saturating_mul(self.columns.len())
+    }
+
+    /// Return the estimated memory charged while materializing this result.
+    #[must_use]
+    pub fn materialized_bytes(&self) -> usize {
+        self.materialized_bytes
     }
 }
 
@@ -194,19 +224,33 @@ impl Database {
     ///
     /// The complete batch is parsed before the first statement is executed.
     /// Execution stops at the first typed execution failure, including when
-    /// retained query cells exceed `max_batch_result_cells`.
+    /// retained query cells or bytes exceed their configured batch limits.
     pub fn execute_batch(&mut self, input: &str) -> Result<Vec<ExecutionResult>> {
-        let maximum = self.config.max_batch_result_cells;
+        let maximum_cells = self.config.max_batch_result_cells;
+        let maximum_bytes = self.config.max_batch_result_bytes;
         let mut retained_cells = 0_usize;
+        let mut retained_bytes = 0_usize;
         let mut results = Vec::new();
         for result in self.execute_batch_iter(input)? {
             let result = result?;
-            let additional = result.query().map_or(0, QueryResult::cell_count);
-            let actual = retained_cells.saturating_add(additional);
-            if actual > maximum {
-                return Err(Error::BatchResultTooLarge { actual, maximum });
+            let additional_cells = result.query().map_or(0, QueryResult::cell_count);
+            let actual_cells = retained_cells.saturating_add(additional_cells);
+            if actual_cells > maximum_cells {
+                return Err(Error::BatchResultTooLarge {
+                    actual: actual_cells,
+                    maximum: maximum_cells,
+                });
             }
-            retained_cells = actual;
+            let additional_bytes = result.query().map_or(0, QueryResult::materialized_bytes);
+            let actual_bytes = retained_bytes.saturating_add(additional_bytes);
+            if actual_bytes > maximum_bytes {
+                return Err(Error::BatchResultBytesTooLarge {
+                    actual: actual_bytes,
+                    maximum: maximum_bytes,
+                });
+            }
+            retained_cells = actual_cells;
+            retained_bytes = actual_bytes;
             results.push(result);
         }
         Ok(results)
@@ -298,6 +342,14 @@ impl Database {
                         .collect::<Result<Vec<_>>>()?,
                 };
 
+                let materialized_bytes = estimate_result_bytes(table, &column_indices);
+                if materialized_bytes > self.config.max_result_bytes {
+                    return Err(Error::ResultBytesTooLarge {
+                        actual: materialized_bytes,
+                        maximum: self.config.max_result_bytes,
+                    });
+                }
+
                 let columns = column_indices
                     .iter()
                     .map(|&index| {
@@ -322,7 +374,11 @@ impl Database {
                     })
                     .collect();
 
-                Ok(ExecutionResult::Query(QueryResult { columns, rows }))
+                Ok(ExecutionResult::Query(QueryResult {
+                    columns,
+                    rows,
+                    materialized_bytes,
+                }))
             }
         }
     }
@@ -336,4 +392,38 @@ impl Default for Database {
 
 fn normalize(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
+}
+
+fn estimate_result_bytes(table: &Table, column_indices: &[usize]) -> usize {
+    let cell_count = table.row_count().saturating_mul(column_indices.len());
+    let mut bytes = mem::size_of::<QueryResult>()
+        .saturating_add(cell_count.saturating_mul(mem::size_of::<Value>()))
+        .saturating_add(
+            table
+                .row_count()
+                .saturating_mul(mem::size_of::<Vec<Value>>()),
+        )
+        .saturating_add(
+            column_indices
+                .len()
+                .saturating_mul(mem::size_of::<ColumnSchema>()),
+        );
+    let mut string_bytes = vec![None; table.schema().len()];
+
+    for &index in column_indices {
+        let definition = table
+            .schema()
+            .column(index)
+            .expect("projection indices come from this schema");
+        bytes = bytes.saturating_add(definition.name().len());
+
+        let selected_string_bytes = *string_bytes[index].get_or_insert_with(|| {
+            table
+                .column(index)
+                .expect("storage columns match the schema")
+                .cloned_string_bytes()
+        });
+        bytes = bytes.saturating_add(selected_string_bytes);
+    }
+    bytes
 }

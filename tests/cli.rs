@@ -3,7 +3,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusthouse::DEFAULT_MAX_INPUT_BYTES;
+use rusthouse::{DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_RESULT_BYTES};
 
 fn run_cli(input: &str, arguments: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
@@ -106,4 +106,29 @@ fn oversized_open_stdin_is_rejected_without_waiting_for_eof() {
         stderr.contains("exceeding the limit"),
         "unexpected stderr: {stderr}"
     );
+}
+
+#[test]
+fn duplicate_projection_cannot_amplify_one_string_past_the_result_byte_limit() {
+    let payload = "a".repeat(1_040_000);
+    let projection = std::iter::repeat_n("x", 1024).collect::<Vec<_>>().join(",");
+    let batch = format!(
+        "CREATE TABLE t (x String);\
+         INSERT INTO t VALUES ('{payload}');\
+         SELECT {projection} FROM t;"
+    );
+    assert!(
+        batch.len() < DEFAULT_MAX_INPUT_BYTES,
+        "regression batch must fit below the CLI input limit"
+    );
+
+    let output = run_cli(&batch, &["--format", "csv"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("query result requires"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(stderr.contains(&DEFAULT_MAX_RESULT_BYTES.to_string()));
 }

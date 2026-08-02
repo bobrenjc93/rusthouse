@@ -15,8 +15,12 @@ pub enum Error {
     TooManyProjectedColumns { actual: usize, maximum: usize },
     /// One query would materialize more cells than the configured limit.
     ResultTooLarge { actual: usize, maximum: usize },
+    /// One query would materialize more bytes than the configured limit.
+    ResultBytesTooLarge { actual: usize, maximum: usize },
     /// Collected query results in one batch exceeded their cumulative limit.
     BatchResultTooLarge { actual: usize, maximum: usize },
+    /// Collected query results in one batch exceeded their cumulative byte limit.
+    BatchResultBytesTooLarge { actual: usize, maximum: usize },
     /// A schema contains the same, case-insensitive column name twice.
     DuplicateColumn { name: String },
     /// The catalog already contains the case-insensitive table name.
@@ -63,9 +67,17 @@ impl fmt::Display for Error {
                 formatter,
                 "query result has {actual} cells, exceeding the limit of {maximum}"
             ),
+            Self::ResultBytesTooLarge { actual, maximum } => write!(
+                formatter,
+                "query result requires {actual} bytes, exceeding the limit of {maximum}"
+            ),
             Self::BatchResultTooLarge { actual, maximum } => write!(
                 formatter,
                 "batch results have {actual} cells, exceeding the limit of {maximum}"
+            ),
+            Self::BatchResultBytesTooLarge { actual, maximum } => write!(
+                formatter,
+                "batch results require {actual} bytes, exceeding the limit of {maximum}"
             ),
             Self::DuplicateColumn { name } => {
                 write!(formatter, "duplicate column {name:?}")
