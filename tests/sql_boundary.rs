@@ -301,3 +301,113 @@ fn limit_streams_projections_and_order_by_uses_bounded_top_k() {
         })
     ));
 }
+
+#[test]
+fn empty_non_count_aggregates_return_typed_errors() {
+    let mut database = Database::new();
+    database
+        .execute_one("CREATE TABLE empty_metrics (i Int64, f Float64, b Bool, s String)")
+        .unwrap();
+
+    let count = query(&mut database, "SELECT COUNT(*) AS n FROM empty_metrics");
+    assert_eq!(count.rows, vec![vec![Value::Int64(0)]]);
+    for function in ["SUM(i)", "MIN(i)", "MAX(f)", "AVG(i)"] {
+        assert!(matches!(
+            database.execute_one(&format!("SELECT {function} FROM empty_metrics")),
+            Err(DatabaseError::EmptyAggregate(_))
+        ));
+    }
+
+    database
+        .execute_one("INSERT INTO empty_metrics VALUES (4, 2.5, true, 'present')")
+        .unwrap();
+    assert!(matches!(
+        database.execute_one("SELECT MIN(i) FROM empty_metrics WHERE b = false"),
+        Err(DatabaseError::EmptyAggregate(function)) if function == "min"
+    ));
+    assert!(
+        query(
+            &mut database,
+            "SELECT i, COUNT(*) FROM empty_metrics WHERE b = false GROUP BY i"
+        )
+        .rows
+        .is_empty()
+    );
+}
+
+#[test]
+fn group_by_matches_recursively_resolved_column_identity() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE expression_groups (a Int64);
+             INSERT INTO expression_groups VALUES (1), (1), (2)",
+        )
+        .unwrap();
+
+    let expression = query(
+        &mut database,
+        "SELECT A + 1 AS shifted, COUNT(*) AS n
+         FROM expression_groups GROUP BY a + 1 ORDER BY shifted",
+    );
+    assert_eq!(
+        expression.rows,
+        vec![
+            vec![Value::Int64(2), Value::Int64(2)],
+            vec![Value::Int64(3), Value::Int64(1)],
+        ]
+    );
+
+    let qualified = query(
+        &mut database,
+        "SELECT expression_groups.A AS value, COUNT(*) AS n
+         FROM expression_groups GROUP BY a ORDER BY value",
+    );
+    assert_eq!(qualified.rows[0], vec![Value::Int64(1), Value::Int64(2)]);
+}
+
+#[test]
+fn unicode_identifiers_are_case_insensitive_across_catalog_and_aliases() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE Ångström (Énergie Int64, Straße String);
+             INSERT INTO ångström (énergie, STRASSE) VALUES (2, 'b'), (1, 'a')",
+        )
+        .unwrap();
+    let result = query(
+        &mut database,
+        "SELECT ÉNERGIE AS Résultat, strasse FROM ÅNGSTRÖM ORDER BY résultat",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int64(1), Value::String("a".into())],
+            vec![Value::Int64(2), Value::String("b".into())],
+        ]
+    );
+}
+
+#[test]
+fn mixed_numeric_comparisons_preserve_int64_precision() {
+    let mut database = Database::new();
+    let result = query(
+        &mut database,
+        "SELECT
+           9007199254740993 = 9007199254740992.0 AS rounded_equal,
+           9007199254740993 > 9007199254740992.0 AS exact_greater,
+           9223372036854775807 < 9223372036854775808.0 AS below_upper_bound,
+           -9223372036854775808 = -9223372036854775808.0 AS minimum_equal,
+           -1 > -1.5 AS negative_fraction",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]]
+    );
+}

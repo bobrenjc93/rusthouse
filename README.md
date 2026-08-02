@@ -17,8 +17,11 @@ RustHouse supports:
 - `LIMIT`, `LIMIT ... OFFSET ...`, and `LIMIT offset, count`.
 
 Identifiers can be unquoted, double quoted, or backtick quoted. Unquoted SQL
-keywords and identifiers are case-insensitive. The four storage types are
-non-nullable; `NULL` is rejected instead of being silently coerced.
+keywords and identifiers are case-insensitive; identifier matching uses full
+non-Turkic Unicode case folding. The four storage types are non-nullable;
+`NULL` is rejected instead of being silently coerced. `COUNT` over an empty
+input returns zero. `SUM`, `MIN`, `MAX`, and `AVG` over an empty input return a
+typed `EmptyAggregate` error because the engine cannot represent SQL `NULL`.
 
 ## CLI
 
@@ -73,6 +76,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-The implementation uses only the Rust standard library. It is currently
-single-process and in-memory: persistence, server protocols, joins, windows,
-and nullable types are not implemented.
+The implementation is currently single-process and in-memory: persistence,
+server protocols, joins, windows, and nullable types are not implemented. Its
+only runtime dependency is a focused Unicode case-folding table.

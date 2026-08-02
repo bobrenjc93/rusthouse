@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use unicode_casefold::UnicodeCaseFold;
+
 use crate::{DataType, DatabaseError, LimitKind, Limits, Value};
 
 /// A named, typed column in a table schema.
@@ -192,5 +194,9 @@ impl Table {
 }
 
 pub(crate) fn normalize_identifier(name: &str) -> String {
-    name.to_ascii_lowercase()
+    name.case_fold().collect()
+}
+
+pub(crate) fn identifiers_equal(left: &str, right: &str) -> bool {
+    normalize_identifier(left) == normalize_identifier(right)
 }

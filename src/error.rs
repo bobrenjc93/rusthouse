@@ -54,6 +54,7 @@ pub enum DatabaseError {
     },
     InvalidQuery(String),
     InvalidValue(String),
+    EmptyAggregate(String),
     LimitExceeded {
         kind: LimitKind,
         limit: usize,
@@ -97,6 +98,9 @@ impl fmt::Display for DatabaseError {
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::InvalidValue(message) => write!(f, "invalid value: {message}"),
+            Self::EmptyAggregate(function) => {
+                write!(f, "aggregate {function} has no input rows")
+            }
             Self::LimitExceeded {
                 kind,
                 limit,

@@ -6,7 +6,7 @@ use crate::sql::{
     AggregateFunction, BinaryOperator, ColumnReference, Expr, MAX_SAFE_EXPRESSION_DEPTH, OrderBy,
     Select, SelectItem, Statement, UnaryOperator, parse,
 };
-use crate::storage::{Schema, Table, normalize_identifier};
+use crate::storage::{Schema, Table, identifiers_equal, normalize_identifier};
 use crate::{ColumnDefinition, DataType, DatabaseError, LimitKind, Value};
 
 /// Resource limits enforced by parsing, storage, and query execution.
@@ -269,7 +269,7 @@ impl Database {
                 .order_by
                 .iter()
                 .any(|order| order.expr.contains_aggregate());
-        validate_select(&select, &items, has_aggregate)?;
+        validate_select(&select, &items, has_aggregate, schema)?;
         for item in &items {
             validate_column_references(&item.expr, table)?;
         }
@@ -658,6 +658,7 @@ fn validate_select(
     select: &Select,
     items: &[Projection],
     has_aggregate: bool,
+    schema: &Schema,
 ) -> Result<(), DatabaseError> {
     if select.filter.as_ref().is_some_and(Expr::contains_aggregate) {
         return Err(DatabaseError::invalid(
@@ -671,11 +672,11 @@ fn validate_select(
     }
     if has_aggregate || !select.group_by.is_empty() {
         for item in items {
-            validate_group_expression(&item.expr, &select.group_by, false)?;
+            validate_group_expression(&item.expr, &select.group_by, false, schema)?;
         }
         for order in &select.order_by {
             if !is_projection_alias(&order.expr, items) {
-                validate_group_expression(&order.expr, &select.group_by, false)?;
+                validate_group_expression(&order.expr, &select.group_by, false, schema)?;
             }
         }
     }
@@ -686,8 +687,13 @@ fn validate_group_expression(
     expr: &Expr,
     group_by: &[Expr],
     inside_aggregate: bool,
+    schema: &Schema,
 ) -> Result<(), DatabaseError> {
-    if !inside_aggregate && group_by.iter().any(|group| equivalent_expr(expr, group)) {
+    if !inside_aggregate
+        && group_by
+            .iter()
+            .any(|group| equivalent_expr(expr, group, schema))
+    {
         return Ok(());
     }
     match expr {
@@ -704,31 +710,76 @@ fn validate_group_expression(
                 ));
             }
             if let Some(argument) = argument {
-                validate_group_expression(argument, group_by, true)?;
+                validate_group_expression(argument, group_by, true, schema)?;
             }
             Ok(())
         }
         Expr::Binary { left, right, .. } => {
-            validate_group_expression(left, group_by, inside_aggregate)?;
-            validate_group_expression(right, group_by, inside_aggregate)
+            validate_group_expression(left, group_by, inside_aggregate, schema)?;
+            validate_group_expression(right, group_by, inside_aggregate, schema)
         }
-        Expr::Unary { expr, .. } => validate_group_expression(expr, group_by, inside_aggregate),
+        Expr::Unary { expr, .. } => {
+            validate_group_expression(expr, group_by, inside_aggregate, schema)
+        }
     }
 }
 
-fn equivalent_expr(left: &Expr, right: &Expr) -> bool {
+fn equivalent_expr(left: &Expr, right: &Expr, schema: &Schema) -> bool {
     match (left, right) {
+        (Expr::Literal(left), Expr::Literal(right)) => left == right,
         (Expr::Column(left), Expr::Column(right)) => {
-            left.qualifier
-                .as_ref()
-                .map(|name| normalize_identifier(name))
-                == right
-                    .qualifier
-                    .as_ref()
-                    .map(|name| normalize_identifier(name))
-                && normalize_identifier(&left.name) == normalize_identifier(&right.name)
+            match (
+                schema.column_index(&left.name),
+                schema.column_index(&right.name),
+            ) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
         }
-        _ => left == right,
+        (
+            Expr::Aggregate {
+                function: left_function,
+                argument: left_argument,
+            },
+            Expr::Aggregate {
+                function: right_function,
+                argument: right_argument,
+            },
+        ) => {
+            left_function == right_function
+                && match (left_argument, right_argument) {
+                    (Some(left), Some(right)) => equivalent_expr(left, right, schema),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (
+            Expr::Binary {
+                left: left_left,
+                operator: left_operator,
+                right: left_right,
+            },
+            Expr::Binary {
+                left: right_left,
+                operator: right_operator,
+                right: right_right,
+            },
+        ) => {
+            left_operator == right_operator
+                && equivalent_expr(left_left, right_left, schema)
+                && equivalent_expr(left_right, right_right, schema)
+        }
+        (
+            Expr::Unary {
+                operator: left_operator,
+                expr: left,
+            },
+            Expr::Unary {
+                operator: right_operator,
+                expr: right,
+            },
+        ) => left_operator == right_operator && equivalent_expr(left, right, schema),
+        _ => false,
     }
 }
 
@@ -742,7 +793,7 @@ fn is_projection_alias(expr: &Expr, items: &[Projection]) -> bool {
     items.iter().any(|item| {
         item.alias
             .as_ref()
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(&reference.name))
+            .is_some_and(|alias| identifiers_equal(alias, &reference.name))
     })
 }
 
@@ -756,7 +807,7 @@ fn resolve_projection_alias(expr: &mut Expr, items: &[Projection]) {
     if let Some(item) = items.iter().find(|item| {
         item.alias
             .as_ref()
-            .is_some_and(|alias| alias.eq_ignore_ascii_case(&reference.name))
+            .is_some_and(|alias| identifiers_equal(alias, &reference.name))
     }) {
         *expr = item.expr.clone();
     }
@@ -886,6 +937,9 @@ fn eval_aggregate(
             .map_err(|_| DatabaseError::ArithmeticOverflow("COUNT exceeds Int64".into()))?;
         return Ok(Value::Int64(count));
     }
+    if rows.is_empty() {
+        return Err(DatabaseError::EmptyAggregate(function.name().to_owned()));
+    }
     let argument = argument.expect("non-count aggregates require an argument");
     let data_type = infer_type(argument, schema)?;
     match function {
@@ -927,9 +981,9 @@ fn eval_aggregate(
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let mut values = rows.iter();
-            let Some(first) = values.next() else {
-                return Ok(default_value(data_type, function == AggregateFunction::Avg));
-            };
+            let first = values
+                .next()
+                .expect("empty aggregates are rejected before evaluation");
             let mut selected = eval_row_expr(argument, table, Some(*first))?;
             for row in values {
                 let candidate = eval_row_expr(argument, table, Some(*row))?;
@@ -949,16 +1003,6 @@ fn eval_aggregate(
     }
 }
 
-fn default_value(data_type: DataType, nan_float: bool) -> Value {
-    match data_type {
-        DataType::Int64 => Value::Int64(0),
-        DataType::Float64 if nan_float => Value::Float64(f64::NAN),
-        DataType::Float64 => Value::Float64(0.0),
-        DataType::Bool => Value::Bool(false),
-        DataType::String => Value::String(String::new()),
-    }
-}
-
 fn eval_row_expr(
     expr: &Expr,
     table: Option<&Table>,
@@ -974,7 +1018,7 @@ fn eval_row_expr(
                 ))
             })?;
             if let Some(qualifier) = &reference.qualifier
-                && !qualifier.eq_ignore_ascii_case(&table.name)
+                && !identifiers_equal(qualifier, &table.name)
             {
                 return Err(DatabaseError::ColumnNotFound(reference.label()));
             }
@@ -1139,18 +1183,8 @@ fn value_order(left: &Value, right: &Value) -> Result<Ordering, DatabaseError> {
         (Value::Float64(left), Value::Float64(right)) => Ok(left
             .partial_cmp(right)
             .unwrap_or_else(|| left.total_cmp(right))),
-        (Value::Int64(left), Value::Float64(right)) => {
-            let left = *left as f64;
-            Ok(left
-                .partial_cmp(right)
-                .unwrap_or_else(|| left.total_cmp(right)))
-        }
-        (Value::Float64(left), Value::Int64(right)) => {
-            let right = *right as f64;
-            Ok(left
-                .partial_cmp(&right)
-                .unwrap_or_else(|| left.total_cmp(&right)))
-        }
+        (Value::Int64(left), Value::Float64(right)) => Ok(compare_i64_f64(*left, *right)),
+        (Value::Float64(left), Value::Int64(right)) => Ok(compare_i64_f64(*right, *left).reverse()),
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         (Value::String(left), Value::String(right)) => Ok(left.cmp(right)),
         (left, right) => Err(DatabaseError::invalid(format!(
@@ -1158,6 +1192,32 @@ fn value_order(left: &Value, right: &Value) -> Result<Ordering, DatabaseError> {
             left.data_type(),
             right.data_type()
         ))),
+    }
+}
+
+fn compare_i64_f64(integer: i64, float: f64) -> Ordering {
+    const I64_MIN_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+    const I64_UPPER_BOUND_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+
+    if float.is_nan() {
+        return if float.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    if float < I64_MIN_AS_F64 {
+        return Ordering::Greater;
+    }
+    if float >= I64_UPPER_BOUND_AS_F64 {
+        return Ordering::Less;
+    }
+
+    let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() > 0.0 => Ordering::Less,
+        Ordering::Equal if float.fract() < 0.0 => Ordering::Greater,
+        ordering => ordering,
     }
 }
 
@@ -1330,7 +1390,7 @@ fn validate_column_references(expr: &Expr, table: Option<&Table>) -> Result<(), 
                 ))
             })?;
             if let Some(qualifier) = &reference.qualifier
-                && !qualifier.eq_ignore_ascii_case(&table.name)
+                && !identifiers_equal(qualifier, &table.name)
             {
                 return Err(DatabaseError::ColumnNotFound(reference.label()));
             }
@@ -1368,7 +1428,7 @@ fn evaluate_order(
                 && reference.qualifier.is_none()
                 && let Some(index) = columns
                     .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(&reference.name))
+                    .position(|column| identifiers_equal(&column.name, &reference.name))
             {
                 Ok(values[index].clone())
             } else if let Some(group) = group {
