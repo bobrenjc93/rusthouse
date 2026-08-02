@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod dml;
 pub mod formats;
 pub mod lexer;
 pub mod query;
@@ -9,6 +10,9 @@ pub mod storage;
 
 pub use catalog::{Catalog, CatalogError, TableNotFoundError};
 pub use ddl::{CreateTableError, CreateTableStatement, execute_create_table, parse_create_table};
+pub use dml::{
+    InsertValuesError, InsertValuesStatement, execute_insert_values, parse_insert_values,
+};
 pub use formats::{CsvWithNamesError, CsvWithNamesWriter};
 pub use query::{
     ColumnNotFoundError, MAX_TABLE_SELECT_RESULT_BYTES, ScalarSelect, ScalarSelectError,
