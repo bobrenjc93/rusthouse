@@ -22,7 +22,7 @@ The early implementation should favor Rust's standard library and a small depend
 ## Current CLI
 
 The CLI executes a bounded, semicolon-delimited SQL script from standard input.
-It supports the current `CREATE TABLE`, one-row `INSERT INTO ... VALUES`, scalar
+It supports the current `CREATE TABLE`, multi-row `INSERT INTO ... VALUES`, scalar
 `SELECT`, and table projection `SELECT` shapes. Each SELECT is emitted in source
 order as ClickHouse-style `CSVWithNames`; command statements emit nothing.
 
@@ -40,10 +40,11 @@ The library can create in-memory catalog tables with
 
 ## Library DML
 
-The library can insert one typed row into an existing catalog table with
+The library can insert one or more typed rows into an existing catalog table with
 `execute_insert_values(&mut catalog, sql)`. The supported DML shape is exactly
-`INSERT INTO name VALUES (literal [, literal ...])`, using `Int64`, `Float64`,
-`Bool`, or `String` literals, with an optional trailing semicolon.
+`INSERT INTO name VALUES (literal [, literal ...]) [, (literal [, literal ...]) ...]`,
+using `Int64`, `Float64`, `Bool`, or `String` literals, with an optional trailing
+semicolon. All rows in one statement are validated and inserted atomically.
 
 ## Development model
 

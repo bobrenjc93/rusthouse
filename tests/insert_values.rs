@@ -1,6 +1,6 @@
 use rusthouse::{
-    Catalog, Column, DataType, InsertError, InsertValuesError, TableNotFoundError, Value,
-    execute_create_table, execute_insert_values, parse_insert_values,
+    BatchInsertError, Catalog, Column, DataType, InsertError, InsertValuesError,
+    TableNotFoundError, Value, execute_create_table, execute_insert_values, parse_insert_values,
 };
 
 fn catalog_with_all_types() -> Catalog {
@@ -19,11 +19,14 @@ fn catalog_with_all_types() -> Catalog {
 }
 
 #[test]
-fn inserts_one_escaped_all_type_row_with_an_optional_semicolon() {
+fn inserts_multiple_mixed_type_rows_with_escaped_strings() {
     let mut catalog = catalog_with_all_types();
 
     let statement = parse_insert_values(
-        r#"InSeRt InTo "Daily Metrics" VaLuEs (-7, +1.25e1, TRUE, 'customer''s note')"#,
+        r#"InSeRt InTo "Daily Metrics" VaLuEs
+           (-7, +1.25e1, TRUE, 'customer''s note'),
+           (0, -3.5, false, 'comma, inside'),
+           (42, 0.0, TRUE, 'last')"#,
     )
     .expect("the supported shape parses");
     assert_eq!(statement.table_name(), "Daily Metrics");
@@ -36,21 +39,51 @@ fn inserts_one_escaped_all_type_row_with_an_optional_semicolon() {
             Value::String("customer's note".to_owned()),
         ]
     );
+    assert_eq!(
+        statement.rows(),
+        [
+            vec![
+                Value::Int64(-7),
+                Value::Float64(12.5),
+                Value::Bool(true),
+                Value::String("customer's note".to_owned()),
+            ],
+            vec![
+                Value::Int64(0),
+                Value::Float64(-3.5),
+                Value::Bool(false),
+                Value::String("comma, inside".to_owned()),
+            ],
+            vec![
+                Value::Int64(42),
+                Value::Float64(0.0),
+                Value::Bool(true),
+                Value::String("last".to_owned()),
+            ],
+        ]
+    );
 
     execute_insert_values(
         &mut catalog,
-        r#"INSERT INTO "Daily Metrics" VALUES (-7, +1.25e1, TRUE, 'customer''s note');"#,
+        r#"INSERT INTO "Daily Metrics" VALUES
+           (-7, +1.25e1, TRUE, 'customer''s note'),
+           (0, -3.5, false, 'comma, inside'),
+           (42, 0.0, TRUE, 'last');"#,
     )
-    .expect("the row matches the table");
+    .expect("the rows match the table");
 
     let table = catalog.table("Daily Metrics").unwrap();
-    assert_eq!(table.row_count(), 1);
-    assert_eq!(table.columns()[0], Column::Int64(vec![-7]));
-    assert_eq!(table.columns()[1], Column::Float64(vec![12.5]));
-    assert_eq!(table.columns()[2], Column::Bool(vec![true]));
+    assert_eq!(table.row_count(), 3);
+    assert_eq!(table.columns()[0], Column::Int64(vec![-7, 0, 42]));
+    assert_eq!(table.columns()[1], Column::Float64(vec![12.5, -3.5, 0.0]));
+    assert_eq!(table.columns()[2], Column::Bool(vec![true, false, true]));
     assert_eq!(
         table.columns()[3],
-        Column::String(vec!["customer's note".to_owned()])
+        Column::String(vec![
+            "customer's note".to_owned(),
+            "comma, inside".to_owned(),
+            "last".to_owned(),
+        ])
     );
 }
 
@@ -65,7 +98,12 @@ fn malformed_statements_do_not_mutate_storage() {
         "INSERT INTO missing VALUES ()",
         "INSERT INTO missing VALUES (1,)",
         "INSERT INTO missing VALUES (1) extra",
-        "INSERT INTO missing VALUES (1), (2)",
+        "INSERT INTO missing VALUES (1) (2)",
+        "INSERT INTO missing VALUES (1),",
+        "INSERT INTO missing VALUES (1),, (2)",
+        "INSERT INTO missing VALUES (1), 2",
+        "INSERT INTO missing VALUES (1), ()",
+        "INSERT INTO missing VALUES (1), (2,)",
         "INSERT INTO missing VALUES (1);;",
         "INSERT INTO missing VALUES (1); INSERT INTO missing VALUES (2)",
         "INSERT INTO missing SELECT 1",
@@ -101,23 +139,35 @@ fn missing_table_error_preserves_existing_storage() {
 }
 
 #[test]
-fn width_and_type_errors_are_atomic_and_typed() {
+fn late_width_and_type_errors_report_tuple_index_and_are_atomic() {
     let mut catalog = catalog_with_all_types();
     let invalid = [
         (
-            "INSERT INTO \"Daily Metrics\" VALUES (1, 2.0, true)",
-            InsertError::RowWidth {
-                expected: 4,
-                actual: 3,
+            "INSERT INTO \"Daily Metrics\" VALUES \
+             (1, 2.0, true, 'first'), \
+             (2, 3.0, false, 'second'), \
+             (3, 4.0, true)",
+            BatchInsertError {
+                batch_index: 2,
+                source: InsertError::RowWidth {
+                    expected: 4,
+                    actual: 3,
+                },
             },
         ),
         (
-            "INSERT INTO \"Daily Metrics\" VALUES (1, 2, true, 'note')",
-            InsertError::TypeMismatch {
-                column_index: 1,
-                column_name: "score".to_owned(),
-                expected: DataType::Float64,
-                actual: DataType::Int64,
+            "INSERT INTO \"Daily Metrics\" VALUES \
+             (1, 2.0, true, 'first'), \
+             (2, 3.0, false, 'second'), \
+             (3, 4, true, 'third')",
+            BatchInsertError {
+                batch_index: 2,
+                source: InsertError::TypeMismatch {
+                    column_index: 1,
+                    column_name: "score".to_owned(),
+                    expected: DataType::Float64,
+                    actual: DataType::Int64,
+                },
             },
         ),
     ];

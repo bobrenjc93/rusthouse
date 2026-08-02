@@ -23,8 +23,9 @@ fn executes_create_insert_and_select_and_emits_selects_in_order() {
     let output = rusthouse(
         br#"
             CREATE TABLE events (id Int64, score Float64, active Bool, label String);
-            INSERT INTO events VALUES (1, 9.5, true, 'first');
-            INSERT INTO events VALUES (2, -3.25, false, 'second');
+            INSERT INTO events VALUES
+                (1, 9.5, true, 'first'),
+                (2, -3.25, false, 'second');
             SELECT label, id, active, score FROM events;
             SELECT 42 AS answer;
         "#,

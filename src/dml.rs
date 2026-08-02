@@ -1,17 +1,17 @@
-//! Parsing and execution for one-row `INSERT INTO ... VALUES` statements.
+//! Parsing and execution for `INSERT INTO ... VALUES` statements.
 
 use std::error::Error;
 use std::fmt;
 
 use crate::catalog::{Catalog, TableNotFoundError};
 use crate::lexer::{Delimiter, LexError, LexerLimits, Literal, Operator, Token, TokenKind, lex};
-use crate::storage::{InsertError, Value};
+use crate::storage::{BatchInsertError, Value};
 
-/// A parsed one-row `INSERT INTO ... VALUES` statement.
+/// A parsed `INSERT INTO ... VALUES` statement containing one or more rows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsertValuesStatement {
     table_name: String,
-    values: Vec<Value>,
+    rows: Vec<Vec<Value>>,
 }
 
 impl InsertValuesStatement {
@@ -21,18 +21,27 @@ impl InsertValuesStatement {
         &self.table_name
     }
 
-    /// Returns the typed row values in statement order.
+    /// Returns the typed values in the first row.
+    ///
+    /// Every statement contains at least one row. Use [`Self::rows`] to inspect
+    /// every row in a multi-row statement.
     #[must_use]
     pub fn values(&self) -> &[Value] {
-        &self.values
+        &self.rows[0]
     }
 
-    fn into_parts(self) -> (String, Vec<Value>) {
-        (self.table_name, self.values)
+    /// Returns all typed rows in statement order.
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+
+    fn into_parts(self) -> (String, Vec<Vec<Value>>) {
+        (self.table_name, self.rows)
     }
 }
 
-/// An error returned while parsing or executing one-row `INSERT VALUES`.
+/// An error returned while parsing or executing `INSERT VALUES`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InsertValuesError {
     /// Tokenization failed.
@@ -70,8 +79,8 @@ pub enum InsertValuesError {
     },
     /// The target table is not present in the catalog.
     TableNotFound(TableNotFoundError),
-    /// The typed row does not match the target table schema.
-    Insert(InsertError),
+    /// A typed row does not match the target table schema.
+    Insert(BatchInsertError),
 }
 
 impl fmt::Display for InsertValuesError {
@@ -99,7 +108,7 @@ impl fmt::Display for InsertValuesError {
                 "SQL parse error at byte {position}: NULL literals are not supported"
             ),
             Self::TableNotFound(error) => error.fmt(formatter),
-            Self::Insert(error) => write!(formatter, "row insertion failed: {error}"),
+            Self::Insert(error) => write!(formatter, "batch insertion failed: {error}"),
         }
     }
 }
@@ -127,13 +136,14 @@ impl From<TableNotFoundError> for InsertValuesError {
     }
 }
 
-impl From<InsertError> for InsertValuesError {
-    fn from(error: InsertError) -> Self {
+impl From<BatchInsertError> for InsertValuesError {
+    fn from(error: BatchInsertError) -> Self {
         Self::Insert(error)
     }
 }
 
-/// Parses exactly one `INSERT INTO name VALUES (literal [, literal ...])`.
+/// Parses exactly one `INSERT INTO name VALUES (literal [, literal ...])
+/// [, (literal [, literal ...]) ...]` statement.
 ///
 /// The statement keywords are ASCII case-insensitive. A single trailing
 /// semicolon is optional, and the lexer default limits bound the work
@@ -146,31 +156,28 @@ pub fn parse_insert_values(input: &str) -> Result<InsertValuesStatement, InsertV
     cursor.expect_keyword("INTO", "INTO")?;
     let table_name = cursor.take_identifier("a table name")?;
     cursor.expect_keyword("VALUES", "VALUES")?;
-    cursor.expect_delimiter(Delimiter::LeftParenthesis, "`(`")?;
-
-    let mut values = Vec::new();
+    let mut rows = Vec::new();
     loop {
-        values.push(cursor.take_value()?);
+        rows.push(cursor.take_row()?);
         if cursor.take_delimiter(Delimiter::Comma) {
             continue;
         }
-        cursor.expect_delimiter(Delimiter::RightParenthesis, "`,` or `)`")?;
         break;
     }
     cursor.finish()?;
 
-    Ok(InsertValuesStatement { table_name, values })
+    Ok(InsertValuesStatement { table_name, rows })
 }
 
-/// Parses and inserts one row into an existing catalog table.
+/// Parses and inserts one or more rows into an existing catalog table.
 ///
-/// Parsing completes before catalog lookup. The table's existing atomic row
-/// insertion validates width, exact logical types, and finite floats before
+/// Parsing completes before catalog lookup. The table's atomic batch insertion
+/// validates every row's width, exact logical types, and finite floats before
 /// any physical column is changed.
 pub fn execute_insert_values(catalog: &mut Catalog, input: &str) -> Result<(), InsertValuesError> {
     let statement = parse_insert_values(input)?;
-    let (table_name, values) = statement.into_parts();
-    catalog.table_mut(&table_name)?.insert_row(values)?;
+    let (table_name, rows) = statement.into_parts();
+    catalog.table_mut(&table_name)?.insert_batch(rows)?;
     Ok(())
 }
 
@@ -244,6 +251,19 @@ impl<'a> Cursor<'a> {
             .next()
             .ok_or_else(|| self.syntax("an Int64, Float64, Bool, or String literal"))?;
         parse_value(token, sign)
+    }
+
+    fn take_row(&mut self) -> Result<Vec<Value>, InsertValuesError> {
+        self.expect_delimiter(Delimiter::LeftParenthesis, "`(`")?;
+        let mut values = Vec::new();
+        loop {
+            values.push(self.take_value()?);
+            if self.take_delimiter(Delimiter::Comma) {
+                continue;
+            }
+            self.expect_delimiter(Delimiter::RightParenthesis, "`,` or `)`")?;
+            return Ok(values);
+        }
     }
 
     fn take_sign(&mut self) -> Option<Operator> {

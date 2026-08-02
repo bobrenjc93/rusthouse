@@ -102,7 +102,7 @@ impl Database {
 
     /// Executes a bounded semicolon-delimited sequence in source order.
     ///
-    /// Only the existing `CREATE TABLE`, one-row `INSERT INTO ... VALUES`,
+    /// Only the existing `CREATE TABLE`, multi-row `INSERT INTO ... VALUES`,
     /// scalar `SELECT`, and table projection `SELECT` shapes are dispatched.
     /// Command statements produce no result; each `SELECT` contributes one
     /// result in statement order. Statements completed before an execution
