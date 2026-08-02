@@ -30,3 +30,6 @@ jobs:
 
       - name: Run all tests
         run: cargo test --locked --all-targets --all-features
+
+      - name: Run documentation tests
+        run: cargo test --locked --all-features --doc
