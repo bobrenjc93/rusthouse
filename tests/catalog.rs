@@ -301,3 +301,17 @@ fn forged_asts_reject_case_insensitive_duplicate_columns() {
     );
     assert!(catalog.is_empty());
 }
+
+#[test]
+fn lookups_reject_names_over_the_input_limit() {
+    let mut catalog = Catalog::new();
+    catalog
+        .create_table(parse_create_table("CREATE TABLE events (id Int64)").unwrap())
+        .unwrap();
+    let over_limit = "a".repeat(MAX_INPUT_BYTES + 1);
+
+    assert!(catalog.table(&over_limit).is_none());
+    assert_eq!(catalog.table_name(&over_limit), None);
+    assert!(catalog.table("EVENTS").is_some());
+    assert_eq!(catalog.table_name("EVENTS"), Some("events"));
+}

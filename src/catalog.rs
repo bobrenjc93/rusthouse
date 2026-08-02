@@ -225,15 +225,15 @@ impl Catalog {
 
     /// Looks up a table using an ASCII case-insensitive name.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.tables
-            .get(&normalize_name(name))
-            .map(|entry| &entry.table)
+        let normalized_name = normalize_lookup_name(name)?;
+        self.tables.get(&normalized_name).map(|entry| &entry.table)
     }
 
     /// Returns the spelling used when a table was created.
     pub fn table_name(&self, name: &str) -> Option<&str> {
+        let normalized_name = normalize_lookup_name(name)?;
         self.tables
-            .get(&normalize_name(name))
+            .get(&normalized_name)
             .map(|entry| entry.name.as_str())
     }
 }
@@ -246,6 +246,13 @@ impl Default for Catalog {
 
 fn normalize_name(name: &str) -> String {
     name.to_ascii_lowercase()
+}
+
+fn normalize_lookup_name(name: &str) -> Option<String> {
+    if name.len() > MAX_INPUT_BYTES {
+        return None;
+    }
+    Some(normalize_name(name))
 }
 
 fn validate_statement(statement: &CreateTable) -> Result<(), CatalogError> {
