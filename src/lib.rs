@@ -1,8 +1,9 @@
 //! RustHouse is an experimental, compact analytical database.
 //!
 //! Its storage layer provides validated, in-memory columnar tables with four
-//! physical data types. Rows are checked in full before they are appended, so
-//! a rejected row never leaves columns with different lengths.
+//! physical data types. Rows and row batches are checked in full before they
+//! are appended, so rejected inserts never leave columns with different
+//! lengths.
 
 mod error;
 mod storage;

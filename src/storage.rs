@@ -230,11 +230,34 @@ impl Table {
     /// No column is changed when validation returns an error.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
         self.validate_row(&row)?;
+        self.append_row(row);
+        Ok(())
+    }
+
+    /// Validates and appends a batch of complete rows to the table.
+    ///
+    /// All rows are validated before any value is appended. On failure,
+    /// [`Error::BatchRow`] reports the zero-based batch row index and the
+    /// underlying validation error, and the table remains unchanged.
+    pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<()> {
+        for (row_index, row) in rows.iter().enumerate() {
+            self.validate_row(row).map_err(|source| Error::BatchRow {
+                row_index,
+                source: Box::new(source),
+            })?;
+        }
+
+        for row in rows {
+            self.append_row(row);
+        }
+        Ok(())
+    }
+
+    fn append_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 }
 
@@ -420,6 +443,103 @@ mod tests {
             assert_eq!(table.insert_row(row), Err(expected_error));
             assert_eq!(table, original);
             assert!(table.columns().iter().all(Column::is_empty));
+        }
+    }
+
+    #[test]
+    fn inserts_empty_and_valid_batches() {
+        let mut table = four_type_table();
+
+        table.insert_rows(vec![]).expect("empty batch");
+        assert!(table.is_empty());
+        assert!(table.columns().iter().all(Column::is_empty));
+
+        table
+            .insert_rows(vec![
+                vec![
+                    Value::Int64(1),
+                    Value::Float64(1.5),
+                    Value::Bool(true),
+                    Value::String("first".to_owned()),
+                ],
+                vec![
+                    Value::Int64(2),
+                    Value::Float64(2.5),
+                    Value::Bool(false),
+                    Value::String("second".to_owned()),
+                ],
+                vec![
+                    Value::Int64(3),
+                    Value::Float64(3.5),
+                    Value::Bool(true),
+                    Value::String("third".to_owned()),
+                ],
+            ])
+            .expect("valid batch");
+
+        assert_eq!(table.row_count(), 3);
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[1, 2, 3]));
+        assert!(matches!(&table.columns()[1], Column::Float64(v) if v == &[1.5, 2.5, 3.5]));
+        assert!(matches!(&table.columns()[2], Column::Bool(v) if v == &[true, false, true]));
+        assert!(
+            matches!(&table.columns()[3], Column::String(v) if v == &["first", "second", "third"])
+        );
+    }
+
+    #[test]
+    fn rejected_batches_report_the_row_and_leave_every_column_unchanged() {
+        let valid_row = || {
+            vec![
+                Value::Int64(10),
+                Value::Float64(10.5),
+                Value::Bool(true),
+                Value::String("valid".to_owned()),
+            ]
+        };
+        let invalid_values = [
+            Value::String("not an integer".to_owned()),
+            Value::Bool(false),
+            Value::Int64(0),
+            Value::Float64(0.0),
+        ];
+        let expected_types = [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Bool,
+            DataType::String,
+        ];
+        let actual_types = [
+            DataType::String,
+            DataType::Bool,
+            DataType::Int64,
+            DataType::Float64,
+        ];
+        let column_names = ["id", "score", "enabled", "label"];
+
+        for row_index in [0, 1, 2] {
+            for column_index in 0..4 {
+                let mut table = four_type_table();
+                table.insert_row(valid_row()).expect("seed row");
+                let original = table.clone();
+                let mut rows = vec![valid_row(), valid_row(), valid_row()];
+                rows[row_index][column_index] = invalid_values[column_index].clone();
+
+                assert_eq!(
+                    table.insert_rows(rows),
+                    Err(Error::BatchRow {
+                        row_index,
+                        source: Box::new(Error::TypeMismatch {
+                            table: "events".to_owned(),
+                            column: column_names[column_index].to_owned(),
+                            expected: expected_types[column_index],
+                            actual: actual_types[column_index],
+                        }),
+                    })
+                );
+                assert_eq!(table.row_count(), original.row_count());
+                assert_eq!(table.columns(), original.columns());
+                assert_eq!(table, original);
+            }
         }
     }
 }
