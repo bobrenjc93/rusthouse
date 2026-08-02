@@ -23,9 +23,25 @@ The early implementation should favor Rust's standard library and a small depend
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
 
+RustHouse's minimum supported Rust version is 1.85.0. With
+[rustup](https://rustup.rs/) installed, the repository's `rust-toolchain.toml`
+selects that exact release and installs the required `rustfmt` and Clippy
+components.
+
+Run the same quality gate as CI from the repository root:
+
 ```bash
-cargo test
-cargo run -- --help
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --doc --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items --locked
+```
+
+To run the current binary after verification:
+
+```bash
+cargo run --locked
 ```
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
