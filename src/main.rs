@@ -5,7 +5,9 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use rusthouse::lexer::LexerLimits;
-use rusthouse::{CsvWithNamesWriter, Database, SelectResult, Value};
+use rusthouse::{CsvWithNamesWriter, Database, MAX_SCRIPT_RESULT_BYTES, SelectResult, Value};
+
+const MAX_CLI_OUTPUT_BYTES: usize = MAX_SCRIPT_RESULT_BYTES;
 
 const HELP: &str = "RustHouse executes a bounded SQL script from standard input.
 
@@ -54,7 +56,7 @@ fn execute_stdin() -> Result<(), CliError> {
 
     // Complete execution and formatting before stdout is touched so failures
     // cannot leave behind an earlier result set or a partial row.
-    let mut output = Vec::new();
+    let mut output = BoundedOutput::new(MAX_CLI_OUTPUT_BYTES);
     for result in results {
         match result {
             SelectResult::Scalar(result) => {
@@ -77,9 +79,47 @@ fn execute_stdin() -> Result<(), CliError> {
     }
 
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&output)?;
+    stdout.write_all(output.as_slice())?;
     stdout.flush()?;
     Ok(())
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other(format!(
+                "CSV output exceeds the {}-byte limit",
+                self.limit
+            )));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(|_| io::Error::other("failed to allocate CSV output buffer"))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn value_text(value: &Value) -> String {
@@ -183,5 +223,21 @@ impl From<rusthouse::CsvWithNamesError> for CliError {
 impl From<io::Error> for CliError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_output_rejects_growth_without_retaining_partial_bytes() {
+        let mut output = BoundedOutput::new(4);
+        output.write_all(b"1234").unwrap();
+
+        let error = output.write_all(b"5").unwrap_err();
+
+        assert_eq!(output.as_slice(), b"1234");
+        assert!(error.to_string().contains("4-byte limit"));
     }
 }

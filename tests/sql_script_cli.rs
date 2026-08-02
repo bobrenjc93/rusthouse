@@ -79,3 +79,38 @@ fn malformed_scripts_fail_closed_without_partial_select_output() {
         assert!(!output.stderr.is_empty(), "failure omitted its diagnostic");
     }
 }
+
+#[test]
+fn repeated_selects_stop_at_the_aggregate_result_limit_without_output() {
+    const ROWS: usize = 32;
+    const PAYLOAD_BYTES: usize = 16 * 1024;
+    const PROJECTIONS: usize = 20;
+    const SELECTS: usize = 900;
+
+    let payload = "x".repeat(PAYLOAD_BYTES);
+    let projection = std::iter::repeat_n("payload", PROJECTIONS)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut script = String::from("CREATE TABLE events (payload String);");
+    for _ in 0..ROWS {
+        script.push_str("INSERT INTO events VALUES ('");
+        script.push_str(&payload);
+        script.push_str("');");
+    }
+    for _ in 0..SELECTS {
+        script.push_str("SELECT ");
+        script.push_str(&projection);
+        script.push_str(" FROM events;");
+    }
+    assert!(script.len() < 1024 * 1024);
+
+    let output = rusthouse(script.as_bytes());
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("aggregate SELECT results")
+    );
+}

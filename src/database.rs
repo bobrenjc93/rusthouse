@@ -11,9 +11,13 @@ use crate::query::{
     ScalarSelect, ScalarSelectError, TableSelectError, TableSelectResult, execute_table_select,
     parse_scalar_select,
 };
+use crate::storage::Value;
 
 /// Maximum number of statements accepted by one call to [`Database::execute`].
 pub const MAX_SCRIPT_STATEMENTS: usize = 1024;
+
+/// Maximum estimated heap allocation retained by all results from one script.
+pub const MAX_SCRIPT_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A result produced by a supported `SELECT` statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +26,59 @@ pub enum SelectResult {
     Scalar(ScalarSelect),
     /// A projection from a catalog table.
     Table(TableSelectResult),
+}
+
+impl SelectResult {
+    fn estimated_heap_bytes(&self) -> usize {
+        match self {
+            Self::Scalar(result) => {
+                result
+                    .column_name()
+                    .len()
+                    .saturating_add(match result.value() {
+                        Value::String(value) => value.len(),
+                        _ => 0,
+                    })
+            }
+            Self::Table(result) => {
+                let header_bytes = result
+                    .headers()
+                    .len()
+                    .saturating_mul(std::mem::size_of::<crate::ColumnSchema>())
+                    .saturating_add(
+                        result
+                            .headers()
+                            .iter()
+                            .map(|column| column.name().len())
+                            .fold(0usize, usize::saturating_add),
+                    );
+                let row_vector_bytes = result
+                    .rows()
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Vec<Value>>());
+                let value_bytes = result
+                    .rows()
+                    .iter()
+                    .map(Vec::len)
+                    .fold(0usize, usize::saturating_add)
+                    .saturating_mul(std::mem::size_of::<Value>());
+                let string_bytes = result
+                    .rows()
+                    .iter()
+                    .flatten()
+                    .filter_map(|value| match value {
+                        Value::String(value) => Some(value.len()),
+                        _ => None,
+                    })
+                    .fold(0usize, usize::saturating_add);
+
+                header_bytes
+                    .saturating_add(row_vector_bytes)
+                    .saturating_add(value_bytes)
+                    .saturating_add(string_bytes)
+            }
+        }
+    }
 }
 
 /// An in-memory database that preserves catalog state between executions.
@@ -54,6 +111,7 @@ impl Database {
         let tokens = lex(input, LexerLimits::default()).map_err(DatabaseError::Lex)?;
         let statements = split_statements(input, &tokens)?;
         let mut results = Vec::new();
+        let mut result_bytes = 0usize;
 
         for (statement_index, statement) in statements.into_iter().enumerate() {
             let first = statement
@@ -90,7 +148,12 @@ impl Database {
                                 source,
                             }
                         })?;
-                    results.push(SelectResult::Table(result));
+                    push_result(
+                        &mut results,
+                        &mut result_bytes,
+                        SelectResult::Table(result),
+                        statement_index,
+                    )?;
                 } else {
                     let result = parse_scalar_select(statement.sql).map_err(|source| {
                         DatabaseError::ScalarSelect {
@@ -98,7 +161,12 @@ impl Database {
                             source,
                         }
                     })?;
-                    results.push(SelectResult::Scalar(result));
+                    push_result(
+                        &mut results,
+                        &mut result_bytes,
+                        SelectResult::Scalar(result),
+                        statement_index,
+                    )?;
                 }
             } else {
                 return Err(DatabaseError::UnsupportedStatement {
@@ -110,6 +178,26 @@ impl Database {
 
         Ok(results)
     }
+}
+
+fn push_result(
+    results: &mut Vec<SelectResult>,
+    result_bytes: &mut usize,
+    result: SelectResult,
+    statement_index: usize,
+) -> Result<(), DatabaseError> {
+    let estimated_bytes = result_bytes.saturating_add(result.estimated_heap_bytes());
+    if estimated_bytes > MAX_SCRIPT_RESULT_BYTES {
+        return Err(DatabaseError::ScriptResultSizeLimitExceeded {
+            statement_index,
+            estimated_bytes,
+            limit: MAX_SCRIPT_RESULT_BYTES,
+        });
+    }
+
+    results.push(result);
+    *result_bytes = estimated_bytes;
+    Ok(())
 }
 
 fn is_table_select(tokens: &[Token]) -> bool {
@@ -208,6 +296,15 @@ pub enum DatabaseError {
         /// Maximum number of statements accepted per execution.
         limit: usize,
     },
+    /// Retaining all SELECT results would exceed the script memory budget.
+    ScriptResultSizeLimitExceeded {
+        /// Zero-based index of the SELECT that would exceed the budget.
+        statement_index: usize,
+        /// Estimated aggregate bytes including the rejected result.
+        estimated_bytes: usize,
+        /// Maximum estimated bytes retained per script.
+        limit: usize,
+    },
     /// A statement does not begin with one of the supported commands.
     UnsupportedStatement {
         /// Zero-based statement index within the script.
@@ -259,6 +356,15 @@ impl fmt::Display for DatabaseError {
             Self::StatementLimitExceeded { limit } => {
                 write!(formatter, "SQL script exceeds the {limit}-statement limit")
             }
+            Self::ScriptResultSizeLimitExceeded {
+                statement_index,
+                estimated_bytes,
+                limit,
+            } => write!(
+                formatter,
+                "statement {} would make aggregate SELECT results require an estimated {estimated_bytes} bytes, limit is {limit}",
+                statement_index + 1
+            ),
             Self::UnsupportedStatement {
                 statement_index,
                 position,

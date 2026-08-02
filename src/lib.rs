@@ -10,7 +10,9 @@ pub mod query;
 pub mod storage;
 
 pub use catalog::{Catalog, CatalogError, TableNotFoundError};
-pub use database::{Database, DatabaseError, MAX_SCRIPT_STATEMENTS, SelectResult};
+pub use database::{
+    Database, DatabaseError, MAX_SCRIPT_RESULT_BYTES, MAX_SCRIPT_STATEMENTS, SelectResult,
+};
 pub use ddl::{CreateTableError, CreateTableStatement, execute_create_table, parse_create_table};
 pub use dml::{
     InsertValuesError, InsertValuesStatement, execute_insert_values, parse_insert_values,
