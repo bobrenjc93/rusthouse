@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Validate Burner evaluation history and render its deterministic SVG."""
+"""Validate Burner ProgressHistory and reproduce its deterministic SVG."""
 
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
-from html import escape
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -15,11 +16,10 @@ from typing import Any
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HISTORY = REPOSITORY_ROOT / "docs" / "burner-evaluation-history.json"
-DEFAULT_OUTPUT = REPOSITORY_ROOT / "docs" / "burner-evaluation-history.svg"
-COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
-EVALUATION_PATTERN = re.compile(r"eval_[0-9a-f]{8}")
-RUN_PATTERN = re.compile(r"evalrun_[0-9a-f]{8}")
+DEFAULT_OUTPUT = REPOSITORY_ROOT / "docs" / "burner-evaluation-progress.svg"
 COLOR_PATTERN = re.compile(r"#[0-9A-Fa-f]{6}")
+TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z")
+BASELINE_KEY_PATTERN = re.compile(r"^(?:base|baseline):(.+)$")
 
 
 class HistoryError(ValueError):
@@ -35,15 +35,23 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, An
     return result
 
 
+def _reject_nonstandard_number(value: str) -> None:
+    raise HistoryError(f"non-finite JSON number {value}")
+
+
 def load_history(path: Path) -> dict[str, Any]:
-    """Load JSON while rejecting duplicate object keys."""
+    """Load and validate a Burner ProgressHistory document."""
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise HistoryError(f"cannot read {path}: {error}") from error
 
     try:
-        document = json.loads(raw, object_pairs_hook=_object_without_duplicate_keys)
+        document = json.loads(
+            raw,
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=_reject_nonstandard_number,
+        )
     except json.JSONDecodeError as error:
         raise HistoryError(
             f"invalid JSON in {path} at line {error.lineno}, column {error.colno}: "
@@ -70,6 +78,20 @@ def _require_exact_keys(
         raise HistoryError(f"{context} has {'; '.join(problems)}")
 
 
+def _require_point_keys(value: dict[str, Any], context: str) -> None:
+    required = {"key", "recordedAt", "label", "kind", "title", "scores"}
+    allowed = required | {"commit", "prNumber"}
+    missing = sorted(required - set(value))
+    unknown = sorted(set(value) - allowed)
+    problems = []
+    if missing:
+        problems.append(f"missing {', '.join(missing)}")
+    if unknown:
+        problems.append(f"unknown {', '.join(unknown)}")
+    if problems:
+        raise HistoryError(f"{context} has {'; '.join(problems)}")
+
+
 def _require_string(value: Any, context: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise HistoryError(f"{context} must be a non-empty string")
@@ -84,360 +106,243 @@ def _require_mapping(value: Any, context: str) -> dict[str, Any]:
 
 def _parse_timestamp(value: Any, context: str) -> datetime:
     timestamp = _require_string(value, context)
+    if not TIMESTAMP_PATTERN.fullmatch(timestamp):
+        raise HistoryError(f"{context} must use UTC format YYYY-MM-DDTHH:MM:SS[.sss]Z")
     try:
-        parsed = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError as error:
-        raise HistoryError(
-            f"{context} must use UTC format YYYY-MM-DDTHH:MM:SSZ"
-        ) from error
-    return parsed
+        raise HistoryError(f"{context} is not a valid timestamp") from error
 
 
-def _validate_evaluations(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not value:
-        raise HistoryError("evaluations must be a non-empty array")
-
-    evaluations: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    seen_names: set[str] = set()
-    for index, raw_evaluation in enumerate(value):
-        context = f"evaluations[{index}]"
+def _validate_evaluations(value: Any) -> dict[str, dict[str, str]]:
+    evaluations = _require_mapping(value, "evaluations")
+    for evaluation_id, raw_evaluation in evaluations.items():
+        context = f"evaluations.{evaluation_id}"
+        _require_string(evaluation_id, "evaluation id")
         evaluation = _require_mapping(raw_evaluation, context)
-        _require_exact_keys(evaluation, {"id", "name", "color", "enabled"}, context)
-        evaluation_id = _require_string(evaluation["id"], f"{context}.id")
-        name = _require_string(evaluation["name"], f"{context}.name")
+        _require_exact_keys(evaluation, {"name", "color"}, context)
+        _require_string(evaluation["name"], f"{context}.name")
         color = _require_string(evaluation["color"], f"{context}.color")
-        if not EVALUATION_PATTERN.fullmatch(evaluation_id):
-            raise HistoryError(f"{context}.id must match eval_<8 lowercase hex digits>")
         if not COLOR_PATTERN.fullmatch(color):
             raise HistoryError(f"{context}.color must be a six-digit hexadecimal color")
-        if not isinstance(evaluation["enabled"], bool):
-            raise HistoryError(f"{context}.enabled must be a boolean")
-        if evaluation_id in seen_ids:
-            raise HistoryError(f"duplicate evaluation id {evaluation_id}")
-        if name in seen_names:
-            raise HistoryError(f"duplicate evaluation name {name!r}")
-        seen_ids.add(evaluation_id)
-        seen_names.add(name)
-        evaluations.append(evaluation)
     return evaluations
 
 
-def _validate_complete_map(
-    value: Any, evaluation_ids: set[str], context: str
-) -> dict[str, Any]:
-    mapping = _require_mapping(value, context)
-    _require_exact_keys(mapping, evaluation_ids, context)
-    return mapping
+def _baseline_identity(point: dict[str, Any]) -> str | None:
+    if point["kind"] != "baseline":
+        return None
+    commit = point.get("commit")
+    if isinstance(commit, str) and commit.strip():
+        return commit.strip()
+    match = BASELINE_KEY_PATTERN.fullmatch(point["key"])
+    return match.group(1) if match else None
 
 
 def validate_history(history: dict[str, Any]) -> None:
-    """Reject malformed history before it can become a graph."""
-    _require_exact_keys(
-        history, {"version", "automation", "evaluations", "points"}, "history"
-    )
+    """Validate Burner fields while preserving valid lifecycle sparsity."""
+    _require_exact_keys(history, {"version", "evaluations", "points"}, "history")
     if type(history["version"]) is not int or history["version"] != 1:
         raise HistoryError("history.version must be integer 1")
-    _require_string(history["automation"], "history.automation")
 
     evaluations = _validate_evaluations(history["evaluations"])
-    evaluation_ids = {evaluation["id"] for evaluation in evaluations}
+    evaluation_ids = set(evaluations)
     points = history["points"]
-    if not isinstance(points, list) or not points:
-        raise HistoryError("points must be a non-empty array")
+    if not isinstance(points, list):
+        raise HistoryError("points must be an array")
 
-    seen_commits: set[str] = set()
+    seen_keys: set[str] = set()
     seen_pull_requests: set[int] = set()
-    seen_runs: set[str] = set()
+    seen_baselines: set[str] = set()
     previous_timestamp: datetime | None = None
-    baseline_count = 0
 
     for index, raw_point in enumerate(points):
         context = f"points[{index}]"
         point = _require_mapping(raw_point, context)
-        kind = point.get("kind")
-        expected_keys = {
-            "kind",
-            "label",
-            "evaluated_at",
-            "commit",
-            "scores",
-            "evaluation_runs",
-        }
-        if kind == "merge":
-            expected_keys.add("pull_request")
-        elif kind != "baseline":
-            raise HistoryError(f"{context}.kind must be 'baseline' or 'merge'")
-        _require_exact_keys(point, expected_keys, context)
+        _require_point_keys(point, context)
 
-        if kind == "baseline":
-            baseline_count += 1
-            if index != 0:
-                raise HistoryError("the baseline must be the first point")
-        else:
-            pull_request = point["pull_request"]
+        key = _require_string(point["key"], f"{context}.key")
+        if key in seen_keys:
+            raise HistoryError(f"duplicate point key {key!r}")
+        seen_keys.add(key)
+
+        kind = point["kind"]
+        if kind not in {"baseline", "leaf", "composite"}:
+            raise HistoryError(
+                f"{context}.kind must be 'baseline', 'leaf', or 'composite'"
+            )
+        _require_string(point["label"], f"{context}.label")
+        _require_string(point["title"], f"{context}.title")
+
+        timestamp = _parse_timestamp(point["recordedAt"], f"{context}.recordedAt")
+        if previous_timestamp is not None and timestamp < previous_timestamp:
+            raise HistoryError("points must be ordered by nondecreasing recordedAt")
+        previous_timestamp = timestamp
+
+        if "commit" in point:
+            commit = _require_string(point["commit"], f"{context}.commit")
+            if commit != commit.strip():
+                raise HistoryError(
+                    f"{context}.commit must not contain surrounding space"
+                )
+        if "prNumber" in point:
+            pull_request = point["prNumber"]
             if type(pull_request) is not int or pull_request <= 0:
-                raise HistoryError(f"{context}.pull_request must be a positive integer")
+                raise HistoryError(f"{context}.prNumber must be a positive integer")
             if pull_request in seen_pull_requests:
                 raise HistoryError(f"duplicate pull request #{pull_request}")
             seen_pull_requests.add(pull_request)
 
-        _require_string(point["label"], f"{context}.label")
-        timestamp = _parse_timestamp(point["evaluated_at"], f"{context}.evaluated_at")
-        if previous_timestamp is not None and timestamp <= previous_timestamp:
+        baseline_identity = _baseline_identity(point)
+        if kind == "baseline" and baseline_identity is None:
             raise HistoryError(
-                "points must have strictly increasing evaluated_at values"
+                f"{context} baseline must identify its base with commit or key"
             )
-        previous_timestamp = timestamp
+        if baseline_identity is not None:
+            if baseline_identity in seen_baselines:
+                raise HistoryError(f"duplicate baseline {baseline_identity!r}")
+            seen_baselines.add(baseline_identity)
 
-        commit = _require_string(point["commit"], f"{context}.commit")
-        if not COMMIT_PATTERN.fullmatch(commit):
+        scores = _require_mapping(point["scores"], f"{context}.scores")
+        if not scores:
+            raise HistoryError(f"{context}.scores must not be empty")
+        unknown_evaluations = sorted(set(scores) - evaluation_ids)
+        if unknown_evaluations:
             raise HistoryError(
-                f"{context}.commit must be 40 lowercase hexadecimal digits"
+                f"{context}.scores has unknown {', '.join(unknown_evaluations)}"
             )
-        if commit in seen_commits:
-            raise HistoryError(f"duplicate commit {commit}")
-        seen_commits.add(commit)
-
-        scores = _validate_complete_map(
-            point["scores"], evaluation_ids, f"{context}.scores"
-        )
-        runs = _validate_complete_map(
-            point["evaluation_runs"], evaluation_ids, f"{context}.evaluation_runs"
-        )
-        for evaluation_id in evaluation_ids:
-            score = scores[evaluation_id]
-            if type(score) is not int or not 0 <= score <= 100:
+        for evaluation_id, score in scores.items():
+            if type(score) not in {int, float} or not math.isfinite(score):
                 raise HistoryError(
-                    f"{context}.scores.{evaluation_id} must be an integer from 0 to 100"
+                    f"{context}.scores.{evaluation_id} must be a finite number"
                 )
-            run_id = _require_string(
-                runs[evaluation_id], f"{context}.evaluation_runs.{evaluation_id}"
-            )
-            if not RUN_PATTERN.fullmatch(run_id):
+            if not 0 <= score <= 100:
                 raise HistoryError(
-                    f"{context}.evaluation_runs.{evaluation_id} must match "
-                    "evalrun_<8 lowercase hex digits>"
+                    f"{context}.scores.{evaluation_id} must be from 0 to 100"
                 )
-            if run_id in seen_runs:
-                raise HistoryError(
-                    f"evaluation run {run_id} is reused by multiple points"
-                )
-            seen_runs.add(run_id)
-
-    if baseline_count != 1:
-        raise HistoryError("history must contain exactly one baseline point")
 
 
-def _number(value: float) -> str:
-    return f"{value:.2f}".rstrip("0").rstrip(".")
+def _escape_xml(value: str) -> str:
+    replacements = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&apos;",
+    }
+    return "".join(replacements.get(character, character) for character in value)
+
+
+def _js_number(value: float | int) -> str:
+    if isinstance(value, int) or value.is_integer():
+        return str(int(value))
+    return repr(value)
+
+
+def _js_to_fixed_1(value: float) -> str:
+    rounded = Decimal.from_float(value).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return f"{rounded:.1f}"
 
 
 def render_svg(history: dict[str, Any]) -> str:
-    """Render validated history to stable, dependency-free SVG markup."""
+    """Render the same SVG shape written by Burner's progress updater."""
     validate_history(history)
     evaluations = history["evaluations"]
     points = history["points"]
+    width = 1200
+    legend_rows = max(1, math.ceil(len(evaluations) / 2))
+    height = 420 + legend_rows * 28
+    left = 70
+    right = 32
+    top = 54
+    bottom = 90 + legend_rows * 28
+    plot_width = width - left - right
+    plot_height = height - top - bottom
 
-    width = 1120
-    height = 640
-    plot_left = 82.0
-    plot_right = 700.0
-    plot_top = 82.0
-    plot_bottom = 522.0
-    legend_left = 738.0
+    def x(index: int) -> float:
+        if len(points) <= 1:
+            return left + plot_width / 2
+        return left + (index / (len(points) - 1)) * plot_width
 
-    if len(points) == 1:
-        x_positions = [(plot_left + plot_right) / 2]
+    def y(score: float) -> float:
+        clamped = max(0, min(100, score))
+        return top + (1 - clamped / 100) * plot_height
+
+    grid = "".join(
+        f'<line x1="{left}" y1="{_js_number(y(score))}" '
+        f'x2="{width - right}" y2="{_js_number(y(score))}" class="grid"/>'
+        f'<text x="{left - 12}" y="{_js_number(y(score) + 5)}" '
+        f'text-anchor="end" class="axis">{score}</text>'
+        for score in (0, 25, 50, 75, 100)
+    )
+    if len(points) <= 8:
+        label_indexes = list(range(len(points)))
     else:
-        step = (plot_right - plot_left) / (len(points) - 1)
-        x_positions = [plot_left + step * index for index in range(len(points))]
-
-    def score_y(score: int) -> float:
-        return plot_bottom - (score / 100) * (plot_bottom - plot_top)
-
-    latest_scores = points[-1]["scores"]
-    description = "; ".join(
-        f"{evaluation['name']}: {latest_scores[evaluation['id']]}"
-        for evaluation in evaluations
-    )
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
-            'aria-labelledby="burner-history-title burner-history-description">'
-        ),
-        '  <title id="burner-history-title">Burner evaluation progress</title>',
-        (
-            '  <desc id="burner-history-description">'
-            f"{len(points)} chronological evaluation point(s), scored from 0 to 100. "
-            f"Latest scores: {escape(description)}.</desc>"
-        ),
-        '  <rect width="1120" height="640" fill="#FFFFFF"/>',
-        (
-            '  <text x="82" y="34" fill="#17202A" font-family="system-ui, sans-serif" '
-            'font-size="22" font-weight="700">Burner evaluation progress</text>'
-        ),
-        (
-            '  <text x="82" y="58" fill="#4D5966" font-family="system-ui, sans-serif" '
-            f'font-size="13">{len(points)} chronological point(s) | fixed score range 0-100</text>'
-        ),
-        '  <g aria-label="Score grid">',
-    ]
-
-    for score in range(0, 101, 20):
-        y = score_y(score)
-        lines.extend(
-            [
-                (
-                    f'    <line x1="{_number(plot_left)}" y1="{_number(y)}" '
-                    f'x2="{_number(plot_right)}" y2="{_number(y)}" '
-                    'stroke="#D9DEE3" stroke-width="1"/>'
-                ),
-                (
-                    f'    <text x="68" y="{_number(y + 4)}" text-anchor="end" '
-                    'fill="#4D5966" font-family="system-ui, sans-serif" '
-                    f'font-size="12">{score}</text>'
-                ),
-            ]
-        )
-    lines.extend(
-        [
-            "  </g>",
-            (
-                '  <text x="20" y="302" transform="rotate(-90 20 302)" '
-                'text-anchor="middle" fill="#303942" font-family="system-ui, sans-serif" '
-                'font-size="13" font-weight="600">Score (0-100)</text>'
-            ),
-            (
-                f'  <line x1="{_number(plot_left)}" y1="{_number(plot_top)}" '
-                f'x2="{_number(plot_left)}" y2="{_number(plot_bottom)}" '
-                'stroke="#69737D" stroke-width="1.5"/>'
-            ),
-            (
-                f'  <line x1="{_number(plot_left)}" y1="{_number(plot_bottom)}" '
-                f'x2="{_number(plot_right)}" y2="{_number(plot_bottom)}" '
-                'stroke="#69737D" stroke-width="1.5"/>'
-            ),
-        ]
+        label_indexes = []
+        for index in range(8):
+            candidate = math.floor(index * (len(points) - 1) / 7 + 0.5)
+            if candidate not in label_indexes:
+                label_indexes.append(candidate)
+    x_labels = "".join(
+        f'<text x="{_js_number(x(index))}" y="{top + plot_height + 28}" '
+        f'text-anchor="middle" class="axis">'
+        f'{_escape_xml(points[index]["label"])}</text>'
+        for index in label_indexes
     )
 
-    for evaluation in evaluations:
-        evaluation_id = evaluation["id"]
+    lines = []
+    for evaluation_id, evaluation in evaluations.items():
         coordinates = [
-            f"{_number(x_positions[index])},{_number(score_y(point['scores'][evaluation_id]))}"
+            f"{_js_to_fixed_1(x(index))},"
+            f"{_js_to_fixed_1(y(point['scores'][evaluation_id]))}"
             for index, point in enumerate(points)
+            if evaluation_id in point["scores"]
         ]
-        lines.append(
-            f'  <g role="group" aria-label="{escape(evaluation["name"])} score series">'
-        )
-        lines.append(f'    <title>{escape(evaluation["name"])}</title>')
-        if len(coordinates) > 1:
-            lines.append(
-                f'    <polyline points="{" ".join(coordinates)}" fill="none" '
-                f'stroke="{evaluation["color"]}" stroke-width="2.5" '
-                'stroke-linejoin="round" stroke-linecap="round"/>'
+        if not coordinates:
+            continue
+        dots = ""
+        if len(points) <= 60:
+            dots = "".join(
+                f'<circle cx="{coordinate.split(",")[0]}" '
+                f'cy="{coordinate.split(",")[1]}" r="3.5" '
+                f'fill="{evaluation["color"]}"/>'
+                for coordinate in coordinates
             )
-        lines.append("  </g>")
-
-    for point_index, point in enumerate(points):
-        coordinate_groups: dict[int, list[dict[str, Any]]] = {}
-        for evaluation in evaluations:
-            score = point["scores"][evaluation["id"]]
-            coordinate_groups.setdefault(score, []).append(evaluation)
-        for score, coincident_evaluations in coordinate_groups.items():
-            count = len(coincident_evaluations)
-            for series_index, evaluation in enumerate(coincident_evaluations):
-                radius = 4.5 + 2 * (count - series_index - 1)
-                lines.append(
-                    f'  <circle cx="{_number(x_positions[point_index])}" '
-                    f'cy="{_number(score_y(score))}" r="{_number(radius)}" '
-                    f'fill="{evaluation["color"]}" stroke="#FFFFFF" stroke-width="1">'
-                    f'<title>{escape(evaluation["name"])}: {score} at '
-                    f'{escape(point["label"])}</title></circle>'
-                )
-
-    label_interval = max(1, (len(points) + 7) // 8)
-    shown_labels = set(range(0, len(points), label_interval)) | {len(points) - 1}
-    for index in sorted(shown_labels):
-        label = points[index]["label"]
-        lines.extend(
-            [
-                (
-                    f'  <line x1="{_number(x_positions[index])}" y1="{_number(plot_bottom)}" '
-                    f'x2="{_number(x_positions[index])}" y2="{_number(plot_bottom + 6)}" '
-                    'stroke="#69737D" stroke-width="1"/>'
-                ),
-                (
-                    f'  <text x="{_number(x_positions[index])}" y="{_number(plot_bottom + 23)}" '
-                    'text-anchor="middle" fill="#303942" font-family="system-ui, sans-serif" '
-                    f'font-size="11">{escape(label)}</text>'
-                ),
-            ]
+        lines.append(
+            f'<polyline points="{" ".join(coordinates)}" fill="none" '
+            f'stroke="{evaluation["color"]}" stroke-width="3" '
+            f'stroke-linejoin="round" stroke-linecap="round"/>{dots}'
         )
 
-    lines.extend(
-        [
-            (
-                '  <text x="391" y="582" text-anchor="middle" fill="#303942" '
-                'font-family="system-ui, sans-serif" font-size="13" '
-                'font-weight="600">Burner baseline and merged pull requests</text>'
-            ),
-            (
-                f'  <line x1="{_number(legend_left - 18)}" y1="82" '
-                f'x2="{_number(legend_left - 18)}" y2="522" '
-                'stroke="#D9DEE3" stroke-width="1"/>'
-            ),
-            (
-                f'  <text x="{_number(legend_left)}" y="102" fill="#17202A" '
-                'font-family="system-ui, sans-serif" font-size="14" '
-                'font-weight="700">Evaluations</text>'
-            ),
-            (
-                '  <text x="1080" y="102" text-anchor="end" fill="#4D5966" '
-                'font-family="system-ui, sans-serif" font-size="12">Latest</text>'
-            ),
-        ]
-    )
-    for index, evaluation in enumerate(evaluations):
-        y = 136 + index * 59
-        lines.extend(
-            [
-                (
-                    f'  <line x1="{_number(legend_left)}" y1="{y}" '
-                    f'x2="{_number(legend_left + 24)}" y2="{y}" '
-                    f'stroke="{evaluation["color"]}" stroke-width="3" '
-                    'stroke-linecap="round"/>'
-                ),
-                (
-                    f'  <circle cx="{_number(legend_left + 12)}" cy="{y}" r="4" '
-                    f'fill="{evaluation["color"]}" stroke="#FFFFFF" stroke-width="1"/>'
-                ),
-                (
-                    f'  <text x="{_number(legend_left + 34)}" y="{y + 4}" '
-                    'fill="#303942" font-family="system-ui, sans-serif" '
-                    f'font-size="12">{escape(evaluation["name"])}</text>'
-                ),
-                (
-                    f'  <text x="1080" y="{y + 4}" text-anchor="end" fill="#17202A" '
-                    'font-family="system-ui, sans-serif" font-size="12" '
-                    f'font-weight="700">{latest_scores[evaluation["id"]]}</text>'
-                ),
-            ]
+    legend = []
+    for index, evaluation in enumerate(evaluations.values()):
+        column = index % 2
+        row = index // 2
+        legend_x = left + column * (plot_width / 2)
+        legend_y = top + plot_height + 66 + row * 28
+        legend.append(
+            f'<line x1="{_js_number(legend_x)}" y1="{legend_y}" '
+            f'x2="{_js_number(legend_x + 26)}" y2="{legend_y}" '
+            f'stroke="{evaluation["color"]}" stroke-width="4"/>'
+            f'<text x="{_js_number(legend_x + 36)}" y="{legend_y + 5}" '
+            f'class="legend">{_escape_xml(evaluation["name"])}</text>'
         )
-    lines.extend(
-        [
-            (
-                '  <text x="738" y="514" fill="#4D5966" '
-                'font-family="system-ui, sans-serif" font-size="11">'
-                f'Latest: {escape(points[-1]["label"])}</text>'
-            ),
-            "</svg>",
-            "",
-        ]
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img" aria-labelledby="title desc">\n'
+        '<title id="title">Burner evaluation progress</title><desc id="desc">'
+        "Time series of evaluation scores recorded at each Burner merge.</desc>\n"
+        "<style>text{font-family:ui-sans-serif,system-ui,-apple-system,"
+        'BlinkMacSystemFont,"Segoe UI",sans-serif}.title{font-size:22px;font-weight:700;'
+        "fill:#20242a}.axis{font-size:12px;fill:#59636e}.legend{font-size:13px;"
+        "fill:#2f3740}.grid{stroke:#d8dee5;stroke-width:1}.plot{fill:#fff;"
+        "stroke:#b7c0ca}</style>\n"
+        f'<rect width="100%" height="100%" fill="#f8fafc" rx="14"/><text x="{left}" '
+        'y="32" class="title">Burner evaluation progress</text>\n'
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" '
+        f'class="plot"/>{grid}{"".join(lines)}{x_labels}{"".join(legend)}\n'
+        "</svg>\n"
     )
-    return "\n".join(lines)
 
 
 def _arguments() -> argparse.Namespace:
@@ -461,7 +366,7 @@ def main() -> int:
         if arguments.check:
             try:
                 existing = arguments.output.read_text(encoding="utf-8")
-            except OSError as error:
+            except (OSError, UnicodeError) as error:
                 raise HistoryError(
                     f"cannot read {arguments.output}: {error}"
                 ) from error

@@ -33,9 +33,7 @@ The repository begins as a deliberately tiny seed. Substantial functionality sho
 <!-- burner-progress:start -->
 ## Burner evaluation progress
 
-![Burner evaluation scores over time on a fixed 0 to 100 scale](docs/burner-evaluation-history.svg)
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
 
-[Raw versioned evaluation history](docs/burner-evaluation-history.json)
-
-Burner automatically appends one complete point after each Burner-managed pull request merges, keyed by both PR number and merge commit, and regenerates this graph from the raw history. Merge retries cannot create a second point: validation fails on duplicate PRs or commits, missing evaluation scores, malformed values, or scores outside 0-100. Run `python3 scripts/render_burner_evaluation_history.py --check` to verify the committed graph.
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
 <!-- burner-progress:end -->

@@ -1,50 +1,39 @@
 {
   "version": 1,
-  "automation": "Burner owns this history. After each Burner-managed pull request merges, the merge workflow appends exactly one merge point containing the PR number, merge commit, accepted evaluation-run IDs, and every registered score, then regenerates the SVG. Validation rejects incomplete, malformed, out-of-range, nonchronological, or duplicate points, so a retried merge update cannot record the same PR twice.",
-  "evaluations": [
-    {
-      "id": "eval_3bb67d82",
+  "evaluations": {
+    "eval_3bb67d82": {
       "name": "Analytical database capability",
-      "color": "#0072B2",
-      "enabled": true
+      "color": "#ff6b35"
     },
-    {
-      "id": "eval_c93f863f",
+    "eval_c93f863f": {
       "name": "Rust engineering quality",
-      "color": "#D55E00",
-      "enabled": true
+      "color": "#7c5cff"
     },
-    {
-      "id": "eval_d7467264",
+    "eval_d7467264": {
       "name": "ClickHouse sustained parity",
-      "color": "#009E73",
-      "enabled": true
+      "color": "#00a7a5"
     },
-    {
-      "id": "eval_7180f312",
+    "eval_7180f312": {
       "name": "Benchmark integrity and anti-gaming",
-      "color": "#E69F00",
-      "enabled": true
+      "color": "#e6a700"
     },
-    {
-      "id": "eval_3de1596c",
+    "eval_3de1596c": {
       "name": "ClickHouse feature comprehensiveness",
-      "color": "#CC79A7",
-      "enabled": true
+      "color": "#d94f8a"
     },
-    {
-      "id": "eval_b9911e8e",
+    "eval_b9911e8e": {
       "name": "Evaluation progress accounting",
-      "color": "#56B4E9",
-      "enabled": true
+      "color": "#2589bd"
     }
-  ],
+  },
   "points": [
     {
-      "kind": "baseline",
-      "label": "0eb0644 baseline",
-      "evaluated_at": "2026-08-02T02:13:21Z",
+      "key": "base:0eb064497f06d13af2229dba0405aa7c659b4e5d",
       "commit": "0eb064497f06d13af2229dba0405aa7c659b4e5d",
+      "recordedAt": "2026-08-02T02:13:21.076Z",
+      "label": "base 0eb0644",
+      "kind": "baseline",
+      "title": "main",
       "scores": {
         "eval_3bb67d82": 0,
         "eval_c93f863f": 25,
@@ -52,14 +41,6 @@
         "eval_7180f312": 85,
         "eval_3de1596c": 0,
         "eval_b9911e8e": 0
-      },
-      "evaluation_runs": {
-        "eval_3bb67d82": "evalrun_60bc83b6",
-        "eval_c93f863f": "evalrun_8c0f574b",
-        "eval_d7467264": "evalrun_a83abd97",
-        "eval_7180f312": "evalrun_017d9ebf",
-        "eval_3de1596c": "evalrun_24b168cd",
-        "eval_b9911e8e": "evalrun_ecb22e59"
       }
     }
   ]
