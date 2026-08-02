@@ -54,6 +54,43 @@ fn create_table_produces_no_csv_result() {
 }
 
 #[test]
+fn comparisons_execute_alongside_catalog_changes() {
+    let mut database = Database::new();
+
+    let results = database
+        .execute(
+            "SELECT 2 = 2 AS equal;\n\
+             CREATE TABLE events (id Int64);\n\
+             SELECT NULL <> 'event' AS unknown;",
+        )
+        .unwrap();
+
+    assert_eq!(results[0].value, ScalarValue::Boolean(true));
+    assert_eq!(results[1].value, ScalarValue::Null);
+    assert!(database.table("events").is_some());
+}
+
+#[test]
+fn comparison_errors_roll_back_earlier_catalog_changes() {
+    let mut database = database_with_seed();
+    let before = database.clone();
+    let sql = "CREATE TABLE fresh (id Int64); SELECT 1 = '1';";
+
+    let error = database.execute(sql).unwrap_err();
+
+    assert_eq!(error.byte_offset(), sql.find('=').unwrap());
+    assert_eq!(error.column(), sql.find('=').unwrap() + 1);
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::Syntax {
+            message: "operator '=' cannot compare Integer and String".into(),
+        }
+    );
+    assert_eq!(database, before);
+    assert!(database.table("fresh").is_none());
+}
+
+#[test]
 fn duplicate_field_is_typed_positioned_and_preserves_catalog() {
     let mut database = database_with_seed();
     let before = database.clone();
