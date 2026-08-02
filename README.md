@@ -22,9 +22,11 @@ The early implementation should favor Rust's standard library and a small depend
 ## Current SQL surface
 
 The CLI and `Database` API execute batches containing scalar `SELECT`,
-`CREATE TABLE name (field type, ...)`, and schema-ordered
-`INSERT INTO name VALUES (...), (...)` statements. Scalar expressions support
-literals and same-type `=` or `<>` comparisons, with SQL NULL propagation.
+`SELECT COUNT(*) [AS alias] FROM table`, `CREATE TABLE name (field type, ...)`,
+and schema-ordered `INSERT INTO name VALUES (...), (...)` statements. Scalar
+expressions support literals and same-type `=` or `<>` comparisons, with SQL
+NULL propagation. `COUNT(*)` returns the row count of a stored table, including
+rows inserted earlier in the same batch.
 Table fields support `Int64`, `Float64`, `Bool`, and `String`; they are currently
 non-nullable. DDL and inserts produce no CSV output, and a failing statement
 rolls back the complete SQL batch.
