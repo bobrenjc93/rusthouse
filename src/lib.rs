@@ -1,12 +1,14 @@
 //! RustHouse is an experimental, compact analytical database.
 
 pub mod catalog;
+pub mod ddl;
 pub mod formats;
 pub mod lexer;
 pub mod query;
 pub mod storage;
 
-pub use catalog::{Catalog, CreateTableError, TableNotFoundError};
+pub use catalog::{Catalog, CatalogError, TableNotFoundError};
+pub use ddl::{CreateTableError, CreateTableStatement, execute_create_table, parse_create_table};
 pub use formats::{CsvWithNamesError, CsvWithNamesWriter};
 pub use query::{
     ColumnNotFoundError, MAX_TABLE_SELECT_RESULT_BYTES, ScalarSelect, ScalarSelectError,

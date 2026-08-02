@@ -31,10 +31,10 @@ impl Catalog {
         &mut self,
         name: impl Into<String>,
         schema: Schema,
-    ) -> Result<(), CreateTableError> {
+    ) -> Result<(), CatalogError> {
         let name = name.into();
         if name.is_empty() {
-            return Err(CreateTableError::EmptyName);
+            return Err(CatalogError::EmptyTableName);
         }
 
         match self.tables.entry(name) {
@@ -42,7 +42,7 @@ impl Catalog {
                 entry.insert(Table::new(schema));
                 Ok(())
             }
-            Entry::Occupied(entry) => Err(CreateTableError::DuplicateName {
+            Entry::Occupied(entry) => Err(CatalogError::DuplicateTable {
                 name: entry.key().clone(),
             }),
         }
@@ -62,6 +62,12 @@ impl Catalog {
             .ok_or_else(|| TableNotFoundError::new(name))
     }
 
+    /// Returns whether a table with this exact name exists.
+    #[must_use]
+    pub fn contains_table(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+    }
+
     /// Returns the number of tables in the catalog.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -75,28 +81,28 @@ impl Catalog {
     }
 }
 
-/// An error returned when a table cannot be created.
+/// An error returned while changing a [`Catalog`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreateTableError {
+pub enum CatalogError {
     /// A table name must not be empty.
-    EmptyName,
+    EmptyTableName,
     /// A table with the exact name already exists.
-    DuplicateName {
+    DuplicateTable {
         /// The name already owned by the catalog.
         name: String,
     },
 }
 
-impl fmt::Display for CreateTableError {
+impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyName => formatter.write_str("a table name must not be empty"),
-            Self::DuplicateName { name } => write!(formatter, "table `{name}` already exists"),
+            Self::EmptyTableName => formatter.write_str("a table name must not be empty"),
+            Self::DuplicateTable { name } => write!(formatter, "table `{name}` already exists"),
         }
     }
 }
 
-impl Error for CreateTableError {}
+impl Error for CatalogError {}
 
 /// An error returned when an exact table name is not in the catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
