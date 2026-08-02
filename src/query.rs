@@ -126,10 +126,10 @@ impl From<LexError> for ScalarSelectError {
     }
 }
 
-/// The materialized result of a table projection.
+/// The materialized result of a table query.
 ///
-/// Headers follow projection order and retain each catalog column's logical
-/// type. Rows follow insertion order and contain values in header order.
+/// Projection headers retain each catalog column's logical type and rows
+/// follow insertion order. Aggregate results describe their own typed schema.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableSelectResult {
     headers: Vec<ColumnSchema>,
@@ -226,6 +226,11 @@ pub enum TableSelectError {
         /// The logical type inferred from the predicate literal.
         actual: DataType,
     },
+    /// The table row count cannot be represented by the aggregate's `Int64` type.
+    CountOutOfRange {
+        /// The metadata row count that could not be converted.
+        count: usize,
+    },
     /// Materializing the complete result would exceed the memory budget.
     ResultSizeLimitExceeded {
         /// Estimated bytes known to be required when the limit was exceeded.
@@ -271,6 +276,12 @@ impl fmt::Display for TableSelectError {
                 formatter,
                 "predicate column `{column_name}` has type {expected}, but the literal has type {actual}"
             ),
+            Self::CountOutOfRange { count } => {
+                write!(
+                    formatter,
+                    "table row count {count} is outside the Int64 range"
+                )
+            }
             Self::ResultSizeLimitExceeded {
                 estimated_bytes,
                 limit,
@@ -305,19 +316,24 @@ impl From<TableNotFoundError> for TableSelectError {
     }
 }
 
-/// Executes `SELECT column [, column ...] FROM table [WHERE column = literal]`.
+/// Executes a supported table `SELECT` against a catalog.
 ///
-/// One optional trailing semicolon is accepted. Names are resolved exactly
-/// and case-sensitively, matching the catalog and schema storage boundaries.
-/// Projection and predicate columns are resolved independently before any
-/// result rows are materialized. Predicate literals require an exact logical
-/// type match; numeric coercions are not performed.
+/// Supported shapes are `SELECT column [, column ...] FROM table` and exactly
+/// `SELECT COUNT(*) [AS identifier] FROM table`. Column projections allow one
+/// optional `WHERE column = literal` predicate with an exact logical type
+/// match; numeric coercions are not performed. One optional trailing semicolon
+/// is accepted. Names are resolved exactly and case-sensitively. A count reads
+/// only the table's row-count metadata and validates that it fits `Int64`.
 pub fn execute_table_select(
     catalog: &Catalog,
     input: &str,
 ) -> Result<TableSelectResult, TableSelectError> {
     let projection = parse_table_select(input)?;
     let table = catalog.table(&projection.table_name)?;
+    let column_names = match projection.selection {
+        TableSelection::Columns(column_names) => column_names,
+        TableSelection::Count { column_name } => return count_result(table, column_name),
+    };
     let column_indices: HashMap<&str, usize> = table
         .schema()
         .columns()
@@ -326,8 +342,8 @@ pub fn execute_table_select(
         .map(|(index, column)| (column.name(), index))
         .collect();
 
-    let mut columns = Vec::with_capacity(projection.column_names.len());
-    for column_name in &projection.column_names {
+    let mut columns = Vec::with_capacity(column_names.len());
+    for column_name in &column_names {
         let Some(column_index) = column_indices.get(column_name.as_str()).copied() else {
             return Err(TableSelectError::ColumnNotFound(ColumnNotFoundError {
                 table_name: projection.table_name.clone(),
@@ -399,6 +415,21 @@ pub fn execute_table_select(
     }
 
     Ok(TableSelectResult { headers, rows })
+}
+
+fn count_result(table: &Table, column_name: String) -> Result<TableSelectResult, TableSelectError> {
+    let count = int64_count(table.row_count())?;
+    Ok(TableSelectResult {
+        headers: vec![ColumnSchema::new(
+            column_name,
+            crate::storage::DataType::Int64,
+        )],
+        rows: vec![vec![Value::Int64(count)]],
+    })
+}
+
+fn int64_count(count: usize) -> Result<i64, TableSelectError> {
+    i64::try_from(count).map_err(|_| TableSelectError::CountOutOfRange { count })
 }
 
 struct ResolvedColumn<'a> {
@@ -513,7 +544,7 @@ fn add_result_bytes(
 }
 
 struct TableProjection {
-    column_names: Vec<String>,
+    selection: TableSelection,
     table_name: String,
     predicate: Option<EqualityPredicate>,
 }
@@ -523,29 +554,50 @@ struct EqualityPredicate {
     value: Value,
 }
 
+enum TableSelection {
+    Columns(Vec<String>),
+    Count { column_name: String },
+}
+
 fn parse_table_select(input: &str) -> Result<TableProjection, TableSelectError> {
     let tokens = lex(input, LexerLimits::default())?;
     let mut cursor = TableSelectCursor::new(input, &tokens);
 
     cursor.expect_keyword("SELECT", "SELECT")?;
-    let mut column_names = vec![cursor.take_identifier("a column name")?];
-    while cursor.take_comma() {
-        column_names.push(cursor.take_identifier("a column name after `,`")?);
-    }
+    let selection = if cursor.peek_is_count_call() {
+        let expression_start = cursor.position();
+        cursor.expect_keyword("COUNT", "COUNT")?;
+        cursor.expect_delimiter(Delimiter::LeftParenthesis, "`(` after COUNT")?;
+        cursor.expect_operator(Operator::Multiply, "`*` in COUNT(*)")?;
+        let expression_end =
+            cursor.expect_delimiter(Delimiter::RightParenthesis, "`)` after COUNT(*)")?;
+        let mut column_name = input[expression_start..expression_end].to_owned();
+        if cursor.take_keyword("AS") {
+            column_name = cursor.take_identifier("an identifier after AS")?;
+        }
+        TableSelection::Count { column_name }
+    } else {
+        let mut column_names = vec![cursor.take_identifier("a column name")?];
+        while cursor.take_comma() {
+            column_names.push(cursor.take_identifier("a column name after `,`")?);
+        }
+        TableSelection::Columns(column_names)
+    };
     cursor.expect_keyword("FROM", "`,` or FROM")?;
     let table_name = cursor.take_identifier("a table name after FROM")?;
-    let predicate = if cursor.take_keyword("WHERE") {
-        let column_name = cursor.take_identifier("a column name after WHERE")?;
-        cursor.expect_operator(Operator::Equal, "`=` after the predicate column")?;
-        let value = cursor.take_predicate_value()?;
-        Some(EqualityPredicate { column_name, value })
-    } else {
-        None
-    };
+    let predicate =
+        if matches!(&selection, TableSelection::Columns(_)) && cursor.take_keyword("WHERE") {
+            let column_name = cursor.take_identifier("a column name after WHERE")?;
+            cursor.expect_operator(Operator::Equal, "`=` after the predicate column")?;
+            let value = cursor.take_predicate_value()?;
+            Some(EqualityPredicate { column_name, value })
+        } else {
+            None
+        };
     cursor.finish()?;
 
     Ok(TableProjection {
-        column_names,
+        selection,
         table_name,
         predicate,
     })
@@ -602,6 +654,31 @@ impl<'a> TableSelectCursor<'a> {
         }
     }
 
+    fn peek_is_count_call(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.index).map(|token| &token.kind),
+                self.tokens.get(self.index + 1).map(|token| &token.kind),
+            ),
+            (
+                Some(TokenKind::Identifier(identifier)),
+                Some(TokenKind::Delimiter(Delimiter::LeftParenthesis)),
+            ) if identifier.eq_ignore_ascii_case("COUNT")
+        )
+    }
+
+    fn take_keyword(&mut self, keyword: &str) -> bool {
+        if matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Identifier(identifier)) if identifier.eq_ignore_ascii_case(keyword)
+        ) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn expect_keyword(
         &mut self,
         keyword: &str,
@@ -620,18 +697,6 @@ impl<'a> TableSelectCursor<'a> {
                 position: token.span.start,
                 expected,
             }),
-        }
-    }
-
-    fn take_keyword(&mut self, keyword: &str) -> bool {
-        if matches!(
-            self.tokens.get(self.index).map(|token| &token.kind),
-            Some(TokenKind::Identifier(identifier)) if identifier.eq_ignore_ascii_case(keyword)
-        ) {
-            self.index += 1;
-            true
-        } else {
-            false
         }
     }
 
@@ -657,16 +722,23 @@ impl<'a> TableSelectCursor<'a> {
         Ok(identifier)
     }
 
-    fn take_comma(&mut self) -> bool {
-        if matches!(
-            self.tokens.get(self.index).map(|token| &token.kind),
-            Some(TokenKind::Delimiter(Delimiter::Comma))
-        ) {
-            self.index += 1;
-            true
-        } else {
-            false
+    fn expect_delimiter(
+        &mut self,
+        delimiter: Delimiter,
+        expected: &'static str,
+    ) -> Result<usize, TableSelectError> {
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax(expected))?;
+        if token.kind != TokenKind::Delimiter(delimiter) {
+            return Err(TableSelectError::Syntax {
+                position: token.span.start,
+                expected,
+            });
         }
+        self.index += 1;
+        Ok(token.span.end)
     }
 
     fn expect_operator(
@@ -678,14 +750,25 @@ impl<'a> TableSelectCursor<'a> {
             .tokens
             .get(self.index)
             .ok_or_else(|| self.syntax(expected))?;
-        if token.kind == TokenKind::Operator(operator) {
-            self.index += 1;
-            Ok(())
-        } else {
-            Err(TableSelectError::Syntax {
+        if token.kind != TokenKind::Operator(operator) {
+            return Err(TableSelectError::Syntax {
                 position: token.span.start,
                 expected,
-            })
+            });
+        }
+        self.index += 1;
+        Ok(())
+    }
+
+    fn take_comma(&mut self) -> bool {
+        if matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Delimiter(Delimiter::Comma))
+        ) {
+            self.index += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -1067,6 +1150,17 @@ mod tests {
                 estimated_bytes: exceeded_lower_bound,
                 limit: first_row_bytes,
             })
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn count_conversion_rejects_values_outside_int64() {
+        let count = usize::try_from(i64::MAX).unwrap() + 1;
+
+        assert_eq!(
+            int64_count(count),
+            Err(TableSelectError::CountOutOfRange { count })
         );
     }
 }
