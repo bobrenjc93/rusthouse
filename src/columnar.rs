@@ -59,6 +59,25 @@ impl Column {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    fn filter(&self, mask: &[bool], selected_count: usize) -> Self {
+        fn filter_values<T: Clone>(values: &[T], mask: &[bool], selected_count: usize) -> Vec<T> {
+            let mut filtered = Vec::with_capacity(selected_count);
+            for (value, selected) in values.iter().zip(mask) {
+                if *selected {
+                    filtered.push(value.clone());
+                }
+            }
+            filtered
+        }
+
+        match self {
+            Self::Int64(values) => Self::Int64(filter_values(values, mask, selected_count)),
+            Self::Float64(values) => Self::Float64(filter_values(values, mask, selected_count)),
+            Self::Bool(values) => Self::Bool(filter_values(values, mask, selected_count)),
+            Self::String(values) => Self::String(filter_values(values, mask, selected_count)),
+        }
+    }
 }
 
 /// A column and its schema name.
@@ -156,9 +175,34 @@ impl RecordBatch {
             .find(|column| column.name == name)
             .map(NamedColumn::column)
     }
+
+    /// Returns a batch containing the rows selected by `mask`.
+    ///
+    /// The mask must contain exactly one value per row. A `true` value retains
+    /// the row at that position, preserving the original schema and row order.
+    pub fn filter(&self, mask: &[bool]) -> Result<Self, RecordBatchError> {
+        if mask.len() != self.row_count {
+            return Err(RecordBatchError::MaskLengthMismatch {
+                expected: self.row_count,
+                actual: mask.len(),
+            });
+        }
+
+        let row_count = mask.iter().filter(|selected| **selected).count();
+        let columns = self
+            .columns
+            .iter()
+            .map(|named_column| NamedColumn {
+                name: named_column.name.clone(),
+                column: named_column.column.filter(mask, row_count),
+            })
+            .collect();
+
+        Ok(Self { columns, row_count })
+    }
 }
 
-/// A schema or row-shape violation found while constructing a [`RecordBatch`].
+/// A schema, row-shape, or mask violation involving a [`RecordBatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordBatchError {
     EmptyColumnName {
@@ -172,6 +216,10 @@ pub enum RecordBatchError {
     ColumnLengthMismatch {
         name: String,
         index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    MaskLengthMismatch {
         expected: usize,
         actual: usize,
     },
@@ -200,6 +248,12 @@ impl fmt::Display for RecordBatchError {
                 formatter,
                 "column `{name}` at index {index} has {actual} rows, expected {expected}"
             ),
+            Self::MaskLengthMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "filter mask has {actual} rows, expected {expected}"
+                )
+            }
         }
     }
 }
