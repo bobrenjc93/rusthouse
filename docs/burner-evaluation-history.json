@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "evaluations": {
+    "eval_3bb67d82": {
+      "name": "Analytical database capability",
+      "color": "#ff6b35"
+    },
+    "eval_c93f863f": {
+      "name": "Rust engineering quality",
+      "color": "#7c5cff"
+    },
+    "eval_d7467264": {
+      "name": "ClickHouse sustained parity",
+      "color": "#00a7a5"
+    },
+    "eval_7180f312": {
+      "name": "Benchmark integrity and anti-gaming",
+      "color": "#e6a700"
+    },
+    "eval_3de1596c": {
+      "name": "ClickHouse feature comprehensiveness",
+      "color": "#d94f8a"
+    },
+    "eval_b9911e8e": {
+      "name": "Evaluation progress accounting",
+      "color": "#2589bd"
+    }
+  },
+  "points": [
+    {
+      "key": "base:0eb064497f06d13af2229dba0405aa7c659b4e5d",
+      "commit": "0eb064497f06d13af2229dba0405aa7c659b4e5d",
+      "recordedAt": "2026-08-02T02:13:21.076Z",
+      "label": "base 0eb0644",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_3bb67d82": 0,
+        "eval_c93f863f": 25,
+        "eval_d7467264": 0,
+        "eval_7180f312": 85,
+        "eval_3de1596c": 0,
+        "eval_b9911e8e": 0
+      }
+    }
+  ]
+}
