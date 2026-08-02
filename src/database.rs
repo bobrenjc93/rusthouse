@@ -181,7 +181,7 @@ impl Iterator for BatchResults<'_> {
         if self.failed {
             (0, Some(0))
         } else {
-            self.statements.size_hint()
+            (0, self.statements.size_hint().1)
         }
     }
 }

@@ -248,3 +248,26 @@ fn collecting_batches_preflight_multiple_results_against_remaining_bytes() {
         }
     );
 }
+
+#[test]
+fn streaming_batch_size_hint_is_conservative_before_an_early_failure() {
+    let mut database = Database::new();
+    let mut results = database
+        .execute_batch_iter(
+            "SELECT * FROM missing; \
+             CREATE TABLE later (id Int64); \
+             SELECT * FROM later",
+        )
+        .expect("parse batch");
+
+    assert_eq!(results.size_hint(), (0, Some(3)));
+    assert_eq!(
+        results.next(),
+        Some(Err(Error::TableNotFound {
+            name: "missing".to_owned(),
+        }))
+    );
+    assert_eq!(results.size_hint(), (0, Some(0)));
+    assert_eq!(results.next(), None);
+    assert_eq!(results.next(), None, "iterator remains fused");
+}
