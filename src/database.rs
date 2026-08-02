@@ -35,11 +35,11 @@ impl Database {
     ///
     /// Supported definitions have the form
     /// `CREATE TABLE name (field type, ...);`, where `type` is one of `Int64`,
-    /// `Float64`, `Bool`, or `String`. Positional inserts have the form
-    /// `INSERT INTO name VALUES (...), (...);` and must supply one literal per
-    /// schema field in schema order. Created fields are non-nullable. DDL and
-    /// inserts produce no query result, so only `SELECT` statements are returned
-    /// for CSV rendering.
+    /// `Float64`, `Bool`, or `String`, optionally wrapped in `Nullable(...)`.
+    /// Positional inserts have the form `INSERT INTO name VALUES (...), (...);`
+    /// and must supply one literal per schema field in schema order. Plain
+    /// field types are non-nullable. DDL and inserts produce no query result,
+    /// so only `SELECT` statements are returned for CSV rendering.
     ///
     /// The complete batch is parsed and catalog changes are staged before they
     /// are published. Therefore any returned error leaves the catalog
@@ -267,7 +267,7 @@ fn build_table(input: &str, definition: CreateTable) -> Result<(String, Table), 
     let fields = definition
         .fields
         .into_iter()
-        .map(|field| Field::new(field.name.value, field.data_type, false))
+        .map(|field| Field::new(field.name.value, field.data_type, field.nullable))
         .collect();
     let schema = Schema::new(fields).map_err(|error| {
         SqlError::at(
