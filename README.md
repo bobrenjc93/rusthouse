@@ -29,3 +29,25 @@ cargo run -- --help
 ```
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+## Current SQL surface
+
+The library currently executes one bounded `CREATE TABLE` statement per call
+and retains its typed schema in memory:
+
+```rust
+use rusthouse::{DataType, Database};
+
+let mut database = Database::new();
+database.execute(
+    "CREATE TABLE events (id Int64, score Float64, active Bool, label String)",
+)?;
+
+let events = database.catalog().table("events").expect("table exists");
+assert_eq!(events.column("id").expect("column exists").data_type(), DataType::Int64);
+# Ok::<(), rusthouse::Error>(())
+```
+
+SQL keywords and the four type names are case-insensitive. By default, an
+input may contain at most 1 MiB and a table may contain at most 1,024 columns;
+both limits can be changed with `DatabaseConfig`.
