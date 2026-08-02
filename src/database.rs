@@ -42,8 +42,9 @@ impl Database {
     ///
     /// The complete batch is parsed and catalog changes are staged before they
     /// are published. Therefore any returned error leaves the catalog
-    /// unchanged. Batches larger than [`MAX_SQL_INPUT_BYTES`] UTF-8
-    /// bytes are rejected before parsing.
+    /// unchanged. Batches larger than [`MAX_SQL_INPUT_BYTES`] UTF-8 bytes or
+    /// containing more than [`crate::MAX_SQL_STATEMENTS`] statements are
+    /// rejected before execution.
     pub fn execute(&mut self, input: &str) -> Result<Vec<QueryResult>, SqlError> {
         if input.len() > MAX_SQL_INPUT_BYTES {
             return Err(SqlError::at(

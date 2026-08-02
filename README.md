@@ -38,8 +38,9 @@ most 1,024 fields, each field identifier may contain at most 256 bytes, and one
 stored `String` value may contain at most 1,048,576 bytes. `Schema::new` and the
 atomic table append APIs report typed errors when these limits are exceeded.
 
-Each SQL batch is limited to 32 MiB (33,554,432 UTF-8 bytes), whether submitted
-through the CLI or directly through `Database::execute`.
+Each SQL batch is limited to 32 MiB (33,554,432 UTF-8 bytes) and 10,000
+statements, whether submitted through the CLI or directly through
+`Database::execute`.
 
 ## Development model
 

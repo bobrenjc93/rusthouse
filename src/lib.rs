@@ -18,6 +18,12 @@ use std::io::{self, Write};
 /// single CLI invocation. The limit is 32 MiB (33,554,432 bytes).
 pub const MAX_SQL_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Maximum number of statements accepted in one SQL batch.
+///
+/// This separately bounds parser and result cardinality for dense inputs that
+/// are well below [`MAX_SQL_INPUT_BYTES`].
+pub const MAX_SQL_STATEMENTS: usize = 10_000;
+
 /// Returns the product name.
 pub fn product_name() -> &'static str {
     "RustHouse"
@@ -79,6 +85,11 @@ pub enum SqlErrorKind {
         /// Maximum accepted batch size in UTF-8 bytes.
         max_bytes: usize,
     },
+    /// A SQL batch contains more than [`MAX_SQL_STATEMENTS`] statements.
+    TooManyStatements {
+        /// Maximum accepted number of statements in one batch.
+        max_statements: usize,
+    },
     /// The input does not match the supported SQL grammar.
     Syntax {
         /// A concise description of what was expected or invalid.
@@ -128,6 +139,10 @@ impl fmt::Display for SqlErrorKind {
             Self::InputTooLarge { max_bytes } => {
                 write!(formatter, "SQL input exceeds the {max_bytes}-byte limit")
             }
+            Self::TooManyStatements { max_statements } => write!(
+                formatter,
+                "SQL batch exceeds the {max_statements}-statement limit"
+            ),
             Self::Syntax { message } => formatter.write_str(message),
             Self::DuplicateTable { table } => write!(formatter, "table `{table}` already exists"),
             Self::DuplicateField { table, field } => {
@@ -339,6 +354,15 @@ impl<'a> Parser<'a> {
         }
 
         while !self.is_at_end() {
+            if statements.len() == MAX_SQL_STATEMENTS {
+                return Err(SqlError::at(
+                    self.input,
+                    self.position,
+                    SqlErrorKind::TooManyStatements {
+                        max_statements: MAX_SQL_STATEMENTS,
+                    },
+                ));
+            }
             statements.push(self.parse_statement()?);
             self.skip_whitespace();
         }

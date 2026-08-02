@@ -1,7 +1,7 @@
 use rusthouse::{
     BatchAppendError, Column, DEFAULT_TABLE_ROW_LIMIT, DataType, Database, MAX_IDENTIFIER_BYTES,
-    MAX_SCHEMA_FIELDS, MAX_SQL_INPUT_BYTES, MAX_STORED_STRING_BYTES, ScalarValue, SchemaError,
-    SqlErrorKind, ValueType, write_csv,
+    MAX_SCHEMA_FIELDS, MAX_SQL_INPUT_BYTES, MAX_SQL_STATEMENTS, MAX_STORED_STRING_BYTES,
+    ScalarValue, SchemaError, SqlErrorKind, ValueType, write_csv,
 };
 
 #[test]
@@ -405,6 +405,30 @@ fn enforces_the_sql_input_byte_limit_at_the_boundary() {
         }
     );
     assert!(database.is_empty());
+}
+
+#[test]
+fn bounds_dense_statement_batches_and_preserves_catalog() {
+    const STATEMENT: &str = "SELECT 1;";
+
+    let mut accepted_database = Database::new();
+    let accepted_sql = STATEMENT.repeat(MAX_SQL_STATEMENTS);
+    let results = accepted_database.execute(&accepted_sql).unwrap();
+    assert_eq!(results.len(), MAX_SQL_STATEMENTS);
+
+    let mut rejected_database = database_with_seed();
+    let before = rejected_database.clone();
+    let rejected_sql = format!("{accepted_sql}{STATEMENT}");
+    let error = rejected_database.execute(&rejected_sql).unwrap_err();
+
+    assert_eq!(error.byte_offset(), accepted_sql.len());
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::TooManyStatements {
+            max_statements: MAX_SQL_STATEMENTS,
+        }
+    );
+    assert_eq!(rejected_database, before);
 }
 
 fn padded_multibyte_sql(byte_len: usize) -> String {
