@@ -67,3 +67,10 @@ RustHouse is licensed under the [MIT License](LICENSE).
 
 _Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
 <!-- burner-progress:end -->
+
+Validate the history contract and checked-in chart with:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
+python3 scripts/render_burner_evaluation_history.py --check
+```
