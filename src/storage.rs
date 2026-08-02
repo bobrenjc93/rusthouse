@@ -433,14 +433,14 @@ impl Table {
                 });
             }
 
-            if let Value::Float64(value) = value
-                && !value.is_finite()
-            {
-                return Err(InsertError::NonFiniteFloat {
-                    column_index: index,
-                    column_name: column.name.clone(),
-                    value: *value,
-                });
+            if let Value::Float64(value) = value {
+                if !value.is_finite() {
+                    return Err(InsertError::NonFiniteFloat {
+                        column_index: index,
+                        column_name: column.name.clone(),
+                        value: *value,
+                    });
+                }
             }
         }
 
