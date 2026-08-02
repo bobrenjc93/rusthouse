@@ -292,12 +292,15 @@ pub(crate) fn parse(
     max_expression_depth: usize,
     max_expression_nodes: usize,
     max_string_bytes: usize,
+    max_tokens: usize,
+    max_statements: usize,
 ) -> Result<Vec<Statement>, DatabaseError> {
-    let tokens = Lexer::new(input, max_string_bytes).tokenize()?;
+    let tokens = Lexer::new(input, max_string_bytes, max_tokens, max_statements).tokenize()?;
     Parser::new(
         tokens,
         max_expression_depth.min(MAX_SAFE_EXPRESSION_DEPTH),
         max_expression_nodes.min(MAX_SAFE_EXPRESSION_NODES),
+        max_statements,
     )
     .parse_statements()
 }
@@ -306,19 +309,30 @@ struct Lexer<'a> {
     input: &'a str,
     offset: usize,
     max_string_bytes: usize,
+    max_tokens: usize,
+    max_statements: usize,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str, max_string_bytes: usize) -> Self {
+    fn new(
+        input: &'a str,
+        max_string_bytes: usize,
+        max_tokens: usize,
+        max_statements: usize,
+    ) -> Self {
         Self {
             input,
             offset: 0,
             max_string_bytes,
+            max_tokens,
+            max_statements,
         }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>, DatabaseError> {
         let mut tokens = Vec::new();
+        let mut statements = 0_usize;
+        let mut at_statement_start = true;
         while self.offset < self.input.len() {
             self.skip_space_and_comments()?;
             if self.offset >= self.input.len() {
@@ -362,6 +376,26 @@ impl<'a> Lexer<'a> {
                     ));
                 }
             };
+            if tokens.len() >= self.max_tokens {
+                return Err(DatabaseError::LimitExceeded {
+                    kind: LimitKind::RequestTokens,
+                    limit: self.max_tokens,
+                    actual: tokens.len() + 1,
+                });
+            }
+            if matches!(kind, TokenKind::Semicolon) {
+                at_statement_start = true;
+            } else if at_statement_start {
+                if statements >= self.max_statements {
+                    return Err(DatabaseError::LimitExceeded {
+                        kind: LimitKind::RequestStatements,
+                        limit: self.max_statements,
+                        actual: statements + 1,
+                    });
+                }
+                statements += 1;
+                at_statement_start = false;
+            }
             tokens.push(Token {
                 kind,
                 offset: start,
@@ -492,10 +526,16 @@ struct Parser {
     expression_nodes: usize,
     max_expression_depth: usize,
     max_expression_nodes: usize,
+    max_statements: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, max_expression_depth: usize, max_expression_nodes: usize) -> Self {
+    fn new(
+        tokens: Vec<Token>,
+        max_expression_depth: usize,
+        max_expression_nodes: usize,
+        max_statements: usize,
+    ) -> Self {
         Self {
             tokens,
             position: 0,
@@ -503,6 +543,7 @@ impl Parser {
             expression_nodes: 0,
             max_expression_depth,
             max_expression_nodes,
+            max_statements,
         }
     }
 
@@ -512,6 +553,13 @@ impl Parser {
             while self.consume(&TokenKind::Semicolon) {}
             if self.at_eof() {
                 break;
+            }
+            if statements.len() >= self.max_statements {
+                return Err(DatabaseError::LimitExceeded {
+                    kind: LimitKind::RequestStatements,
+                    limit: self.max_statements,
+                    actual: statements.len() + 1,
+                });
             }
             let statement = self.parse_statement()?;
             validate_expression_depth(&statement, self.max_expression_depth)?;
@@ -1085,6 +1133,8 @@ mod tests {
             256,
             1024,
             1024 * 1024,
+            65_536,
+            1_024,
         )
         .unwrap();
         assert_eq!(statements.len(), 3);
@@ -1103,6 +1153,8 @@ mod tests {
             256,
             1024,
             1024 * 1024,
+            65_536,
+            1_024,
         )
         .unwrap_err();
         assert!(error.to_string().contains("expected ';'"));

@@ -16,6 +16,10 @@ pub enum LimitKind {
     IntermediateRows,
     IntermediateBytes,
     ResultBytes,
+    RequestTokens,
+    RequestStatements,
+    RequestResultRows,
+    RequestResultBytes,
 }
 
 impl fmt::Display for LimitKind {
@@ -32,6 +36,10 @@ impl fmt::Display for LimitKind {
             Self::IntermediateRows => "intermediate rows",
             Self::IntermediateBytes => "intermediate bytes",
             Self::ResultBytes => "result bytes",
+            Self::RequestTokens => "request tokens",
+            Self::RequestStatements => "request statements",
+            Self::RequestResultRows => "request result rows",
+            Self::RequestResultBytes => "request result bytes",
         };
         f.write_str(name)
     }

@@ -139,7 +139,10 @@ fn input_column_row_result_and_string_limits_are_enforced() {
 
 #[test]
 fn deeply_nested_and_flat_expressions_return_typed_errors_without_crashing() {
-    let mut database = Database::new();
+    let mut database = Database::with_limits(Limits {
+        max_tokens_per_request: 200_000,
+        ..Limits::default()
+    });
     let nested = format!("SELECT {}1{}", "(".repeat(50_000), ")".repeat(50_000));
     assert!(matches!(
         database.execute_one(&nested),
@@ -554,6 +557,7 @@ fn order_by_rejects_ambiguous_output_names() {
 fn caller_cannot_raise_expression_nodes_above_the_safe_cap() {
     let mut database = Database::with_limits(Limits {
         max_expression_nodes: usize::MAX,
+        max_tokens_per_request: 200_000,
         ..Limits::default()
     });
     assert_eq!(database.limits().max_expression_nodes, 256);
@@ -593,4 +597,103 @@ fn scalar_select_does_not_consume_the_table_column_limit() {
             ..
         })
     ));
+}
+
+#[test]
+fn adversarial_multi_statement_requests_are_bounded() {
+    let sql = "SELECT 1;".repeat(200_000);
+    let mut database = Database::new();
+    assert!(sql.len() < database.limits().max_input_bytes);
+    assert!(matches!(
+        database.execute(&sql),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::RequestStatements,
+            ..
+        })
+    ));
+
+    let mut tokens = Database::with_limits(Limits {
+        max_tokens_per_request: 3,
+        max_statements_per_request: 10,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        tokens.execute_one("SELECT 1 + 2"),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::RequestTokens,
+            limit: 3,
+            actual: 4,
+        })
+    ));
+
+    let mut statements = Database::with_limits(Limits {
+        max_tokens_per_request: 100,
+        max_statements_per_request: 2,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        statements.execute("SELECT 1; SELECT 2; SELECT 3"),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::RequestStatements,
+            limit: 2,
+            actual: 3,
+        })
+    ));
+}
+
+#[test]
+fn execute_enforces_cumulative_request_result_limits() {
+    let mut rows = Database::with_limits(Limits {
+        max_tokens_per_request: 100,
+        max_statements_per_request: 10,
+        max_request_result_rows: 2,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        rows.execute("SELECT 1; SELECT 2; SELECT 3"),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::RequestResultRows,
+            limit: 2,
+            actual: 3,
+        })
+    ));
+
+    let mut bytes = Database::with_limits(Limits {
+        max_request_result_bytes: 1,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        bytes.execute_one("SELECT 1"),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::RequestResultBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn insert_validates_unreachable_short_circuit_branches() {
+    let mut database = Database::new();
+    database
+        .execute_one("CREATE TABLE boolean_values (flag Bool)")
+        .unwrap();
+
+    assert!(matches!(
+        database.execute_one("INSERT INTO boolean_values VALUES (true OR missing)"),
+        Err(DatabaseError::ColumnNotFound(name)) if name == "missing"
+    ));
+    assert!(matches!(
+        database.execute_one("INSERT INTO boolean_values VALUES (true OR 1)"),
+        Err(DatabaseError::InvalidQuery(_))
+    ));
+    assert!(matches!(
+        database.execute_one("INSERT INTO boolean_values VALUES (false), (true OR 1)"),
+        Err(DatabaseError::InvalidQuery(_))
+    ));
+    assert_eq!(database.table_row_count("boolean_values").unwrap(), 0);
+
+    database
+        .execute_one("INSERT INTO boolean_values VALUES (true OR false)")
+        .unwrap();
+    assert_eq!(database.table_row_count("boolean_values").unwrap(), 1);
 }

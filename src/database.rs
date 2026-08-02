@@ -24,6 +24,10 @@ pub struct Limits {
     pub max_intermediate_rows: usize,
     pub max_intermediate_bytes: usize,
     pub max_result_bytes: usize,
+    pub max_tokens_per_request: usize,
+    pub max_statements_per_request: usize,
+    pub max_request_result_rows: usize,
+    pub max_request_result_bytes: usize,
 }
 
 impl Default for Limits {
@@ -40,6 +44,10 @@ impl Default for Limits {
             max_intermediate_rows: 1_000_000,
             max_intermediate_bytes: 128 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
+            max_tokens_per_request: 262_144,
+            max_statements_per_request: 1_024,
+            max_request_result_rows: 1_000_000,
+            max_request_result_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -89,10 +97,15 @@ impl Database {
     /// Parses and executes all statements in `sql` in input order.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<ExecutionResult>, DatabaseError> {
         let statements = self.parse_sql(sql)?;
-        statements
-            .into_iter()
-            .map(|statement| self.execute_parsed(statement))
-            .collect()
+        let mut results = Vec::new();
+        let mut request_rows = 0_usize;
+        let mut request_bytes = size_of::<Vec<ExecutionResult>>();
+        for statement in statements {
+            let result = self.execute_parsed(statement)?;
+            account_request_result(&result, &mut request_rows, &mut request_bytes, &self.limits)?;
+            results.push(result);
+        }
+        Ok(results)
     }
 
     fn parse_sql(&self, sql: &str) -> Result<Vec<Statement>, DatabaseError> {
@@ -108,6 +121,8 @@ impl Database {
             self.limits.max_expression_depth,
             self.limits.max_expression_nodes,
             self.limits.max_string_bytes,
+            self.limits.max_tokens_per_request,
+            self.limits.max_statements_per_request,
         )
     }
 
@@ -120,7 +135,11 @@ impl Database {
                 statements.len()
             )));
         }
-        self.execute_parsed(statements.pop().expect("one statement was checked"))
+        let result = self.execute_parsed(statements.pop().expect("one statement was checked"))?;
+        let mut request_rows = 0;
+        let mut request_bytes = size_of::<Vec<ExecutionResult>>();
+        account_request_result(&result, &mut request_rows, &mut request_bytes, &self.limits)?;
+        Ok(result)
     }
 
     /// Returns a schema when exact-quoted and folded-unquoted lookup are unambiguous.
@@ -256,9 +275,9 @@ impl Database {
             (0..table.schema.columns().len()).collect()
         };
 
-        // Materialize and coerce every row before calling the atomic storage append.
-        let mut rows = Vec::with_capacity(expressions.len());
-        for (row_number, expression_row) in expressions.into_iter().enumerate() {
+        // Bind and type-check the entire batch before short-circuiting evaluation can hide errors.
+        let values_scope = Schema::empty();
+        for (row_number, expression_row) in expressions.iter().enumerate() {
             if expression_row.len() != column_order.len() {
                 return Err(DatabaseError::InvalidValue(format!(
                     "row {} has {} values but INSERT expects {}",
@@ -267,13 +286,22 @@ impl Database {
                     column_order.len()
                 )));
             }
-            let mut row: Vec<Option<Value>> = vec![None; table.schema.columns().len()];
             for (expression, &target) in expression_row.iter().zip(&column_order) {
                 if expression.contains_aggregate() {
                     return Err(DatabaseError::invalid(
                         "aggregate functions are not allowed in VALUES",
                     ));
                 }
+                let actual = infer_type(expression, &values_scope)?;
+                validate_insert_type(actual, table.schema.columns()[target].data_type)?;
+            }
+        }
+
+        // Materialize and coerce every row before calling the atomic storage append.
+        let mut rows = Vec::with_capacity(expressions.len());
+        for expression_row in expressions {
+            let mut row: Vec<Option<Value>> = vec![None; table.schema.columns().len()];
+            for (expression, &target) in expression_row.iter().zip(&column_order) {
                 let value = eval_row_expr(expression, None, None)?;
                 let expected = table.schema.columns()[target].data_type;
                 row[target] = Some(coerce_insert(value, expected)?);
@@ -755,14 +783,17 @@ fn validate_result_bytes(
     rows: &[Vec<Value>],
     limits: &Limits,
 ) -> Result<(), DatabaseError> {
-    let bytes = rows
-        .iter()
+    let bytes = estimate_query_result_bytes(columns, rows);
+    check_byte_limit(LimitKind::ResultBytes, limits.max_result_bytes, bytes)
+}
+
+fn estimate_query_result_bytes(columns: &[ColumnDefinition], rows: &[Vec<Value>]) -> usize {
+    rows.iter()
         .fold(estimate_result_base(columns), |bytes, row| {
             bytes
                 .saturating_add(size_of::<Vec<Value>>().saturating_mul(2))
                 .saturating_add(estimate_values(row))
-        });
-    check_byte_limit(LimitKind::ResultBytes, limits.max_result_bytes, bytes)
+        })
 }
 
 fn estimate_result_base(columns: &[ColumnDefinition]) -> usize {
@@ -775,6 +806,38 @@ fn estimate_result_base(columns: &[ColumnDefinition]) -> usize {
                 .sum::<usize>(),
         )
         .saturating_add(size_of::<Vec<Vec<Value>>>())
+}
+
+fn account_request_result(
+    result: &ExecutionResult,
+    request_rows: &mut usize,
+    request_bytes: &mut usize,
+    limits: &Limits,
+) -> Result<(), DatabaseError> {
+    let (rows, bytes) = match result {
+        ExecutionResult::TableCreated { table } => (0, table.capacity()),
+        ExecutionResult::RowsInserted { table, .. } => (0, table.capacity()),
+        ExecutionResult::Query(result) => (
+            result.rows.len(),
+            estimate_query_result_bytes(&result.columns, &result.rows),
+        ),
+    };
+    *request_rows = request_rows.saturating_add(rows);
+    if *request_rows > limits.max_request_result_rows {
+        return Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::RequestResultRows,
+            limit: limits.max_request_result_rows,
+            actual: *request_rows,
+        });
+    }
+    *request_bytes = request_bytes
+        .saturating_add(size_of::<ExecutionResult>().saturating_mul(2))
+        .saturating_add(bytes);
+    check_byte_limit(
+        LimitKind::RequestResultBytes,
+        limits.max_request_result_bytes,
+        *request_bytes,
+    )
 }
 
 fn expand_wildcards(
@@ -1448,6 +1511,18 @@ fn coerce_insert(value: Value, expected: DataType) -> Result<Value, DatabaseErro
             expected,
             actual: value.data_type(),
         }),
+    }
+}
+
+fn validate_insert_type(actual: DataType, expected: DataType) -> Result<(), DatabaseError> {
+    if actual == expected || (actual == DataType::Int64 && expected == DataType::Float64) {
+        Ok(())
+    } else {
+        Err(DatabaseError::TypeMismatch {
+            context: "INSERT value".into(),
+            expected,
+            actual,
+        })
     }
 }
 
