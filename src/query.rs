@@ -1,4 +1,4 @@
-//! Parsing for the first executable SQL query shape.
+//! Parsing and execution for the supported `SELECT` statement shapes.
 
 use std::collections::HashMap;
 use std::error::Error;
