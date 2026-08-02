@@ -1,4 +1,16 @@
 //! RustHouse is an experimental, compact analytical database.
+//!
+//! Its storage layer provides validated, in-memory columnar tables with four
+//! physical data types. Rows are checked in full before they are appended, so
+//! a rejected row never leaves columns with different lengths.
+
+mod error;
+mod storage;
+mod value;
+
+pub use error::{Error, Result};
+pub use storage::{Column, ColumnDef, Table};
+pub use value::{DataType, Value};
 
 /// Returns the product name while the first storage engine is being built.
 pub fn product_name() -> &'static str {
