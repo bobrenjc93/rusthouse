@@ -43,6 +43,29 @@ cargo test --locked --all-targets --all-features &&
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
 
+## SQL values inserts
+
+An existing table can accept one atomic, bounded SQL values insert without a
+catalog. The supplied name identifies that table:
+
+```rust
+use rusthouse::sql::execute_insert;
+use rusthouse::{ColumnSchema, DataType, Schema, Table};
+
+let schema = Schema::new(vec![ColumnSchema::new("value", DataType::Int64)]);
+let mut table = Table::new(schema, 100);
+let inserted = execute_insert(
+    "INSERT INTO metrics VALUES (-1), (2);",
+    "metrics",
+    &mut table,
+).unwrap();
+assert_eq!(inserted, 2);
+```
+
+Use `execute_insert_with_limits` and `InsertLimits` to set input-byte, token,
+row, and value bounds explicitly. Values are decoded against the table schema,
+and the table remains unchanged if any row or storage validation fails.
+
 <!-- burner-progress:start -->
 ## Burner evaluation progress
 
