@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{DataType, Error, Result, Value};
 
 /// A named, typed field in a [`Table`] schema.
@@ -118,11 +120,9 @@ impl Table {
             return Err(Error::EmptySchema);
         }
 
-        for (index, field) in schema.iter().enumerate() {
-            if schema[..index]
-                .iter()
-                .any(|existing| existing.name.eq_ignore_ascii_case(&field.name))
-            {
+        let mut normalized_names = HashSet::with_capacity(schema.len());
+        for field in &schema {
+            if !normalized_names.insert(field.name.to_ascii_lowercase()) {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
@@ -310,6 +310,30 @@ mod tests {
             ],
         );
         assert_eq!(duplicate, Err(Error::DuplicateColumn("eventid".to_owned())));
+    }
+
+    #[test]
+    fn validates_wide_schemas_without_pairwise_name_scans() {
+        let schema: Vec<_> = (0..20_000)
+            .map(|index| {
+                ColumnDef::new(
+                    format!("event_attribute_with_a_long_shared_prefix_{index:05}"),
+                    DataType::Int64,
+                )
+            })
+            .collect();
+        let mut duplicate_schema = schema.clone();
+        duplicate_schema.last_mut().expect("non-empty schema").name =
+            schema[0].name.to_ascii_uppercase();
+
+        let table = Table::new("wide", schema).expect("unique wide schema");
+        assert_eq!(table.schema().len(), 20_000);
+        assert_eq!(
+            Table::new("duplicate", duplicate_schema),
+            Err(Error::DuplicateColumn(
+                "EVENT_ATTRIBUTE_WITH_A_LONG_SHARED_PREFIX_00000".to_owned()
+            ))
+        );
     }
 
     #[test]
