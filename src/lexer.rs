@@ -40,6 +40,7 @@ pub struct LexerLimits {
     /// Maximum number of emitted tokens.
     pub max_tokens: usize,
     /// Maximum decoded string or source numeric literal size in bytes.
+    /// Fixed `TRUE`, `FALSE`, and `NULL` tokens are not subject to this limit.
     pub max_literal_bytes: usize,
 }
 
@@ -431,31 +432,15 @@ impl Lexer<'_> {
 
         let value = &self.input[start..self.cursor];
         let kind = if value.eq_ignore_ascii_case("true") {
-            self.check_literal_length(start, value.len())?;
             TokenKind::Literal(Literal::Boolean(true))
         } else if value.eq_ignore_ascii_case("false") {
-            self.check_literal_length(start, value.len())?;
             TokenKind::Literal(Literal::Boolean(false))
         } else if value.eq_ignore_ascii_case("null") {
-            self.check_literal_length(start, value.len())?;
             TokenKind::Literal(Literal::Null)
         } else {
             TokenKind::Identifier(value.to_owned())
         };
         self.push(kind, start)
-    }
-
-    fn check_literal_length(&self, start: usize, length: usize) -> Result<(), LexError> {
-        if length > self.limits.max_literal_bytes {
-            return Err(LexError::new(
-                LexErrorKind::LiteralTooLarge {
-                    length,
-                    limit: self.limits.max_literal_bytes,
-                },
-                start,
-            ));
-        }
-        Ok(())
     }
 
     fn symbol(&mut self, character: char, start: usize) -> Result<(), LexError> {
@@ -757,5 +742,19 @@ mod tests {
                 limit: 3
             }
         ));
+    }
+
+    #[test]
+    fn fixed_literals_are_valid_at_a_zero_literal_size_limit() {
+        let tokens = lex("TRUE false NULL", LexerLimits::new(32, 3, 0)).unwrap();
+
+        assert_eq!(
+            tokens.iter().map(|token| &token.kind).collect::<Vec<_>>(),
+            vec![
+                &TokenKind::Literal(Literal::Boolean(true)),
+                &TokenKind::Literal(Literal::Boolean(false)),
+                &TokenKind::Literal(Literal::Null),
+            ]
+        );
     }
 }
