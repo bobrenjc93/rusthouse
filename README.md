@@ -43,6 +43,25 @@ println!("returned {} rows", result.rows.len());
 Only that exact projection is supported today; predicates, explicit column
 lists, ordering, and SQL `LIMIT` remain future query-engine work.
 
+## CSV export API
+
+`write_csv` streams a table directly to any `std::io::Write` sink. It emits a
+header followed by rows without building the complete output in memory. NULL
+is written as `\N`, booleans as `true` or `false`, and finite floats use the
+standard shortest round-trip decimal representation. Fields containing commas,
+quotes, carriage returns, or line feeds are quoted using CSV double-quote
+escaping.
+
+```rust
+use rusthouse::{Table, write_csv};
+
+# fn export(table: &Table) -> std::io::Result<Vec<u8>> {
+let mut output = Vec::new();
+write_csv(&mut output, table)?;
+# Ok(output)
+# }
+```
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.

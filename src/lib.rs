@@ -1,11 +1,13 @@
 //! RustHouse is an experimental, compact analytical database.
 
 pub mod catalog;
+pub mod csv;
 pub mod parser;
 pub mod query;
 pub mod storage;
 
 pub use catalog::{Catalog, CatalogError, CatalogLimits, IdentifierError};
+pub use csv::write_csv;
 pub use parser::{
     ColumnDefinition, ColumnType, CreateTable, Keyword, MAX_COLUMNS, MAX_INPUT_BYTES, MAX_TOKENS,
     ParseError, ParseErrorKind, SelectAll, parse_create_table, parse_select_all,
