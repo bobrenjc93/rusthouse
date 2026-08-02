@@ -1,6 +1,6 @@
 //! RustHouse is an experimental, compact analytical database.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 mod table;
 
@@ -45,13 +45,56 @@ impl std::error::Error for SqlError {}
 /// The grammar is `SELECT <signed Int64> [AS <identifier>] [;]`. Keywords are
 /// case-insensitive. The unaliased column name is the literal as written.
 pub fn execute_literal_select_csv(sql: &str) -> Result<String, SqlError> {
+    let table = execute_literal_select(sql)?;
+    Ok(table_to_csv(&table))
+}
+
+fn execute_literal_select(sql: &str) -> Result<Table, SqlError> {
     let query = parse_literal_select(sql)?;
-    let mut csv = String::with_capacity(query.column_name.len() + 32);
-    push_csv_field(&mut csv, &query.column_name);
+    let schema = Schema::new(vec![Field::new(query.column_name, DataType::Int64)])
+        .expect("a single-field query result always has a valid schema");
+    let mut table = Table::new(schema);
+    table
+        .append_row(vec![Value::Int64(query.value)])
+        .expect("the literal value matches the query result schema");
+    Ok(table)
+}
+
+fn table_to_csv(table: &Table) -> String {
+    let mut csv = String::new();
+
+    for (index, field) in table.schema().fields().iter().enumerate() {
+        if index > 0 {
+            csv.push(',');
+        }
+        push_csv_field(&mut csv, &field.name);
+    }
     csv.push('\n');
-    csv.push_str(&query.value.to_string());
-    csv.push('\n');
-    Ok(csv)
+
+    for row in 0..table.row_count() {
+        for (index, column) in table.columns().iter().enumerate() {
+            if index > 0 {
+                csv.push(',');
+            }
+            push_csv_value(&mut csv, column, row);
+        }
+        csv.push('\n');
+    }
+
+    csv
+}
+
+fn push_csv_value(csv: &mut String, column: &Column, row: usize) {
+    match column {
+        Column::Int64(values) => write!(csv, "{}", values[row]),
+        Column::Float64(values) => write!(csv, "{}", values[row]),
+        Column::Bool(values) => write!(csv, "{}", values[row]),
+        Column::String(values) => {
+            push_csv_field(csv, &values[row]);
+            return;
+        }
+    }
+    .expect("writing to a String cannot fail");
 }
 
 struct LiteralSelect {
@@ -155,6 +198,18 @@ mod tests {
             execute_literal_select_csv("SELECT +9223372036854775807").unwrap(),
             "+9223372036854775807\n9223372036854775807\n"
         );
+    }
+
+    #[test]
+    fn executes_into_a_schema_checked_columnar_result() {
+        let table = execute_literal_select("SELECT -42 AS answer").unwrap();
+
+        assert_eq!(
+            table.schema().fields(),
+            &[Field::new("answer", DataType::Int64)]
+        );
+        assert_eq!(table.columns(), &[Column::Int64(vec![-42])]);
+        assert_eq!(table.row_count(), 1);
     }
 
     #[test]
