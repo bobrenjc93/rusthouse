@@ -184,6 +184,25 @@ fn propagates_writer_failures_and_stops_before_consuming_rows() {
     assert_eq!(row_pulls.get(), 0);
 }
 
+#[test]
+fn streams_a_large_default_valid_record_without_an_aggregate_buffer() {
+    const COLUMN_COUNT: usize = 128;
+    const CELL_BYTES: usize = 8 * 1024;
+
+    let header = vec!["column"; COLUMN_COUNT];
+    let quote_heavy_cell = "\"".repeat(CELL_BYTES);
+    let row = vec![quote_heavy_cell.as_str(); COLUMN_COUNT];
+    let mut writer = RejectAfterHeader::default();
+
+    let error = CsvFormatter::default()
+        .write(&mut writer, &header, [row])
+        .unwrap_err();
+
+    assert!(matches!(error, CsvError::Io(_)));
+    assert!(writer.header_complete);
+    assert_eq!(writer.first_rejected_write, Some(1));
+}
+
 struct FailingWriter {
     writes: Rc<Cell<usize>>,
 }
@@ -195,6 +214,33 @@ impl Write for FailingWriter {
             io::ErrorKind::BrokenPipe,
             "destination closed",
         ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RejectAfterHeader {
+    header_complete: bool,
+    first_rejected_write: Option<usize>,
+}
+
+impl Write for RejectAfterHeader {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.header_complete {
+            self.first_rejected_write.get_or_insert(buffer.len());
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stop after header",
+            ));
+        }
+
+        if buffer.ends_with(b"\r\n") {
+            self.header_complete = true;
+        }
+        Ok(buffer.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {

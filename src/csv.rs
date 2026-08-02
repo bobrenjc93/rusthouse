@@ -1,7 +1,7 @@
 //! Bounded, streaming CSV output.
 //!
-//! [`CsvFormatter`] writes one validated record at a time, so callers do not
-//! need to collect a complete result set before exporting it.
+//! [`CsvFormatter`] validates and writes one record at a time, so callers do
+//! not need to collect a complete result set before exporting it.
 
 use std::error::Error;
 use std::fmt;
@@ -145,9 +145,10 @@ impl From<io::Error> for CsvError {
 ///
 /// Records use commas and `\r\n` line endings. Empty fields and fields that
 /// contain a comma, double quote, carriage return, or line feed are quoted;
-/// double quotes inside a quoted field are doubled. The formatter buffers only
-/// the current record so a validation failure cannot write part of that record.
-/// Previously completed records can already have reached the writer.
+/// double quotes inside a quoted field are doubled. Each complete record is
+/// validated before it is streamed without an aggregate record buffer, so a
+/// validation failure cannot write part of that record. Previously completed
+/// records can already have reached the writer.
 ///
 /// # Examples
 ///
@@ -200,15 +201,8 @@ impl CsvFormatter {
         Row: AsRef<[Cell]>,
         Cell: AsRef<str>,
     {
-        self.check_column_count(CsvRecord::Header, header.len())?;
-
-        let mut encoded = Vec::new();
-        self.encode_record(
-            &mut encoded,
-            CsvRecord::Header,
-            header.iter().map(AsRef::as_ref),
-        )?;
-        writer.write_all(&encoded)?;
+        self.validate_record(CsvRecord::Header, header)?;
+        write_record(writer, header)?;
 
         for (row_index, row) in rows.into_iter().enumerate() {
             let cells = row.as_ref();
@@ -221,10 +215,8 @@ impl CsvFormatter {
                     actual: cells.len(),
                 });
             }
-
-            encoded.clear();
-            self.encode_record(&mut encoded, record, cells.iter().map(AsRef::as_ref))?;
-            writer.write_all(&encoded)?;
+            self.validate_cells(record, cells)?;
+            write_record(writer, cells)?;
         }
 
         Ok(())
@@ -241,13 +233,22 @@ impl CsvFormatter {
         Ok(())
     }
 
-    fn encode_record<'a>(
+    fn validate_record<Cell: AsRef<str>>(
         &self,
-        output: &mut Vec<u8>,
         record: CsvRecord,
-        cells: impl IntoIterator<Item = &'a str>,
+        cells: &[Cell],
     ) -> Result<(), CsvError> {
-        for (column, cell) in cells.into_iter().enumerate() {
+        self.check_column_count(record, cells.len())?;
+        self.validate_cells(record, cells)
+    }
+
+    fn validate_cells<Cell: AsRef<str>>(
+        &self,
+        record: CsvRecord,
+        cells: &[Cell],
+    ) -> Result<(), CsvError> {
+        for (column, cell) in cells.iter().enumerate() {
+            let cell = cell.as_ref();
             if cell.len() > self.limits.max_cell_bytes {
                 return Err(CsvError::CellSizeLimitExceeded {
                     record,
@@ -256,12 +257,7 @@ impl CsvFormatter {
                     actual: cell.len(),
                 });
             }
-            if column != 0 {
-                output.push(b',');
-            }
-            encode_field(output, cell);
         }
-        output.extend_from_slice(b"\r\n");
         Ok(())
     }
 }
@@ -272,23 +268,38 @@ impl Default for CsvFormatter {
     }
 }
 
-fn encode_field(output: &mut Vec<u8>, field: &str) {
+fn write_record<W: Write + ?Sized, Cell: AsRef<str>>(
+    writer: &mut W,
+    cells: &[Cell],
+) -> io::Result<()> {
+    for (column, cell) in cells.iter().enumerate() {
+        if column != 0 {
+            writer.write_all(b",")?;
+        }
+        write_field(writer, cell.as_ref())?;
+    }
+    writer.write_all(b"\r\n")
+}
+
+fn write_field<W: Write + ?Sized>(writer: &mut W, field: &str) -> io::Result<()> {
     let bytes = field.as_bytes();
     let quote = bytes.is_empty()
         || bytes
             .iter()
             .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'));
 
-    if quote {
-        output.push(b'"');
-        for &byte in bytes {
-            output.push(byte);
-            if byte == b'"' {
-                output.push(b'"');
-            }
-        }
-        output.push(b'"');
-    } else {
-        output.extend_from_slice(bytes);
+    if !quote {
+        return writer.write_all(bytes);
     }
+
+    writer.write_all(b"\"")?;
+    let mut start = 0;
+    while let Some(relative_end) = bytes[start..].iter().position(|byte| *byte == b'"') {
+        let end = start + relative_end;
+        writer.write_all(&bytes[start..end])?;
+        writer.write_all(b"\"\"")?;
+        start = end + 1;
+    }
+    writer.write_all(&bytes[start..])?;
+    writer.write_all(b"\"")
 }
