@@ -228,7 +228,7 @@ pub enum TableSelectError {
     },
     /// Materializing the complete result would exceed the memory budget.
     ResultSizeLimitExceeded {
-        /// Estimated bytes required by the materialized headers and rows.
+        /// Estimated bytes known to be required when the limit was exceeded.
         estimated_bytes: usize,
         /// Maximum estimated bytes allowed for one result.
         limit: usize,
@@ -418,22 +418,16 @@ fn enforce_result_size_limit(
     predicate: Option<&ResolvedPredicate<'_>>,
     limit: usize,
 ) -> Result<usize, TableSelectError> {
-    let (estimated_bytes, matching_row_count) = estimate_result_bytes(table, columns, predicate);
-    if estimated_bytes > limit {
-        Err(TableSelectError::ResultSizeLimitExceeded {
-            estimated_bytes,
-            limit,
-        })
-    } else {
-        Ok(matching_row_count)
-    }
+    account_result_bytes(table, columns, predicate, limit)
+        .map(|(_, matching_row_count)| matching_row_count)
 }
 
-fn estimate_result_bytes(
+fn account_result_bytes(
     table: &Table,
     columns: &[ResolvedColumn<'_>],
     predicate: Option<&ResolvedPredicate<'_>>,
-) -> (usize, usize) {
+    limit: usize,
+) -> Result<(usize, usize), TableSelectError> {
     let header_bytes = columns
         .len()
         .saturating_mul(std::mem::size_of::<ColumnSchema>())
@@ -443,38 +437,79 @@ fn estimate_result_bytes(
                 .map(|column| column.schema.name().len())
                 .fold(0usize, usize::saturating_add),
         );
-    let mut matching_row_count = 0usize;
-    let mut string_payload_bytes = 0usize;
-    let mut projected_string_columns = HashMap::<usize, (&[String], usize)>::new();
-    for column in columns {
-        if let Column::String(values) = column.values {
-            let (_, occurrences) = projected_string_columns
-                .entry(column.index)
-                .or_insert((values, 0));
-            *occurrences = occurrences.saturating_add(1);
+    let mut estimated_bytes = add_result_bytes(0, header_bytes, limit)?;
+    let fixed_bytes_per_row = std::mem::size_of::<Vec<Value>>()
+        .saturating_add(columns.len().saturating_mul(std::mem::size_of::<Value>()));
+
+    if predicate.is_none() {
+        estimated_bytes = add_result_bytes(
+            estimated_bytes,
+            table.row_count().saturating_mul(fixed_bytes_per_row),
+            limit,
+        )?;
+
+        let projected_string_columns = projected_string_columns(columns);
+        for (values, occurrences) in projected_string_columns.values() {
+            for value in *values {
+                estimated_bytes = add_result_bytes(
+                    estimated_bytes,
+                    value.len().saturating_mul(*occurrences),
+                    limit,
+                )?;
+            }
         }
+        return Ok((estimated_bytes, table.row_count()));
     }
+
+    let projected_string_columns = projected_string_columns(columns);
+    let mut matching_row_count = 0usize;
     for row_index in 0..table.row_count() {
         if !matches_predicate(predicate, row_index) {
             continue;
         }
         matching_row_count = matching_row_count.saturating_add(1);
+        estimated_bytes = add_result_bytes(estimated_bytes, fixed_bytes_per_row, limit)?;
         for (values, occurrences) in projected_string_columns.values() {
-            string_payload_bytes = string_payload_bytes
-                .saturating_add(values[row_index].len().saturating_mul(*occurrences));
+            estimated_bytes = add_result_bytes(
+                estimated_bytes,
+                values[row_index].len().saturating_mul(*occurrences),
+                limit,
+            )?;
         }
     }
 
-    let row_vector_bytes = matching_row_count.saturating_mul(std::mem::size_of::<Vec<Value>>());
-    let row_value_bytes = matching_row_count
-        .saturating_mul(columns.len())
-        .saturating_mul(std::mem::size_of::<Value>());
+    Ok((estimated_bytes, matching_row_count))
+}
 
-    let estimated_bytes = header_bytes
-        .saturating_add(row_vector_bytes)
-        .saturating_add(row_value_bytes)
-        .saturating_add(string_payload_bytes);
-    (estimated_bytes, matching_row_count)
+fn projected_string_columns<'a>(
+    columns: &[ResolvedColumn<'a>],
+) -> HashMap<usize, (&'a [String], usize)> {
+    let mut projected_string_columns = HashMap::new();
+    for column in columns {
+        if let Column::String(values) = column.values {
+            let (_, occurrences) = projected_string_columns
+                .entry(column.index)
+                .or_insert((values.as_slice(), 0usize));
+            *occurrences = occurrences.saturating_add(1);
+        }
+    }
+    projected_string_columns
+}
+
+fn add_result_bytes(
+    estimated_bytes: usize,
+    additional_bytes: usize,
+    limit: usize,
+) -> Result<usize, TableSelectError> {
+    let estimated_bytes = estimated_bytes.saturating_add(additional_bytes);
+    if estimated_bytes > limit {
+        Err(TableSelectError::ResultSizeLimitExceeded {
+            estimated_bytes,
+            limit,
+        })
+    } else {
+        Ok(estimated_bytes)
+    }
 }
 
 struct TableProjection {
@@ -950,7 +985,9 @@ mod tests {
             schema: table.schema().column(0).unwrap(),
             values: table.column(0).unwrap(),
         }];
-        let estimated_bytes = estimate_result_bytes(&table, &columns, None).0;
+        let estimated_bytes = account_result_bytes(&table, &columns, None, usize::MAX)
+            .unwrap()
+            .0;
 
         assert_eq!(
             enforce_result_size_limit(&table, &columns, None, estimated_bytes),
@@ -961,6 +998,74 @@ mod tests {
             Err(TableSelectError::ResultSizeLimitExceeded {
                 estimated_bytes,
                 limit: estimated_bytes - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn unfiltered_size_accounting_rejects_the_fixed_width_lower_bound_first() {
+        let schema =
+            crate::Schema::new(vec![ColumnSchema::new("payload", crate::DataType::String)])
+                .unwrap();
+        let mut table = Table::new(schema);
+        table
+            .insert_batch(vec![
+                vec![Value::String("first payload".to_owned())],
+                vec![Value::String("second payload".to_owned())],
+            ])
+            .unwrap();
+        let columns = [ResolvedColumn {
+            index: 0,
+            schema: table.schema().column(0).unwrap(),
+            values: table.column(0).unwrap(),
+        }];
+        let header_bytes = std::mem::size_of::<ColumnSchema>() + "payload".len();
+        let fixed_bytes =
+            table.row_count() * (std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>());
+        let fixed_width_lower_bound = header_bytes + fixed_bytes;
+
+        assert_eq!(
+            enforce_result_size_limit(&table, &columns, None, fixed_width_lower_bound - 1),
+            Err(TableSelectError::ResultSizeLimitExceeded {
+                estimated_bytes: fixed_width_lower_bound,
+                limit: fixed_width_lower_bound - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn filtered_size_accounting_stops_at_the_exceeded_row_lower_bound() {
+        let schema = crate::Schema::new(vec![
+            ColumnSchema::new("payload", crate::DataType::String),
+            ColumnSchema::new("matches", crate::DataType::Bool),
+        ])
+        .unwrap();
+        let mut table = Table::new(schema);
+        table
+            .insert_batch(vec![
+                vec![Value::String("first".to_owned()), Value::Bool(true)],
+                vec![Value::String("second".to_owned()), Value::Bool(true)],
+            ])
+            .unwrap();
+        let columns = [ResolvedColumn {
+            index: 0,
+            schema: table.schema().column(0).unwrap(),
+            values: table.column(0).unwrap(),
+        }];
+        let predicate = ResolvedPredicate {
+            values: table.column(1).unwrap(),
+            value: Value::Bool(true),
+        };
+        let header_bytes = std::mem::size_of::<ColumnSchema>() + "payload".len();
+        let fixed_bytes_per_row = std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>();
+        let first_row_bytes = header_bytes + fixed_bytes_per_row + "first".len();
+        let exceeded_lower_bound = first_row_bytes + fixed_bytes_per_row;
+
+        assert_eq!(
+            enforce_result_size_limit(&table, &columns, Some(&predicate), first_row_bytes),
+            Err(TableSelectError::ResultSizeLimitExceeded {
+                estimated_bytes: exceeded_lower_bound,
+                limit: first_row_bytes,
             })
         );
     }
