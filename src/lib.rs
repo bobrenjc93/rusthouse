@@ -8,6 +8,8 @@ mod error;
 mod storage;
 mod value;
 
+pub mod csv;
+pub use csv::{CsvError, CsvFormatter, CsvLimits, CsvRecord};
 pub use error::{Error, Result};
 pub use storage::{Column, ColumnDef, Table};
 pub use value::{DataType, Value};
