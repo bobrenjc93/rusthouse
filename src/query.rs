@@ -268,15 +268,17 @@ pub fn execute_table_select(
 ) -> Result<TableSelectResult, TableSelectError> {
     let projection = parse_table_select(input)?;
     let table = catalog.table(&projection.table_name)?;
+    let column_indices: HashMap<&str, usize> = table
+        .schema()
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.name(), index))
+        .collect();
 
     let mut columns = Vec::with_capacity(projection.column_names.len());
     for column_name in &projection.column_names {
-        let Some(column_index) = table
-            .schema()
-            .columns()
-            .iter()
-            .position(|column| column.name() == column_name)
-        else {
+        let Some(column_index) = column_indices.get(column_name.as_str()).copied() else {
             return Err(TableSelectError::ColumnNotFound(ColumnNotFoundError {
                 table_name: projection.table_name,
                 column_name: column_name.clone(),

@@ -150,3 +150,35 @@ fn rejects_repeated_large_strings_before_materializing_the_result() {
         } if estimated_bytes > MAX_TABLE_SELECT_RESULT_BYTES
     ));
 }
+
+#[test]
+fn resolves_wide_repeated_projections_without_rescanning_the_schema() {
+    const WIDTH: usize = 10_000;
+
+    let schema = Schema::new(
+        (0..WIDTH)
+            .map(|index| ColumnSchema::new(format!("column_{index}"), DataType::Int64))
+            .collect(),
+    )
+    .expect("generated column names are unique");
+    let mut catalog = Catalog::new();
+    catalog
+        .create_table("wide", schema)
+        .expect("table name is available");
+    let projected_name = format!("column_{}", WIDTH - 1);
+    let columns = std::iter::repeat_n(projected_name.as_str(), WIDTH)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let result = execute_table_select(&catalog, &format!("SELECT {columns} FROM wide"))
+        .expect("wide repeated projection is valid");
+
+    assert_eq!(result.headers().len(), WIDTH);
+    assert!(
+        result
+            .headers()
+            .iter()
+            .all(|column| column.name() == projected_name && column.data_type() == DataType::Int64)
+    );
+    assert!(result.rows().is_empty());
+}
