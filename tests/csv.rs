@@ -203,6 +203,24 @@ fn streams_a_large_default_valid_record_without_an_aggregate_buffer() {
     assert_eq!(writer.first_rejected_write, Some(1));
 }
 
+#[test]
+fn validates_and_writes_the_same_as_ref_snapshot() {
+    let calls = Rc::new(Cell::new(0));
+    let changing_cell = ChangingCell {
+        calls: Rc::clone(&calls),
+        first: "ok",
+        later: "far too large",
+    };
+    let mut output = Vec::new();
+
+    CsvFormatter::new(CsvLimits::new(1, 2))
+        .write(&mut output, &["h"], [vec![changing_cell]])
+        .unwrap();
+
+    assert_eq!(output, b"h\r\nok\r\n");
+    assert_eq!(calls.get(), 1);
+}
+
 struct FailingWriter {
     writes: Rc<Cell<usize>>,
 }
@@ -245,5 +263,19 @@ impl Write for RejectAfterHeader {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+struct ChangingCell {
+    calls: Rc<Cell<usize>>,
+    first: &'static str,
+    later: &'static str,
+}
+
+impl AsRef<str> for ChangingCell {
+    fn as_ref(&self) -> &str {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call == 0 { self.first } else { self.later }
     }
 }

@@ -146,9 +146,11 @@ impl From<io::Error> for CsvError {
 /// Records use commas and `\r\n` line endings. Empty fields and fields that
 /// contain a comma, double quote, carriage return, or line feed are quoted;
 /// double quotes inside a quoted field are doubled. Each complete record is
-/// validated before it is streamed without an aggregate record buffer, so a
-/// validation failure cannot write part of that record. Previously completed
-/// records can already have reached the writer.
+/// captured and validated before it is streamed without an aggregate encoded
+/// record buffer, so a validation failure cannot write part of that record.
+/// The formatter retains one `&str` per field, bounded by `max_columns`, to
+/// ensure validation and output observe the same cell values. Previously
+/// completed records can already have reached the writer.
 ///
 /// # Examples
 ///
@@ -201,8 +203,9 @@ impl CsvFormatter {
         Row: AsRef<[Cell]>,
         Cell: AsRef<str>,
     {
-        self.validate_record(CsvRecord::Header, header)?;
-        write_record(writer, header)?;
+        self.check_column_count(CsvRecord::Header, header.len())?;
+        let header = self.capture_and_validate(CsvRecord::Header, header)?;
+        write_record(writer, &header)?;
 
         for (row_index, row) in rows.into_iter().enumerate() {
             let cells = row.as_ref();
@@ -215,8 +218,8 @@ impl CsvFormatter {
                     actual: cells.len(),
                 });
             }
-            self.validate_cells(record, cells)?;
-            write_record(writer, cells)?;
+            let cells = self.capture_and_validate(record, cells)?;
+            write_record(writer, &cells)?;
         }
 
         Ok(())
@@ -233,20 +236,12 @@ impl CsvFormatter {
         Ok(())
     }
 
-    fn validate_record<Cell: AsRef<str>>(
+    fn capture_and_validate<'a, Cell: AsRef<str>>(
         &self,
         record: CsvRecord,
-        cells: &[Cell],
-    ) -> Result<(), CsvError> {
-        self.check_column_count(record, cells.len())?;
-        self.validate_cells(record, cells)
-    }
-
-    fn validate_cells<Cell: AsRef<str>>(
-        &self,
-        record: CsvRecord,
-        cells: &[Cell],
-    ) -> Result<(), CsvError> {
+        cells: &'a [Cell],
+    ) -> Result<Vec<&'a str>, CsvError> {
+        let mut captured = Vec::with_capacity(cells.len());
         for (column, cell) in cells.iter().enumerate() {
             let cell = cell.as_ref();
             if cell.len() > self.limits.max_cell_bytes {
@@ -257,8 +252,9 @@ impl CsvFormatter {
                     actual: cell.len(),
                 });
             }
+            captured.push(cell);
         }
-        Ok(())
+        Ok(captured)
     }
 }
 
@@ -268,15 +264,12 @@ impl Default for CsvFormatter {
     }
 }
 
-fn write_record<W: Write + ?Sized, Cell: AsRef<str>>(
-    writer: &mut W,
-    cells: &[Cell],
-) -> io::Result<()> {
-    for (column, cell) in cells.iter().enumerate() {
+fn write_record<W: Write + ?Sized>(writer: &mut W, cells: &[&str]) -> io::Result<()> {
+    for (column, &cell) in cells.iter().enumerate() {
         if column != 0 {
             writer.write_all(b",")?;
         }
-        write_field(writer, cell.as_ref())?;
+        write_field(writer, cell)?;
     }
     writer.write_all(b"\r\n")
 }
