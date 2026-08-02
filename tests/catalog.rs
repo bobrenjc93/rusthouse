@@ -1,6 +1,7 @@
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, ColumnDefinition, ColumnType, CreateTable,
-    IdentifierError, MAX_COLUMNS, MAX_INPUT_BYTES, SchemaError, parse_create_table,
+    IdentifierError, MAX_COLUMNS, MAX_INPUT_BYTES, QueryLimits, SchemaError, Value, execute_select,
+    parse_create_table,
 };
 
 #[test]
@@ -33,6 +34,38 @@ fn creates_an_empty_non_nullable_table_from_parsed_sql() {
         table.schema().column(3).unwrap().data_type(),
         ColumnType::String
     );
+}
+
+#[test]
+fn created_table_supports_transactional_batch_insertion_and_bounded_scans() {
+    let mut catalog = Catalog::new();
+    catalog
+        .create_table(parse_create_table("CREATE TABLE Events (id Int64, label String)").unwrap())
+        .unwrap();
+
+    catalog
+        .table_mut("EVENTS")
+        .unwrap()
+        .insert_rows(&[
+            vec![Value::Int64(1), Value::from("first")],
+            vec![Value::Int64(2), Value::from("second")],
+        ])
+        .unwrap();
+
+    let table = catalog.table("events").unwrap();
+    let result = execute_select(
+        "SELECT * FROM Events",
+        catalog.table_name("events").unwrap(),
+        table,
+        QueryLimits::new(1),
+    )
+    .unwrap();
+
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::Int64(1), Value::from("first")]]
+    );
+    assert!(result.truncated);
 }
 
 #[test]
@@ -310,6 +343,7 @@ fn lookups_reject_names_over_the_input_limit() {
         .unwrap();
     let over_limit = "a".repeat(MAX_INPUT_BYTES + 1);
 
+    assert!(catalog.table_mut(&over_limit).is_none());
     assert!(catalog.table(&over_limit).is_none());
     assert_eq!(catalog.table_name(&over_limit), None);
     assert!(catalog.table("EVENTS").is_some());

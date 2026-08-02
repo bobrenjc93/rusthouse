@@ -229,6 +229,14 @@ impl Catalog {
         self.tables.get(&normalized_name).map(|entry| &entry.table)
     }
 
+    /// Mutably looks up a table using an ASCII case-insensitive name.
+    pub fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
+        let normalized_name = normalize_lookup_name(name)?;
+        self.tables
+            .get_mut(&normalized_name)
+            .map(|entry| &mut entry.table)
+    }
+
     /// Returns the spelling used when a table was created.
     pub fn table_name(&self, name: &str) -> Option<&str> {
         let normalized_name = normalize_lookup_name(name)?;
