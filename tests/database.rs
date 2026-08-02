@@ -12,7 +12,7 @@ fn preserves_catalog_state_across_execution_calls() {
     );
     assert!(
         database
-            .execute("INSERT INTO events VALUES (7, 'first')")
+            .execute("INSERT INTO events VALUES (7, 'first'), (8, 'second')")
             .unwrap()
             .is_empty()
     );
@@ -23,9 +23,12 @@ fn preserves_catalog_state_across_execution_calls() {
     };
     assert_eq!(
         result.rows(),
-        [vec![Value::String("first".to_owned()), Value::Int64(7)]]
+        [
+            vec![Value::String("first".to_owned()), Value::Int64(7)],
+            vec![Value::String("second".to_owned()), Value::Int64(8)],
+        ]
     );
-    assert_eq!(database.catalog().table("events").unwrap().row_count(), 1);
+    assert_eq!(database.catalog().table("events").unwrap().row_count(), 2);
 }
 
 #[test]
