@@ -221,6 +221,32 @@ impl BatchBudget {
     }
 }
 
+#[derive(Debug)]
+enum RowSelection {
+    Prefix(usize),
+    Indices(Vec<usize>),
+}
+
+impl RowSelection {
+    fn len(&self) -> usize {
+        match self {
+            Self::Prefix(length) => *length,
+            Self::Indices(indices) => indices.len(),
+        }
+    }
+
+    fn row_at(&self, position: usize) -> usize {
+        match self {
+            Self::Prefix(_) => position,
+            Self::Indices(indices) => indices[position],
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(|position| self.row_at(position))
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -384,20 +410,11 @@ impl Database {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let mut row_indices = (0..table.row_count()).collect::<Vec<_>>();
-                if !order_by.is_empty() {
-                    row_indices.sort_by(|&left, &right| {
-                        compare_rows(table, &order_by, left, right).then_with(|| left.cmp(&right))
-                    });
-                }
-                row_indices.truncate(
-                    statement
-                        .limit
-                        .unwrap_or(table.row_count())
-                        .min(table.row_count()),
-                );
-
-                let result_cells = row_indices.len().saturating_mul(projection_width);
+                let selected_row_count = statement
+                    .limit
+                    .unwrap_or(table.row_count())
+                    .min(table.row_count());
+                let result_cells = selected_row_count.saturating_mul(projection_width);
                 if result_cells > self.config.max_result_cells {
                     return Err(Error::ResultTooLarge {
                         actual: result_cells,
@@ -408,8 +425,37 @@ impl Database {
                     budget.check_cells(result_cells)?;
                 }
 
+                let prefix_selection = if selected_row_count == 0 || order_by.is_empty() {
+                    Some(RowSelection::Prefix(selected_row_count))
+                } else {
+                    None
+                };
+                if prefix_selection.is_none() {
+                    let fixed_materialized_bytes =
+                        estimate_fixed_result_bytes(table, &column_indices, selected_row_count);
+                    if fixed_materialized_bytes > self.config.max_result_bytes {
+                        return Err(Error::ResultBytesTooLarge {
+                            actual: fixed_materialized_bytes,
+                            maximum: self.config.max_result_bytes,
+                        });
+                    }
+                    if let Some(budget) = batch_budget {
+                        budget.check_bytes(fixed_materialized_bytes)?;
+                    }
+                }
+
+                let selected_rows = if let Some(prefix) = prefix_selection {
+                    prefix
+                } else if selected_row_count == table.row_count() {
+                    let mut indices = (0..table.row_count()).collect::<Vec<_>>();
+                    indices.sort_by(|&left, &right| compare_rows(table, &order_by, left, right));
+                    RowSelection::Indices(indices)
+                } else {
+                    RowSelection::Indices(select_top_rows(table, &order_by, selected_row_count))
+                };
+
                 let materialized_bytes =
-                    estimate_result_bytes(table, &column_indices, &row_indices);
+                    estimate_result_bytes(table, &column_indices, &selected_rows);
                 if materialized_bytes > self.config.max_result_bytes {
                     return Err(Error::ResultBytesTooLarge {
                         actual: materialized_bytes,
@@ -430,8 +476,8 @@ impl Database {
                             .clone()
                     })
                     .collect();
-                let rows = row_indices
-                    .into_iter()
+                let rows = selected_rows
+                    .iter()
                     .map(|row| {
                         column_indices
                             .iter()
@@ -485,23 +531,65 @@ fn compare_rows(
         })
         .find(|&ordering| ordering != Ordering::Equal)
         .unwrap_or(Ordering::Equal)
+        .then_with(|| left.cmp(&right))
 }
 
-fn estimate_result_bytes(table: &Table, column_indices: &[usize], row_indices: &[usize]) -> usize {
-    let cell_count = row_indices.len().saturating_mul(column_indices.len());
+fn select_top_rows(table: &Table, order_by: &[(usize, SortDirection)], limit: usize) -> Vec<usize> {
+    debug_assert!(limit > 0);
+    debug_assert!(limit < table.row_count());
+
+    let mut heap = Vec::with_capacity(limit);
+    for row in 0..table.row_count() {
+        if heap.len() < limit {
+            heap.push(row);
+            let mut child = heap.len() - 1;
+            while child > 0 {
+                let parent = (child - 1) / 2;
+                if compare_rows(table, order_by, heap[parent], heap[child]) != Ordering::Less {
+                    break;
+                }
+                heap.swap(parent, child);
+                child = parent;
+            }
+        } else if compare_rows(table, order_by, row, heap[0]) == Ordering::Less {
+            heap[0] = row;
+            let mut parent = 0;
+            loop {
+                let left = parent * 2 + 1;
+                if left >= heap.len() {
+                    break;
+                }
+                let right = left + 1;
+                let worse_child = if right < heap.len()
+                    && compare_rows(table, order_by, heap[left], heap[right]) == Ordering::Less
+                {
+                    right
+                } else {
+                    left
+                };
+                if compare_rows(table, order_by, heap[parent], heap[worse_child]) != Ordering::Less
+                {
+                    break;
+                }
+                heap.swap(parent, worse_child);
+                parent = worse_child;
+            }
+        }
+    }
+    heap.sort_by(|&left, &right| compare_rows(table, order_by, left, right));
+    heap
+}
+
+fn estimate_fixed_result_bytes(table: &Table, column_indices: &[usize], row_count: usize) -> usize {
+    let cell_count = row_count.saturating_mul(column_indices.len());
     let mut bytes = mem::size_of::<QueryResult>()
         .saturating_add(cell_count.saturating_mul(mem::size_of::<Value>()))
-        .saturating_add(
-            row_indices
-                .len()
-                .saturating_mul(mem::size_of::<Vec<Value>>()),
-        )
+        .saturating_add(row_count.saturating_mul(mem::size_of::<Vec<Value>>()))
         .saturating_add(
             column_indices
                 .len()
                 .saturating_mul(mem::size_of::<ColumnSchema>()),
         );
-    let mut string_bytes = vec![None; table.schema().len()];
 
     for &index in column_indices {
         let definition = table
@@ -509,12 +597,24 @@ fn estimate_result_bytes(table: &Table, column_indices: &[usize], row_indices: &
             .column(index)
             .expect("projection indices come from this schema");
         bytes = bytes.saturating_add(definition.name().len());
+    }
+    bytes
+}
 
+fn estimate_result_bytes(
+    table: &Table,
+    column_indices: &[usize],
+    selected_rows: &RowSelection,
+) -> usize {
+    let mut bytes = estimate_fixed_result_bytes(table, column_indices, selected_rows.len());
+    let mut string_bytes = vec![None; table.schema().len()];
+
+    for &index in column_indices {
         let selected_string_bytes = *string_bytes[index].get_or_insert_with(|| {
             table
                 .column(index)
                 .expect("storage columns match the schema")
-                .cloned_string_bytes(row_indices)
+                .cloned_string_bytes(selected_rows.iter())
         });
         bytes = bytes.saturating_add(selected_string_bytes);
     }

@@ -13,6 +13,8 @@ pub enum Error {
     TooManyColumns { actual: usize, maximum: usize },
     /// A `SELECT` requested more output columns than the configured limit.
     TooManyProjectedColumns { actual: usize, maximum: usize },
+    /// An `ORDER BY` requested more unique columns than the configured limit.
+    TooManyOrderByColumns { actual: usize, maximum: usize },
     /// One query would materialize more cells than the configured limit.
     ResultTooLarge { actual: usize, maximum: usize },
     /// One query would materialize more bytes than the configured limit.
@@ -62,6 +64,10 @@ impl fmt::Display for Error {
             Self::TooManyProjectedColumns { actual, maximum } => write!(
                 formatter,
                 "projection has {actual} columns, exceeding the limit of {maximum}"
+            ),
+            Self::TooManyOrderByColumns { actual, maximum } => write!(
+                formatter,
+                "ORDER BY has {actual} unique columns, exceeding the limit of {maximum}"
             ),
             Self::ResultTooLarge { actual, maximum } => write!(
                 formatter,

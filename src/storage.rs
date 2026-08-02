@@ -222,9 +222,9 @@ impl Column {
         }
     }
 
-    pub(crate) fn cloned_string_bytes(&self, rows: &[usize]) -> usize {
+    pub(crate) fn cloned_string_bytes(&self, rows: impl Iterator<Item = usize>) -> usize {
         match self {
-            Self::String(values) => rows.iter().fold(0_usize, |total, &row| {
+            Self::String(values) => rows.fold(0_usize, |total, row| {
                 total.saturating_add(values[row].len())
             }),
             Self::Int64(_) | Self::Float64(_) | Self::Bool(_) => 0,

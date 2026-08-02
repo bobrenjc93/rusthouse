@@ -1,5 +1,7 @@
 //! Tokenization and parsing for the supported SQL subset.
 
+use std::collections::HashSet;
+
 use crate::{ColumnSchema, DataType, Error, Result, Value};
 
 /// A parsed `CREATE TABLE` statement.
@@ -476,6 +478,7 @@ impl Parser {
         let table = self.expect_identifier("a table name")?.0;
 
         let mut order_by = Vec::new();
+        let mut ordered_columns = HashSet::new();
         if self.current_is_keyword("ORDER") {
             self.advance();
             self.expect_keyword("BY")?;
@@ -490,7 +493,16 @@ impl Parser {
                 } else {
                     SortDirection::Ascending
                 };
-                order_by.push(OrderBy { column, direction });
+                if ordered_columns.insert(column.to_ascii_lowercase()) {
+                    let actual = order_by.len() + 1;
+                    if actual > self.max_columns {
+                        return Err(Error::TooManyOrderByColumns {
+                            actual,
+                            maximum: self.max_columns,
+                        });
+                    }
+                    order_by.push(OrderBy { column, direction });
+                }
 
                 if matches!(self.current().kind, TokenKind::Comma) {
                     self.advance();
@@ -660,5 +672,35 @@ mod tests {
             let input = format!("SELECT * FROM events LIMIT {limit}");
             assert!(parse_one(&input, 10).is_err(), "accepted LIMIT {limit}");
         }
+    }
+
+    #[test]
+    fn deduplicates_and_bounds_order_by_columns() {
+        let statement = parse_one("SELECT * FROM events ORDER BY Key DESC, key ASC, other", 2)
+            .expect("duplicate ORDER BY columns do not consume the bound");
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(
+            select.order_by,
+            [
+                OrderBy {
+                    column: "Key".to_owned(),
+                    direction: SortDirection::Descending,
+                },
+                OrderBy {
+                    column: "other".to_owned(),
+                    direction: SortDirection::Ascending,
+                },
+            ]
+        );
+
+        assert_eq!(
+            parse_one("SELECT * FROM events ORDER BY a, b, c", 2),
+            Err(Error::TooManyOrderByColumns {
+                actual: 3,
+                maximum: 2,
+            })
+        );
     }
 }

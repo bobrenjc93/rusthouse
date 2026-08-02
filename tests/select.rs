@@ -145,6 +145,74 @@ fn orders_all_types_lexicographically_with_mixed_directions_and_stable_ties() {
 }
 
 #[test]
+fn repeated_order_terms_are_deduplicated_for_large_tied_inputs() {
+    const ROW_COUNT: usize = 12_000;
+
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE tied (id Int64, tie_key Int64)")
+        .expect("create tied table");
+
+    let values = (0..ROW_COUNT)
+        .map(|id| format!("({id}, 0)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    database
+        .execute(&format!("INSERT INTO tied VALUES {values}"))
+        .expect("insert tied rows");
+
+    let order_by = std::iter::repeat_n("tie_key", ROW_COUNT)
+        .collect::<Vec<_>>()
+        .join(",");
+    let result = query(
+        database
+            .execute(&format!("SELECT id FROM tied ORDER BY {order_by} LIMIT 1"))
+            .expect("deduplicated top one"),
+    );
+
+    assert_eq!(result.rows(), [vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn bounded_top_n_matches_full_ordering_across_heap_sizes() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (id Int64, primary_key Int64, secondary_key Int64)")
+        .expect("create samples table");
+    let values = (0_i64..64)
+        .map(|id| {
+            let primary = (id * 37) % 11;
+            let secondary = (id * 19) % 7;
+            format!("({id}, {primary}, {secondary})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    database
+        .execute(&format!("INSERT INTO samples VALUES {values}"))
+        .expect("insert samples");
+
+    let full = query(
+        database
+            .execute(
+                "SELECT id FROM samples
+                 ORDER BY primary_key DESC, secondary_key ASC",
+            )
+            .expect("full ordering"),
+    );
+    for limit in [1, 2, 7, 31, 63] {
+        let top = query(
+            database
+                .execute(&format!(
+                    "SELECT id FROM samples
+                     ORDER BY primary_key DESC, secondary_key ASC LIMIT {limit}"
+                ))
+                .expect("bounded ordering"),
+        );
+        assert_eq!(top.rows(), &full.rows()[..limit]);
+    }
+}
+
+#[test]
 fn limit_is_exact_and_applied_before_result_materialization_limits() {
     let config = DatabaseConfig::new(4096, 2).with_result_limits(2, 8);
     let mut database = Database::with_config(config);

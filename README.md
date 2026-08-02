@@ -73,7 +73,9 @@ by multi-column `ORDER BY` terms with `ASC` or `DESC` and a nonnegative
 `LIMIT`. Predicates, expressions, aggregation, grouping, and joins are not yet
 part of the grammar. SQL keywords, identifiers, and the four type names are
 case-insensitive. By default, an input may contain at most 1 MiB and a table
-or projection may contain at most 1,024 columns. One materialized query and
+or projection may contain at most 1,024 columns. Repeated case-insensitive
+`ORDER BY` columns are ignored after their first occurrence, and unique sort
+columns use the same 1,024-column bound. One materialized query and
 all query results retained by `execute_batch` are each limited to 1,048,576
 cells and an estimated 64 MiB of materialized memory. The byte estimate
 includes cloned string payloads for every occurrence in a projection. These
