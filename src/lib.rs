@@ -1,8 +1,10 @@
 //! RustHouse is an experimental, compact analytical database.
 
+pub mod format;
 pub mod sql;
 pub mod storage;
 
+pub use format::{CsvError, CsvWithNamesWriter, write_csv_with_names};
 pub use storage::{Column, ColumnSchema, DataType, Row, Schema, StorageError, Table, Value};
 
 /// Returns the product name while the first storage engine is being built.
