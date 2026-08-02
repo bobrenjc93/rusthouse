@@ -49,7 +49,8 @@ fn executes_every_statement_received_before_eof() {
 fn escapes_csv_strings_and_decodes_sql_quotes() {
     let output = run(
         &["--format=csv"],
-        "SELECT 'plain' AS text;\n\
+        "SELECT '' AS empty;\n\
+         SELECT 'plain' AS text;\n\
          SELECT 'a,\"b\"' AS punctuation;\n\
          SELECT 'line\nnext' AS lines;\n\
          SELECT 'it''s done' AS apostrophe;",
@@ -58,9 +59,33 @@ fn escapes_csv_strings_and_decodes_sql_quotes() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "text\nplain\npunctuation\n\"a,\"\"b\"\"\"\nlines\n\"line\nnext\"\napostrophe\nit's done\n"
+        "empty\n\"\"\ntext\nplain\npunctuation\n\"a,\"\"b\"\"\"\nlines\n\"line\nnext\"\napostrophe\nit's done\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn enforces_the_sql_input_size_limit_at_the_boundary() {
+    let prefix = "SELECT 1 AS value;";
+    let accepted_sql = format!(
+        "{prefix}{}",
+        " ".repeat(rusthouse::MAX_SQL_INPUT_BYTES - prefix.len())
+    );
+
+    let accepted = run(&["--format", "csv"], &accepted_sql);
+    assert!(accepted.status.success());
+    assert_eq!(String::from_utf8(accepted.stdout).unwrap(), "value\n1\n");
+    assert!(accepted.stderr.is_empty());
+
+    let rejected_sql = format!("{accepted_sql} ");
+    let rejected = run(&["--format", "csv"], &rejected_sql);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("SQL input exceeds the 1048576-byte limit")
+    );
 }
 
 #[test]

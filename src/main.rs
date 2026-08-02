@@ -93,14 +93,29 @@ fn validate_format(format: &str) -> Result<(), String> {
 }
 
 fn execute() -> Result<(), String> {
-    let mut sql = String::new();
-    io::stdin()
-        .read_to_string(&mut sql)
-        .map_err(|error| format!("failed to read SQL from stdin: {error}"))?;
+    let stdin = io::stdin();
+    let sql = read_sql(stdin.lock())?;
 
     let results = rusthouse::parse_sql_batch(&sql).map_err(|error| error.to_string())?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     rusthouse::write_csv(&results, &mut output)
         .map_err(|error| format!("failed to write CSV to stdout: {error}"))
+}
+
+fn read_sql(reader: impl Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((rusthouse::MAX_SQL_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read SQL from stdin: {error}"))?;
+
+    if bytes.len() > rusthouse::MAX_SQL_INPUT_BYTES {
+        return Err(format!(
+            "SQL input exceeds the {}-byte limit",
+            rusthouse::MAX_SQL_INPUT_BYTES
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|_| "SQL input must be valid UTF-8".to_owned())
 }
