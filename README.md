@@ -4,6 +4,8 @@ RustHouse is a from-scratch analytical database in Rust, inspired by the useful 
 
 This is intentionally not a wire-compatible ClickHouse clone. The goal is to grow a credible small competitor through measured, reviewed iterations while keeping the implementation approachable.
 
+The current SQL foundation includes a bounded lexer with byte-positioned tokens and errors. Callers explicitly provide input-byte, token-count, and statement-count limits.
+
 ## Product target
 
 The first useful release should support:
@@ -28,4 +30,25 @@ cargo test
 cargo run -- --help
 ```
 
+RustHouse uses Rust 1.85.0, the minimum toolchain supporting edition 2024.
+`rustup` reads the checked-in toolchain file and installs rustfmt and Clippy.
+Run the same quality checks as CI from the repository root with:
+
+```bash
+cargo fmt --all --check && \
+  cargo build --all-targets --all-features --locked && \
+  cargo clippy --all-targets --all-features --locked -- -D warnings && \
+  cargo test --all-targets --all-features --locked && \
+  cargo test --doc --all-features --locked && \
+  RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --locked
+```
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->
