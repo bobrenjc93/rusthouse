@@ -1,6 +1,6 @@
 use rusthouse::{
-    Column, ColumnSchema, DataType, InsertError, NonFiniteFloat, Schema, SchemaError, Table,
-    TableLimits, Value, ValueRef, ValueType,
+    Column, ColumnSchema, DataType, InsertError, InsertRowsError, NonFiniteFloat, Schema,
+    SchemaError, Table, TableLimits, Value, ValueRef, ValueType,
 };
 
 fn all_types_schema(nullable: bool) -> Schema {
@@ -175,6 +175,142 @@ fn rejects_invalid_rows_without_mutation() {
         assert_eq!(table.insert_row(&row), Err(expected_error));
         assert_eq!(table, before);
     }
+}
+
+#[test]
+fn inserts_multiple_rows_as_one_batch() {
+    let mut table = Table::new(all_types_schema(true));
+    table
+        .insert_rows(&[
+            vec![
+                Value::Int64(1),
+                Value::Float64(1.5),
+                Value::Bool(true),
+                Value::from("first"),
+            ],
+            vec![Value::Null, Value::Null, Value::Null, Value::Null],
+            vec![
+                Value::Int64(3),
+                Value::Float64(3.5),
+                Value::Bool(false),
+                Value::from("third"),
+            ],
+        ])
+        .unwrap();
+
+    assert_eq!(table.len(), 3);
+    assert_eq!(table.string_bytes(), 10);
+    assert_eq!(
+        table.row(2),
+        Some(vec![
+            ValueRef::Int64(3),
+            ValueRef::Float64(3.5),
+            ValueRef::Bool(false),
+            ValueRef::String("third"),
+        ])
+    );
+    assert!(table.columns().iter().all(|column| column.len() == 3));
+}
+
+#[test]
+fn rejects_a_later_batch_row_without_inserting_preceding_rows() {
+    let mut table = Table::new(all_types_schema(false));
+    table
+        .insert_row(&[
+            Value::Int64(1),
+            Value::Float64(1.0),
+            Value::Bool(true),
+            Value::from("existing"),
+        ])
+        .unwrap();
+    let before = table.clone();
+
+    let error = table
+        .insert_rows(&[
+            vec![
+                Value::Int64(2),
+                Value::Float64(2.0),
+                Value::Bool(false),
+                Value::from("valid"),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Float64(3.0),
+                Value::Bool(true),
+                Value::from("also valid"),
+            ],
+            vec![
+                Value::Bool(false),
+                Value::Float64(4.0),
+                Value::Bool(true),
+                Value::from("invalid"),
+            ],
+        ])
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        InsertRowsError {
+            row: 2,
+            source: InsertError::TypeMismatch {
+                column: 0,
+                column_name: "id".to_owned(),
+                expected: DataType::Int64,
+                actual: ValueType::Bool,
+            },
+        }
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn batch_accepts_exact_cumulative_row_and_string_boundaries() {
+    let schema = Schema::new(vec![ColumnSchema::new("text", DataType::String, false)]).unwrap();
+    let mut table = Table::with_limits(schema, TableLimits::new(3, 6));
+    table.insert_row(&[Value::from("a")]).unwrap();
+
+    table
+        .insert_rows(&[vec![Value::from("bc")], vec![Value::from("def")]])
+        .unwrap();
+
+    assert_eq!(table.len(), 3);
+    assert_eq!(table.string_bytes(), 6);
+}
+
+#[test]
+fn cumulative_batch_limits_identify_the_first_rejected_row() {
+    let schema = Schema::new(vec![ColumnSchema::new("text", DataType::String, false)]).unwrap();
+    let mut row_limited = Table::with_limits(schema.clone(), TableLimits::new(3, usize::MAX));
+    row_limited.insert_row(&[Value::from("existing")]).unwrap();
+    let before = row_limited.clone();
+    assert_eq!(
+        row_limited.insert_rows(&[
+            vec![Value::from("first")],
+            vec![Value::from("second")],
+            vec![Value::from("rejected")],
+        ]),
+        Err(InsertRowsError {
+            row: 2,
+            source: InsertError::RowLimitExceeded { limit: 3 },
+        })
+    );
+    assert_eq!(row_limited, before);
+
+    let mut string_limited = Table::with_limits(schema, TableLimits::new(4, 6));
+    string_limited.insert_row(&[Value::from("a")]).unwrap();
+    let before = string_limited.clone();
+    assert_eq!(
+        string_limited.insert_rows(&[vec![Value::from("bc")], vec![Value::from("defg")],]),
+        Err(InsertRowsError {
+            row: 1,
+            source: InsertError::StringLimitExceeded {
+                limit: 6,
+                current: 3,
+                attempted: 7,
+            },
+        })
+    );
+    assert_eq!(string_limited, before);
 }
 
 #[test]

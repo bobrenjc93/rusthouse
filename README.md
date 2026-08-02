@@ -19,6 +19,30 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Current query API
+
+The library can execute the deliberately narrow `SELECT * FROM <identifier>`
+grammar against a caller-supplied in-memory table. Results contain cloned column
+metadata and owned rows, capped by a configurable row limit:
+
+```rust
+use rusthouse::{QueryLimits, Table, execute_select};
+
+# fn scan(table: &Table) -> Result<(), rusthouse::QueryError> {
+let result = execute_select(
+    "SELECT * FROM events;",
+    "events",
+    table,
+    QueryLimits::new(1_000),
+)?;
+println!("returned {} rows", result.rows.len());
+# Ok(())
+# }
+```
+
+Only that exact projection is supported today; predicates, explicit column
+lists, ordering, and SQL `LIMIT` remain future query-engine work.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
