@@ -28,4 +28,21 @@ cargo test
 cargo run -- --help
 ```
 
+## Constant-query CLI
+
+The current executable implements a deliberately bounded first SQL surface. It
+accepts semicolon-separated `SELECT` statements whose projections are `Int64`,
+`Float64`, `Bool`, or single-quoted String literals. Projections may use
+`AS identifier` aliases. Output is CSVWithNames-compatible CSV; tables, other
+clauses, expressions, aggregation, and DDL are rejected.
+
+```bash
+cargo run -- --execute "SELECT 42 AS answer, 'it''s ready' AS message" --format csv
+printf "SELECT true AS ready; SELECT 1.5 AS ratio;" | cargo run -- --format csv
+```
+
+Without `--execute`, the command reads standard input through EOF. SQL input is
+limited to 1 MiB. Invalid arguments, malformed SQL, invalid UTF-8, and oversized
+input produce an error on standard error and a nonzero exit status.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
