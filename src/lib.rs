@@ -1,12 +1,24 @@
 //! RustHouse is an experimental, compact analytical database.
 
+mod format;
+mod parser;
 mod storage;
 
+pub use format::render_csv;
+pub use parser::{SelectStatement, SqlError, parse_sql};
 pub use storage::{ColumnDef, DataType, Table, TableError, Value};
 
-/// Returns the product name while the first storage engine is being built.
+/// Maximum number of bytes accepted at the SQL input boundary.
+pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Returns the product name.
 pub fn product_name() -> &'static str {
     "RustHouse"
+}
+
+/// Parses supported SQL and returns its results in CSV-with-header format.
+pub fn execute_sql(input: &str) -> Result<String, SqlError> {
+    parse_sql(input).map(|statements| render_csv(&statements))
 }
 
 #[cfg(test)]
