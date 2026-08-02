@@ -1,8 +1,8 @@
 //! Stateful SQL execution and the in-memory table catalog.
 
 use crate::{
-    CreateTable, Field, InsertInto, QueryResult, Schema, SqlError, SqlErrorKind, Statement, Table,
-    parse_database_batch,
+    CreateTable, Field, InsertInto, MAX_IDENTIFIER_BYTES, MAX_SCHEMA_FIELDS, QueryResult, Schema,
+    SqlError, SqlErrorKind, Statement, Table, parse_database_batch,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -53,7 +53,7 @@ impl Database {
             match statement {
                 Statement::Select(result) => results.push(result),
                 Statement::CreateTable(definition) => {
-                    let (name, table) = build_table(definition);
+                    let (name, table) = build_table(input, definition)?;
                     staged_tables.insert(name, table);
                 }
                 Statement::InsertInto(insert) => {
@@ -151,17 +151,38 @@ impl Database {
     }
 }
 
-fn build_table(definition: CreateTable) -> (String, Table) {
+fn build_table(input: &str, definition: CreateTable) -> Result<(String, Table), SqlError> {
+    let error_offset = definition
+        .fields
+        .get(MAX_SCHEMA_FIELDS)
+        .map(|field| field.name.byte_offset)
+        .or_else(|| {
+            definition
+                .fields
+                .iter()
+                .find(|field| field.name.value.len() > MAX_IDENTIFIER_BYTES)
+                .map(|field| field.name.byte_offset)
+        })
+        .unwrap_or(definition.name.byte_offset);
+    let table_name = definition.name.value.clone();
     let normalized_name = normalize_identifier(&definition.name.value);
     let fields = definition
         .fields
         .into_iter()
         .map(|field| Field::new(field.name.value, field.data_type, false))
         .collect();
-    let schema = Schema::new(fields)
-        .expect("CREATE TABLE field names were checked for duplicates during parsing");
+    let schema = Schema::new(fields).map_err(|error| {
+        SqlError::at(
+            input,
+            error_offset,
+            SqlErrorKind::InvalidSchema {
+                table: table_name,
+                error,
+            },
+        )
+    })?;
 
-    (normalized_name, Table::new(schema, DEFAULT_TABLE_ROW_LIMIT))
+    Ok((normalized_name, Table::new(schema, DEFAULT_TABLE_ROW_LIMIT)))
 }
 
 fn normalize_identifier(identifier: &str) -> String {

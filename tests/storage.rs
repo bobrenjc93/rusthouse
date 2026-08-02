@@ -1,6 +1,6 @@
 use rusthouse::{
-    AppendError, BatchAppendError, Column, DataType, Field, Schema, SchemaError, Table, Value,
-    ValueType,
+    AppendError, BatchAppendError, Column, DataType, Field, MAX_IDENTIFIER_BYTES,
+    MAX_SCHEMA_FIELDS, MAX_STORED_STRING_BYTES, Schema, SchemaError, Table, Value, ValueType,
 };
 use std::cell::Cell;
 
@@ -36,6 +36,45 @@ fn schema_rejects_duplicate_field_names() {
     .unwrap_err();
 
     assert_eq!(error, SchemaError::DuplicateField { field: "id".into() });
+}
+
+#[test]
+fn schema_field_count_accepts_the_boundary_and_rejects_one_over() {
+    let fields = (0..MAX_SCHEMA_FIELDS)
+        .map(|index| Field::new(format!("field_{index}"), DataType::Int64, false))
+        .collect::<Vec<_>>();
+
+    let schema = Schema::new(fields.clone()).unwrap();
+    assert_eq!(schema.len(), MAX_SCHEMA_FIELDS);
+
+    let mut oversized = fields;
+    oversized.push(Field::new("one_too_many", DataType::Int64, false));
+    assert_eq!(
+        Schema::new(oversized),
+        Err(SchemaError::TooManyFields {
+            limit: MAX_SCHEMA_FIELDS,
+            actual: MAX_SCHEMA_FIELDS + 1,
+        })
+    );
+}
+
+#[test]
+fn schema_identifier_limit_counts_multibyte_utf8_bytes() {
+    let exact = "é".repeat(MAX_IDENTIFIER_BYTES / "é".len());
+    assert_eq!(exact.len(), MAX_IDENTIFIER_BYTES);
+    assert!(exact.chars().count() < MAX_IDENTIFIER_BYTES);
+    Schema::new(vec![Field::new(&exact, DataType::String, false)]).unwrap();
+
+    let one_over = format!("{exact}a");
+    assert_eq!(one_over.len(), MAX_IDENTIFIER_BYTES + 1);
+    assert_eq!(
+        Schema::new(vec![Field::new(&one_over, DataType::String, false)]),
+        Err(SchemaError::IdentifierTooLong {
+            field: one_over,
+            length: MAX_IDENTIFIER_BYTES + 1,
+            limit: MAX_IDENTIFIER_BYTES,
+        })
+    );
 }
 
 #[test]
@@ -177,6 +216,56 @@ fn every_validation_error_leaves_the_table_unchanged() {
         vec![],
         AppendError::RowLimitExceeded { limit: 2 },
     );
+}
+
+#[test]
+fn named_append_enforces_the_stored_string_boundary_atomically() {
+    let schema = Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
+    let mut table = Table::new(schema, 2);
+    let exact = "x".repeat(MAX_STORED_STRING_BYTES);
+
+    table.append_row([("value", Value::String(exact))]).unwrap();
+    let before = table.clone();
+    let one_over = "x".repeat(MAX_STORED_STRING_BYTES + 1);
+
+    assert_eq!(
+        table.append_row([("value", Value::String(one_over))]),
+        Err(AppendError::StringTooLong {
+            field: "value".into(),
+            length: MAX_STORED_STRING_BYTES + 1,
+            limit: MAX_STORED_STRING_BYTES,
+        })
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn positional_batch_counts_multibyte_string_bytes_before_any_mutation() {
+    let schema = Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
+    let mut table = Table::new(schema, 4);
+    let exact = "é".repeat(MAX_STORED_STRING_BYTES / "é".len());
+    assert_eq!(exact.len(), MAX_STORED_STRING_BYTES);
+    assert!(exact.chars().count() < MAX_STORED_STRING_BYTES);
+    table
+        .append_batch([[Value::String(exact.clone())]])
+        .unwrap();
+
+    let before = table.clone();
+    let one_over = format!("{exact}a");
+    assert_eq!(one_over.len(), MAX_STORED_STRING_BYTES + 1);
+    assert_eq!(
+        table.append_batch([
+            [Value::String("valid earlier row".into())],
+            [Value::String(one_over)],
+        ]),
+        Err(BatchAppendError::StringTooLong {
+            row_index: 1,
+            field: "value".into(),
+            length: MAX_STORED_STRING_BYTES + 1,
+            limit: MAX_STORED_STRING_BYTES,
+        })
+    );
+    assert_eq!(table, before);
 }
 
 #[test]
