@@ -203,19 +203,20 @@ impl Catalog {
             });
         }
 
-        let schema = Schema::new(
-            statement
-                .columns
-                .into_iter()
-                .map(|column| ColumnSchema::new(column.name, column.column_type, false))
-                .collect(),
-        )
-        .map_err(CatalogError::InvalidSchema)?;
+        let mut columns = Vec::with_capacity(statement.columns.len());
+        for column in &statement.columns {
+            columns.push(ColumnSchema::new(
+                column.name.as_str().to_owned(),
+                column.column_type,
+                false,
+            ));
+        }
+        let schema = Schema::new(columns).map_err(CatalogError::InvalidSchema)?;
 
         self.tables.insert(
             normalized_name,
             CatalogTable {
-                name: statement.name,
+                name: statement.name.as_str().to_owned(),
                 table: Table::new(schema),
             },
         );
@@ -332,4 +333,42 @@ fn validate_identifier(name: &str) -> Result<(), IdentifierError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::ColumnDefinition;
+
+    #[test]
+    fn accepted_ast_does_not_retain_forged_spare_capacity() {
+        let string_capacity = MAX_INPUT_BYTES * 4;
+        let mut table_name = String::with_capacity(string_capacity);
+        table_name.push_str("events");
+        let mut column_name = String::with_capacity(string_capacity);
+        column_name.push_str("id");
+
+        let forged_column_capacity = MAX_COLUMNS * 4;
+        let mut columns = Vec::with_capacity(forged_column_capacity);
+        columns.push(ColumnDefinition {
+            name: column_name,
+            column_type: DataType::Int64,
+        });
+        assert!(table_name.capacity() > MAX_INPUT_BYTES);
+        assert!(columns.capacity() > MAX_COLUMNS);
+        assert!(columns[0].name.capacity() > MAX_INPUT_BYTES);
+
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(CreateTable {
+                name: table_name,
+                columns,
+            })
+            .unwrap();
+
+        let entry = catalog.tables.get("events").unwrap();
+        assert!(entry.name.capacity() <= MAX_INPUT_BYTES);
+        assert!(entry.table.schema().column_capacity() <= MAX_COLUMNS);
+        assert!(entry.table.schema().column_name_capacity(0).unwrap() <= MAX_INPUT_BYTES);
+    }
 }
