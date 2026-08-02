@@ -1,0 +1,76 @@
+name: Record Burner evaluation history
+
+on:
+  repository_dispatch:
+    types: [burner_evaluation_completed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  record:
+    name: Verify merge and record scores
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Authenticate, verify, regenerate, and push with conflict retries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..8}; do
+            git fetch origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+            attempt_dir="${RUNNER_TEMP}/burner-history-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${attempt}"
+            git worktree add --detach "$attempt_dir" "origin/${DEFAULT_BRANCH}"
+
+            set +e
+            (
+              set -euo pipefail
+              cd "$attempt_dir"
+              python3 scripts/burner_history.py dispatch \
+                --event "$GITHUB_EVENT_PATH" \
+                --repository "$GITHUB_REPOSITORY"
+              python3 scripts/burner_history.py validate
+
+              if git diff --quiet -- README.md docs/burner-evaluation-history.json docs/burner-evaluation-progress.svg; then
+                exit 0
+              fi
+
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add -- README.md docs/burner-evaluation-history.json docs/burner-evaluation-progress.svg
+              git diff --cached --check
+              git commit -m "docs: record Burner evaluation for PR #${PR_NUMBER}"
+              if ! git push origin "HEAD:${DEFAULT_BRANCH}"; then
+                exit 75
+              fi
+            )
+            status=$?
+            set -e
+
+            git worktree remove --force "$attempt_dir"
+            if [[ $status -eq 0 ]]; then
+              exit 0
+            fi
+            if [[ $status -ne 75 ]]; then
+              exit "$status"
+            fi
+
+            echo "Default branch advanced during attempt ${attempt}; retrying from the latest history."
+            sleep $((attempt * 2))
+          done
+
+          echo "Could not push evaluation history after 8 conflicts; retry this dispatch." >&2
+          exit 1
+

@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "description": "Versioned source data for the Burner evaluation graph. The root baseline is preserved here, and verified merged pull requests are appended automatically by the repository dispatch workflow.",
+  "tracking": {
+    "repository": "bobrenjc93/rusthouse",
+    "defaultBranch": "main",
+    "startedAt": "2026-08-01T23:27:12.862Z",
+    "rootCommit": "86a8093e0d64e3c9aca7cbd52fa79afd8e063487",
+    "dispatchEvent": "burner_evaluation_completed",
+    "dispatchActor": {
+      "login": "bobrenjc93",
+      "id": 1324201
+    },
+    "updatePolicy": "After Burner finishes every enabled evaluation for a merged PR, the trusted dispatchActor sends one version-1 repository dispatch containing the PR number, merge commit, and complete score set. The workflow rejects every other GitHub-authenticated sender, then verifies GitHub merge evidence and default-branch ancestry before recording the point; exact retries do not add another point and conflicting retries fail. A new evaluation may be registered with introducedAt after the latest point, and its score becomes mandatory on the first merge at or after that boundary."
+  },
+  "evaluations": {
+    "eval_89d3e777": {
+      "name": "Analytical database capability",
+      "color": "#c2410c",
+      "dash": "",
+      "introducedAt": "2026-08-01T23:26:09.122Z"
+    },
+    "eval_c7781241": {
+      "name": "Rust engineering quality",
+      "color": "#2563eb",
+      "dash": "10 4",
+      "introducedAt": "2026-08-01T23:26:09.404Z"
+    },
+    "eval_b1dae97f": {
+      "name": "ClickHouse sustained parity",
+      "color": "#15803d",
+      "dash": "3 3",
+      "introducedAt": "2026-08-01T23:26:09.687Z"
+    },
+    "eval_c42dd3d5": {
+      "name": "Benchmark integrity and anti-gaming",
+      "color": "#7e22ce",
+      "dash": "12 4 3 4",
+      "introducedAt": "2026-08-01T23:26:09.980Z"
+    },
+    "eval_1463d7a4": {
+      "name": "ClickHouse feature comprehensiveness",
+      "color": "#be123c",
+      "dash": "8 3",
+      "introducedAt": "2026-08-01T23:26:10.282Z"
+    },
+    "eval_07088400": {
+      "name": "Evaluation progress accounting",
+      "color": "#0f766e",
+      "dash": "2 3",
+      "introducedAt": "2026-08-01T23:26:10.570Z"
+    }
+  },
+  "points": [
+    {
+      "key": "baseline:86a8093e0d64e3c9aca7cbd52fa79afd8e063487",
+      "kind": "baseline",
+      "recordedAt": "2026-08-01T23:27:12.862Z",
+      "label": "Baseline 86a8093",
+      "commit": "86a8093e0d64e3c9aca7cbd52fa79afd8e063487",
+      "scores": {
+        "eval_89d3e777": 0,
+        "eval_c7781241": 25,
+        "eval_b1dae97f": 0,
+        "eval_c42dd3d5": 85,
+        "eval_1463d7a4": 0,
+        "eval_07088400": 0
+      },
+      "evidence": {
+        "source": "Burner baseline evaluation",
+        "runs": {
+          "eval_89d3e777": "evalrun_5e8c2023",
+          "eval_c7781241": "evalrun_49fa1d8d",
+          "eval_b1dae97f": "evalrun_1b845f92",
+          "eval_c42dd3d5": "evalrun_64e1a850",
+          "eval_1463d7a4": "evalrun_cadcc041",
+          "eval_07088400": "evalrun_366de506"
+        }
+      }
+    }
+  ]
+}
