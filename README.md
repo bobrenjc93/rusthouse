@@ -77,7 +77,9 @@ all query results retained by `execute_batch` are each limited to 1,048,576
 cells and an estimated 64 MiB of materialized memory. The byte estimate
 includes cloned string payloads for every occurrence in a projection. These
 limits can be changed with `DatabaseConfig`, `DatabaseConfig::with_result_limits`,
-and `DatabaseConfig::with_result_byte_limits`.
+and `DatabaseConfig::with_result_byte_limits`. Collecting batches preflight
+each `SELECT` against their remaining cell and byte budgets before allocating
+its projected rows.
 
 The CLI reads one complete valid semicolon-separated batch from stdin and
 rejects oversized input as soon as it crosses the byte limit. It streams each

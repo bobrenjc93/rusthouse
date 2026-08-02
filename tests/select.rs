@@ -215,26 +215,36 @@ fn collecting_batches_are_cumulative_but_streaming_batches_do_not_retain() {
 }
 
 #[test]
-fn collecting_batches_enforce_cumulative_materialized_bytes() {
-    let config = DatabaseConfig::new(4096, 2)
+fn collecting_batches_preflight_multiple_results_against_remaining_bytes() {
+    let payload = "x".repeat(4096);
+    let setup = format!(
+        "CREATE TABLE events (label String); \
+         INSERT INTO events VALUES ('{payload}');"
+    );
+
+    let mut probe = Database::with_config(DatabaseConfig::new(8192, 2));
+    probe.execute_batch(&setup).expect("probe setup");
+    let one_result_bytes = query(
+        probe
+            .execute("SELECT label FROM events")
+            .expect("individually valid result"),
+    )
+    .materialized_bytes();
+
+    let config = DatabaseConfig::new(8192, 2)
         .with_result_limits(4, 4)
-        .with_result_byte_limits(usize::MAX, 1);
+        .with_result_byte_limits(one_result_bytes, one_result_bytes);
     let mut database = Database::with_config(config);
-    database
-        .execute_batch(
-            "CREATE TABLE events (id Int64); \
-             INSERT INTO events VALUES (1);",
-        )
-        .expect("setup batch");
+    database.execute_batch(&setup).expect("bounded setup");
 
     let error = database
-        .execute_batch("SELECT id FROM events")
-        .expect_err("one materialized row exceeds a one-byte batch limit");
-    assert!(matches!(
+        .execute_batch("SELECT label FROM events; SELECT label FROM events")
+        .expect_err("the second result exceeds the remaining batch bytes");
+    assert_eq!(
         error,
         Error::BatchResultBytesTooLarge {
-            actual,
-            maximum: 1
-        } if actual > 1
-    ));
+            actual: one_result_bytes.saturating_mul(2),
+            maximum: one_result_bytes,
+        }
+    );
 }

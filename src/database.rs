@@ -188,6 +188,38 @@ impl Iterator for BatchResults<'_> {
 
 impl FusedIterator for BatchResults<'_> {}
 
+#[derive(Clone, Copy, Debug)]
+struct BatchBudget {
+    retained_cells: usize,
+    retained_bytes: usize,
+    maximum_cells: usize,
+    maximum_bytes: usize,
+}
+
+impl BatchBudget {
+    fn check_cells(self, additional: usize) -> Result<()> {
+        let actual = self.retained_cells.saturating_add(additional);
+        if actual > self.maximum_cells {
+            return Err(Error::BatchResultTooLarge {
+                actual,
+                maximum: self.maximum_cells,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_bytes(self, additional: usize) -> Result<()> {
+        let actual = self.retained_bytes.saturating_add(additional);
+        if actual > self.maximum_bytes {
+            return Err(Error::BatchResultBytesTooLarge {
+                actual,
+                maximum: self.maximum_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Database {
     #[must_use]
     pub fn new() -> Self {
@@ -225,32 +257,26 @@ impl Database {
     /// The complete batch is parsed before the first statement is executed.
     /// Execution stops at the first typed execution failure, including when
     /// retained query cells or bytes exceed their configured batch limits.
+    /// Each query is checked against the remaining budgets before its rows
+    /// are materialized.
     pub fn execute_batch(&mut self, input: &str) -> Result<Vec<ExecutionResult>> {
-        let maximum_cells = self.config.max_batch_result_cells;
-        let maximum_bytes = self.config.max_batch_result_bytes;
+        self.validate_input_size(input)?;
+        let statements = sql::parse_batch(input, self.config.max_columns_per_table)?;
         let mut retained_cells = 0_usize;
         let mut retained_bytes = 0_usize;
         let mut results = Vec::new();
-        for result in self.execute_batch_iter(input)? {
-            let result = result?;
-            let additional_cells = result.query().map_or(0, QueryResult::cell_count);
-            let actual_cells = retained_cells.saturating_add(additional_cells);
-            if actual_cells > maximum_cells {
-                return Err(Error::BatchResultTooLarge {
-                    actual: actual_cells,
-                    maximum: maximum_cells,
-                });
+        for statement in statements {
+            let budget = BatchBudget {
+                retained_cells,
+                retained_bytes,
+                maximum_cells: self.config.max_batch_result_cells,
+                maximum_bytes: self.config.max_batch_result_bytes,
+            };
+            let result = self.execute_statement_with_budget(statement, Some(budget))?;
+            if let Some(query) = result.query() {
+                retained_cells = retained_cells.saturating_add(query.cell_count());
+                retained_bytes = retained_bytes.saturating_add(query.materialized_bytes());
             }
-            let additional_bytes = result.query().map_or(0, QueryResult::materialized_bytes);
-            let actual_bytes = retained_bytes.saturating_add(additional_bytes);
-            if actual_bytes > maximum_bytes {
-                return Err(Error::BatchResultBytesTooLarge {
-                    actual: actual_bytes,
-                    maximum: maximum_bytes,
-                });
-            }
-            retained_cells = actual_cells;
-            retained_bytes = actual_bytes;
             results.push(result);
         }
         Ok(results)
@@ -280,6 +306,14 @@ impl Database {
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<ExecutionResult> {
+        self.execute_statement_with_budget(statement, None)
+    }
+
+    fn execute_statement_with_budget(
+        &mut self,
+        statement: Statement,
+        batch_budget: Option<BatchBudget>,
+    ) -> Result<ExecutionResult> {
         match statement {
             Statement::CreateTable(statement) => {
                 let (name, columns) = statement.into_parts();
@@ -326,6 +360,9 @@ impl Database {
                         maximum: self.config.max_result_cells,
                     });
                 }
+                if let Some(budget) = batch_budget {
+                    budget.check_cells(result_cells)?;
+                }
 
                 let column_indices = match statement.projection {
                     Projection::All => (0..table.schema().len()).collect::<Vec<_>>(),
@@ -348,6 +385,9 @@ impl Database {
                         actual: materialized_bytes,
                         maximum: self.config.max_result_bytes,
                     });
+                }
+                if let Some(budget) = batch_budget {
+                    budget.check_bytes(materialized_bytes)?;
                 }
 
                 let columns = column_indices
