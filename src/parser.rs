@@ -172,7 +172,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_string(&mut self) -> Result<String, QueryError> {
-        debug_assert!(self.consume_byte(b'\''));
+        let consumed_opening_quote = self.consume_byte(b'\'');
+        debug_assert!(consumed_opening_quote);
         let mut value = String::new();
 
         loop {
