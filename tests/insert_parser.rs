@@ -65,6 +65,7 @@ fn parsed_rows_are_directly_accepted_by_atomic_batch_insertion() {
         TableLimits {
             max_columns: 3,
             max_rows: 2,
+            max_cells: 6,
             max_string_bytes: 9,
         },
     )

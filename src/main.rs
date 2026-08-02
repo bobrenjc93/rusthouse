@@ -1,6 +1,8 @@
+mod cli;
+
 fn main() {
-    println!(
-        "{}: the analytical engine is warming up",
-        rusthouse::product_name()
-    );
+    if let Err(error) = cli::run() {
+        eprintln!("rusthouse: {error}");
+        std::process::exit(1);
+    }
 }

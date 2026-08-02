@@ -1,6 +1,6 @@
 //! Typed, column-oriented in-memory table storage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, TryReserveError};
 use std::error::Error;
 use std::fmt;
 
@@ -259,18 +259,30 @@ impl Column {
             _ => unreachable!("values are type-checked before columns are mutated"),
         }
     }
+
+    fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        match self {
+            Self::Int64(values) => values.try_reserve(additional),
+            Self::Float64(values) => values.try_reserve(additional),
+            Self::Bool(values) => values.try_reserve(additional),
+            Self::String(values) => values.try_reserve(additional),
+        }
+    }
 }
 
 /// Resource bounds enforced by a [`Table`].
 ///
-/// `max_string_bytes` limits the total UTF-8 payload stored across all String
-/// columns, rather than the size of an individual value.
+/// `max_cells` limits the number of scalar values across all columns, while
+/// `max_string_bytes` separately limits the total UTF-8 payload stored across
+/// all String columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableLimits {
     /// Maximum number of columns in a table.
     pub max_columns: usize,
     /// Maximum number of rows stored in a table.
     pub max_rows: usize,
+    /// Maximum number of scalar cells stored across all columns.
+    pub max_cells: usize,
     /// Maximum total UTF-8 payload across all String columns, in bytes.
     pub max_string_bytes: usize,
 }
@@ -280,6 +292,7 @@ impl Default for TableLimits {
         Self {
             max_columns: 1_024,
             max_rows: 1_000_000,
+            max_cells: 16 * 1024 * 1024,
             max_string_bytes: 64 * 1024 * 1024,
         }
     }
@@ -350,6 +363,11 @@ impl Table {
         self.row_count
     }
 
+    /// Returns the number of scalar cells stored across all columns.
+    pub fn cell_count(&self) -> usize {
+        self.row_count * self.schema.len()
+    }
+
     /// Returns whether the table contains no rows.
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
@@ -372,9 +390,10 @@ impl Table {
 
     /// Atomically inserts a batch of rows.
     ///
-    /// Row count, shape, value types, and cumulative String bytes are checked
-    /// for the entire batch before any column is changed. A validation error
-    /// therefore leaves the table exactly as it was before the call.
+    /// Row and cell counts, shape, value types, and cumulative String bytes are
+    /// checked for the entire batch. Every column then reserves enough capacity
+    /// for the batch before any value is appended. An error therefore leaves
+    /// the table's logical contents unchanged.
     ///
     /// # Errors
     ///
@@ -392,6 +411,20 @@ impl Table {
             return Err(TableError::RowLimitExceeded {
                 limit: self.limits.max_rows,
                 attempted: attempted_rows,
+            });
+        }
+
+        let attempted_cells =
+            attempted_rows
+                .checked_mul(self.schema.len())
+                .ok_or(TableError::CellLimitExceeded {
+                    limit: self.limits.max_cells,
+                    attempted: usize::MAX,
+                })?;
+        if attempted_cells > self.limits.max_cells {
+            return Err(TableError::CellLimitExceeded {
+                limit: self.limits.max_cells,
+                attempted: attempted_cells,
             });
         }
 
@@ -443,6 +476,14 @@ impl Table {
             });
         }
 
+        for column in &mut self.columns {
+            column
+                .try_reserve(rows.len())
+                .map_err(|_| TableError::AllocationFailed {
+                    additional_rows: rows.len(),
+                })?;
+        }
+
         for row in rows {
             for (column, value) in self.columns.iter_mut().zip(row) {
                 column.push(value);
@@ -477,12 +518,24 @@ pub enum TableError {
         /// Total rows that the insertion attempted to store.
         attempted: usize,
     },
+    /// An insertion would exceed the table's configured scalar-cell limit.
+    CellLimitExceeded {
+        /// Configured maximum number of scalar cells.
+        limit: usize,
+        /// Total cells that the insertion attempted to store.
+        attempted: usize,
+    },
     /// An insertion would exceed the table's configured String byte limit.
     StringByteLimitExceeded {
         /// Configured maximum UTF-8 String payload, in bytes.
         limit: usize,
         /// Total UTF-8 String payload that the insertion attempted, in bytes.
         attempted: usize,
+    },
+    /// Physical columns could not reserve capacity for a validated batch.
+    AllocationFailed {
+        /// Additional rows for which each column attempted to reserve space.
+        additional_rows: usize,
     },
     /// A row has a different number of values than the schema has columns.
     RowShapeMismatch {
@@ -522,9 +575,17 @@ impl fmt::Display for TableError {
                 formatter,
                 "row limit exceeded: limit is {limit}, attempted {attempted}"
             ),
+            Self::CellLimitExceeded { limit, attempted } => write!(
+                formatter,
+                "cell limit exceeded: limit is {limit}, attempted {attempted}"
+            ),
             Self::StringByteLimitExceeded { limit, attempted } => write!(
                 formatter,
                 "String byte limit exceeded: limit is {limit}, attempted {attempted}"
+            ),
+            Self::AllocationFailed { additional_rows } => write!(
+                formatter,
+                "could not reserve column capacity for {additional_rows} additional rows"
             ),
             Self::RowShapeMismatch {
                 row,

@@ -6,6 +6,7 @@ fn limits(max_columns: usize, max_rows: usize, max_string_bytes: usize) -> Table
     TableLimits {
         max_columns,
         max_rows,
+        max_cells: max_columns.saturating_mul(max_rows),
         max_string_bytes,
     }
 }

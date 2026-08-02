@@ -14,6 +14,7 @@ fn limits(max_columns: usize, max_rows: usize, max_string_bytes: usize) -> Table
     TableLimits {
         max_columns,
         max_rows,
+        max_cells: max_columns.saturating_mul(max_rows),
         max_string_bytes,
     }
 }
@@ -145,6 +146,37 @@ fn enforces_row_and_utf8_byte_limits_at_the_boundary() {
 }
 
 #[test]
+fn enforces_total_cell_limit_without_mutating_columns() {
+    let mut table = Table::new(
+        schema(&[("id", DataType::Int64), ("active", DataType::Bool)]),
+        TableLimits {
+            max_columns: 2,
+            max_rows: 10,
+            max_cells: 4,
+            max_string_bytes: 0,
+        },
+    )
+    .unwrap();
+    table
+        .insert_row(vec![Value::Int64(1), Value::Bool(true)])
+        .unwrap();
+    assert_eq!(table.cell_count(), 2);
+    let snapshot = table.clone();
+
+    assert_eq!(
+        table.insert_batch(vec![
+            vec![Value::Int64(2), Value::Bool(false)],
+            vec![Value::Int64(3), Value::Bool(true)],
+        ]),
+        Err(TableError::CellLimitExceeded {
+            limit: 4,
+            attempted: 6,
+        })
+    );
+    assert_eq!(table, snapshot);
+}
+
+#[test]
 fn rejects_row_shape_without_mutating_the_table() {
     let mut table = Table::new(
         schema(&[("id", DataType::Int64), ("ok", DataType::Bool)]),
@@ -253,6 +285,12 @@ impl ReferenceTable {
             return false;
         };
         if attempted_rows > self.limits.max_rows {
+            return false;
+        }
+        let Some(attempted_cells) = attempted_rows.checked_mul(4) else {
+            return false;
+        };
+        if attempted_cells > self.limits.max_cells {
             return false;
         }
 

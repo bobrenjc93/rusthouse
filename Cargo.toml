@@ -11,3 +11,7 @@ repository = "https://github.com/bobrenjc93/rusthouse"
 unsafe_code = "forbid"
 
 [dependencies]
+
+[[bench]]
+name = "analytical_scan"
+harness = false

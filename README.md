@@ -59,6 +59,39 @@ id,label
 2,"with,comma"
 ```
 
+## Command line
+
+The `rusthouse` binary executes a bounded SQL script in one in-memory catalog.
+It accepts `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT * FROM ...`;
+each SELECT result is streamed to standard output as CSV. Pass a file path, or
+omit it (or use `-`) to read from standard input:
+
+```bash
+cargo run --quiet -- tests/fixtures/cli_workflow.sql
+printf 'CREATE TABLE t (id Int64); INSERT INTO t VALUES (1); SELECT * FROM t;' \
+  | cargo run --quiet
+```
+
+Input is UTF-8 and bounded to 8 MiB per invocation. Each statement also uses
+the parser and table limits documented by the library API. Run
+`cargo run --quiet -- --help` for the complete command contract.
+
+## Benchmarks
+
+The dependency-free analytical scan benchmark builds a deterministic,
+four-column table and repeatedly scans every typed column while computing
+numeric sums, a Boolean count, and String bytes. Its output includes the fixed
+seed, workload size, elapsed time, throughput, and a result checksum:
+
+```bash
+cargo bench --bench analytical_scan
+RUSTHOUSE_BENCH_ROWS=1000000 RUSTHOUSE_BENCH_ITERATIONS=100 \
+  cargo bench --bench analytical_scan
+```
+
+The environment variables make workload scaling reproducible; compare timing
+results only on the same machine and toolchain.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
