@@ -1,5 +1,6 @@
 //! Typed, columnar in-memory storage.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
@@ -197,6 +198,37 @@ impl Column {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Return one cell as an owned typed value.
+    #[must_use]
+    pub fn value(&self, row: usize) -> Option<Value> {
+        match self {
+            Self::Int64(values) => values.get(row).copied().map(Value::Int64),
+            Self::Float64(values) => values.get(row).copied().map(Value::Float64),
+            Self::Bool(values) => values.get(row).copied().map(Value::Bool),
+            Self::String(values) => values.get(row).cloned().map(Value::String),
+        }
+    }
+
+    pub(crate) fn compare_rows(&self, left: usize, right: usize) -> Ordering {
+        match self {
+            Self::Int64(values) => values[left].cmp(&values[right]),
+            Self::Float64(values) => values[left]
+                .partial_cmp(&values[right])
+                .expect("stored Float64 values are finite"),
+            Self::Bool(values) => values[left].cmp(&values[right]),
+            Self::String(values) => values[left].cmp(&values[right]),
+        }
+    }
+
+    pub(crate) fn cloned_string_bytes(&self, rows: impl Iterator<Item = usize>) -> usize {
+        match self {
+            Self::String(values) => rows.fold(0_usize, |total, row| {
+                total.saturating_add(values[row].len())
+            }),
+            Self::Int64(_) | Self::Float64(_) | Self::Bool(_) => 0,
+        }
     }
 
     pub fn as_int64(&self) -> Option<&[i64]> {
