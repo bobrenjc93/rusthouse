@@ -49,25 +49,52 @@ The repository begins as a deliberately tiny seed. Substantial functionality sho
 
 ## Current SQL surface
 
-The library currently executes one bounded `CREATE TABLE` statement per call
-and retains its typed schema in memory:
+The in-memory database executes bounded `CREATE TABLE`, `INSERT INTO ...
+VALUES`, and single-table projection `SELECT` statements. A batch is parsed in
+full before its statements execute in source order:
 
 ```rust
-use rusthouse::{DataType, Database};
+use rusthouse::{Database, Value};
 
 let mut database = Database::new();
-database.execute(
-    "CREATE TABLE events (id Int64, score Float64, active Bool, label String)",
+database.execute_batch(
+    "CREATE TABLE events (id Int64, score Float64, active Bool, label String);
+     INSERT INTO events VALUES (1, 2.5, true, 'first');",
 )?;
 
-let events = database.catalog().table("events").expect("table exists");
-assert_eq!(events.column("id").expect("column exists").data_type(), DataType::Int64);
+let result = database.execute("SELECT label, id FROM events")?;
+let rows = result.query().expect("SELECT returns rows").rows();
+assert_eq!(rows, [vec![Value::String("first".to_owned()), Value::Int64(1)]]);
 # Ok::<(), rusthouse::Error>(())
 ```
 
-SQL keywords and the four type names are case-insensitive. By default, an
-input may contain at most 1 MiB and a table may contain at most 1,024 columns;
-both limits can be changed with `DatabaseConfig`.
+`SELECT *` and explicit bare column lists are supported, optionally followed
+by multi-column `ORDER BY` terms with `ASC` or `DESC` and a nonnegative
+`LIMIT`. Predicates, expressions, aggregation, grouping, and joins are not yet
+part of the grammar. SQL keywords, identifiers, and the four type names are
+case-insensitive. By default, an input may contain at most 1 MiB and a table
+or projection may contain at most 1,024 columns. One materialized query and
+all query results retained by `execute_batch` are each limited to 1,048,576
+cells and an estimated 64 MiB of materialized memory. The byte estimate
+includes cloned string payloads for every occurrence in a projection. These
+limits can be changed with `DatabaseConfig`, `DatabaseConfig::with_result_limits`,
+and `DatabaseConfig::with_result_byte_limits`. Collecting batches preflight
+each `SELECT` against their remaining cell and byte budgets before allocating
+its projected rows.
+
+The CLI reads one complete valid semicolon-separated batch from stdin and
+rejects oversized input as soon as it crosses the byte limit. It streams each
+completed `SELECT` as CSV with a header row, without retaining earlier query
+results, and reports argument, input, SQL, storage, and output failures on
+stderr with a nonzero status:
+
+```bash
+printf "%s\n" \
+  "CREATE TABLE events (id Int64, label String);" \
+  "INSERT INTO events VALUES (1, 'one, quoted');" \
+  "SELECT * FROM events;" \
+  | cargo run -- --format csv
+```
 
 <!-- burner-progress:start -->
 ## Burner evaluation progress
