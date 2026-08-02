@@ -126,7 +126,7 @@ impl Schema {
     }
 }
 
-/// An owned value accepted by [`Table::insert_row`].
+/// An owned value accepted by [`Table::insert_row`] and [`Table::insert_rows`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -561,6 +561,32 @@ impl fmt::Display for InsertError {
 
 impl Error for InsertError {}
 
+/// An error from [`Table::insert_rows`] that identifies the rejected batch row.
+///
+/// `row` is the zero-based index within the submitted batch. The table remains
+/// unchanged when this error is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertRowsError {
+    pub row: usize,
+    pub source: InsertError,
+}
+
+impl fmt::Display for InsertRowsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "batch row {} was rejected: {}",
+            self.row, self.source
+        )
+    }
+}
+
+impl Error for InsertRowsError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// An in-memory table backed by one contiguous vector per schema column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
@@ -638,13 +664,52 @@ impl Table {
     /// Validates and appends one row. Every fallible validation completes before
     /// any column is changed, so every returned error leaves the table unchanged.
     pub fn insert_row(&mut self, values: &[Value]) -> Result<(), InsertError> {
+        let attempted_string_bytes =
+            self.validate_row(values, self.row_count, self.string_bytes)?;
+
+        self.append_row(values);
+        self.row_count += 1;
+        self.string_bytes = attempted_string_bytes;
+        Ok(())
+    }
+
+    /// Validates and appends a batch of rows atomically.
+    ///
+    /// Row indexes in [`InsertRowsError`] are zero-based within `rows`. All row
+    /// validation and cumulative resource-limit checks complete before any
+    /// column is changed, so every returned error leaves the table unchanged.
+    pub fn insert_rows(&mut self, rows: &[Vec<Value>]) -> Result<(), InsertRowsError> {
+        let mut attempted_row_count = self.row_count;
+        let mut attempted_string_bytes = self.string_bytes;
+
+        for (row, values) in rows.iter().enumerate() {
+            attempted_string_bytes = self
+                .validate_row(values, attempted_row_count, attempted_string_bytes)
+                .map_err(|source| InsertRowsError { row, source })?;
+            attempted_row_count += 1;
+        }
+
+        for values in rows {
+            self.append_row(values);
+        }
+        self.row_count = attempted_row_count;
+        self.string_bytes = attempted_string_bytes;
+        Ok(())
+    }
+
+    fn validate_row(
+        &self,
+        values: &[Value],
+        current_row_count: usize,
+        current_string_bytes: usize,
+    ) -> Result<usize, InsertError> {
         if values.len() != self.schema.len() {
             return Err(InsertError::Shape {
                 expected: self.schema.len(),
                 actual: values.len(),
             });
         }
-        if self.row_count >= self.limits.max_rows {
+        if current_row_count >= self.limits.max_rows {
             return Err(InsertError::RowLimitExceeded {
                 limit: self.limits.max_rows,
             });
@@ -684,21 +749,22 @@ impl Table {
             }
         }
 
-        let attempted_string_bytes = self.string_bytes.saturating_add(added_string_bytes);
+        let attempted_string_bytes = current_string_bytes.saturating_add(added_string_bytes);
         if attempted_string_bytes > self.limits.max_string_bytes {
             return Err(InsertError::StringLimitExceeded {
                 limit: self.limits.max_string_bytes,
-                current: self.string_bytes,
+                current: current_string_bytes,
                 attempted: attempted_string_bytes,
             });
         }
 
+        Ok(attempted_string_bytes)
+    }
+
+    fn append_row(&mut self, values: &[Value]) {
         for (column, value) in self.columns.iter_mut().zip(values) {
             column.push(value);
         }
-        self.row_count += 1;
-        self.string_bytes = attempted_string_bytes;
-        Ok(())
     }
 }
 

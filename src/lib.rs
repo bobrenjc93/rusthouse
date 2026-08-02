@@ -8,9 +8,9 @@ pub use parser::{
     ParseError, ParseErrorKind, parse_create_table,
 };
 pub use storage::{
-    BoolColumn, Column, ColumnSchema, DataType, Float64Column, InsertError, Int64Column,
-    NonFiniteFloat, Schema, SchemaError, StringColumn, Table, TableLimits, TypedColumn, Value,
-    ValueRef, ValueType,
+    BoolColumn, Column, ColumnSchema, DataType, Float64Column, InsertError, InsertRowsError,
+    Int64Column, NonFiniteFloat, Schema, SchemaError, StringColumn, Table, TableLimits,
+    TypedColumn, Value, ValueRef, ValueType,
 };
 
 /// Returns the product name while the first storage engine is being built.
