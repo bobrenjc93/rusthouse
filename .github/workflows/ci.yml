@@ -1,0 +1,36 @@
+name: Rust quality gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy checks
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run unit and integration tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Run documentation tests
+        run: cargo test --locked --doc --all-features
