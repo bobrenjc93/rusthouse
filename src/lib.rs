@@ -13,8 +13,9 @@ pub mod sql;
 
 pub use catalog::Catalog;
 pub use database::{
-    DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_INPUT_BYTES, Database, DatabaseConfig,
-    ExecutionResult, QueryResult,
+    BatchResults, DEFAULT_MAX_BATCH_RESULT_CELLS, DEFAULT_MAX_COLUMNS_PER_TABLE,
+    DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_RESULT_CELLS, Database, DatabaseConfig, ExecutionResult,
+    QueryResult,
 };
 pub use error::{Error, Result};
 pub use schema::{ColumnSchema, DataType, TableSchema};

@@ -1,4 +1,6 @@
-use rusthouse::{DataType, Database, Error, ExecutionResult, InsertError, QueryResult, Value};
+use rusthouse::{
+    DataType, Database, DatabaseConfig, Error, ExecutionResult, InsertError, QueryResult, Value,
+};
 
 fn query(result: ExecutionResult) -> QueryResult {
     match result {
@@ -138,4 +140,76 @@ fn reports_lookup_and_insert_failures_as_typed_errors() {
             .expect("select table"),
     );
     assert!(result.is_empty(), "failed insert must be atomic");
+}
+
+#[test]
+fn bounds_projection_width_and_materialized_result_cells() {
+    let config = DatabaseConfig::new(4096, 2).with_result_limits(4, 8);
+    let mut database = Database::with_config(config);
+    database
+        .execute_batch(
+            "CREATE TABLE events (id Int64); \
+             INSERT INTO events VALUES (1), (2);",
+        )
+        .expect("setup batch");
+
+    let boundary = query(
+        database
+            .execute("SELECT id, id FROM events")
+            .expect("four cells are allowed"),
+    );
+    assert_eq!(boundary.cell_count(), 4);
+
+    database
+        .execute("INSERT INTO events VALUES (3)")
+        .expect("third row");
+    assert_eq!(
+        database.execute("SELECT id, id FROM events"),
+        Err(Error::ResultTooLarge {
+            actual: 6,
+            maximum: 4,
+        })
+    );
+    assert_eq!(
+        database.execute("SELECT id, id, id FROM events"),
+        Err(Error::TooManyProjectedColumns {
+            actual: 3,
+            maximum: 2,
+        })
+    );
+}
+
+#[test]
+fn collecting_batches_are_cumulative_but_streaming_batches_do_not_retain() {
+    let config = DatabaseConfig::new(4096, 2).with_result_limits(4, 2);
+    let mut database = Database::with_config(config);
+    database
+        .execute_batch(
+            "CREATE TABLE events (id Int64); \
+             INSERT INTO events VALUES (1);",
+        )
+        .expect("setup batch");
+
+    let collected = database
+        .execute_batch("SELECT id FROM events; SELECT id FROM events")
+        .expect("two retained cells are allowed");
+    assert_eq!(collected.len(), 2);
+    assert_eq!(
+        database
+            .execute_batch("SELECT id FROM events; SELECT id FROM events; SELECT id FROM events"),
+        Err(Error::BatchResultTooLarge {
+            actual: 3,
+            maximum: 2,
+        })
+    );
+
+    let streamed = database
+        .execute_batch_iter("SELECT id FROM events; SELECT id FROM events; SELECT id FROM events")
+        .expect("parse streaming batch");
+    let mut streamed_count = 0;
+    for result in streamed {
+        result.expect("streaming results are individually bounded");
+        streamed_count += 1;
+    }
+    assert_eq!(streamed_count, 3);
 }

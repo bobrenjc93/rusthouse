@@ -11,6 +11,12 @@ pub enum Error {
     UnknownType { name: String, position: usize },
     /// A statement declared more columns than the configured limit.
     TooManyColumns { actual: usize, maximum: usize },
+    /// A `SELECT` requested more output columns than the configured limit.
+    TooManyProjectedColumns { actual: usize, maximum: usize },
+    /// One query would materialize more cells than the configured limit.
+    ResultTooLarge { actual: usize, maximum: usize },
+    /// Collected query results in one batch exceeded their cumulative limit.
+    BatchResultTooLarge { actual: usize, maximum: usize },
     /// A schema contains the same, case-insensitive column name twice.
     DuplicateColumn { name: String },
     /// The catalog already contains the case-insensitive table name.
@@ -48,6 +54,18 @@ impl fmt::Display for Error {
             Self::TooManyColumns { actual, maximum } => write!(
                 formatter,
                 "table has at least {actual} columns, exceeding the limit of {maximum}"
+            ),
+            Self::TooManyProjectedColumns { actual, maximum } => write!(
+                formatter,
+                "projection has {actual} columns, exceeding the limit of {maximum}"
+            ),
+            Self::ResultTooLarge { actual, maximum } => write!(
+                formatter,
+                "query result has {actual} cells, exceeding the limit of {maximum}"
+            ),
+            Self::BatchResultTooLarge { actual, maximum } => write!(
+                formatter,
+                "batch results have {actual} cells, exceeding the limit of {maximum}"
             ),
             Self::DuplicateColumn { name } => {
                 write!(formatter, "duplicate column {name:?}")

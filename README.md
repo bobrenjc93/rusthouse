@@ -72,12 +72,16 @@ assert_eq!(rows, [vec![Value::String("first".to_owned()), Value::Int64(1)]]);
 expressions, aggregation, grouping, sorting, and joins are not yet part of the
 grammar. SQL keywords, identifiers, and the four type names are
 case-insensitive. By default, an input may contain at most 1 MiB and a table
-may contain at most 1,024 columns; both limits can be changed with
-`DatabaseConfig`.
+or projection may contain at most 1,024 columns. One materialized query and
+all query results retained by `execute_batch` are each limited to 1,048,576
+cells. These limits can be changed with `DatabaseConfig` and
+`DatabaseConfig::with_result_limits`.
 
-The CLI reads one complete semicolon-separated batch from stdin. It emits each
-`SELECT` as CSV with a header row and reports argument, input, SQL, storage,
-and output failures on stderr with a nonzero status:
+The CLI reads one complete valid semicolon-separated batch from stdin and
+rejects oversized input as soon as it crosses the byte limit. It streams each
+completed `SELECT` as CSV with a header row, without retaining earlier query
+results, and reports argument, input, SQL, storage, and output failures on
+stderr with a nonzero status:
 
 ```bash
 printf "%s\n" \

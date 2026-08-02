@@ -26,11 +26,12 @@ fn run() -> Result<(), CliError> {
 
     let mut database = Database::new();
     let input = read_complete_stdin(database.config().max_input_bytes)?;
-    let results = database.execute_batch(&input)?;
+    let results = database.execute_batch_iter(&input)?;
 
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     for result in results {
+        let result = result?;
         if let ExecutionResult::Query(result) = result {
             rusthouse::csv::write_query(&mut writer, &result).map_err(CliError::Output)?;
         }
@@ -99,29 +100,31 @@ fn validate_format(value: &str) -> Result<(), CliError> {
 
 fn read_complete_stdin(maximum: usize) -> Result<String, CliError> {
     let stdin = io::stdin();
-    let mut reader = stdin.lock();
+    read_bounded(stdin.lock(), maximum)
+}
+
+fn read_bounded(mut reader: impl Read, maximum: usize) -> Result<String, CliError> {
     let mut retained = Vec::with_capacity(maximum.min(8192));
     let mut buffer = [0_u8; 8192];
-    let mut total = 0_usize;
 
     loop {
-        let read = reader.read(&mut buffer).map_err(CliError::Input)?;
+        let remaining = maximum - retained.len();
+        let requested = remaining.saturating_add(1).min(buffer.len());
+        let read = reader
+            .read(&mut buffer[..requested])
+            .map_err(CliError::Input)?;
         if read == 0 {
             break;
         }
-        total = total.saturating_add(read);
-        if retained.len() < maximum {
-            let keep = read.min(maximum - retained.len());
-            retained.extend_from_slice(&buffer[..keep]);
+        if read > remaining {
+            return Err(CliError::Database(Error::InputTooLarge {
+                actual: maximum.saturating_add(1),
+                maximum,
+            }));
         }
+        retained.extend_from_slice(&buffer[..read]);
     }
 
-    if total > maximum {
-        return Err(CliError::Database(Error::InputTooLarge {
-            actual: total,
-            maximum,
-        }));
-    }
     String::from_utf8(retained).map_err(|_| CliError::InvalidUtf8)
 }
 
@@ -167,5 +170,39 @@ mod tests {
             Action::Run
         );
         assert!(parse_args([OsString::from("--format=json")]).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_stops_at_the_first_excess_byte() {
+        struct NeverReadPastLimit {
+            first: Option<Vec<u8>>,
+        }
+
+        impl Read for NeverReadPastLimit {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let input = self
+                    .first
+                    .take()
+                    .expect("reader must return immediately after detecting overflow");
+                let read = input.len().min(buffer.len());
+                buffer[..read].copy_from_slice(&input[..read]);
+                Ok(read)
+            }
+        }
+
+        let error = read_bounded(
+            NeverReadPastLimit {
+                first: Some(b"12345".to_vec()),
+            },
+            4,
+        )
+        .expect_err("five bytes exceed a four-byte limit");
+        assert!(matches!(
+            error,
+            CliError::Database(Error::InputTooLarge {
+                actual: 5,
+                maximum: 4
+            })
+        ));
     }
 }

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::iter::FusedIterator;
+use std::vec;
 
 use crate::sql::{Projection, Statement};
 use crate::{Catalog, ColumnSchema, Error, Result, Schema, Table, TableSchema, Value, sql};
@@ -9,11 +11,19 @@ pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
 /// Default maximum number of columns in one table.
 pub const DEFAULT_MAX_COLUMNS_PER_TABLE: usize = 1024;
 
-/// Resource limits applied before a statement changes the catalog.
+/// Default maximum number of materialized cells in one query result.
+pub const DEFAULT_MAX_RESULT_CELLS: usize = 1024 * 1024;
+
+/// Default maximum number of query-result cells retained by one batch call.
+pub const DEFAULT_MAX_BATCH_RESULT_CELLS: usize = 1024 * 1024;
+
+/// Resource limits applied while parsing and executing SQL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DatabaseConfig {
     pub max_input_bytes: usize,
     pub max_columns_per_table: usize,
+    pub max_result_cells: usize,
+    pub max_batch_result_cells: usize,
 }
 
 impl DatabaseConfig {
@@ -22,7 +32,21 @@ impl DatabaseConfig {
         Self {
             max_input_bytes,
             max_columns_per_table,
+            max_result_cells: DEFAULT_MAX_RESULT_CELLS,
+            max_batch_result_cells: DEFAULT_MAX_BATCH_RESULT_CELLS,
         }
+    }
+
+    /// Override per-query and cumulative collecting-batch result limits.
+    #[must_use]
+    pub const fn with_result_limits(
+        mut self,
+        max_result_cells: usize,
+        max_batch_result_cells: usize,
+    ) -> Self {
+        self.max_result_cells = max_result_cells;
+        self.max_batch_result_cells = max_batch_result_cells;
+        self
     }
 }
 
@@ -59,6 +83,12 @@ impl QueryResult {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+
+    /// Return the number of typed cells in this result.
+    #[must_use]
+    pub fn cell_count(&self) -> usize {
+        self.rows.len().saturating_mul(self.columns.len())
+    }
 }
 
 /// The outcome of one executed SQL statement.
@@ -90,6 +120,43 @@ pub struct Database {
     tables: HashMap<String, Table>,
     config: DatabaseConfig,
 }
+
+/// A streaming iterator over the results of a parsed SQL batch.
+///
+/// Statements execute only as the iterator advances. After the first
+/// execution error, the iterator is exhausted.
+#[derive(Debug)]
+pub struct BatchResults<'a> {
+    database: &'a mut Database,
+    statements: vec::IntoIter<Statement>,
+    failed: bool,
+}
+
+impl Iterator for BatchResults<'_> {
+    type Item = Result<ExecutionResult>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let statement = self.statements.next()?;
+        let result = self.database.execute_statement(statement);
+        if result.is_err() {
+            self.failed = true;
+        }
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.failed {
+            (0, Some(0))
+        } else {
+            self.statements.size_hint()
+        }
+    }
+}
+
+impl FusedIterator for BatchResults<'_> {}
 
 impl Database {
     #[must_use]
@@ -126,14 +193,35 @@ impl Database {
     /// Parse and execute a semicolon-separated SQL batch in source order.
     ///
     /// The complete batch is parsed before the first statement is executed.
-    /// Execution stops at the first typed execution failure.
+    /// Execution stops at the first typed execution failure, including when
+    /// retained query cells exceed `max_batch_result_cells`.
     pub fn execute_batch(&mut self, input: &str) -> Result<Vec<ExecutionResult>> {
+        let maximum = self.config.max_batch_result_cells;
+        let mut retained_cells = 0_usize;
+        let mut results = Vec::new();
+        for result in self.execute_batch_iter(input)? {
+            let result = result?;
+            let additional = result.query().map_or(0, QueryResult::cell_count);
+            let actual = retained_cells.saturating_add(additional);
+            if actual > maximum {
+                return Err(Error::BatchResultTooLarge { actual, maximum });
+            }
+            retained_cells = actual;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Parse a batch and stream each execution result without retaining prior
+    /// query rows.
+    pub fn execute_batch_iter(&mut self, input: &str) -> Result<BatchResults<'_>> {
         self.validate_input_size(input)?;
         let statements = sql::parse_batch(input, self.config.max_columns_per_table)?;
-        statements
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        Ok(BatchResults {
+            database: self,
+            statements: statements.into_iter(),
+            failed: false,
+        })
     }
 
     fn validate_input_size(&self, input: &str) -> Result<()> {
@@ -176,6 +264,24 @@ impl Database {
                     .ok_or_else(|| Error::TableNotFound {
                         name: statement.table.clone(),
                     })?;
+
+                let projection_width = match &statement.projection {
+                    Projection::All => table.schema().len(),
+                    Projection::Columns(columns) => columns.len(),
+                };
+                if projection_width > self.config.max_columns_per_table {
+                    return Err(Error::TooManyProjectedColumns {
+                        actual: projection_width,
+                        maximum: self.config.max_columns_per_table,
+                    });
+                }
+                let result_cells = table.row_count().saturating_mul(projection_width);
+                if result_cells > self.config.max_result_cells {
+                    return Err(Error::ResultTooLarge {
+                        actual: result_cells,
+                        maximum: self.config.max_result_cells,
+                    });
+                }
 
                 let column_indices = match statement.projection {
                     Projection::All => (0..table.schema().len()).collect::<Vec<_>>(),
