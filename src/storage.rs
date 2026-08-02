@@ -25,6 +25,15 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
+/// Maximum number of fields in a [`Schema`].
+pub const MAX_SCHEMA_FIELDS: usize = 1_024;
+
+/// Maximum UTF-8 byte length of a schema field identifier.
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+
+/// Maximum UTF-8 byte length of one stored [`Value::String`].
+pub const MAX_STORED_STRING_BYTES: usize = 1024 * 1024;
+
 /// A physical value type supported by the storage layer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DataType {
@@ -91,10 +100,25 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Builds a schema, rejecting duplicate field names.
+    /// Builds a schema, enforcing field-count, identifier-size, and uniqueness
+    /// constraints.
     pub fn new(fields: Vec<Field>) -> Result<Self, SchemaError> {
+        if fields.len() > MAX_SCHEMA_FIELDS {
+            return Err(SchemaError::TooManyFields {
+                limit: MAX_SCHEMA_FIELDS,
+                actual: fields.len(),
+            });
+        }
+
         let mut field_indexes = HashMap::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
+            if field.name.len() > MAX_IDENTIFIER_BYTES {
+                return Err(SchemaError::IdentifierTooLong {
+                    field: field.name.clone(),
+                    length: field.name.len(),
+                    limit: MAX_IDENTIFIER_BYTES,
+                });
+            }
             if field_indexes.insert(field.name.clone(), index).is_some() {
                 return Err(SchemaError::DuplicateField {
                     field: field.name.clone(),
@@ -136,6 +160,22 @@ impl Schema {
 /// An error produced while constructing a [`Schema`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchemaError {
+    /// The schema contains more fields than the storage limit permits.
+    TooManyFields {
+        /// The maximum number of fields.
+        limit: usize,
+        /// The number of supplied fields.
+        actual: usize,
+    },
+    /// A field identifier exceeds the UTF-8 byte-length limit.
+    IdentifierTooLong {
+        /// The oversized field identifier.
+        field: String,
+        /// The identifier's UTF-8 byte length.
+        length: usize,
+        /// The maximum UTF-8 byte length.
+        limit: usize,
+    },
     /// Two schema fields have the same name.
     DuplicateField {
         /// The repeated field name.
@@ -146,6 +186,20 @@ pub enum SchemaError {
 impl fmt::Display for SchemaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TooManyFields { limit, actual } => {
+                write!(
+                    formatter,
+                    "schema has {actual} fields, exceeding the limit of {limit}"
+                )
+            }
+            Self::IdentifierTooLong {
+                field,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "schema field `{field}` is {length} UTF-8 bytes, exceeding the limit of {limit}"
+            ),
             Self::DuplicateField { field } => {
                 write!(formatter, "schema contains duplicate field `{field}`")
             }
@@ -441,8 +495,9 @@ impl Table {
     /// Atomically appends a named row after validating its complete contents.
     ///
     /// Field order does not matter. Duplicate fields, missing or unexpected
-    /// fields, type mismatches, disallowed nulls, and rows beyond the configured
-    /// limit return an [`AppendError`] without changing the table.
+    /// fields, type mismatches, disallowed nulls, oversized strings, and rows
+    /// beyond the configured limit return an [`AppendError`] without changing
+    /// the table.
     pub fn append_row<I, N>(&mut self, row: I) -> Result<(), AppendError>
     where
         I: IntoIterator<Item = (N, Value)>,
@@ -511,6 +566,12 @@ impl Table {
                     expected: field.data_type(),
                     actual: value.value_type(),
                 });
+            } else if let Some(length) = oversized_string_length(value) {
+                return Err(AppendError::StringTooLong {
+                    field: name.clone(),
+                    length,
+                    limit: MAX_STORED_STRING_BYTES,
+                });
             }
         }
 
@@ -536,8 +597,8 @@ impl Table {
     ///
     /// Each row must contain exactly one [`Value`] per schema field, in schema
     /// order. An empty batch succeeds, including when the table is full. Any
-    /// shape, type, nullability, or row-limit error identifies its zero-based
-    /// row within the batch and leaves the table unchanged.
+    /// shape, type, nullability, string-size, or row-limit error identifies its
+    /// zero-based row within the batch and leaves the table unchanged.
     ///
     /// Consumption is bounded for untrusted iterators: at most one row beyond
     /// the remaining table capacity and one value beyond the schema width are
@@ -583,6 +644,13 @@ impl Table {
                         field: field.name().to_owned(),
                         expected: field.data_type(),
                         actual: value.value_type(),
+                    });
+                } else if let Some(length) = oversized_string_length(value) {
+                    return Err(BatchAppendError::StringTooLong {
+                        row_index,
+                        field: field.name().to_owned(),
+                        length,
+                        limit: MAX_STORED_STRING_BYTES,
                     });
                 }
             }
@@ -636,6 +704,13 @@ fn value_matches_type(value: &Value, data_type: DataType) -> bool {
     )
 }
 
+fn oversized_string_length(value: &Value) -> Option<usize> {
+    match value {
+        Value::String(value) if value.len() > MAX_STORED_STRING_BYTES => Some(value.len()),
+        _ => None,
+    }
+}
+
 /// A validation error returned by [`Table::append_row`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppendError {
@@ -675,6 +750,15 @@ pub enum AppendError {
         /// The non-nullable field name.
         field: String,
     },
+    /// A string value exceeds the stored UTF-8 byte-length limit.
+    StringTooLong {
+        /// The field containing the oversized string.
+        field: String,
+        /// The string's UTF-8 byte length.
+        length: usize,
+        /// The maximum UTF-8 byte length.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for AppendError {
@@ -709,6 +793,14 @@ impl fmt::Display for AppendError {
             Self::NullabilityViolation { field } => {
                 write!(formatter, "field `{field}` is not nullable")
             }
+            Self::StringTooLong {
+                field,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "field `{field}` contains a {length}-byte string, exceeding the limit of {limit}"
+            ),
         }
     }
 }
@@ -753,6 +845,18 @@ pub enum BatchAppendError {
         /// The non-nullable field name.
         field: String,
     },
+    /// A string value in the indexed batch row exceeds the stored UTF-8
+    /// byte-length limit.
+    StringTooLong {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// The field containing the oversized string.
+        field: String,
+        /// The string's UTF-8 byte length.
+        length: usize,
+        /// The maximum UTF-8 byte length.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for BatchAppendError {
@@ -788,6 +892,15 @@ impl fmt::Display for BatchAppendError {
                     "field `{field}` in batch row {row_index} is not nullable"
                 )
             }
+            Self::StringTooLong {
+                row_index,
+                field,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "field `{field}` in batch row {row_index} contains a {length}-byte string, exceeding the limit of {limit}"
+            ),
         }
     }
 }

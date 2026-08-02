@@ -1,5 +1,6 @@
 use rusthouse::{
-    DEFAULT_TABLE_ROW_LIMIT, DataType, Database, ScalarValue, SqlErrorKind, write_csv,
+    DEFAULT_TABLE_ROW_LIMIT, DataType, Database, MAX_IDENTIFIER_BYTES, MAX_SCHEMA_FIELDS,
+    ScalarValue, SchemaError, SqlErrorKind, write_csv,
 };
 
 #[test]
@@ -165,6 +166,56 @@ fn unknown_type_is_typed_positioned_and_preserves_catalog() {
     assert_eq!(error.byte_offset(), sql.find("Decimal").unwrap());
     assert_eq!((error.line(), error.column()), (2, 8));
     assert_eq!(database, before);
+}
+
+#[test]
+fn schema_limit_errors_are_typed_positioned_and_preserve_catalog() {
+    let long_field = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
+    let definitions = (0..=MAX_SCHEMA_FIELDS)
+        .map(|index| format!("field_{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    for (sql, expected_offset, expected_error) in [
+        (
+            format!("CREATE TABLE long_name ({long_field} String);"),
+            "CREATE TABLE long_name (".len(),
+            SchemaError::IdentifierTooLong {
+                field: long_field,
+                length: MAX_IDENTIFIER_BYTES + 1,
+                limit: MAX_IDENTIFIER_BYTES,
+            },
+        ),
+        (
+            format!("CREATE TABLE wide ({definitions});"),
+            format!("CREATE TABLE wide ({definitions}")
+                .rfind(&format!("field_{}", MAX_SCHEMA_FIELDS))
+                .unwrap(),
+            SchemaError::TooManyFields {
+                limit: MAX_SCHEMA_FIELDS,
+                actual: MAX_SCHEMA_FIELDS + 1,
+            },
+        ),
+    ] {
+        let mut database = database_with_seed();
+        let before = database.clone();
+
+        let error = database.execute(&sql).unwrap_err();
+
+        assert_eq!(error.byte_offset(), expected_offset);
+        assert_eq!(
+            error.kind(),
+            &SqlErrorKind::InvalidSchema {
+                table: if matches!(expected_error, SchemaError::IdentifierTooLong { .. }) {
+                    "long_name".into()
+                } else {
+                    "wide".into()
+                },
+                error: expected_error,
+            }
+        );
+        assert_eq!(database, before);
+    }
 }
 
 #[test]

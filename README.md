@@ -32,6 +32,11 @@ catalog API exposes immutable table lookup; row ingestion and persistence are
 not SQL features yet. The lower-level `Table` API supports atomic, positional
 batch append for schema-ordered rows.
 
+Storage resource limits are measured in UTF-8 bytes: a schema may contain at
+most 1,024 fields, each field identifier may contain at most 256 bytes, and one
+stored `String` value may contain at most 1,048,576 bytes. `Schema::new` and the
+atomic table append APIs report typed errors when these limits are exceeded.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.

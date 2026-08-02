@@ -5,8 +5,9 @@ pub mod storage;
 
 pub use database::{DEFAULT_TABLE_ROW_LIMIT, Database};
 pub use storage::{
-    AppendError, BatchAppendError, Column, DataType, Field, Schema, SchemaError, Table,
-    TypedColumn, ValidityBitmap, Value, ValueType,
+    AppendError, BatchAppendError, Column, DataType, Field, MAX_IDENTIFIER_BYTES,
+    MAX_SCHEMA_FIELDS, MAX_STORED_STRING_BYTES, Schema, SchemaError, Table, TypedColumn,
+    ValidityBitmap, Value, ValueType,
 };
 
 use std::borrow::Cow;
@@ -94,6 +95,13 @@ pub enum SqlErrorKind {
         /// The unrecognized type name.
         data_type: String,
     },
+    /// A `CREATE TABLE` definition violates a storage schema limit.
+    InvalidSchema {
+        /// The table whose schema is invalid.
+        table: String,
+        /// The typed storage-layer validation error.
+        error: SchemaError,
+    },
 }
 
 impl fmt::Display for SqlErrorKind {
@@ -109,6 +117,9 @@ impl fmt::Display for SqlErrorKind {
             }
             Self::UnknownDataType { data_type } => {
                 write!(formatter, "unknown data type `{data_type}`")
+            }
+            Self::InvalidSchema { table, error } => {
+                write!(formatter, "invalid schema for table `{table}`: {error}")
             }
         }
     }
