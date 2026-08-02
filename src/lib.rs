@@ -3,7 +3,10 @@
 pub mod sql;
 pub mod storage;
 
-pub use storage::{Column, ColumnSchema, DataType, Row, Schema, StorageError, Table, Value};
+pub use storage::{
+    Column, ColumnSchema, ComparisonOperator, DataType, Row, ScanError, Schema, StorageError,
+    Table, Value,
+};
 
 /// Returns the product name while the first storage engine is being built.
 pub fn product_name() -> &'static str {
