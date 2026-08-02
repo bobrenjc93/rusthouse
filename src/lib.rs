@@ -1,5 +1,6 @@
 //! RustHouse is an experimental, compact analytical database.
 
+pub mod lexer;
 pub mod storage;
 
 pub use storage::{Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value};
