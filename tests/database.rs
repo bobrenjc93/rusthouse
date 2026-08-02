@@ -86,6 +86,32 @@ fn nullable_types_preserve_schema_flags_and_store_nulls() {
 }
 
 #[test]
+fn nullable_tables_and_relational_selects_execute_in_one_batch() {
+    let mut database = Database::new();
+
+    let results = database
+        .execute(
+            "CREATE TABLE readings (id Int64, value Nullable(Float64));\n\
+             INSERT INTO readings VALUES (1, NULL), (2, 2.5);\n\
+             SELECT NULL < 1 AS unknown;\n\
+             SELECT 2.5 >= 2.0 AS ordered;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (&result.header[..], &result.value))
+            .collect::<Vec<_>>(),
+        vec![
+            ("unknown", &ScalarValue::Null),
+            ("ordered", &ScalarValue::Boolean(true)),
+        ]
+    );
+    assert_eq!(database.table("readings").unwrap().row_count(), 2);
+}
+
+#[test]
 fn create_table_produces_no_csv_result() {
     let mut database = Database::new();
     let results = database.execute("CREATE TABLE events (id Int64);").unwrap();
