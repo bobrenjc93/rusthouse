@@ -40,9 +40,13 @@ fn run() -> io::Result<()> {
         Action::Run => {}
     }
 
-    let mut input = String::new();
-    io::stdin().lock().read_to_string(&mut input)?;
     let mut database = Database::new();
+    let read_limit = database.limits().max_input_bytes.saturating_add(1);
+    let mut input = String::new();
+    io::stdin()
+        .lock()
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_string(&mut input)?;
     let results = database
         .execute(&input)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;

@@ -11,6 +11,10 @@ pub enum LimitKind {
     ResultRows,
     ColumnsPerTable,
     StringBytes,
+    ExpressionDepth,
+    IntermediateRows,
+    IntermediateBytes,
+    ResultBytes,
 }
 
 impl fmt::Display for LimitKind {
@@ -22,6 +26,10 @@ impl fmt::Display for LimitKind {
             Self::ResultRows => "result rows",
             Self::ColumnsPerTable => "columns per table",
             Self::StringBytes => "string bytes",
+            Self::ExpressionDepth => "expression depth",
+            Self::IntermediateRows => "intermediate rows",
+            Self::IntermediateBytes => "intermediate bytes",
+            Self::ResultBytes => "result bytes",
         };
         f.write_str(name)
     }

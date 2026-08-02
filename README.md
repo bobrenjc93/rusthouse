@@ -55,11 +55,15 @@ assert_eq!(result.rows[0][0], Value::Int64(2));
 # Ok::<(), rusthouse::DatabaseError>(())
 ```
 
-`Database::with_limits` configures input bytes, rows per insert, rows per
-table, returned rows, columns per table, and bytes per string. Limit failures,
-parse failures, catalog errors, type errors, and arithmetic failures are
-distinct `DatabaseError` variants. An insert batch is fully evaluated and
-validated before any column is changed.
+`Database::with_limits` configures input bytes, expression depth, rows per
+insert, rows per table, returned and intermediate rows, result and intermediate
+bytes, columns per table, and bytes per string value (including query
+literals). Limit failures, parse failures, catalog errors, type errors, and
+arithmetic failures are distinct `DatabaseError` variants. An insert batch is
+fully evaluated and validated before any column is changed. Unordered queries
+apply `OFFSET`/`LIMIT` before projection; ordered queries retain a bounded top-k
+working set. Expression depth is hard-capped at 64 to keep parser and evaluator
+stack use safe even when a caller supplies a larger configured value.
 
 ## Development
 

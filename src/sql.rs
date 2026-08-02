@@ -1,4 +1,6 @@
-use crate::{ColumnDefinition, DataType, DatabaseError, Value};
+use crate::{ColumnDefinition, DataType, DatabaseError, LimitKind, Value};
+
+pub(crate) const MAX_SAFE_EXPRESSION_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Statement {
@@ -13,6 +15,54 @@ pub(crate) enum Statement {
         rows: Vec<Vec<Expr>>,
     },
     Select(Select),
+}
+
+fn validate_expression_depth(statement: &Statement, max_depth: usize) -> Result<(), DatabaseError> {
+    let mut stack = Vec::new();
+    match statement {
+        Statement::CreateTable { .. } => {}
+        Statement::Insert { rows, .. } => {
+            for expression in rows.iter().flatten() {
+                stack.push((expression, 1_usize));
+            }
+        }
+        Statement::Select(select) => {
+            for item in &select.items {
+                if let SelectItem::Expr { expr, .. } = item {
+                    stack.push((expr, 1));
+                }
+            }
+            if let Some(filter) = &select.filter {
+                stack.push((filter, 1));
+            }
+            stack.extend(select.group_by.iter().map(|expr| (expr, 1)));
+            stack.extend(select.order_by.iter().map(|order| (&order.expr, 1)));
+        }
+    }
+
+    while let Some((expression, depth)) = stack.pop() {
+        if depth > max_depth {
+            return Err(DatabaseError::LimitExceeded {
+                kind: LimitKind::ExpressionDepth,
+                limit: max_depth,
+                actual: depth,
+            });
+        }
+        match expression {
+            Expr::Aggregate { argument, .. } => {
+                if let Some(argument) = argument {
+                    stack.push((argument, depth + 1));
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                stack.push((left, depth + 1));
+                stack.push((right, depth + 1));
+            }
+            Expr::Unary { expr, .. } => stack.push((expr, depth + 1)),
+            Expr::Literal(_) | Expr::Column(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,7 +136,7 @@ pub(crate) enum UnaryOperator {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Literal(Value),
-    Column(String),
+    Column(ColumnReference),
     Aggregate {
         function: AggregateFunction,
         argument: Option<Box<Expr>>,
@@ -102,6 +152,28 @@ pub(crate) enum Expr {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnReference {
+    pub(crate) qualifier: Option<String>,
+    pub(crate) name: String,
+}
+
+impl ColumnReference {
+    pub(crate) fn unqualified(name: String) -> Self {
+        Self {
+            qualifier: None,
+            name,
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        self.qualifier.as_ref().map_or_else(
+            || self.name.clone(),
+            |table| format!("{table}.{}", self.name),
+        )
+    }
+}
+
 impl Expr {
     pub(crate) fn label(&self) -> String {
         match self {
@@ -109,7 +181,7 @@ impl Expr {
                 Value::String(value) => format!("'{value}'"),
                 _ => value.to_string(),
             },
-            Self::Column(name) => name.clone(),
+            Self::Column(reference) => reference.label(),
             Self::Aggregate { function, argument } => match argument {
                 Some(argument) => format!("{}({})", function.name(), argument.label()),
                 None => format!("{}(*)", function.name()),
@@ -187,19 +259,28 @@ struct Token {
     offset: usize,
 }
 
-pub(crate) fn parse(input: &str) -> Result<Vec<Statement>, DatabaseError> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens).parse_statements()
+pub(crate) fn parse(
+    input: &str,
+    max_expression_depth: usize,
+    max_string_bytes: usize,
+) -> Result<Vec<Statement>, DatabaseError> {
+    let tokens = Lexer::new(input, max_string_bytes).tokenize()?;
+    Parser::new(tokens, max_expression_depth.min(MAX_SAFE_EXPRESSION_DEPTH)).parse_statements()
 }
 
 struct Lexer<'a> {
     input: &'a str,
     offset: usize,
+    max_string_bytes: usize,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, offset: 0 }
+    fn new(input: &'a str, max_string_bytes: usize) -> Self {
+        Self {
+            input,
+            offset: 0,
+            max_string_bytes,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>, DatabaseError> {
@@ -305,6 +386,13 @@ impl<'a> Lexer<'a> {
             } else {
                 value.push(ch);
             }
+            if quote == '\'' && value.len() > self.max_string_bytes {
+                return Err(DatabaseError::LimitExceeded {
+                    kind: LimitKind::StringBytes,
+                    limit: self.max_string_bytes,
+                    actual: value.len(),
+                });
+            }
         }
         Err(DatabaseError::parse("unterminated quoted value", start))
     }
@@ -366,13 +454,19 @@ fn is_identifier_continue(ch: char) -> bool {
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
+    expression_depth: usize,
+    expression_nodes: usize,
+    max_expression_depth: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, max_expression_depth: usize) -> Self {
         Self {
             tokens,
             position: 0,
+            expression_depth: 0,
+            expression_nodes: 0,
+            max_expression_depth,
         }
     }
 
@@ -383,7 +477,9 @@ impl Parser {
             if self.at_eof() {
                 break;
             }
-            statements.push(self.parse_statement()?);
+            let statement = self.parse_statement()?;
+            validate_expression_depth(&statement, self.max_expression_depth)?;
+            statements.push(statement);
             if !self.consume(&TokenKind::Semicolon) && !self.at_eof() {
                 return Err(self.error("expected ';' between statements"));
             }
@@ -568,12 +664,26 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, DatabaseError> {
-        self.parse_or()
+        if self.expression_depth == 0 {
+            self.expression_nodes = 0;
+        }
+        if self.expression_depth >= self.max_expression_depth {
+            return Err(DatabaseError::LimitExceeded {
+                kind: LimitKind::ExpressionDepth,
+                limit: self.max_expression_depth,
+                actual: self.expression_depth + 1,
+            });
+        }
+        self.expression_depth += 1;
+        let result = self.parse_or();
+        self.expression_depth -= 1;
+        result
     }
 
     fn parse_or(&mut self) -> Result<Expr, DatabaseError> {
         let mut expr = self.parse_and()?;
         while self.consume_keyword("OR") {
+            self.record_expression_node()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 operator: BinaryOperator::Or,
@@ -584,12 +694,29 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, DatabaseError> {
-        let mut expr = self.parse_comparison()?;
+        let mut expr = self.parse_not()?;
         while self.consume_keyword("AND") {
+            self.record_expression_node()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 operator: BinaryOperator::And,
-                right: Box::new(self.parse_comparison()?),
+                right: Box::new(self.parse_not()?),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_not(&mut self) -> Result<Expr, DatabaseError> {
+        let mut count = 0_usize;
+        while self.consume_keyword("NOT") {
+            count += 1;
+        }
+        let mut expr = self.parse_comparison()?;
+        for _ in 0..count {
+            self.record_expression_node()?;
+            expr = Expr::Unary {
+                operator: UnaryOperator::Not,
+                expr: Box::new(expr),
             };
         }
         Ok(expr)
@@ -613,6 +740,7 @@ impl Parser {
             None
         };
         if let Some(operator) = operator {
+            self.record_expression_node()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 operator,
@@ -632,6 +760,7 @@ impl Parser {
             } else {
                 break;
             };
+            self.record_expression_node()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 operator,
@@ -653,6 +782,7 @@ impl Parser {
             } else {
                 break;
             };
+            self.record_expression_node()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 operator,
@@ -663,33 +793,36 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, DatabaseError> {
-        let operator = if self.consume_keyword("NOT") {
-            Some(UnaryOperator::Not)
-        } else if self.consume(&TokenKind::Minus) {
-            if let TokenKind::Number(value) = self.current().kind.clone()
-                && !value.contains(['.', 'e', 'E'])
-            {
-                let offset = self.current().offset.saturating_sub(1);
-                self.advance();
-                let number = format!("-{value}").parse::<i64>().map_err(|_| {
-                    DatabaseError::parse(format!("invalid Int64 literal -{value}"), offset)
-                })?;
-                return Ok(Expr::Literal(Value::Int64(number)));
+        let mut operators = Vec::new();
+        loop {
+            if self.consume(&TokenKind::Minus) {
+                if operators.is_empty()
+                    && let TokenKind::Number(value) = self.current().kind.clone()
+                    && !value.contains(['.', 'e', 'E'])
+                {
+                    let offset = self.current().offset.saturating_sub(1);
+                    self.advance();
+                    let number = format!("-{value}").parse::<i64>().map_err(|_| {
+                        DatabaseError::parse(format!("invalid Int64 literal -{value}"), offset)
+                    })?;
+                    return Ok(Expr::Literal(Value::Int64(number)));
+                }
+                operators.push(UnaryOperator::Negate);
+            } else if self.consume(&TokenKind::Plus) {
+                operators.push(UnaryOperator::Positive);
+            } else {
+                break;
             }
-            Some(UnaryOperator::Negate)
-        } else if self.consume(&TokenKind::Plus) {
-            Some(UnaryOperator::Positive)
-        } else {
-            None
-        };
-        if let Some(operator) = operator {
-            Ok(Expr::Unary {
-                operator,
-                expr: Box::new(self.parse_unary()?),
-            })
-        } else {
-            self.parse_primary()
         }
+        let mut expr = self.parse_primary()?;
+        for operator in operators.into_iter().rev() {
+            self.record_expression_node()?;
+            expr = Expr::Unary {
+                operator,
+                expr: Box::new(expr),
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, DatabaseError> {
@@ -743,6 +876,7 @@ impl Parser {
                 None
             } else if self.consume(&TokenKind::RightParen) {
                 if function == AggregateFunction::Count {
+                    self.record_expression_node()?;
                     return Ok(Expr::Aggregate {
                         function,
                         argument: None,
@@ -759,14 +893,15 @@ impl Parser {
             if function != AggregateFunction::Count && argument.is_none() {
                 return Err(self.error(format!("{}(*) is not supported", function.name())));
             }
+            self.record_expression_node()?;
             Ok(Expr::Aggregate { function, argument })
         } else {
-            let mut qualified = name;
-            if self.consume(&TokenKind::Dot) {
-                qualified.push('.');
-                qualified.push_str(&self.parse_identifier()?);
-            }
-            Ok(Expr::Column(qualified))
+            let (qualifier, name) = if self.consume(&TokenKind::Dot) {
+                (Some(name), self.parse_identifier()?)
+            } else {
+                (None, name)
+            };
+            Ok(Expr::Column(ColumnReference { qualifier, name }))
         }
     }
 
@@ -777,6 +912,19 @@ impl Parser {
                 Ok(name)
             }
             _ => Err(self.error("expected an identifier")),
+        }
+    }
+
+    fn record_expression_node(&mut self) -> Result<(), DatabaseError> {
+        self.expression_nodes += 1;
+        if self.expression_nodes > self.max_expression_depth {
+            Err(DatabaseError::LimitExceeded {
+                kind: LimitKind::ExpressionDepth,
+                limit: self.max_expression_depth,
+                actual: self.expression_nodes,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -879,6 +1027,8 @@ mod tests {
              SELECT `Group` AS g, SUM(n) total FROM `Odd Table` \
              WHERE n >= -2 AND (`Group` = 'x' OR `Group` = 'a;''b') \
              GROUP BY `Group` ORDER BY total DESC LIMIT 3;",
+            256,
+            1024 * 1024,
         )
         .unwrap();
         assert_eq!(statements.len(), 3);
@@ -892,7 +1042,7 @@ mod tests {
 
     #[test]
     fn rejects_trailing_unparsed_tokens() {
-        let error = parse("SELECT 1 nonsense FROM t unexpected").unwrap_err();
+        let error = parse("SELECT 1 nonsense FROM t unexpected", 256, 1024 * 1024).unwrap_err();
         assert!(error.to_string().contains("expected ';'"));
     }
 }
