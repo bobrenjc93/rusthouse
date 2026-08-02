@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use rusthouse::{Column, DataType, Field, InsertError, ScalarValue, Schema, SchemaError, Table};
 
 fn four_type_schema() -> Schema {
@@ -34,6 +36,30 @@ fn schemas_reject_empty_and_duplicate_fields() {
         Err(SchemaError::DuplicateFieldName {
             name: "userid".to_owned(),
         })
+    );
+    assert_eq!(
+        Schema::new(vec![
+            Field::new("Ångström", DataType::Int64),
+            Field::new("ångström", DataType::Float64),
+        ]),
+        Err(SchemaError::DuplicateFieldName {
+            name: "ångström".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn schema_and_table_lookups_use_unicode_case_normalization() {
+    let schema =
+        Schema::new(vec![Field::new("Ångström", DataType::Int64)]).expect("field name is valid");
+
+    assert_eq!(schema.field("ångström"), schema.fields().first());
+    assert_eq!(schema.index_of("ångström"), Some(0));
+
+    let table = Table::new(schema, 1);
+    assert_eq!(
+        table.column_by_name("ångström"),
+        Some(&Column::Int64(vec![]))
     );
 }
 
@@ -102,6 +128,27 @@ fn rejected_inserts_are_atomic() {
         Err(InsertError::RowLimitExceeded { limit: 1 })
     );
     assert_eq!(table, original);
+}
+
+#[test]
+fn overlong_iterators_are_consumed_only_through_the_arity_sentinel() {
+    let consumed = Cell::new(0);
+    let unbounded_values = std::iter::from_fn(|| {
+        consumed.set(consumed.get() + 1);
+        Some(ScalarValue::Int64(1))
+    });
+    let mut table = Table::new(four_type_schema(), 1);
+
+    assert_eq!(
+        table.insert(unbounded_values),
+        Err(InsertError::ArityMismatch {
+            expected: 4,
+            actual: 5,
+        })
+    );
+    assert_eq!(consumed.get(), 5);
+    assert!(table.is_empty());
+    assert!(table.columns().iter().all(Column::is_empty));
 }
 
 #[test]

@@ -6,6 +6,10 @@ use std::fmt;
 
 use crate::scalar::DataType;
 
+fn normalize_name(name: &str) -> String {
+    name.to_lowercase()
+}
+
 /// A named, typed field in a [`Schema`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
@@ -44,8 +48,9 @@ pub struct Schema {
 impl Schema {
     /// Builds a schema and validates all field names.
     ///
-    /// Names must contain a non-whitespace character and must be unique under
-    /// case-insensitive comparison. A schema must contain at least one field.
+    /// Names must contain a non-whitespace character and must be unique after
+    /// Unicode lowercase normalization. A schema must contain at least one
+    /// field.
     pub fn new(fields: Vec<Field>) -> Result<Self, SchemaError> {
         if fields.is_empty() {
             return Err(SchemaError::EmptySchema);
@@ -57,7 +62,7 @@ impl Schema {
                 return Err(SchemaError::EmptyFieldName { index });
             }
 
-            if !names.insert(field.name.to_lowercase()) {
+            if !names.insert(normalize_name(&field.name)) {
                 return Err(SchemaError::DuplicateFieldName {
                     name: field.name.clone(),
                 });
@@ -88,20 +93,19 @@ impl Schema {
         self.fields.is_empty()
     }
 
-    /// Finds a field by case-insensitive name.
+    /// Finds a field by its Unicode lowercase-normalized name.
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&Field> {
-        self.fields
-            .iter()
-            .find(|field| field.name.eq_ignore_ascii_case(name))
+        self.index_of(name).map(|index| &self.fields[index])
     }
 
-    /// Finds a field's storage index by case-insensitive name.
+    /// Finds a field's storage index by its Unicode lowercase-normalized name.
     #[must_use]
     pub fn index_of(&self, name: &str) -> Option<usize> {
+        let normalized_name = normalize_name(name);
         self.fields
             .iter()
-            .position(|field| field.name.eq_ignore_ascii_case(name))
+            .position(|field| normalize_name(&field.name) == normalized_name)
     }
 }
 

@@ -43,12 +43,25 @@ impl Table {
     where
         I: IntoIterator<Item = ScalarValue>,
     {
-        let row: Vec<ScalarValue> = row.into_iter().collect();
+        let mut values = row.into_iter();
+        let exact_length = match values.size_hint() {
+            (lower, Some(upper)) if lower == upper => Some(lower),
+            _ => None,
+        };
+        let mut row = Vec::with_capacity(self.columns.len());
+        row.extend(values.by_ref().take(self.columns.len()));
 
         if row.len() != self.columns.len() {
             return Err(InsertError::ArityMismatch {
                 expected: self.columns.len(),
                 actual: row.len(),
+            });
+        }
+
+        if values.next().is_some() {
+            return Err(InsertError::ArityMismatch {
+                expected: self.columns.len(),
+                actual: exact_length.unwrap_or_else(|| self.columns.len().saturating_add(1)),
             });
         }
 
@@ -130,6 +143,10 @@ impl Table {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InsertError {
     /// The number of values did not match the schema.
+    ///
+    /// For an overlong iterator without an exact size hint, `actual` is the
+    /// observed lower bound of the schema width plus one. The remaining values
+    /// are deliberately not consumed.
     ArityMismatch { expected: usize, actual: usize },
     /// A value did not match its field's scalar type.
     TypeMismatch {
@@ -145,6 +162,10 @@ pub enum InsertError {
 impl fmt::Display for InsertError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArityMismatch { expected, actual } if actual > expected => write!(
+                formatter,
+                "expected {expected} values, received at least {actual}"
+            ),
             Self::ArityMismatch { expected, actual } => {
                 write!(formatter, "expected {expected} values, received {actual}")
             }
