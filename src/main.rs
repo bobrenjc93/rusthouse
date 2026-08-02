@@ -31,8 +31,11 @@ fn main() -> ExitCode {
 fn run() -> Result<(), CliError> {
     match parse_args(env::args_os().skip(1))? {
         Action::Help => {
-            print!("{HELP}");
-            io::stdout().flush().map_err(CliError::Output)
+            let mut output = BufWriter::new(io::stdout().lock());
+            output
+                .write_all(HELP.as_bytes())
+                .map_err(CliError::Output)?;
+            output.flush().map_err(CliError::Output)
         }
         Action::Execute(Format::Csv) => {
             let query = read_query(io::stdin().lock())?;

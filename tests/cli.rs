@@ -31,6 +31,31 @@ fn help_succeeds() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn help_reports_closed_stdout_without_panicking() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (stdout, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+        .arg("--help")
+        .stdout(Stdio::from(OwnedFd::from(stdout)))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr.contains("failed to write standard output"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
 #[test]
 fn csv_format_reads_to_eof_and_escapes_header_and_row() {
     let sql = b"SELECT 'Ada said ''hello'',\nagain' AS \"greeting, \"\"quoted\"\"\"";
