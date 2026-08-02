@@ -9,9 +9,12 @@ mod error;
 mod parser;
 mod result;
 
+pub mod columnar;
+
+pub use columnar::{Column, DataType, NamedColumn, RecordBatch, RecordBatchError};
 pub use csv::write_csv;
 pub use error::QueryError;
-pub use result::{Column, DataType, QueryResult, Value};
+pub use result::{Column as ResultColumn, QueryResult, Value};
 
 /// Maximum query size accepted by the command-line interface, in bytes.
 pub const MAX_QUERY_BYTES: usize = 1024 * 1024;

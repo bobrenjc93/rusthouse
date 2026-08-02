@@ -1,15 +1,4 @@
-/// Logical type of a result column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataType {
-    /// Signed 64-bit integer.
-    Int64,
-    /// Finite 64-bit floating-point value.
-    Float64,
-    /// Boolean value.
-    Bool,
-    /// UTF-8 string.
-    String,
-}
+use crate::DataType;
 
 /// A scalar value in a query result.
 #[derive(Debug, Clone, PartialEq)]
