@@ -247,8 +247,15 @@ pub(crate) struct CreateField {
     pub(crate) data_type: DataType,
 }
 
+#[derive(Debug)]
+pub(crate) struct CountRows {
+    pub(crate) table: PositionedIdentifier,
+    pub(crate) header: String,
+}
+
 pub(crate) enum DatabaseEvent {
     Select(QueryResult),
+    CountRows(CountRows),
     CreateTable(CreateTable),
     InsertStart(PositionedIdentifier),
     InsertRow(InsertRow),
@@ -377,7 +384,7 @@ impl<'a> Parser<'a> {
             }
 
             if self.consume_keyword("SELECT") {
-                let _ = consume(DatabaseEvent::Select(self.parse_select()?))?;
+                let _ = consume(self.parse_database_select()?)?;
             } else if self.consume_keyword("CREATE") {
                 let _ = consume(DatabaseEvent::CreateTable(self.parse_create_table()?))?;
             } else if self.consume_keyword("INSERT") {
@@ -420,6 +427,75 @@ impl<'a> Parser<'a> {
         self.advance();
 
         Ok(QueryResult { header, value })
+    }
+
+    fn parse_database_select(&mut self) -> Result<DatabaseEvent, SqlError> {
+        self.skip_whitespace();
+        let expression_start = self.position;
+
+        if self.consume_keyword("COUNT") {
+            self.parse_count_rows(expression_start)
+                .map(DatabaseEvent::CountRows)
+        } else {
+            self.parse_select().map(DatabaseEvent::Select)
+        }
+    }
+
+    fn parse_count_rows(&mut self, expression_start: usize) -> Result<CountRows, SqlError> {
+        self.skip_whitespace();
+        if self.peek() != Some('(') {
+            return Err(self.syntax_error("expected '(' after COUNT"));
+        }
+        self.advance();
+        self.skip_whitespace();
+        if self.peek() != Some('*') {
+            return Err(self.syntax_error("expected '*' in COUNT"));
+        }
+        self.advance();
+        self.skip_whitespace();
+        if self.peek() != Some(')') {
+            return Err(self.syntax_error("expected ')' after '*' in COUNT"));
+        }
+        self.advance();
+
+        let expression_end = self.position;
+        let has_separator = self.skip_required_whitespace();
+        let header = if self.consume_keyword("AS") {
+            if !has_separator {
+                return Err(self.syntax_error_at(expression_end, "expected whitespace before AS"));
+            }
+            if !self.skip_required_whitespace() {
+                return Err(self.syntax_error("expected an identifier after AS"));
+            }
+            let alias = self
+                .parse_identifier("expected an identifier after AS")?
+                .value;
+            if !self.skip_required_whitespace() {
+                return Err(self.syntax_error("expected FROM after COUNT alias"));
+            }
+            alias
+        } else {
+            if !has_separator {
+                return Err(self.syntax_error("expected FROM after COUNT expression"));
+            }
+            self.input[expression_start..expression_end].to_owned()
+        };
+
+        if !self.consume_keyword("FROM") {
+            return Err(self.syntax_error("expected FROM after COUNT expression"));
+        }
+        if !self.skip_required_whitespace() {
+            return Err(self.syntax_error("expected a table name after FROM"));
+        }
+        let table = self.parse_identifier("expected a table name after FROM")?;
+
+        self.skip_whitespace();
+        if self.peek() != Some(';') {
+            return Err(self.syntax_error("expected ';' after SELECT statement"));
+        }
+        self.advance();
+
+        Ok(CountRows { table, header })
     }
 
     fn parse_create_table(&mut self) -> Result<CreateTable, SqlError> {
