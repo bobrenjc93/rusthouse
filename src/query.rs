@@ -126,10 +126,10 @@ impl From<LexError> for ScalarSelectError {
     }
 }
 
-/// The materialized result of a table projection.
+/// The materialized result of a table query.
 ///
-/// Headers follow projection order and retain each catalog column's logical
-/// type. Rows follow insertion order and contain values in header order.
+/// Projection headers retain each catalog column's logical type and rows
+/// follow insertion order. Aggregate results describe their own typed schema.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableSelectResult {
     headers: Vec<ColumnSchema>,
@@ -198,6 +198,11 @@ pub enum TableSelectError {
     TableNotFound(TableNotFoundError),
     /// A projected column is not present in the source table.
     ColumnNotFound(ColumnNotFoundError),
+    /// The table row count cannot be represented by the aggregate's `Int64` type.
+    CountOutOfRange {
+        /// The metadata row count that could not be converted.
+        count: usize,
+    },
     /// Materializing the complete result would exceed the memory budget.
     ResultSizeLimitExceeded {
         /// Estimated bytes required by the materialized headers and rows.
@@ -223,6 +228,12 @@ impl fmt::Display for TableSelectError {
             ),
             Self::TableNotFound(error) => error.fmt(formatter),
             Self::ColumnNotFound(error) => error.fmt(formatter),
+            Self::CountOutOfRange { count } => {
+                write!(
+                    formatter,
+                    "table row count {count} is outside the Int64 range"
+                )
+            }
             Self::ResultSizeLimitExceeded {
                 estimated_bytes,
                 limit,
@@ -257,17 +268,23 @@ impl From<TableNotFoundError> for TableSelectError {
     }
 }
 
-/// Executes `SELECT column [, column ...] FROM table` against a catalog.
+/// Executes a supported table `SELECT` against a catalog.
 ///
-/// One optional trailing semicolon is accepted. Names are resolved exactly
-/// and case-sensitively, matching the catalog and schema storage boundaries.
-/// All requested columns are resolved before any result rows are materialized.
+/// Supported shapes are `SELECT column [, column ...] FROM table` and exactly
+/// `SELECT COUNT(*) [AS identifier] FROM table`. One optional trailing
+/// semicolon is accepted. Names are resolved exactly and case-sensitively,
+/// matching the catalog and schema storage boundaries. A count reads only the
+/// table's row-count metadata and validates that it fits its `Int64` result.
 pub fn execute_table_select(
     catalog: &Catalog,
     input: &str,
 ) -> Result<TableSelectResult, TableSelectError> {
     let projection = parse_table_select(input)?;
     let table = catalog.table(&projection.table_name)?;
+    let column_names = match projection.selection {
+        TableSelection::Columns(column_names) => column_names,
+        TableSelection::Count { column_name } => return count_result(table, column_name),
+    };
     let column_indices: HashMap<&str, usize> = table
         .schema()
         .columns()
@@ -276,8 +293,8 @@ pub fn execute_table_select(
         .map(|(index, column)| (column.name(), index))
         .collect();
 
-    let mut columns = Vec::with_capacity(projection.column_names.len());
-    for column_name in &projection.column_names {
+    let mut columns = Vec::with_capacity(column_names.len());
+    for column_name in &column_names {
         let Some(column_index) = column_indices.get(column_name.as_str()).copied() else {
             return Err(TableSelectError::ColumnNotFound(ColumnNotFoundError {
                 table_name: projection.table_name,
@@ -311,6 +328,21 @@ pub fn execute_table_select(
     }
 
     Ok(TableSelectResult { headers, rows })
+}
+
+fn count_result(table: &Table, column_name: String) -> Result<TableSelectResult, TableSelectError> {
+    let count = int64_count(table.row_count())?;
+    Ok(TableSelectResult {
+        headers: vec![ColumnSchema::new(
+            column_name,
+            crate::storage::DataType::Int64,
+        )],
+        rows: vec![vec![Value::Int64(count)]],
+    })
+}
+
+fn int64_count(count: usize) -> Result<i64, TableSelectError> {
+    i64::try_from(count).map_err(|_| TableSelectError::CountOutOfRange { count })
 }
 
 struct ResolvedColumn<'a> {
@@ -377,8 +409,13 @@ fn estimate_result_bytes(table: &Table, columns: &[ResolvedColumn<'_>]) -> usize
 }
 
 struct TableProjection {
-    column_names: Vec<String>,
+    selection: TableSelection,
     table_name: String,
+}
+
+enum TableSelection {
+    Columns(Vec<String>),
+    Count { column_name: String },
 }
 
 fn parse_table_select(input: &str) -> Result<TableProjection, TableSelectError> {
@@ -386,16 +423,31 @@ fn parse_table_select(input: &str) -> Result<TableProjection, TableSelectError> 
     let mut cursor = TableSelectCursor::new(input, &tokens);
 
     cursor.expect_keyword("SELECT", "SELECT")?;
-    let mut column_names = vec![cursor.take_identifier("a column name")?];
-    while cursor.take_comma() {
-        column_names.push(cursor.take_identifier("a column name after `,`")?);
-    }
+    let selection = if cursor.peek_is_count_call() {
+        let expression_start = cursor.position();
+        cursor.expect_keyword("COUNT", "COUNT")?;
+        cursor.expect_delimiter(Delimiter::LeftParenthesis, "`(` after COUNT")?;
+        cursor.expect_operator(Operator::Multiply, "`*` in COUNT(*)")?;
+        let expression_end =
+            cursor.expect_delimiter(Delimiter::RightParenthesis, "`)` after COUNT(*)")?;
+        let mut column_name = input[expression_start..expression_end].to_owned();
+        if cursor.take_keyword("AS") {
+            column_name = cursor.take_identifier("an identifier after AS")?;
+        }
+        TableSelection::Count { column_name }
+    } else {
+        let mut column_names = vec![cursor.take_identifier("a column name")?];
+        while cursor.take_comma() {
+            column_names.push(cursor.take_identifier("a column name after `,`")?);
+        }
+        TableSelection::Columns(column_names)
+    };
     cursor.expect_keyword("FROM", "`,` or FROM")?;
     let table_name = cursor.take_identifier("a table name after FROM")?;
     cursor.finish()?;
 
     Ok(TableProjection {
-        column_names,
+        selection,
         table_name,
     })
 }
@@ -434,6 +486,31 @@ impl<'a> TableSelectCursor<'a> {
         TableSelectError::Syntax {
             position: self.position(),
             expected,
+        }
+    }
+
+    fn peek_is_count_call(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.index).map(|token| &token.kind),
+                self.tokens.get(self.index + 1).map(|token| &token.kind),
+            ),
+            (
+                Some(TokenKind::Identifier(identifier)),
+                Some(TokenKind::Delimiter(Delimiter::LeftParenthesis)),
+            ) if identifier.eq_ignore_ascii_case("COUNT")
+        )
+    }
+
+    fn take_keyword(&mut self, keyword: &str) -> bool {
+        if matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Identifier(identifier)) if identifier.eq_ignore_ascii_case(keyword)
+        ) {
+            self.index += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -478,6 +555,44 @@ impl<'a> TableSelectCursor<'a> {
         };
         self.index += 1;
         Ok(identifier)
+    }
+
+    fn expect_delimiter(
+        &mut self,
+        delimiter: Delimiter,
+        expected: &'static str,
+    ) -> Result<usize, TableSelectError> {
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax(expected))?;
+        if token.kind != TokenKind::Delimiter(delimiter) {
+            return Err(TableSelectError::Syntax {
+                position: token.span.start,
+                expected,
+            });
+        }
+        self.index += 1;
+        Ok(token.span.end)
+    }
+
+    fn expect_operator(
+        &mut self,
+        operator: Operator,
+        expected: &'static str,
+    ) -> Result<(), TableSelectError> {
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax(expected))?;
+        if token.kind != TokenKind::Operator(operator) {
+            return Err(TableSelectError::Syntax {
+                position: token.span.start,
+                expected,
+            });
+        }
+        self.index += 1;
+        Ok(())
     }
 
     fn take_comma(&mut self) -> bool {
@@ -763,6 +878,17 @@ mod tests {
                 estimated_bytes,
                 limit: estimated_bytes - 1,
             })
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn count_conversion_rejects_values_outside_int64() {
+        let count = usize::try_from(i64::MAX).unwrap() + 1;
+
+        assert_eq!(
+            int64_count(count),
+            Err(TableSelectError::CountOutOfRange { count })
         );
     }
 }

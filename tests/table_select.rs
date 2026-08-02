@@ -103,6 +103,66 @@ fn reports_typed_unknown_table_and_column_failures() {
 }
 
 #[test]
+fn counts_empty_and_populated_tables_as_one_typed_int64_row() {
+    let mut catalog = all_types_catalog();
+
+    let empty = execute_table_select(&catalog, "SELECT COUNT(*) FROM events")
+        .expect("empty table count is valid");
+    assert_eq!(
+        empty.headers(),
+        [ColumnSchema::new("COUNT(*)", DataType::Int64)]
+    );
+    assert_eq!(empty.rows(), [vec![Value::Int64(0)]]);
+
+    catalog
+        .table_mut("events")
+        .unwrap()
+        .insert_batch(vec![
+            vec![1_i64.into(), 1.5_f64.into(), true.into(), "one".into()],
+            vec![2_i64.into(), 2.5_f64.into(), false.into(), "two".into()],
+        ])
+        .unwrap();
+
+    let populated = execute_table_select(
+        &catalog,
+        r#"select count(*) AS "number of events" from events;"#,
+    )
+    .expect("populated table count with a quoted alias is valid");
+    assert_eq!(
+        populated.headers(),
+        [ColumnSchema::new("number of events", DataType::Int64)]
+    );
+    assert_eq!(populated.rows(), [vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn count_reports_unknown_tables_and_rejects_trailing_or_broader_syntax() {
+    let catalog = all_types_catalog();
+
+    assert_eq!(
+        execute_table_select(&catalog, "SELECT COUNT(*) FROM missing"),
+        Err(TableSelectError::TableNotFound(TableNotFoundError {
+            name: "missing".to_owned(),
+        }))
+    );
+
+    let unsupported = [
+        "SELECT COUNT(*) FROM events WHERE active = TRUE",
+        "SELECT COUNT(*) FROM events LIMIT 1",
+        "SELECT COUNT(id) FROM events",
+        "SELECT COUNT(DISTINCT id) FROM events",
+        "SELECT COUNT(*) total FROM events",
+        "SELECT COUNT(*), id FROM events",
+    ];
+    for sql in unsupported {
+        assert!(
+            execute_table_select(&catalog, sql).is_err(),
+            "unsupported COUNT query succeeded: {sql}"
+        );
+    }
+}
+
+#[test]
 fn rejects_wildcards_aliases_filters_ordering_and_multiple_statements() {
     let catalog = all_types_catalog();
     let unsupported = [

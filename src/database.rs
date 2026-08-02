@@ -24,7 +24,7 @@ pub const MAX_SCRIPT_RESULT_BYTES: usize = 64 * 1024 * 1024;
 pub enum SelectResult {
     /// A `SELECT` whose expression is one scalar literal.
     Scalar(ScalarSelect),
-    /// A projection from a catalog table.
+    /// A projection or aggregate from a catalog table.
     Table(TableSelectResult),
 }
 
@@ -103,7 +103,8 @@ impl Database {
     /// Executes a bounded semicolon-delimited sequence in source order.
     ///
     /// Only the existing `CREATE TABLE`, one-row `INSERT INTO ... VALUES`,
-    /// scalar `SELECT`, and table projection `SELECT` shapes are dispatched.
+    /// scalar `SELECT`, table projection `SELECT`, and table `COUNT(*)` shapes
+    /// are dispatched.
     /// Command statements produce no result; each `SELECT` contributes one
     /// result in statement order. Statements completed before an execution
     /// error remain applied.
