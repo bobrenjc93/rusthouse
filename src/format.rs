@@ -56,7 +56,8 @@ impl From<io::Error> for CsvError {
 /// The header is written by [`CsvWithNamesWriter::new`]. Each subsequent
 /// record is validated against the header width and written immediately, so
 /// memory use is bounded by one record rather than the complete result set.
-/// Fields follow RFC 4180 quoting rules and records end with `\r\n`.
+/// Text fields are always double-quoted for ClickHouse compatibility, embedded
+/// quotes follow RFC 4180 escaping rules, and records end with `\r\n`.
 pub struct CsvWithNamesWriter<W> {
     target: W,
     width: usize,
@@ -172,13 +173,6 @@ where
 
 fn write_field<W: Write>(target: &mut W, field: &str) -> io::Result<()> {
     let bytes = field.as_bytes();
-    if !bytes
-        .iter()
-        .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'))
-    {
-        return target.write_all(bytes);
-    }
-
     target.write_all(b"\"")?;
     let mut remaining = bytes;
     while let Some(quote) = remaining.iter().position(|byte| *byte == b'"') {
@@ -202,11 +196,11 @@ mod tests {
 
         write_csv_with_names(&mut output, ["id", "name"], std::iter::empty::<[&str; 2]>()).unwrap();
 
-        assert_eq!(output, b"id,name\r\n");
+        assert_eq!(output, b"\"id\",\"name\"\r\n");
     }
 
     #[test]
-    fn quotes_every_rfc_4180_special_character() {
+    fn quotes_and_escapes_every_rfc_4180_special_character() {
         let mut output = Vec::new();
 
         write_csv_with_names(
@@ -218,8 +212,25 @@ mod tests {
 
         assert_eq!(
             output,
-            b"plain,\"with,comma\",\"with\"\"quote\",\"with\rcr\",\"with\nlf\"\r\n\
-              value,\"a,b\",\"say \"\"hi\"\"\",\"a\rb\",\"a\nb\"\r\n"
+            b"\"plain\",\"with,comma\",\"with\"\"quote\",\"with\rcr\",\"with\nlf\"\r\n\
+              \"value\",\"a,b\",\"say \"\"hi\"\"\",\"a\rb\",\"a\nb\"\r\n"
+        );
+    }
+
+    #[test]
+    fn preserves_clickhouse_sensitive_text() {
+        let mut output = Vec::new();
+
+        write_csv_with_names(
+            &mut output,
+            ["value"],
+            [["'"], ["'literal'"], [" padded "], ["\tpadded\t"]],
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            b"\"value\"\r\n\"'\"\r\n\"'literal'\"\r\n\" padded \"\r\n\"\tpadded\t\"\r\n"
         );
     }
 
@@ -239,7 +250,7 @@ mod tests {
                     actual: 1 | 3,
                 }
             ));
-            assert_eq!(output, b"left,right\r\n");
+            assert_eq!(output, b"\"left\",\"right\"\r\n");
         }
     }
 
@@ -263,14 +274,14 @@ mod tests {
         let observed = Rc::clone(&bytes);
         let records = (0..2).map(move |row| {
             if row == 1 {
-                assert_eq!(&*observed.borrow(), b"name\r\nfirst\r\n");
+                assert_eq!(&*observed.borrow(), b"\"name\"\r\n\"first\"\r\n");
             }
             [if row == 0 { "first" } else { "second" }]
         });
 
         write_csv_with_names(&mut SharedTarget(Rc::clone(&bytes)), ["name"], records).unwrap();
 
-        assert_eq!(&*bytes.borrow(), b"name\r\nfirst\r\nsecond\r\n");
+        assert_eq!(&*bytes.borrow(), b"\"name\"\r\n\"first\"\r\n\"second\"\r\n");
     }
 
     #[test]
@@ -295,7 +306,7 @@ mod tests {
         }
 
         let error =
-            write_csv_with_names(&mut FailingTarget { remaining: 6 }, ["name"], [["record"]])
+            write_csv_with_names(&mut FailingTarget { remaining: 8 }, ["name"], [["record"]])
                 .unwrap_err();
 
         match error {
