@@ -124,6 +124,16 @@ impl Schema {
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|column| column.name == name)
     }
+
+    #[cfg(test)]
+    pub(crate) fn column_capacity(&self) -> usize {
+        self.columns.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn column_name_capacity(&self, index: usize) -> Option<usize> {
+        self.columns.get(index).map(|column| column.name.capacity())
+    }
 }
 
 /// An owned value accepted by [`Table::insert_row`] and [`Table::insert_rows`].
