@@ -4,9 +4,10 @@ use std::mem::{size_of, size_of_val};
 
 use crate::sql::{
     AggregateFunction, BinaryOperator, ColumnReference, Expr, Identifier,
-    MAX_SAFE_EXPRESSION_DEPTH, OrderBy, Select, SelectItem, Statement, UnaryOperator, parse,
+    MAX_SAFE_EXPRESSION_DEPTH, MAX_SAFE_EXPRESSION_NODES, OrderBy, Select, SelectItem, Statement,
+    UnaryOperator, parse,
 };
-use crate::storage::{Schema, Table, identifier_key, identifiers_equal, normalize_identifier};
+use crate::storage::{Schema, Table, identifier_key, identifiers_equal};
 use crate::{ColumnDefinition, DataType, DatabaseError, LimitKind, Value};
 
 /// Resource limits enforced by parsing, storage, and query execution.
@@ -35,7 +36,7 @@ impl Default for Limits {
             max_columns_per_table: 1_024,
             max_string_bytes: 1024 * 1024,
             max_expression_depth: MAX_SAFE_EXPRESSION_DEPTH,
-            max_expression_nodes: 1_024,
+            max_expression_nodes: MAX_SAFE_EXPRESSION_NODES,
             max_intermediate_rows: 1_000_000,
             max_intermediate_bytes: 128 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
@@ -74,6 +75,7 @@ impl Database {
     /// Creates an empty database with caller-provided resource limits.
     pub fn with_limits(mut limits: Limits) -> Self {
         limits.max_expression_depth = limits.max_expression_depth.min(MAX_SAFE_EXPRESSION_DEPTH);
+        limits.max_expression_nodes = limits.max_expression_nodes.min(MAX_SAFE_EXPRESSION_NODES);
         Self {
             tables: HashMap::new(),
             limits,
@@ -121,19 +123,54 @@ impl Database {
         self.execute_parsed(statements.pop().expect("one statement was checked"))
     }
 
-    /// Returns a table schema, matching names case-insensitively.
+    /// Returns a schema when exact-quoted and folded-unquoted lookup are unambiguous.
     pub fn schema(&self, table: &str) -> Result<&Schema, DatabaseError> {
-        self.tables
-            .get(&normalize_identifier(table))
+        self.resolve_table(table).map(|table| &table.schema)
+    }
+
+    /// Returns a table schema using exact quoted-identifier semantics.
+    pub fn schema_quoted(&self, table: &str) -> Result<&Schema, DatabaseError> {
+        self.table_with_mode(table, true).map(|table| &table.schema)
+    }
+
+    /// Returns a table schema using case-folded unquoted-identifier semantics.
+    pub fn schema_unquoted(&self, table: &str) -> Result<&Schema, DatabaseError> {
+        self.table_with_mode(table, false)
             .map(|table| &table.schema)
-            .ok_or_else(|| DatabaseError::TableNotFound(table.to_owned()))
     }
 
     pub fn table_row_count(&self, table: &str) -> Result<usize, DatabaseError> {
+        self.resolve_table(table).map(Table::row_count)
+    }
+
+    pub fn table_row_count_quoted(&self, table: &str) -> Result<usize, DatabaseError> {
+        self.table_with_mode(table, true).map(Table::row_count)
+    }
+
+    pub fn table_row_count_unquoted(&self, table: &str) -> Result<usize, DatabaseError> {
+        self.table_with_mode(table, false).map(Table::row_count)
+    }
+
+    fn table_with_mode(&self, table: &str, quoted: bool) -> Result<&Table, DatabaseError> {
         self.tables
-            .get(&normalize_identifier(table))
-            .map(Table::row_count)
+            .get(&identifier_key(table, quoted))
             .ok_or_else(|| DatabaseError::TableNotFound(table.to_owned()))
+    }
+
+    fn resolve_table(&self, table: &str) -> Result<&Table, DatabaseError> {
+        let quoted_key = identifier_key(table, true);
+        let unquoted_key = identifier_key(table, false);
+        if quoted_key == unquoted_key {
+            return self
+                .tables
+                .get(&quoted_key)
+                .ok_or_else(|| DatabaseError::TableNotFound(table.to_owned()));
+        }
+        match (self.tables.get(&quoted_key), self.tables.get(&unquoted_key)) {
+            (Some(_), Some(_)) => Err(DatabaseError::AmbiguousTable(table.to_owned())),
+            (Some(table), None) | (None, Some(table)) => Ok(table),
+            (None, None) => Err(DatabaseError::TableNotFound(table.to_owned())),
+        }
     }
 
     fn execute_parsed(&mut self, statement: Statement) -> Result<ExecutionResult, DatabaseError> {
@@ -264,13 +301,7 @@ impl Database {
             ),
             None => None,
         };
-        let empty_schema = Schema::new(
-            vec![ColumnDefinition {
-                name: "_virtual".into(),
-                data_type: DataType::Bool,
-            }],
-            &self.limits,
-        )?;
+        let empty_schema = Schema::empty();
         let schema = table.map_or(&empty_schema, |table| &table.schema);
 
         let items = expand_wildcards(&select.items, schema, table.is_some())?;

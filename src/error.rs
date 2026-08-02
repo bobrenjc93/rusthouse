@@ -46,6 +46,7 @@ pub enum DatabaseError {
     },
     TableAlreadyExists(String),
     TableNotFound(String),
+    AmbiguousTable(String),
     ColumnAlreadyExists(String),
     ColumnNotFound(String),
     AmbiguousColumn(String),
@@ -87,6 +88,7 @@ impl fmt::Display for DatabaseError {
             }
             Self::TableAlreadyExists(name) => write!(f, "table already exists: {name}"),
             Self::TableNotFound(name) => write!(f, "table not found: {name}"),
+            Self::AmbiguousTable(name) => write!(f, "ambiguous table: {name}"),
             Self::ColumnAlreadyExists(name) => write!(f, "column already exists: {name}"),
             Self::ColumnNotFound(name) => write!(f, "column not found: {name}"),
             Self::AmbiguousColumn(name) => write!(f, "ambiguous column: {name}"),

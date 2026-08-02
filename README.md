@@ -70,7 +70,16 @@ working set. Projection and ordering budgets are charged after each scalar, so
 a single wide row cannot bypass byte limits. Expression depth is hard-capped at 64 to keep parser and evaluator
 stack use safe even when a caller supplies a larger configured value. The
 separate node-count bound limits expression memory without treating balanced
-trees as deeply nested.
+trees as deeply nested. It is hard-capped at 256 nodes so caller overrides
+cannot construct an AST whose recursive destruction would exhaust the stack.
+The column limit applies to physical table schemas, not scalar `SELECT`
+results.
+
+Public catalog helpers mirror SQL identifier rules. `schema` and
+`table_row_count` reject names whose exact-quoted and folded-unquoted meanings
+select different tables; `_quoted` and `_unquoted` variants choose explicitly.
+`Schema` provides the same behavior through `resolve_column_index`,
+`column_index_quoted`, and `column_index_unquoted`.
 
 ## Development
 

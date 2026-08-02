@@ -19,6 +19,13 @@ pub struct Schema {
 }
 
 impl Schema {
+    pub(crate) fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            quoted: Vec::new(),
+        }
+    }
+
     pub fn new(columns: Vec<ColumnDefinition>, limits: &Limits) -> Result<Self, DatabaseError> {
         let quoted = vec![false; columns.len()];
         Self::new_with_quoted(columns, quoted, limits)
@@ -57,7 +64,32 @@ impl Schema {
         &self.columns
     }
 
+    /// Returns a column only when quoted and unquoted interpretations are unambiguous.
     pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.resolve_column_index(name).ok()
+    }
+
+    /// Resolves either an exact quoted spelling or an unquoted folded name.
+    /// Returns an ambiguity error when those interpretations select different columns.
+    pub fn resolve_column_index(&self, name: &str) -> Result<usize, DatabaseError> {
+        let quoted = self.column_index_bound(name, true);
+        let unquoted = self.column_index_bound(name, false);
+        match (quoted, unquoted) {
+            (Some(left), Some(right)) if left != right => {
+                Err(DatabaseError::AmbiguousColumn(name.to_owned()))
+            }
+            (Some(index), _) | (_, Some(index)) => Ok(index),
+            (None, None) => Err(DatabaseError::ColumnNotFound(name.to_owned())),
+        }
+    }
+
+    /// Resolves a column with exact, quoted-identifier semantics.
+    pub fn column_index_quoted(&self, name: &str) -> Option<usize> {
+        self.column_index_bound(name, true)
+    }
+
+    /// Resolves a column with case-folded, unquoted-identifier semantics.
+    pub fn column_index_unquoted(&self, name: &str) -> Option<usize> {
         self.column_index_bound(name, false)
     }
 

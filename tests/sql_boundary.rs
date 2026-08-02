@@ -487,6 +487,29 @@ fn quoted_identifiers_preserve_exact_case() {
         database.execute_one("SELECT \"CASENAME\" FROM \"CaseTable\""),
         Err(DatabaseError::ColumnNotFound(_))
     ));
+
+    assert!(matches!(
+        database.schema("CaseTable"),
+        Err(DatabaseError::AmbiguousTable(name)) if name == "CaseTable"
+    ));
+    let upper = database.schema_quoted("CaseTable").unwrap();
+    assert!(matches!(
+        upper.resolve_column_index("CaseName"),
+        Err(DatabaseError::AmbiguousColumn(name)) if name == "CaseName"
+    ));
+    assert_eq!(upper.column_index_quoted("CaseName"), Some(0));
+    assert_eq!(upper.column_index_quoted("casename"), Some(1));
+    assert_eq!(upper.column_index_unquoted("CaseName"), Some(1));
+    assert_eq!(
+        database.schema_quoted("casetable").unwrap().columns()[0].name,
+        "id"
+    );
+    assert_eq!(
+        database.schema_unquoted("CaseTable").unwrap().columns()[0].name,
+        "id"
+    );
+    assert_eq!(database.table_row_count_quoted("CaseTable").unwrap(), 1);
+    assert_eq!(database.table_row_count_quoted("casetable").unwrap(), 0);
 }
 
 fn balanced_sum(terms: usize) -> String {
@@ -524,5 +547,50 @@ fn order_by_rejects_ambiguous_output_names() {
     assert!(matches!(
         database.execute_one("SELECT a, b AS a FROM alias_collision ORDER BY a"),
         Err(DatabaseError::AmbiguousColumn(name)) if name == "a"
+    ));
+}
+
+#[test]
+fn caller_cannot_raise_expression_nodes_above_the_safe_cap() {
+    let mut database = Database::with_limits(Limits {
+        max_expression_nodes: usize::MAX,
+        ..Limits::default()
+    });
+    assert_eq!(database.limits().max_expression_nodes, 256);
+
+    let flat = format!("SELECT {}", vec!["1"; 50_000].join(" + "));
+    assert!(matches!(
+        database.execute_one(&flat),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::ExpressionNodes,
+            ..
+        })
+    ));
+    let unary = format!("SELECT {}1", "+".repeat(50_000));
+    assert!(matches!(
+        database.execute_one(&unary),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::ExpressionNodes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scalar_select_does_not_consume_the_table_column_limit() {
+    let mut database = Database::with_limits(Limits {
+        max_columns_per_table: 0,
+        ..Limits::default()
+    });
+    assert_eq!(
+        query(&mut database, "SELECT 1 AS value").rows,
+        vec![vec![Value::Int64(1)]]
+    );
+    assert!(matches!(
+        database.execute_one("CREATE TABLE forbidden (id Int64)"),
+        Err(DatabaseError::LimitExceeded {
+            kind: LimitKind::ColumnsPerTable,
+            ..
+        })
     ));
 }

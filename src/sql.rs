@@ -1,6 +1,7 @@
 use crate::{DataType, DatabaseError, LimitKind, Value};
 
 pub(crate) const MAX_SAFE_EXPRESSION_DEPTH: usize = 64;
+pub(crate) const MAX_SAFE_EXPRESSION_NODES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Statement {
@@ -296,7 +297,7 @@ pub(crate) fn parse(
     Parser::new(
         tokens,
         max_expression_depth.min(MAX_SAFE_EXPRESSION_DEPTH),
-        max_expression_nodes,
+        max_expression_nodes.min(MAX_SAFE_EXPRESSION_NODES),
     )
     .parse_statements()
 }
