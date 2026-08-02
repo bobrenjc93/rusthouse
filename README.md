@@ -28,4 +28,25 @@ cargo test
 cargo run -- --help
 ```
 
+## Current CLI
+
+The current SQL boundary intentionally supports only semicolon-separated
+`SELECT <signed Int64 literal> [AS identifier]` statements. SQL is read from
+standard input and results are written as CSV with a header for each statement.
+The default header is `value`; an `AS` alias replaces it. Input is limited to
+65,536 bytes.
+
+```bash
+printf 'SELECT -7 AS temperature; SELECT +2;' | cargo run -- --format csv
+```
+
+This prints:
+
+```csv
+temperature
+-7
+value
+2
+```
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
