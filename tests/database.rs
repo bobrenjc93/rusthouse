@@ -340,6 +340,115 @@ fn schema_limit_errors_are_typed_positioned_and_preserve_catalog() {
 }
 
 #[test]
+fn sql_schema_and_insert_width_accept_the_boundary_and_reject_one_over() {
+    let definitions = (0..MAX_SCHEMA_FIELDS)
+        .map(|index| format!("field_{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = std::iter::repeat_n("1", MAX_SCHEMA_FIELDS)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+
+    database
+        .execute(&format!(
+            "CREATE TABLE wide ({definitions}); INSERT INTO wide VALUES ({values});"
+        ))
+        .unwrap();
+
+    let table = database.table("wide").unwrap();
+    assert_eq!(table.schema().len(), MAX_SCHEMA_FIELDS);
+    assert_eq!(table.row_count(), 1);
+
+    let sql = format!("INSERT INTO wide VALUES ({values}, 1);");
+    let error = database.execute(&sql).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::InvalidRow {
+            table: "wide".into(),
+            source: BatchAppendError::RowShapeMismatch {
+                row_index: 0,
+                expected: MAX_SCHEMA_FIELDS,
+                actual: MAX_SCHEMA_FIELDS + 1,
+            },
+        }
+    );
+    assert_eq!(database.table("wide").unwrap().row_count(), 1);
+}
+
+#[test]
+fn sql_insert_rows_accept_the_boundary_and_stop_one_over() {
+    const PREFIX: &str = "CREATE TABLE bounded (value Int64); INSERT INTO bounded VALUES ";
+    let mut accepted_sql = String::with_capacity(PREFIX.len() + DEFAULT_TABLE_ROW_LIMIT * 4);
+    accepted_sql.push_str(PREFIX);
+    accepted_sql.push_str(&"(1),".repeat(DEFAULT_TABLE_ROW_LIMIT - 1));
+    accepted_sql.push_str("(1);");
+    let mut accepted_database = Database::new();
+
+    accepted_database.execute(&accepted_sql).unwrap();
+
+    assert_eq!(
+        accepted_database.table("bounded").unwrap().row_count(),
+        DEFAULT_TABLE_ROW_LIMIT
+    );
+    drop(accepted_database);
+    drop(accepted_sql);
+
+    let mut rejected_sql = String::with_capacity(PREFIX.len() + (DEFAULT_TABLE_ROW_LIMIT + 1) * 4);
+    rejected_sql.push_str(PREFIX);
+    rejected_sql.push_str(&"(1),".repeat(DEFAULT_TABLE_ROW_LIMIT));
+    rejected_sql.push_str("(1);");
+    let mut rejected_database = Database::new();
+
+    let error = rejected_database.execute(&rejected_sql).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::InvalidRow {
+            table: "bounded".into(),
+            source: BatchAppendError::RowLimitExceeded {
+                row_index: DEFAULT_TABLE_ROW_LIMIT,
+                limit: DEFAULT_TABLE_ROW_LIMIT,
+            },
+        }
+    );
+    assert!(rejected_database.is_empty());
+}
+
+#[test]
+fn incremental_insert_does_not_require_copying_existing_rows() {
+    const EXISTING_ROWS: usize = 100_000;
+    const PREFIX: &str = "CREATE TABLE events (id Int64); INSERT INTO events VALUES ";
+    let mut sql = String::with_capacity(PREFIX.len() + EXISTING_ROWS * 4);
+    sql.push_str(PREFIX);
+    sql.push_str(&"(1),".repeat(EXISTING_ROWS - 1));
+    sql.push_str("(1);");
+    let mut database = Database::new();
+    database.execute(&sql).unwrap();
+
+    let error = database
+        .execute("INSERT INTO events VALUES ('wrong');")
+        .unwrap_err();
+
+    assert!(matches!(
+        error.kind(),
+        SqlErrorKind::InvalidRow {
+            source: BatchAppendError::TypeMismatch { .. },
+            ..
+        }
+    ));
+    assert_eq!(database.table("events").unwrap().row_count(), EXISTING_ROWS);
+
+    database.execute("INSERT INTO events VALUES (2);").unwrap();
+    let table = database.table("events").unwrap();
+    assert_eq!(table.row_count(), EXISTING_ROWS + 1);
+    let Column::Int64(ids) = table.column("id").unwrap() else {
+        panic!("id should be an Int64 column");
+    };
+    assert_eq!(ids.values().last(), Some(&2));
+}
+
+#[test]
 fn schema_limit_failure_rolls_back_an_earlier_staged_insert() {
     let mut database = database_with_seed();
     let before = database.clone();

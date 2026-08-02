@@ -232,28 +232,7 @@ impl std::error::Error for SqlError {
 /// literals. Comparisons use SQL NULL propagation and require non-null
 /// operands to have the same type.
 pub fn parse_sql_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
-    Parser::new(input, ParserMode::SelectOnly)
-        .parse_batch()?
-        .into_iter()
-        .map(|statement| match statement {
-            Statement::Select(result) => Ok(result),
-            Statement::CreateTable(_) => unreachable!("SELECT-only parsing produced CREATE TABLE"),
-            Statement::InsertInto(_) => unreachable!("SELECT-only parsing produced INSERT"),
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy)]
-enum ParserMode {
-    SelectOnly,
-    Database,
-}
-
-#[derive(Debug)]
-pub(crate) enum Statement {
-    Select(QueryResult),
-    CreateTable(CreateTable),
-    InsertInto(InsertInto),
+    Parser::new(input).parse_select_batch()
 }
 
 #[derive(Debug)]
@@ -268,10 +247,17 @@ pub(crate) struct CreateField {
     pub(crate) data_type: DataType,
 }
 
-#[derive(Debug)]
-pub(crate) struct InsertInto {
-    pub(crate) table: PositionedIdentifier,
-    pub(crate) rows: Vec<InsertRow>,
+pub(crate) enum DatabaseEvent {
+    Select(QueryResult),
+    CreateTable(CreateTable),
+    InsertStart(PositionedIdentifier),
+    InsertRow(InsertRow),
+    InsertEnd,
+}
+
+pub(crate) enum DatabaseEventOutcome {
+    Continue,
+    InsertSchemaWidth(usize),
 }
 
 #[derive(Debug)]
@@ -286,8 +272,11 @@ pub(crate) struct PositionedIdentifier {
     pub(crate) byte_offset: usize,
 }
 
-pub(crate) fn parse_database_batch(input: &str) -> Result<Vec<Statement>, SqlError> {
-    Parser::new(input, ParserMode::Database).parse_batch()
+pub(crate) fn parse_database_batch(
+    input: &str,
+    consume: impl FnMut(DatabaseEvent) -> Result<DatabaseEventOutcome, SqlError>,
+) -> Result<(), SqlError> {
+    Parser::new(input).parse_database_batch(consume)
 }
 
 /// Writes each query result as a CSV header followed by its single row.
@@ -330,31 +319,23 @@ fn write_csv_field<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
 struct Parser<'a> {
     input: &'a str,
     position: usize,
-    mode: ParserMode,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, mode: ParserMode) -> Self {
-        Self {
-            input,
-            position: 0,
-            mode,
-        }
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
     }
 
-    fn parse_batch(mut self) -> Result<Vec<Statement>, SqlError> {
-        let mut statements = Vec::new();
+    fn parse_select_batch(mut self) -> Result<Vec<QueryResult>, SqlError> {
+        let mut results = Vec::new();
         self.skip_whitespace();
 
         if self.is_at_end() {
-            return Err(self.syntax_error(match self.mode {
-                ParserMode::SelectOnly => "expected a SELECT statement",
-                ParserMode::Database => "expected a SELECT, CREATE TABLE, or INSERT statement",
-            }));
+            return Err(self.syntax_error("expected a SELECT statement"));
         }
 
         while !self.is_at_end() {
-            if statements.len() == MAX_SQL_STATEMENTS {
+            if results.len() == MAX_SQL_STATEMENTS {
                 return Err(SqlError::at(
                     self.input,
                     self.position,
@@ -363,28 +344,53 @@ impl<'a> Parser<'a> {
                     },
                 ));
             }
-            statements.push(self.parse_statement()?);
+            if !self.consume_keyword("SELECT") {
+                return Err(self.syntax_error("expected SELECT"));
+            }
+            results.push(self.parse_select()?);
             self.skip_whitespace();
         }
 
-        Ok(statements)
+        Ok(results)
     }
 
-    fn parse_statement(&mut self) -> Result<Statement, SqlError> {
-        if self.consume_keyword("SELECT") {
-            return self.parse_select().map(Statement::Select);
-        }
-        if matches!(self.mode, ParserMode::Database) && self.consume_keyword("CREATE") {
-            return self.parse_create_table().map(Statement::CreateTable);
-        }
-        if matches!(self.mode, ParserMode::Database) && self.consume_keyword("INSERT") {
-            return self.parse_insert_into().map(Statement::InsertInto);
+    fn parse_database_batch(
+        mut self,
+        mut consume: impl FnMut(DatabaseEvent) -> Result<DatabaseEventOutcome, SqlError>,
+    ) -> Result<(), SqlError> {
+        let mut statement_count = 0;
+        self.skip_whitespace();
+
+        if self.is_at_end() {
+            return Err(self.syntax_error("expected a SELECT, CREATE TABLE, or INSERT statement"));
         }
 
-        Err(self.syntax_error(match self.mode {
-            ParserMode::SelectOnly => "expected SELECT",
-            ParserMode::Database => "expected SELECT, CREATE TABLE, or INSERT",
-        }))
+        while !self.is_at_end() {
+            if statement_count == MAX_SQL_STATEMENTS {
+                return Err(SqlError::at(
+                    self.input,
+                    self.position,
+                    SqlErrorKind::TooManyStatements {
+                        max_statements: MAX_SQL_STATEMENTS,
+                    },
+                ));
+            }
+
+            if self.consume_keyword("SELECT") {
+                let _ = consume(DatabaseEvent::Select(self.parse_select()?))?;
+            } else if self.consume_keyword("CREATE") {
+                let _ = consume(DatabaseEvent::CreateTable(self.parse_create_table()?))?;
+            } else if self.consume_keyword("INSERT") {
+                self.parse_insert_into(&mut consume)?;
+            } else {
+                return Err(self.syntax_error("expected SELECT, CREATE TABLE, or INSERT"));
+            }
+
+            statement_count += 1;
+            self.skip_whitespace();
+        }
+
+        Ok(())
     }
 
     fn parse_select(&mut self) -> Result<QueryResult, SqlError> {
@@ -440,6 +446,19 @@ impl<'a> Parser<'a> {
         let mut field_names = std::collections::HashSet::new();
         loop {
             let field_name = self.parse_identifier("expected a field name")?;
+            if fields.len() == MAX_SCHEMA_FIELDS {
+                return Err(SqlError::at(
+                    self.input,
+                    field_name.byte_offset,
+                    SqlErrorKind::InvalidSchema {
+                        table: name.value,
+                        error: SchemaError::TooManyFields {
+                            limit: MAX_SCHEMA_FIELDS,
+                            actual: MAX_SCHEMA_FIELDS + 1,
+                        },
+                    },
+                ));
+            }
             if !field_names.insert(field_name.value.to_ascii_lowercase()) {
                 return Err(SqlError::at(
                     self.input,
@@ -498,7 +517,10 @@ impl<'a> Parser<'a> {
         Ok(CreateTable { name, fields })
     }
 
-    fn parse_insert_into(&mut self) -> Result<InsertInto, SqlError> {
+    fn parse_insert_into(
+        &mut self,
+        consume: &mut impl FnMut(DatabaseEvent) -> Result<DatabaseEventOutcome, SqlError>,
+    ) -> Result<(), SqlError> {
         if !self.skip_required_whitespace() || !self.consume_keyword("INTO") {
             return Err(self.syntax_error("expected INTO after INSERT"));
         }
@@ -507,16 +529,36 @@ impl<'a> Parser<'a> {
         }
 
         let table = self.parse_identifier("expected a table name after INSERT INTO")?;
+        let table_name = table.value.clone();
         if !self.skip_required_whitespace() || !self.consume_keyword("VALUES") {
             return Err(self.syntax_error("expected VALUES after table name"));
         }
         self.skip_whitespace();
+        let max_values = match consume(DatabaseEvent::InsertStart(table))? {
+            DatabaseEventOutcome::InsertSchemaWidth(width) => width,
+            DatabaseEventOutcome::Continue => {
+                unreachable!("an INSERT start event returns its schema width")
+            }
+        };
 
-        let mut rows = Vec::new();
+        let mut row_index = 0;
         loop {
             let byte_offset = self.position;
             if self.peek() != Some('(') {
                 return Err(self.syntax_error("expected '(' to start an INSERT row"));
+            }
+            if row_index == DEFAULT_TABLE_ROW_LIMIT {
+                return Err(SqlError::at(
+                    self.input,
+                    byte_offset,
+                    SqlErrorKind::InvalidRow {
+                        table: table_name,
+                        source: BatchAppendError::RowLimitExceeded {
+                            row_index,
+                            limit: DEFAULT_TABLE_ROW_LIMIT,
+                        },
+                    },
+                ));
             }
             self.advance();
             self.skip_whitespace();
@@ -524,7 +566,23 @@ impl<'a> Parser<'a> {
             let mut values = Vec::new();
             if self.peek() != Some(')') {
                 loop {
-                    values.push(self.parse_insert_literal()?);
+                    let value_offset = self.position;
+                    let value = self.parse_insert_literal()?;
+                    if values.len() == max_values {
+                        return Err(SqlError::at(
+                            self.input,
+                            value_offset,
+                            SqlErrorKind::InvalidRow {
+                                table: table_name,
+                                source: BatchAppendError::RowShapeMismatch {
+                                    row_index,
+                                    expected: max_values,
+                                    actual: max_values + 1,
+                                },
+                            },
+                        ));
+                    }
+                    values.push(value);
                     self.skip_whitespace();
                     match self.peek() {
                         Some(',') => {
@@ -540,10 +598,11 @@ impl<'a> Parser<'a> {
             }
 
             self.advance();
-            rows.push(InsertRow {
+            let _ = consume(DatabaseEvent::InsertRow(InsertRow {
                 byte_offset,
                 values,
-            });
+            }))?;
+            row_index += 1;
             self.skip_whitespace();
 
             match self.peek() {
@@ -559,7 +618,8 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(InsertInto { table, rows })
+        let _ = consume(DatabaseEvent::InsertEnd)?;
+        Ok(())
     }
 
     fn parse_insert_literal(&mut self) -> Result<Value, SqlError> {

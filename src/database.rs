@@ -1,8 +1,9 @@
 //! Stateful SQL execution and the in-memory table catalog.
 
 use crate::{
-    CreateTable, Field, InsertInto, MAX_IDENTIFIER_BYTES, MAX_SCHEMA_FIELDS, MAX_SQL_INPUT_BYTES,
-    QueryResult, Schema, SqlError, SqlErrorKind, Statement, Table, parse_database_batch,
+    BatchAppendError, CreateTable, DatabaseEvent, DatabaseEventOutcome, Field,
+    MAX_IDENTIFIER_BYTES, MAX_SCHEMA_FIELDS, MAX_SQL_INPUT_BYTES, QueryResult, Schema, SqlError,
+    SqlErrorKind, Table, parse_database_batch,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -56,26 +57,99 @@ impl Database {
             ));
         }
 
-        let statements = parse_database_batch(input)?;
-        self.validate_table_names(input, &statements)?;
-
         let mut results = Vec::new();
-        let mut staged_tables = HashMap::new();
-        for statement in statements {
-            match statement {
-                Statement::Select(result) => results.push(result),
-                Statement::CreateTable(definition) => {
-                    let (name, table) = build_table(input, definition)?;
-                    staged_tables.insert(name, table);
-                }
-                Statement::InsertInto(insert) => {
-                    self.stage_insert(input, &mut staged_tables, insert)?;
-                }
-            }
-        }
+        let mut staged_tables: HashMap<String, StagedTable> = HashMap::new();
+        let mut table_names: HashSet<String> = self.tables.keys().cloned().collect();
+        let mut current_insert = None;
 
-        for (name, table) in staged_tables {
-            self.tables.insert(name, table);
+        parse_database_batch(input, |event| {
+            let outcome = match event {
+                DatabaseEvent::Select(result) => {
+                    results.push(result);
+                    DatabaseEventOutcome::Continue
+                }
+                DatabaseEvent::CreateTable(definition) => {
+                    let normalized_name = normalize_identifier(&definition.name.value);
+                    if !table_names.insert(normalized_name) {
+                        return Err(SqlError::at(
+                            input,
+                            definition.name.byte_offset,
+                            SqlErrorKind::DuplicateTable {
+                                table: definition.name.value,
+                            },
+                        ));
+                    }
+                    let (name, table) = build_table(input, definition)?;
+                    staged_tables.insert(name, StagedTable::Created(table));
+                    DatabaseEventOutcome::Continue
+                }
+                DatabaseEvent::InsertStart(table) => {
+                    let normalized_name = normalize_identifier(&table.value);
+                    if !staged_tables.contains_key(&normalized_name) {
+                        let Some(existing) = self.tables.get(&normalized_name) else {
+                            return Err(SqlError::at(
+                                input,
+                                table.byte_offset,
+                                SqlErrorKind::UnknownTable { table: table.value },
+                            ));
+                        };
+                        staged_tables.insert(
+                            normalized_name.clone(),
+                            StagedTable::from_existing(existing),
+                        );
+                    }
+                    current_insert = Some(CurrentInsert {
+                        normalized_name: normalized_name.clone(),
+                        table_name: table.value,
+                        row_index: 0,
+                    });
+                    DatabaseEventOutcome::InsertSchemaWidth(
+                        staged_tables
+                            .get(&normalized_name)
+                            .expect("the INSERT target was staged")
+                            .schema_len(),
+                    )
+                }
+                DatabaseEvent::InsertRow(row) => {
+                    let insert = current_insert
+                        .as_mut()
+                        .expect("INSERT rows follow an INSERT start event");
+                    let table = staged_tables
+                        .get_mut(&insert.normalized_name)
+                        .expect("the INSERT target was staged by its start event");
+                    if let Err(source) = table.append_row(row.values) {
+                        return Err(SqlError::at(
+                            input,
+                            row.byte_offset,
+                            SqlErrorKind::InvalidRow {
+                                table: insert.table_name.clone(),
+                                source: source.with_row_index(insert.row_index),
+                            },
+                        ));
+                    }
+                    insert.row_index += 1;
+                    DatabaseEventOutcome::Continue
+                }
+                DatabaseEvent::InsertEnd => {
+                    current_insert = None;
+                    DatabaseEventOutcome::Continue
+                }
+            };
+            Ok(outcome)
+        })?;
+
+        for (name, staged) in staged_tables {
+            match staged {
+                StagedTable::Created(table) => {
+                    let previous = self.tables.insert(name, table);
+                    debug_assert!(previous.is_none(), "new table names were validated");
+                }
+                StagedTable::Existing { delta, .. } => self
+                    .tables
+                    .get_mut(&name)
+                    .expect("an existing staged table remains in the catalog")
+                    .append_committed(delta),
+            }
         }
 
         Ok(results)
@@ -95,72 +169,49 @@ impl Database {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
 
-    fn validate_table_names(&self, input: &str, statements: &[Statement]) -> Result<(), SqlError> {
-        let mut names: HashSet<String> = self.tables.keys().cloned().collect();
+enum StagedTable {
+    Created(Table),
+    Existing {
+        delta: Table,
+        base_row_count: usize,
+        row_limit: usize,
+    },
+}
 
-        for statement in statements {
-            let Statement::CreateTable(definition) = statement else {
-                continue;
-            };
-            if !names.insert(normalize_identifier(&definition.name.value)) {
-                return Err(SqlError::at(
-                    input,
-                    definition.name.byte_offset,
-                    SqlErrorKind::DuplicateTable {
-                        table: definition.name.value.clone(),
-                    },
-                ));
-            }
+impl StagedTable {
+    fn from_existing(table: &Table) -> Self {
+        Self::Existing {
+            delta: Table::new(table.schema().clone(), table.row_limit()),
+            base_row_count: table.row_count(),
+            row_limit: table.row_limit(),
         }
-
-        Ok(())
     }
 
-    fn stage_insert(
-        &self,
-        input: &str,
-        staged_tables: &mut HashMap<String, Table>,
-        mut insert: InsertInto,
-    ) -> Result<(), SqlError> {
-        let normalized_name = normalize_identifier(&insert.table.value);
-        if !staged_tables.contains_key(&normalized_name) {
-            let Some(table) = self.tables.get(&normalized_name) else {
-                return Err(SqlError::at(
-                    input,
-                    insert.table.byte_offset,
-                    SqlErrorKind::UnknownTable {
-                        table: insert.table.value,
-                    },
-                ));
-            };
-            staged_tables.insert(normalized_name.clone(), table.clone());
+    fn append_row(&mut self, values: Vec<crate::Value>) -> Result<(), BatchAppendError> {
+        match self {
+            Self::Created(table) => table.append_batch([values]),
+            Self::Existing {
+                delta,
+                base_row_count,
+                row_limit,
+            } => delta.append_batch_after([values], *base_row_count, *row_limit),
         }
-
-        let table = staged_tables
-            .get_mut(&normalized_name)
-            .expect("the target table was staged above");
-        let append_result = table.append_batch(
-            insert
-                .rows
-                .iter_mut()
-                .map(|row| std::mem::take(&mut row.values)),
-        );
-
-        if let Err(source) = append_result {
-            let byte_offset = insert.rows[source.row_index()].byte_offset;
-            return Err(SqlError::at(
-                input,
-                byte_offset,
-                SqlErrorKind::InvalidRow {
-                    table: insert.table.value,
-                    source,
-                },
-            ));
-        }
-
-        Ok(())
     }
+
+    fn schema_len(&self) -> usize {
+        match self {
+            Self::Created(table) => table.schema().len(),
+            Self::Existing { delta, .. } => delta.schema().len(),
+        }
+    }
+}
+
+struct CurrentInsert {
+    normalized_name: String,
+    table_name: String,
+    row_index: usize,
 }
 
 fn build_table(input: &str, definition: CreateTable) -> Result<(String, Table), SqlError> {

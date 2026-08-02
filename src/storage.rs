@@ -343,6 +343,16 @@ impl ValidityBitmap {
         }
         self.len += 1;
     }
+
+    fn append(&mut self, other: Self) {
+        for index in 0..other.len {
+            self.push(
+                other
+                    .get(index)
+                    .expect("the appended bitmap index is in bounds"),
+            );
+        }
+    }
 }
 
 /// A type-specific values vector and its validity bitmap.
@@ -390,6 +400,11 @@ impl<T> TypedColumn<T> {
     fn push(&mut self, value: T, valid: bool) {
         self.values.push(value);
         self.validity.push(valid);
+    }
+
+    fn append(&mut self, other: Self) {
+        self.values.extend(other.values);
+        self.validity.append(other.validity);
     }
 }
 
@@ -462,6 +477,16 @@ impl Column {
             (Self::Bool(column), Value::Null) => column.push(false, false),
             (Self::String(column), Value::Null) => column.push(String::new(), false),
             _ => unreachable!("append values are type-checked before columns are mutated"),
+        }
+    }
+
+    fn append(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Int64(column), Self::Int64(other)) => column.append(other),
+            (Self::Float64(column), Self::Float64(other)) => column.append(other),
+            (Self::Bool(column), Self::Bool(other)) => column.append(other),
+            (Self::String(column), Self::String(other)) => column.append(other),
+            _ => unreachable!("validated table deltas have matching column types"),
         }
     }
 }
@@ -608,16 +633,30 @@ impl Table {
         I: IntoIterator<Item = R>,
         R: IntoIterator<Item = Value>,
     {
-        let remaining = self.row_limit.saturating_sub(self.row_count);
-        let row_limit = remaining.saturating_add(1);
+        self.append_batch_after(rows, 0, self.row_limit)
+    }
+
+    pub(crate) fn append_batch_after<I, R>(
+        &mut self,
+        rows: I,
+        base_row_count: usize,
+        row_limit: usize,
+    ) -> Result<(), BatchAppendError>
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = Value>,
+    {
+        let logical_row_count = base_row_count.saturating_add(self.row_count);
+        let remaining = row_limit.saturating_sub(logical_row_count);
+        let consumption_limit = remaining.saturating_add(1);
         let value_limit = self.schema.len().saturating_add(1);
         let mut validated_rows = Vec::new();
 
-        for (row_index, row) in rows.into_iter().take(row_limit).enumerate() {
+        for (row_index, row) in rows.into_iter().take(consumption_limit).enumerate() {
             if row_index == remaining {
                 return Err(BatchAppendError::RowLimitExceeded {
                     row_index,
-                    limit: self.row_limit,
+                    limit: row_limit,
                 });
             }
 
@@ -666,6 +705,16 @@ impl Table {
         }
         self.row_count += appended;
         Ok(())
+    }
+
+    pub(crate) fn append_committed(&mut self, delta: Self) {
+        debug_assert_eq!(self.schema, delta.schema);
+        debug_assert!(self.row_count.saturating_add(delta.row_count) <= self.row_limit);
+
+        for (column, delta_column) in self.columns.iter_mut().zip(delta.columns) {
+            column.append(delta_column);
+        }
+        self.row_count += delta.row_count;
     }
 
     /// Returns the table schema.
@@ -868,6 +917,44 @@ impl BatchAppendError {
             | Self::TypeMismatch { row_index, .. }
             | Self::NullabilityViolation { row_index, .. }
             | Self::StringTooLong { row_index, .. } => *row_index,
+        }
+    }
+
+    pub(crate) fn with_row_index(self, row_index: usize) -> Self {
+        match self {
+            Self::RowLimitExceeded { limit, .. } => Self::RowLimitExceeded { row_index, limit },
+            Self::RowShapeMismatch {
+                expected, actual, ..
+            } => Self::RowShapeMismatch {
+                row_index,
+                expected,
+                actual,
+            },
+            Self::TypeMismatch {
+                field,
+                expected,
+                actual,
+                ..
+            } => Self::TypeMismatch {
+                row_index,
+                field,
+                expected,
+                actual,
+            },
+            Self::NullabilityViolation { field, .. } => {
+                Self::NullabilityViolation { row_index, field }
+            }
+            Self::StringTooLong {
+                field,
+                length,
+                limit,
+                ..
+            } => Self::StringTooLong {
+                row_index,
+                field,
+                length,
+                limit,
+            },
         }
     }
 }
