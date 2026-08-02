@@ -1,5 +1,6 @@
 use rusthouse::{
-    DEFAULT_TABLE_ROW_LIMIT, DataType, Database, ScalarValue, SqlErrorKind, write_csv,
+    DEFAULT_TABLE_ROW_LIMIT, DataType, Database, MAX_SQL_INPUT_BYTES, ScalarValue, SqlErrorKind,
+    write_csv,
 };
 
 #[test]
@@ -188,6 +189,46 @@ fn malformed_definitions_preserve_catalog() {
         );
         assert_eq!(database, before, "SQL: {sql}");
     }
+}
+
+#[test]
+fn enforces_the_sql_input_byte_limit_at_the_boundary() {
+    assert_eq!(MAX_SQL_INPUT_BYTES, 32 * 1024 * 1024);
+
+    let mut database = Database::new();
+    let accepted_sql = padded_multibyte_sql(MAX_SQL_INPUT_BYTES);
+
+    let results = database.execute(&accepted_sql).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].value, ScalarValue::Integer(1));
+
+    let rejected_sql = padded_multibyte_sql(MAX_SQL_INPUT_BYTES + 1);
+    let error = database.execute(&rejected_sql).unwrap_err();
+
+    assert_eq!(error.byte_offset(), 0);
+    assert_eq!((error.line(), error.column()), (1, 1));
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::InputTooLarge {
+            max_bytes: MAX_SQL_INPUT_BYTES,
+        }
+    );
+    assert!(database.is_empty());
+}
+
+fn padded_multibyte_sql(byte_len: usize) -> String {
+    const PREFIX: &str = "SELECT 1;";
+    const MULTIBYTE_WHITESPACE: &str = "\u{2003}";
+
+    let padding_len = byte_len - PREFIX.len() - MULTIBYTE_WHITESPACE.len();
+    let mut sql = String::with_capacity(byte_len);
+    sql.push_str(PREFIX);
+    sql.push_str(&" ".repeat(padding_len));
+    sql.push_str(MULTIBYTE_WHITESPACE);
+    assert_eq!(sql.len(), byte_len);
+    assert!(sql.chars().count() < sql.len());
+    sql
 }
 
 fn database_with_seed() -> Database {

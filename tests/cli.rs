@@ -110,26 +110,39 @@ fn escapes_csv_strings_and_decodes_sql_quotes() {
 
 #[test]
 fn enforces_the_sql_input_size_limit_at_the_boundary() {
-    let prefix = "SELECT 1 AS value;";
-    let accepted_sql = format!(
-        "{prefix}{}",
-        " ".repeat(rusthouse::MAX_SQL_INPUT_BYTES - prefix.len())
-    );
+    let accepted_sql = padded_multibyte_sql(rusthouse::MAX_SQL_INPUT_BYTES);
 
     let accepted = run(&["--format", "csv"], &accepted_sql);
     assert!(accepted.status.success());
-    assert_eq!(String::from_utf8(accepted.stdout).unwrap(), "value\n1\n");
+    assert_eq!(String::from_utf8(accepted.stdout).unwrap(), "1\n1\n");
     assert!(accepted.stderr.is_empty());
 
-    let rejected_sql = format!("{accepted_sql} ");
+    let rejected_sql = padded_multibyte_sql(rusthouse::MAX_SQL_INPUT_BYTES + 1);
     let rejected = run(&["--format", "csv"], &rejected_sql);
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(
         String::from_utf8(rejected.stderr)
             .unwrap()
-            .contains("SQL input exceeds the 1048576-byte limit")
+            .contains(&format!(
+                "SQL input exceeds the {}-byte limit",
+                rusthouse::MAX_SQL_INPUT_BYTES
+            ))
     );
+}
+
+fn padded_multibyte_sql(byte_len: usize) -> String {
+    const PREFIX: &str = "SELECT 1;";
+    const MULTIBYTE_WHITESPACE: &str = "\u{2003}";
+
+    let padding_len = byte_len - PREFIX.len() - MULTIBYTE_WHITESPACE.len();
+    let mut sql = String::with_capacity(byte_len);
+    sql.push_str(PREFIX);
+    sql.push_str(&" ".repeat(padding_len));
+    sql.push_str(MULTIBYTE_WHITESPACE);
+    assert_eq!(sql.len(), byte_len);
+    assert!(sql.chars().count() < sql.len());
+    sql
 }
 
 #[test]

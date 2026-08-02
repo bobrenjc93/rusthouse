@@ -32,6 +32,9 @@ catalog API exposes immutable table lookup; row ingestion and persistence are
 not SQL features yet. The lower-level `Table` API supports atomic, positional
 batch append for schema-ordered rows.
 
+Each SQL batch is limited to 32 MiB (33,554,432 UTF-8 bytes), whether submitted
+through the CLI or directly through `Database::execute`.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
