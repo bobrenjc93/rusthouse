@@ -67,12 +67,11 @@ fn help_succeeds_without_reading_a_query() {
 }
 
 #[test]
-fn malformed_unsupported_and_multiple_statements_emit_no_output() {
+fn malformed_and_unsupported_statements_emit_no_output() {
     let cases: &[(&[&str], &[u8])] = &[
         (&["--format", "csv"], b"SELECT"),
         (&["--format", "csv"], b"SELECT NULL"),
         (&["--format", "csv"], b"SELECT 1 + 2"),
-        (&["--format", "csv"], b"SELECT 1; SELECT 2"),
         (&["--format", "json"], b"SELECT 1"),
     ];
 

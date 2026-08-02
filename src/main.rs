@@ -5,9 +5,11 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use rusthouse::lexer::LexerLimits;
-use rusthouse::{CsvWithNamesWriter, parse_scalar_select};
+use rusthouse::{CsvWithNamesWriter, Database, MAX_SCRIPT_RESULT_BYTES, SelectResult, Value};
 
-const HELP: &str = "RustHouse executes a bounded scalar SELECT from standard input.
+const MAX_CLI_OUTPUT_BYTES: usize = MAX_SCRIPT_RESULT_BYTES;
+
+const HELP: &str = "RustHouse executes a bounded SQL script from standard input.
 
 Usage: rusthouse --format csv
 
@@ -50,19 +52,83 @@ fn execute_stdin() -> Result<(), CliError> {
         });
     }
     let input = std::str::from_utf8(&input).map_err(|_| CliError::InvalidUtf8)?;
-    let result = parse_scalar_select(input)?;
+    let results = Database::new().execute(input)?;
 
-    // Complete formatting before stdout is touched so query failures cannot
-    // leave behind a header or partial row.
-    let mut output = Vec::new();
-    let mut csv = CsvWithNamesWriter::new(&mut output, [result.column_name()])?;
-    csv.write_row([result.value_text()])?;
-    csv.flush()?;
+    // Complete execution and formatting before stdout is touched so failures
+    // cannot leave behind an earlier result set or a partial row.
+    let mut output = BoundedOutput::new(MAX_CLI_OUTPUT_BYTES);
+    for result in results {
+        match result {
+            SelectResult::Scalar(result) => {
+                let mut csv = CsvWithNamesWriter::new(&mut output, [result.column_name()])?;
+                csv.write_row([result.value_text()])?;
+                csv.flush()?;
+            }
+            SelectResult::Table(result) => {
+                let mut csv = CsvWithNamesWriter::new(
+                    &mut output,
+                    result.headers().iter().map(|column| column.name()),
+                )?;
+                for row in result.rows() {
+                    let row = row.iter().map(value_text).collect::<Vec<_>>();
+                    csv.write_row(row)?;
+                }
+                csv.flush()?;
+            }
+        }
+    }
 
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&output)?;
+    stdout.write_all(output.as_slice())?;
     stdout.flush()?;
     Ok(())
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other(format!(
+                "CSV output exceeds the {}-byte limit",
+                self.limit
+            )));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(|_| io::Error::other("failed to allocate CSV output buffer"))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::Int64(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+    }
 }
 
 enum Action {
@@ -110,7 +176,7 @@ enum CliError {
     UnknownArgument(String),
     InputTooLarge { limit: usize },
     InvalidUtf8,
-    Query(rusthouse::ScalarSelectError),
+    Database(rusthouse::DatabaseError),
     Csv(rusthouse::CsvWithNamesError),
     Io(io::Error),
 }
@@ -124,7 +190,7 @@ impl fmt::Display for CliError {
                 write!(formatter, "SQL input exceeds the {limit}-byte limit")
             }
             Self::InvalidUtf8 => formatter.write_str("SQL input is not valid UTF-8"),
-            Self::Query(error) => error.fmt(formatter),
+            Self::Database(error) => error.fmt(formatter),
             Self::Csv(error) => error.fmt(formatter),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
         }
@@ -134,7 +200,7 @@ impl fmt::Display for CliError {
 impl Error for CliError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Query(error) => Some(error),
+            Self::Database(error) => Some(error),
             Self::Csv(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
@@ -142,9 +208,9 @@ impl Error for CliError {
     }
 }
 
-impl From<rusthouse::ScalarSelectError> for CliError {
-    fn from(error: rusthouse::ScalarSelectError) -> Self {
-        Self::Query(error)
+impl From<rusthouse::DatabaseError> for CliError {
+    fn from(error: rusthouse::DatabaseError) -> Self {
+        Self::Database(error)
     }
 }
 
@@ -157,5 +223,21 @@ impl From<rusthouse::CsvWithNamesError> for CliError {
 impl From<io::Error> for CliError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_output_rejects_growth_without_retaining_partial_bytes() {
+        let mut output = BoundedOutput::new(4);
+        output.write_all(b"1234").unwrap();
+
+        let error = output.write_all(b"5").unwrap_err();
+
+        assert_eq!(output.as_slice(), b"1234");
+        assert!(error.to_string().contains("4-byte limit"));
     }
 }
