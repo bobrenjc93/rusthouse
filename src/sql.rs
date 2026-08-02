@@ -23,7 +23,9 @@ pub const MAX_INSERT_STRING_BYTES: usize = 32 * 1024;
 /// Resource limits applied while parsing a SQL statement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParseLimits {
+    /// Maximum accepted statement length, in bytes.
     pub max_sql_bytes: usize,
+    /// Maximum number of column definitions in one statement.
     pub max_columns: usize,
 }
 
@@ -39,9 +41,13 @@ impl Default for ParseLimits {
 /// Resource limits applied while parsing an INSERT statement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InsertParseLimits {
+    /// Maximum accepted statement length, in bytes.
     pub max_sql_bytes: usize,
+    /// Maximum number of rows in one statement.
     pub max_rows: usize,
+    /// Maximum total number of values across all rows in one statement.
     pub max_values: usize,
+    /// Maximum decoded UTF-8 bytes across all String literals.
     pub max_string_bytes: usize,
 }
 
@@ -59,13 +65,16 @@ impl Default for InsertParseLimits {
 /// One named, typed column in a `CREATE TABLE` statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnDefinition {
+    /// The column name exactly as it appeared in the statement.
     pub name: String,
+    /// The parsed type of the column.
     pub data_type: DataType,
 }
 
 /// The typed result of parsing one `CREATE TABLE` statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateTableStatement {
+    /// The table name exactly as it appeared in the statement.
     pub table_name: String,
     /// Columns in the order in which they appeared in the statement.
     pub columns: Vec<ColumnDefinition>,
@@ -77,6 +86,7 @@ pub struct CreateTableStatement {
 /// [`crate::Table::insert_batch`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct InsertStatement {
+    /// The target table name exactly as it appeared in the statement.
     pub table_name: String,
     /// Rows and their values in statement order.
     pub rows: Vec<Vec<Value>>,
@@ -90,36 +100,78 @@ pub struct InsertStatement {
 pub enum ParseError {
     /// The input did not match the supported grammar.
     Syntax {
+        /// Zero-based byte offset at which parsing failed.
         position: usize,
+        /// Description of the grammar element required at `position`.
         expected: &'static str,
+        /// Token found at `position`, or `None` at the end of input.
         found: Option<String>,
     },
     /// A syntactically valid type name is not supported.
-    UnsupportedType { position: usize, type_name: String },
+    UnsupportedType {
+        /// Zero-based byte offset of the type name.
+        position: usize,
+        /// Unsupported type name exactly as it appeared in the statement.
+        type_name: String,
+    },
     /// Non-whitespace input followed the statement or its optional semicolon.
-    TrailingInput { position: usize },
+    TrailingInput {
+        /// Zero-based byte offset of the first trailing token.
+        position: usize,
+    },
     /// The input exceeded the configured byte limit.
     SqlTooLarge {
+        /// Byte offset equal to the first byte beyond the configured limit.
         position: usize,
+        /// Configured maximum statement length, in bytes.
         max_bytes: usize,
+        /// Actual statement length, in bytes.
         actual_bytes: usize,
     },
     /// The statement exceeded the configured column limit.
-    TooManyColumns { position: usize, max_columns: usize },
+    TooManyColumns {
+        /// Zero-based byte offset of the first excess column.
+        position: usize,
+        /// Configured maximum number of columns.
+        max_columns: usize,
+    },
     /// An INSERT exceeded the configured row limit.
-    TooManyRows { position: usize, max_rows: usize },
+    TooManyRows {
+        /// Zero-based byte offset of the first excess row.
+        position: usize,
+        /// Configured maximum number of rows.
+        max_rows: usize,
+    },
     /// An INSERT exceeded the configured total value limit.
-    TooManyValues { position: usize, max_values: usize },
+    TooManyValues {
+        /// Zero-based byte offset of the first excess value.
+        position: usize,
+        /// Configured maximum number of values.
+        max_values: usize,
+    },
     /// String literals exceeded the configured decoded UTF-8 byte limit.
     StringByteLimitExceeded {
+        /// Zero-based byte offset of the String literal that exceeded the limit.
         position: usize,
+        /// Configured maximum decoded String payload, in bytes.
         max_bytes: usize,
+        /// Decoded String payload that the statement attempted, in bytes.
         attempted_bytes: usize,
     },
     /// An integer literal was outside the `i64` range.
-    IntegerOverflow { position: usize, literal: String },
+    IntegerOverflow {
+        /// Zero-based byte offset of the integer literal.
+        position: usize,
+        /// Out-of-range literal exactly as it appeared in the statement.
+        literal: String,
+    },
     /// A floating-point literal evaluated to a non-finite value.
-    NonFiniteFloat { position: usize, literal: String },
+    NonFiniteFloat {
+        /// Zero-based byte offset of the floating-point literal.
+        position: usize,
+        /// Non-finite literal exactly as it appeared in the statement.
+        literal: String,
+    },
 }
 
 impl ParseError {
@@ -222,6 +274,11 @@ impl Error for ParseError {}
 /// letters, digits, or underscores. One optional trailing semicolon is
 /// accepted.
 ///
+/// # Errors
+///
+/// Returns [`ParseError`] when the input exceeds the default resource limits
+/// or does not match the supported `CREATE TABLE` grammar.
+///
 /// # Examples
 ///
 /// ```
@@ -239,6 +296,11 @@ pub fn parse_create_table(sql: &str) -> Result<CreateTableStatement, ParseError>
 }
 
 /// Parses one `CREATE TABLE` statement using caller-provided resource limits.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the input exceeds `limits` or does not match the
+/// supported `CREATE TABLE` grammar.
 pub fn parse_create_table_with_limits(
     sql: &str,
     limits: ParseLimits,
@@ -255,6 +317,12 @@ pub fn parse_create_table_with_limits(
 /// decimal point or exponent become [`Value::Float64`]. Boolean keywords are
 /// ASCII case-insensitive. String literals use single quotes and escape a
 /// quote by doubling it.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the input exceeds the default resource limits,
+/// contains an invalid literal, or does not match the supported `INSERT`
+/// grammar.
 ///
 /// # Examples
 ///
@@ -276,6 +344,11 @@ pub fn parse_insert(sql: &str) -> Result<InsertStatement, ParseError> {
 
 /// Parses one `INSERT INTO ... VALUES` statement using caller-provided
 /// resource limits.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the input exceeds `limits`, contains an invalid
+/// literal, or does not match the supported `INSERT` grammar.
 pub fn parse_insert_with_limits(
     sql: &str,
     limits: InsertParseLimits,

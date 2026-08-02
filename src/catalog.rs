@@ -47,6 +47,12 @@ impl Catalog {
     /// Schema validation and table construction finish before the catalog is
     /// changed. A duplicate name or invalid schema therefore leaves every
     /// existing table unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::DuplicateTable`] if the name is already in use,
+    /// or [`CatalogError::Table`] if the parsed schema violates table rules or
+    /// resource limits.
     pub fn create_table(&mut self, statement: CreateTableStatement) -> Result<(), CatalogError> {
         let CreateTableStatement {
             table_name,
@@ -71,6 +77,10 @@ impl Catalog {
     }
 
     /// Looks up a table using an ASCII case-insensitive name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::TableNotFound`] if `name` is not in the catalog.
     pub fn table(&self, name: &str) -> Result<&Table, CatalogError> {
         self.tables
             .get(&table_key(name))
@@ -80,6 +90,11 @@ impl Catalog {
     }
 
     /// Atomically applies a parsed `INSERT INTO ... VALUES` statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::TableNotFound`] if the target does not exist, or
+    /// [`CatalogError::Table`] if the rows fail table validation.
     pub fn insert(&mut self, statement: InsertStatement) -> Result<(), CatalogError> {
         let InsertStatement { table_name, rows } = statement;
         self.insert_batch(&table_name, rows)
@@ -89,6 +104,11 @@ impl Catalog {
     ///
     /// The table layer validates the full batch before appending any value, so
     /// an invalid batch leaves the target table unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::TableNotFound`] if `table_name` does not exist,
+    /// or [`CatalogError::Table`] if the rows fail table validation.
     pub fn insert_batch(
         &mut self,
         table_name: &str,
@@ -118,11 +138,20 @@ fn table_key(name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogError {
     /// A table with the same ASCII case-insensitive name already exists.
-    DuplicateTable { name: String },
+    DuplicateTable {
+        /// Requested table name exactly as supplied by the caller.
+        name: String,
+    },
     /// No table matches the requested ASCII case-insensitive name.
-    TableNotFound { name: String },
+    TableNotFound {
+        /// Requested table name exactly as supplied by the caller.
+        name: String,
+    },
     /// Schema construction or table validation failed.
-    Table(TableError),
+    Table(
+        /// Underlying table-layer failure.
+        TableError,
+    ),
 }
 
 impl fmt::Display for CatalogError {
