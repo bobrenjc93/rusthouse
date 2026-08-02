@@ -61,6 +61,39 @@ fn create_table_without_select_produces_no_csv() {
 }
 
 #[test]
+fn inserts_schema_ordered_literals_and_escaped_strings_without_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "CREATE TABLE events (id Int64, score Float64, active Bool, label String);\n\
+         INSERT INTO events VALUES\n\
+         (1, 1.5, TRUE, 'it''s ready'),\n\
+         (2, -0.25, FALSE, 'line\nnext');",
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn late_invalid_insert_row_rolls_back_without_partial_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "SELECT 'must not render' AS earlier;\n\
+         CREATE TABLE events (id Int64, score Float64, active Bool, label String);\n\
+         INSERT INTO events VALUES\n\
+         (1, 1.5, TRUE, 'valid'),\n\
+         (2, 'wrong', FALSE, 'invalid');",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot insert into table `events`"));
+    assert!(stderr.contains("field `score` in batch row 1 expects Float64"));
+}
+
+#[test]
 fn evaluates_equality_truth_tables_and_renders_null() {
     let output = run(
         &["--format", "csv"],
@@ -110,26 +143,39 @@ fn escapes_csv_strings_and_decodes_sql_quotes() {
 
 #[test]
 fn enforces_the_sql_input_size_limit_at_the_boundary() {
-    let prefix = "SELECT 1 AS value;";
-    let accepted_sql = format!(
-        "{prefix}{}",
-        " ".repeat(rusthouse::MAX_SQL_INPUT_BYTES - prefix.len())
-    );
+    let accepted_sql = padded_multibyte_sql(rusthouse::MAX_SQL_INPUT_BYTES);
 
     let accepted = run(&["--format", "csv"], &accepted_sql);
     assert!(accepted.status.success());
-    assert_eq!(String::from_utf8(accepted.stdout).unwrap(), "value\n1\n");
+    assert_eq!(String::from_utf8(accepted.stdout).unwrap(), "1\n1\n");
     assert!(accepted.stderr.is_empty());
 
-    let rejected_sql = format!("{accepted_sql} ");
+    let rejected_sql = padded_multibyte_sql(rusthouse::MAX_SQL_INPUT_BYTES + 1);
     let rejected = run(&["--format", "csv"], &rejected_sql);
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stdout.is_empty());
     assert!(
         String::from_utf8(rejected.stderr)
             .unwrap()
-            .contains("SQL input exceeds the 1048576-byte limit")
+            .contains(&format!(
+                "SQL input exceeds the {}-byte limit",
+                rusthouse::MAX_SQL_INPUT_BYTES
+            ))
     );
+}
+
+fn padded_multibyte_sql(byte_len: usize) -> String {
+    const PREFIX: &str = "SELECT 1;";
+    const MULTIBYTE_WHITESPACE: &str = "\u{2003}";
+
+    let padding_len = byte_len - PREFIX.len() - MULTIBYTE_WHITESPACE.len();
+    let mut sql = String::with_capacity(byte_len);
+    sql.push_str(PREFIX);
+    sql.push_str(&" ".repeat(padding_len));
+    sql.push_str(MULTIBYTE_WHITESPACE);
+    assert_eq!(sql.len(), byte_len);
+    assert!(sql.chars().count() < sql.len());
+    sql
 }
 
 #[test]
@@ -163,6 +209,10 @@ fn rejects_malformed_sql_without_partial_csv() {
         "CREATE TABLE empty ();",
         "CREATE TABLE duplicate (id Int64, id String);",
         "CREATE TABLE unknown (value Decimal);",
+        "INSERT values (1);",
+        "INSERT INTO missing (1);",
+        "INSERT INTO missing VALUES (1)",
+        "INSERT INTO missing VALUES (1,);",
     ] {
         let output = run(&["--format", "csv"], sql);
 

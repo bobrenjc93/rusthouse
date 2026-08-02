@@ -25,6 +25,15 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
+/// Maximum number of fields in a [`Schema`].
+pub const MAX_SCHEMA_FIELDS: usize = 1_024;
+
+/// Maximum UTF-8 byte length of a schema field identifier.
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+
+/// Maximum UTF-8 byte length of one stored [`Value::String`].
+pub const MAX_STORED_STRING_BYTES: usize = 1024 * 1024;
+
 /// A physical value type supported by the storage layer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DataType {
@@ -91,10 +100,25 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Builds a schema, rejecting duplicate field names.
+    /// Builds a schema, enforcing field-count, identifier-size, and uniqueness
+    /// constraints.
     pub fn new(fields: Vec<Field>) -> Result<Self, SchemaError> {
+        if fields.len() > MAX_SCHEMA_FIELDS {
+            return Err(SchemaError::TooManyFields {
+                limit: MAX_SCHEMA_FIELDS,
+                actual: fields.len(),
+            });
+        }
+
         let mut field_indexes = HashMap::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
+            if field.name.len() > MAX_IDENTIFIER_BYTES {
+                return Err(SchemaError::IdentifierTooLong {
+                    field: field.name.clone(),
+                    length: field.name.len(),
+                    limit: MAX_IDENTIFIER_BYTES,
+                });
+            }
             if field_indexes.insert(field.name.clone(), index).is_some() {
                 return Err(SchemaError::DuplicateField {
                     field: field.name.clone(),
@@ -136,6 +160,22 @@ impl Schema {
 /// An error produced while constructing a [`Schema`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchemaError {
+    /// The schema contains more fields than the storage limit permits.
+    TooManyFields {
+        /// The maximum number of fields.
+        limit: usize,
+        /// The number of supplied fields.
+        actual: usize,
+    },
+    /// A field identifier exceeds the UTF-8 byte-length limit.
+    IdentifierTooLong {
+        /// The oversized field identifier.
+        field: String,
+        /// The identifier's UTF-8 byte length.
+        length: usize,
+        /// The maximum UTF-8 byte length.
+        limit: usize,
+    },
     /// Two schema fields have the same name.
     DuplicateField {
         /// The repeated field name.
@@ -146,6 +186,20 @@ pub enum SchemaError {
 impl fmt::Display for SchemaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TooManyFields { limit, actual } => {
+                write!(
+                    formatter,
+                    "schema has {actual} fields, exceeding the limit of {limit}"
+                )
+            }
+            Self::IdentifierTooLong {
+                field,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "schema field `{field}` is {length} UTF-8 bytes, exceeding the limit of {limit}"
+            ),
             Self::DuplicateField { field } => {
                 write!(formatter, "schema contains duplicate field `{field}`")
             }
@@ -289,6 +343,16 @@ impl ValidityBitmap {
         }
         self.len += 1;
     }
+
+    fn append(&mut self, other: Self) {
+        for index in 0..other.len {
+            self.push(
+                other
+                    .get(index)
+                    .expect("the appended bitmap index is in bounds"),
+            );
+        }
+    }
 }
 
 /// A type-specific values vector and its validity bitmap.
@@ -336,6 +400,11 @@ impl<T> TypedColumn<T> {
     fn push(&mut self, value: T, valid: bool) {
         self.values.push(value);
         self.validity.push(valid);
+    }
+
+    fn append(&mut self, other: Self) {
+        self.values.extend(other.values);
+        self.validity.append(other.validity);
     }
 }
 
@@ -410,6 +479,16 @@ impl Column {
             _ => unreachable!("append values are type-checked before columns are mutated"),
         }
     }
+
+    fn append(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Int64(column), Self::Int64(other)) => column.append(other),
+            (Self::Float64(column), Self::Float64(other)) => column.append(other),
+            (Self::Bool(column), Self::Bool(other)) => column.append(other),
+            (Self::String(column), Self::String(other)) => column.append(other),
+            _ => unreachable!("validated table deltas have matching column types"),
+        }
+    }
 }
 
 /// A bounded table containing one [`Column`] per schema field.
@@ -441,8 +520,9 @@ impl Table {
     /// Atomically appends a named row after validating its complete contents.
     ///
     /// Field order does not matter. Duplicate fields, missing or unexpected
-    /// fields, type mismatches, disallowed nulls, and rows beyond the configured
-    /// limit return an [`AppendError`] without changing the table.
+    /// fields, type mismatches, disallowed nulls, oversized strings, and rows
+    /// beyond the configured limit return an [`AppendError`] without changing
+    /// the table.
     pub fn append_row<I, N>(&mut self, row: I) -> Result<(), AppendError>
     where
         I: IntoIterator<Item = (N, Value)>,
@@ -511,6 +591,12 @@ impl Table {
                     expected: field.data_type(),
                     actual: value.value_type(),
                 });
+            } else if let Some(length) = oversized_string_length(value) {
+                return Err(AppendError::StringTooLong {
+                    field: name.clone(),
+                    length,
+                    limit: MAX_STORED_STRING_BYTES,
+                });
             }
         }
 
@@ -536,8 +622,8 @@ impl Table {
     ///
     /// Each row must contain exactly one [`Value`] per schema field, in schema
     /// order. An empty batch succeeds, including when the table is full. Any
-    /// shape, type, nullability, or row-limit error identifies its zero-based
-    /// row within the batch and leaves the table unchanged.
+    /// shape, type, nullability, string-size, or row-limit error identifies its
+    /// zero-based row within the batch and leaves the table unchanged.
     ///
     /// Consumption is bounded for untrusted iterators: at most one row beyond
     /// the remaining table capacity and one value beyond the schema width are
@@ -547,16 +633,30 @@ impl Table {
         I: IntoIterator<Item = R>,
         R: IntoIterator<Item = Value>,
     {
-        let remaining = self.row_limit.saturating_sub(self.row_count);
-        let row_limit = remaining.saturating_add(1);
+        self.append_batch_after(rows, 0, self.row_limit)
+    }
+
+    pub(crate) fn append_batch_after<I, R>(
+        &mut self,
+        rows: I,
+        base_row_count: usize,
+        row_limit: usize,
+    ) -> Result<(), BatchAppendError>
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = Value>,
+    {
+        let logical_row_count = base_row_count.saturating_add(self.row_count);
+        let remaining = row_limit.saturating_sub(logical_row_count);
+        let consumption_limit = remaining.saturating_add(1);
         let value_limit = self.schema.len().saturating_add(1);
         let mut validated_rows = Vec::new();
 
-        for (row_index, row) in rows.into_iter().take(row_limit).enumerate() {
+        for (row_index, row) in rows.into_iter().take(consumption_limit).enumerate() {
             if row_index == remaining {
                 return Err(BatchAppendError::RowLimitExceeded {
                     row_index,
-                    limit: self.row_limit,
+                    limit: row_limit,
                 });
             }
 
@@ -584,6 +684,13 @@ impl Table {
                         expected: field.data_type(),
                         actual: value.value_type(),
                     });
+                } else if let Some(length) = oversized_string_length(value) {
+                    return Err(BatchAppendError::StringTooLong {
+                        row_index,
+                        field: field.name().to_owned(),
+                        length,
+                        limit: MAX_STORED_STRING_BYTES,
+                    });
                 }
             }
 
@@ -598,6 +705,16 @@ impl Table {
         }
         self.row_count += appended;
         Ok(())
+    }
+
+    pub(crate) fn append_committed(&mut self, delta: Self) {
+        debug_assert_eq!(self.schema, delta.schema);
+        debug_assert!(self.row_count.saturating_add(delta.row_count) <= self.row_limit);
+
+        for (column, delta_column) in self.columns.iter_mut().zip(delta.columns) {
+            column.append(delta_column);
+        }
+        self.row_count += delta.row_count;
     }
 
     /// Returns the table schema.
@@ -634,6 +751,13 @@ fn value_matches_type(value: &Value, data_type: DataType) -> bool {
             | (Value::Bool(_), DataType::Bool)
             | (Value::String(_), DataType::String)
     )
+}
+
+fn oversized_string_length(value: &Value) -> Option<usize> {
+    match value {
+        Value::String(value) if value.len() > MAX_STORED_STRING_BYTES => Some(value.len()),
+        _ => None,
+    }
 }
 
 /// A validation error returned by [`Table::append_row`].
@@ -675,6 +799,15 @@ pub enum AppendError {
         /// The non-nullable field name.
         field: String,
     },
+    /// A string value exceeds the stored UTF-8 byte-length limit.
+    StringTooLong {
+        /// The field containing the oversized string.
+        field: String,
+        /// The string's UTF-8 byte length.
+        length: usize,
+        /// The maximum UTF-8 byte length.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for AppendError {
@@ -709,6 +842,14 @@ impl fmt::Display for AppendError {
             Self::NullabilityViolation { field } => {
                 write!(formatter, "field `{field}` is not nullable")
             }
+            Self::StringTooLong {
+                field,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "field `{field}` contains a {length}-byte string, exceeding the limit of {limit}"
+            ),
         }
     }
 }
@@ -753,6 +894,69 @@ pub enum BatchAppendError {
         /// The non-nullable field name.
         field: String,
     },
+    /// A string value in the indexed batch row exceeds the stored UTF-8
+    /// byte-length limit.
+    StringTooLong {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// The field containing the oversized string.
+        field: String,
+        /// The string's UTF-8 byte length.
+        length: usize,
+        /// The maximum UTF-8 byte length.
+        limit: usize,
+    },
+}
+
+impl BatchAppendError {
+    /// Returns the zero-based index of the invalid row within the batch.
+    pub fn row_index(&self) -> usize {
+        match self {
+            Self::RowLimitExceeded { row_index, .. }
+            | Self::RowShapeMismatch { row_index, .. }
+            | Self::TypeMismatch { row_index, .. }
+            | Self::NullabilityViolation { row_index, .. }
+            | Self::StringTooLong { row_index, .. } => *row_index,
+        }
+    }
+
+    pub(crate) fn with_row_index(self, row_index: usize) -> Self {
+        match self {
+            Self::RowLimitExceeded { limit, .. } => Self::RowLimitExceeded { row_index, limit },
+            Self::RowShapeMismatch {
+                expected, actual, ..
+            } => Self::RowShapeMismatch {
+                row_index,
+                expected,
+                actual,
+            },
+            Self::TypeMismatch {
+                field,
+                expected,
+                actual,
+                ..
+            } => Self::TypeMismatch {
+                row_index,
+                field,
+                expected,
+                actual,
+            },
+            Self::NullabilityViolation { field, .. } => {
+                Self::NullabilityViolation { row_index, field }
+            }
+            Self::StringTooLong {
+                field,
+                length,
+                limit,
+                ..
+            } => Self::StringTooLong {
+                row_index,
+                field,
+                length,
+                limit,
+            },
+        }
+    }
 }
 
 impl fmt::Display for BatchAppendError {
@@ -788,6 +992,15 @@ impl fmt::Display for BatchAppendError {
                     "field `{field}` in batch row {row_index} is not nullable"
                 )
             }
+            Self::StringTooLong {
+                row_index,
+                field,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "field `{field}` in batch row {row_index} contains a {length}-byte string, exceeding the limit of {limit}"
+            ),
         }
     }
 }

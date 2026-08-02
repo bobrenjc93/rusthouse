@@ -21,16 +21,26 @@ The early implementation should favor Rust's standard library and a small depend
 
 ## Current SQL surface
 
-The CLI and `Database` API execute batches containing scalar `SELECT` and
-`CREATE TABLE name (field type, ...)` statements. Scalar expressions support
+The CLI and `Database` API execute batches containing scalar `SELECT`,
+`CREATE TABLE name (field type, ...)`, and schema-ordered
+`INSERT INTO name VALUES (...), (...)` statements. Scalar expressions support
 literals and same-type `=` or `<>` comparisons, with SQL NULL propagation.
 Table fields support `Int64`, `Float64`, `Bool`, and `String`; they are currently
-non-nullable. DDL produces no CSV output.
+non-nullable. DDL and inserts produce no CSV output, and a failing statement
+rolls back the complete SQL batch.
 
 Catalog tables are in-memory and each is capped at 1,000,000 rows. The public
-catalog API exposes immutable table lookup; row ingestion and persistence are
-not SQL features yet. The lower-level `Table` API supports atomic, positional
-batch append for schema-ordered rows.
+catalog API exposes immutable table lookup, and persistence is not implemented.
+SQL inserts use the lower-level `Table` API's atomic positional batch append.
+
+Storage resource limits are measured in UTF-8 bytes: a schema may contain at
+most 1,024 fields, each field identifier may contain at most 256 bytes, and one
+stored `String` value may contain at most 1,048,576 bytes. `Schema::new` and the
+atomic table append APIs report typed errors when these limits are exceeded.
+
+Each SQL batch is limited to 32 MiB (33,554,432 UTF-8 bytes) and 10,000
+statements, whether submitted through the CLI or directly through
+`Database::execute`.
 
 ## Development model
 
