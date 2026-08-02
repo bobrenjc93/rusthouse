@@ -107,7 +107,7 @@ fn malformed_and_out_of_scope_sql_fails() {
 }
 
 #[test]
-fn oversized_stdin_is_drained_and_fails() {
+fn oversized_stdin_fails() {
     let input = vec![b' '; rusthouse::cli::MAX_QUERY_BYTES + 1];
 
     let output = run_with_stdin(&[], &input);

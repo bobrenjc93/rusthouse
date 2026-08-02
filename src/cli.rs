@@ -22,8 +22,9 @@ pub const HELP: &str = concat!(
     "  -h, --help             Print help\n\n",
     "SQL is limited to semicolon-separated SELECT statements projecting Int64,\n",
     "Float64, Bool, and String literals, with optional AS aliases. Without\n",
-    "--execute, input is read from standard input through EOF. The input limit is\n",
-    "1 MiB. Tables, clauses, expressions, aggregation, and DDL are not supported.\n"
+    "--execute, valid input is read from standard input through EOF. Input over\n",
+    "1 MiB is rejected as soon as the limit is crossed. Tables, clauses,\n",
+    "expressions, aggregation, and DDL are not supported.\n"
 );
 
 /// An argument, input, query, or output failure at the CLI boundary.
@@ -182,22 +183,18 @@ fn validate_format(format: &str, seen: &mut bool) -> Result<(), CliError> {
 fn read_sql(mut input: impl Read) -> Result<String, CliError> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
-    let mut total_bytes = 0_usize;
 
     loop {
         let read = input.read(&mut buffer).map_err(CliError::Input)?;
         if read == 0 {
             break;
         }
-        total_bytes = total_bytes.saturating_add(read);
-        if total_bytes <= MAX_QUERY_BYTES {
-            bytes.extend_from_slice(&buffer[..read]);
+        if read > MAX_QUERY_BYTES - bytes.len() {
+            return Err(CliError::InputTooLarge);
         }
+        bytes.extend_from_slice(&buffer[..read]);
     }
 
-    if total_bytes > MAX_QUERY_BYTES {
-        return Err(CliError::InputTooLarge);
-    }
     String::from_utf8(bytes).map_err(|_| CliError::InputEncoding)
 }
 
@@ -219,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn drains_oversized_input_before_failing() {
+    fn stops_reading_as_soon_as_input_is_oversized() {
         struct TrackingInput {
             remaining: usize,
             reached_eof: bool,
@@ -239,12 +236,13 @@ mod tests {
         }
 
         let mut input = TrackingInput {
-            remaining: MAX_QUERY_BYTES + 1,
+            remaining: MAX_QUERY_BYTES + 16 * 1024,
             reached_eof: false,
         };
         let error = read_sql(&mut input).unwrap_err();
 
         assert!(matches!(error, CliError::InputTooLarge));
-        assert!(input.reached_eof);
+        assert!(!input.reached_eof);
+        assert_eq!(input.remaining, 8 * 1024);
     }
 }

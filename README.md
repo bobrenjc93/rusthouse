@@ -41,8 +41,9 @@ cargo run -- --execute "SELECT 42 AS answer, 'it''s ready' AS message" --format 
 printf "SELECT true AS ready; SELECT 1.5 AS ratio;" | cargo run -- --format csv
 ```
 
-Without `--execute`, the command reads standard input through EOF. SQL input is
-limited to 1 MiB. Invalid arguments, malformed SQL, invalid UTF-8, and oversized
-input produce an error on standard error and a nonzero exit status.
+Without `--execute`, the command reads valid standard input through EOF. SQL
+input is limited to 1 MiB and is rejected as soon as it crosses that limit.
+Invalid arguments, malformed SQL, invalid UTF-8, and oversized input produce an
+error on standard error and a nonzero exit status.
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
