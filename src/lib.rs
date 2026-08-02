@@ -2,6 +2,10 @@
 
 use std::fmt;
 
+mod table;
+
+pub use table::{Column, DataType, Field, Schema, SchemaError, Table, TableError, Value};
+
 /// Maximum number of SQL bytes accepted from either the command line or stdin.
 pub const MAX_SQL_INPUT_BYTES: usize = 1024 * 1024;
 
