@@ -13,3 +13,10 @@ RustHouse should evolve through narrow modules with explicit boundaries:
 The initial engine can be single-process and single-node. Public interfaces should leave room for immutable parts, parallel scans, compression, and a write-ahead log, but those are later experiments rather than premature abstractions.
 
 Every feature should include end-to-end tests at the SQL boundary. Benchmarks should use reproducible generated data and report enough context to compare future iterations.
+
+## Storage foundation
+
+The current storage layer separates scalar values, validated schemas, typed
+columns, and bounded tables into independent modules. `Table::insert` checks a
+complete row's arity and types plus the configured row limit before appending,
+so a rejected row cannot leave columns with different lengths.

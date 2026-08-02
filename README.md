@@ -19,6 +19,27 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Current storage foundation
+
+The library provides validated schemas and bounded in-memory tables for
+`Int64`, `Float64`, `Bool`, and `String`. Rows are validated atomically and
+transposed into type-specific columns on insert.
+
+```rust
+use rusthouse::{DataType, Field, ScalarValue, Schema, Table};
+
+let schema = Schema::new(vec![
+    Field::new("id", DataType::Int64),
+    Field::new("name", DataType::String),
+])?;
+let mut table = Table::new(schema, 10_000);
+table.insert([
+    ScalarValue::Int64(1),
+    ScalarValue::String("Ada".to_owned()),
+])?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
