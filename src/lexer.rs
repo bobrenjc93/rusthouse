@@ -69,8 +69,11 @@ pub struct Token {
 /// SQL token categories.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
-    /// An unquoted or decoded double-quoted identifier.
+    /// An unquoted identifier. A parser may apply dialect-specific case folding
+    /// or reserved-word rules to this value.
     Identifier(String),
+    /// A decoded double-quoted identifier whose spelling must remain distinct.
+    QuotedIdentifier(String),
     Literal(Literal),
     Operator(Operator),
     Delimiter(Delimiter),
@@ -343,7 +346,7 @@ impl Lexer<'_> {
                     '"',
                     decoded_length,
                 );
-                return self.push(TokenKind::Identifier(value), start);
+                return self.push(TokenKind::QuotedIdentifier(value), start);
             }
 
             decoded_length += character.len_utf8();
@@ -617,7 +620,7 @@ mod tests {
         let tokens = lex(sql, generous_limits()).unwrap();
 
         assert!(tokens.iter().any(|token| {
-            token.kind == TokenKind::Identifier("daily\"total".into())
+            token.kind == TokenKind::QuotedIdentifier("daily\"total".into())
                 && &sql[token.span.as_range()] == "\"daily\"\"total\""
         }));
         assert!(tokens.iter().any(|token| {
@@ -643,6 +646,27 @@ mod tests {
             tokens
                 .iter()
                 .any(|token| token.kind == TokenKind::Literal(Literal::Null))
+        );
+    }
+
+    #[test]
+    fn preserves_reserved_word_and_case_sensitive_quoted_identifiers() {
+        let tokens = lex(
+            "select \"select\", MixedCase, \"MixedCase\"",
+            generous_limits(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            tokens.iter().map(|token| &token.kind).collect::<Vec<_>>(),
+            vec![
+                &TokenKind::Identifier("select".into()),
+                &TokenKind::QuotedIdentifier("select".into()),
+                &TokenKind::Delimiter(Delimiter::Comma),
+                &TokenKind::Identifier("MixedCase".into()),
+                &TokenKind::Delimiter(Delimiter::Comma),
+                &TokenKind::QuotedIdentifier("MixedCase".into()),
+            ]
         );
     }
 
