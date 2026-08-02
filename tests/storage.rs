@@ -273,6 +273,26 @@ fn configured_data_limit_cannot_exceed_the_global_bound() {
 }
 
 #[test]
+fn table_clone_preserves_string_capacity_and_data_accounting() {
+    let schema = Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
+    let mut value = String::with_capacity(128);
+    value.push_str("stored");
+    let retained_capacity = value.capacity();
+    let expected_size = 1 + std::mem::size_of::<String>() + retained_capacity;
+    let mut table = Table::with_data_limit(schema, 10, expected_size * 2);
+    table.append_row([("value", Value::String(value))]).unwrap();
+
+    let cloned = table.clone();
+    let Column::String(values) = cloned.column("value").unwrap() else {
+        panic!("value should be a String column");
+    };
+
+    assert_eq!(values.values()[0].capacity(), retained_capacity);
+    assert_eq!(cloned.data_size_bytes(), expected_size);
+    assert_eq!(cloned, table);
+}
+
+#[test]
 fn positional_batch_counts_multibyte_string_bytes_before_any_mutation() {
     let schema = Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
     let mut table = Table::new(schema, 4);

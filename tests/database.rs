@@ -86,6 +86,31 @@ fn nullable_types_preserve_schema_flags_and_store_nulls() {
 }
 
 #[test]
+fn database_clone_preserves_string_capacity_and_data_accounting() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE messages (value String); INSERT INTO messages VALUES ('x');")
+        .unwrap();
+    let original = database.table("messages").unwrap();
+    let Column::String(original_values) = original.column("value").unwrap() else {
+        panic!("value should be a String column");
+    };
+    let original_capacity = original_values.values()[0].capacity();
+    assert!(original_capacity > original_values.values()[0].len());
+
+    let cloned_database = database.clone();
+    let cloned = cloned_database.table("messages").unwrap();
+    let Column::String(cloned_values) = cloned.column("value").unwrap() else {
+        panic!("value should be a String column");
+    };
+    let expected_size = 1 + std::mem::size_of::<String>() + original_capacity;
+
+    assert_eq!(cloned_values.values()[0].capacity(), original_capacity);
+    assert_eq!(cloned.data_size_bytes(), expected_size);
+    assert_eq!(cloned_database, database);
+}
+
+#[test]
 fn create_table_produces_no_csv_result() {
     let mut database = Database::new();
     let results = database.execute("CREATE TABLE events (id Int64);").unwrap();

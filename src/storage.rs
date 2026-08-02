@@ -416,7 +416,7 @@ impl<T> TypedColumn<T> {
 }
 
 /// A column backed by a vector matching its schema type.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Column {
     /// An `Int64` vector.
     Int64(TypedColumn<i64>),
@@ -426,6 +426,30 @@ pub enum Column {
     Bool(TypedColumn<bool>),
     /// A `String` vector.
     String(TypedColumn<String>),
+}
+
+impl Clone for Column {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Int64(column) => Self::Int64(column.clone()),
+            Self::Float64(column) => Self::Float64(column.clone()),
+            Self::Bool(column) => Self::Bool(column.clone()),
+            Self::String(column) => Self::String(TypedColumn {
+                values: column
+                    .values
+                    .iter()
+                    .map(|value| {
+                        // Table accounting charges retained string capacity, so
+                        // cloning must retain the same capacity as well.
+                        let mut cloned = String::with_capacity(value.capacity());
+                        cloned.push_str(value);
+                        cloned
+                    })
+                    .collect(),
+                validity: column.validity.clone(),
+            }),
+        }
+    }
 }
 
 impl Column {
