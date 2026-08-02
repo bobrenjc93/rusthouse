@@ -96,7 +96,8 @@ fn execute() -> Result<(), String> {
     let stdin = io::stdin();
     let sql = read_sql(stdin.lock())?;
 
-    let results = rusthouse::parse_sql_batch(&sql).map_err(|error| error.to_string())?;
+    let mut database = rusthouse::Database::new();
+    let results = database.execute(&sql).map_err(|error| error.to_string())?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
     rusthouse::write_csv(&results, &mut output)

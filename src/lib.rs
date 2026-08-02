@@ -1,7 +1,9 @@
 //! RustHouse is an experimental, compact analytical database.
 
+mod database;
 pub mod storage;
 
+pub use database::{DEFAULT_TABLE_ROW_LIMIT, Database};
 pub use storage::{
     AppendError, Column, DataType, Field, Schema, SchemaError, Table, TypedColumn, ValidityBitmap,
     Value, ValueType,
@@ -64,12 +66,90 @@ pub struct QueryResult {
     pub value: ScalarValue,
 }
 
-/// A syntax or literal validation error in a SQL batch.
+/// The typed cause of a SQL parsing or execution error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlErrorKind {
+    /// The input does not match the supported SQL grammar.
+    Syntax {
+        /// A concise description of what was expected or invalid.
+        message: String,
+    },
+    /// A table name is already present in the catalog or batch.
+    DuplicateTable {
+        /// The repeated table name as written in the failing statement.
+        table: String,
+    },
+    /// A table definition repeats a field name.
+    DuplicateField {
+        /// The table being defined.
+        table: String,
+        /// The repeated field name as written in the failing definition.
+        field: String,
+    },
+    /// A field uses a type that the storage layer does not support.
+    UnknownDataType {
+        /// The unrecognized type name.
+        data_type: String,
+    },
+}
+
+impl fmt::Display for SqlErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax { message } => formatter.write_str(message),
+            Self::DuplicateTable { table } => write!(formatter, "table `{table}` already exists"),
+            Self::DuplicateField { table, field } => {
+                write!(
+                    formatter,
+                    "table `{table}` contains duplicate field `{field}`"
+                )
+            }
+            Self::UnknownDataType { data_type } => {
+                write!(formatter, "unknown data type `{data_type}`")
+            }
+        }
+    }
+}
+
+/// A typed, position-aware error in a SQL batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlError {
+    byte_offset: usize,
     line: usize,
     column: usize,
-    message: String,
+    kind: SqlErrorKind,
+}
+
+impl SqlError {
+    /// Returns the zero-based UTF-8 byte offset of the failing token.
+    pub fn byte_offset(&self) -> usize {
+        self.byte_offset
+    }
+
+    /// Returns the one-based source line of the failing token.
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// Returns the one-based character column of the failing token.
+    pub fn column(&self) -> usize {
+        self.column
+    }
+
+    /// Returns the typed cause of the error.
+    pub fn kind(&self) -> &SqlErrorKind {
+        &self.kind
+    }
+
+    fn at(input: &str, byte_offset: usize, kind: SqlErrorKind) -> Self {
+        let (line, column) = line_and_column(input, byte_offset);
+        Self {
+            byte_offset,
+            line,
+            column,
+            kind,
+        }
+    }
 }
 
 impl fmt::Display for SqlError {
@@ -77,7 +157,7 @@ impl fmt::Display for SqlError {
         write!(
             formatter,
             "SQL error at line {}, column {}: {}",
-            self.line, self.column, self.message
+            self.line, self.column, self.kind
         )
     }
 }
@@ -86,7 +166,48 @@ impl std::error::Error for SqlError {}
 
 /// Parses a batch of `SELECT <literal> [AS <identifier>];` statements.
 pub fn parse_sql_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
-    Parser::new(input).parse_batch()
+    Parser::new(input, ParserMode::SelectOnly)
+        .parse_batch()?
+        .into_iter()
+        .map(|statement| match statement {
+            Statement::Select(result) => Ok(result),
+            Statement::CreateTable(_) => unreachable!("SELECT-only parsing produced CREATE TABLE"),
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum ParserMode {
+    SelectOnly,
+    Database,
+}
+
+#[derive(Debug)]
+pub(crate) enum Statement {
+    Select(QueryResult),
+    CreateTable(CreateTable),
+}
+
+#[derive(Debug)]
+pub(crate) struct CreateTable {
+    pub(crate) name: PositionedIdentifier,
+    pub(crate) fields: Vec<CreateField>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CreateField {
+    pub(crate) name: PositionedIdentifier,
+    pub(crate) data_type: DataType,
+}
+
+#[derive(Debug)]
+pub(crate) struct PositionedIdentifier {
+    pub(crate) value: String,
+    pub(crate) byte_offset: usize,
+}
+
+pub(crate) fn parse_database_batch(input: &str) -> Result<Vec<Statement>, SqlError> {
+    Parser::new(input, ParserMode::Database).parse_batch()
 }
 
 /// Writes each query result as a CSV header followed by its single row.
@@ -129,33 +250,52 @@ fn write_csv_field<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
 struct Parser<'a> {
     input: &'a str,
     position: usize,
+    mode: ParserMode,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+    fn new(input: &'a str, mode: ParserMode) -> Self {
+        Self {
+            input,
+            position: 0,
+            mode,
+        }
     }
 
-    fn parse_batch(mut self) -> Result<Vec<QueryResult>, SqlError> {
-        let mut results = Vec::new();
+    fn parse_batch(mut self) -> Result<Vec<Statement>, SqlError> {
+        let mut statements = Vec::new();
         self.skip_whitespace();
 
         if self.is_at_end() {
-            return Err(self.error("expected a SELECT statement"));
+            return Err(self.syntax_error(match self.mode {
+                ParserMode::SelectOnly => "expected a SELECT statement",
+                ParserMode::Database => "expected a SELECT or CREATE TABLE statement",
+            }));
         }
 
         while !self.is_at_end() {
-            results.push(self.parse_select()?);
+            statements.push(self.parse_statement()?);
             self.skip_whitespace();
         }
 
-        Ok(results)
+        Ok(statements)
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement, SqlError> {
+        if self.consume_keyword("SELECT") {
+            return self.parse_select().map(Statement::Select);
+        }
+        if matches!(self.mode, ParserMode::Database) && self.consume_keyword("CREATE") {
+            return self.parse_create_table().map(Statement::CreateTable);
+        }
+
+        Err(self.syntax_error(match self.mode {
+            ParserMode::SelectOnly => "expected SELECT",
+            ParserMode::Database => "expected SELECT or CREATE TABLE",
+        }))
     }
 
     fn parse_select(&mut self) -> Result<QueryResult, SqlError> {
-        if !self.consume_keyword("SELECT") {
-            return Err(self.error("expected SELECT"));
-        }
         self.skip_whitespace();
 
         let literal_start = self.position;
@@ -166,21 +306,104 @@ impl<'a> Parser<'a> {
 
         let header = if self.consume_keyword("AS") {
             if !has_alias_separator {
-                return Err(self.error_at(literal_end, "expected whitespace before AS"));
+                return Err(self.syntax_error_at(literal_end, "expected whitespace before AS"));
             }
             self.skip_whitespace();
-            self.parse_identifier()?
+            self.parse_identifier("expected an identifier after AS")?
+                .value
         } else {
             self.input[literal_start..literal_end].to_owned()
         };
 
         self.skip_whitespace();
         if self.peek() != Some(';') {
-            return Err(self.error("expected ';' after SELECT statement"));
+            return Err(self.syntax_error("expected ';' after SELECT statement"));
         }
         self.advance();
 
         Ok(QueryResult { header, value })
+    }
+
+    fn parse_create_table(&mut self) -> Result<CreateTable, SqlError> {
+        if !self.skip_required_whitespace() || !self.consume_keyword("TABLE") {
+            return Err(self.syntax_error("expected TABLE after CREATE"));
+        }
+        if !self.skip_required_whitespace() {
+            return Err(self.syntax_error("expected a table name after CREATE TABLE"));
+        }
+
+        let name = self.parse_identifier("expected a table name after CREATE TABLE")?;
+        self.skip_whitespace();
+        if self.peek() != Some('(') {
+            return Err(self.syntax_error("expected '(' after table name"));
+        }
+        self.advance();
+        self.skip_whitespace();
+
+        if self.peek() == Some(')') {
+            return Err(self.syntax_error("expected at least one field definition"));
+        }
+
+        let mut fields = Vec::new();
+        let mut field_names = std::collections::HashSet::new();
+        loop {
+            let field_name = self.parse_identifier("expected a field name")?;
+            if !field_names.insert(field_name.value.to_ascii_lowercase()) {
+                return Err(SqlError::at(
+                    self.input,
+                    field_name.byte_offset,
+                    SqlErrorKind::DuplicateField {
+                        table: name.value.clone(),
+                        field: field_name.value,
+                    },
+                ));
+            }
+            if !self.skip_required_whitespace() {
+                return Err(self.syntax_error("expected a data type after field name"));
+            }
+
+            let type_name = self.parse_identifier("expected a data type after field name")?;
+            let data_type = match type_name.value.to_ascii_lowercase().as_str() {
+                "int64" => DataType::Int64,
+                "float64" => DataType::Float64,
+                "bool" => DataType::Bool,
+                "string" => DataType::String,
+                _ => {
+                    return Err(SqlError::at(
+                        self.input,
+                        type_name.byte_offset,
+                        SqlErrorKind::UnknownDataType {
+                            data_type: type_name.value,
+                        },
+                    ));
+                }
+            };
+            fields.push(CreateField {
+                name: field_name,
+                data_type,
+            });
+
+            self.skip_whitespace();
+            match self.peek() {
+                Some(',') => {
+                    self.advance();
+                    self.skip_whitespace();
+                }
+                Some(')') => {
+                    self.advance();
+                    break;
+                }
+                _ => return Err(self.syntax_error("expected ',' or ')' after field definition")),
+            }
+        }
+
+        self.skip_whitespace();
+        if self.peek() != Some(';') {
+            return Err(self.syntax_error("expected ';' after CREATE TABLE statement"));
+        }
+        self.advance();
+
+        Ok(CreateTable { name, fields })
     }
 
     fn parse_literal(&mut self) -> Result<ScalarValue, SqlError> {
@@ -189,10 +412,9 @@ impl<'a> Parser<'a> {
             Some('+') | Some('-') | Some('.') | Some('0'..='9') => self.parse_number(),
             _ if self.consume_keyword("TRUE") => Ok(ScalarValue::Boolean(true)),
             _ if self.consume_keyword("FALSE") => Ok(ScalarValue::Boolean(false)),
-            _ => {
-                Err(self
-                    .error("expected an integer, finite float, boolean, or quoted string literal"))
-            }
+            _ => Err(self.syntax_error(
+                "expected an integer, finite float, boolean, or quoted string literal",
+            )),
         }
     }
 
@@ -209,7 +431,7 @@ impl<'a> Parser<'a> {
                 }
                 Some('\'') => return Ok(value),
                 Some(character) => value.push(character),
-                None => return Err(self.error_at(start, "unterminated quoted string")),
+                None => return Err(self.syntax_error_at(start, "unterminated quoted string")),
             }
         }
     }
@@ -234,7 +456,7 @@ impl<'a> Parser<'a> {
         };
 
         if digits_before_decimal + digits_after_decimal == 0 {
-            return Err(self.error_at(start, "invalid numeric literal"));
+            return Err(self.syntax_error_at(start, "invalid numeric literal"));
         }
 
         let has_exponent = if matches!(self.peek(), Some('e') | Some('E')) {
@@ -244,7 +466,7 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             if self.consume_digits() == 0 {
-                return Err(self.error_at(exponent_start, "invalid float exponent"));
+                return Err(self.syntax_error_at(exponent_start, "invalid float exponent"));
             }
             true
         } else {
@@ -255,26 +477,31 @@ impl<'a> Parser<'a> {
         if has_decimal || has_exponent {
             let value = literal
                 .parse::<f64>()
-                .map_err(|_| self.error_at(start, "invalid float literal"))?;
+                .map_err(|_| self.syntax_error_at(start, "invalid float literal"))?;
             if !value.is_finite() {
-                return Err(self.error_at(start, "float literal must be finite"));
+                return Err(self.syntax_error_at(start, "float literal must be finite"));
             }
             Ok(ScalarValue::Float(value))
         } else {
             literal
                 .parse::<i64>()
                 .map(ScalarValue::Integer)
-                .map_err(|_| self.error_at(start, "integer literal is outside the Int64 range"))
+                .map_err(|_| {
+                    self.syntax_error_at(start, "integer literal is outside the Int64 range")
+                })
         }
     }
 
-    fn parse_identifier(&mut self) -> Result<String, SqlError> {
+    fn parse_identifier(
+        &mut self,
+        expected_message: &'static str,
+    ) -> Result<PositionedIdentifier, SqlError> {
         let start = self.position;
         match self.peek() {
             Some(character) if character.is_ascii_alphabetic() || character == '_' => {
                 self.advance();
             }
-            _ => return Err(self.error("expected an identifier after AS")),
+            _ => return Err(self.syntax_error(expected_message)),
         }
 
         while matches!(self.peek(), Some(character) if character.is_ascii_alphanumeric() || character == '_')
@@ -282,7 +509,10 @@ impl<'a> Parser<'a> {
             self.advance();
         }
 
-        Ok(self.input[start..self.position].to_owned())
+        Ok(PositionedIdentifier {
+            value: self.input[start..self.position].to_owned(),
+            byte_offset: start,
+        })
     }
 
     fn consume_digits(&mut self) -> usize {
@@ -321,6 +551,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn skip_required_whitespace(&mut self) -> bool {
+        let start = self.position;
+        self.skip_whitespace();
+        self.position > start
+    }
+
     fn peek(&self) -> Option<char> {
         self.input[self.position..].chars().next()
     }
@@ -335,17 +571,18 @@ impl<'a> Parser<'a> {
         self.position == self.input.len()
     }
 
-    fn error(&self, message: impl Into<String>) -> SqlError {
-        self.error_at(self.position, message)
+    fn syntax_error(&self, message: impl Into<String>) -> SqlError {
+        self.syntax_error_at(self.position, message)
     }
 
-    fn error_at(&self, position: usize, message: impl Into<String>) -> SqlError {
-        let (line, column) = line_and_column(self.input, position);
-        SqlError {
-            line,
-            column,
-            message: message.into(),
-        }
+    fn syntax_error_at(&self, position: usize, message: impl Into<String>) -> SqlError {
+        SqlError::at(
+            self.input,
+            position,
+            SqlErrorKind::Syntax {
+                message: message.into(),
+            },
+        )
     }
 }
 
