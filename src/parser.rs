@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub use crate::storage::DataType as ColumnType;
+
 /// Maximum accepted SQL input size, measured in UTF-8 bytes.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 
@@ -24,15 +26,6 @@ pub struct CreateTable {
 pub struct ColumnDefinition {
     pub name: String,
     pub column_type: ColumnType,
-}
-
-/// The column types accepted by the initial RustHouse SQL boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColumnType {
-    Int64,
-    Float64,
-    Bool,
-    String,
 }
 
 /// A keyword expected at an error location.
@@ -333,14 +326,15 @@ impl<'a> Parser<'a> {
 
     fn parse_identifier(&mut self) -> Result<(&'a str, usize), ParseError> {
         let token = *self.current_token();
-        if let TokenKind::Word(word) = token.kind
-            && word
+        if let TokenKind::Word(word) = token.kind {
+            if word
                 .as_bytes()
                 .first()
                 .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-        {
-            self.advance();
-            return Ok((word, token.position));
+            {
+                self.advance();
+                return Ok((word, token.position));
+            }
         }
 
         Err(ParseError {

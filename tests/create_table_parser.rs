@@ -1,6 +1,6 @@
 use rusthouse::{
-    ColumnDefinition, ColumnType, CreateTable, Keyword, MAX_COLUMNS, MAX_INPUT_BYTES, MAX_TOKENS,
-    ParseErrorKind, parse_create_table,
+    ColumnDefinition, ColumnSchema, ColumnType, CreateTable, DataType, Keyword, MAX_COLUMNS,
+    MAX_INPUT_BYTES, MAX_TOKENS, ParseErrorKind, Schema, Table, parse_create_table,
 };
 
 #[test]
@@ -33,6 +33,29 @@ fn parses_case_insensitive_keywords_and_all_column_types() {
                 },
             ],
         }
+    );
+}
+
+#[test]
+fn parsed_types_construct_storage_columns_without_translation() {
+    let statement = parse_create_table("CREATE TABLE events (id Int64, label String)").unwrap();
+    let schema = Schema::new(
+        statement
+            .columns
+            .into_iter()
+            .map(|column| ColumnSchema::new(column.name, column.column_type, true))
+            .collect(),
+    )
+    .unwrap();
+    let table = Table::new(schema);
+
+    assert_eq!(
+        table.schema().column(0).unwrap().data_type(),
+        DataType::Int64
+    );
+    assert_eq!(
+        table.schema().column(1).unwrap().data_type(),
+        DataType::String
     );
 }
 
