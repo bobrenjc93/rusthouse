@@ -49,25 +49,43 @@ The repository begins as a deliberately tiny seed. Substantial functionality sho
 
 ## Current SQL surface
 
-The library currently executes one bounded `CREATE TABLE` statement per call
-and retains its typed schema in memory:
+The in-memory database executes bounded `CREATE TABLE`, `INSERT INTO ...
+VALUES`, and single-table projection `SELECT` statements. A batch is parsed in
+full before its statements execute in source order:
 
 ```rust
-use rusthouse::{DataType, Database};
+use rusthouse::{Database, Value};
 
 let mut database = Database::new();
-database.execute(
-    "CREATE TABLE events (id Int64, score Float64, active Bool, label String)",
+database.execute_batch(
+    "CREATE TABLE events (id Int64, score Float64, active Bool, label String);
+     INSERT INTO events VALUES (1, 2.5, true, 'first');",
 )?;
 
-let events = database.catalog().table("events").expect("table exists");
-assert_eq!(events.column("id").expect("column exists").data_type(), DataType::Int64);
+let result = database.execute("SELECT label, id FROM events")?;
+let rows = result.query().expect("SELECT returns rows").rows();
+assert_eq!(rows, [vec![Value::String("first".to_owned()), Value::Int64(1)]]);
 # Ok::<(), rusthouse::Error>(())
 ```
 
-SQL keywords and the four type names are case-insensitive. By default, an
-input may contain at most 1 MiB and a table may contain at most 1,024 columns;
-both limits can be changed with `DatabaseConfig`.
+`SELECT *` and explicit bare column lists are supported. Predicates,
+expressions, aggregation, grouping, sorting, and joins are not yet part of the
+grammar. SQL keywords, identifiers, and the four type names are
+case-insensitive. By default, an input may contain at most 1 MiB and a table
+may contain at most 1,024 columns; both limits can be changed with
+`DatabaseConfig`.
+
+The CLI reads one complete semicolon-separated batch from stdin. It emits each
+`SELECT` as CSV with a header row and reports argument, input, SQL, storage,
+and output failures on stderr with a nonzero status:
+
+```bash
+printf "%s\n" \
+  "CREATE TABLE events (id Int64, label String);" \
+  "INSERT INTO events VALUES (1, 'one, quoted');" \
+  "SELECT * FROM events;" \
+  | cargo run -- --format csv
+```
 
 <!-- burner-progress:start -->
 ## Burner evaluation progress

@@ -1,10 +1,11 @@
 //! RustHouse is an experimental, compact analytical database.
 //!
 //! [`Database`] is the public entry point for executing SQL. The current SQL
-//! surface is deliberately small and supports one `CREATE TABLE` statement per
-//! call.
+//! surface supports typed `CREATE TABLE`, `INSERT INTO ... VALUES`, and
+//! single-table projection `SELECT` statements.
 
 pub mod catalog;
+pub mod csv;
 mod database;
 mod error;
 mod schema;
@@ -13,6 +14,7 @@ pub mod sql;
 pub use catalog::Catalog;
 pub use database::{
     DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_INPUT_BYTES, Database, DatabaseConfig,
+    ExecutionResult, QueryResult,
 };
 pub use error::{Error, Result};
 pub use schema::{ColumnSchema, DataType, TableSchema};

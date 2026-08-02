@@ -15,6 +15,18 @@ pub enum Error {
     DuplicateColumn { name: String },
     /// The catalog already contains the case-insensitive table name.
     TableAlreadyExists { name: String },
+    /// A statement referenced a table that is not in the catalog.
+    TableNotFound { name: String },
+    /// A projection referenced a column that is not in its table.
+    ColumnNotFound { table: String, column: String },
+    /// A literal could not be represented by its SQL type.
+    InvalidLiteral {
+        value: String,
+        position: usize,
+        expected: &'static str,
+    },
+    /// Typed storage rejected an insertion batch.
+    Insert(crate::InsertError),
 }
 
 /// A result returned by RustHouse operations.
@@ -43,8 +55,30 @@ impl fmt::Display for Error {
             Self::TableAlreadyExists { name } => {
                 write!(formatter, "table {name:?} already exists")
             }
+            Self::TableNotFound { name } => write!(formatter, "table {name:?} does not exist"),
+            Self::ColumnNotFound { table, column } => {
+                write!(
+                    formatter,
+                    "column {column:?} does not exist in table {table:?}"
+                )
+            }
+            Self::InvalidLiteral {
+                value,
+                position,
+                expected,
+            } => write!(
+                formatter,
+                "invalid {expected} literal {value:?} at byte {position}"
+            ),
+            Self::Insert(error) => write!(formatter, "insert failed: {error}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<crate::InsertError> for Error {
+    fn from(error: crate::InsertError) -> Self {
+        Self::Insert(error)
+    }
+}

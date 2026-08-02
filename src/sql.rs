@@ -1,6 +1,6 @@
 //! Tokenization and parsing for the supported SQL subset.
 
-use crate::{ColumnSchema, DataType, Error, Result};
+use crate::{ColumnSchema, DataType, Error, Result, Value};
 
 /// A parsed `CREATE TABLE` statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,24 +25,67 @@ impl CreateTable {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Insert {
+    pub(crate) table: String,
+    pub(crate) rows: Vec<Vec<Value>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Projection {
+    All,
+    Columns(Vec<String>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Select {
+    pub(crate) table: String,
+    pub(crate) projection: Projection,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Statement {
+    CreateTable(CreateTable),
+    Insert(Insert),
+    Select(Select),
+}
+
 /// Parse exactly one `CREATE TABLE` statement.
 ///
 /// The byte-size bound is enforced by [`crate::Database`]; this function
 /// enforces the caller-provided column bound while parsing.
 pub fn parse_create_table(input: &str, max_columns: usize) -> Result<CreateTable> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens, max_columns).parse_create_table()
+    match parse_one(input, max_columns)? {
+        Statement::CreateTable(statement) => Ok(statement),
+        Statement::Insert(_) | Statement::Select(_) => Err(Error::Syntax {
+            position: 0,
+            message: "expected keyword CREATE".to_owned(),
+        }),
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) fn parse_one(input: &str, max_columns: usize) -> Result<Statement> {
+    let tokens = Lexer::new(input).tokenize()?;
+    Parser::new(tokens, max_columns).parse_one()
+}
+
+pub(crate) fn parse_batch(input: &str, max_columns: usize) -> Result<Vec<Statement>> {
+    let tokens = Lexer::new(input).tokenize()?;
+    Parser::new(tokens, max_columns).parse_batch()
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct Token {
     kind: TokenKind,
     position: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
     Identifier(String),
+    Number(String),
+    String(String),
+    Asterisk,
     Comma,
     LeftParenthesis,
     RightParenthesis,
@@ -74,6 +117,10 @@ impl<'a> Lexer<'a> {
             };
 
             let kind = match character {
+                '*' => {
+                    self.advance();
+                    TokenKind::Asterisk
+                }
                 ',' => {
                     self.advance();
                     TokenKind::Comma
@@ -89,6 +136,14 @@ impl<'a> Lexer<'a> {
                 ';' => {
                     self.advance();
                     TokenKind::Semicolon
+                }
+                '\'' => TokenKind::String(self.scan_string(position)?),
+                character
+                    if character.is_ascii_digit()
+                        || (character == '-'
+                            && self.next().is_some_and(|next| next.is_ascii_digit())) =>
+                {
+                    TokenKind::Number(self.scan_number())
                 }
                 character if character.is_ascii_alphabetic() || character == '_' => {
                     TokenKind::Identifier(self.scan_identifier())
@@ -106,6 +161,12 @@ impl<'a> Lexer<'a> {
 
     fn current(&self) -> Option<char> {
         self.input[self.position..].chars().next()
+    }
+
+    fn next(&self) -> Option<char> {
+        let mut characters = self.input[self.position..].chars();
+        characters.next()?;
+        characters.next()
     }
 
     fn advance(&mut self) {
@@ -130,6 +191,75 @@ impl<'a> Lexer<'a> {
         }
         self.input[start..self.position].to_owned()
     }
+
+    fn scan_number(&mut self) -> String {
+        let start = self.position;
+        if self.current() == Some('-') {
+            self.advance();
+        }
+        while self
+            .current()
+            .is_some_and(|character| character.is_ascii_digit())
+        {
+            self.advance();
+        }
+        if self.current() == Some('.') {
+            self.advance();
+            while self
+                .current()
+                .is_some_and(|character| character.is_ascii_digit())
+            {
+                self.advance();
+            }
+        }
+        if self
+            .current()
+            .is_some_and(|character| matches!(character, 'e' | 'E'))
+        {
+            self.advance();
+            if self
+                .current()
+                .is_some_and(|character| matches!(character, '+' | '-'))
+            {
+                self.advance();
+            }
+            while self
+                .current()
+                .is_some_and(|character| character.is_ascii_digit())
+            {
+                self.advance();
+            }
+        }
+        self.input[start..self.position].to_owned()
+    }
+
+    fn scan_string(&mut self, start: usize) -> Result<String> {
+        self.advance();
+        let mut value = String::new();
+        loop {
+            match self.current() {
+                None => {
+                    return Err(Error::Syntax {
+                        position: start,
+                        message: "unterminated string literal".to_owned(),
+                    });
+                }
+                Some('\'') if self.next() == Some('\'') => {
+                    value.push('\'');
+                    self.advance();
+                    self.advance();
+                }
+                Some('\'') => {
+                    self.advance();
+                    return Ok(value);
+                }
+                Some(character) => {
+                    value.push(character);
+                    self.advance();
+                }
+            }
+        }
+    }
 }
 
 struct Parser {
@@ -147,7 +277,50 @@ impl Parser {
         }
     }
 
-    fn parse_create_table(mut self) -> Result<CreateTable> {
+    fn parse_one(mut self) -> Result<Statement> {
+        if matches!(self.current().kind, TokenKind::End) {
+            return self.syntax("expected a SQL statement");
+        }
+        let statement = self.parse_statement()?;
+        if matches!(self.current().kind, TokenKind::Semicolon) {
+            self.advance();
+        }
+        if !matches!(self.current().kind, TokenKind::End) {
+            return self.syntax("expected the end of the statement");
+        }
+        Ok(statement)
+    }
+
+    fn parse_batch(mut self) -> Result<Vec<Statement>> {
+        if matches!(self.current().kind, TokenKind::End) {
+            return self.syntax("expected a SQL statement");
+        }
+
+        let mut statements = Vec::new();
+        while !matches!(self.current().kind, TokenKind::End) {
+            statements.push(self.parse_statement()?);
+            match self.current().kind {
+                TokenKind::Semicolon => self.advance(),
+                TokenKind::End => break,
+                _ => return self.syntax("expected ';' between statements"),
+            }
+        }
+        Ok(statements)
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement> {
+        if self.current_is_keyword("CREATE") {
+            self.parse_create_table().map(Statement::CreateTable)
+        } else if self.current_is_keyword("INSERT") {
+            self.parse_insert().map(Statement::Insert)
+        } else if self.current_is_keyword("SELECT") {
+            self.parse_select().map(Statement::Select)
+        } else {
+            self.syntax("expected CREATE, INSERT, or SELECT")
+        }
+    }
+
+    fn parse_create_table(&mut self) -> Result<CreateTable> {
         self.expect_keyword("CREATE")?;
         self.expect_keyword("TABLE")?;
         let name = self.expect_identifier("a table name")?.0;
@@ -176,9 +349,7 @@ impl Parser {
             columns.push(ColumnSchema::new(name, data_type));
 
             match self.current().kind {
-                TokenKind::Comma => {
-                    self.advance();
-                }
+                TokenKind::Comma => self.advance(),
                 TokenKind::RightParenthesis => {
                     self.advance();
                     break;
@@ -187,20 +358,117 @@ impl Parser {
             }
         }
 
-        if matches!(self.current().kind, TokenKind::Semicolon) {
-            self.advance();
-        }
-        if !matches!(self.current().kind, TokenKind::End) {
-            return self.syntax("expected the end of the statement");
-        }
-
         Ok(CreateTable { name, columns })
     }
 
+    fn parse_insert(&mut self) -> Result<Insert> {
+        self.expect_keyword("INSERT")?;
+        self.expect_keyword("INTO")?;
+        let table = self.expect_identifier("a table name")?.0;
+        self.expect_keyword("VALUES")?;
+
+        let mut rows = Vec::new();
+        loop {
+            self.expect_symbol(TokenKind::LeftParenthesis, "'('")?;
+            let mut row = Vec::new();
+            if matches!(self.current().kind, TokenKind::RightParenthesis) {
+                self.advance();
+            } else {
+                loop {
+                    row.push(self.parse_literal()?);
+                    match self.current().kind {
+                        TokenKind::Comma => self.advance(),
+                        TokenKind::RightParenthesis => {
+                            self.advance();
+                            break;
+                        }
+                        _ => return self.syntax("expected ',' or ')' after value"),
+                    }
+                }
+            }
+            rows.push(row);
+
+            if matches!(self.current().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(Insert { table, rows })
+    }
+
+    fn parse_literal(&mut self) -> Result<Value> {
+        let token = self.current().clone();
+        match token.kind {
+            TokenKind::String(value) => {
+                self.advance();
+                Ok(Value::String(value))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("TRUE") => {
+                self.advance();
+                Ok(Value::Bool(true))
+            }
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("FALSE") => {
+                self.advance();
+                Ok(Value::Bool(false))
+            }
+            TokenKind::Number(value)
+                if value.contains('.') || value.contains('e') || value.contains('E') =>
+            {
+                self.advance();
+                value
+                    .parse::<f64>()
+                    .map(Value::Float64)
+                    .map_err(|_| Error::InvalidLiteral {
+                        value,
+                        position: token.position,
+                        expected: "Float64",
+                    })
+            }
+            TokenKind::Number(value) => {
+                self.advance();
+                value
+                    .parse::<i64>()
+                    .map(Value::Int64)
+                    .map_err(|_| Error::InvalidLiteral {
+                        value,
+                        position: token.position,
+                        expected: "Int64",
+                    })
+            }
+            _ => self.syntax("expected a String, Int64, Float64, or Bool literal"),
+        }
+    }
+
+    fn parse_select(&mut self) -> Result<Select> {
+        self.expect_keyword("SELECT")?;
+        let projection = if matches!(self.current().kind, TokenKind::Asterisk) {
+            self.advance();
+            Projection::All
+        } else {
+            let mut columns = Vec::new();
+            loop {
+                columns.push(self.expect_identifier("a projected column or '*'")?.0);
+                if matches!(self.current().kind, TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            Projection::Columns(columns)
+        };
+        self.expect_keyword("FROM")?;
+        let table = self.expect_identifier("a table name")?.0;
+        Ok(Select { table, projection })
+    }
+
+    fn current_is_keyword(&self, expected: &str) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
+    }
+
     fn expect_keyword(&mut self, expected: &str) -> Result<()> {
-        let token = self.current();
-        if matches!(&token.kind, TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.current_is_keyword(expected) {
             self.advance();
             Ok(())
         } else {
@@ -258,6 +526,36 @@ mod tests {
                 position: 29,
                 message: "unexpected character '\u{e9}'".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_a_complete_statement_batch_and_unescapes_strings() {
+        let statements = parse_batch(
+            "CREATE TABLE t (id Int64, label String);\n\
+             INSERT INTO t VALUES (1, 'it''s one'), (2, 'two');\n\
+             SELECT label, id FROM t;",
+            10,
+        )
+        .expect("valid batch");
+
+        assert_eq!(statements.len(), 3);
+        assert_eq!(
+            statements[1],
+            Statement::Insert(Insert {
+                table: "t".to_owned(),
+                rows: vec![
+                    vec![Value::Int64(1), Value::String("it's one".to_owned())],
+                    vec![Value::Int64(2), Value::String("two".to_owned())],
+                ],
+            })
+        );
+        assert_eq!(
+            statements[2],
+            Statement::Select(Select {
+                table: "t".to_owned(),
+                projection: Projection::Columns(vec!["label".to_owned(), "id".to_owned()]),
+            })
         );
     }
 }

@@ -199,6 +199,17 @@ impl Column {
         self.len() == 0
     }
 
+    /// Return one cell as an owned typed value.
+    #[must_use]
+    pub fn value(&self, row: usize) -> Option<Value> {
+        match self {
+            Self::Int64(values) => values.get(row).copied().map(Value::Int64),
+            Self::Float64(values) => values.get(row).copied().map(Value::Float64),
+            Self::Bool(values) => values.get(row).copied().map(Value::Bool),
+            Self::String(values) => values.get(row).cloned().map(Value::String),
+        }
+    }
+
     pub fn as_int64(&self) -> Option<&[i64]> {
         match self {
             Self::Int64(values) => Some(values),
