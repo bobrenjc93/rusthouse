@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::storage::{DataType, Value};
 
-const MAX_SQL_TOKENS: usize = 1_000_000;
+const MAX_SQL_TOKENS: usize = 4_000_000;
 const MAX_STATEMENTS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,21 +144,35 @@ pub(crate) fn parse(sql: &str) -> Result<Vec<Statement>> {
 struct Lexer<'a> {
     source: &'a str,
     offset: usize,
+    token_limit: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(source: &'a str) -> Self {
-        Self { source, offset: 0 }
+        Self {
+            source,
+            offset: 0,
+            token_limit: MAX_SQL_TOKENS,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_token_limit(source: &'a str, token_limit: usize) -> Self {
+        Self {
+            source,
+            offset: 0,
+            token_limit,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
             self.skip_trivia()?;
-            if tokens.len() >= MAX_SQL_TOKENS {
+            if tokens.len() >= self.token_limit {
                 return Err(self.error(
                     self.offset,
-                    format!("SQL token limit exceeded (maximum {MAX_SQL_TOKENS})"),
+                    format!("SQL token limit exceeded (maximum {})", self.token_limit),
                 ));
             }
             let offset = self.offset;
@@ -1221,5 +1235,13 @@ mod tests {
         };
         assert_eq!(select.items[0].expression, Expr::Column("true".to_owned()));
         assert_eq!(select.items[1].expression, Expr::Column("null".to_owned()));
+    }
+
+    #[test]
+    fn punctuation_heavy_input_obeys_the_configured_token_limit() {
+        let error = Lexer::with_token_limit(&";".repeat(65), 64)
+            .tokenize()
+            .unwrap_err();
+        assert!(error.message().contains("token limit"));
     }
 }

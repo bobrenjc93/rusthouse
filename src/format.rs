@@ -27,8 +27,8 @@ impl OutputFormat {
     }
 }
 
-/// Encodes one query result. CSV has no header row; JSON is an array of
-/// objects whose keys are the projected column names.
+/// Encodes one query result. CSV starts with an escaped column-name row; JSON
+/// is an array of objects whose keys are the projected column names.
 pub fn render(result: &QueryResult, format: OutputFormat) -> Result<String> {
     let size = encoded_size(result, format)?;
     Ok(match format {
@@ -39,6 +39,13 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> Result<String> {
 
 fn render_csv(result: &QueryResult, capacity: usize) -> String {
     let mut output = String::with_capacity(capacity);
+    for (index, name) in result.columns.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        csv_field(&mut output, name);
+    }
+    output.push('\n');
     for row in &result.rows {
         for (index, value) in row.iter().enumerate() {
             if index != 0 {
@@ -118,7 +125,11 @@ fn encoded_size(result: &QueryResult, format: OutputFormat) -> Result<usize> {
 }
 
 fn csv_size(result: &QueryResult) -> Result<usize> {
-    result.rows.iter().try_fold(0usize, |total, row| {
+    let mut total = result.columns.len().saturating_sub(1) + 1;
+    for name in &result.columns {
+        total = checked_output_add(total, csv_text_size(name))?;
+    }
+    result.rows.iter().try_fold(total, |total, row| {
         let separators = row.len().saturating_sub(1) + 1;
         let total = checked_output_add(total, separators)?;
         row.iter().try_fold(total, |total, value| {
@@ -139,10 +150,15 @@ fn csv_value_size(value: &Value) -> usize {
                 5
             }
         }
-        Value::String(value) if value.contains([',', '"', '\n', '\r']) || value == "\\N" => {
-            2 + value.len() + value.bytes().filter(|byte| *byte == b'"').count()
-        }
-        Value::String(value) => value.len(),
+        Value::String(value) => csv_text_size(value),
+    }
+}
+
+fn csv_text_size(value: &str) -> usize {
+    if value.contains([',', '"', '\n', '\r']) || value == "\\N" {
+        2 + value.len() + value.bytes().filter(|byte| *byte == b'"').count()
+    } else {
+        value.len()
     }
 }
 
@@ -273,10 +289,22 @@ mod tests {
     }
 
     #[test]
-    fn renders_rfc_style_csv_without_a_header() {
+    fn renders_rfc_style_csv_with_a_header() {
         assert_eq!(
             render(&result(), OutputFormat::Csv).unwrap(),
-            "\"a,\"\"b\",1.5,true\n\"line\n2\",\\N,false\n"
+            "name,value,valid\n\"a,\"\"b\",1.5,true\n\"line\n2\",\\N,false\n"
+        );
+    }
+
+    #[test]
+    fn escapes_csv_column_names() {
+        let result = QueryResult {
+            columns: vec!["a,b".to_owned(), "quote\"name".to_owned()],
+            rows: Vec::new(),
+        };
+        assert_eq!(
+            render(&result, OutputFormat::Csv).unwrap(),
+            "\"a,b\",\"quote\"\"name\"\n"
         );
     }
 

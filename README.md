@@ -36,7 +36,7 @@ FROM events GROUP BY category ORDER BY total DESC;" \
   | cargo run --quiet -- --format csv
 ```
 
-`--format csv` is the default and emits headerless RFC-style records. NULL is `\N`. `--format json` emits one JSON array of typed row objects per query and requires unique output names. Input, materialized query results, and encoded output are each capped at 64 MiB; token and statement counts, expression depth, aggregate/grouping work, table cells, and per-table/catalog storage also have explicit limits so compact adversarial input fails cleanly.
+`--format csv` is the default and emits RFC-style records with an escaped column-name header. NULL is `\N`. `--format json` emits one JSON array of typed row objects per query and requires unique output names. Input, materialized query results, and encoded output are each capped at 64 MiB; token and statement counts, expression depth, aggregate/grouping work, table cells, and per-table/catalog storage also have explicit limits so compact adversarial input fails cleanly.
 
 ```bash
 cargo run -- --help

@@ -359,3 +359,30 @@ fn aggregate_expression_row_work_is_bounded_before_execution() {
         .unwrap_err();
     assert!(error.message().contains("aggregate work limit"));
 }
+
+#[test]
+fn default_benchmark_batch_of_fifty_thousand_wide_rows_is_accepted() {
+    let columns = (0..11)
+        .map(|index| format!("c{index} Int64"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let row = format!(
+        "({})",
+        std::iter::repeat_n("1", 11).collect::<Vec<_>>().join(",")
+    );
+    let rows = std::iter::repeat_n(row.as_str(), 50_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut engine = Engine::new();
+    engine
+        .execute(&format!(
+            "CREATE TABLE benchmark_batch ({columns}); \
+             INSERT INTO benchmark_batch VALUES {rows};"
+        ))
+        .unwrap();
+    let result = engine
+        .execute("SELECT count(*) AS row_count FROM benchmark_batch")
+        .unwrap()
+        .remove(0);
+    assert_eq!(result.rows, vec![vec![Value::Int64(50_000)]]);
+}

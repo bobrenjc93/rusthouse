@@ -46,8 +46,24 @@ fn csv_cli_executes_repeated_statements_in_one_process() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "1,\"a,b\"\n2,two\n2\n"
+        "id,name\n1,\"a,b\"\n2,two\nn\n2\n"
     );
+}
+
+#[test]
+fn csv_cli_matches_the_benchmark_header_contract() {
+    let output = run_cli(
+        &["--format", "csv"],
+        "CREATE TABLE benchmark_header (x Int64); \
+         INSERT INTO benchmark_header VALUES (1); \
+         SELECT count(*) AS row_count FROM benchmark_header;",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "row_count\n1\n");
 }
 
 #[test]
@@ -113,17 +129,6 @@ fn repeated_large_string_projections_respect_the_result_byte_limit() {
     assert!(output.stdout.is_empty());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("result byte limit"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn punctuation_heavy_input_respects_the_token_limit() {
-    let output = run_cli(&[], &";".repeat(1_000_001));
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("token limit"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
