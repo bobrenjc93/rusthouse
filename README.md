@@ -27,9 +27,10 @@ and schema-ordered `INSERT INTO name VALUES (...), (...)` statements. Scalar
 expressions support literals and same-type `=`, `<>`, `<`, `<=`, `>`, or `>=`
 comparisons, with SQL NULL propagation. `COUNT(*)` returns the row count of a
 stored table, including rows inserted earlier in the same batch.
-Table fields support `Int64`, `Float64`, `Bool`, and `String`; they are currently
-non-nullable. DDL and inserts produce no CSV output, and a failing statement
-rolls back the complete SQL batch.
+Table fields support `Int64`, `Float64`, `Bool`, and `String`. Plain types are
+non-nullable, while `Nullable(Int64)`, `Nullable(Float64)`, `Nullable(Bool)`,
+and `Nullable(String)` accept `NULL`. DDL and inserts produce no CSV output,
+and a failing statement rolls back the complete SQL batch.
 
 Catalog tables are in-memory and each is capped at 1,000,000 rows. The public
 catalog API exposes immutable table lookup, and persistence is not implemented.

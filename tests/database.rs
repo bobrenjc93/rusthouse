@@ -44,6 +44,48 @@ fn executes_create_table_alongside_scalar_selects() {
 }
 
 #[test]
+fn nullable_types_preserve_schema_flags_and_store_nulls() {
+    let mut database = Database::new();
+
+    database
+        .execute(
+            "CREATE TABLE readings (\
+             required Int64, \
+             maybe_id Nullable(Int64), \
+             maybe_score nullable ( Float64 ), \
+             maybe_active NULLABLE(Bool), \
+             maybe_label Nullable(String)); \
+             INSERT INTO readings VALUES (1, NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+
+    let table = database.table("readings").unwrap();
+    assert_eq!(
+        table
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| (field.name(), field.data_type(), field.is_nullable()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("required", DataType::Int64, false),
+            ("maybe_id", DataType::Int64, true),
+            ("maybe_score", DataType::Float64, true),
+            ("maybe_active", DataType::Bool, true),
+            ("maybe_label", DataType::String, true),
+        ]
+    );
+
+    for field_name in ["maybe_id", "maybe_score", "maybe_active", "maybe_label"] {
+        assert_eq!(
+            table.column(field_name).unwrap().validity().get(0),
+            Some(false),
+            "field {field_name} should store NULL in its validity bitmap"
+        );
+    }
+}
+
+#[test]
 fn create_table_produces_no_csv_result() {
     let mut database = Database::new();
     let results = database.execute("CREATE TABLE events (id Int64);").unwrap();
@@ -369,6 +411,47 @@ fn unknown_type_is_typed_positioned_and_preserves_catalog() {
     assert_eq!(error.byte_offset(), sql.find("Decimal").unwrap());
     assert_eq!((error.line(), error.column()), (2, 8));
     assert_eq!(database, before);
+}
+
+#[test]
+fn unknown_nullable_inner_type_is_typed_positioned_and_atomic() {
+    let mut database = database_with_seed();
+    let before = database.clone();
+    let sql = "INSERT INTO seed VALUES (1);\n\
+               CREATE TABLE readings (value Nullable(Decimal));";
+
+    let error = database.execute(sql).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::UnknownDataType {
+            data_type: "Decimal".into(),
+        }
+    );
+    assert_eq!(error.byte_offset(), sql.find("Decimal").unwrap());
+    assert_eq!((error.line(), error.column()), (2, 39));
+    assert_eq!(database, before);
+}
+
+#[test]
+fn malformed_nullable_wrappers_are_atomic() {
+    for sql in [
+        "INSERT INTO seed VALUES (1); CREATE TABLE invalid (value Nullable);",
+        "INSERT INTO seed VALUES (1); CREATE TABLE invalid (value Nullable());",
+        "INSERT INTO seed VALUES (1); CREATE TABLE invalid (value Nullable(Int64);",
+        "INSERT INTO seed VALUES (1); CREATE TABLE invalid (value Nullable(Int64, String));",
+    ] {
+        let mut database = database_with_seed();
+        let before = database.clone();
+
+        let error = database.execute(sql).unwrap_err();
+
+        assert!(
+            matches!(error.kind(), SqlErrorKind::Syntax { .. }),
+            "SQL: {sql}, error: {error}"
+        );
+        assert_eq!(database, before, "SQL: {sql}");
+    }
 }
 
 #[test]
