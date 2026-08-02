@@ -24,6 +24,12 @@ pub use storage::{
 };
 
 /// Returns the product name while the first storage engine is being built.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(rusthouse::product_name(), "RustHouse");
+/// ```
 pub fn product_name() -> &'static str {
     "RustHouse"
 }
