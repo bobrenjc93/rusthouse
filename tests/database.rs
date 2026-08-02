@@ -268,6 +268,36 @@ fn counts_rows_from_committed_and_staged_tables_case_insensitively() {
 }
 
 #[test]
+fn counts_nullable_rows_before_and_after_commit() {
+    let mut database = Database::new();
+
+    let results = database
+        .execute(
+            "CREATE TABLE readings (id Int64, value Nullable(Float64));\n\
+             SELECT COUNT(*) AS before_insert FROM readings;\n\
+             INSERT INTO readings VALUES (1, NULL), (2, 2.5), (3, NULL);\n\
+             SELECT COUNT(*) AS after_insert FROM readings;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (&result.header[..], &result.value))
+            .collect::<Vec<_>>(),
+        vec![
+            ("before_insert", &ScalarValue::Integer(0)),
+            ("after_insert", &ScalarValue::Integer(3)),
+        ]
+    );
+
+    let committed = database
+        .execute("SELECT COUNT(*) AS committed FROM readings;")
+        .unwrap();
+    assert_eq!(committed[0].value, ScalarValue::Integer(3));
+}
+
+#[test]
 fn unknown_count_table_is_positioned_and_rolls_back_the_batch() {
     let mut database = database_with_seed();
     database.execute("INSERT INTO seed VALUES (1);").unwrap();
