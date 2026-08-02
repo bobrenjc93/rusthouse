@@ -44,6 +44,16 @@ fn parses_every_literal_type_and_doubled_quotes() {
 }
 
 #[test]
+fn parses_signed_leading_decimal_floats() {
+    let statement = parse_insert("INSERT INTO metrics VALUES (-.5, +.25)").unwrap();
+
+    assert_eq!(
+        statement.values,
+        vec![Value::Float64(-0.5), Value::Float64(0.25)]
+    );
+}
+
+#[test]
 fn executes_against_the_catalog_in_schema_order() {
     let mut catalog = events_catalog();
 

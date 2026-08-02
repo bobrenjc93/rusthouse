@@ -301,12 +301,7 @@ fn tokenize(input: &str) -> Result<Vec<Token<'_>>, ParseError> {
         }
 
         let token_position = position;
-        let kind = if byte.is_ascii_digit()
-            || ((byte == b'+' || byte == b'-' || byte == b'.')
-                && bytes
-                    .get(position + 1)
-                    .is_some_and(|next| next.is_ascii_digit()))
-        {
+        let kind = if is_number_start(bytes, position) {
             position += 1;
             while position < bytes.len()
                 && !bytes[position].is_ascii_whitespace()
@@ -380,6 +375,25 @@ fn tokenize(input: &str) -> Result<Vec<Token<'_>>, ParseError> {
         position: input.len(),
     });
     Ok(tokens)
+}
+
+fn is_number_start(bytes: &[u8], position: usize) -> bool {
+    match bytes[position] {
+        byte if byte.is_ascii_digit() => true,
+        b'.' => bytes
+            .get(position + 1)
+            .is_some_and(|next| next.is_ascii_digit()),
+        b'+' | b'-' => {
+            bytes
+                .get(position + 1)
+                .is_some_and(|next| next.is_ascii_digit())
+                || (bytes.get(position + 1) == Some(&b'.')
+                    && bytes
+                        .get(position + 2)
+                        .is_some_and(|next| next.is_ascii_digit()))
+        }
+        _ => false,
+    }
 }
 
 struct Parser<'a> {
