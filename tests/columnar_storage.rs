@@ -1,4 +1,7 @@
-use rusthouse::{Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value};
+use rusthouse::{
+    BatchInsertError, Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table,
+    Value,
+};
 
 fn all_types_schema() -> Schema {
     Schema::new(vec![
@@ -57,6 +60,79 @@ fn stores_each_type_in_its_own_physical_vector() {
         table.columns()[3],
         Column::String(vec!["Ada".to_owned(), "Lin".to_owned()])
     );
+}
+
+#[test]
+fn inserts_an_all_type_batch_into_physical_columns() {
+    let mut table = Table::new(all_types_schema());
+
+    table
+        .insert_batch(vec![
+            vec![1_i64.into(), 1.25_f64.into(), true.into(), "Ada".into()],
+            vec![2_i64.into(), (-3.5_f64).into(), false.into(), "Lin".into()],
+            vec![3_i64.into(), 0.0_f64.into(), true.into(), "Grace".into()],
+        ])
+        .expect("batch is valid");
+
+    assert_eq!(table.row_count(), 3);
+    assert_eq!(table.columns()[0], Column::Int64(vec![1, 2, 3]));
+    assert_eq!(table.columns()[1], Column::Float64(vec![1.25, -3.5, 0.0]));
+    assert_eq!(table.columns()[2], Column::Bool(vec![true, false, true]));
+    assert_eq!(
+        table.columns()[3],
+        Column::String(vec!["Ada".to_owned(), "Lin".to_owned(), "Grace".to_owned()])
+    );
+}
+
+#[test]
+fn invalid_final_batch_row_reports_its_index_and_changes_nothing() {
+    let mut table = Table::new(all_types_schema());
+    table
+        .insert_row(vec![
+            10_i64.into(),
+            9.5_f64.into(),
+            true.into(),
+            "existing".into(),
+        ])
+        .expect("baseline row is valid");
+    let baseline = table.clone();
+
+    let error = table.insert_batch(vec![
+        vec![11_i64.into(), 1.0_f64.into(), false.into(), "valid".into()],
+        vec![12_i64.into(), 2.0_f64.into(), true.into(), "valid".into()],
+        vec![
+            13_i64.into(),
+            3.0_f64.into(),
+            false.into(),
+            Value::Bool(true),
+        ],
+    ]);
+
+    assert_eq!(
+        error,
+        Err(BatchInsertError {
+            batch_index: 2,
+            source: InsertError::TypeMismatch {
+                column_index: 3,
+                column_name: "name".to_owned(),
+                expected: DataType::String,
+                actual: DataType::Bool,
+            },
+        })
+    );
+    assert_eq!(table, baseline);
+}
+
+#[test]
+fn empty_batch_is_a_no_op() {
+    let mut table = Table::new(all_types_schema());
+    let baseline = table.clone();
+
+    table
+        .insert_batch(Vec::new())
+        .expect("empty batch is valid");
+
+    assert_eq!(table, baseline);
 }
 
 #[test]
