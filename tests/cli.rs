@@ -61,6 +61,39 @@ fn create_table_without_select_produces_no_csv() {
 }
 
 #[test]
+fn inserts_schema_ordered_literals_and_escaped_strings_without_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "CREATE TABLE events (id Int64, score Float64, active Bool, label String);\n\
+         INSERT INTO events VALUES\n\
+         (1, 1.5, TRUE, 'it''s ready'),\n\
+         (2, -0.25, FALSE, 'line\nnext');",
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn late_invalid_insert_row_rolls_back_without_partial_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "SELECT 'must not render' AS earlier;\n\
+         CREATE TABLE events (id Int64, score Float64, active Bool, label String);\n\
+         INSERT INTO events VALUES\n\
+         (1, 1.5, TRUE, 'valid'),\n\
+         (2, 'wrong', FALSE, 'invalid');",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot insert into table `events`"));
+    assert!(stderr.contains("field `score` in batch row 1 expects Float64"));
+}
+
+#[test]
 fn evaluates_equality_truth_tables_and_renders_null() {
     let output = run(
         &["--format", "csv"],
@@ -163,6 +196,10 @@ fn rejects_malformed_sql_without_partial_csv() {
         "CREATE TABLE empty ();",
         "CREATE TABLE duplicate (id Int64, id String);",
         "CREATE TABLE unknown (value Decimal);",
+        "INSERT values (1);",
+        "INSERT INTO missing (1);",
+        "INSERT INTO missing VALUES (1)",
+        "INSERT INTO missing VALUES (1,);",
     ] {
         let output = run(&["--format", "csv"], sql);
 

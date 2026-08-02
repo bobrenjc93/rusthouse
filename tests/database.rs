@@ -1,5 +1,6 @@
 use rusthouse::{
-    DEFAULT_TABLE_ROW_LIMIT, DataType, Database, ScalarValue, SqlErrorKind, write_csv,
+    BatchAppendError, Column, DEFAULT_TABLE_ROW_LIMIT, DataType, Database, ScalarValue,
+    SqlErrorKind, ValueType, write_csv,
 };
 
 #[test]
@@ -51,6 +52,93 @@ fn create_table_produces_no_csv_result() {
 
     assert!(results.is_empty());
     assert!(csv.is_empty());
+}
+
+#[test]
+fn positional_insert_stores_all_types_in_schema_order_and_produces_no_csv() {
+    let mut database = Database::new();
+
+    let results = database
+        .execute(
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String);\n\
+             INSERT INTO EVENTS VALUES\n\
+             (1, 1.5, TRUE, 'it''s ready'),\n\
+             (2, -0.25, FALSE, 'second');",
+        )
+        .unwrap();
+
+    assert!(results.is_empty());
+    let table = database.table("events").unwrap();
+    assert_eq!(table.row_count(), 2);
+    let Column::Int64(ids) = table.column("id").unwrap() else {
+        panic!("id should be an Int64 column");
+    };
+    assert_eq!(ids.values(), &[1, 2]);
+    let Column::Float64(scores) = table.column("score").unwrap() else {
+        panic!("score should be a Float64 column");
+    };
+    assert_eq!(scores.values(), &[1.5, -0.25]);
+    let Column::Bool(active) = table.column("active").unwrap() else {
+        panic!("active should be a Bool column");
+    };
+    assert_eq!(active.values(), &[true, false]);
+    let Column::String(labels) = table.column("label").unwrap() else {
+        panic!("label should be a String column");
+    };
+    assert_eq!(labels.values(), &["it's ready", "second"]);
+}
+
+#[test]
+fn late_invalid_insert_row_is_typed_and_rolls_back_the_complete_batch() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String);\n\
+             INSERT INTO events VALUES (1, 1.0, TRUE, 'existing');",
+        )
+        .unwrap();
+    let before = database.clone();
+    let sql = "INSERT INTO events VALUES\n\
+               (2, 2.0, FALSE, 'valid'),\n\
+               (3, 'wrong', TRUE, 'invalid');";
+
+    let error = database.execute(sql).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::InvalidRow {
+            table: "events".into(),
+            source: BatchAppendError::TypeMismatch {
+                row_index: 1,
+                field: "score".into(),
+                expected: DataType::Float64,
+                actual: ValueType::String,
+            },
+        }
+    );
+    assert_eq!((error.line(), error.column()), (3, 1));
+    assert_eq!(database, before);
+}
+
+#[test]
+fn unknown_insert_table_is_typed_and_rolls_back_earlier_statements() {
+    let mut database = database_with_seed();
+    let before = database.clone();
+    let sql = "INSERT INTO seed VALUES (2);\n\
+               CREATE TABLE fresh (id Int64);\n\
+               INSERT INTO missing VALUES (1);";
+
+    let error = database.execute(sql).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::UnknownTable {
+            table: "missing".into(),
+        }
+    );
+    assert_eq!((error.line(), error.column()), (3, 13));
+    assert_eq!(database, before);
+    assert!(database.table("fresh").is_none());
 }
 
 #[test]
