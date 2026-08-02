@@ -5,8 +5,8 @@ pub mod storage;
 
 pub use database::{DEFAULT_TABLE_ROW_LIMIT, Database};
 pub use storage::{
-    AppendError, Column, DataType, Field, Schema, SchemaError, Table, TypedColumn, ValidityBitmap,
-    Value, ValueType,
+    AppendError, BatchAppendError, Column, DataType, Field, Schema, SchemaError, Table,
+    TypedColumn, ValidityBitmap, Value, ValueType,
 };
 
 use std::borrow::Cow;

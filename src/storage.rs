@@ -155,7 +155,7 @@ impl fmt::Display for SchemaError {
 
 impl Error for SchemaError {}
 
-/// A scalar value accepted by [`Table::append_row`].
+/// A scalar value accepted by [`Table::append_row`] and [`Table::append_batch`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// SQL-style NULL, whose concrete type comes from its field.
@@ -532,6 +532,74 @@ impl Table {
         Ok(())
     }
 
+    /// Atomically appends schema-ordered rows after validating the entire batch.
+    ///
+    /// Each row must contain exactly one [`Value`] per schema field, in schema
+    /// order. An empty batch succeeds, including when the table is full. Any
+    /// shape, type, nullability, or row-limit error identifies its zero-based
+    /// row within the batch and leaves the table unchanged.
+    ///
+    /// Consumption is bounded for untrusted iterators: at most one row beyond
+    /// the remaining table capacity and one value beyond the schema width are
+    /// requested.
+    pub fn append_batch<I, R>(&mut self, rows: I) -> Result<(), BatchAppendError>
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = Value>,
+    {
+        let remaining = self.row_limit.saturating_sub(self.row_count);
+        let row_limit = remaining.saturating_add(1);
+        let value_limit = self.schema.len().saturating_add(1);
+        let mut validated_rows = Vec::new();
+
+        for (row_index, row) in rows.into_iter().take(row_limit).enumerate() {
+            if row_index == remaining {
+                return Err(BatchAppendError::RowLimitExceeded {
+                    row_index,
+                    limit: self.row_limit,
+                });
+            }
+
+            let values: Vec<Value> = row.into_iter().take(value_limit).collect();
+            if values.len() != self.schema.len() {
+                return Err(BatchAppendError::RowShapeMismatch {
+                    row_index,
+                    expected: self.schema.len(),
+                    actual: values.len(),
+                });
+            }
+
+            for (field, value) in self.schema.fields().iter().zip(&values) {
+                if matches!(value, Value::Null) {
+                    if !field.is_nullable() {
+                        return Err(BatchAppendError::NullabilityViolation {
+                            row_index,
+                            field: field.name().to_owned(),
+                        });
+                    }
+                } else if !value_matches_type(value, field.data_type()) {
+                    return Err(BatchAppendError::TypeMismatch {
+                        row_index,
+                        field: field.name().to_owned(),
+                        expected: field.data_type(),
+                        actual: value.value_type(),
+                    });
+                }
+            }
+
+            validated_rows.push(values);
+        }
+
+        let appended = validated_rows.len();
+        for row in validated_rows {
+            for (column, value) in self.columns.iter_mut().zip(row) {
+                column.push_validated(value);
+            }
+        }
+        self.row_count += appended;
+        Ok(())
+    }
+
     /// Returns the table schema.
     pub fn schema(&self) -> &Schema {
         &self.schema
@@ -646,3 +714,82 @@ impl fmt::Display for AppendError {
 }
 
 impl Error for AppendError {}
+
+/// A validation error returned by [`Table::append_batch`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BatchAppendError {
+    /// The indexed batch row would exceed the table's configured row bound.
+    RowLimitExceeded {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// The configured maximum number of rows.
+        limit: usize,
+    },
+    /// The indexed batch row has a different width than the schema.
+    RowShapeMismatch {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// The number of schema fields.
+        expected: usize,
+        /// The number of values observed. When this is greater than `expected`,
+        /// it is a lower bound because ingestion stops after `expected + 1`.
+        actual: usize,
+    },
+    /// A non-null value does not have its field's declared type.
+    TypeMismatch {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// The field containing the invalid value.
+        field: String,
+        /// The field's declared type.
+        expected: DataType,
+        /// The supplied value's runtime type.
+        actual: ValueType,
+    },
+    /// A null was supplied for a non-nullable field.
+    NullabilityViolation {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// The non-nullable field name.
+        field: String,
+    },
+}
+
+impl fmt::Display for BatchAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RowLimitExceeded { row_index, limit } => write!(
+                formatter,
+                "batch row {row_index} exceeds the table row limit of {limit}"
+            ),
+            Self::RowShapeMismatch {
+                row_index,
+                expected,
+                actual,
+            } => {
+                let qualifier = if actual > expected { "at least " } else { "" };
+                write!(
+                    formatter,
+                    "batch row {row_index} shape mismatch: expected {expected} values, got {qualifier}{actual}"
+                )
+            }
+            Self::TypeMismatch {
+                row_index,
+                field,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "field `{field}` in batch row {row_index} expects {expected}, but received {actual}"
+            ),
+            Self::NullabilityViolation { row_index, field } => {
+                write!(
+                    formatter,
+                    "field `{field}` in batch row {row_index} is not nullable"
+                )
+            }
+        }
+    }
+}
+
+impl Error for BatchAppendError {}
