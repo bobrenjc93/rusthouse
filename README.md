@@ -44,12 +44,21 @@ table.insert([
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
 
+Development uses the Rust 1.85.0 toolchain declared in `rust-toolchain.toml`. Rustup installs the matching `rustfmt` and Clippy components automatically. Run the same quality gate as CI with:
+
 ```bash
-cargo test
-cargo run -- --help
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features --locked
+cargo build --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items --locked
+RUSTDOCFLAGS="-D warnings" cargo test --workspace --doc --all-features --locked
 ```
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+RustHouse is licensed under the [MIT License](LICENSE).
 
 <!-- burner-progress:start -->
 ## Burner evaluation progress
