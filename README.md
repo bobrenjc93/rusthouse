@@ -1,31 +1,74 @@
 # RustHouse
 
-RustHouse is a from-scratch analytical database in Rust, inspired by the useful core of ClickHouse: typed columnar data, fast scans and aggregations, a practical SQL surface, and an operational interface that is easy to embed and understand.
+RustHouse is a small in-memory analytical database written in Rust. It stores
+each field in a typed column vector and provides both an embedding API and a
+stdin/stdout SQL CLI.
 
-This is intentionally not a wire-compatible ClickHouse clone. The goal is to grow a credible small competitor through measured, reviewed iterations while keeping the implementation approachable.
+## SQL surface
 
-## Product target
+RustHouse supports:
 
-The first useful release should support:
+- `CREATE TABLE` with `Int64`, `Float64`, `Bool`, and `String` columns;
+- multi-row `INSERT INTO ... VALUES`, including explicit column order;
+- `SELECT` projections, aliases, `*`, arithmetic, and comparisons;
+- `WHERE` expressions with parentheses, `AND`, `OR`, and `NOT`;
+- `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` with `GROUP BY`;
+- multi-key `ORDER BY` with `ASC`/`DESC`; and
+- `LIMIT`, `LIMIT ... OFFSET ...`, and `LIMIT offset, count`.
 
-- typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
-- a genuinely columnar in-memory representation;
-- `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
-- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
-- a batch/interactive CLI with readable table, CSV, and JSON output;
-- durable local snapshots with an explicit, documented file format;
-- an HTTP endpoint for executing SQL;
-- deterministic tests and a small benchmark that demonstrate analytical behavior.
+Identifiers can be unquoted, double quoted, or backtick quoted. Unquoted SQL
+keywords and identifiers are case-insensitive. The four storage types are
+non-nullable; `NULL` is rejected instead of being silently coerced.
 
-The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
+## CLI
 
-## Development model
-
-RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
+Pass one or more semicolon-delimited statements on standard input. DDL and
+inserts do not print status text. Every query result is emitted as CSV with a
+header row.
 
 ```bash
-cargo test
-cargo run -- --help
+printf '%s\n' \
+  'CREATE TABLE readings (site String, value Float64);' \
+  "INSERT INTO readings VALUES ('west', 2.5), ('east', 4.0);" \
+  'SELECT site, AVG(value) AS mean FROM readings GROUP BY site ORDER BY site;' \
+  | cargo run --quiet -- --format csv
 ```
 
-The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+Use `cargo run -- --help` for the complete CLI syntax. A downstream consumer
+closing stdout early is treated as a normal broken-pipe termination.
+
+## Embedding
+
+[`Database::execute`](src/database.rs) parses and executes multiple statements
+in order, returning one typed `ExecutionResult` per statement.
+
+```rust
+use rusthouse::{Database, ExecutionResult, Value};
+
+let mut database = Database::new();
+database.execute("CREATE TABLE facts (id Int64, active Bool);")?;
+database.execute("INSERT INTO facts VALUES (1, true), (2, false);")?;
+let result = database.execute_one("SELECT COUNT(*) AS n FROM facts")?;
+
+let ExecutionResult::Query(result) = result else { unreachable!() };
+assert_eq!(result.rows[0][0], Value::Int64(2));
+# Ok::<(), rusthouse::DatabaseError>(())
+```
+
+`Database::with_limits` configures input bytes, rows per insert, rows per
+table, returned rows, columns per table, and bytes per string. Limit failures,
+parse failures, catalog errors, type errors, and arithmetic failures are
+distinct `DatabaseError` variants. An insert batch is fully evaluated and
+validated before any column is changed.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+The implementation uses only the Rust standard library. It is currently
+single-process and in-memory: persistence, server protocols, joins, windows,
+and nullable types are not implemented.
