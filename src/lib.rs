@@ -24,6 +24,8 @@ pub fn product_name() -> &'static str {
 /// A scalar value supported by the initial query surface.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarValue {
+    /// SQL NULL, including the result of a comparison with a NULL operand.
+    Null,
     Integer(i64),
     Float(f64),
     Boolean(bool),
@@ -44,6 +46,7 @@ impl ScalarValue {
 
     fn csv_value(&self) -> Cow<'_, str> {
         match self {
+            Self::Null => Cow::Borrowed("\\N"),
             Self::Integer(value) => Cow::Owned(value.to_string()),
             Self::Float(value) => {
                 let mut rendered = value.to_string();
@@ -164,7 +167,11 @@ impl fmt::Display for SqlError {
 
 impl std::error::Error for SqlError {}
 
-/// Parses a batch of `SELECT <literal> [AS <identifier>];` statements.
+/// Parses a batch of scalar `SELECT` statements.
+///
+/// An expression is either a literal or one `=` or `<>` comparison between
+/// literals. Comparisons use SQL NULL propagation and require non-null
+/// operands to have the same type.
 pub fn parse_sql_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
     Parser::new(input, ParserMode::SelectOnly)
         .parse_batch()?
@@ -298,21 +305,21 @@ impl<'a> Parser<'a> {
     fn parse_select(&mut self) -> Result<QueryResult, SqlError> {
         self.skip_whitespace();
 
-        let literal_start = self.position;
-        let value = self.parse_literal()?;
-        let literal_end = self.position;
+        let expression_start = self.position;
+        let value = self.parse_expression()?;
+        let expression_end = self.position;
         self.skip_whitespace();
-        let has_alias_separator = self.position > literal_end;
+        let has_alias_separator = self.position > expression_end;
 
         let header = if self.consume_keyword("AS") {
             if !has_alias_separator {
-                return Err(self.syntax_error_at(literal_end, "expected whitespace before AS"));
+                return Err(self.syntax_error_at(expression_end, "expected whitespace before AS"));
             }
             self.skip_whitespace();
             self.parse_identifier("expected an identifier after AS")?
                 .value
         } else {
-            self.input[literal_start..literal_end].to_owned()
+            self.input[expression_start..expression_end].to_owned()
         };
 
         self.skip_whitespace();
@@ -406,14 +413,42 @@ impl<'a> Parser<'a> {
         Ok(CreateTable { name, fields })
     }
 
+    fn parse_expression(&mut self) -> Result<ScalarValue, SqlError> {
+        let left = self.parse_literal()?;
+        let left_end = self.position;
+        self.skip_whitespace();
+
+        let operator_position = self.position;
+        let operator = if self.input[self.position..].starts_with("<>") {
+            self.position += 2;
+            Some(ComparisonOperator::NotEqual)
+        } else if self.peek() == Some('=') {
+            self.advance();
+            Some(ComparisonOperator::Equal)
+        } else {
+            None
+        };
+
+        let Some(operator) = operator else {
+            self.position = left_end;
+            return Ok(left);
+        };
+
+        self.skip_whitespace();
+        let right = self.parse_literal()?;
+        compare_scalars(left, right, operator)
+            .map_err(|message| self.syntax_error_at(operator_position, message))
+    }
+
     fn parse_literal(&mut self) -> Result<ScalarValue, SqlError> {
         match self.peek() {
             Some('\'') => self.parse_string().map(ScalarValue::String),
             Some('+') | Some('-') | Some('.') | Some('0'..='9') => self.parse_number(),
+            _ if self.consume_keyword("NULL") => Ok(ScalarValue::Null),
             _ if self.consume_keyword("TRUE") => Ok(ScalarValue::Boolean(true)),
             _ if self.consume_keyword("FALSE") => Ok(ScalarValue::Boolean(false)),
             _ => Err(self.syntax_error(
-                "expected an integer, finite float, boolean, or quoted string literal",
+                "expected NULL, an integer, finite float, boolean, or quoted string literal",
             )),
         }
     }
@@ -586,6 +621,62 @@ impl<'a> Parser<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ComparisonOperator {
+    Equal,
+    NotEqual,
+}
+
+impl ComparisonOperator {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+        }
+    }
+
+    fn apply(self, equal: bool) -> bool {
+        match self {
+            Self::Equal => equal,
+            Self::NotEqual => !equal,
+        }
+    }
+}
+
+fn compare_scalars(
+    left: ScalarValue,
+    right: ScalarValue,
+    operator: ComparisonOperator,
+) -> Result<ScalarValue, String> {
+    let equal = match (left, right) {
+        (ScalarValue::Null, _) | (_, ScalarValue::Null) => return Ok(ScalarValue::Null),
+        (ScalarValue::Integer(left), ScalarValue::Integer(right)) => left == right,
+        (ScalarValue::Float(left), ScalarValue::Float(right)) => left == right,
+        (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left == right,
+        (ScalarValue::String(left), ScalarValue::String(right)) => left == right,
+        (left, right) => {
+            return Err(format!(
+                "operator '{}' cannot compare {} and {}",
+                operator.sql(),
+                scalar_type_name(&left),
+                scalar_type_name(&right)
+            ));
+        }
+    };
+
+    Ok(ScalarValue::Boolean(operator.apply(equal)))
+}
+
+fn scalar_type_name(value: &ScalarValue) -> &'static str {
+    match value {
+        ScalarValue::Null => "NULL",
+        ScalarValue::Integer(_) => "Integer",
+        ScalarValue::Float(_) => "Float",
+        ScalarValue::Boolean(_) => "Boolean",
+        ScalarValue::String(_) => "String",
+    }
+}
+
 fn line_and_column(input: &str, position: usize) -> (usize, usize) {
     let mut line = 1;
     let mut column = 1;
@@ -613,7 +704,7 @@ mod tests {
     fn parses_supported_literals_and_aliases() {
         let results = parse_sql_batch(
             "SELECT -12 AS integer_value; SELECT +.5 AS float_value; \
-             SELECT FALSE; SELECT 'it''s text' AS string_value;",
+             SELECT FALSE; SELECT 'it''s text' AS string_value; SELECT NULL;",
         )
         .unwrap();
 
@@ -625,21 +716,103 @@ mod tests {
             results[3].value,
             ScalarValue::String("it's text".to_owned())
         );
+        assert_eq!(results[4].header, "NULL");
+        assert_eq!(results[4].value, ScalarValue::Null);
+    }
+
+    #[test]
+    fn evaluates_comparison_truth_tables() {
+        let results = parse_sql_batch(
+            "SELECT 2 = 2; SELECT 2 <> 2; SELECT 2 = 3; SELECT 2 <> 3; \
+             SELECT 1.5 = 1.5; SELECT 1.5 <> 2.5; \
+             SELECT TRUE = TRUE; SELECT TRUE <> FALSE; \
+             SELECT 'same' = 'same'; SELECT 'same' <> 'other'; \
+             SELECT NULL = NULL; SELECT NULL <> 1; SELECT 'text' = NULL;",
+        )
+        .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| &result.value)
+                .collect::<Vec<_>>(),
+            vec![
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Null,
+                &ScalarValue::Null,
+                &ScalarValue::Null,
+            ]
+        );
+        assert_eq!(results[0].header, "2 = 2");
+    }
+
+    #[test]
+    fn reports_mixed_comparison_types_at_the_operator() {
+        for (sql, operator, left_type, right_type) in [
+            ("SELECT 1 = 1.0;", "=", "Integer", "Float"),
+            ("SELECT FALSE <> 'false';", "<>", "Boolean", "String"),
+        ] {
+            let error = parse_sql_batch(sql).unwrap_err();
+
+            assert_eq!(error.line(), 1);
+            assert_eq!(error.column(), sql.find(operator).unwrap() + 1);
+            assert_eq!(
+                error.kind(),
+                &SqlErrorKind::Syntax {
+                    message: format!(
+                        "operator '{operator}' cannot compare {left_type} and {right_type}"
+                    ),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_one_compact_comparison_and_rejects_a_second_operator() {
+        let result = parse_sql_batch("SELECT 1=1;").unwrap();
+        assert_eq!(result[0].header, "1=1");
+        assert_eq!(result[0].value, ScalarValue::Boolean(true));
+
+        let sql = "SELECT 1 = 1 <> 2;";
+        let error = parse_sql_batch(sql).unwrap_err();
+        assert_eq!(error.line(), 1);
+        assert_eq!(error.column(), sql.find("<>").unwrap() + 1);
+        assert_eq!(
+            error.kind(),
+            &SqlErrorKind::Syntax {
+                message: "expected ';' after SELECT statement".into(),
+            }
+        );
     }
 
     #[test]
     fn quotes_csv_fields() {
-        let results = vec![QueryResult {
-            header: "message, \"text\"".to_owned(),
-            value: ScalarValue::String("one, \"two\"\nthree".to_owned()),
-        }];
+        let results = vec![
+            QueryResult {
+                header: "message, \"text\"".to_owned(),
+                value: ScalarValue::String("one, \"two\"\nthree".to_owned()),
+            },
+            QueryResult {
+                header: "missing".to_owned(),
+                value: ScalarValue::Null,
+            },
+        ];
         let mut output = Vec::new();
 
         write_csv(&results, &mut output).unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "\"message, \"\"text\"\"\"\n\"one, \"\"two\"\"\nthree\"\n"
+            "\"message, \"\"text\"\"\"\n\"one, \"\"two\"\"\nthree\"\nmissing\n\\N\n"
         );
     }
 
