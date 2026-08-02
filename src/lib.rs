@@ -228,9 +228,9 @@ impl std::error::Error for SqlError {
 
 /// Parses a batch of scalar `SELECT` statements.
 ///
-/// An expression is either a literal or one `=` or `<>` comparison between
-/// literals. Comparisons use SQL NULL propagation and require non-null
-/// operands to have the same type.
+/// An expression is either a literal or one comparison between literals using
+/// `=`, `<>`, `<`, `<=`, `>`, or `>=`. Comparisons use SQL NULL propagation and
+/// require non-null operands to have the same type.
 pub fn parse_sql_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
     Parser::new(input).parse_select_batch()
 }
@@ -638,15 +638,21 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
 
         let operator_position = self.position;
-        let operator = if self.input[self.position..].starts_with("<>") {
-            self.position += 2;
-            Some(ComparisonOperator::NotEqual)
-        } else if self.peek() == Some('=') {
-            self.advance();
-            Some(ComparisonOperator::Equal)
-        } else {
-            None
-        };
+        let operator = [
+            ("<>", ComparisonOperator::NotEqual),
+            ("<=", ComparisonOperator::LessThanOrEqual),
+            (">=", ComparisonOperator::GreaterThanOrEqual),
+            ("=", ComparisonOperator::Equal),
+            ("<", ComparisonOperator::LessThan),
+            (">", ComparisonOperator::GreaterThan),
+        ]
+        .into_iter()
+        .find_map(|(sql, operator)| {
+            self.input[self.position..].starts_with(sql).then(|| {
+                self.position += sql.len();
+                operator
+            })
+        });
 
         let Some(operator) = operator else {
             self.position = left_end;
@@ -844,6 +850,10 @@ impl<'a> Parser<'a> {
 enum ComparisonOperator {
     Equal,
     NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
 }
 
 impl ComparisonOperator {
@@ -851,13 +861,23 @@ impl ComparisonOperator {
         match self {
             Self::Equal => "=",
             Self::NotEqual => "<>",
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterThanOrEqual => ">=",
         }
     }
 
-    fn apply(self, equal: bool) -> bool {
+    fn apply(self, ordering: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
         match self {
-            Self::Equal => equal,
-            Self::NotEqual => !equal,
+            Self::Equal => ordering == Equal,
+            Self::NotEqual => ordering != Equal,
+            Self::LessThan => ordering == Less,
+            Self::LessThanOrEqual => matches!(ordering, Less | Equal),
+            Self::GreaterThan => ordering == Greater,
+            Self::GreaterThanOrEqual => matches!(ordering, Greater | Equal),
         }
     }
 }
@@ -867,12 +887,14 @@ fn compare_scalars(
     right: ScalarValue,
     operator: ComparisonOperator,
 ) -> Result<ScalarValue, String> {
-    let equal = match (left, right) {
+    let ordering = match (left, right) {
         (ScalarValue::Null, _) | (_, ScalarValue::Null) => return Ok(ScalarValue::Null),
-        (ScalarValue::Integer(left), ScalarValue::Integer(right)) => left == right,
-        (ScalarValue::Float(left), ScalarValue::Float(right)) => left == right,
-        (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left == right,
-        (ScalarValue::String(left), ScalarValue::String(right)) => left == right,
+        (ScalarValue::Integer(left), ScalarValue::Integer(right)) => left.cmp(&right),
+        (ScalarValue::Float(left), ScalarValue::Float(right)) => left
+            .partial_cmp(&right)
+            .expect("SQL float literals are finite"),
+        (ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left.cmp(&right),
+        (ScalarValue::String(left), ScalarValue::String(right)) => left.cmp(&right),
         (left, right) => {
             return Err(format!(
                 "operator '{}' cannot compare {} and {}",
@@ -883,7 +905,7 @@ fn compare_scalars(
         }
     };
 
-    Ok(ScalarValue::Boolean(operator.apply(equal)))
+    Ok(ScalarValue::Boolean(operator.apply(ordering)))
 }
 
 fn scalar_type_name(value: &ScalarValue) -> &'static str {
@@ -940,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_comparison_truth_tables() {
+    fn evaluates_equality_truth_tables() {
         let results = parse_sql_batch(
             "SELECT 2 = 2; SELECT 2 <> 2; SELECT 2 = 3; SELECT 2 <> 3; \
              SELECT 1.5 = 1.5; SELECT 1.5 <> 2.5; \
@@ -975,10 +997,70 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_relational_comparison_truth_tables() {
+        let results = parse_sql_batch(
+            "SELECT 1 < 2; SELECT 2 < 2; SELECT 2 <= 2; SELECT 3 <= 2; \
+             SELECT 3 > 2; SELECT 2 > 2; SELECT 2 >= 2; SELECT 1 >= 2; \
+             SELECT -1.5 < 0.5; SELECT 2.5 <= 2.5; SELECT 3.5 > 2.5; SELECT 3.5 >= 4.5; \
+             SELECT FALSE < TRUE; SELECT TRUE <= TRUE; SELECT TRUE > FALSE; SELECT FALSE >= TRUE; \
+             SELECT 'alpha' < 'beta'; SELECT 'same' <= 'same'; \
+             SELECT 'zulu' > 'alpha'; SELECT 'alpha' >= 'zulu';",
+        )
+        .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| &result.value)
+                .collect::<Vec<_>>(),
+            vec![
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(true),
+                &ScalarValue::Boolean(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn relational_comparisons_propagate_null() {
+        let results = parse_sql_batch(
+            "SELECT NULL < 1; SELECT 1 <= NULL; SELECT NULL > NULL; SELECT 'x' >= NULL;",
+        )
+        .unwrap();
+
+        assert!(
+            results
+                .iter()
+                .all(|result| result.value == ScalarValue::Null)
+        );
+    }
+
+    #[test]
     fn reports_mixed_comparison_types_at_the_operator() {
         for (sql, operator, left_type, right_type) in [
             ("SELECT 1 = 1.0;", "=", "Integer", "Float"),
             ("SELECT FALSE <> 'false';", "<>", "Boolean", "String"),
+            ("SELECT 1 < 1.0;", "<", "Integer", "Float"),
+            ("SELECT 1.0 <= 1;", "<=", "Float", "Integer"),
+            ("SELECT TRUE > 0;", ">", "Boolean", "Integer"),
+            ("SELECT '1' >= 1;", ">=", "String", "Integer"),
         ] {
             let error = parse_sql_batch(sql).unwrap_err();
 
@@ -997,20 +1079,31 @@ mod tests {
 
     #[test]
     fn accepts_one_compact_comparison_and_rejects_a_second_operator() {
-        let result = parse_sql_batch("SELECT 1=1;").unwrap();
-        assert_eq!(result[0].header, "1=1");
-        assert_eq!(result[0].value, ScalarValue::Boolean(true));
-
-        let sql = "SELECT 1 = 1 <> 2;";
-        let error = parse_sql_batch(sql).unwrap_err();
-        assert_eq!(error.line(), 1);
-        assert_eq!(error.column(), sql.find("<>").unwrap() + 1);
-        assert_eq!(
-            error.kind(),
-            &SqlErrorKind::Syntax {
-                message: "expected ';' after SELECT statement".into(),
-            }
+        let results =
+            parse_sql_batch("SELECT 1=1; SELECT 1<2; SELECT 2<=2; SELECT 3>2; SELECT 3>=3;")
+                .unwrap();
+        assert_eq!(results[1].header, "1<2");
+        assert!(
+            results
+                .iter()
+                .all(|result| result.value == ScalarValue::Boolean(true))
         );
+
+        for (sql, second_operator) in [
+            ("SELECT 1 = 1 <> 2;", "<>"),
+            ("SELECT 1 < 2 < 3;", "< 3"),
+            ("SELECT 1 <= 2 >= 1;", ">="),
+        ] {
+            let error = parse_sql_batch(sql).unwrap_err();
+            assert_eq!(error.line(), 1);
+            assert_eq!(error.column(), sql.find(second_operator).unwrap() + 1);
+            assert_eq!(
+                error.kind(),
+                &SqlErrorKind::Syntax {
+                    message: "expected ';' after SELECT statement".into(),
+                }
+            );
+        }
     }
 
     #[test]
