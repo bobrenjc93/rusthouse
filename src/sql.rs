@@ -5,7 +5,7 @@ use std::fmt;
 
 pub use crate::{DataType, Value};
 
-/// Maximum SQL statement size accepted by [`parse_create_table`], in bytes.
+/// Maximum SQL statement size accepted by the SQL parsers, in bytes.
 pub const MAX_SQL_BYTES: usize = 64 * 1024;
 
 /// Maximum number of columns accepted by [`parse_create_table`].
@@ -56,6 +56,20 @@ impl Default for InsertParseLimits {
     }
 }
 
+/// Resource limits applied while parsing a SELECT statement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectParseLimits {
+    pub max_sql_bytes: usize,
+}
+
+impl Default for SelectParseLimits {
+    fn default() -> Self {
+        Self {
+            max_sql_bytes: MAX_SQL_BYTES,
+        }
+    }
+}
+
 /// One named, typed column in a `CREATE TABLE` statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnDefinition {
@@ -80,6 +94,12 @@ pub struct InsertStatement {
     pub table_name: String,
     /// Rows and their values in statement order.
     pub rows: Vec<Vec<Value>>,
+}
+
+/// The typed result of parsing one `SELECT * FROM ...` statement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectStatement {
+    pub table_name: String,
 }
 
 /// A typed SQL parse failure.
@@ -245,7 +265,7 @@ pub fn parse_create_table_with_limits(
 ) -> Result<CreateTableStatement, ParseError> {
     enforce_sql_size(sql, limits.max_sql_bytes)?;
 
-    Parser::new(sql, limits.max_columns).parse()
+    Parser::new(sql).parse_create_table(limits.max_columns)
 }
 
 /// Parses one bounded `INSERT INTO ... VALUES` statement using the default
@@ -282,6 +302,36 @@ pub fn parse_insert_with_limits(
 ) -> Result<InsertStatement, ParseError> {
     enforce_sql_size(sql, limits.max_sql_bytes)?;
     InsertParser::new(sql, limits).parse()
+}
+
+/// Parses one bounded `SELECT * FROM <table>` statement using the default
+/// limits.
+///
+/// Keywords are ASCII case-insensitive. Identifiers consist of an ASCII
+/// letter or underscore followed by ASCII letters, digits, or underscores.
+/// One optional trailing semicolon is accepted.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::sql::parse_select;
+///
+/// let statement = parse_select("SELECT * FROM readings;")?;
+/// assert_eq!(statement.table_name, "readings");
+/// # Ok::<(), rusthouse::sql::ParseError>(())
+/// ```
+pub fn parse_select(sql: &str) -> Result<SelectStatement, ParseError> {
+    parse_select_with_limits(sql, SelectParseLimits::default())
+}
+
+/// Parses one `SELECT * FROM <table>` statement using caller-provided
+/// resource limits.
+pub fn parse_select_with_limits(
+    sql: &str,
+    limits: SelectParseLimits,
+) -> Result<SelectStatement, ParseError> {
+    enforce_sql_size(sql, limits.max_sql_bytes)?;
+    Parser::new(sql).parse_select()
 }
 
 fn enforce_sql_size(sql: &str, max_bytes: usize) -> Result<(), ParseError> {
@@ -380,32 +430,33 @@ struct Parser<'a> {
     sql: &'a str,
     lexer: Lexer<'a>,
     lookahead: Option<Option<Token>>,
-    max_columns: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(sql: &'a str, max_columns: usize) -> Self {
+    fn new(sql: &'a str) -> Self {
         Self {
             sql,
             lexer: Lexer::new(sql),
             lookahead: None,
-            max_columns,
         }
     }
 
-    fn parse(mut self) -> Result<CreateTableStatement, ParseError> {
+    fn parse_create_table(
+        mut self,
+        max_columns: usize,
+    ) -> Result<CreateTableStatement, ParseError> {
         self.expect_keyword("CREATE")?;
         self.expect_keyword("TABLE")?;
         let table_name = self.expect_identifier("table name")?;
         self.expect_kind(TokenKind::LeftParenthesis, "'('")?;
 
-        let mut columns = Vec::with_capacity(self.max_columns.min(16));
+        let mut columns = Vec::with_capacity(max_columns.min(16));
         loop {
             let column_token = self.expect_word("column name")?;
-            if columns.len() == self.max_columns {
+            if columns.len() == max_columns {
                 return Err(ParseError::TooManyColumns {
                     position: column_token.start,
-                    max_columns: self.max_columns,
+                    max_columns,
                 });
             }
 
@@ -434,26 +485,22 @@ impl<'a> Parser<'a> {
             }
         }
 
-        match self.next() {
-            None => {}
-            Some(token) if token.kind == TokenKind::Semicolon => {
-                if let Some(trailing) = self.next() {
-                    return Err(ParseError::TrailingInput {
-                        position: trailing.start,
-                    });
-                }
-            }
-            Some(token) => {
-                return Err(ParseError::TrailingInput {
-                    position: token.start,
-                });
-            }
-        }
+        self.finish_statement()?;
 
         Ok(CreateTableStatement {
             table_name,
             columns,
         })
+    }
+
+    fn parse_select(mut self) -> Result<SelectStatement, ParseError> {
+        self.expect_keyword("SELECT")?;
+        self.expect_text("*", "'*'")?;
+        self.expect_keyword("FROM")?;
+        let table_name = self.expect_identifier("table name")?;
+        self.finish_statement()?;
+
+        Ok(SelectStatement { table_name })
     }
 
     fn expect_keyword(&mut self, keyword: &'static str) -> Result<(), ParseError> {
@@ -491,6 +538,33 @@ impl<'a> Parser<'a> {
         match token {
             Some(token) if token.kind == kind => Ok(token),
             token => Err(self.syntax_error(expected, token)),
+        }
+    }
+
+    fn expect_text(
+        &mut self,
+        expected_text: &str,
+        expected: &'static str,
+    ) -> Result<Token, ParseError> {
+        let token = self.next();
+        match token {
+            Some(token) if self.token_text(token) == expected_text => Ok(token),
+            token => Err(self.syntax_error(expected, token)),
+        }
+    }
+
+    fn finish_statement(&mut self) -> Result<(), ParseError> {
+        match self.next() {
+            None => Ok(()),
+            Some(token) if token.kind == TokenKind::Semicolon => match self.next() {
+                None => Ok(()),
+                Some(trailing) => Err(ParseError::TrailingInput {
+                    position: trailing.start,
+                }),
+            },
+            Some(token) => Err(ParseError::TrailingInput {
+                position: token.start,
+            }),
         }
     }
 
