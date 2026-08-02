@@ -19,6 +19,10 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Current storage API
+
+The crate provides an in-memory `Table` backed by distinct typed column vectors. A validated `Schema` fixes column order and types, and `Table::insert_rows` atomically validates and inserts batches of up to 65,536 rows. Invalid row widths, type mismatches, non-finite floats, and oversized batches return structured errors without changing the table.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
@@ -28,4 +32,47 @@ cargo test
 cargo run -- --help
 ```
 
+## Quality gate
+
+The repository pins its Rust toolchain in `rust-toolchain.toml`. Run the same
+checks enforced by CI with:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo test --doc --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --locked
+```
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+## Current SQL surface
+
+The library currently executes one bounded `CREATE TABLE` statement per call
+and retains its typed schema in memory:
+
+```rust
+use rusthouse::{DataType, Database};
+
+let mut database = Database::new();
+database.execute(
+    "CREATE TABLE events (id Int64, score Float64, active Bool, label String)",
+)?;
+
+let events = database.catalog().table("events").expect("table exists");
+assert_eq!(events.column("id").expect("column exists").data_type(), DataType::Int64);
+# Ok::<(), rusthouse::Error>(())
+```
+
+SQL keywords and the four type names are case-insensitive. By default, an
+input may contain at most 1 MiB and a table may contain at most 1,024 columns;
+both limits can be changed with `DatabaseConfig`.
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->
