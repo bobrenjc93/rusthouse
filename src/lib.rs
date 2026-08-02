@@ -1,8 +1,8 @@
 //! RustHouse is an experimental, compact analytical database.
 //!
 //! [`Database`] is the public entry point for executing SQL. The current SQL
-//! surface is deliberately small and supports one `CREATE TABLE` statement per
-//! call.
+//! surface is deliberately small and supports one `CREATE TABLE` or multi-row
+//! `INSERT INTO ... VALUES` statement per call.
 
 pub mod catalog;
 mod database;

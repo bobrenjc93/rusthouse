@@ -1,4 +1,4 @@
-use crate::{Catalog, Error, Result, TableSchema, sql};
+use crate::{Catalog, Error, MAX_BATCH_ROWS, Result, Table, TableSchema, sql};
 
 /// Default maximum size of one SQL statement, in UTF-8 bytes.
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -60,9 +60,16 @@ impl Database {
         &self.catalog
     }
 
-    /// Parse and execute exactly one `CREATE TABLE` statement.
+    /// Find a table's typed columnar data using a case-insensitive name.
+    #[must_use]
+    pub fn table(&self, name: &str) -> Option<&Table> {
+        self.catalog.table_data(name)
+    }
+
+    /// Parse and execute exactly one supported SQL statement.
     ///
-    /// Parsing and schema validation finish before the catalog is mutated.
+    /// Insertion batches are bounded and fully validated before any row is
+    /// committed to typed storage.
     pub fn execute(&mut self, input: &str) -> Result<()> {
         let input_bytes = input.len();
         if input_bytes > self.config.max_input_bytes {
@@ -72,10 +79,19 @@ impl Database {
             });
         }
 
-        let statement = sql::parse_create_table(input, self.config.max_columns_per_table)?;
-        let (name, columns) = statement.into_parts();
-        let schema = TableSchema::new(name, columns)?;
-        self.catalog.register(schema)
+        let statement =
+            sql::parse_statement(input, self.config.max_columns_per_table, MAX_BATCH_ROWS)?;
+        match statement {
+            sql::Statement::CreateTable(statement) => {
+                let (name, columns) = statement.into_parts();
+                let schema = TableSchema::new(name, columns)?;
+                self.catalog.register(schema)
+            }
+            sql::Statement::Insert(statement) => {
+                let (table_name, rows) = statement.into_parts();
+                self.catalog.insert_rows(&table_name, rows)
+            }
+        }
     }
 }
 

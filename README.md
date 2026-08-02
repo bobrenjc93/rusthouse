@@ -49,8 +49,8 @@ The repository begins as a deliberately tiny seed. Substantial functionality sho
 
 ## Current SQL surface
 
-The library currently executes one bounded `CREATE TABLE` statement per call
-and retains its typed schema in memory:
+The library executes one bounded `CREATE TABLE` or `INSERT INTO ... VALUES`
+statement per call and retains typed schemas and columnar data in memory:
 
 ```rust
 use rusthouse::{DataType, Database};
@@ -59,15 +59,22 @@ let mut database = Database::new();
 database.execute(
     "CREATE TABLE events (id Int64, score Float64, active Bool, label String)",
 )?;
+database.execute(
+    "INSERT INTO events VALUES (1, 9.5, true, 'first'), (2, -3.0, false, 'O''Brien')",
+)?;
 
 let events = database.catalog().table("events").expect("table exists");
 assert_eq!(events.column("id").expect("column exists").data_type(), DataType::Int64);
+assert_eq!(database.table("events").expect("data exists").row_count(), 2);
 # Ok::<(), rusthouse::Error>(())
 ```
 
 SQL keywords and the four type names are case-insensitive. By default, an
 input may contain at most 1 MiB and a table may contain at most 1,024 columns;
-both limits can be changed with `DatabaseConfig`.
+both limits can be changed with `DatabaseConfig`. Insertions accept signed
+`Int64` values, finite `Float64` values, booleans, and single-quoted strings;
+write a quote inside a string as `''`. A batch contains at most 65,536 rows and
+is committed only after every row matches the target schema.
 
 <!-- burner-progress:start -->
 ## Burner evaluation progress

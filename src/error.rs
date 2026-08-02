@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::storage::InsertError;
+
 /// An error returned while parsing or executing SQL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -15,6 +17,10 @@ pub enum Error {
     DuplicateColumn { name: String },
     /// The catalog already contains the case-insensitive table name.
     TableAlreadyExists { name: String },
+    /// An insertion targeted a table that is not registered.
+    TableNotFound { name: String },
+    /// A parsed insertion batch did not match its target table.
+    Insert(InsertError),
 }
 
 /// A result returned by RustHouse operations.
@@ -43,8 +49,16 @@ impl fmt::Display for Error {
             Self::TableAlreadyExists { name } => {
                 write!(formatter, "table {name:?} already exists")
             }
+            Self::TableNotFound { name } => write!(formatter, "table {name:?} does not exist"),
+            Self::Insert(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<InsertError> for Error {
+    fn from(error: InsertError) -> Self {
+        Self::Insert(error)
+    }
+}
