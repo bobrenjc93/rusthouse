@@ -3,6 +3,16 @@ use std::process::{Command, Output, Stdio};
 
 use rusthouse::MAX_QUERY_BYTES;
 
+#[cfg(unix)]
+fn closed_output() -> Stdio {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let (output, peer) = UnixStream::pair().unwrap();
+    drop(peer);
+    Stdio::from(OwnedFd::from(output))
+}
+
 fn run(arguments: &[&str], input: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(arguments)
@@ -34,15 +44,9 @@ fn help_succeeds() {
 #[cfg(unix)]
 #[test]
 fn help_reports_closed_stdout_without_panicking() {
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixStream;
-
-    let (stdout, peer) = UnixStream::pair().unwrap();
-    drop(peer);
-
     let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .arg("--help")
-        .stdout(Stdio::from(OwnedFd::from(stdout)))
+        .stdout(closed_output())
         .stderr(Stdio::piped())
         .output()
         .unwrap();
@@ -54,6 +58,22 @@ fn help_reports_closed_stdout_without_panicking() {
         "{stderr}"
     );
     assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn errors_preserve_exit_codes_when_stderr_is_closed() {
+    for (arguments, expected_code) in [(&[][..], 1), (&["--unknown"][..], 2)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(closed_output())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(expected_code));
+    }
 }
 
 #[test]

@@ -22,8 +22,10 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("rusthouse: {error}");
-            error.exit_code()
+            let exit_code = error.exit_code();
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "rusthouse: {error}");
+            exit_code
         }
     }
 }
