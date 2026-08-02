@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::catalog::{Catalog, TableNotFoundError};
 use crate::lexer::{Delimiter, LexError, LexerLimits, Literal, Operator, Token, TokenKind, lex};
-use crate::storage::{Column, ColumnSchema, Table, Value};
+use crate::storage::{Column, ColumnSchema, DataType, Table, Value};
 
 /// Maximum estimated heap allocation for one materialized table projection.
 pub const MAX_TABLE_SELECT_RESULT_BYTES: usize = 64 * 1024 * 1024;
@@ -156,7 +156,7 @@ impl TableSelectResult {
     }
 }
 
-/// A column requested by a projection does not exist in its source table.
+/// A column requested by a projection or predicate does not exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnNotFoundError {
     /// The exact table name resolved by the query.
@@ -194,10 +194,38 @@ pub enum TableSelectError {
         /// Zero-based byte position at which the extra statement begins.
         position: usize,
     },
+    /// An integer predicate literal is outside the supported `Int64` range.
+    InvalidInt64 {
+        /// The rejected source spelling.
+        literal: String,
+        /// Zero-based byte position of the literal.
+        position: usize,
+    },
+    /// A float predicate literal cannot be represented by a finite `Float64`.
+    InvalidFloat64 {
+        /// The rejected source spelling.
+        literal: String,
+        /// Zero-based byte position of the literal.
+        position: usize,
+    },
+    /// `NULL` is recognized lexically but is not supported by storage.
+    UnsupportedNull {
+        /// Zero-based byte position of the literal.
+        position: usize,
+    },
     /// The source table is not present in the catalog.
     TableNotFound(TableNotFoundError),
-    /// A projected column is not present in the source table.
+    /// A projected or predicate column is not present in the source table.
     ColumnNotFound(ColumnNotFoundError),
+    /// A predicate literal does not exactly match its column's logical type.
+    PredicateTypeMismatch {
+        /// The predicate column name exactly as parsed.
+        column_name: String,
+        /// The logical type required by the predicate column.
+        expected: DataType,
+        /// The logical type inferred from the predicate literal.
+        actual: DataType,
+    },
     /// Materializing the complete result would exceed the memory budget.
     ResultSizeLimitExceeded {
         /// Estimated bytes required by the materialized headers and rows.
@@ -221,8 +249,28 @@ impl fmt::Display for TableSelectError {
                 formatter,
                 "SQL parse error at byte {position}: only one statement is allowed"
             ),
+            Self::InvalidInt64 { literal, position } => write!(
+                formatter,
+                "SQL parse error at byte {position}: integer literal `{literal}` is outside the Int64 range"
+            ),
+            Self::InvalidFloat64 { literal, position } => write!(
+                formatter,
+                "SQL parse error at byte {position}: float literal `{literal}` is not a finite Float64"
+            ),
+            Self::UnsupportedNull { position } => write!(
+                formatter,
+                "SQL parse error at byte {position}: NULL literals are not supported"
+            ),
             Self::TableNotFound(error) => error.fmt(formatter),
             Self::ColumnNotFound(error) => error.fmt(formatter),
+            Self::PredicateTypeMismatch {
+                column_name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "predicate column `{column_name}` has type {expected}, but the literal has type {actual}"
+            ),
             Self::ResultSizeLimitExceeded {
                 estimated_bytes,
                 limit,
@@ -257,11 +305,13 @@ impl From<TableNotFoundError> for TableSelectError {
     }
 }
 
-/// Executes `SELECT column [, column ...] FROM table` against a catalog.
+/// Executes `SELECT column [, column ...] FROM table [WHERE column = literal]`.
 ///
 /// One optional trailing semicolon is accepted. Names are resolved exactly
 /// and case-sensitively, matching the catalog and schema storage boundaries.
-/// All requested columns are resolved before any result rows are materialized.
+/// Projection and predicate columns are resolved independently before any
+/// result rows are materialized. Predicate literals require an exact logical
+/// type match; numeric coercions are not performed.
 pub fn execute_table_select(
     catalog: &Catalog,
     input: &str,
@@ -280,7 +330,7 @@ pub fn execute_table_select(
     for column_name in &projection.column_names {
         let Some(column_index) = column_indices.get(column_name.as_str()).copied() else {
             return Err(TableSelectError::ColumnNotFound(ColumnNotFoundError {
-                table_name: projection.table_name,
+                table_name: projection.table_name.clone(),
                 column_name: column_name.clone(),
             }));
         };
@@ -297,11 +347,49 @@ pub fn execute_table_select(
         });
     }
 
-    enforce_result_size_limit(table, &columns, MAX_TABLE_SELECT_RESULT_BYTES)?;
+    let predicate = if let Some(predicate) = projection.predicate {
+        let Some(column_index) = column_indices.get(predicate.column_name.as_str()).copied() else {
+            return Err(TableSelectError::ColumnNotFound(ColumnNotFoundError {
+                table_name: projection.table_name.clone(),
+                column_name: predicate.column_name,
+            }));
+        };
+        let column_type = table
+            .schema()
+            .column(column_index)
+            .expect("resolved predicate column index remains valid")
+            .data_type();
+        let literal_type = predicate.value.data_type();
+        if column_type != literal_type {
+            return Err(TableSelectError::PredicateTypeMismatch {
+                column_name: predicate.column_name,
+                expected: column_type,
+                actual: literal_type,
+            });
+        }
+        Some(ResolvedPredicate {
+            values: table
+                .column(column_index)
+                .expect("table columns correspond to schema columns"),
+            value: predicate.value,
+        })
+    } else {
+        None
+    };
+
+    let matching_row_count = enforce_result_size_limit(
+        table,
+        &columns,
+        predicate.as_ref(),
+        MAX_TABLE_SELECT_RESULT_BYTES,
+    )?;
 
     let headers = columns.iter().map(|column| column.schema.clone()).collect();
-    let mut rows = Vec::with_capacity(table.row_count());
+    let mut rows = Vec::with_capacity(matching_row_count);
     for row_index in 0..table.row_count() {
+        if !matches_predicate(predicate.as_ref(), row_index) {
+            continue;
+        }
         rows.push(
             columns
                 .iter()
@@ -319,23 +407,33 @@ struct ResolvedColumn<'a> {
     values: &'a Column,
 }
 
+struct ResolvedPredicate<'a> {
+    values: &'a Column,
+    value: Value,
+}
+
 fn enforce_result_size_limit(
     table: &Table,
     columns: &[ResolvedColumn<'_>],
+    predicate: Option<&ResolvedPredicate<'_>>,
     limit: usize,
-) -> Result<(), TableSelectError> {
-    let estimated_bytes = estimate_result_bytes(table, columns);
+) -> Result<usize, TableSelectError> {
+    let (estimated_bytes, matching_row_count) = estimate_result_bytes(table, columns, predicate);
     if estimated_bytes > limit {
         Err(TableSelectError::ResultSizeLimitExceeded {
             estimated_bytes,
             limit,
         })
     } else {
-        Ok(())
+        Ok(matching_row_count)
     }
 }
 
-fn estimate_result_bytes(table: &Table, columns: &[ResolvedColumn<'_>]) -> usize {
+fn estimate_result_bytes(
+    table: &Table,
+    columns: &[ResolvedColumn<'_>],
+    predicate: Option<&ResolvedPredicate<'_>>,
+) -> (usize, usize) {
     let header_bytes = columns
         .len()
         .saturating_mul(std::mem::size_of::<ColumnSchema>())
@@ -345,40 +443,49 @@ fn estimate_result_bytes(table: &Table, columns: &[ResolvedColumn<'_>]) -> usize
                 .map(|column| column.schema.name().len())
                 .fold(0usize, usize::saturating_add),
         );
-    let row_vector_bytes = table
-        .row_count()
-        .saturating_mul(std::mem::size_of::<Vec<Value>>());
-    let row_value_bytes = table
-        .row_count()
+    let mut matching_row_count = 0usize;
+    let mut string_payload_bytes = 0usize;
+    let mut projected_string_columns = HashMap::<usize, (&[String], usize)>::new();
+    for column in columns {
+        if let Column::String(values) = column.values {
+            let (_, occurrences) = projected_string_columns
+                .entry(column.index)
+                .or_insert((values, 0));
+            *occurrences = occurrences.saturating_add(1);
+        }
+    }
+    for row_index in 0..table.row_count() {
+        if !matches_predicate(predicate, row_index) {
+            continue;
+        }
+        matching_row_count = matching_row_count.saturating_add(1);
+        for (values, occurrences) in projected_string_columns.values() {
+            string_payload_bytes = string_payload_bytes
+                .saturating_add(values[row_index].len().saturating_mul(*occurrences));
+        }
+    }
+
+    let row_vector_bytes = matching_row_count.saturating_mul(std::mem::size_of::<Vec<Value>>());
+    let row_value_bytes = matching_row_count
         .saturating_mul(columns.len())
         .saturating_mul(std::mem::size_of::<Value>());
 
-    let mut string_bytes_by_column = HashMap::new();
-    let string_payload_bytes = columns.iter().fold(0usize, |total, column| {
-        let bytes = *string_bytes_by_column
-            .entry(column.index)
-            .or_insert_with(|| {
-                let bytes = match column.values {
-                    Column::String(values) => values
-                        .iter()
-                        .map(String::len)
-                        .fold(0usize, usize::saturating_add),
-                    _ => 0,
-                };
-                bytes
-            });
-        total.saturating_add(bytes)
-    });
-
-    header_bytes
+    let estimated_bytes = header_bytes
         .saturating_add(row_vector_bytes)
         .saturating_add(row_value_bytes)
-        .saturating_add(string_payload_bytes)
+        .saturating_add(string_payload_bytes);
+    (estimated_bytes, matching_row_count)
 }
 
 struct TableProjection {
     column_names: Vec<String>,
     table_name: String,
+    predicate: Option<EqualityPredicate>,
+}
+
+struct EqualityPredicate {
+    column_name: String,
+    value: Value,
 }
 
 fn parse_table_select(input: &str) -> Result<TableProjection, TableSelectError> {
@@ -392,11 +499,20 @@ fn parse_table_select(input: &str) -> Result<TableProjection, TableSelectError> 
     }
     cursor.expect_keyword("FROM", "`,` or FROM")?;
     let table_name = cursor.take_identifier("a table name after FROM")?;
+    let predicate = if cursor.take_keyword("WHERE") {
+        let column_name = cursor.take_identifier("a column name after WHERE")?;
+        cursor.expect_operator(Operator::Equal, "`=` after the predicate column")?;
+        let value = cursor.take_predicate_value()?;
+        Some(EqualityPredicate { column_name, value })
+    } else {
+        None
+    };
     cursor.finish()?;
 
     Ok(TableProjection {
         column_names,
         table_name,
+        predicate,
     })
 }
 
@@ -406,6 +522,20 @@ fn value_at(column: &Column, row_index: usize) -> Value {
         Column::Float64(values) => Value::Float64(values[row_index]),
         Column::Bool(values) => Value::Bool(values[row_index]),
         Column::String(values) => Value::String(values[row_index].clone()),
+    }
+}
+
+fn matches_predicate(predicate: Option<&ResolvedPredicate<'_>>, row_index: usize) -> bool {
+    let Some(predicate) = predicate else {
+        return true;
+    };
+
+    match (predicate.values, &predicate.value) {
+        (Column::Int64(values), Value::Int64(value)) => values[row_index] == *value,
+        (Column::Float64(values), Value::Float64(value)) => values[row_index] == *value,
+        (Column::Bool(values), Value::Bool(value)) => values[row_index] == *value,
+        (Column::String(values), Value::String(value)) => values[row_index] == *value,
+        _ => unreachable!("predicate type is validated before scanning rows"),
     }
 }
 
@@ -458,6 +588,18 @@ impl<'a> TableSelectCursor<'a> {
         }
     }
 
+    fn take_keyword(&mut self, keyword: &str) -> bool {
+        if matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Identifier(identifier)) if identifier.eq_ignore_ascii_case(keyword)
+        ) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn take_identifier(&mut self, expected: &'static str) -> Result<String, TableSelectError> {
         let token = self
             .tokens
@@ -492,6 +634,42 @@ impl<'a> TableSelectCursor<'a> {
         }
     }
 
+    fn expect_operator(
+        &mut self,
+        operator: Operator,
+        expected: &'static str,
+    ) -> Result<(), TableSelectError> {
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax(expected))?;
+        if token.kind == TokenKind::Operator(operator) {
+            self.index += 1;
+            Ok(())
+        } else {
+            Err(TableSelectError::Syntax {
+                position: token.span.start,
+                expected,
+            })
+        }
+    }
+
+    fn take_predicate_value(&mut self) -> Result<Value, TableSelectError> {
+        let sign = match self.tokens.get(self.index).map(|token| &token.kind) {
+            Some(TokenKind::Operator(operator @ (Operator::Plus | Operator::Minus))) => {
+                self.index += 1;
+                Some(*operator)
+            }
+            _ => None,
+        };
+        let token = self
+            .tokens
+            .get(self.index)
+            .ok_or_else(|| self.syntax("an Int64, Float64, Bool, or String literal"))?;
+        self.index += 1;
+        parse_predicate_value(token, sign)
+    }
+
     fn finish(&mut self) -> Result<(), TableSelectError> {
         if matches!(
             self.tokens.get(self.index).map(|token| &token.kind),
@@ -508,6 +686,27 @@ impl<'a> TableSelectCursor<'a> {
         }
         Ok(())
     }
+}
+
+fn parse_predicate_value(token: &Token, sign: Option<Operator>) -> Result<Value, TableSelectError> {
+    parse_value(token, sign).map_err(|error| match error {
+        ScalarSelectError::Lex(error) => TableSelectError::Lex(error),
+        ScalarSelectError::Syntax { position, expected } => {
+            TableSelectError::Syntax { position, expected }
+        }
+        ScalarSelectError::MultipleStatements { position } => {
+            TableSelectError::MultipleStatements { position }
+        }
+        ScalarSelectError::InvalidInt64 { literal, position } => {
+            TableSelectError::InvalidInt64 { literal, position }
+        }
+        ScalarSelectError::InvalidFloat64 { literal, position } => {
+            TableSelectError::InvalidFloat64 { literal, position }
+        }
+        ScalarSelectError::UnsupportedNull { position } => {
+            TableSelectError::UnsupportedNull { position }
+        }
+    })
 }
 
 /// Parses one `SELECT <literal> [AS identifier]` statement.
@@ -751,14 +950,14 @@ mod tests {
             schema: table.schema().column(0).unwrap(),
             values: table.column(0).unwrap(),
         }];
-        let estimated_bytes = estimate_result_bytes(&table, &columns);
+        let estimated_bytes = estimate_result_bytes(&table, &columns, None).0;
 
         assert_eq!(
-            enforce_result_size_limit(&table, &columns, estimated_bytes),
-            Ok(())
+            enforce_result_size_limit(&table, &columns, None, estimated_bytes),
+            Ok(1)
         );
         assert_eq!(
-            enforce_result_size_limit(&table, &columns, estimated_bytes - 1),
+            enforce_result_size_limit(&table, &columns, None, estimated_bytes - 1),
             Err(TableSelectError::ResultSizeLimitExceeded {
                 estimated_bytes,
                 limit: estimated_bytes - 1,

@@ -26,6 +26,7 @@ fn executes_create_insert_and_select_and_emits_selects_in_order() {
             INSERT INTO events VALUES (1, 9.5, true, 'first');
             INSERT INTO events VALUES (2, -3.25, false, 'second');
             SELECT label, id, active, score FROM events;
+            SELECT label FROM events WHERE active = false;
             SELECT 42 AS answer;
         "#,
     );
@@ -41,6 +42,8 @@ fn executes_create_insert_and_select_and_emits_selects_in_order() {
             "\"label\",\"id\",\"active\",\"score\"\n",
             "\"first\",\"1\",\"true\",\"9.5\"\n",
             "\"second\",\"2\",\"false\",\"-3.25\"\n",
+            "\"label\"\n",
+            "\"second\"\n",
             "\"answer\"\n",
             "\"42\"\n",
         )
