@@ -21,12 +21,14 @@ The early implementation should favor Rust's standard library and a small depend
 
 ## Current CLI
 
-The CLI executes one bounded scalar query from standard input. The supported
-shape is `SELECT <Int64|Float64|Bool|String literal> [AS identifier]`, with an
-optional trailing semicolon, and output is ClickHouse-style `CSVWithNames`.
+The CLI executes a bounded, semicolon-delimited SQL script from standard input.
+It supports the current `CREATE TABLE`, one-row `INSERT INTO ... VALUES`, scalar
+`SELECT`, and table projection `SELECT` shapes. Each SELECT is emitted in source
+order as ClickHouse-style `CSVWithNames`; command statements emit nothing.
 
 ```bash
-printf "SELECT 42 AS answer\n" | cargo run -- --format csv
+printf "CREATE TABLE t (id Int64); INSERT INTO t VALUES (42); SELECT id FROM t;\n" \
+  | cargo run -- --format csv
 ```
 
 ## Library DDL
@@ -35,6 +37,13 @@ The library can create in-memory catalog tables with
 `execute_create_table(&mut catalog, sql)`. The supported DDL shape is exactly
 `CREATE TABLE name (column type [, column type ...])`, using `Int64`,
 `Float64`, `Bool`, or `String`, with an optional trailing semicolon.
+
+## Library DML
+
+The library can insert one typed row into an existing catalog table with
+`execute_insert_values(&mut catalog, sql)`. The supported DML shape is exactly
+`INSERT INTO name VALUES (literal [, literal ...])`, using `Int64`, `Float64`,
+`Bool`, or `String` literals, with an optional trailing semicolon.
 
 ## Development model
 
