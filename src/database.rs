@@ -201,15 +201,23 @@ enum StagedTable {
         delta: Table,
         base_row_count: usize,
         row_limit: usize,
+        base_data_size_bytes: usize,
+        data_byte_limit: usize,
     },
 }
 
 impl StagedTable {
     fn from_existing(table: &Table) -> Self {
         Self::Existing {
-            delta: Table::new(table.schema().clone(), table.row_limit()),
+            delta: Table::with_data_limit(
+                table.schema().clone(),
+                table.row_limit(),
+                table.data_byte_limit(),
+            ),
             base_row_count: table.row_count(),
             row_limit: table.row_limit(),
+            base_data_size_bytes: table.data_size_bytes(),
+            data_byte_limit: table.data_byte_limit(),
         }
     }
 
@@ -220,7 +228,15 @@ impl StagedTable {
                 delta,
                 base_row_count,
                 row_limit,
-            } => delta.append_batch_after([values], *base_row_count, *row_limit),
+                base_data_size_bytes,
+                data_byte_limit,
+            } => delta.append_batch_after(
+                [values],
+                *base_row_count,
+                *row_limit,
+                *base_data_size_bytes,
+                *data_byte_limit,
+            ),
         }
     }
 
@@ -285,4 +301,69 @@ fn build_table(input: &str, definition: CreateTable) -> Result<(String, Table), 
 
 fn normalize_identifier(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DataType, Schema, Value};
+
+    fn byte_bounded_database(with_existing_row: bool) -> (Database, usize) {
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]).unwrap();
+        let row_size = 1 + std::mem::size_of::<i64>();
+        let mut table = Table::with_data_limit(schema, 10, row_size * 2 - 1);
+        if with_existing_row {
+            table.append_batch([[Value::Int64(1)]]).unwrap();
+        }
+
+        let mut database = Database::new();
+        database.tables.insert("bounded".into(), table);
+        (database, row_size)
+    }
+
+    #[test]
+    fn staged_insert_includes_committed_data_in_the_table_budget() {
+        let (mut database, row_size) = byte_bounded_database(true);
+        let before = database.clone();
+
+        let error = database
+            .execute("INSERT INTO bounded VALUES (2);")
+            .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            &SqlErrorKind::InvalidRow {
+                table: "bounded".into(),
+                source: BatchAppendError::TableDataLimitExceeded {
+                    row_index: 0,
+                    attempted: row_size * 2,
+                    limit: row_size * 2 - 1,
+                },
+            }
+        );
+        assert_eq!(database, before);
+    }
+
+    #[test]
+    fn staged_multi_row_insert_reports_the_crossing_batch_row_and_rolls_back() {
+        let (mut database, row_size) = byte_bounded_database(false);
+        let before = database.clone();
+
+        let error = database
+            .execute("INSERT INTO bounded VALUES (1), (2);")
+            .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            &SqlErrorKind::InvalidRow {
+                table: "bounded".into(),
+                source: BatchAppendError::TableDataLimitExceeded {
+                    row_index: 1,
+                    attempted: row_size * 2,
+                    limit: row_size * 2 - 1,
+                },
+            }
+        );
+        assert_eq!(database, before);
+    }
 }

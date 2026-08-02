@@ -1,6 +1,7 @@
 use rusthouse::{
     AppendError, BatchAppendError, Column, DataType, Field, MAX_IDENTIFIER_BYTES,
-    MAX_SCHEMA_FIELDS, MAX_STORED_STRING_BYTES, Schema, SchemaError, Table, Value, ValueType,
+    MAX_SCHEMA_FIELDS, MAX_STORED_STRING_BYTES, MAX_TABLE_DATA_BYTES, Schema, SchemaError, Table,
+    Value, ValueType,
 };
 use std::cell::Cell;
 
@@ -240,6 +241,38 @@ fn named_append_enforces_the_stored_string_boundary_atomically() {
 }
 
 #[test]
+fn named_append_enforces_the_aggregate_data_limit_atomically() {
+    let schema = Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
+    let first = String::from("first");
+    let first_size = 1 + std::mem::size_of::<String>() + first.capacity();
+    let second = String::from("second");
+    let second_size = 1 + std::mem::size_of::<String>() + second.capacity();
+    let mut table = Table::with_data_limit(schema, 10, first_size + second_size - 1);
+
+    table.append_row([("value", Value::String(first))]).unwrap();
+    assert_eq!(table.data_size_bytes(), first_size);
+    let before = table.clone();
+
+    assert_eq!(
+        table.append_row([("value", Value::String(second))]),
+        Err(AppendError::TableDataLimitExceeded {
+            attempted: first_size + second_size,
+            limit: first_size + second_size - 1,
+        })
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn configured_data_limit_cannot_exceed_the_global_bound() {
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]).unwrap();
+    let table = Table::with_data_limit(schema, usize::MAX, usize::MAX);
+
+    assert_eq!(table.data_byte_limit(), MAX_TABLE_DATA_BYTES);
+    assert_eq!(table.data_size_bytes(), 0);
+}
+
+#[test]
 fn positional_batch_counts_multibyte_string_bytes_before_any_mutation() {
     let schema = Schema::new(vec![Field::new("value", DataType::String, false)]).unwrap();
     let mut table = Table::new(schema, 4);
@@ -263,6 +296,24 @@ fn positional_batch_counts_multibyte_string_bytes_before_any_mutation() {
             field: "value".into(),
             length: MAX_STORED_STRING_BYTES + 1,
             limit: MAX_STORED_STRING_BYTES,
+        })
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn positional_batch_rolls_back_when_aggregate_data_limit_is_crossed() {
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]).unwrap();
+    let row_size = 1 + std::mem::size_of::<i64>();
+    let mut table = Table::with_data_limit(schema, 10, row_size * 2 - 1);
+    let before = table.clone();
+
+    assert_eq!(
+        table.append_batch([[Value::Int64(1)], [Value::Int64(2)]]),
+        Err(BatchAppendError::TableDataLimitExceeded {
+            row_index: 1,
+            attempted: row_size * 2,
+            limit: row_size * 2 - 1,
         })
     );
     assert_eq!(table, before);

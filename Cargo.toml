@@ -8,3 +8,6 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+
+[dev-dependencies]
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }

@@ -34,6 +34,13 @@ pub const MAX_IDENTIFIER_BYTES: usize = 256;
 /// Maximum UTF-8 byte length of one stored [`Value::String`].
 pub const MAX_STORED_STRING_BYTES: usize = 1024 * 1024;
 
+/// Hard upper bound for accounted column data retained by one [`Table`].
+///
+/// The 256 MiB budget includes each typed value slot, string allocation
+/// capacity, and one conservative byte per validity bit. Schema metadata and
+/// allocator bookkeeping are not included.
+pub const MAX_TABLE_DATA_BYTES: usize = 256 * 1024 * 1024;
+
 /// A physical value type supported by the storage layer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DataType {
@@ -498,11 +505,23 @@ pub struct Table {
     columns: Vec<Column>,
     row_count: usize,
     row_limit: usize,
+    data_size_bytes: usize,
+    data_byte_limit: usize,
 }
 
 impl Table {
-    /// Creates an empty table that will store at most `row_limit` rows.
+    /// Creates an empty table bounded by `row_limit` and
+    /// [`MAX_TABLE_DATA_BYTES`].
     pub fn new(schema: Schema, row_limit: usize) -> Self {
+        Self::with_data_limit(schema, row_limit, MAX_TABLE_DATA_BYTES)
+    }
+
+    /// Creates an empty table with row and accounted-data bounds.
+    ///
+    /// `data_byte_limit` can lower the global [`MAX_TABLE_DATA_BYTES`] bound but
+    /// cannot raise it. The effective value is available through
+    /// [`Table::data_byte_limit`].
+    pub fn with_data_limit(schema: Schema, row_limit: usize, data_byte_limit: usize) -> Self {
         let columns = schema
             .fields()
             .iter()
@@ -514,6 +533,8 @@ impl Table {
             columns,
             row_count: 0,
             row_limit,
+            data_size_bytes: 0,
+            data_byte_limit: data_byte_limit.min(MAX_TABLE_DATA_BYTES),
         }
     }
 
@@ -611,10 +632,25 @@ impl Table {
             ordered[index] = Some(value);
         }
 
+        let row_data_size = accounted_row_bytes(
+            &self.schema,
+            ordered
+                .iter()
+                .map(|value| value.as_ref().expect("all schema fields were provided")),
+        );
+        let attempted = self.data_size_bytes.saturating_add(row_data_size);
+        if attempted > self.data_byte_limit {
+            return Err(AppendError::TableDataLimitExceeded {
+                attempted,
+                limit: self.data_byte_limit,
+            });
+        }
+
         for (column, value) in self.columns.iter_mut().zip(ordered) {
             column.push_validated(value.expect("all schema fields were provided"));
         }
         self.row_count += 1;
+        self.data_size_bytes = attempted;
         Ok(())
     }
 
@@ -633,7 +669,7 @@ impl Table {
         I: IntoIterator<Item = R>,
         R: IntoIterator<Item = Value>,
     {
-        self.append_batch_after(rows, 0, self.row_limit)
+        self.append_batch_after(rows, 0, self.row_limit, 0, self.data_byte_limit)
     }
 
     pub(crate) fn append_batch_after<I, R>(
@@ -641,6 +677,8 @@ impl Table {
         rows: I,
         base_row_count: usize,
         row_limit: usize,
+        base_data_size_bytes: usize,
+        data_byte_limit: usize,
     ) -> Result<(), BatchAppendError>
     where
         I: IntoIterator<Item = R>,
@@ -651,6 +689,7 @@ impl Table {
         let consumption_limit = remaining.saturating_add(1);
         let value_limit = self.schema.len().saturating_add(1);
         let mut validated_rows = Vec::new();
+        let mut appended_data_size = 0_usize;
 
         for (row_index, row) in rows.into_iter().take(consumption_limit).enumerate() {
             if row_index == remaining {
@@ -694,6 +733,20 @@ impl Table {
                 }
             }
 
+            let row_data_size = accounted_row_bytes(&self.schema, values.iter());
+            let attempted = base_data_size_bytes
+                .saturating_add(self.data_size_bytes)
+                .saturating_add(appended_data_size)
+                .saturating_add(row_data_size);
+            if attempted > data_byte_limit {
+                return Err(BatchAppendError::TableDataLimitExceeded {
+                    row_index,
+                    attempted,
+                    limit: data_byte_limit,
+                });
+            }
+            appended_data_size = appended_data_size.saturating_add(row_data_size);
+
             validated_rows.push(values);
         }
 
@@ -704,17 +757,22 @@ impl Table {
             }
         }
         self.row_count += appended;
+        self.data_size_bytes = self.data_size_bytes.saturating_add(appended_data_size);
         Ok(())
     }
 
     pub(crate) fn append_committed(&mut self, delta: Self) {
         debug_assert_eq!(self.schema, delta.schema);
         debug_assert!(self.row_count.saturating_add(delta.row_count) <= self.row_limit);
+        debug_assert!(
+            self.data_size_bytes.saturating_add(delta.data_size_bytes) <= self.data_byte_limit
+        );
 
         for (column, delta_column) in self.columns.iter_mut().zip(delta.columns) {
             column.append(delta_column);
         }
         self.row_count += delta.row_count;
+        self.data_size_bytes += delta.data_size_bytes;
     }
 
     /// Returns the table schema.
@@ -741,6 +799,39 @@ impl Table {
     pub fn row_limit(&self) -> usize {
         self.row_limit
     }
+
+    /// Returns the accounted bytes retained by typed values and validity data.
+    pub fn data_size_bytes(&self) -> usize {
+        self.data_size_bytes
+    }
+
+    /// Returns the effective accounted-data limit for this table.
+    pub fn data_byte_limit(&self) -> usize {
+        self.data_byte_limit
+    }
+}
+
+fn accounted_row_bytes<'a>(schema: &Schema, values: impl IntoIterator<Item = &'a Value>) -> usize {
+    schema
+        .fields()
+        .iter()
+        .zip(values)
+        .fold(schema.len(), |total, (field, value)| {
+            let slot_bytes = match field.data_type() {
+                DataType::Int64 => std::mem::size_of::<i64>(),
+                DataType::Float64 => std::mem::size_of::<f64>(),
+                DataType::Bool => std::mem::size_of::<bool>(),
+                DataType::String => {
+                    std::mem::size_of::<String>()
+                        + match value {
+                            Value::String(value) => value.capacity(),
+                            Value::Null => 0,
+                            _ => unreachable!("row values are type-checked before accounting"),
+                        }
+                }
+            };
+            total.saturating_add(slot_bytes)
+        })
 }
 
 fn value_matches_type(value: &Value, data_type: DataType) -> bool {
@@ -766,6 +857,13 @@ pub enum AppendError {
     /// The row would exceed the table's configured row bound.
     RowLimitExceeded {
         /// The configured maximum number of rows.
+        limit: usize,
+    },
+    /// The row would exceed the table's accounted column-data budget.
+    TableDataLimitExceeded {
+        /// Accounted bytes the table would retain after the append.
+        attempted: usize,
+        /// The configured maximum accounted bytes.
         limit: usize,
     },
     /// A field occurs more than once in the input row.
@@ -816,6 +914,10 @@ impl fmt::Display for AppendError {
             Self::RowLimitExceeded { limit } => {
                 write!(formatter, "row limit of {limit} has been reached")
             }
+            Self::TableDataLimitExceeded { attempted, limit } => write!(
+                formatter,
+                "table data would require {attempted} bytes, exceeding the limit of {limit}"
+            ),
             Self::DuplicateField { field } => {
                 write!(formatter, "row contains duplicate field `{field}`")
             }
@@ -866,6 +968,16 @@ pub enum BatchAppendError {
         /// The configured maximum number of rows.
         limit: usize,
     },
+    /// The indexed batch row would exceed the table's accounted column-data
+    /// budget.
+    TableDataLimitExceeded {
+        /// The zero-based index of the row within the input batch.
+        row_index: usize,
+        /// Accounted bytes the table would retain through this row.
+        attempted: usize,
+        /// The configured maximum accounted bytes.
+        limit: usize,
+    },
     /// The indexed batch row has a different width than the schema.
     RowShapeMismatch {
         /// The zero-based index of the row within the input batch.
@@ -913,6 +1025,7 @@ impl BatchAppendError {
     pub fn row_index(&self) -> usize {
         match self {
             Self::RowLimitExceeded { row_index, .. }
+            | Self::TableDataLimitExceeded { row_index, .. }
             | Self::RowShapeMismatch { row_index, .. }
             | Self::TypeMismatch { row_index, .. }
             | Self::NullabilityViolation { row_index, .. }
@@ -923,6 +1036,13 @@ impl BatchAppendError {
     pub(crate) fn with_row_index(self, row_index: usize) -> Self {
         match self {
             Self::RowLimitExceeded { limit, .. } => Self::RowLimitExceeded { row_index, limit },
+            Self::TableDataLimitExceeded {
+                attempted, limit, ..
+            } => Self::TableDataLimitExceeded {
+                row_index,
+                attempted,
+                limit,
+            },
             Self::RowShapeMismatch {
                 expected, actual, ..
             } => Self::RowShapeMismatch {
@@ -965,6 +1085,14 @@ impl fmt::Display for BatchAppendError {
             Self::RowLimitExceeded { row_index, limit } => write!(
                 formatter,
                 "batch row {row_index} exceeds the table row limit of {limit}"
+            ),
+            Self::TableDataLimitExceeded {
+                row_index,
+                attempted,
+                limit,
+            } => write!(
+                formatter,
+                "batch row {row_index} would grow table data to {attempted} bytes, exceeding the limit of {limit}"
             ),
             Self::RowShapeMismatch {
                 row_index,

@@ -40,10 +40,37 @@ Storage resource limits are measured in UTF-8 bytes: a schema may contain at
 most 1,024 fields, each field identifier may contain at most 256 bytes, and one
 stored `String` value may contain at most 1,048,576 bytes. `Schema::new` and the
 atomic table append APIs report typed errors when these limits are exceeded.
+Each table also has a 256 MiB aggregate column-data budget; callers using the
+public storage API can select a lower bound with `Table::with_data_limit`.
 
 Each SQL batch is limited to 32 MiB (33,554,432 UTF-8 bytes) and 10,000
 statements, whether submitted through the CLI or directly through
 `Database::execute`.
+
+## Usage
+
+Execute SQL through the CLI:
+
+```bash
+printf '%s\n' \
+  'CREATE TABLE events (id Int64, note Nullable(String));' \
+  "INSERT INTO events VALUES (1, NULL), (2, 'ready');" \
+  'SELECT COUNT(*) AS event_count FROM events;' \
+| cargo run --locked --quiet -- --format csv
+```
+
+Run the equivalent embedded API example:
+
+```bash
+cargo run --locked --example database
+```
+
+Both commands print:
+
+```csv
+event_count
+2
+```
 
 ## Development model
 
