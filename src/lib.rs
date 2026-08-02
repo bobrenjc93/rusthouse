@@ -3,8 +3,8 @@
 pub mod storage;
 
 pub use storage::{
-    AppendError, Column, DataType, Field, Schema, SchemaError, Table, TypedColumn, ValidityBitmap,
-    Value, ValueType,
+    AppendError, BatchAppendError, Column, DataType, Field, Schema, SchemaError, Table,
+    TypedColumn, ValidityBitmap, Value, ValueType,
 };
 
 use std::borrow::Cow;
