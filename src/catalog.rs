@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::sql::{CreateTableStatement, InsertStatement};
+use crate::sql::{CreateTableStatement, InsertStatement, SelectStatement};
 use crate::{ColumnSchema, Schema, Table, TableError, TableLimits, Value};
 
 /// An in-memory collection of named [`Table`]s.
@@ -77,6 +77,15 @@ impl Catalog {
             .ok_or_else(|| CatalogError::TableNotFound {
                 name: name.to_owned(),
             })
+    }
+
+    /// Resolves a full-table SELECT as a borrowed table.
+    ///
+    /// The result retains the table's schema, columnar storage, and insertion
+    /// order and can be passed directly to streaming formats such as
+    /// [`crate::csv::write_csv`].
+    pub fn select(&self, statement: SelectStatement) -> Result<&Table, CatalogError> {
+        self.table(&statement.table_name)
     }
 
     /// Atomically applies a parsed `INSERT INTO ... VALUES` statement.
