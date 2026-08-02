@@ -10,8 +10,10 @@ use std::fmt;
 /// A half-open byte range in the original SQL input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
-    start: usize,
-    end: usize,
+    /// The inclusive starting byte offset.
+    pub start: usize,
+    /// The exclusive ending byte offset.
+    pub end: usize,
 }
 
 impl Span {

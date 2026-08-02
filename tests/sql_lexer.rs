@@ -2,6 +2,16 @@ use rusthouse::sql::lexer::{
     InvalidNumberReason, LexErrorKind, LexerLimits, Span, Token, TokenKind, tokenize,
 };
 
+#[test]
+fn span_fields_and_struct_literals_remain_public() {
+    let span = Span { start: 2, end: 5 };
+
+    assert_eq!(span.start, 2);
+    assert_eq!(span.end, 5);
+    assert_eq!(span.start(), span.start);
+    assert_eq!(span.end(), span.end);
+}
+
 fn limits(input_bytes: usize, tokens: usize, statements: usize) -> LexerLimits {
     LexerLimits::new(input_bytes, tokens, statements)
 }
