@@ -123,6 +123,39 @@ fn evaluates_equality_truth_tables_and_renders_null() {
 }
 
 #[test]
+fn evaluates_relational_truth_tables_with_compact_syntax() {
+    let output = run(
+        &["--format", "csv"],
+        "SELECT 1<2 AS integer_less;\n\
+         SELECT 2<=2 AS integer_less_equal;\n\
+         SELECT -1.5>0.5 AS float_greater;\n\
+         SELECT 2.5>=2.5 AS float_greater_equal;\n\
+         SELECT FALSE<TRUE AS boolean_less;\n\
+         SELECT TRUE<=FALSE AS boolean_less_equal;\n\
+         SELECT 'alpha'>'beta' AS string_greater;\n\
+         SELECT 'same'>='same' AS string_greater_equal;\n\
+         SELECT NULL<1 AS null_left;\n\
+         SELECT 'x'>=NULL AS null_right;",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "integer_less\ntrue\n\
+         integer_less_equal\ntrue\n\
+         float_greater\nfalse\n\
+         float_greater_equal\ntrue\n\
+         boolean_less\ntrue\n\
+         boolean_less_equal\nfalse\n\
+         string_greater\nfalse\n\
+         string_greater_equal\ntrue\n\
+         null_left\n\\N\n\
+         null_right\n\\N\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn escapes_csv_strings_and_decodes_sql_quotes() {
     let output = run(
         &["--format=csv"],
@@ -239,5 +272,20 @@ fn later_mixed_type_comparison_produces_no_partial_csv() {
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "error: SQL error at line 1, column 33: operator '=' cannot compare Integer and String\n"
+    );
+}
+
+#[test]
+fn later_mixed_type_relational_comparison_produces_no_partial_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "SELECT 1 < 2 AS valid; SELECT TRUE >= 'true' AS invalid;",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: SQL error at line 1, column 36: operator '>=' cannot compare Boolean and String\n"
     );
 }
