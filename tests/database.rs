@@ -226,6 +226,36 @@ fn counts_rows_from_committed_and_staged_tables_case_insensitively() {
 }
 
 #[test]
+fn counts_rows_alongside_relational_selects_in_one_batch() {
+    let mut database = Database::new();
+
+    let results = database
+        .execute(
+            "CREATE TABLE readings (id Int64);\n\
+             SELECT COUNT(*) AS before_insert FROM readings;\n\
+             INSERT INTO readings VALUES (1), (2);\n\
+             SELECT NULL < 1 AS unknown;\n\
+             SELECT 2.5 >= 2.0 AS ordered;\n\
+             SELECT COUNT(*) AS after_insert FROM readings;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (&result.header[..], &result.value))
+            .collect::<Vec<_>>(),
+        vec![
+            ("before_insert", &ScalarValue::Integer(0)),
+            ("unknown", &ScalarValue::Null),
+            ("ordered", &ScalarValue::Boolean(true)),
+            ("after_insert", &ScalarValue::Integer(2)),
+        ]
+    );
+    assert_eq!(database.table("readings").unwrap().row_count(), 2);
+}
+
+#[test]
 fn unknown_count_table_is_positioned_and_rolls_back_the_batch() {
     let mut database = database_with_seed();
     database.execute("INSERT INTO seed VALUES (1);").unwrap();
