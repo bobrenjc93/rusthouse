@@ -28,4 +28,16 @@ cargo test
 cargo run -- --help
 ```
 
+RustHouse's minimum supported Rust version is 1.85. The checked-in toolchain
+file selects Rust 1.85.0 and installs the components required by the quality
+gate. Run the same checks as CI with:
+
+```bash
+cargo fmt --all -- --check
+cargo build --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --doc --all-features --locked
+```
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
