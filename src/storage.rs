@@ -92,6 +92,40 @@ impl Value {
     }
 }
 
+/// A comparison supported by a checked predicate scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComparisonOperator {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+impl ComparisonOperator {
+    fn is_ordered(self) -> bool {
+        matches!(
+            self,
+            Self::LessThan | Self::LessThanOrEqual | Self::GreaterThan | Self::GreaterThanOrEqual
+        )
+    }
+}
+
+impl fmt::Display for ComparisonOperator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let operator = match self {
+            Self::Equal => "=",
+            Self::NotEqual => "!=",
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "<=",
+            Self::GreaterThan => ">",
+            Self::GreaterThanOrEqual => ">=",
+        };
+        formatter.write_str(operator)
+    }
+}
+
 /// One logical row in a batch insert.
 pub type Row = Vec<Value>;
 
@@ -212,6 +246,66 @@ impl fmt::Display for StorageError {
 
 impl Error for StorageError {}
 
+/// A validation failure produced before or during a predicate scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanError {
+    ColumnOutOfBounds {
+        column: usize,
+        column_count: usize,
+    },
+    TypeMismatch {
+        column: usize,
+        expected: DataType,
+        actual: DataType,
+    },
+    UnsupportedOperator {
+        column: usize,
+        data_type: DataType,
+        operator: ComparisonOperator,
+    },
+    NonFiniteFloat {
+        column: usize,
+    },
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ColumnOutOfBounds {
+                column,
+                column_count,
+            } => write!(
+                formatter,
+                "column {column} is out of bounds for a table with {column_count} columns"
+            ),
+            Self::TypeMismatch {
+                column,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "literal for column {column} has type {actual}, but the column requires {expected}"
+            ),
+            Self::UnsupportedOperator {
+                column,
+                data_type,
+                operator,
+            } => write!(
+                formatter,
+                "operator {operator} is not supported for {data_type} column {column}"
+            ),
+            Self::NonFiniteFloat { column } => {
+                write!(
+                    formatter,
+                    "literal for column {column} is not a finite Float64"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ScanError {}
+
 /// A row-bounded table backed by one physical vector per schema column.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Table {
@@ -254,6 +348,83 @@ impl Table {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Returns the row indices whose value in `column` matches `literal`.
+    ///
+    /// Equality and inequality are supported for every stored type. Ordered
+    /// comparisons are supported for integer, finite float, and string
+    /// columns. Matches retain their ascending physical row order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::{
+    ///     ColumnSchema, ComparisonOperator, DataType, Schema, Table, Value,
+    /// };
+    ///
+    /// let mut table = Table::new(
+    ///     Schema::new(vec![ColumnSchema::new("amount", DataType::Int64)]),
+    ///     2,
+    /// );
+    /// table
+    ///     .insert_batch(vec![vec![Value::Int64(4)], vec![Value::Int64(9)]])
+    ///     .unwrap();
+    ///
+    /// let matches = table
+    ///     .scan(0, ComparisonOperator::GreaterThan, &Value::Int64(4))
+    ///     .unwrap();
+    /// assert_eq!(matches, vec![1]);
+    /// ```
+    pub fn scan(
+        &self,
+        column: usize,
+        operator: ComparisonOperator,
+        literal: &Value,
+    ) -> Result<Vec<usize>, ScanError> {
+        let stored_column = self
+            .columns
+            .get(column)
+            .ok_or(ScanError::ColumnOutOfBounds {
+                column,
+                column_count: self.columns.len(),
+            })?;
+        let expected = stored_column.data_type();
+        let actual = literal.data_type();
+        if actual != expected {
+            return Err(ScanError::TypeMismatch {
+                column,
+                expected,
+                actual,
+            });
+        }
+        if expected == DataType::Bool && operator.is_ordered() {
+            return Err(ScanError::UnsupportedOperator {
+                column,
+                data_type: expected,
+                operator,
+            });
+        }
+        if matches!(literal, Value::Float64(value) if !value.is_finite()) {
+            return Err(ScanError::NonFiniteFloat { column });
+        }
+
+        let matches = match (stored_column, literal) {
+            (Column::Int64(values), Value::Int64(literal)) => {
+                matching_indices(values, operator, literal)
+            }
+            (Column::Float64(values), Value::Float64(literal)) => {
+                matching_indices(values, operator, literal)
+            }
+            (Column::Bool(values), Value::Bool(literal)) => {
+                matching_indices(values, operator, literal)
+            }
+            (Column::String(values), Value::String(literal)) => {
+                matching_indices(values, operator, literal)
+            }
+            _ => unreachable!("the scan literal type was validated against the column"),
+        };
+        Ok(matches)
     }
 
     /// Validates and atomically appends a batch of logical rows.
@@ -321,6 +492,29 @@ impl Table {
     }
 }
 
+fn matching_indices<T: PartialOrd>(
+    values: &[T],
+    operator: ComparisonOperator,
+    literal: &T,
+) -> Vec<usize> {
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| comparison_matches(value, operator, literal).then_some(index))
+        .collect()
+}
+
+fn comparison_matches<T: PartialOrd>(value: &T, operator: ComparisonOperator, literal: &T) -> bool {
+    match operator {
+        ComparisonOperator::Equal => value == literal,
+        ComparisonOperator::NotEqual => value != literal,
+        ComparisonOperator::LessThan => value < literal,
+        ComparisonOperator::LessThanOrEqual => value <= literal,
+        ComparisonOperator::GreaterThan => value > literal,
+        ComparisonOperator::GreaterThanOrEqual => value >= literal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +535,29 @@ mod tests {
             Value::Bool(boolean),
             Value::String(string.to_owned()),
         ]
+    }
+
+    fn populated_four_type_table() -> Table {
+        let mut table = Table::new(four_type_schema(), 4);
+        table
+            .insert_batch(vec![
+                row(-1, -1.5, false, "ant"),
+                row(0, 0.0, true, "bee"),
+                row(1, 1.5, true, "bee"),
+                row(2, 2.0, false, "cat"),
+            ])
+            .unwrap();
+        table
+    }
+
+    fn assert_scan(
+        table: &Table,
+        column: usize,
+        operator: ComparisonOperator,
+        literal: Value,
+        expected: &[usize],
+    ) {
+        assert_eq!(table.scan(column, operator, &literal).unwrap(), expected);
     }
 
     #[test]
@@ -498,5 +715,212 @@ mod tests {
 
         assert!(table.is_empty());
         assert!(table.columns().is_empty());
+    }
+
+    #[test]
+    fn scans_equality_and_inequality_for_every_stored_type() {
+        let table = populated_four_type_table();
+        let before = table.clone();
+
+        assert_scan(&table, 0, ComparisonOperator::Equal, Value::Int64(0), &[1]);
+        assert_scan(
+            &table,
+            1,
+            ComparisonOperator::Equal,
+            Value::Float64(1.5),
+            &[2],
+        );
+        assert_scan(
+            &table,
+            2,
+            ComparisonOperator::Equal,
+            Value::Bool(true),
+            &[1, 2],
+        );
+        assert_scan(
+            &table,
+            3,
+            ComparisonOperator::Equal,
+            Value::String("bee".to_owned()),
+            &[1, 2],
+        );
+
+        assert_scan(
+            &table,
+            0,
+            ComparisonOperator::NotEqual,
+            Value::Int64(0),
+            &[0, 2, 3],
+        );
+        assert_scan(
+            &table,
+            1,
+            ComparisonOperator::NotEqual,
+            Value::Float64(1.5),
+            &[0, 1, 3],
+        );
+        assert_scan(
+            &table,
+            2,
+            ComparisonOperator::NotEqual,
+            Value::Bool(true),
+            &[0, 3],
+        );
+        assert_scan(
+            &table,
+            3,
+            ComparisonOperator::NotEqual,
+            Value::String("bee".to_owned()),
+            &[0, 3],
+        );
+
+        assert_eq!(table, before, "scans must not mutate table contents");
+    }
+
+    #[test]
+    fn distinguishes_strict_and_inclusive_ordering_boundaries() {
+        let table = populated_four_type_table();
+        let ordered_columns = [
+            (
+                0,
+                Value::Int64(1),
+                vec![0, 1],
+                vec![0, 1, 2],
+                vec![3],
+                vec![2, 3],
+            ),
+            (
+                1,
+                Value::Float64(1.5),
+                vec![0, 1],
+                vec![0, 1, 2],
+                vec![3],
+                vec![2, 3],
+            ),
+            (
+                3,
+                Value::String("bee".to_owned()),
+                vec![0],
+                vec![0, 1, 2],
+                vec![3],
+                vec![1, 2, 3],
+            ),
+        ];
+
+        for (column, literal, less, less_equal, greater, greater_equal) in ordered_columns {
+            assert_scan(
+                &table,
+                column,
+                ComparisonOperator::LessThan,
+                literal.clone(),
+                &less,
+            );
+            assert_scan(
+                &table,
+                column,
+                ComparisonOperator::LessThanOrEqual,
+                literal.clone(),
+                &less_equal,
+            );
+            assert_scan(
+                &table,
+                column,
+                ComparisonOperator::GreaterThan,
+                literal.clone(),
+                &greater,
+            );
+            assert_scan(
+                &table,
+                column,
+                ComparisonOperator::GreaterThanOrEqual,
+                literal,
+                &greater_equal,
+            );
+        }
+    }
+
+    #[test]
+    fn returns_empty_selection_vectors_when_nothing_matches() {
+        let table = populated_four_type_table();
+        assert_scan(&table, 0, ComparisonOperator::Equal, Value::Int64(99), &[]);
+
+        let empty = Table::new(four_type_schema(), 0);
+        assert_scan(
+            &empty,
+            3,
+            ComparisonOperator::LessThan,
+            Value::String("anything".to_owned()),
+            &[],
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_scan_columns() {
+        let table = populated_four_type_table();
+
+        assert_eq!(
+            table.scan(4, ComparisonOperator::Equal, &Value::Int64(0)),
+            Err(ScanError::ColumnOutOfBounds {
+                column: 4,
+                column_count: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_scan_literals_with_the_wrong_type() {
+        let table = populated_four_type_table();
+        let cases = [
+            (0, DataType::Int64, Value::String("0".to_owned())),
+            (1, DataType::Float64, Value::Bool(false)),
+            (2, DataType::Bool, Value::Int64(0)),
+            (3, DataType::String, Value::Float64(0.0)),
+        ];
+
+        for (column, expected, literal) in cases {
+            let actual = literal.data_type();
+            assert_eq!(
+                table.scan(column, ComparisonOperator::Equal, &literal),
+                Err(ScanError::TypeMismatch {
+                    column,
+                    expected,
+                    actual,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ordered_comparisons_for_boolean_columns() {
+        let table = populated_four_type_table();
+        let ordered_operators = [
+            ComparisonOperator::LessThan,
+            ComparisonOperator::LessThanOrEqual,
+            ComparisonOperator::GreaterThan,
+            ComparisonOperator::GreaterThanOrEqual,
+        ];
+
+        for operator in ordered_operators {
+            assert_eq!(
+                table.scan(2, operator, &Value::Bool(false)),
+                Err(ScanError::UnsupportedOperator {
+                    column: 2,
+                    data_type: DataType::Bool,
+                    operator,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_float_scan_literals() {
+        let table = populated_four_type_table();
+
+        for literal in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                table.scan(1, ComparisonOperator::Equal, &Value::Float64(literal)),
+                Err(ScanError::NonFiniteFloat { column: 1 })
+            );
+        }
     }
 }
