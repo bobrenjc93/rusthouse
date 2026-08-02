@@ -1,11 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::iter::FusedIterator;
 use std::mem;
 use std::vec;
 
 use crate::sql::{Projection, SortDirection, Statement};
-use crate::{Catalog, ColumnSchema, Error, Result, Schema, Table, TableSchema, Value, sql};
+use crate::{Catalog, ColumnSchema, Error, Result, Table, TableSchema, Value, sql};
 
 /// Default maximum size of one SQL input, in UTF-8 bytes.
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -148,7 +147,6 @@ impl ExecutionResult {
 #[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
-    tables: HashMap<String, Table>,
     config: DatabaseConfig,
 }
 
@@ -257,7 +255,6 @@ impl Database {
     pub fn with_config(config: DatabaseConfig) -> Self {
         Self {
             catalog: Catalog::new(),
-            tables: HashMap::new(),
             config,
         }
     }
@@ -270,6 +267,12 @@ impl Database {
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Find a table's typed columnar data using a case-insensitive name.
+    #[must_use]
+    pub fn table(&self, name: &str) -> Option<&Table> {
+        self.catalog.table_data(name)
     }
 
     /// Parse and execute exactly one supported SQL statement.
@@ -344,31 +347,24 @@ impl Database {
         match statement {
             Statement::CreateTable(statement) => {
                 let (name, columns) = statement.into_parts();
-                let schema = TableSchema::new(name.clone(), columns)?;
-                let table = Table::new(Schema::from(&schema));
+                let schema = TableSchema::new(name, columns)?;
                 self.catalog.register(schema)?;
-                let previous = self.tables.insert(normalize(&name), table);
-                debug_assert!(previous.is_none());
                 Ok(ExecutionResult::CreatedTable)
             }
             Statement::Insert(statement) => {
-                let row_count = statement.rows.len();
-                let table = self
-                    .tables
-                    .get_mut(&normalize(&statement.table))
-                    .ok_or_else(|| Error::TableNotFound {
-                        name: statement.table.clone(),
-                    })?;
-                table.insert_rows(statement.rows)?;
+                let (table_name, rows) = statement.into_parts();
+                let row_count = rows.len();
+                self.catalog.insert_rows(&table_name, rows)?;
                 Ok(ExecutionResult::InsertedRows(row_count))
             }
             Statement::Select(statement) => {
                 let table_name = statement.table;
-                let table = self.tables.get(&normalize(&table_name)).ok_or_else(|| {
-                    Error::TableNotFound {
-                        name: table_name.clone(),
-                    }
-                })?;
+                let table =
+                    self.catalog
+                        .table_data(&table_name)
+                        .ok_or_else(|| Error::TableNotFound {
+                            name: table_name.clone(),
+                        })?;
 
                 let projection_width = match &statement.projection {
                     Projection::All => table.schema().len(),
@@ -505,10 +501,6 @@ impl Default for Database {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn normalize(identifier: &str) -> String {
-    identifier.to_ascii_lowercase()
 }
 
 fn compare_rows(

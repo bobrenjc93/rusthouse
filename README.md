@@ -72,8 +72,11 @@ assert_eq!(rows, [vec![Value::String("first".to_owned()), Value::Int64(1)]]);
 by multi-column `ORDER BY` terms with `ASC` or `DESC` and a nonnegative
 `LIMIT`. Predicates, expressions, aggregation, grouping, and joins are not yet
 part of the grammar. SQL keywords, identifiers, and the four type names are
-case-insensitive. By default, an input may contain at most 1 MiB and a table
-or projection may contain at most 1,024 columns. Repeated case-insensitive
+case-insensitive. Insertions accept signed `Int64` values, finite `Float64`
+values, booleans, and single-quoted strings; write a quote inside a string as
+`''`. Each insertion contains at most 65,536 rows and is committed only after
+every row matches the target schema. By default, an input may contain at most
+1 MiB and a table or projection may contain at most 1,024 columns. Repeated case-insensitive
 `ORDER BY` columns are ignored after their first occurrence, and unique sort
 columns use the same 1,024-column bound. One materialized query and
 all query results retained by `execute_batch` are each limited to 1,048,576

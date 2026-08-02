@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::{ColumnSchema, DataType, Error, Result, Value};
+use crate::{ColumnSchema, DataType, Error, InsertError, MAX_BATCH_ROWS, Result, Value};
 
 /// A parsed `CREATE TABLE` statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,10 +27,27 @@ impl CreateTable {
     }
 }
 
+/// A parsed `INSERT INTO ... VALUES` statement.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Insert {
-    pub(crate) table: String,
-    pub(crate) rows: Vec<Vec<Value>>,
+pub struct Insert {
+    table: String,
+    rows: Vec<Vec<Value>>,
+}
+
+impl Insert {
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        &self.table
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+
+    pub(crate) fn into_parts(self) -> (String, Vec<Vec<Value>>) {
+        (self.table, self.rows)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,15 +69,16 @@ pub(crate) struct OrderBy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Select {
+pub struct Select {
     pub(crate) table: String,
     pub(crate) projection: Projection,
     pub(crate) order_by: Vec<OrderBy>,
     pub(crate) limit: Option<usize>,
 }
 
+/// A parsed SQL statement.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Statement {
+pub enum Statement {
     CreateTable(CreateTable),
     Insert(Insert),
     Select(Select),
@@ -80,14 +98,27 @@ pub fn parse_create_table(input: &str, max_columns: usize) -> Result<CreateTable
     }
 }
 
+/// Parse exactly one supported SQL statement.
+///
+/// The byte-size bound is enforced by [`crate::Database`]. This function
+/// enforces the caller-provided schema and insertion batch bounds.
+pub fn parse_statement(
+    input: &str,
+    max_columns: usize,
+    max_batch_rows: usize,
+) -> Result<Statement> {
+    let tokens = Lexer::new(input).tokenize()?;
+    Parser::new(tokens, max_columns, max_batch_rows).parse_one()
+}
+
 pub(crate) fn parse_one(input: &str, max_columns: usize) -> Result<Statement> {
     let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens, max_columns).parse_one()
+    Parser::new(tokens, max_columns, MAX_BATCH_ROWS).parse_one()
 }
 
 pub(crate) fn parse_batch(input: &str, max_columns: usize) -> Result<Vec<Statement>> {
     let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens, max_columns).parse_batch()
+    Parser::new(tokens, max_columns, MAX_BATCH_ROWS).parse_batch()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,15 +185,11 @@ impl<'a> Lexer<'a> {
                     TokenKind::Semicolon
                 }
                 '\'' => TokenKind::String(self.scan_string(position)?),
-                character
-                    if character.is_ascii_digit()
-                        || (character == '-'
-                            && self.next().is_some_and(|next| next.is_ascii_digit())) =>
-                {
-                    TokenKind::Number(self.scan_number())
-                }
                 character if character.is_ascii_alphabetic() || character == '_' => {
                     TokenKind::Identifier(self.scan_identifier())
+                }
+                character if character.is_ascii_digit() || self.number_starts_here() => {
+                    TokenKind::Number(self.scan_number()?)
                 }
                 _ => {
                     return Err(Error::Syntax {
@@ -183,6 +210,21 @@ impl<'a> Lexer<'a> {
         let mut characters = self.input[self.position..].chars();
         characters.next()?;
         characters.next()
+    }
+
+    fn number_starts_here(&self) -> bool {
+        match (self.current(), self.next()) {
+            (Some('+' | '-'), Some(next)) => {
+                next.is_ascii_digit()
+                    || (next == '.'
+                        && self.input[self.position + 2..]
+                            .chars()
+                            .next()
+                            .is_some_and(|character| character.is_ascii_digit()))
+            }
+            (Some('.'), Some(next)) => next.is_ascii_digit(),
+            _ => false,
+        }
     }
 
     fn advance(&mut self) {
@@ -208,15 +250,18 @@ impl<'a> Lexer<'a> {
         self.input[start..self.position].to_owned()
     }
 
-    fn scan_number(&mut self) -> String {
+    fn scan_number(&mut self) -> Result<String> {
         let start = self.position;
-        if self.current() == Some('-') {
+        if matches!(self.current(), Some('+' | '-')) {
             self.advance();
         }
+
+        let mut digits = 0;
         while self
             .current()
             .is_some_and(|character| character.is_ascii_digit())
         {
+            digits += 1;
             self.advance();
         }
         if self.current() == Some('.') {
@@ -225,9 +270,13 @@ impl<'a> Lexer<'a> {
                 .current()
                 .is_some_and(|character| character.is_ascii_digit())
             {
+                digits += 1;
                 self.advance();
             }
         }
+
+        debug_assert!(digits > 0, "the caller recognizes numeric prefixes");
+
         if self
             .current()
             .is_some_and(|character| matches!(character, 'e' | 'E'))
@@ -239,14 +288,21 @@ impl<'a> Lexer<'a> {
             {
                 self.advance();
             }
+            let exponent_start = self.position;
             while self
                 .current()
                 .is_some_and(|character| character.is_ascii_digit())
             {
                 self.advance();
             }
+            if self.position == exponent_start {
+                return Err(Error::Syntax {
+                    position: self.position,
+                    message: "expected exponent digits".to_owned(),
+                });
+            }
         }
-        self.input[start..self.position].to_owned()
+        Ok(self.input[start..self.position].to_owned())
     }
 
     fn scan_string(&mut self, start: usize) -> Result<String> {
@@ -282,14 +338,16 @@ struct Parser {
     tokens: Vec<Token>,
     position: usize,
     max_columns: usize,
+    max_batch_rows: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, max_columns: usize) -> Self {
+    fn new(tokens: Vec<Token>, max_columns: usize, max_batch_rows: usize) -> Self {
         Self {
             tokens,
             position: 0,
             max_columns,
+            max_batch_rows,
         }
     }
 
@@ -403,6 +461,13 @@ impl Parser {
                 }
             }
             rows.push(row);
+            if rows.len() > self.max_batch_rows {
+                return Err(InsertError::BatchTooLarge {
+                    actual: rows.len(),
+                    maximum: self.max_batch_rows,
+                }
+                .into());
+            }
 
             if matches!(self.current().kind, TokenKind::Comma) {
                 self.advance();
@@ -631,6 +696,49 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
             })
+        );
+    }
+
+    #[test]
+    fn parses_all_insert_literal_types_and_sql_string_escaping() {
+        let statement = parse_statement(
+            "INSERT INTO Events VALUES (-1, +2.5, TRUE, 'O''Brien'), (+3, -4e-2, false, '')",
+            10,
+            10,
+        )
+        .expect("valid INSERT");
+
+        let Statement::Insert(insert) = statement else {
+            panic!("expected INSERT");
+        };
+        assert_eq!(insert.table_name(), "Events");
+        assert_eq!(
+            insert.rows(),
+            [
+                vec![
+                    Value::Int64(-1),
+                    Value::Float64(2.5),
+                    Value::Bool(true),
+                    Value::String("O'Brien".to_owned()),
+                ],
+                vec![
+                    Value::Int64(3),
+                    Value::Float64(-0.04),
+                    Value::Bool(false),
+                    Value::String(String::new()),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn enforces_the_insert_row_bound_while_parsing() {
+        assert_eq!(
+            parse_statement("INSERT INTO t VALUES (1), (2), (3)", 10, 2),
+            Err(Error::Insert(InsertError::BatchTooLarge {
+                actual: 3,
+                maximum: 2,
+            }))
         );
     }
 
