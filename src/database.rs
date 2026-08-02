@@ -1,8 +1,8 @@
 //! Stateful SQL execution and the in-memory table catalog.
 
 use crate::{
-    CreateTable, Field, InsertInto, MAX_IDENTIFIER_BYTES, MAX_SCHEMA_FIELDS, QueryResult, Schema,
-    SqlError, SqlErrorKind, Statement, Table, parse_database_batch,
+    CreateTable, Field, InsertInto, MAX_IDENTIFIER_BYTES, MAX_SCHEMA_FIELDS, MAX_SQL_INPUT_BYTES,
+    QueryResult, Schema, SqlError, SqlErrorKind, Statement, Table, parse_database_batch,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -42,8 +42,19 @@ impl Database {
     ///
     /// The complete batch is parsed and catalog changes are staged before they
     /// are published. Therefore any returned error leaves the catalog
-    /// unchanged.
+    /// unchanged. Batches larger than [`MAX_SQL_INPUT_BYTES`] UTF-8
+    /// bytes are rejected before parsing.
     pub fn execute(&mut self, input: &str) -> Result<Vec<QueryResult>, SqlError> {
+        if input.len() > MAX_SQL_INPUT_BYTES {
+            return Err(SqlError::at(
+                input,
+                0,
+                SqlErrorKind::InputTooLarge {
+                    max_bytes: MAX_SQL_INPUT_BYTES,
+                },
+            ));
+        }
+
         let statements = parse_database_batch(input)?;
         self.validate_table_names(input, &statements)?;
 

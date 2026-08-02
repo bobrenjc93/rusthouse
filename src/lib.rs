@@ -14,8 +14,9 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, Write};
 
-/// Maximum number of SQL bytes accepted from a single CLI invocation.
-pub const MAX_SQL_INPUT_BYTES: usize = 1024 * 1024;
+/// Maximum number of UTF-8 SQL bytes accepted by [`Database::execute`] and a
+/// single CLI invocation. The limit is 32 MiB (33,554,432 bytes).
+pub const MAX_SQL_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Returns the product name.
 pub fn product_name() -> &'static str {
@@ -73,6 +74,11 @@ pub struct QueryResult {
 /// The typed cause of a SQL parsing or execution error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlErrorKind {
+    /// A SQL batch exceeds [`MAX_SQL_INPUT_BYTES`].
+    InputTooLarge {
+        /// Maximum accepted batch size in UTF-8 bytes.
+        max_bytes: usize,
+    },
     /// The input does not match the supported SQL grammar.
     Syntax {
         /// A concise description of what was expected or invalid.
@@ -119,6 +125,9 @@ pub enum SqlErrorKind {
 impl fmt::Display for SqlErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InputTooLarge { max_bytes } => {
+                write!(formatter, "SQL input exceeds the {max_bytes}-byte limit")
+            }
             Self::Syntax { message } => formatter.write_str(message),
             Self::DuplicateTable { table } => write!(formatter, "table `{table}` already exists"),
             Self::DuplicateField { table, field } => {
