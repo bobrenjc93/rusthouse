@@ -307,13 +307,13 @@ impl Table {
                         actual,
                     });
                 }
-                if let Value::Float64(value) = value
-                    && !value.is_finite()
-                {
-                    return Err(StorageError::NonFiniteFloat {
-                        row: row_index,
-                        column: column_index,
-                    });
+                if let Value::Float64(value) = value {
+                    if !value.is_finite() {
+                        return Err(StorageError::NonFiniteFloat {
+                            row: row_index,
+                            column: column_index,
+                        });
+                    }
                 }
             }
         }
