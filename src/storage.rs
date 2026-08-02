@@ -4,56 +4,15 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
+use crate::TableSchema;
+pub use crate::{ColumnSchema, DataType};
+
 /// The largest number of rows accepted by one call to [`Table::insert_rows`].
 ///
 /// Bounding individual batches prevents an accidental input from requiring an
 /// unbounded temporary validation pass. Larger inputs can be split across
 /// multiple calls.
 pub const MAX_BATCH_ROWS: usize = 65_536;
-
-/// A logical type supported by the in-memory storage layer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DataType {
-    Int64,
-    Float64,
-    Bool,
-    String,
-}
-
-impl fmt::Display for DataType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Int64 => formatter.write_str("Int64"),
-            Self::Float64 => formatter.write_str("Float64"),
-            Self::Bool => formatter.write_str("Bool"),
-            Self::String => formatter.write_str("String"),
-        }
-    }
-}
-
-/// A named column in a [`Schema`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColumnSchema {
-    name: String,
-    data_type: DataType,
-}
-
-impl ColumnSchema {
-    pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
-        Self {
-            name: name.into(),
-            data_type,
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn data_type(&self) -> DataType {
-        self.data_type
-    }
-}
 
 /// Errors produced while constructing a schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,7 +50,7 @@ impl Schema {
         for column in &columns {
             if !names.insert(column.name()) {
                 return Err(SchemaError::DuplicateColumn {
-                    name: column.name.clone(),
+                    name: column.name().to_owned(),
                 });
             }
         }
@@ -116,7 +75,15 @@ impl Schema {
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|column| column.name == name)
+        self.columns.iter().position(|column| column.name() == name)
+    }
+}
+
+impl From<&TableSchema> for Schema {
+    fn from(schema: &TableSchema) -> Self {
+        Self {
+            columns: schema.columns().to_vec(),
+        }
     }
 }
 
@@ -423,7 +390,7 @@ impl Table {
                     return Err(InsertError::TypeMismatch {
                         row: row_index,
                         column: column_index,
-                        column_name: definition.name.clone(),
+                        column_name: definition.name().to_owned(),
                         expected,
                         actual,
                     });
@@ -433,7 +400,7 @@ impl Table {
                     return Err(InsertError::NonFiniteFloat {
                         row: row_index,
                         column: column_index,
-                        column_name: definition.name.clone(),
+                        column_name: definition.name().to_owned(),
                     });
                 }
             }

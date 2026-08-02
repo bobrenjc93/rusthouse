@@ -1,4 +1,4 @@
-use rusthouse::{DataType, Database, DatabaseConfig, Error};
+use rusthouse::{DataType, Database, DatabaseConfig, Error, Schema, Table};
 
 #[test]
 fn creates_a_harness_shaped_schema_with_case_insensitive_keywords_and_types() {
@@ -33,6 +33,34 @@ fn creates_a_harness_shaped_schema_with_case_insensitive_keywords_and_types() {
     assert_eq!(
         table.column("payload").expect("payload").data_type(),
         DataType::String
+    );
+}
+
+#[test]
+fn created_schema_initializes_the_typed_columnar_table() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64, score Float64, active Bool, label String)")
+        .expect("valid CREATE TABLE");
+
+    let table_schema = database
+        .catalog()
+        .table("events")
+        .expect("registered table");
+    let mut table = Table::new(Schema::from(table_schema));
+    table
+        .insert_rows(vec![vec![
+            1.into(),
+            2.5.into(),
+            true.into(),
+            "first".into(),
+        ]])
+        .expect("schema types are shared with storage");
+
+    assert_eq!(table.row_count(), 1);
+    assert_eq!(
+        table.column_by_name("id").expect("id column").as_int64(),
+        Some([1].as_slice())
     );
 }
 
