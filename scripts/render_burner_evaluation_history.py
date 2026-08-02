@@ -184,10 +184,19 @@ def validate_history(history: dict[str, Any]) -> None:
                 raise HistoryError(
                     f"{context}.commit must not contain surrounding space"
                 )
+        if kind == "baseline" and "prNumber" in point:
+            raise HistoryError(f"{context} baseline must not include prNumber")
+        if kind in {"leaf", "composite"} and "prNumber" not in point:
+            raise HistoryError(f"{context} {kind} must include prNumber")
         if "prNumber" in point:
             pull_request = point["prNumber"]
             if type(pull_request) is not int or pull_request <= 0:
                 raise HistoryError(f"{context}.prNumber must be a positive integer")
+            expected_key = f"pr:{pull_request}"
+            if key != expected_key:
+                raise HistoryError(
+                    f"{context}.key must be {expected_key!r} for prNumber {pull_request}"
+                )
             if pull_request in seen_pull_requests:
                 raise HistoryError(f"duplicate pull request #{pull_request}")
             seen_pull_requests.add(pull_request)

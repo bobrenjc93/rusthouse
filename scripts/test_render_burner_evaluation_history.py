@@ -156,6 +156,34 @@ class EvaluationHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(renderer.HistoryError, "unknown not_registered"):
             renderer.validate_history(history)
 
+    def test_pr_points_require_canonical_retry_identity(self) -> None:
+        for pull_request, message in (
+            (None, "leaf must include prNumber"),
+            (12, "key must be 'pr:12' for prNumber 12"),
+        ):
+            with self.subTest(pull_request=pull_request):
+                history = deepcopy(self.history)
+                history["points"].append(
+                    self._point(
+                        key="retry-slot",
+                        recorded_at="2026-08-03T00:00:00.000Z",
+                        kind="leaf",
+                        pull_request=pull_request,
+                        scores={"eval_c93f863f": 30},
+                    )
+                )
+                history["points"].append(
+                    self._point(
+                        key="pr:12",
+                        recorded_at="2026-08-04T00:00:00.000Z",
+                        kind="leaf",
+                        pull_request=12,
+                        scores={"eval_c93f863f": 31},
+                    )
+                )
+                with self.assertRaisesRegex(renderer.HistoryError, message):
+                    renderer.validate_history(history)
+
     def test_duplicate_key_pull_request_or_baseline_is_rejected(self) -> None:
         cases = []
 
@@ -175,13 +203,13 @@ class EvaluationHistoryTests(unittest.TestCase):
             )
         )
         point = self._point(
-            key="retry:1",
+            key="pr:1",
             recorded_at="2026-08-04T00:00:00.000Z",
             kind="leaf",
             pull_request=1,
             scores={"eval_c93f863f": 31},
         )
-        cases.append((duplicate_pr, point, "duplicate pull request #1"))
+        cases.append((duplicate_pr, point, "duplicate point key"))
 
         duplicate_baseline = deepcopy(self.history)
         point = self._point(
