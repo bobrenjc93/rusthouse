@@ -1,4 +1,10 @@
+#![deny(missing_docs)]
+
 //! RustHouse is an experimental, compact analytical database.
+//!
+//! The crate provides bounded parsers for its supported SQL statements, a
+//! case-insensitive in-memory [`Catalog`], typed columnar [`Table`] storage,
+//! and streaming [`csv`] export.
 
 mod catalog;
 pub mod csv;

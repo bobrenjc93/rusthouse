@@ -7,9 +7,13 @@ use std::fmt;
 /// A data type supported by the in-memory table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
+    /// A signed 64-bit integer.
     Int64,
+    /// An IEEE 754 double-precision floating-point number.
     Float64,
+    /// A Boolean value.
     Bool,
+    /// An owned UTF-8 String.
     String,
 }
 
@@ -33,6 +37,7 @@ pub struct ColumnSchema {
 }
 
 impl ColumnSchema {
+    /// Creates a column definition with the supplied name and type.
     pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
         Self {
             name: name.into(),
@@ -40,10 +45,12 @@ impl ColumnSchema {
         }
     }
 
+    /// Returns the column name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the column's data type.
     pub fn data_type(&self) -> DataType {
         self.data_type
     }
@@ -58,6 +65,11 @@ pub struct Schema {
 
 impl Schema {
     /// Builds a schema, rejecting duplicate column names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::DuplicateColumnName`] when two columns have
+    /// exactly the same name.
     pub fn new(columns: Vec<ColumnSchema>) -> Result<Self, TableError> {
         let mut indexes = HashMap::with_capacity(columns.len());
 
@@ -72,22 +84,27 @@ impl Schema {
         Ok(Self { columns, indexes })
     }
 
+    /// Returns all column definitions in schema order.
     pub fn columns(&self) -> &[ColumnSchema] {
         &self.columns
     }
 
+    /// Returns the number of columns in the schema.
     pub fn len(&self) -> usize {
         self.columns.len()
     }
 
+    /// Returns whether the schema contains no columns.
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
 
+    /// Returns the definition of the column named `name`, if present.
     pub fn column(&self, name: &str) -> Option<&ColumnSchema> {
         self.index_of(name).map(|index| &self.columns[index])
     }
 
+    /// Returns the position of the column named `name`, if present.
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.indexes.get(name).copied()
     }
@@ -104,13 +121,30 @@ impl Eq for Schema {}
 /// An owned value accepted by row and batch insertion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    Int64(i64),
-    Float64(f64),
-    Bool(bool),
-    String(String),
+    /// A signed 64-bit integer value.
+    Int64(
+        /// Stored integer.
+        i64,
+    ),
+    /// An IEEE 754 double-precision floating-point value.
+    Float64(
+        /// Stored floating-point number.
+        f64,
+    ),
+    /// A Boolean value.
+    Bool(
+        /// Stored Boolean.
+        bool,
+    ),
+    /// An owned UTF-8 String value.
+    String(
+        /// Stored String.
+        String,
+    ),
 }
 
 impl Value {
+    /// Returns the RustHouse data type of this value.
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
@@ -127,10 +161,26 @@ impl Value {
 /// are not retained after insertion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Column {
-    Int64(Vec<i64>),
-    Float64(Vec<f64>),
-    Bool(Vec<bool>),
-    String(Vec<String>),
+    /// Contiguous signed 64-bit integer storage.
+    Int64(
+        /// Values in row order.
+        Vec<i64>,
+    ),
+    /// Contiguous double-precision floating-point storage.
+    Float64(
+        /// Values in row order.
+        Vec<f64>,
+    ),
+    /// Contiguous Boolean storage.
+    Bool(
+        /// Values in row order.
+        Vec<bool>,
+    ),
+    /// Contiguous owned UTF-8 String storage.
+    String(
+        /// Values in row order.
+        Vec<String>,
+    ),
 }
 
 impl Column {
@@ -143,6 +193,7 @@ impl Column {
         }
     }
 
+    /// Returns the data type stored by this column.
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
@@ -152,6 +203,7 @@ impl Column {
         }
     }
 
+    /// Returns the number of values in the column.
     pub fn len(&self) -> usize {
         match self {
             Self::Int64(values) => values.len(),
@@ -161,10 +213,12 @@ impl Column {
         }
     }
 
+    /// Returns whether the column contains no values.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns the integer values, or `None` for a differently typed column.
     pub fn as_int64(&self) -> Option<&[i64]> {
         match self {
             Self::Int64(values) => Some(values),
@@ -172,6 +226,7 @@ impl Column {
         }
     }
 
+    /// Returns the float values, or `None` for a differently typed column.
     pub fn as_float64(&self) -> Option<&[f64]> {
         match self {
             Self::Float64(values) => Some(values),
@@ -179,6 +234,7 @@ impl Column {
         }
     }
 
+    /// Returns the Boolean values, or `None` for a differently typed column.
     pub fn as_bool(&self) -> Option<&[bool]> {
         match self {
             Self::Bool(values) => Some(values),
@@ -186,6 +242,7 @@ impl Column {
         }
     }
 
+    /// Returns the String values, or `None` for a differently typed column.
     pub fn as_string(&self) -> Option<&[String]> {
         match self {
             Self::String(values) => Some(values),
@@ -210,8 +267,11 @@ impl Column {
 /// columns, rather than the size of an individual value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableLimits {
+    /// Maximum number of columns in a table.
     pub max_columns: usize,
+    /// Maximum number of rows stored in a table.
     pub max_rows: usize,
+    /// Maximum total UTF-8 payload across all String columns, in bytes.
     pub max_string_bytes: usize,
 }
 
@@ -237,6 +297,11 @@ pub struct Table {
 
 impl Table {
     /// Creates an empty table after checking the configured column limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::ColumnLimitExceeded`] when the schema is wider
+    /// than `limits.max_columns`.
     pub fn new(schema: Schema, limits: TableLimits) -> Result<Self, TableError> {
         if schema.len() > limits.max_columns {
             return Err(TableError::ColumnLimitExceeded {
@@ -260,35 +325,47 @@ impl Table {
         })
     }
 
+    /// Returns the table schema.
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
+    /// Returns the resource limits enforced by this table.
     pub fn limits(&self) -> TableLimits {
         self.limits
     }
 
+    /// Returns physical columns in schema order.
     pub fn columns(&self) -> &[Column] {
         &self.columns
     }
 
+    /// Returns the physical column named `name`, if present.
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.schema.index_of(name).map(|index| &self.columns[index])
     }
 
+    /// Returns the number of stored rows.
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 
+    /// Returns whether the table contains no rows.
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
 
+    /// Returns the total UTF-8 payload stored in all String columns, in bytes.
     pub fn string_bytes(&self) -> usize {
         self.string_bytes
     }
 
     /// Inserts one row using the same atomic validation as batch insertion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError`] if the row exceeds a resource limit or does not
+    /// match the schema. The table is unchanged on error.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<(), TableError> {
         self.insert_batch(vec![row])
     }
@@ -298,6 +375,11 @@ impl Table {
     /// Row count, shape, value types, and cumulative String bytes are checked
     /// for the entire batch before any column is changed. A validation error
     /// therefore leaves the table exactly as it was before the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError`] if the batch exceeds a resource limit or any row
+    /// does not match the schema. The table is unchanged on error.
     pub fn insert_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<(), TableError> {
         let attempted_rows =
             self.row_count
@@ -376,31 +458,52 @@ impl Table {
 /// A schema, resource-bound, or row-validation failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableError {
+    /// A schema contains the same column name more than once.
     DuplicateColumnName {
+        /// Repeated column name.
         name: String,
     },
+    /// A schema is wider than the table's configured column limit.
     ColumnLimitExceeded {
+        /// Configured maximum number of columns.
         limit: usize,
+        /// Number of columns in the supplied schema.
         attempted: usize,
     },
+    /// An insertion would exceed the table's configured row limit.
     RowLimitExceeded {
+        /// Configured maximum number of rows.
         limit: usize,
+        /// Total rows that the insertion attempted to store.
         attempted: usize,
     },
+    /// An insertion would exceed the table's configured String byte limit.
     StringByteLimitExceeded {
+        /// Configured maximum UTF-8 String payload, in bytes.
         limit: usize,
+        /// Total UTF-8 String payload that the insertion attempted, in bytes.
         attempted: usize,
     },
+    /// A row has a different number of values than the schema has columns.
     RowShapeMismatch {
+        /// Zero-based position of the invalid row within the supplied batch.
         row: usize,
+        /// Number of values required by the schema.
         expected: usize,
+        /// Number of values supplied in the row.
         actual: usize,
     },
+    /// A value's type does not match its schema column.
     TypeMismatch {
+        /// Zero-based position of the invalid row within the supplied batch.
         row: usize,
+        /// Zero-based position of the invalid value within its row.
         column: usize,
+        /// Name of the schema column containing the invalid value.
         column_name: String,
+        /// Data type required by the schema.
         expected: DataType,
+        /// Data type of the supplied value.
         actual: DataType,
     },
 }
