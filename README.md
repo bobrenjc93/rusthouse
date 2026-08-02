@@ -28,4 +28,26 @@ cargo test
 cargo run -- --help
 ```
 
+## Current CLI slice
+
+RustHouse currently executes one deliberately narrow SQL form and writes CSV
+with a header:
+
+```text
+SELECT <signed Int64> [AS <identifier>] [;]
+```
+
+Pass the statement with `--execute` (or `-e`), or pipe it on standard input.
+CSV is the default and only output format, and can be selected explicitly with
+`--format csv`.
+
+```bash
+cargo run -- --execute 'SELECT -42 AS answer' --format csv
+printf 'SELECT 7;\n' | cargo run --quiet
+```
+
+SQL input is limited to 1 MiB. Standard input is always drained through EOF,
+including after that limit is crossed, so a producer can finish without a
+broken-pipe failure.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
