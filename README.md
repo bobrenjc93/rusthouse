@@ -28,4 +28,17 @@ cargo test
 cargo run -- --help
 ```
 
+## Quality gate
+
+The repository pins its Rust toolchain in `rust-toolchain.toml`. Run the same
+checks enforced by CI with:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo test --doc --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps --locked
+```
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
