@@ -40,13 +40,21 @@ fn creates_a_harness_shaped_schema_with_case_insensitive_keywords_and_types() {
 fn created_schema_initializes_the_typed_columnar_table() {
     let mut database = Database::new();
     database
-        .execute("CREATE TABLE events (id Int64, score Float64, active Bool, label String)")
+        .execute("CREATE TABLE events (UserID Int64, score Float64, active Bool, label String)")
         .expect("valid CREATE TABLE");
 
     let table_schema = database
         .catalog()
         .table("events")
         .expect("registered table");
+    assert_eq!(
+        table_schema
+            .column("userid")
+            .expect("case-insensitive catalog column")
+            .data_type(),
+        DataType::Int64
+    );
+
     let mut table = Table::new(Schema::from(table_schema));
     table
         .insert_rows(vec![vec![
@@ -59,7 +67,10 @@ fn created_schema_initializes_the_typed_columnar_table() {
 
     assert_eq!(table.row_count(), 1);
     assert_eq!(
-        table.column_by_name("id").expect("id column").as_int64(),
+        table
+            .column_by_name("uSeRiD")
+            .expect("case-insensitive storage column")
+            .as_int64(),
         Some([1].as_slice())
     );
 }

@@ -48,7 +48,7 @@ impl Schema {
 
         let mut names = HashSet::with_capacity(columns.len());
         for column in &columns {
-            if !names.insert(column.name()) {
+            if !names.insert(column.name().to_ascii_lowercase()) {
                 return Err(SchemaError::DuplicateColumn {
                     name: column.name().to_owned(),
                 });
@@ -75,7 +75,9 @@ impl Schema {
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|column| column.name() == name)
+        self.columns
+            .iter()
+            .position(|column| column.name().eq_ignore_ascii_case(name))
     }
 }
 
@@ -430,10 +432,10 @@ mod tests {
         assert_eq!(
             Schema::new(vec![
                 ColumnSchema::new("id", DataType::Int64),
-                ColumnSchema::new("id", DataType::String),
+                ColumnSchema::new("ID", DataType::String),
             ]),
             Err(SchemaError::DuplicateColumn {
-                name: "id".to_owned(),
+                name: "ID".to_owned(),
             })
         );
     }
