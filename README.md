@@ -38,6 +38,13 @@ The library can create in-memory catalog tables with
 `CREATE TABLE name (column type [, column type ...])`, using `Int64`,
 `Float64`, `Bool`, or `String`, with an optional trailing semicolon.
 
+## Library DML
+
+The library can insert one typed row into an existing catalog table with
+`execute_insert_values(&mut catalog, sql)`. The supported DML shape is exactly
+`INSERT INTO name VALUES (literal [, literal ...])`, using `Int64`, `Float64`,
+`Bool`, or `String` literals, with an optional trailing semicolon.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
