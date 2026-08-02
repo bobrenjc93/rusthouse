@@ -454,8 +454,12 @@ impl Table {
             });
         }
 
+        // One value beyond the schema width is enough to reject an oversized
+        // row without exhausting an untrusted or infinite iterator.
+        let field_limit = self.schema.len().saturating_add(1);
         let fields: Vec<(String, Value)> = row
             .into_iter()
+            .take(field_limit)
             .map(|(name, value)| (name.into(), value))
             .collect();
 
@@ -581,7 +585,8 @@ pub enum AppendError {
     RowShapeMismatch {
         /// The number of schema fields.
         expected: usize,
-        /// The number of fields supplied by the row.
+        /// The number of fields observed. When this is greater than `expected`,
+        /// it is a lower bound because ingestion stops after `expected + 1`.
         actual: usize,
         /// Schema fields not supplied by the row, in schema order.
         missing: Vec<String>,
@@ -618,10 +623,13 @@ impl fmt::Display for AppendError {
                 actual,
                 missing,
                 unexpected,
-            } => write!(
-                formatter,
-                "row shape mismatch: expected {expected} fields, got {actual}; missing {missing:?}; unexpected {unexpected:?}"
-            ),
+            } => {
+                let qualifier = if actual > expected { "at least " } else { "" };
+                write!(
+                    formatter,
+                    "row shape mismatch: expected {expected} fields, got {qualifier}{actual}; missing {missing:?}; unexpected {unexpected:?}"
+                )
+            }
             Self::TypeMismatch {
                 field,
                 expected,

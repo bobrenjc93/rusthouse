@@ -1,6 +1,7 @@
 use rusthouse::{
     AppendError, Column, DataType, Field, Schema, SchemaError, Table, Value, ValueType,
 };
+use std::cell::Cell;
 
 fn four_type_schema() -> Schema {
     Schema::new(vec![
@@ -175,6 +176,36 @@ fn every_validation_error_leaves_the_table_unchanged() {
         vec![],
         AppendError::RowLimitExceeded { limit: 2 },
     );
+}
+
+#[test]
+fn oversized_row_iterator_is_bounded_and_does_not_mutate_the_table() {
+    let mut table = populated_table(2);
+    let before = table.clone();
+    let yielded = Cell::new(0);
+    let row = (0..100).map(|index| {
+        yielded.set(yielded.get() + 1);
+        let name = match index {
+            0 => "id".to_owned(),
+            1 => "score".to_owned(),
+            2 => "active".to_owned(),
+            3 => "name".to_owned(),
+            _ => format!("extra_{index}"),
+        };
+        (name, Value::Null)
+    });
+
+    assert_eq!(
+        table.append_row(row),
+        Err(AppendError::RowShapeMismatch {
+            expected: 4,
+            actual: 5,
+            missing: vec![],
+            unexpected: vec!["extra_4".into()],
+        })
+    );
+    assert_eq!(yielded.get(), 5);
+    assert_eq!(table, before);
 }
 
 #[test]
