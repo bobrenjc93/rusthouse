@@ -68,3 +68,11 @@ assert_eq!(events.column("id").expect("column exists").data_type(), DataType::In
 SQL keywords and the four type names are case-insensitive. By default, an
 input may contain at most 1 MiB and a table may contain at most 1,024 columns;
 both limits can be changed with `DatabaseConfig`.
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->
