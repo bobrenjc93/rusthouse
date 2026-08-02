@@ -94,6 +94,18 @@ pub enum SqlErrorKind {
         /// The unrecognized type name.
         data_type: String,
     },
+    /// An INSERT names a table that is not present at that point in the batch.
+    UnknownTable {
+        /// The table name as written in the failing statement.
+        table: String,
+    },
+    /// A schema-ordered INSERT row is invalid for its target table.
+    InvalidRow {
+        /// The target table name as written in the failing statement.
+        table: String,
+        /// The typed storage validation failure.
+        source: BatchAppendError,
+    },
 }
 
 impl fmt::Display for SqlErrorKind {
@@ -109,6 +121,10 @@ impl fmt::Display for SqlErrorKind {
             }
             Self::UnknownDataType { data_type } => {
                 write!(formatter, "unknown data type `{data_type}`")
+            }
+            Self::UnknownTable { table } => write!(formatter, "unknown table `{table}`"),
+            Self::InvalidRow { table, source } => {
+                write!(formatter, "cannot insert into table `{table}`: {source}")
             }
         }
     }
@@ -165,7 +181,14 @@ impl fmt::Display for SqlError {
     }
 }
 
-impl std::error::Error for SqlError {}
+impl std::error::Error for SqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            SqlErrorKind::InvalidRow { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Parses a batch of scalar `SELECT` statements.
 ///
@@ -179,6 +202,7 @@ pub fn parse_sql_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
         .map(|statement| match statement {
             Statement::Select(result) => Ok(result),
             Statement::CreateTable(_) => unreachable!("SELECT-only parsing produced CREATE TABLE"),
+            Statement::InsertInto(_) => unreachable!("SELECT-only parsing produced INSERT"),
         })
         .collect()
 }
@@ -193,6 +217,7 @@ enum ParserMode {
 pub(crate) enum Statement {
     Select(QueryResult),
     CreateTable(CreateTable),
+    InsertInto(InsertInto),
 }
 
 #[derive(Debug)]
@@ -205,6 +230,18 @@ pub(crate) struct CreateTable {
 pub(crate) struct CreateField {
     pub(crate) name: PositionedIdentifier,
     pub(crate) data_type: DataType,
+}
+
+#[derive(Debug)]
+pub(crate) struct InsertInto {
+    pub(crate) table: PositionedIdentifier,
+    pub(crate) rows: Vec<InsertRow>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InsertRow {
+    pub(crate) byte_offset: usize,
+    pub(crate) values: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -276,7 +313,7 @@ impl<'a> Parser<'a> {
         if self.is_at_end() {
             return Err(self.syntax_error(match self.mode {
                 ParserMode::SelectOnly => "expected a SELECT statement",
-                ParserMode::Database => "expected a SELECT or CREATE TABLE statement",
+                ParserMode::Database => "expected a SELECT, CREATE TABLE, or INSERT statement",
             }));
         }
 
@@ -295,10 +332,13 @@ impl<'a> Parser<'a> {
         if matches!(self.mode, ParserMode::Database) && self.consume_keyword("CREATE") {
             return self.parse_create_table().map(Statement::CreateTable);
         }
+        if matches!(self.mode, ParserMode::Database) && self.consume_keyword("INSERT") {
+            return self.parse_insert_into().map(Statement::InsertInto);
+        }
 
         Err(self.syntax_error(match self.mode {
             ParserMode::SelectOnly => "expected SELECT",
-            ParserMode::Database => "expected SELECT or CREATE TABLE",
+            ParserMode::Database => "expected SELECT, CREATE TABLE, or INSERT",
         }))
     }
 
@@ -411,6 +451,80 @@ impl<'a> Parser<'a> {
         self.advance();
 
         Ok(CreateTable { name, fields })
+    }
+
+    fn parse_insert_into(&mut self) -> Result<InsertInto, SqlError> {
+        if !self.skip_required_whitespace() || !self.consume_keyword("INTO") {
+            return Err(self.syntax_error("expected INTO after INSERT"));
+        }
+        if !self.skip_required_whitespace() {
+            return Err(self.syntax_error("expected a table name after INSERT INTO"));
+        }
+
+        let table = self.parse_identifier("expected a table name after INSERT INTO")?;
+        if !self.skip_required_whitespace() || !self.consume_keyword("VALUES") {
+            return Err(self.syntax_error("expected VALUES after table name"));
+        }
+        self.skip_whitespace();
+
+        let mut rows = Vec::new();
+        loop {
+            let byte_offset = self.position;
+            if self.peek() != Some('(') {
+                return Err(self.syntax_error("expected '(' to start an INSERT row"));
+            }
+            self.advance();
+            self.skip_whitespace();
+
+            let mut values = Vec::new();
+            if self.peek() != Some(')') {
+                loop {
+                    values.push(self.parse_insert_literal()?);
+                    self.skip_whitespace();
+                    match self.peek() {
+                        Some(',') => {
+                            self.advance();
+                            self.skip_whitespace();
+                        }
+                        Some(')') => break,
+                        _ => {
+                            return Err(self.syntax_error("expected ',' or ')' after INSERT value"));
+                        }
+                    }
+                }
+            }
+
+            self.advance();
+            rows.push(InsertRow {
+                byte_offset,
+                values,
+            });
+            self.skip_whitespace();
+
+            match self.peek() {
+                Some(',') => {
+                    self.advance();
+                    self.skip_whitespace();
+                }
+                Some(';') => {
+                    self.advance();
+                    break;
+                }
+                _ => return Err(self.syntax_error("expected ',' or ';' after INSERT row")),
+            }
+        }
+
+        Ok(InsertInto { table, rows })
+    }
+
+    fn parse_insert_literal(&mut self) -> Result<Value, SqlError> {
+        Ok(match self.parse_literal()? {
+            ScalarValue::Null => Value::Null,
+            ScalarValue::Integer(value) => Value::Int64(value),
+            ScalarValue::Float(value) => Value::Float64(value),
+            ScalarValue::Boolean(value) => Value::Bool(value),
+            ScalarValue::String(value) => Value::String(value),
+        })
     }
 
     fn parse_expression(&mut self) -> Result<ScalarValue, SqlError> {

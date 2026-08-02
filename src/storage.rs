@@ -755,6 +755,18 @@ pub enum BatchAppendError {
     },
 }
 
+impl BatchAppendError {
+    /// Returns the zero-based index of the invalid row within the batch.
+    pub fn row_index(&self) -> usize {
+        match self {
+            Self::RowLimitExceeded { row_index, .. }
+            | Self::RowShapeMismatch { row_index, .. }
+            | Self::TypeMismatch { row_index, .. }
+            | Self::NullabilityViolation { row_index, .. } => *row_index,
+        }
+    }
+}
+
 impl fmt::Display for BatchAppendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
