@@ -338,3 +338,24 @@ fn unquoted_identifiers_are_ascii_and_quoted_identifiers_allow_unicode() {
         .unwrap_err();
     assert!(error.message().contains("unknown table"));
 }
+
+#[test]
+fn aggregate_expression_row_work_is_bounded_before_execution() {
+    let mut engine = Engine::new();
+    engine
+        .execute(&format!(
+            "CREATE TABLE aggregate_work (x Int64); INSERT INTO aggregate_work VALUES {};",
+            (0..1001)
+                .map(|value| format!("({value})"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .unwrap();
+    let aggregates = std::iter::repeat_n("sum(x)", 10_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = engine
+        .execute(&format!("SELECT {aggregates} FROM aggregate_work"))
+        .unwrap_err();
+    assert!(error.message().contains("aggregate work limit"));
+}

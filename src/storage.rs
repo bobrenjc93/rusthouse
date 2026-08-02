@@ -8,6 +8,7 @@ pub(crate) const MAX_COLUMNS: usize = 1_024;
 pub(crate) const MAX_ROWS: usize = 1_000_000;
 const MAX_TABLE_CELLS: usize = 10_000_000;
 const MAX_TABLE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CATALOG_BYTES: usize = 256 * 1024 * 1024;
 const MAX_INSERT_STAGING_BYTES: usize = 128 * 1024 * 1024;
 
 /// A physical column type supported by RustHouse.
@@ -241,7 +242,13 @@ impl Table {
         self.columns[column].value_size(row)
     }
 
-    fn insert(&mut self, column_names: Option<&[String]>, rows: Vec<Vec<Value>>) -> Result<usize> {
+    fn insert(
+        &mut self,
+        column_names: Option<&[String]>,
+        rows: Vec<Vec<Value>>,
+        catalog_available_bytes: usize,
+        catalog_limit: usize,
+    ) -> Result<(usize, usize)> {
         if rows.is_empty() {
             return Err(Error::new("INSERT must contain at least one row"));
         }
@@ -287,6 +294,7 @@ impl Table {
             .checked_mul(rows.len())
             .ok_or_else(|| Error::new("table storage size overflow"))?;
         check_table_bytes(self.storage_bytes, insert_bytes)?;
+        check_catalog_bytes(insert_bytes, catalog_available_bytes, catalog_limit)?;
 
         let staged_cells = rows
             .len()
@@ -336,6 +344,7 @@ impl Table {
             }
         }
         check_table_bytes(self.storage_bytes, insert_bytes)?;
+        check_catalog_bytes(insert_bytes, catalog_available_bytes, catalog_limit)?;
 
         // Reservations may change capacities, but table values remain untouched on failure.
         let inserted = staged.first().map_or(0, Vec::len);
@@ -356,7 +365,7 @@ impl Table {
         }
         self.row_count = new_count;
         self.storage_bytes += insert_bytes;
-        Ok(inserted)
+        Ok((inserted, insert_bytes))
     }
 
     fn insert_targets(&self, column_names: Option<&[String]>) -> Result<Vec<usize>> {
@@ -406,6 +415,16 @@ fn check_table_bytes(existing: usize, additional: usize) -> Result<()> {
     }
 }
 
+fn check_catalog_bytes(additional: usize, available: usize, limit: usize) -> Result<()> {
+    if additional > available {
+        Err(Error::new(format!(
+            "catalog storage byte limit exceeded (maximum {limit} bytes)"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn coerce(value: Value, schema: &ColumnSchema, row: usize, position: usize) -> Result<Value> {
     if value == Value::Null {
         return if schema.nullable {
@@ -431,9 +450,20 @@ fn coerce(value: Value, schema: &ColumnSchema, row: usize, position: usize) -> R
     }
 }
 
-#[derive(Default)]
 pub(crate) struct Catalog {
     tables: HashMap<String, Table>,
+    storage_bytes: usize,
+    storage_limit: usize,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            tables: HashMap::new(),
+            storage_bytes: 0,
+            storage_limit: MAX_CATALOG_BYTES,
+        }
+    }
 }
 
 impl Catalog {
@@ -493,10 +523,23 @@ impl Catalog {
         columns: Option<&[String]>,
         rows: Vec<Vec<Value>>,
     ) -> Result<usize> {
-        self.tables
+        let available = self.storage_limit.saturating_sub(self.storage_bytes);
+        let (inserted, inserted_bytes) = self
+            .tables
             .get_mut(&canonical(table))
             .ok_or_else(|| Error::new(format!("unknown table '{table}'")))?
-            .insert(columns, rows)
+            .insert(columns, rows, available, self.storage_limit)?;
+        self.storage_bytes += inserted_bytes;
+        Ok(inserted)
+    }
+
+    #[cfg(test)]
+    fn with_storage_limit(storage_limit: usize) -> Self {
+        Self {
+            tables: HashMap::new(),
+            storage_bytes: 0,
+            storage_limit,
+        }
     }
 }
 
@@ -630,5 +673,34 @@ mod tests {
             .unwrap_err();
         assert!(error.message().contains("storage byte limit"));
         assert_eq!(bytes.table("bytes").unwrap().row_count, 0);
+    }
+
+    #[test]
+    fn catalog_storage_limit_is_cumulative_across_tables() {
+        let bytes_per_value = base_storage_bytes(DataType::String);
+        let mut catalog = Catalog::with_storage_limit(bytes_per_value * 3);
+        for name in ["first", "second"] {
+            catalog
+                .create(CreateTable {
+                    name: name.to_owned(),
+                    if_not_exists: false,
+                    columns: vec![ColumnDefinition {
+                        name: "value".to_owned(),
+                        data_type: DataType::String,
+                        nullable: true,
+                    }],
+                })
+                .unwrap();
+        }
+        catalog
+            .insert("first", None, vec![vec![Value::Null], vec![Value::Null]])
+            .unwrap();
+        let error = catalog
+            .insert("second", None, vec![vec![Value::Null], vec![Value::Null]])
+            .unwrap_err();
+        assert!(error.message().contains("catalog storage byte limit"));
+        assert_eq!(catalog.table("first").unwrap().row_count, 2);
+        assert_eq!(catalog.table("second").unwrap().row_count, 0);
+        assert_eq!(catalog.storage_bytes, bytes_per_value * 2);
     }
 }

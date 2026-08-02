@@ -13,6 +13,7 @@ const MAX_RESULT_CELLS: usize = 10_000_000;
 const MAX_GROUP_BY_EXPRESSIONS: usize = 1_024;
 const MAX_GROUP_KEY_CELLS: usize = 1_000_000;
 const MAX_GROUP_KEY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AGGREGATE_WORK: usize = 10_000_000;
 #[cfg(not(test))]
 const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
@@ -111,6 +112,7 @@ impl Engine {
                 .order_by
                 .iter()
                 .any(|item| has_aggregate(&item.expression));
+        check_aggregate_work(&select, &aliases, matching_rows.len())?;
 
         let mut budget = ResultBudget::default();
         let mut output = if aggregate_query {
@@ -720,6 +722,106 @@ fn has_aggregate(expression: &Expr) -> bool {
 
 fn is_aggregate_name(name: &str) -> bool {
     matches!(name, "count" | "sum" | "min" | "max" | "avg")
+}
+
+fn check_aggregate_work(
+    select: &Select,
+    aliases: &HashMap<String, Expr>,
+    matching_rows: usize,
+) -> Result<()> {
+    let mut expression_work = 0usize;
+    for item in &select.items {
+        expression_work = expression_work
+            .checked_add(aggregate_expression_work(&item.expression, None)?)
+            .ok_or_else(aggregate_work_error)?;
+    }
+    if let Some(having) = &select.having {
+        expression_work = expression_work
+            .checked_add(aggregate_expression_work(having, Some(aliases))?)
+            .ok_or_else(aggregate_work_error)?;
+    }
+    for order in &select.order_by {
+        expression_work = expression_work
+            .checked_add(aggregate_expression_work(&order.expression, Some(aliases))?)
+            .ok_or_else(aggregate_work_error)?;
+    }
+    let work = matching_rows
+        .checked_mul(expression_work)
+        .ok_or_else(aggregate_work_error)?;
+    if work > MAX_AGGREGATE_WORK {
+        Err(aggregate_work_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn aggregate_expression_work(
+    expression: &Expr,
+    aliases: Option<&HashMap<String, Expr>>,
+) -> Result<usize> {
+    match expression {
+        Expr::Column(name) => {
+            if let Some(alias) = aliases.and_then(|aliases| aliases.get(&canonical(name))) {
+                aggregate_expression_work(alias, None)
+            } else {
+                Ok(0)
+            }
+        }
+        Expr::Function {
+            name, arguments, ..
+        } if is_aggregate_name(name) => {
+            if name == "count"
+                && (arguments.is_empty() || arguments.first() == Some(&Expr::Wildcard))
+            {
+                Ok(0)
+            } else {
+                scalar_expression_work(&arguments[0], aliases)
+            }
+        }
+        Expr::Binary { left, right, .. } => aggregate_expression_work(left, aliases)?
+            .checked_add(aggregate_expression_work(right, aliases)?)
+            .ok_or_else(aggregate_work_error),
+        Expr::Unary { expression, .. } | Expr::IsNull { expression, .. } => {
+            aggregate_expression_work(expression, aliases)
+        }
+        Expr::Literal(_) | Expr::Wildcard | Expr::Function { .. } => Ok(0),
+    }
+}
+
+fn scalar_expression_work(
+    expression: &Expr,
+    aliases: Option<&HashMap<String, Expr>>,
+) -> Result<usize> {
+    match expression {
+        Expr::Column(name) => {
+            if let Some(alias) = aliases.and_then(|aliases| aliases.get(&canonical(name))) {
+                scalar_expression_work(alias, None)
+            } else {
+                Ok(1)
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            let left = scalar_expression_work(left, aliases)?;
+            let right = scalar_expression_work(right, aliases)?;
+            1usize
+                .checked_add(left)
+                .and_then(|work| work.checked_add(right))
+                .ok_or_else(aggregate_work_error)
+        }
+        Expr::Unary { expression, .. } | Expr::IsNull { expression, .. } => 1usize
+            .checked_add(scalar_expression_work(expression, aliases)?)
+            .ok_or_else(aggregate_work_error),
+        Expr::Literal(_) => Ok(1),
+        Expr::Function { .. } | Expr::Wildcard => Err(Error::new(
+            "invalid nested function or wildcard in aggregate argument",
+        )),
+    }
+}
+
+fn aggregate_work_error() -> Error {
+    Error::new(format!(
+        "aggregate work limit exceeded (maximum {MAX_AGGREGATE_WORK} expression-row evaluations)"
+    ))
 }
 
 fn build_groups(table: &Table, group_by: &[Expr], rows: Vec<usize>) -> Result<Vec<Vec<usize>>> {
