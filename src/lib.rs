@@ -155,8 +155,12 @@ impl<'a> Parser<'a> {
         let value = self.parse_literal()?;
         let literal_end = self.position;
         self.skip_whitespace();
+        let has_alias_separator = self.position > literal_end;
 
         let header = if self.consume_keyword("AS") {
+            if !has_alias_separator {
+                return Err(self.error_at(literal_end, "expected whitespace before AS"));
+            }
             self.skip_whitespace();
             self.parse_identifier()?
         } else {

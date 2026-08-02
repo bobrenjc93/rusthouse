@@ -114,6 +114,7 @@ fn rejects_malformed_sql_without_partial_csv() {
         "SELECT column_name;",
         "SELECT 'unterminated;",
         "SELECT 1e999;",
+        "SELECT 1AS alias;",
         "SELECT 1; SELECT nope;",
     ] {
         let output = run(&["--format", "csv"], sql);
