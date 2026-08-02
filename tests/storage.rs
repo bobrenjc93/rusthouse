@@ -1,5 +1,6 @@
 use rusthouse::{
-    AppendError, Column, DataType, Field, Schema, SchemaError, Table, Value, ValueType,
+    AppendError, BatchAppendError, Column, DataType, Field, Schema, SchemaError, Table, Value,
+    ValueType,
 };
 use std::cell::Cell;
 
@@ -242,5 +243,165 @@ fn zero_row_limit_rejects_without_allocating_column_values() {
         Err(AppendError::RowLimitExceeded { limit: 0 })
     );
     assert_eq!(table, before);
+    assert!(table.columns().iter().all(Column::is_empty));
+}
+
+#[test]
+fn positional_batch_stores_all_types_and_nulls_in_schema_order() {
+    let mut table = Table::new(four_type_schema(), 3);
+
+    table
+        .append_batch([
+            vec![
+                Value::Int64(1),
+                Value::Float64(1.5),
+                Value::Bool(true),
+                Value::String("one".into()),
+            ],
+            vec![Value::Int64(2), Value::Null, Value::Null, Value::Null],
+        ])
+        .unwrap();
+
+    assert_eq!(table.row_count(), 2);
+    let Column::Int64(ids) = table.column("id").unwrap() else {
+        panic!("id should be an Int64 column");
+    };
+    assert_eq!(ids.values(), &[1, 2]);
+    assert_eq!(ids.validity().words(), &[0b11]);
+
+    let Column::Float64(scores) = table.column("score").unwrap() else {
+        panic!("score should be a Float64 column");
+    };
+    assert_eq!(scores.values(), &[1.5, 0.0]);
+    assert_eq!(scores.validity().words(), &[0b01]);
+
+    let Column::Bool(active) = table.column("active").unwrap() else {
+        panic!("active should be a Bool column");
+    };
+    assert_eq!(active.values(), &[true, false]);
+    assert_eq!(active.validity().words(), &[0b01]);
+
+    let Column::String(names) = table.column("name").unwrap() else {
+        panic!("name should be a String column");
+    };
+    assert_eq!(names.values(), &["one", ""]);
+    assert_eq!(names.validity().words(), &[0b01]);
+}
+
+#[test]
+fn late_invalid_batch_rows_report_their_index_and_roll_back() {
+    let mut table = populated_table(10);
+    let before = table.clone();
+    let rows = [
+        vec![
+            Value::Int64(8),
+            Value::Float64(8.0),
+            Value::Bool(false),
+            Value::String("Grace".into()),
+        ],
+        vec![
+            Value::Int64(9),
+            Value::String("wrong".into()),
+            Value::Bool(true),
+            Value::String("Lin".into()),
+        ],
+    ];
+
+    assert_eq!(
+        table.append_batch(rows),
+        Err(BatchAppendError::TypeMismatch {
+            row_index: 1,
+            field: "score".into(),
+            expected: DataType::Float64,
+            actual: ValueType::String,
+        })
+    );
+    assert_eq!(table, before);
+
+    assert_eq!(
+        table.append_batch([
+            vec![
+                Value::Int64(8),
+                Value::Float64(8.0),
+                Value::Bool(false),
+                Value::String("Grace".into()),
+            ],
+            vec![Value::Null, Value::Null, Value::Null, Value::Null],
+        ]),
+        Err(BatchAppendError::NullabilityViolation {
+            row_index: 1,
+            field: "id".into(),
+        })
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn positional_batch_bounds_each_row_iterator_and_rolls_back() {
+    let mut table = populated_table(10);
+    let before = table.clone();
+    let yielded = Cell::new(0);
+    let oversized_row = std::iter::repeat_with(|| {
+        yielded.set(yielded.get() + 1);
+        Value::Null
+    });
+
+    assert_eq!(
+        table.append_batch(std::iter::once(oversized_row)),
+        Err(BatchAppendError::RowShapeMismatch {
+            row_index: 0,
+            expected: 4,
+            actual: 5,
+        })
+    );
+    assert_eq!(yielded.get(), 5);
+    assert_eq!(table, before);
+}
+
+#[test]
+fn positional_batch_bounds_the_row_iterator_by_remaining_capacity() {
+    let mut table = populated_table(3);
+    let before = table.clone();
+    let yielded = Cell::new(0);
+    let rows = std::iter::repeat_with(|| {
+        yielded.set(yielded.get() + 1);
+        [
+            Value::Int64(8),
+            Value::Float64(8.0),
+            Value::Bool(false),
+            Value::String("Grace".into()),
+        ]
+    });
+
+    assert_eq!(
+        table.append_batch(rows),
+        Err(BatchAppendError::RowLimitExceeded {
+            row_index: 2,
+            limit: 3,
+        })
+    );
+    assert_eq!(yielded.get(), 3);
+    assert_eq!(table, before);
+}
+
+#[test]
+fn positional_batch_handles_empty_batches_and_short_rows() {
+    let mut full_table = populated_table(1);
+    let before = full_table.clone();
+    full_table
+        .append_batch(std::iter::empty::<[Value; 4]>())
+        .unwrap();
+    assert_eq!(full_table, before);
+
+    let mut table = Table::new(four_type_schema(), 1);
+    assert_eq!(
+        table.append_batch([vec![Value::Int64(1), Value::Float64(1.0)]]),
+        Err(BatchAppendError::RowShapeMismatch {
+            row_index: 0,
+            expected: 4,
+            actual: 2,
+        })
+    );
+    assert_eq!(table.row_count(), 0);
     assert!(table.columns().iter().all(Column::is_empty));
 }

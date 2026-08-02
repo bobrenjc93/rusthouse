@@ -34,13 +34,57 @@ fn help_describes_the_csv_interface() {
 fn executes_every_statement_received_before_eof() {
     let output = run(
         &["--format", "csv"],
-        "SELECT 7 AS first;\nSELECT -2.5 AS second;\nSELECT TRUE;\n",
+        "SELECT 7 AS first;\n\
+         CREATE TABLE readings (captured_at Int64, value Float64);\n\
+         SELECT -2.5 AS second;\n\
+         SELECT TRUE;\n",
     );
 
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "first\n7\nsecond\n-2.5\nTRUE\ntrue\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn create_table_without_select_produces_no_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "CREATE TABLE events (id Int64, active Bool, label String);",
+    );
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn evaluates_equality_truth_tables_and_renders_null() {
+    let output = run(
+        &["--format", "csv"],
+        "SELECT 4 = 4 AS integer_equal;\n\
+         SELECT 4 <> 4 AS integer_not_equal;\n\
+         SELECT 1.5 = 2.5 AS float_equal;\n\
+         SELECT TRUE <> FALSE AS boolean_not_equal;\n\
+         SELECT 'x' = 'x' AS string_equal;\n\
+         SELECT NULL AS null_literal;\n\
+         SELECT NULL = 1 AS null_left;\n\
+         SELECT 'x' <> NULL AS null_right;",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "integer_equal\ntrue\n\
+         integer_not_equal\nfalse\n\
+         float_equal\nfalse\n\
+         boolean_not_equal\ntrue\n\
+         string_equal\ntrue\n\
+         null_literal\n\\N\n\
+         null_left\n\\N\n\
+         null_right\n\\N\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -116,6 +160,9 @@ fn rejects_malformed_sql_without_partial_csv() {
         "SELECT 1e999;",
         "SELECT 1AS alias;",
         "SELECT 1; SELECT nope;",
+        "CREATE TABLE empty ();",
+        "CREATE TABLE duplicate (id Int64, id String);",
+        "CREATE TABLE unknown (value Decimal);",
     ] {
         let output = run(&["--format", "csv"], sql);
 
@@ -128,4 +175,19 @@ fn rejects_malformed_sql_without_partial_csv() {
             "SQL: {sql}"
         );
     }
+}
+
+#[test]
+fn later_mixed_type_comparison_produces_no_partial_csv() {
+    let output = run(
+        &["--format", "csv"],
+        "SELECT 1 = 1 AS valid; SELECT 1 = '1' AS invalid;",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: SQL error at line 1, column 33: operator '=' cannot compare Integer and String\n"
+    );
 }
