@@ -245,6 +245,7 @@ pub(crate) struct CreateTable {
 pub(crate) struct CreateField {
     pub(crate) name: PositionedIdentifier,
     pub(crate) data_type: DataType,
+    pub(crate) nullable: bool,
 }
 
 pub(crate) enum DatabaseEvent {
@@ -473,25 +474,11 @@ impl<'a> Parser<'a> {
                 return Err(self.syntax_error("expected a data type after field name"));
             }
 
-            let type_name = self.parse_identifier("expected a data type after field name")?;
-            let data_type = match type_name.value.to_ascii_lowercase().as_str() {
-                "int64" => DataType::Int64,
-                "float64" => DataType::Float64,
-                "bool" => DataType::Bool,
-                "string" => DataType::String,
-                _ => {
-                    return Err(SqlError::at(
-                        self.input,
-                        type_name.byte_offset,
-                        SqlErrorKind::UnknownDataType {
-                            data_type: type_name.value,
-                        },
-                    ));
-                }
-            };
+            let (data_type, nullable) = self.parse_create_data_type()?;
             fields.push(CreateField {
                 name: field_name,
                 data_type,
+                nullable,
             });
 
             self.skip_whitespace();
@@ -515,6 +502,48 @@ impl<'a> Parser<'a> {
         self.advance();
 
         Ok(CreateTable { name, fields })
+    }
+
+    fn parse_create_data_type(&mut self) -> Result<(DataType, bool), SqlError> {
+        let type_name = self.parse_identifier("expected a data type after field name")?;
+        if !type_name.value.eq_ignore_ascii_case("Nullable") {
+            return self
+                .resolve_data_type(type_name)
+                .map(|data_type| (data_type, false));
+        }
+
+        self.skip_whitespace();
+        if self.peek() != Some('(') {
+            return Err(self.syntax_error("expected '(' after Nullable"));
+        }
+        self.advance();
+        self.skip_whitespace();
+
+        let inner_type = self.parse_identifier("expected a data type inside Nullable(...)")?;
+        let data_type = self.resolve_data_type(inner_type)?;
+        self.skip_whitespace();
+        if self.peek() != Some(')') {
+            return Err(self.syntax_error("expected ')' after Nullable inner type"));
+        }
+        self.advance();
+
+        Ok((data_type, true))
+    }
+
+    fn resolve_data_type(&self, type_name: PositionedIdentifier) -> Result<DataType, SqlError> {
+        match type_name.value.to_ascii_lowercase().as_str() {
+            "int64" => Ok(DataType::Int64),
+            "float64" => Ok(DataType::Float64),
+            "bool" => Ok(DataType::Bool),
+            "string" => Ok(DataType::String),
+            _ => Err(SqlError::at(
+                self.input,
+                type_name.byte_offset,
+                SqlErrorKind::UnknownDataType {
+                    data_type: type_name.value,
+                },
+            )),
+        }
     }
 
     fn parse_insert_into(
