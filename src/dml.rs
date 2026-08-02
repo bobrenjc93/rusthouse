@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::catalog::{Catalog, TableNotFoundError};
 use crate::lexer::{Delimiter, LexError, LexerLimits, Literal, Operator, Token, TokenKind, lex};
-use crate::storage::{BatchInsertError, Value};
+use crate::storage::{BatchInsertError, InsertError, Value};
 
 /// A parsed `INSERT INTO ... VALUES` statement containing one or more rows.
 #[derive(Clone, Debug, PartialEq)]
@@ -79,8 +79,15 @@ pub enum InsertValuesError {
     },
     /// The target table is not present in the catalog.
     TableNotFound(TableNotFoundError),
-    /// A typed row does not match the target table schema.
-    Insert(BatchInsertError),
+    /// The typed row in a single-row statement does not match the table schema.
+    Insert(InsertError),
+    /// A typed row in a multi-row statement does not match the table schema.
+    BatchInsert {
+        /// The zero-based index of the invalid tuple within the statement.
+        tuple_index: usize,
+        /// The validation error for the invalid tuple.
+        source: InsertError,
+    },
 }
 
 impl fmt::Display for InsertValuesError {
@@ -108,7 +115,14 @@ impl fmt::Display for InsertValuesError {
                 "SQL parse error at byte {position}: NULL literals are not supported"
             ),
             Self::TableNotFound(error) => error.fmt(formatter),
-            Self::Insert(error) => write!(formatter, "batch insertion failed: {error}"),
+            Self::Insert(error) => write!(formatter, "row insertion failed: {error}"),
+            Self::BatchInsert {
+                tuple_index,
+                source,
+            } => write!(
+                formatter,
+                "tuple at index {tuple_index} failed validation: {source}"
+            ),
         }
     }
 }
@@ -119,6 +133,7 @@ impl Error for InsertValuesError {
             Self::Lex(error) => Some(error),
             Self::TableNotFound(error) => Some(error),
             Self::Insert(error) => Some(error),
+            Self::BatchInsert { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -136,8 +151,8 @@ impl From<TableNotFoundError> for InsertValuesError {
     }
 }
 
-impl From<BatchInsertError> for InsertValuesError {
-    fn from(error: BatchInsertError) -> Self {
+impl From<InsertError> for InsertValuesError {
+    fn from(error: InsertError) -> Self {
         Self::Insert(error)
     }
 }
@@ -177,8 +192,23 @@ pub fn parse_insert_values(input: &str) -> Result<InsertValuesStatement, InsertV
 pub fn execute_insert_values(catalog: &mut Catalog, input: &str) -> Result<(), InsertValuesError> {
     let statement = parse_insert_values(input)?;
     let (table_name, rows) = statement.into_parts();
-    catalog.table_mut(&table_name)?.insert_batch(rows)?;
+    let is_single_row = rows.len() == 1;
+    catalog
+        .table_mut(&table_name)?
+        .insert_batch(rows)
+        .map_err(|error| map_insert_error(error, is_single_row))?;
     Ok(())
+}
+
+fn map_insert_error(error: BatchInsertError, is_single_row: bool) -> InsertValuesError {
+    if is_single_row {
+        InsertValuesError::Insert(error.source)
+    } else {
+        InsertValuesError::BatchInsert {
+            tuple_index: error.batch_index,
+            source: error.source,
+        }
+    }
 }
 
 struct Cursor<'a> {

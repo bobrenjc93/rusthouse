@@ -1,6 +1,6 @@
 use rusthouse::{
-    BatchInsertError, Catalog, Column, DataType, InsertError, InsertValuesError,
-    TableNotFoundError, Value, execute_create_table, execute_insert_values, parse_insert_values,
+    Catalog, Column, DataType, InsertError, InsertValuesError, TableNotFoundError, Value,
+    execute_create_table, execute_insert_values, parse_insert_values,
 };
 
 fn catalog_with_all_types() -> Catalog {
@@ -147,12 +147,9 @@ fn late_width_and_type_errors_report_tuple_index_and_are_atomic() {
              (1, 2.0, true, 'first'), \
              (2, 3.0, false, 'second'), \
              (3, 4.0, true)",
-            BatchInsertError {
-                batch_index: 2,
-                source: InsertError::RowWidth {
-                    expected: 4,
-                    actual: 3,
-                },
+            InsertError::RowWidth {
+                expected: 4,
+                actual: 3,
             },
         ),
         (
@@ -160,14 +157,11 @@ fn late_width_and_type_errors_report_tuple_index_and_are_atomic() {
              (1, 2.0, true, 'first'), \
              (2, 3.0, false, 'second'), \
              (3, 4, true, 'third')",
-            BatchInsertError {
-                batch_index: 2,
-                source: InsertError::TypeMismatch {
-                    column_index: 1,
-                    column_name: "score".to_owned(),
-                    expected: DataType::Float64,
-                    actual: DataType::Int64,
-                },
+            InsertError::TypeMismatch {
+                column_index: 1,
+                column_name: "score".to_owned(),
+                expected: DataType::Float64,
+                actual: DataType::Int64,
             },
         ),
     ];
@@ -176,10 +170,36 @@ fn late_width_and_type_errors_report_tuple_index_and_are_atomic() {
         let before = catalog.clone();
         assert_eq!(
             execute_insert_values(&mut catalog, sql),
-            Err(InsertValuesError::Insert(expected))
+            Err(InsertValuesError::BatchInsert {
+                tuple_index: 2,
+                source: expected,
+            })
         );
         assert_eq!(catalog, before, "{sql:?} changed storage");
     }
+}
+
+#[test]
+fn single_row_errors_preserve_the_existing_insert_error_contract() {
+    let mut catalog = catalog_with_all_types();
+    let before = catalog.clone();
+    let expected = InsertError::RowWidth {
+        expected: 4,
+        actual: 3,
+    };
+
+    assert_eq!(
+        InsertValuesError::from(expected.clone()),
+        InsertValuesError::Insert(expected.clone())
+    );
+    assert_eq!(
+        execute_insert_values(
+            &mut catalog,
+            "INSERT INTO \"Daily Metrics\" VALUES (1, 2.0, true)",
+        ),
+        Err(InsertValuesError::Insert(expected))
+    );
+    assert_eq!(catalog, before);
 }
 
 #[test]
