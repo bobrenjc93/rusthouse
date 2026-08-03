@@ -31,7 +31,9 @@ The explicit
 operator and materializes rows in stable order. Plain projections borrow a
 prefix of the table's column storage;
 filtered projections return matching non-`NULL` values in source order through
-the bounded comparison scan.
+the bounded comparison scan. `SELECT DISTINCT column FROM table` uses explicit
+input-row and distinct-value limits and returns deterministic `NULL`-first,
+ascending values.
 
 ## Snapshot envelope
 
