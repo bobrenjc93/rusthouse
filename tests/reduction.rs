@@ -227,10 +227,48 @@ fn int64_avg_uses_a_wide_exact_accumulator() {
         cancellation.avg("value", None),
         Ok(Some(Value::Float64(-0.5)))
     );
+
+    let mut exact_quotient = Table::new(vec![Field::new("value", DataType::Int64)]).unwrap();
+    exact_quotient
+        .insert_batch([
+            vec![Value::Int64(9_007_199_254_740_991)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(1)],
+        ])
+        .unwrap();
+    assert_eq!(
+        exact_quotient.avg("value", None),
+        Ok(Some(Value::Float64(3_002_399_751_580_331.0)))
+    );
 }
 
 #[test]
-fn float64_avg_uses_ordered_ieee_754_operations() {
+fn int64_avg_rounds_halfway_results_to_even() {
+    const BASE: i64 = 9_007_199_254_740_992;
+    let mut table = Table::new(vec![
+        Field::new("even_lower", DataType::Int64),
+        Field::new("even_upper", DataType::Int64),
+    ])
+    .unwrap();
+    table
+        .insert_batch([
+            vec![Value::Int64(BASE), Value::Int64(BASE + 2)],
+            vec![Value::Int64(BASE + 2), Value::Int64(BASE + 4)],
+        ])
+        .unwrap();
+
+    assert_eq!(
+        table.avg("even_lower", None),
+        Ok(Some(Value::Float64(BASE as f64)))
+    );
+    assert_eq!(
+        table.avg("even_upper", None),
+        Ok(Some(Value::Float64((BASE + 4) as f64)))
+    );
+}
+
+#[test]
+fn float64_avg_resists_finite_overflow_and_uses_ieee_754_operations() {
     let mut overflow = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
     overflow
         .insert_batch([
@@ -240,7 +278,20 @@ fn float64_avg_uses_ordered_ieee_754_operations() {
         .unwrap();
     assert_eq!(
         overflow.avg("value", None),
-        Ok(Some(Value::Float64(f64::INFINITY)))
+        Ok(Some(Value::Float64(f64::MAX)))
+    );
+
+    let mut cancellation = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    cancellation
+        .insert_batch([
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(-f64::MAX)],
+        ])
+        .unwrap();
+    assert_eq!(
+        cancellation.avg("value", None),
+        Ok(Some(Value::Float64(f64::MAX / 3.0)))
     );
 
     let mut infinities = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
