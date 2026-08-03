@@ -6,9 +6,10 @@ use std::fmt;
 
 use crate::{
     AggregateError, AggregateLimits, DistinctError, DistinctLimits, InsertError, InsertStatement,
-    Int64Table, OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScanError, ScanLimits,
-    SelectDistinctStatement, SelectPredicate, SelectStatement, count_nullable_i64,
-    distinct_nullable_i64, order_nullable_i64, scan_nullable_i64, scan_nullable_i64_nullness,
+    Int64Table, OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScalarSumStatement,
+    ScanError, ScanLimits, SelectDistinctStatement, SelectPredicate, SelectStatement,
+    aggregate_nullable_i64, count_nullable_i64, distinct_nullable_i64, order_nullable_i64,
+    scan_nullable_i64, scan_nullable_i64_nullness,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -235,6 +236,60 @@ pub fn execute_scalar_count(
     } else {
         counts.count_star()
     })
+}
+
+/// Executes one parsed scalar `SUM` with explicit resource bounds.
+///
+/// The expected table and column names are compared exactly with the
+/// identifiers retained by the parser, including ASCII case. On a match,
+/// execution delegates to [`aggregate_nullable_i64`], returning `None` for
+/// SQL `NULL` when the input is empty or all `NULL`. Aggregate bounds and sum
+/// overflow are preserved in [`SelectExecutionError`].
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{
+///     AggregateLimits, Int64Table, ParseLimits, Schema, execute_scalar_sum,
+///     parse_scalar_sum,
+/// };
+///
+/// let statement = parse_scalar_sum(
+///     "SELECT SUM(value) FROM readings",
+///     ParseLimits::default(),
+/// )?;
+/// let mut table = Int64Table::new(Schema::int64("value", true), 3);
+/// table.append_batch(&[Some(7), None, Some(-2)])?;
+///
+/// let sum = execute_scalar_sum(
+///     "readings",
+///     &table,
+///     &statement,
+///     AggregateLimits::new(3, 3),
+/// )?;
+/// assert_eq!(sum, Some(5));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn execute_scalar_sum(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &ScalarSumStatement,
+    limits: AggregateLimits,
+) -> Result<Option<i64>, SelectExecutionError> {
+    if statement.table_name().as_str() != expected_table_name {
+        return Err(SelectExecutionError::UnknownTable {
+            name: statement.table_name().as_str().to_owned(),
+        });
+    }
+
+    if statement.column_name().as_str() != table.schema().column().name() {
+        return Err(SelectExecutionError::UnknownColumn {
+            name: statement.column_name().as_str().to_owned(),
+        });
+    }
+
+    let aggregates = aggregate_nullable_i64(table.values(), RowSelection::All, limits)?;
+    Ok(aggregates.sum())
 }
 
 /// Executes one parsed `SELECT` against one explicitly named table.
