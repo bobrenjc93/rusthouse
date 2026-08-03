@@ -183,13 +183,15 @@ struct CatalogEntry {
 /// The borrowed output of one projection and optional comparison scan.
 ///
 /// The result owns only projected column indexes and, for a filtered query, a
-/// compact row-selection bitmap. Schema and column values remain owned by the
-/// catalog's source table.
+/// compact row-selection bitmap. A limit is represented by scalar row bounds;
+/// schema and column values remain owned by the catalog's source table.
 #[derive(Debug)]
 pub struct SelectResult<'a> {
     table: &'a Table,
     field_indices: Vec<usize>,
     selection: Option<RowSelection>,
+    row_end: usize,
+    row_count: usize,
 }
 
 impl<'a> SelectResult<'a> {
@@ -223,7 +225,7 @@ impl<'a> SelectResult<'a> {
 
     /// Iterates over selected zero-based indexes in source table order.
     pub fn selected_rows(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        (0..self.table.len()).filter(|row| match &self.selection {
+        (0..self.row_end).filter(|row| match &self.selection {
             Some(selection) => selection
                 .get(*row)
                 .expect("selection and source table have the same row count"),
@@ -239,9 +241,7 @@ impl<'a> SelectResult<'a> {
     /// Returns the number of selected rows.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.selection
-            .as_ref()
-            .map_or(self.table.len(), RowSelection::selected_count)
+        self.row_count
     }
 
     /// Returns whether no source rows matched the query.
@@ -383,6 +383,7 @@ impl Catalog {
             projections,
             table: name,
             predicate,
+            limit,
         } = statement;
         let table = self
             .tables
@@ -395,11 +396,14 @@ impl Catalog {
             .map(|predicate| table.scan(&predicate.column, predicate.operator, &predicate.value))
             .transpose()
             .map_err(|source| CatalogError::TableScan { name, source })?;
+        let (row_end, row_count) = limited_row_bounds(table.len(), selection.as_ref(), limit);
 
         Ok(SelectResult {
             table,
             field_indices,
             selection,
+            row_end,
+            row_count,
         })
     }
 
@@ -445,6 +449,26 @@ impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
+
+fn limited_row_bounds(
+    table_rows: usize,
+    selection: Option<&RowSelection>,
+    limit: Option<usize>,
+) -> (usize, usize) {
+    let selected_count = selection.map_or(table_rows, RowSelection::selected_count);
+    let row_count = limit.map_or(selected_count, |limit| selected_count.min(limit));
+    let row_end = match selection {
+        None => row_count,
+        Some(_) if row_count == 0 => 0,
+        Some(selection) if row_count < selected_count => selection
+            .selected_rows()
+            .nth(row_count - 1)
+            .map_or(0, |row| row + 1),
+        Some(_) => table_rows,
+    };
+
+    (row_end, row_count)
 }
 
 impl Default for Catalog {
