@@ -22,18 +22,19 @@
 //! `.rhsnap-<destination-id>-<process-id>-<sequence>.tmp` sibling, locks and
 //! syncs that file, atomically renames it over the destination, and syncs the
 //! parent directory on Unix. A per-destination `.rhsnap-<destination-id>.lock`
-//! file serializes temporary-file allocation and orphan reclamation, while
-//! payload writes and unrelated destinations remain independent. The next
-//! writer for a destination removes its unlocked temporary files abandoned by
-//! dead writers, never a live writer's file or another destination's files.
-//! File names beginning with `.rhsnap-` (ASCII case-insensitively) are reserved
-//! for this protocol and rejected as snapshot destinations. The last rename
-//! determines the visible snapshot.
+//! file serializes temporary-file allocation for one spelling of a destination,
+//! while payload writes and unrelated destinations remain independent. A new
+//! temporary becomes reclaimable only after its file lock is held. Every writer
+//! may therefore remove accessible, unlocked temporaries abandoned by dead
+//! writers regardless of destination spelling, while live or inaccessible
+//! files are left untouched. File names beginning with `.rhsnap-` (ASCII
+//! case-insensitively) are reserved for this protocol and rejected as snapshot
+//! destinations. The last rename determines the visible snapshot.
 
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -409,11 +410,11 @@ fn create_sibling_temporary_file(
     coordinator
         .lock()
         .map_err(|source| io_failure("lock temporary coordinator", &coordinator_path, source))?;
-    reclaim_orphaned_temporary_files(parent, destination_id)?;
+    reclaim_orphaned_temporary_files(parent);
 
     loop {
         let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temporary_path = parent.join(temporary_file_name(
+        let staging_path = parent.join(staging_file_name(
             destination_id,
             std::process::id(),
             sequence,
@@ -422,11 +423,11 @@ fn create_sibling_temporary_file(
         match OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary_path)
+            .open(&staging_path)
         {
             Ok(file) => {
-                let temporary = OwnedTemporaryFile {
-                    path: temporary_path,
+                let mut temporary = OwnedTemporaryFile {
+                    path: staging_path,
                     file,
                     published: false,
                 };
@@ -434,11 +435,20 @@ fn create_sibling_temporary_file(
                     .file
                     .lock()
                     .map_err(|source| io_failure("lock temporary", &temporary.path, source))?;
+                let temporary_path = parent.join(temporary_file_name(
+                    destination_id,
+                    std::process::id(),
+                    sequence,
+                ));
+                fs::rename(&temporary.path, &temporary_path).map_err(|source| {
+                    io_failure("make temporary reclaimable", &temporary_path, source)
+                })?;
+                temporary.path = temporary_path;
                 return Ok((parent.to_path_buf(), temporary));
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
-                return Err(io_failure("create temporary", &temporary_path, source));
+                return Err(io_failure("create temporary", &staging_path, source));
             }
         }
     }
@@ -486,53 +496,37 @@ fn temporary_file_name(destination_id: u128, process_id: u32, sequence: u64) -> 
     )
 }
 
-fn reclaim_orphaned_temporary_files(
-    parent: &Path,
-    destination_id: u128,
-) -> Result<(), SnapshotError> {
-    let entries = fs::read_dir(parent)
-        .map_err(|source| io_failure("scan temporary directory", parent, source))?;
+fn staging_file_name(destination_id: u128, process_id: u32, sequence: u64) -> String {
+    format!(
+        "{TEMPORARY_FILE_PREFIX}staging-{destination_id:032x}-{process_id:08x}-{sequence:016x}{TEMPORARY_FILE_SUFFIX}"
+    )
+}
+
+fn reclaim_orphaned_temporary_files(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
     for entry in entries {
-        let entry =
-            entry.map_err(|source| io_failure("inspect temporary directory", parent, source))?;
-        if snapshot_temporary_file_destination_id(&entry.file_name()) != Some(destination_id) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if snapshot_temporary_file_destination_id(&entry.file_name()).is_none() {
             continue;
         }
 
         let temporary_path = entry.path();
-        let file = match OpenOptions::new()
+        let Ok(file) = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&temporary_path)
-        {
-            Ok(file) => file,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(io_failure("open orphan candidate", &temporary_path, source));
-            }
+        else {
+            continue;
         };
-
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => continue,
-            Err(TryLockError::Error(source)) => {
-                return Err(io_failure("lock orphan candidate", &temporary_path, source));
-            }
+        if file.try_lock().is_err() {
+            continue;
         }
-
-        match fs::remove_file(&temporary_path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(io_failure(
-                    "remove orphaned temporary",
-                    &temporary_path,
-                    source,
-                ));
-            }
-        }
+        let _ = fs::remove_file(&temporary_path);
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -829,43 +823,37 @@ mod tests {
     #[test]
     fn reclaims_a_temporary_file_left_by_an_interrupted_process() {
         let directory = TestDirectory::new("interrupted-writer");
-        let ready_path = directory.0.join("child.ready");
-        let mut child = Command::new(std::env::current_exe().expect("locate test executable"))
-            .args([
-                "--exact",
-                "snapshot::tests::interrupted_writer_child_process",
-            ])
-            .env(INTERRUPTED_WRITER_DIRECTORY, &directory.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start interrupted writer child");
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ready_path.exists() {
-            if let Some(status) = child.try_wait().expect("inspect child process") {
-                panic!("interrupted writer exited before it was killed: {status}");
-            }
-            if Instant::now() >= deadline {
-                child.kill().expect("kill timed-out child process");
-                child.wait().expect("reap timed-out child process");
-                panic!("interrupted writer did not become ready");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        child.kill().expect("kill writer process");
-        let status = child.wait().expect("reap writer process");
-        assert!(!status.success());
-        fs::remove_file(&ready_path).expect("remove child readiness marker");
-        assert_eq!(snapshot_temporary_files(&directory.0).len(), 1);
+        leave_interrupted_writer_temporary(&directory);
 
         let path = directory.snapshot();
         let store = SnapshotStore::new(32);
         store.write(&path, b"recovered").expect("recover snapshot");
 
         assert_eq!(store.read(&path).expect("reopen snapshot"), b"recovered");
+        assert!(snapshot_temporary_files(&directory.0).is_empty());
+    }
+
+    #[test]
+    fn reclaims_an_interrupted_temporary_when_the_next_path_uses_different_case() {
+        let directory = TestDirectory::new("interrupted-writer-case-alias");
+        leave_interrupted_writer_temporary(&directory);
+
+        let original_path = directory.snapshot();
+        let alias_path = directory.0.join("STATE.SNAPSHOT");
+        assert_ne!(
+            destination_id(original_path.file_name().unwrap()),
+            destination_id(alias_path.file_name().unwrap())
+        );
+
+        let store = SnapshotStore::new(32);
+        store
+            .write(&alias_path, b"recovered through alias")
+            .expect("recover through differently cased path");
+
+        assert_eq!(
+            store.read(&alias_path).expect("reopen alias snapshot"),
+            b"recovered through alias"
+        );
         assert!(snapshot_temporary_files(&directory.0).is_empty());
     }
 
@@ -1140,6 +1128,40 @@ mod tests {
                     .is_some_and(is_snapshot_temporary_file_name)
             })
             .collect()
+    }
+
+    fn leave_interrupted_writer_temporary(directory: &TestDirectory) {
+        let ready_path = directory.0.join("child.ready");
+        let mut child = Command::new(std::env::current_exe().expect("locate test executable"))
+            .args([
+                "--exact",
+                "snapshot::tests::interrupted_writer_child_process",
+            ])
+            .env(INTERRUPTED_WRITER_DIRECTORY, &directory.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start interrupted writer child");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready_path.exists() {
+            if let Some(status) = child.try_wait().expect("inspect child process") {
+                panic!("interrupted writer exited before it was killed: {status}");
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill timed-out child process");
+                child.wait().expect("reap timed-out child process");
+                panic!("interrupted writer did not become ready");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        child.kill().expect("kill writer process");
+        let status = child.wait().expect("reap writer process");
+        assert!(!status.success());
+        fs::remove_file(&ready_path).expect("remove child readiness marker");
+        assert_eq!(snapshot_temporary_files(&directory.0).len(), 1);
     }
 
     #[cfg(unix)]
