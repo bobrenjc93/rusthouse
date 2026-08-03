@@ -320,7 +320,9 @@ fn is_catalog_limit(error: &CatalogError) -> bool {
         | CatalogError::TableLimitExceeded { .. }
         | CatalogError::AggregateResultTooLarge { .. }
         | CatalogError::TableGrouping {
-            source: GroupedCountError::GroupLimitExceeded { .. },
+            source:
+                GroupedCountError::GroupLimitExceeded { .. }
+                | GroupedCountError::StringResultTooLarge { .. },
             ..
         } => true,
         _ => false,

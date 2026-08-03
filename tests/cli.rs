@@ -612,6 +612,45 @@ fn reports_the_group_limit_as_a_cli_resource_limit() {
 }
 
 #[test]
+fn reports_the_grouped_string_byte_limit_as_a_cli_resource_limit() {
+    let limits = CatalogLimits::default().with_max_grouped_result_bytes(3);
+    let mut catalog = Catalog::with_limits(limits);
+    catalog
+        .execute_create("CREATE TABLE groups (key String)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO groups VALUES ('abc'), ('de'), ('abc')")
+        .unwrap();
+
+    execute_batch(
+        Cursor::new(b"SELECT key, COUNT(*) FROM groups WHERE key = 'abc' GROUP BY key\n"),
+        &mut catalog,
+    )
+    .unwrap();
+
+    let error = execute_batch(
+        Cursor::new(b"SELECT key, COUNT(*) FROM groups GROUP BY key\n"),
+        &mut catalog,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 3);
+    assert!(matches!(
+        error,
+        BatchError::ExecutionLimit {
+            line: 1,
+            source: CatalogError::TableGrouping {
+                source: GroupedCountError::StringResultTooLarge {
+                    limit: 3,
+                    required: 5,
+                    ..
+                },
+                ..
+            },
+        }
+    ));
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],

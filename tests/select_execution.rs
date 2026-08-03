@@ -318,6 +318,45 @@ fn grouped_counts_enforce_the_catalog_group_limit_without_truncating() {
 }
 
 #[test]
+fn grouped_string_results_enforce_the_exact_total_byte_limit() {
+    let limits = CatalogLimits::default().with_max_grouped_result_bytes(4);
+    let mut catalog = Catalog::with_limits(limits);
+    catalog
+        .execute_create("CREATE TABLE groups (key String)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO groups VALUES ('pear'), ('fig'), ('pear')")
+        .unwrap();
+
+    let exact = catalog
+        .execute_select("SELECT key, COUNT(*) FROM groups WHERE key = 'pear' GROUP BY key")
+        .unwrap();
+    assert_eq!(
+        exact.grouped_rows().collect::<Vec<_>>(),
+        [(&Value::String("pear".to_owned()), 2)]
+    );
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT key, COUNT(*) FROM groups GROUP BY key")
+            .unwrap_err(),
+        CatalogError::TableGrouping {
+            name: "groups".to_owned(),
+            source: rusthouse::GroupedCountError::StringResultTooLarge {
+                field: "key".to_owned(),
+                limit: 4,
+                required: 7,
+            },
+        }
+    );
+
+    let empty = catalog
+        .execute_select("SELECT key, COUNT(*) FROM groups WHERE key = 'missing' GROUP BY key")
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn unions_intersected_groups_across_packed_bitmap_boundaries() {
     let mut catalog = Catalog::new();
     catalog

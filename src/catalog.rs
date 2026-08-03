@@ -23,6 +23,8 @@ use crate::{RowSelection, ScanError};
 pub const DEFAULT_MAX_TABLES: usize = 1024;
 /// Default maximum number of distinct groups produced by one grouped query.
 pub const DEFAULT_MAX_GROUPS: usize = 100_000;
+/// Default maximum retained String payload bytes in one grouped result.
+pub const DEFAULT_MAX_GROUPED_RESULT_BYTES: usize = 1024 * 1024;
 /// Maximum retained String payload bytes in one scalar aggregate row.
 pub const MAX_AGGREGATE_RESULT_BYTES: usize = 1024 * 1024;
 
@@ -41,6 +43,8 @@ pub struct CatalogLimits {
     pub max_rows_per_table: usize,
     /// Maximum number of distinct groups produced by one `SELECT`.
     pub max_groups_per_query: usize,
+    /// Maximum total String payload bytes retained by a grouped result.
+    pub max_grouped_result_bytes: usize,
 }
 
 impl CatalogLimits {
@@ -54,6 +58,7 @@ impl CatalogLimits {
             max_tables,
             max_rows_per_table,
             max_groups_per_query: DEFAULT_MAX_GROUPS,
+            max_grouped_result_bytes: DEFAULT_MAX_GROUPED_RESULT_BYTES,
         }
     }
 
@@ -75,6 +80,13 @@ impl CatalogLimits {
     #[must_use]
     pub const fn with_max_groups_per_query(mut self, max_groups_per_query: usize) -> Self {
         self.max_groups_per_query = max_groups_per_query;
+        self
+    }
+
+    /// Replaces the total String payload byte limit for one grouped result.
+    #[must_use]
+    pub const fn with_max_grouped_result_bytes(mut self, max_grouped_result_bytes: usize) -> Self {
+        self.max_grouped_result_bytes = max_grouped_result_bytes;
         self
     }
 }
@@ -755,8 +767,9 @@ impl Catalog {
     /// groups. For row projections, unlimited `ORDER BY` owns and sorts all
     /// selected row indexes, while `ORDER BY ... LIMIT k` retains at most `k`
     /// indexes. Scalar aggregate rows retain at most
-    /// [`MAX_AGGREGATE_RESULT_BYTES`] of String payloads. `LIMIT` is applied to
-    /// the final projected or aggregate output.
+    /// [`MAX_AGGREGATE_RESULT_BYTES`] of String payloads. Grouped results retain
+    /// at most [`CatalogLimits::max_grouped_result_bytes`] of owned String key
+    /// payloads. `LIMIT` is applied to the final projected or aggregate output.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -780,6 +793,7 @@ impl Catalog {
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
         let aggregate_result_byte_limit = MAX_AGGREGATE_RESULT_BYTES;
         let max_groups = self.limits.max_groups_per_query;
+        let grouped_result_byte_limit = self.limits.max_grouped_result_bytes;
 
         match projections {
             SelectProjection::CountAll { alias } => execute_aggregates(
@@ -810,7 +824,15 @@ impl Catalog {
                 if limit.is_some() {
                     return Err(CatalogError::GroupedLimitUnsupported);
                 }
-                execute_grouped_count(table, &name, predicate_groups, max_groups, key, alias)
+                execute_grouped_count(
+                    table,
+                    &name,
+                    predicate_groups,
+                    max_groups,
+                    grouped_result_byte_limit,
+                    key,
+                    alias,
+                )
             }
             projections => {
                 let field_indices = resolve_projection(table, projections)?;
@@ -942,12 +964,13 @@ fn execute_grouped_count<'a>(
     table_name: &str,
     predicate_groups: Vec<Vec<ComparisonPredicate>>,
     max_groups: usize,
+    max_string_bytes: usize,
     key: String,
     alias: Option<String>,
 ) -> Result<SelectResult<'a>, CatalogError> {
     let selection = scan_predicate_groups(table, predicate_groups, table_name)?;
     let groups = table
-        .grouped_count(&key, selection.as_ref(), max_groups)
+        .grouped_count_with_string_limit(&key, selection.as_ref(), max_groups, max_string_bytes)
         .map_err(|source| CatalogError::TableGrouping {
             name: table_name.to_owned(),
             source,
