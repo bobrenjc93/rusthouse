@@ -8,10 +8,11 @@ use crate::scan::RowSelection;
 use crate::storage::Column;
 use crate::{DataType, Table, Value};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
-/// A validation or arithmetic error from a table reduction.
+/// A validation, allocation, or arithmetic error from a table reduction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReductionError {
     /// A row selection represents a different number of rows than the table.
@@ -25,6 +26,13 @@ pub enum ReductionError {
     FieldNotFound {
         /// The requested, case-sensitive field name.
         name: String,
+    },
+    /// Memory could not be reserved for distinct-value state.
+    DistinctAllocationFailed {
+        /// Name of the field being reduced.
+        field: String,
+        /// Total number of distinct values requested by the failed insertion.
+        requested_values: usize,
     },
     /// A numeric reduction was requested for a nonnumeric column.
     NonNumericColumn {
@@ -69,6 +77,13 @@ impl fmt::Display for ReductionError {
                 "selection represents {selection_rows} rows; table contains {table_rows} rows"
             ),
             Self::FieldNotFound { name } => write!(formatter, "field `{name}` does not exist"),
+            Self::DistinctAllocationFailed {
+                field,
+                requested_values,
+            } => write!(
+                formatter,
+                "could not reserve storage for {requested_values} distinct values of field `{field}`"
+            ),
             Self::NonNumericColumn { field, data_type } => {
                 write!(formatter, "field `{field}` has nonnumeric type {data_type}")
             }
@@ -104,6 +119,28 @@ impl Table {
     pub fn count(&self, selection: Option<&RowSelection>) -> Result<usize, ReductionError> {
         validate_selection(self.len(), selection)?;
         Ok(selection.map_or_else(|| self.len(), RowSelection::selected_count))
+    }
+
+    /// Counts distinct values of one column over all or selected rows.
+    ///
+    /// Every physical column type is supported. `Float64` values use the same
+    /// key identity as [`f64::total_cmp`]: signed zeroes are distinct, while
+    /// otherwise identical NaN bit patterns compare as one value and NaN sign,
+    /// payload, and signaling state participate in identity. String keys
+    /// borrow their stored values instead of copying them. Distinct state is
+    /// allocated fallibly and grows with distinct cardinality rather than row
+    /// count. Empty inputs return zero.
+    pub fn count_distinct(
+        &self,
+        field: &str,
+        selection: Option<&RowSelection>,
+    ) -> Result<usize, ReductionError> {
+        validate_selection(self.len(), selection)?;
+        let column = self.reduction_column(field)?;
+        match selection {
+            Some(selection) => count_distinct_column(field, column, selection.selected_rows()),
+            None => count_distinct_column(field, column, 0..self.len()),
+        }
     }
 
     /// Sums an `Int64` or `Float64` column over all or selected rows.
@@ -293,6 +330,72 @@ fn validate_selection(
         });
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DistinctKey<'a> {
+    Int64(i64),
+    Float64(u64),
+    Bool(bool),
+    String(&'a str),
+}
+
+fn count_distinct_column(
+    field: &str,
+    column: &Column,
+    rows: impl Iterator<Item = usize>,
+) -> Result<usize, ReductionError> {
+    match column {
+        Column::Int64(values) => {
+            count_distinct_keys(field, rows.map(|row| DistinctKey::Int64(values[row])))
+        }
+        Column::Float64(values) => count_distinct_keys(
+            field,
+            rows.map(|row| DistinctKey::Float64(values[row].to_bits())),
+        ),
+        Column::Bool(values) => {
+            count_distinct_keys(field, rows.map(|row| DistinctKey::Bool(values[row] != 0)))
+        }
+        Column::String(values) => {
+            count_distinct_keys(field, rows.map(|row| DistinctKey::String(&values[row])))
+        }
+    }
+}
+
+fn count_distinct_keys<'a>(
+    field: &str,
+    keys: impl IntoIterator<Item = DistinctKey<'a>>,
+) -> Result<usize, ReductionError> {
+    let mut distinct = HashSet::new();
+    for key in keys {
+        if distinct.contains(&key) {
+            continue;
+        }
+        let requested_values = distinct.len().checked_add(1).ok_or_else(|| {
+            ReductionError::DistinctAllocationFailed {
+                field: field.to_owned(),
+                requested_values: usize::MAX,
+            }
+        })?;
+        reserve_distinct_keys(&mut distinct, 1, field, requested_values)?;
+        let inserted = distinct.insert(key);
+        debug_assert!(inserted);
+    }
+    Ok(distinct.len())
+}
+
+fn reserve_distinct_keys(
+    distinct: &mut HashSet<DistinctKey<'_>>,
+    additional: usize,
+    field: &str,
+    requested_values: usize,
+) -> Result<(), ReductionError> {
+    distinct
+        .try_reserve(additional)
+        .map_err(|_| ReductionError::DistinctAllocationFailed {
+            field: field.to_owned(),
+            requested_values,
+        })
 }
 
 fn sum_int64(
@@ -496,4 +599,21 @@ fn extreme_index<T>(
         }
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_distinct_capacity_allocation_errors() {
+        let mut distinct = HashSet::new();
+        assert_eq!(
+            reserve_distinct_keys(&mut distinct, usize::MAX, "key", usize::MAX),
+            Err(ReductionError::DistinctAllocationFailed {
+                field: "key".to_owned(),
+                requested_values: usize::MAX,
+            })
+        );
+    }
 }
