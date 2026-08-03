@@ -1,10 +1,14 @@
 //! Versioned, bounded snapshot envelopes and nullable `Int64` row payloads.
 //!
-//! This module does not serialize a catalog or perform filesystem I/O. See
+//! This module does not serialize a catalog. It can create and sync a new
+//! envelope file without replacing an existing destination. See
 //! `docs/snapshot-format.md` for the stable binary layouts.
 
 use std::error::Error;
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::Path;
 
 /// Magic bytes at the start of every RustHouse snapshot envelope.
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"RHOUSESN";
@@ -97,6 +101,39 @@ impl fmt::Display for SnapshotError {
 }
 
 impl Error for SnapshotError {}
+
+/// An error produced while creating a new snapshot envelope file.
+#[derive(Debug)]
+pub enum SnapshotFileError {
+    /// The payload could not be encoded before filesystem access began.
+    Encode(SnapshotError),
+    /// The destination could not be exclusively created.
+    Create(io::Error),
+    /// The complete encoded envelope could not be written.
+    Write(io::Error),
+    /// The newly written file could not be synchronized to storage.
+    Sync(io::Error),
+}
+
+impl fmt::Display for SnapshotFileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode(error) => write!(formatter, "could not encode snapshot: {error}"),
+            Self::Create(error) => write!(formatter, "could not create snapshot file: {error}"),
+            Self::Write(error) => write!(formatter, "could not write snapshot file: {error}"),
+            Self::Sync(error) => write!(formatter, "could not sync snapshot file: {error}"),
+        }
+    }
+}
+
+impl Error for SnapshotFileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::Create(error) | Self::Write(error) | Self::Sync(error) => Some(error),
+        }
+    }
+}
 
 /// An error produced while encoding or decoding nullable `Int64` rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +425,29 @@ impl SnapshotCodec {
         envelope.extend_from_slice(payload);
 
         Ok(envelope)
+    }
+
+    /// Encodes `payload`, then creates, writes, and syncs a new envelope file.
+    ///
+    /// Encoding and payload-size validation finish before the destination is
+    /// opened. File creation is exclusive, so an existing destination is
+    /// returned as a [`SnapshotFileError::Create`] error and is never replaced
+    /// or truncated.
+    pub fn create_new_file(
+        self,
+        path: impl AsRef<Path>,
+        payload: &[u8],
+    ) -> Result<(), SnapshotFileError> {
+        let envelope = self.encode(payload).map_err(SnapshotFileError::Encode)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(SnapshotFileError::Create)?;
+
+        file.write_all(&envelope)
+            .map_err(SnapshotFileError::Write)?;
+        file.sync_all().map_err(SnapshotFileError::Sync)
     }
 
     /// Validates an envelope and returns its borrowed payload.

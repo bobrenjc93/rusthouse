@@ -14,7 +14,121 @@ fn parses_casing_whitespace_and_optional_semicolon() {
 
         assert_eq!(statement.column_name().as_str(), column_name, "{input:?}");
         assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
+        assert_eq!(statement.predicate(), None, "{input:?}");
         assert_eq!(statement.limit(), None, "{input:?}");
+    }
+}
+
+#[test]
+fn parses_where_equality_casing_whitespace_bounds_and_limit() {
+    let cases = [
+        ("SELECT value FROM events WHERE value = 7", 7, None),
+        ("select value from events where value=-9;", -9, None),
+        (
+            " SELECT value FROM events WhErE value = +0 LIMIT 2 ; ",
+            0,
+            Some(2),
+        ),
+        (
+            "SELECT value FROM events WHERE value = -9223372036854775808",
+            i64::MIN,
+            None,
+        ),
+        (
+            "SELECT value FROM events WHERE value=9223372036854775807;",
+            i64::MAX,
+            None,
+        ),
+    ];
+
+    for (input, value, limit) in cases {
+        let statement = parse_select(input, ParseLimits::default()).unwrap();
+        let predicate = statement.predicate().unwrap();
+
+        assert_eq!(predicate.column_name().as_str(), "value", "{input:?}");
+        assert_eq!(predicate.value(), value, "{input:?}");
+        assert_eq!(statement.limit(), limit, "{input:?}");
+    }
+}
+
+#[test]
+fn rejects_invalid_and_overflowing_where_literals_with_byte_offsets() {
+    let invalid = [
+        "SELECT c FROM t WHERE c = ",
+        "SELECT c FROM t WHERE c = NULL",
+        "SELECT c FROM t WHERE c = --1",
+    ];
+
+    for input in invalid {
+        let offset = input.find("= ").unwrap() + 2;
+        assert_eq!(
+            parse_select(input, ParseLimits::default()),
+            Err(ParseError::InvalidInt64 { offset }),
+            "{input:?}"
+        );
+    }
+
+    let input = "SELECT c FROM t WHERE c = 1.5";
+    assert_eq!(
+        parse_select(input, ParseLimits::default()),
+        Err(ParseError::InvalidInt64 {
+            offset: input.find('.').unwrap(),
+        })
+    );
+
+    for input in [
+        "SELECT c FROM t WHERE c = -9223372036854775809",
+        "SELECT c FROM t WHERE c = 9223372036854775808",
+    ] {
+        assert_eq!(
+            parse_select(input, ParseLimits::default()),
+            Err(ParseError::Int64Overflow {
+                offset: input.find("= ").unwrap() + 2,
+            }),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn bounds_the_where_identifier_and_rejects_malformed_predicates() {
+    let input = "SELECT c FROM t WHERE column123 = 1";
+    assert_eq!(
+        parse_select(input, ParseLimits::new(input.len(), 8)),
+        Err(ParseError::IdentifierTooLong {
+            offset: input.find("column123").unwrap(),
+            bytes: 9,
+            max_bytes: 8,
+        })
+    );
+
+    let cases = [
+        (
+            "SELECT c FROM t WHERE ",
+            ParseError::UnexpectedInput {
+                offset: 22,
+                expected: "identifier",
+            },
+        ),
+        (
+            "SELECT c FROM t WHERE c 1",
+            ParseError::UnexpectedInput {
+                offset: 24,
+                expected: "'='",
+            },
+        ),
+        (
+            "SELECT c FROM t WHERE c == 1",
+            ParseError::InvalidInt64 { offset: 25 },
+        ),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(
+            parse_select(input, ParseLimits::default()),
+            Err(expected),
+            "{input:?}"
+        );
     }
 }
 
