@@ -1,8 +1,10 @@
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::process::{Command, Output, Stdio};
 
-use rusthouse::DEFAULT_MAX_TABLES;
-use rusthouse::cli::{MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES};
+use rusthouse::cli::{
+    BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
+};
+use rusthouse::{Catalog, DEFAULT_MAX_TABLES};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
 
@@ -181,4 +183,9 @@ fn enforces_the_total_stdin_byte_bound() {
             "rusthouse: input limit exceeded on line 16: stdin exceeds {MAX_BATCH_BYTES} bytes\n"
         )
     );
+
+    let mut input = Cursor::new(input);
+    let error = execute_batch(&mut input, &mut Catalog::new()).unwrap_err();
+    assert!(matches!(error, BatchError::BatchTooLarge { .. }));
+    assert_eq!(input.position(), MAX_BATCH_BYTES as u64 + 1);
 }

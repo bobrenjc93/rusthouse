@@ -10,7 +10,7 @@ use crate::{Catalog, CatalogError, ParseErrorKind, TableError};
 pub const MAX_BATCH_STATEMENTS: usize = 10_000;
 /// Maximum number of bytes accepted for one statement, excluding its line ending.
 pub const MAX_STATEMENT_BYTES: usize = 1024 * 1024;
-/// Maximum number of bytes read from stdin in one process invocation.
+/// Maximum number of stdin bytes accepted in one process invocation.
 pub const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 /// Exit status used for malformed supported statements and execution failures.
@@ -178,10 +178,13 @@ pub fn execute_batch<R: BufRead>(
 
     loop {
         line_number += 1;
+        let remaining_batch_bytes = MAX_BATCH_BYTES - total_bytes;
         let bytes_read =
-            read_bounded_line(&mut input, &mut line).map_err(|source| BatchError::InputRead {
-                line: line_number,
-                source,
+            read_bounded_line(&mut input, &mut line, remaining_batch_bytes).map_err(|source| {
+                BatchError::InputRead {
+                    line: line_number,
+                    source,
+                }
             })?;
         if bytes_read == 0 {
             break;
@@ -267,9 +270,15 @@ fn is_catalog_limit(error: &CatalogError) -> bool {
     }
 }
 
-fn read_bounded_line<R: BufRead>(input: &mut R, line: &mut Vec<u8>) -> io::Result<usize> {
+fn read_bounded_line<R: BufRead>(
+    input: &mut R,
+    line: &mut Vec<u8>,
+    remaining_batch_bytes: usize,
+) -> io::Result<usize> {
     line.clear();
-    let read_limit = MAX_STATEMENT_BYTES as u64 + 2;
+    let statement_read_limit = MAX_STATEMENT_BYTES + 2;
+    let batch_read_limit = remaining_batch_bytes.saturating_add(1);
+    let read_limit = statement_read_limit.min(batch_read_limit) as u64;
     std::io::Read::take(input, read_limit).read_until(b'\n', line)
 }
 
