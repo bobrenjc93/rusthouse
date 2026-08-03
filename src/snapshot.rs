@@ -446,10 +446,11 @@ fn validate_snapshot_path(path: &Path) -> Result<(), SnapshotError> {
             ),
         )
     })?;
-    if file_name.to_str().is_some_and(|name| {
-        name.get(..TEMPORARY_FILE_PREFIX.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TEMPORARY_FILE_PREFIX))
-    }) {
+    if file_name
+        .as_encoded_bytes()
+        .get(..TEMPORARY_FILE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TEMPORARY_FILE_PREFIX.as_bytes()))
+    {
         return Err(SnapshotError::ReservedPath {
             path: path.to_path_buf(),
         });
@@ -699,6 +700,27 @@ mod tests {
                 b"unrelated data"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_names_in_the_reserved_internal_namespace() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = TestDirectory::new("non-utf8-reserved-namespace");
+        let store = SnapshotStore::new(32);
+        let path = directory
+            .0
+            .join(std::ffi::OsString::from_vec(b".rhsnap-\xff".to_vec()));
+
+        assert!(
+            matches!(store.write(&path, b"snapshot"), Err(SnapshotError::ReservedPath { path: found }) if found == path)
+        );
+        assert!(
+            matches!(store.read(&path), Err(SnapshotError::ReservedPath { path: found }) if found == path)
+        );
+        assert!(!directory.0.join(TEMPORARY_COORDINATOR_NAME).exists());
+        assert!(snapshot_temporary_files(&directory.0).is_empty());
     }
 
     #[test]
