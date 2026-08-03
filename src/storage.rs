@@ -118,7 +118,7 @@ impl fmt::Display for SchemaError {
 
 impl Error for SchemaError {}
 
-/// An owned cell value accepted by [`Table::insert_row`].
+/// An owned cell value accepted by [`Table::insert_row`] and [`Table::insert_rows`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// A signed 64-bit integer.
@@ -367,6 +367,50 @@ impl Table {
 
     /// Inserts a row after validating the entire row without mutation.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<(), InsertError> {
+        self.validate_row(&row)?;
+
+        if self.row_count >= self.row_limit {
+            return Err(InsertError::RowLimitExceeded {
+                limit: self.row_limit,
+            });
+        }
+
+        self.append_row(row);
+        self.row_count += 1;
+
+        Ok(())
+    }
+
+    /// Atomically inserts a batch of rows.
+    ///
+    /// Every row is validated in batch order before the table is mutated. The
+    /// entire batch is rejected if a row is invalid or the batch is larger
+    /// than the table's remaining capacity.
+    pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<(), InsertRowsError> {
+        for (row_index, row) in rows.iter().enumerate() {
+            self.validate_row(row)
+                .map_err(|source| InsertRowsError::InvalidRow { row_index, source })?;
+        }
+
+        let remaining = self.row_limit - self.row_count;
+        if rows.len() > remaining {
+            return Err(InsertRowsError::RowLimitExceeded {
+                limit: self.row_limit,
+                remaining,
+                attempted: rows.len(),
+            });
+        }
+
+        let inserted = rows.len();
+        for row in rows {
+            self.append_row(row);
+        }
+        self.row_count += inserted;
+
+        Ok(())
+    }
+
+    fn validate_row(&self, row: &[Value]) -> Result<(), InsertError> {
         if row.len() != self.schema.len() {
             return Err(InsertError::ArityMismatch {
                 expected: self.schema.len(),
@@ -374,8 +418,7 @@ impl Table {
             });
         }
 
-        for (column_index, (definition, value)) in
-            self.schema.columns().iter().zip(&row).enumerate()
+        for (column_index, (definition, value)) in self.schema.columns().iter().zip(row).enumerate()
         {
             let actual = value.data_type();
             let expected = definition.data_type();
@@ -389,12 +432,10 @@ impl Table {
             }
         }
 
-        if self.row_count >= self.row_limit {
-            return Err(InsertError::RowLimitExceeded {
-                limit: self.row_limit,
-            });
-        }
+        Ok(())
+    }
 
+    fn append_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             match (column, value) {
                 (Column::Int64(values), Value::Int64(value)) => values.push(value),
@@ -404,9 +445,6 @@ impl Table {
                 _ => unreachable!("row types were validated before mutation"),
             }
         }
-        self.row_count += 1;
-
-        Ok(())
     }
 }
 
@@ -452,3 +490,51 @@ impl fmt::Display for InsertError {
 }
 
 impl Error for InsertError {}
+
+/// An error that atomically rejects a batch passed to [`Table::insert_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertRowsError {
+    /// A row in the batch failed shape or type validation.
+    InvalidRow {
+        /// The zero-based position of the invalid row within the batch.
+        row_index: usize,
+        /// The validation error for that row.
+        source: InsertError,
+    },
+    /// The complete batch does not fit in the table's remaining capacity.
+    RowLimitExceeded {
+        /// The configured maximum number of rows in the table.
+        limit: usize,
+        /// The number of rows the table could accept before this batch.
+        remaining: usize,
+        /// The number of rows in the rejected batch.
+        attempted: usize,
+    },
+}
+
+impl fmt::Display for InsertRowsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRow { row_index, source } => {
+                write!(formatter, "row {row_index} is invalid: {source}")
+            }
+            Self::RowLimitExceeded {
+                limit,
+                remaining,
+                attempted,
+            } => write!(
+                formatter,
+                "batch contains {attempted} rows but table limit {limit} leaves capacity for {remaining}"
+            ),
+        }
+    }
+}
+
+impl Error for InsertRowsError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidRow { source, .. } => Some(source),
+            Self::RowLimitExceeded { .. } => None,
+        }
+    }
+}

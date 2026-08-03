@@ -17,7 +17,8 @@ pub use sql::{
     SqlError, SqlErrorKind, execute_batch,
 };
 pub use storage::{
-    Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value, ValueRef,
+    Column, ColumnSchema, DataType, InsertError, InsertRowsError, Schema, SchemaError, Table,
+    Value, ValueRef,
 };
 
 /// Returns the product name.
