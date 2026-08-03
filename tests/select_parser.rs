@@ -1,5 +1,6 @@
 use rusthouse::{
-    NullOrder, OrderDirection, ParseError, ParseLimits, parse_create_table, parse_select,
+    ComparisonOperator, NullOrder, OrderDirection, ParseError, ParseLimits, parse_create_table,
+    parse_select,
 };
 
 #[test]
@@ -78,32 +79,69 @@ fn order_by_requires_every_explicit_component_and_a_limit() {
 }
 
 #[test]
-fn parses_where_equality_casing_whitespace_bounds_and_limit() {
+fn parses_every_where_comparison_operator() {
     let cases = [
-        ("SELECT value FROM events WHERE value = 7", 7, None),
-        ("select value from events where value=-9;", -9, None),
+        ("=", ComparisonOperator::Eq),
+        ("!=", ComparisonOperator::Ne),
+        ("<>", ComparisonOperator::Ne),
+        ("<", ComparisonOperator::Lt),
+        ("<=", ComparisonOperator::Le),
+        (">", ComparisonOperator::Gt),
+        (">=", ComparisonOperator::Ge),
+    ];
+
+    for (sql_operator, expected) in cases {
+        let input = format!("SELECT value FROM events WHERE value {sql_operator} 7");
+        let statement = parse_select(&input, ParseLimits::default()).unwrap();
+        let predicate = statement.predicate().unwrap();
+
+        assert_eq!(predicate.column_name().as_str(), "value", "{input:?}");
+        assert_eq!(predicate.operator(), expected, "{input:?}");
+        assert_eq!(predicate.value(), 7, "{input:?}");
+    }
+}
+
+#[test]
+fn parses_where_comparison_casing_whitespace_bounds_and_limit() {
+    let cases = [
         (
-            " SELECT value FROM events WhErE value = +0 LIMIT 2 ; ",
+            "SELECT value FROM events WHERE value = 7",
+            ComparisonOperator::Eq,
+            7,
+            None,
+        ),
+        (
+            "select value from events where value!=-9;",
+            ComparisonOperator::Ne,
+            -9,
+            None,
+        ),
+        (
+            " SELECT value FROM events WhErE value >= +0 LIMIT 2 ; ",
+            ComparisonOperator::Ge,
             0,
             Some(2),
         ),
         (
-            "SELECT value FROM events WHERE value = -9223372036854775808",
+            "SELECT value FROM events WHERE value <= -9223372036854775808",
+            ComparisonOperator::Le,
             i64::MIN,
             None,
         ),
         (
-            "SELECT value FROM events WHERE value=9223372036854775807;",
+            "SELECT value FROM events WHERE value<9223372036854775807;",
+            ComparisonOperator::Lt,
             i64::MAX,
             None,
         ),
     ];
 
-    for (input, value, limit) in cases {
+    for (input, operator, value, limit) in cases {
         let statement = parse_select(input, ParseLimits::default()).unwrap();
         let predicate = statement.predicate().unwrap();
 
         assert_eq!(predicate.column_name().as_str(), "value", "{input:?}");
+        assert_eq!(predicate.operator(), operator, "{input:?}");
         assert_eq!(predicate.value(), value, "{input:?}");
         assert_eq!(statement.limit(), limit, "{input:?}");
     }
@@ -149,7 +187,7 @@ fn rejects_invalid_and_overflowing_where_literals_with_byte_offsets() {
 }
 
 #[test]
-fn bounds_the_where_identifier_and_rejects_malformed_predicates() {
+fn bounds_the_where_identifier() {
     let input = "SELECT c FROM t WHERE column123 = 1";
     assert_eq!(
         parse_select(input, ParseLimits::new(input.len(), 8)),
@@ -159,32 +197,31 @@ fn bounds_the_where_identifier_and_rejects_malformed_predicates() {
             max_bytes: 8,
         })
     );
+}
 
-    let cases = [
-        (
-            "SELECT c FROM t WHERE ",
-            ParseError::UnexpectedInput {
-                offset: 22,
-                expected: "identifier",
-            },
-        ),
-        (
-            "SELECT c FROM t WHERE c 1",
-            ParseError::UnexpectedInput {
-                offset: 24,
-                expected: "'='",
-            },
-        ),
-        (
-            "SELECT c FROM t WHERE c == 1",
-            ParseError::InvalidInt64 { offset: 25 },
-        ),
-    ];
+#[test]
+fn rejects_missing_and_malformed_comparison_operators() {
+    let missing_column = "SELECT c FROM t WHERE ";
+    assert_eq!(
+        parse_select(missing_column, ParseLimits::default()),
+        Err(ParseError::UnexpectedInput {
+            offset: 22,
+            expected: "identifier",
+        })
+    );
 
-    for (input, expected) in cases {
+    let prefix = "SELECT c FROM t WHERE c ";
+    for malformed in [
+        "1", "==", "!==", "<<", ">>", "=>", "=<", "><", "<=>", "!", "! =",
+    ] {
+        let input = format!("{prefix}{malformed} 1");
+
         assert_eq!(
-            parse_select(input, ParseLimits::default()),
-            Err(expected),
+            parse_select(&input, ParseLimits::default()),
+            Err(ParseError::UnexpectedInput {
+                offset: prefix.len(),
+                expected: "comparison operator",
+            }),
             "{input:?}"
         );
     }

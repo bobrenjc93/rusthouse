@@ -6,12 +6,17 @@ use std::error::Error;
 use std::fmt;
 
 use crate::execution::{
-    InsertExecutionError, SelectExecutionError, execute_insert as execute_insert_statement,
+    InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError,
+    execute_insert as execute_insert_statement,
+    execute_scalar_count as execute_scalar_count_statement,
+    execute_select_distinct as execute_select_distinct_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    CreateTableStatement, InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits,
-    ScanLimits, Schema, SelectStatement, parse_create_table, parse_insert, parse_select,
+    AggregateLimits, CreateTableStatement, DistinctLimits, InsertStatement, Int64Table,
+    OrderLimits, ParseError, ParseLimits, ScalarCountStatement, ScanLimits, Schema,
+    SelectDistinctStatement, SelectStatement, parse_create_table, parse_insert, parse_scalar_count,
+    parse_select, parse_select_distinct,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -46,6 +51,8 @@ pub enum CatalogError {
     Insert(InsertExecutionError),
     /// A parsed `SELECT` could not be executed.
     Select(SelectExecutionError),
+    /// A parsed `SELECT DISTINCT` could not be executed.
+    SelectDistinct(SelectDistinctExecutionError),
 }
 
 impl fmt::Display for CatalogError {
@@ -61,6 +68,9 @@ impl fmt::Display for CatalogError {
             ),
             Self::Insert(error) => write!(formatter, "could not execute INSERT: {error}"),
             Self::Select(error) => write!(formatter, "could not execute SELECT: {error}"),
+            Self::SelectDistinct(error) => {
+                write!(formatter, "could not execute SELECT DISTINCT: {error}")
+            }
         }
     }
 }
@@ -71,6 +81,7 @@ impl Error for CatalogError {
             Self::Parse(error) => Some(error),
             Self::Insert(error) => Some(error),
             Self::Select(error) => Some(error),
+            Self::SelectDistinct(error) => Some(error),
             Self::TableAlreadyExists { .. } | Self::TableLimitExceeded { .. } => None,
         }
     }
@@ -206,6 +217,33 @@ impl Catalog {
         execute_insert_statement(name, table, statement).map_err(CatalogError::Insert)
     }
 
+    /// Parses and executes one scalar `COUNT` with explicit resource bounds.
+    pub fn execute_scalar_count(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<u64, CatalogError> {
+        let statement = parse_scalar_count(input, parse_limits)?;
+        self.scalar_count(&statement, aggregate_limits)
+    }
+
+    /// Executes a parsed scalar `COUNT` against its exactly named table.
+    pub fn scalar_count(
+        &self,
+        statement: &ScalarCountStatement,
+        limits: AggregateLimits,
+    ) -> Result<u64, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Select(SelectExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_scalar_count_statement(name, table, statement, limits).map_err(CatalogError::Select)
+    }
+
     /// Parses and executes one bounded projection `SELECT` statement.
     pub fn execute_select(
         &self,
@@ -222,7 +260,7 @@ impl Catalog {
         )
     }
 
-    /// Parses and executes a `SELECT` with explicit equality-scan bounds.
+    /// Parses and executes a `SELECT` with explicit comparison-scan bounds.
     pub fn execute_select_with_limits(
         &self,
         input: &str,
@@ -247,7 +285,7 @@ impl Catalog {
         )
     }
 
-    /// Executes a parsed projection `SELECT` with explicit equality-scan bounds.
+    /// Executes a parsed projection `SELECT` with explicit comparison-scan bounds.
     pub fn select_with_limits(
         &self,
         statement: &SelectStatement,
@@ -271,5 +309,33 @@ impl Catalog {
             ),
         )
         .map_err(CatalogError::Select)
+    }
+
+    /// Parses and executes a `SELECT DISTINCT` with explicit resource bounds.
+    pub fn execute_select_distinct(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        distinct_limits: DistinctLimits,
+    ) -> Result<Vec<Option<i64>>, CatalogError> {
+        let statement = parse_select_distinct(input, parse_limits)?;
+        self.select_distinct(&statement, distinct_limits)
+    }
+
+    /// Executes a parsed `SELECT DISTINCT` with explicit resource bounds.
+    pub fn select_distinct(
+        &self,
+        statement: &SelectDistinctStatement,
+        limits: DistinctLimits,
+    ) -> Result<Vec<Option<i64>>, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::SelectDistinct(SelectDistinctExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_select_distinct_statement(name, table, statement, limits)
+            .map_err(CatalogError::SelectDistinct)
     }
 }

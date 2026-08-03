@@ -13,14 +13,16 @@ pub mod scan;
 pub mod snapshot;
 
 pub use aggregate::{
-    AggregateError, AggregateLimits, NullableI64Aggregates, RowSelection, aggregate_nullable_i64,
+    AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
+    aggregate_nullable_i64, count_nullable_i64,
 };
 pub use catalog::{Catalog, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
-    InsertExecutionError, SelectExecutionError, execute_insert, execute_select,
-    execute_select_with_limits, execute_select_with_order_limits,
+    InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError, execute_insert,
+    execute_scalar_count, execute_select, execute_select_distinct, execute_select_with_limits,
+    execute_select_with_order_limits,
 };
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
@@ -28,9 +30,10 @@ pub use grouping::{
 pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64};
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
-    ColumnDefinition, CreateTableStatement, EqualityPredicate, Identifier, InsertStatement,
-    OrderByClause, ParseError, ParseLimits, SelectStatement, parse_create_table, parse_insert,
-    parse_select,
+    ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
+    InsertStatement, OrderByClause, ParseError, ParseLimits, ScalarCountArgument,
+    ScalarCountStatement, SelectDistinctStatement, SelectStatement, parse_create_table,
+    parse_insert, parse_scalar_count, parse_select, parse_select_distinct,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,

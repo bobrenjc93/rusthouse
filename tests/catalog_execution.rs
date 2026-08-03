@@ -1,6 +1,7 @@
 use rusthouse::{
-    Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError, OrderError,
-    ParseError, ParseLimits, ScanError, ScanLimits, SelectExecutionError,
+    AggregateLimits, Catalog, CatalogError, CatalogLimits, DistinctLimits, InsertError,
+    InsertExecutionError, OrderError, ParseError, ParseLimits, ScanError, ScanLimits,
+    SelectExecutionError,
 };
 
 fn catalog(max_tables: usize, max_rows_per_table: usize) -> Catalog {
@@ -43,6 +44,48 @@ fn executes_a_bounded_multi_table_sql_lifecycle() {
             .unwrap()
             .as_ref(),
         &[Some(2)]
+    );
+}
+
+#[test]
+fn combined_select_features_execute_in_one_catalog() {
+    let parse_limits = ParseLimits::default();
+    let mut catalog = catalog(1, 5);
+    catalog
+        .execute_create("CREATE TABLE readings (value Int64 NULL)", parse_limits)
+        .unwrap();
+    for input in [
+        "INSERT INTO readings VALUES (NULL)",
+        "INSERT INTO readings VALUES (-1)",
+        "INSERT INTO readings VALUES (0)",
+        "INSERT INTO readings VALUES (2)",
+        "INSERT INTO readings VALUES (2)",
+    ] {
+        catalog.execute_insert(input, parse_limits).unwrap();
+    }
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT value FROM readings WHERE value >= 0", parse_limits,)
+            .unwrap()
+            .as_ref(),
+        &[Some(0), Some(2), Some(2)]
+    );
+    assert_eq!(
+        catalog.execute_scalar_count(
+            "SELECT COUNT(value) FROM readings",
+            parse_limits,
+            AggregateLimits::new(5, 5),
+        ),
+        Ok(4)
+    );
+    assert_eq!(
+        catalog.execute_select_distinct(
+            "SELECT DISTINCT value FROM readings",
+            parse_limits,
+            DistinctLimits::new(5, 4),
+        ),
+        Ok(vec![None, Some(-1), Some(0), Some(2)])
     );
 }
 

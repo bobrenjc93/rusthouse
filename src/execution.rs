@@ -5,8 +5,10 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ComparisonOperator, InsertError, InsertStatement, Int64Table, OrderError, OrderLimits,
-    ScanError, ScanLimits, SelectStatement, order_nullable_i64, scan_nullable_i64,
+    AggregateError, AggregateLimits, DistinctError, DistinctLimits, InsertError, InsertStatement,
+    Int64Table, OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScanError, ScanLimits,
+    SelectDistinctStatement, SelectStatement, count_nullable_i64, distinct_nullable_i64,
+    order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -42,17 +44,19 @@ impl From<InsertError> for InsertExecutionError {
     }
 }
 
-/// An error produced while executing a parsed [`SelectStatement`].
+/// An error produced while executing a parsed projection or scalar `SELECT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectExecutionError {
     /// The statement names a table other than the one supplied for execution.
     UnknownTable { name: String },
     /// The statement names a column other than the table's only column.
     UnknownColumn { name: String },
-    /// The bounded equality scan rejected the input or result size.
+    /// The bounded comparison scan rejected the input or result size.
     Scan(ScanError),
     /// The bounded top-k order operation rejected the input or requested limit.
     Order(OrderError),
+    /// The bounded aggregate operation rejected the input or selection size.
+    Aggregate(AggregateError),
 }
 
 impl fmt::Display for SelectExecutionError {
@@ -62,6 +66,7 @@ impl fmt::Display for SelectExecutionError {
             Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
             Self::Scan(error) => write!(formatter, "could not scan rows: {error}"),
             Self::Order(error) => write!(formatter, "could not order rows: {error}"),
+            Self::Aggregate(error) => write!(formatter, "could not aggregate rows: {error}"),
         }
     }
 }
@@ -71,6 +76,7 @@ impl Error for SelectExecutionError {
         match self {
             Self::Scan(error) => Some(error),
             Self::Order(error) => Some(error),
+            Self::Aggregate(error) => Some(error),
             Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
         }
     }
@@ -85,6 +91,50 @@ impl From<ScanError> for SelectExecutionError {
 impl From<OrderError> for SelectExecutionError {
     fn from(error: OrderError) -> Self {
         Self::Order(error)
+    }
+}
+
+impl From<AggregateError> for SelectExecutionError {
+    fn from(error: AggregateError) -> Self {
+        Self::Aggregate(error)
+    }
+}
+
+/// An error produced while executing a parsed [`SelectDistinctStatement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectDistinctExecutionError {
+    /// The statement names a table other than the one supplied for execution.
+    UnknownTable { name: String },
+    /// The statement names a column other than the table's only column.
+    UnknownColumn { name: String },
+    /// The bounded distinct operator rejected the input or result size.
+    Distinct(DistinctError),
+}
+
+impl fmt::Display for SelectDistinctExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
+            Self::Distinct(error) => {
+                write!(formatter, "could not compute distinct values: {error}")
+            }
+        }
+    }
+}
+
+impl Error for SelectDistinctExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Distinct(error) => Some(error),
+            Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
+        }
+    }
+}
+
+impl From<DistinctError> for SelectDistinctExecutionError {
+    fn from(error: DistinctError) -> Self {
+        Self::Distinct(error)
     }
 }
 
@@ -127,12 +177,72 @@ pub fn execute_insert(
     table.append(statement.value()).map_err(Into::into)
 }
 
+/// Executes one parsed scalar `COUNT` with explicit resource bounds.
+///
+/// The expected table name and optional column name are compared exactly with
+/// the identifiers retained by the parser, including ASCII case. On a match,
+/// execution delegates to [`count_nullable_i64`]: `COUNT(*)` includes all
+/// rows, while `COUNT(column)` excludes `NULL`. Both aggregate row caps are
+/// supplied explicitly by the caller.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{
+///     AggregateLimits, Int64Table, ParseLimits, Schema, execute_scalar_count,
+///     parse_scalar_count,
+/// };
+///
+/// let statement = parse_scalar_count(
+///     "SELECT COUNT(value) FROM readings",
+///     ParseLimits::default(),
+/// )?;
+/// let mut table = Int64Table::new(Schema::int64("value", true), 2);
+/// table.append_batch(&[Some(7), None])?;
+///
+/// let count = execute_scalar_count(
+///     "readings",
+///     &table,
+///     &statement,
+///     AggregateLimits::new(2, 2),
+/// )?;
+/// assert_eq!(count, 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn execute_scalar_count(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &ScalarCountStatement,
+    limits: AggregateLimits,
+) -> Result<u64, SelectExecutionError> {
+    if statement.table_name().as_str() != expected_table_name {
+        return Err(SelectExecutionError::UnknownTable {
+            name: statement.table_name().as_str().to_owned(),
+        });
+    }
+
+    if let Some(column_name) = statement.column_name() {
+        if column_name.as_str() != table.schema().column().name() {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: column_name.as_str().to_owned(),
+            });
+        }
+    }
+
+    let counts = count_nullable_i64(table.values(), RowSelection::All, limits)?;
+    Ok(if statement.column_name().is_some() {
+        counts.count_column()
+    } else {
+        counts.count_star()
+    })
+}
+
 /// Executes one parsed `SELECT` against one explicitly named table.
 ///
 /// `expected_table_name` and the table's column name are compared exactly
 /// with the identifiers retained by the parser, including ASCII case. An
 /// unfiltered, unordered result borrows the table's existing column storage.
-/// A `WHERE` equality predicate uses a bounded scan, while `ORDER BY ... LIMIT`
+/// A `WHERE` comparison predicate uses a bounded scan, while `ORDER BY ... LIMIT`
 /// uses the bounded top-k operator and owns the ordered values. Use
 /// [`execute_select_with_order_limits`] for explicit bounds on both operators.
 ///
@@ -169,7 +279,7 @@ pub fn execute_select<'table>(
     )
 }
 
-/// Executes one parsed `SELECT` with explicit equality-scan resource bounds.
+/// Executes one parsed `SELECT` with explicit comparison-scan resource bounds.
 ///
 /// Plain projections do not scan and therefore do not consume these bounds.
 /// Filtered projections preserve source-row order and exclude `NULL` because
@@ -237,7 +347,7 @@ pub fn execute_select_with_order_limits<'table>(
             Some(predicate) => {
                 let matching_rows = scan_nullable_i64(
                     values,
-                    ComparisonOperator::Eq,
+                    predicate.operator(),
                     predicate.value(),
                     scan_limits,
                 )?;
@@ -269,12 +379,8 @@ pub fn execute_select_with_order_limits<'table>(
         return Ok(Cow::Borrowed(&values[..limit.min(values.len())]));
     };
 
-    let matching_rows = scan_nullable_i64(
-        values,
-        ComparisonOperator::Eq,
-        predicate.value(),
-        scan_limits,
-    )?;
+    let matching_rows =
+        scan_nullable_i64(values, predicate.operator(), predicate.value(), scan_limits)?;
     let selected = matching_rows
         .into_iter()
         .take(limit)
@@ -282,4 +388,31 @@ pub fn execute_select_with_order_limits<'table>(
         .collect();
 
     Ok(Cow::Owned(selected))
+}
+
+/// Executes one parsed `SELECT DISTINCT` with explicit resource bounds.
+///
+/// Names are compared exactly, including ASCII case. On valid identifiers,
+/// execution delegates to [`distinct_nullable_i64`], preserving its
+/// deterministic `NULL`-first ascending output and its separate input-row and
+/// distinct-value limits.
+pub fn execute_select_distinct(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &SelectDistinctStatement,
+    limits: DistinctLimits,
+) -> Result<Vec<Option<i64>>, SelectDistinctExecutionError> {
+    if statement.table_name().as_str() != expected_table_name {
+        return Err(SelectDistinctExecutionError::UnknownTable {
+            name: statement.table_name().as_str().to_owned(),
+        });
+    }
+
+    if statement.column_name().as_str() != table.schema().column().name() {
+        return Err(SelectDistinctExecutionError::UnknownColumn {
+            name: statement.column_name().as_str().to_owned(),
+        });
+    }
+
+    distinct_nullable_i64(table.values(), limits).map_err(Into::into)
 }

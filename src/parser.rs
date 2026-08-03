@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::order::{NullOrder, OrderDirection};
+use crate::scan::ComparisonOperator;
 use crate::storage::DataType;
 
 /// Default maximum size of a SQL statement, in bytes.
@@ -123,17 +124,23 @@ impl InsertStatement {
     }
 }
 
-/// A column-to-`Int64` equality predicate in a `WHERE` clause.
+/// A column-to-`Int64` comparison predicate in a `WHERE` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EqualityPredicate {
+pub struct ComparisonPredicate {
     column_name: Identifier,
+    operator: ComparisonOperator,
     value: i64,
 }
 
-impl EqualityPredicate {
+impl ComparisonPredicate {
     /// Returns the compared column name.
     pub fn column_name(&self) -> &Identifier {
         &self.column_name
+    }
+
+    /// Returns the comparison applied to the column and literal.
+    pub const fn operator(&self) -> ComparisonOperator {
+        self.operator
     }
 
     /// Returns the non-`NULL` `Int64` comparison value.
@@ -141,6 +148,9 @@ impl EqualityPredicate {
         self.value
     }
 }
+
+/// Backwards-compatible name for the original equality-only predicate type.
+pub type EqualityPredicate = ComparisonPredicate;
 
 /// An explicit single-column `ORDER BY` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +182,7 @@ impl OrderByClause {
 pub struct SelectStatement {
     column_name: Identifier,
     table_name: Identifier,
-    predicate: Option<EqualityPredicate>,
+    predicate: Option<ComparisonPredicate>,
     order_by: Option<OrderByClause>,
     limit: Option<usize>,
 }
@@ -188,8 +198,8 @@ impl SelectStatement {
         &self.table_name
     }
 
-    /// Returns the optional `WHERE` equality predicate.
-    pub fn predicate(&self) -> Option<&EqualityPredicate> {
+    /// Returns the optional `WHERE` comparison predicate.
+    pub fn predicate(&self) -> Option<&ComparisonPredicate> {
         self.predicate.as_ref()
     }
 
@@ -201,6 +211,68 @@ impl SelectStatement {
     /// Returns the maximum number of rows requested by the statement.
     pub const fn limit(&self) -> Option<usize> {
         self.limit
+    }
+}
+
+/// The argument to a scalar `COUNT` aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarCountArgument {
+    /// Count every input row, including rows containing `NULL`.
+    Star,
+    /// Count non-`NULL` values in the named column.
+    Column(Identifier),
+}
+
+impl ScalarCountArgument {
+    /// Returns the counted column, or `None` for `COUNT(*)`.
+    pub const fn column_name(&self) -> Option<&Identifier> {
+        match self {
+            Self::Star => None,
+            Self::Column(column_name) => Some(column_name),
+        }
+    }
+}
+
+/// The typed syntax tree for a scalar `COUNT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarCountStatement {
+    argument: ScalarCountArgument,
+    table_name: Identifier,
+}
+
+impl ScalarCountStatement {
+    /// Returns whether the aggregate counts all rows or one column.
+    pub const fn argument(&self) -> &ScalarCountArgument {
+        &self.argument
+    }
+
+    /// Returns the counted column, or `None` for `COUNT(*)`.
+    pub const fn column_name(&self) -> Option<&Identifier> {
+        self.argument.column_name()
+    }
+
+    /// Returns the source table name.
+    pub const fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+}
+
+/// The typed syntax tree for a one-column `SELECT DISTINCT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectDistinctStatement {
+    column_name: Identifier,
+    table_name: Identifier,
+}
+
+impl SelectDistinctStatement {
+    /// Returns the projected column name.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns the source table name.
+    pub fn table_name(&self) -> &Identifier {
+        &self.table_name
     }
 }
 
@@ -363,15 +435,15 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 ///
 /// ```text
 /// SELECT identifier FROM identifier
-///     [WHERE identifier = Int64]
+///     [WHERE identifier (= | != | <> | < | <= | > | >=) Int64]
 ///     [ORDER BY identifier (ASC | DESC) NULLS (FIRST | LAST)]
 ///     [LIMIT unsigned-integer] [;]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
-/// around the equality operator and before or after the optional clauses and
+/// around the comparison operator and before or after the optional clauses and
 /// semicolon. `ORDER BY`, when present, requires an explicit direction, `NULL`
-/// placement, and following `LIMIT`. The equality value is a signed decimal
+/// placement, and following `LIMIT`. The comparison value is a signed decimal
 /// `Int64`; `LIMIT` accepts zero and must fit in `usize`. Statement limits and
 /// all reported offsets are measured in bytes.
 ///
@@ -394,6 +466,83 @@ pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement,
     validate_statement_length(input, limits)?;
 
     Parser::new(input, limits.max_identifier_bytes).parse_select()
+}
+
+/// Parses one scalar `COUNT(*)` or `COUNT(column)` statement.
+///
+/// Keywords are ASCII case-insensitive. The optional column argument and table
+/// identifier follow the same rules and bounds as [`parse_create_table`]. The
+/// complete accepted grammar is:
+///
+/// ```text
+/// SELECT COUNT(* | identifier) FROM identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, including whitespace
+/// around the aggregate argument and before or after the optional semicolon.
+/// Aliases, predicates, grouping, ordering, and limits are outside this narrow
+/// scalar grammar. Statement limits and all reported offsets are measured in
+/// bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, ScalarCountArgument, parse_scalar_count};
+///
+/// let statement = parse_scalar_count(
+///     "SELECT COUNT(event_id) FROM events;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert!(matches!(statement.argument(), ScalarCountArgument::Column(_)));
+/// assert_eq!(statement.column_name().unwrap().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_scalar_count(
+    input: &str,
+    limits: ParseLimits,
+) -> Result<ScalarCountStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_scalar_count()
+}
+
+/// Parses one `SELECT DISTINCT` statement containing one column and one table.
+///
+/// Keywords are ASCII case-insensitive. The column and table identifiers
+/// follow the same rules and bounds as [`parse_create_table`]. The complete
+/// accepted grammar is:
+///
+/// ```text
+/// SELECT DISTINCT identifier FROM identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, including whitespace
+/// before or after the optional semicolon. Statement limits and all reported
+/// offsets are measured in bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, parse_select_distinct};
+///
+/// let statement = parse_select_distinct(
+///     "SELECT DISTINCT event_id FROM events;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert_eq!(statement.column_name().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_select_distinct(
+    input: &str,
+    limits: ParseLimits,
+) -> Result<SelectDistinctStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_select_distinct()
 }
 
 fn validate_statement_length(input: &str, limits: ParseLimits) -> Result<(), ParseError> {
@@ -519,11 +668,15 @@ impl<'input> Parser<'input> {
             self.require_whitespace("whitespace after WHERE")?;
             let column_name = self.parse_identifier()?;
             self.skip_whitespace();
-            self.expect_byte(b'=', "'='")?;
+            let operator = self.parse_comparison_operator()?;
             self.skip_whitespace();
             let value = self.parse_where_int64()?;
             self.skip_whitespace();
-            Some(EqualityPredicate { column_name, value })
+            Some(ComparisonPredicate {
+                column_name,
+                operator,
+                value,
+            })
         } else {
             None
         };
@@ -596,6 +749,118 @@ impl<'input> Parser<'input> {
             predicate,
             order_by,
             limit,
+        })
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator, ParseError> {
+        let start = self.position;
+        let operator = match (self.peek(), self.bytes.get(self.position + 1).copied()) {
+            (Some(b'='), _) => {
+                self.position += 1;
+                ComparisonOperator::Eq
+            }
+            (Some(b'!'), Some(b'=')) => {
+                self.position += 2;
+                ComparisonOperator::Ne
+            }
+            (Some(b'<'), Some(b'>')) => {
+                self.position += 2;
+                ComparisonOperator::Ne
+            }
+            (Some(b'<'), Some(b'=')) => {
+                self.position += 2;
+                ComparisonOperator::Le
+            }
+            (Some(b'<'), _) => {
+                self.position += 1;
+                ComparisonOperator::Lt
+            }
+            (Some(b'>'), Some(b'=')) => {
+                self.position += 2;
+                ComparisonOperator::Ge
+            }
+            (Some(b'>'), _) => {
+                self.position += 1;
+                ComparisonOperator::Gt
+            }
+            _ => return Err(self.unexpected("comparison operator")),
+        };
+
+        if self.peek().is_some_and(is_comparison_operator_byte) {
+            self.position = start;
+            return Err(self.unexpected("comparison operator"));
+        }
+
+        Ok(operator)
+    }
+
+    fn parse_scalar_count(mut self) -> Result<ScalarCountStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        self.expect_keyword("COUNT")?;
+        self.skip_whitespace();
+        self.expect_byte(b'(', "'('")?;
+        self.skip_whitespace();
+        let argument = if self.peek() == Some(b'*') {
+            self.position += 1;
+            ScalarCountArgument::Star
+        } else {
+            ScalarCountArgument::Column(self.parse_identifier()?)
+        };
+        self.skip_whitespace();
+        self.expect_byte(b')', "')'")?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(ScalarCountStatement {
+            argument,
+            table_name,
+        })
+    }
+
+    fn parse_select_distinct(mut self) -> Result<SelectDistinctStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        self.expect_keyword("DISTINCT")?;
+        self.require_whitespace("whitespace after DISTINCT")?;
+        if self.keyword_at_position("FROM") && !self.keyword_follows_current_word("FROM") {
+            return Err(self.unexpected("identifier"));
+        }
+        let column_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(SelectDistinctStatement {
+            column_name,
+            table_name,
         })
     }
 
@@ -833,4 +1098,8 @@ fn is_identifier_start(byte: u8) -> bool {
 
 fn is_identifier_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_comparison_operator_byte(byte: u8) -> bool {
+    matches!(byte, b'=' | b'!' | b'<' | b'>')
 }
