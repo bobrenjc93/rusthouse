@@ -1,8 +1,10 @@
 //! RustHouse is an experimental, compact analytical database.
 
 pub mod scan;
+pub mod snapshot;
 
 pub use scan::{ComparisonOperator, ScanError, ScanLimits, scan_nullable_i64};
+pub use snapshot::{SnapshotCodec, SnapshotError};
 mod storage;
 
 pub use storage::{ColumnSchema, DataType, InsertError, Int64Table, Schema};
