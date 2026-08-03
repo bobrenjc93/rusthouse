@@ -10,6 +10,7 @@ pub mod join;
 pub mod order;
 pub mod parser;
 pub mod scan;
+pub mod shared_catalog;
 pub mod snapshot;
 
 pub use aggregate::{
@@ -40,6 +41,7 @@ pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,
     scan_nullable_i64_nullness,
 };
+pub use shared_catalog::{SharedCatalog, SharedCatalogError};
 pub use snapshot::{
     NullableI64PayloadCodec, NullableI64PayloadError, SnapshotCodec, SnapshotError,
     SnapshotFileError,

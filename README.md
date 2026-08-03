@@ -38,6 +38,12 @@ comparison and nullness scans. `SELECT DISTINCT column FROM table` uses
 explicit input-row and distinct-value limits and returns deterministic
 `NULL`-first, ascending values.
 
+For concurrent in-process access, `SharedCatalog` wraps a catalog in an
+`Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE` and `INSERT` with a
+write lock, allow `SELECT` operations through read locks, and return owned
+projection rows. Existing catalog failures remain typed, and lock poisoning is
+reported separately.
+
 ## Snapshot envelope
 
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit
