@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::order::{NullOrder, OrderDirection};
-use crate::scan::ComparisonOperator;
+use crate::scan::{ComparisonOperator, NullPredicate};
 use crate::storage::DataType;
 
 /// Default maximum size of a SQL statement, in bytes.
@@ -152,6 +152,44 @@ impl ComparisonPredicate {
 /// Backwards-compatible name for the original equality-only predicate type.
 pub type EqualityPredicate = ComparisonPredicate;
 
+/// A column nullness predicate in a `WHERE` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NullnessPredicate {
+    column_name: Identifier,
+    predicate: NullPredicate,
+}
+
+impl NullnessPredicate {
+    /// Returns the column whose nullness is tested.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns whether the predicate matches `NULL` or non-`NULL` values.
+    pub const fn predicate(&self) -> NullPredicate {
+        self.predicate
+    }
+}
+
+/// A predicate supported by a one-column `SELECT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectPredicate {
+    /// Compare a column with a non-`NULL` `Int64` literal.
+    Comparison(ComparisonPredicate),
+    /// Test whether a column is `NULL` or is not `NULL`.
+    Nullness(NullnessPredicate),
+}
+
+impl SelectPredicate {
+    /// Returns the column evaluated by the predicate.
+    pub fn column_name(&self) -> &Identifier {
+        match self {
+            Self::Comparison(predicate) => predicate.column_name(),
+            Self::Nullness(predicate) => predicate.column_name(),
+        }
+    }
+}
+
 /// An explicit single-column `ORDER BY` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderByClause {
@@ -182,7 +220,7 @@ impl OrderByClause {
 pub struct SelectStatement {
     column_name: Identifier,
     table_name: Identifier,
-    predicate: Option<ComparisonPredicate>,
+    predicate: Option<SelectPredicate>,
     order_by: Option<OrderByClause>,
     limit: Option<usize>,
 }
@@ -199,7 +237,26 @@ impl SelectStatement {
     }
 
     /// Returns the optional `WHERE` comparison predicate.
+    ///
+    /// This returns `None` when the statement has a nullness predicate. Use
+    /// [`Self::where_predicate`] to inspect either supported predicate kind.
     pub fn predicate(&self) -> Option<&ComparisonPredicate> {
+        match self.predicate.as_ref() {
+            Some(SelectPredicate::Comparison(predicate)) => Some(predicate),
+            Some(SelectPredicate::Nullness(_)) | None => None,
+        }
+    }
+
+    /// Returns the optional `WHERE` nullness predicate.
+    pub fn nullness_predicate(&self) -> Option<&NullnessPredicate> {
+        match self.predicate.as_ref() {
+            Some(SelectPredicate::Nullness(predicate)) => Some(predicate),
+            Some(SelectPredicate::Comparison(_)) | None => None,
+        }
+    }
+
+    /// Returns the optional `WHERE` predicate of either supported kind.
+    pub fn where_predicate(&self) -> Option<&SelectPredicate> {
         self.predicate.as_ref()
     }
 
@@ -435,7 +492,8 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 ///
 /// ```text
 /// SELECT identifier FROM identifier
-///     [WHERE identifier (= | != | <> | < | <= | > | >=) Int64]
+///     [WHERE identifier ((= | != | <> | < | <= | > | >=) Int64
+///                       | IS [NOT] NULL)]
 ///     [ORDER BY identifier (ASC | DESC) NULLS (FIRST | LAST)]
 ///     [LIMIT unsigned-integer] [;]
 /// ```
@@ -443,9 +501,10 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
 /// around the comparison operator and before or after the optional clauses and
 /// semicolon. `ORDER BY`, when present, requires an explicit direction, `NULL`
-/// placement, and following `LIMIT`. The comparison value is a signed decimal
-/// `Int64`; `LIMIT` accepts zero and must fit in `usize`. Statement limits and
-/// all reported offsets are measured in bytes.
+/// placement, and following `LIMIT`. Comparison values are signed decimal
+/// `Int64` values. Nullness predicates use SQL's `IS NULL` or `IS NOT NULL`
+/// form. `LIMIT` accepts zero and must fit in `usize`. Statement limits and all
+/// reported offsets are measured in bytes.
 ///
 /// # Examples
 ///
@@ -668,15 +727,33 @@ impl<'input> Parser<'input> {
             self.require_whitespace("whitespace after WHERE")?;
             let column_name = self.parse_identifier()?;
             self.skip_whitespace();
-            let operator = self.parse_comparison_operator()?;
+            let predicate = if self.keyword_at_position("IS") {
+                self.expect_keyword("IS")?;
+                self.require_whitespace("whitespace after IS")?;
+                let predicate = if self.keyword_at_position("NOT") {
+                    self.expect_keyword("NOT")?;
+                    self.require_whitespace("whitespace after NOT")?;
+                    NullPredicate::IsNotNull
+                } else {
+                    NullPredicate::IsNull
+                };
+                self.expect_keyword("NULL")?;
+                SelectPredicate::Nullness(NullnessPredicate {
+                    column_name,
+                    predicate,
+                })
+            } else {
+                let operator = self.parse_comparison_operator()?;
+                self.skip_whitespace();
+                let value = self.parse_where_int64()?;
+                SelectPredicate::Comparison(ComparisonPredicate {
+                    column_name,
+                    operator,
+                    value,
+                })
+            };
             self.skip_whitespace();
-            let value = self.parse_where_int64()?;
-            self.skip_whitespace();
-            Some(ComparisonPredicate {
-                column_name,
-                operator,
-                value,
-            })
+            Some(predicate)
         } else {
             None
         };

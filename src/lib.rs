@@ -31,9 +31,10 @@ pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64}
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
     ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
-    InsertStatement, OrderByClause, ParseError, ParseLimits, ScalarCountArgument,
-    ScalarCountStatement, SelectDistinctStatement, SelectStatement, parse_create_table,
-    parse_insert, parse_scalar_count, parse_select, parse_select_distinct,
+    InsertStatement, NullnessPredicate, OrderByClause, ParseError, ParseLimits,
+    ScalarCountArgument, ScalarCountStatement, SelectDistinctStatement, SelectPredicate,
+    SelectStatement, parse_create_table, parse_insert, parse_scalar_count, parse_select,
+    parse_select_distinct,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,

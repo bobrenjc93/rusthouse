@@ -114,6 +114,44 @@ fn executes_where_equality_end_to_end_with_null_semantics() {
 }
 
 #[test]
+fn executes_where_nullness_end_to_end() {
+    let limits = ParseLimits::default();
+    let mut catalog = catalog(1, 5);
+    catalog
+        .execute_create("CREATE TABLE readings (value Int64 NULL)", limits)
+        .unwrap();
+    for input in [
+        "INSERT INTO readings VALUES (7)",
+        "INSERT INTO readings VALUES (NULL)",
+        "INSERT INTO readings VALUES (2)",
+        "INSERT INTO readings VALUES (NULL)",
+    ] {
+        catalog.execute_insert(input, limits).unwrap();
+    }
+
+    assert_eq!(
+        catalog
+            .execute_select(
+                "SELECT value FROM readings WHERE value IS NULL LIMIT 1;",
+                limits,
+            )
+            .unwrap()
+            .as_ref(),
+        &[None]
+    );
+    assert_eq!(
+        catalog
+            .execute_select(
+                "SELECT value FROM readings WHERE value IS NOT NULL;",
+                limits,
+            )
+            .unwrap()
+            .as_ref(),
+        &[Some(7), Some(2)]
+    );
+}
+
+#[test]
 fn executes_order_by_limit_end_to_end_with_catalog_bounds() {
     let limits = ParseLimits::default();
     let mut catalog = catalog(1, 4);
