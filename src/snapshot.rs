@@ -18,15 +18,17 @@
 //! The checksum uses polynomial `0xedb8_8320`, an initial value of
 //! `0xffff_ffff`, and a final XOR of `0xffff_ffff`.
 //!
-//! Each write exclusively creates a short `.rhsnap-<process-id>-<sequence>.tmp`
-//! sibling, locks and syncs that file, atomically renames it over the
-//! destination, and syncs the parent directory on Unix. A per-directory
-//! `.rhsnap-coordinator` file serializes temporary-file allocation and orphan
-//! reclamation, while payload writes remain concurrent. The next writer removes
-//! unlocked temporary files abandoned by dead writers, never a live writer's
-//! file. File names beginning with `.rhsnap-` (ASCII case-insensitively) are
-//! reserved for this protocol and rejected as snapshot destinations. The last
-//! rename determines the visible snapshot.
+//! Each write exclusively creates a short
+//! `.rhsnap-<destination-id>-<process-id>-<sequence>.tmp` sibling, locks and
+//! syncs that file, atomically renames it over the destination, and syncs the
+//! parent directory on Unix. A per-destination `.rhsnap-<destination-id>.lock`
+//! file serializes temporary-file allocation and orphan reclamation, while
+//! payload writes and unrelated destinations remain independent. The next
+//! writer for a destination removes its unlocked temporary files abandoned by
+//! dead writers, never a live writer's file or another destination's files.
+//! File names beginning with `.rhsnap-` (ASCII case-insensitively) are reserved
+//! for this protocol and rejected as snapshot destinations. The last rename
+//! determines the visible snapshot.
 
 use std::error::Error;
 use std::ffi::OsStr;
@@ -352,7 +354,12 @@ fn encode_header(payload_len: u64, checksum: u32) -> [u8; SNAPSHOT_HEADER_LEN] {
 static NEXT_TEMPORARY_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const TEMPORARY_FILE_PREFIX: &str = ".rhsnap-";
 const TEMPORARY_FILE_SUFFIX: &str = ".tmp";
-const TEMPORARY_COORDINATOR_NAME: &str = ".rhsnap-coordinator";
+const COORDINATOR_FILE_SUFFIX: &str = ".lock";
+const DESTINATION_ID_HEX_LEN: usize = 32;
+const PROCESS_ID_HEX_LEN: usize = 8;
+const SEQUENCE_HEX_LEN: usize = 16;
+const FNV1A_128_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+const FNV1A_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
 struct OwnedTemporaryFile {
     path: PathBuf,
@@ -385,12 +392,13 @@ impl Drop for OwnedTemporaryFile {
 fn create_sibling_temporary_file(
     path: &Path,
 ) -> Result<(PathBuf, OwnedTemporaryFile), SnapshotError> {
-    validate_snapshot_path(path)?;
+    let file_name = validate_snapshot_path(path)?;
+    let destination_id = destination_id(file_name);
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let coordinator_path = parent.join(TEMPORARY_COORDINATOR_NAME);
+    let coordinator_path = parent.join(coordinator_file_name(destination_id));
     let coordinator = OpenOptions::new()
         .read(true)
         .write(true)
@@ -401,13 +409,14 @@ fn create_sibling_temporary_file(
     coordinator
         .lock()
         .map_err(|source| io_failure("lock temporary coordinator", &coordinator_path, source))?;
-    reclaim_orphaned_temporary_files(parent)?;
+    reclaim_orphaned_temporary_files(parent, destination_id)?;
 
     loop {
         let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temporary_path = parent.join(format!(
-            "{TEMPORARY_FILE_PREFIX}{:08x}-{sequence:016x}{TEMPORARY_FILE_SUFFIX}",
-            std::process::id()
+        let temporary_path = parent.join(temporary_file_name(
+            destination_id,
+            std::process::id(),
+            sequence,
         ));
 
         match OpenOptions::new()
@@ -435,7 +444,7 @@ fn create_sibling_temporary_file(
     }
 }
 
-fn validate_snapshot_path(path: &Path) -> Result<(), SnapshotError> {
+fn validate_snapshot_path(path: &Path) -> Result<&OsStr, SnapshotError> {
     let file_name = path.file_name().ok_or_else(|| {
         io_failure(
             "resolve",
@@ -455,16 +464,38 @@ fn validate_snapshot_path(path: &Path) -> Result<(), SnapshotError> {
             path: path.to_path_buf(),
         });
     }
-    Ok(())
+    Ok(file_name)
 }
 
-fn reclaim_orphaned_temporary_files(parent: &Path) -> Result<(), SnapshotError> {
+fn destination_id(file_name: &OsStr) -> u128 {
+    let mut hash = FNV1A_128_OFFSET_BASIS;
+    for byte in file_name.as_encoded_bytes() {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(FNV1A_128_PRIME);
+    }
+    hash
+}
+
+fn coordinator_file_name(destination_id: u128) -> String {
+    format!("{TEMPORARY_FILE_PREFIX}{destination_id:032x}{COORDINATOR_FILE_SUFFIX}")
+}
+
+fn temporary_file_name(destination_id: u128, process_id: u32, sequence: u64) -> String {
+    format!(
+        "{TEMPORARY_FILE_PREFIX}{destination_id:032x}-{process_id:08x}-{sequence:016x}{TEMPORARY_FILE_SUFFIX}"
+    )
+}
+
+fn reclaim_orphaned_temporary_files(
+    parent: &Path,
+    destination_id: u128,
+) -> Result<(), SnapshotError> {
     let entries = fs::read_dir(parent)
         .map_err(|source| io_failure("scan temporary directory", parent, source))?;
     for entry in entries {
         let entry =
             entry.map_err(|source| io_failure("inspect temporary directory", parent, source))?;
-        if !is_snapshot_temporary_file_name(&entry.file_name()) {
+        if snapshot_temporary_file_destination_id(&entry.file_name()) != Some(destination_id) {
             continue;
         }
 
@@ -504,21 +535,32 @@ fn reclaim_orphaned_temporary_files(parent: &Path) -> Result<(), SnapshotError> 
     Ok(())
 }
 
+#[cfg(test)]
 fn is_snapshot_temporary_file_name(name: &OsStr) -> bool {
-    let Some(identity) = name
+    snapshot_temporary_file_destination_id(name).is_some()
+}
+
+fn snapshot_temporary_file_destination_id(name: &OsStr) -> Option<u128> {
+    let identity = name
         .to_str()
         .and_then(|name| name.strip_prefix(TEMPORARY_FILE_PREFIX))
-        .and_then(|name| name.strip_suffix(TEMPORARY_FILE_SUFFIX))
+        .and_then(|name| name.strip_suffix(TEMPORARY_FILE_SUFFIX))?;
+    let mut fields = identity.split('-');
+    let (Some(destination_id), Some(process_id), Some(sequence), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
     else {
-        return false;
+        return None;
     };
-    let Some((process_id, sequence)) = identity.split_once('-') else {
-        return false;
-    };
-    process_id.len() == 8
-        && sequence.len() == 16
-        && process_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && sequence.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if destination_id.len() != DESTINATION_ID_HEX_LEN
+        || process_id.len() != PROCESS_ID_HEX_LEN
+        || sequence.len() != SEQUENCE_HEX_LEN
+        || !destination_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !process_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !sequence.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u128::from_str_radix(destination_id, 16).ok()
 }
 
 #[cfg(unix)]
@@ -673,14 +715,71 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restricted_coordinator_does_not_block_an_unrelated_shared_directory_destination() {
+        let directory = TestDirectory::new("restricted-unrelated-coordinator");
+        set_unix_mode(&directory.0, 0o777);
+        let blocked_path = directory.0.join("other-user.snapshot");
+        let writable_path = directory.0.join("current-user.snapshot");
+        let blocked_id = destination_id(blocked_path.file_name().unwrap());
+        let writable_id = destination_id(writable_path.file_name().unwrap());
+        assert_ne!(blocked_id, writable_id);
+
+        let restricted_path = directory.0.join(coordinator_file_name(blocked_id));
+        fs::write(&restricted_path, b"").expect("create another destination's coordinator");
+        set_unix_mode(&restricted_path, 0o000);
+
+        let store = SnapshotStore::new(32);
+        store
+            .write(&writable_path, b"independent")
+            .expect("write an unrelated snapshot");
+
+        assert_eq!(
+            store.read(&writable_path).expect("read unrelated snapshot"),
+            b"independent"
+        );
+        assert!(restricted_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricted_temporary_does_not_block_an_unrelated_shared_directory_destination() {
+        let directory = TestDirectory::new("restricted-unrelated-temporary");
+        set_unix_mode(&directory.0, 0o777);
+        let blocked_path = directory.0.join("other-user.snapshot");
+        let writable_path = directory.0.join("current-user.snapshot");
+        let blocked_id = destination_id(blocked_path.file_name().unwrap());
+        let writable_id = destination_id(writable_path.file_name().unwrap());
+        assert_ne!(blocked_id, writable_id);
+
+        let restricted_path = directory
+            .0
+            .join(temporary_file_name(blocked_id, 0xdead_beef, 0));
+        fs::write(&restricted_path, b"another writer's incomplete snapshot")
+            .expect("create another destination's temporary file");
+        set_unix_mode(&restricted_path, 0o000);
+
+        let store = SnapshotStore::new(32);
+        store
+            .write(&writable_path, b"independent")
+            .expect("write an unrelated snapshot");
+
+        assert_eq!(
+            store.read(&writable_path).expect("read unrelated snapshot"),
+            b"independent"
+        );
+        assert!(restricted_path.exists());
+    }
+
     #[test]
     fn rejects_the_reserved_internal_namespace_without_touching_existing_files() {
         let directory = TestDirectory::new("reserved-namespace");
         let store = SnapshotStore::new(32);
 
         for file_name in [
-            ".rhsnap-deadbeef-0000000000000000.tmp",
-            TEMPORARY_COORDINATOR_NAME,
+            ".rhsnap-00000000000000000000000000000000-deadbeef-0000000000000000.tmp",
+            ".rhsnap-00000000000000000000000000000000.lock",
             ".rhsnap-future-protocol-file",
             ".RHSNAP-case-insensitive-filesystem-collision",
         ] {
@@ -719,8 +818,12 @@ mod tests {
         assert!(
             matches!(store.read(&path), Err(SnapshotError::ReservedPath { path: found }) if found == path)
         );
-        assert!(!directory.0.join(TEMPORARY_COORDINATOR_NAME).exists());
-        assert!(snapshot_temporary_files(&directory.0).is_empty());
+        assert_eq!(
+            fs::read_dir(&directory.0)
+                .expect("read test directory")
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -1037,5 +1140,16 @@ mod tests {
                     .is_some_and(is_snapshot_temporary_file_name)
             })
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn set_unix_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .expect("read test permissions")
+            .permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).expect("set test permissions");
     }
 }
