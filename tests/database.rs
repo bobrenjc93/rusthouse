@@ -90,7 +90,7 @@ fn positional_insert_stores_all_types_in_schema_order_and_produces_no_csv() {
 }
 
 #[test]
-fn late_invalid_insert_row_is_typed_and_rolls_back_the_complete_batch() {
+fn late_invalid_insert_into_an_existing_table_rolls_back_the_complete_batch() {
     let mut database = Database::new();
     database
         .execute(
@@ -119,6 +119,34 @@ fn late_invalid_insert_row_is_typed_and_rolls_back_the_complete_batch() {
     );
     assert_eq!((error.line(), error.column()), (3, 1));
     assert_eq!(database, before);
+}
+
+#[test]
+fn late_invalid_insert_into_a_new_table_rolls_back_the_complete_batch() {
+    let mut database = database_with_seed();
+    let before = database.clone();
+    let sql = "CREATE TABLE fresh (id Int64, label String);\n\
+               INSERT INTO fresh VALUES\n\
+               (1, 'valid'),\n\
+               (2, FALSE);";
+
+    let error = database.execute(sql).unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::InvalidRow {
+            table: "fresh".into(),
+            source: BatchAppendError::TypeMismatch {
+                row_index: 1,
+                field: "label".into(),
+                expected: DataType::String,
+                actual: ValueType::Bool,
+            },
+        }
+    );
+    assert_eq!((error.line(), error.column()), (4, 1));
+    assert_eq!(database, before);
+    assert!(database.table("fresh").is_none());
 }
 
 #[test]
@@ -387,6 +415,23 @@ fn sql_insert_rows_accept_the_boundary_and_stop_one_over() {
 
     accepted_database.execute(&accepted_sql).unwrap();
 
+    assert_eq!(
+        accepted_database.table("bounded").unwrap().row_count(),
+        DEFAULT_TABLE_ROW_LIMIT
+    );
+    let error = accepted_database
+        .execute("INSERT INTO bounded VALUES (1);")
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        &SqlErrorKind::InvalidRow {
+            table: "bounded".into(),
+            source: BatchAppendError::RowLimitExceeded {
+                row_index: 0,
+                limit: DEFAULT_TABLE_ROW_LIMIT,
+            },
+        }
+    );
     assert_eq!(
         accepted_database.table("bounded").unwrap().row_count(),
         DEFAULT_TABLE_ROW_LIMIT

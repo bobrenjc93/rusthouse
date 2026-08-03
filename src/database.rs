@@ -173,11 +173,7 @@ impl Database {
 
 enum StagedTable {
     Created(Table),
-    Existing {
-        delta: Table,
-        base_row_count: usize,
-        row_limit: usize,
-    },
+    Existing { delta: Table, base_row_count: usize },
 }
 
 impl StagedTable {
@@ -185,18 +181,16 @@ impl StagedTable {
         Self::Existing {
             delta: Table::new(table.schema().clone(), table.row_limit()),
             base_row_count: table.row_count(),
-            row_limit: table.row_limit(),
         }
     }
 
     fn append_row(&mut self, values: Vec<crate::Value>) -> Result<(), BatchAppendError> {
         match self {
-            Self::Created(table) => table.append_batch([values]),
+            Self::Created(table) => table.append_staged_row_after(values, 0),
             Self::Existing {
                 delta,
                 base_row_count,
-                row_limit,
-            } => delta.append_batch_after([values], *base_row_count, *row_limit),
+            } => delta.append_staged_row_after(values, *base_row_count),
         }
     }
 

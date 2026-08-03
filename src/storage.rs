@@ -633,21 +633,7 @@ impl Table {
         I: IntoIterator<Item = R>,
         R: IntoIterator<Item = Value>,
     {
-        self.append_batch_after(rows, 0, self.row_limit)
-    }
-
-    pub(crate) fn append_batch_after<I, R>(
-        &mut self,
-        rows: I,
-        base_row_count: usize,
-        row_limit: usize,
-    ) -> Result<(), BatchAppendError>
-    where
-        I: IntoIterator<Item = R>,
-        R: IntoIterator<Item = Value>,
-    {
-        let logical_row_count = base_row_count.saturating_add(self.row_count);
-        let remaining = row_limit.saturating_sub(logical_row_count);
+        let remaining = self.row_limit.saturating_sub(self.row_count);
         let consumption_limit = remaining.saturating_add(1);
         let value_limit = self.schema.len().saturating_add(1);
         let mut validated_rows = Vec::new();
@@ -656,55 +642,84 @@ impl Table {
             if row_index == remaining {
                 return Err(BatchAppendError::RowLimitExceeded {
                     row_index,
-                    limit: row_limit,
+                    limit: self.row_limit,
                 });
             }
 
             let values: Vec<Value> = row.into_iter().take(value_limit).collect();
-            if values.len() != self.schema.len() {
-                return Err(BatchAppendError::RowShapeMismatch {
-                    row_index,
-                    expected: self.schema.len(),
-                    actual: values.len(),
-                });
-            }
-
-            for (field, value) in self.schema.fields().iter().zip(&values) {
-                if matches!(value, Value::Null) {
-                    if !field.is_nullable() {
-                        return Err(BatchAppendError::NullabilityViolation {
-                            row_index,
-                            field: field.name().to_owned(),
-                        });
-                    }
-                } else if !value_matches_type(value, field.data_type()) {
-                    return Err(BatchAppendError::TypeMismatch {
-                        row_index,
-                        field: field.name().to_owned(),
-                        expected: field.data_type(),
-                        actual: value.value_type(),
-                    });
-                } else if let Some(length) = oversized_string_length(value) {
-                    return Err(BatchAppendError::StringTooLong {
-                        row_index,
-                        field: field.name().to_owned(),
-                        length,
-                        limit: MAX_STORED_STRING_BYTES,
-                    });
-                }
-            }
-
+            self.validate_positional_row(&values, row_index)?;
             validated_rows.push(values);
         }
 
-        let appended = validated_rows.len();
         for row in validated_rows {
-            for (column, value) in self.columns.iter_mut().zip(row) {
-                column.push_validated(value);
+            self.append_validated_positional_row(row);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_staged_row_after(
+        &mut self,
+        values: Vec<Value>,
+        base_row_count: usize,
+    ) -> Result<(), BatchAppendError> {
+        if base_row_count.saturating_add(self.row_count) >= self.row_limit {
+            return Err(BatchAppendError::RowLimitExceeded {
+                row_index: 0,
+                limit: self.row_limit,
+            });
+        }
+
+        self.validate_positional_row(&values, 0)?;
+        self.append_validated_positional_row(values);
+        Ok(())
+    }
+
+    fn validate_positional_row(
+        &self,
+        values: &[Value],
+        row_index: usize,
+    ) -> Result<(), BatchAppendError> {
+        if values.len() != self.schema.len() {
+            return Err(BatchAppendError::RowShapeMismatch {
+                row_index,
+                expected: self.schema.len(),
+                actual: values.len(),
+            });
+        }
+
+        for (field, value) in self.schema.fields().iter().zip(values) {
+            if matches!(value, Value::Null) {
+                if !field.is_nullable() {
+                    return Err(BatchAppendError::NullabilityViolation {
+                        row_index,
+                        field: field.name().to_owned(),
+                    });
+                }
+            } else if !value_matches_type(value, field.data_type()) {
+                return Err(BatchAppendError::TypeMismatch {
+                    row_index,
+                    field: field.name().to_owned(),
+                    expected: field.data_type(),
+                    actual: value.value_type(),
+                });
+            } else if let Some(length) = oversized_string_length(value) {
+                return Err(BatchAppendError::StringTooLong {
+                    row_index,
+                    field: field.name().to_owned(),
+                    length,
+                    limit: MAX_STORED_STRING_BYTES,
+                });
             }
         }
-        self.row_count += appended;
+
         Ok(())
+    }
+
+    fn append_validated_positional_row(&mut self, values: Vec<Value>) {
+        for (column, value) in self.columns.iter_mut().zip(values) {
+            column.push_validated(value);
+        }
+        self.row_count += 1;
     }
 
     pub(crate) fn append_committed(&mut self, delta: Self) {
