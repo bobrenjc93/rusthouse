@@ -2,8 +2,8 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 
 use rusthouse::{
-    Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError, ParseLimits,
-    SharedCatalog, SharedCatalogError,
+    AggregateLimits, Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError,
+    ParseLimits, SharedCatalog, SharedCatalogError,
 };
 
 fn shared_catalog(max_rows_per_table: usize) -> SharedCatalog {
@@ -65,6 +65,37 @@ fn readers_observe_consistent_owned_snapshots() {
         assert_eq!(snapshot, &expected);
     }
     assert_eq!(snapshots[0], vec![Some(0)]);
+}
+
+#[test]
+fn shared_reads_expose_nullness_predicates_and_scalar_sum() {
+    let catalog = shared_catalog(4);
+    for value in ["NULL", "7", "-2", "NULL"] {
+        catalog
+            .execute_insert(
+                &format!("INSERT INTO readings VALUES ({value})"),
+                ParseLimits::default(),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        catalog
+            .execute_select(
+                "SELECT value FROM readings WHERE value IS NULL",
+                ParseLimits::default(),
+            )
+            .unwrap(),
+        vec![None, None]
+    );
+    assert_eq!(
+        catalog.execute_scalar_sum(
+            "SELECT SUM(value) FROM readings",
+            ParseLimits::default(),
+            AggregateLimits::new(4, 4),
+        ),
+        Ok(Some(5))
+    );
 }
 
 #[test]
