@@ -229,17 +229,17 @@ fn duplicate_and_capacity_failures_precede_snapshot_reads() {
 }
 
 #[test]
-fn loads_a_table_from_an_explicit_fallback_snapshot() {
+fn loads_and_groups_a_table_from_an_explicit_fallback_snapshot() {
     let directory = TestDirectory::new("fallback-success");
     let primary = directory.named_snapshot("primary.snapshot");
     let fallback = directory.named_snapshot("fallback.snapshot");
     let snapshots = SnapshotStore::new(1024);
     let mut source = Catalog::new();
     source
-        .execute_create("CREATE TABLE source (id Int64)")
+        .execute_create("CREATE TABLE source (id Int64, bucket String)")
         .unwrap();
     source
-        .execute_insert("INSERT INTO source VALUES (11), (12)")
+        .execute_insert("INSERT INTO source VALUES (11, 'odd'), (12, 'even'), (13, 'odd')")
         .unwrap();
     source.save_table("source", &fallback, &snapshots).unwrap();
     fs::write(&primary, b"short").unwrap();
@@ -249,10 +249,17 @@ fn loads_a_table_from_an_explicit_fallback_snapshot() {
         .load_table_with_fallback("Recovered", &primary, &fallback, &snapshots)
         .unwrap();
 
-    assert_eq!(loaded.int64_column("id").unwrap(), [11, 12]);
+    assert_eq!(loaded.int64_column("id").unwrap(), [11, 12, 13]);
     let mut table_names = catalog.table_names().collect::<Vec<_>>();
     table_names.sort_unstable();
     assert_eq!(table_names, ["Recovered", "retained"]);
+
+    let result = catalog
+        .execute_select("SELECT bucket, COUNT(*) AS rows FROM Recovered GROUP BY bucket")
+        .unwrap();
+    let mut output = Vec::new();
+    write_select_csv_with_names(&result, &mut output).unwrap();
+    assert_eq!(output, b"\"bucket\",\"rows\"\n\"even\",1\n\"odd\",2\n");
 }
 
 #[test]
