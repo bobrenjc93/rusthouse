@@ -246,6 +246,22 @@ impl SnapshotStore {
         let payload = self.read(path).map_err(TableSnapshotError::Envelope)?;
         decode_table(&payload)
     }
+
+    /// Reconstructs a table from a primary snapshot or an explicit fallback.
+    ///
+    /// The fallback eligibility and independent payload bounds are those of
+    /// [`SnapshotStore::read_with_fallback`]. The selected envelope is fully
+    /// validated before its table payload is decoded.
+    pub fn read_table_with_fallback(
+        &self,
+        primary_path: impl AsRef<Path>,
+        fallback_path: impl AsRef<Path>,
+    ) -> Result<Table, TableSnapshotError> {
+        let payload = self
+            .read_with_fallback(primary_path, fallback_path)
+            .map_err(TableSnapshotError::Envelope)?;
+        decode_table(&payload)
+    }
 }
 
 fn encode_table(table: &Table, max_payload_len: usize) -> Result<Vec<u8>, TableSnapshotError> {
