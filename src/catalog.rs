@@ -9,8 +9,8 @@ use std::path::Path;
 use crate::reduction::ReductionError;
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
-    CreateTableStatement, InsertParseLimits, InsertStatement, OrderByClause, OrderDirection,
-    ParseError, ParseLimits, SelectParseLimits, SelectProjection, SelectStatement,
+    ComparisonPredicate, CreateTableStatement, InsertParseLimits, InsertStatement, OrderByClause,
+    OrderDirection, ParseError, ParseLimits, SelectParseLimits, SelectProjection, SelectStatement,
     parse_create_table_with_limits, parse_insert_with_limits, parse_select_with_limits,
 };
 use crate::storage::{Column, DEFAULT_ROW_LIMIT, DataType, Field, Table, TableError, Value};
@@ -271,7 +271,7 @@ struct ScalarResult {
     value: Value,
 }
 
-/// The output of one projection or scalar aggregate and optional comparison scan.
+/// The output of one projection or scalar aggregate and optional comparison scans.
 ///
 /// A row projection owns only projected column indexes and, for a filtered
 /// query, a compact row-selection bitmap. Ordered results instead own their
@@ -610,9 +610,10 @@ impl Catalog {
     /// Parses and executes one bounded `SELECT` statement.
     ///
     /// The returned result borrows the source table and does not copy table
-    /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
-    /// For row projections, `ORDER BY` owns and sorts only selected row indexes.
-    /// `LIMIT` is applied to the final projected or aggregate output.
+    /// rows. Each `WHERE` comparison is evaluated with [`Table::scan`]. Packed
+    /// selections are intersected within `AND` groups and unioned across `OR`
+    /// groups. For row projections, `ORDER BY` owns and sorts only selected row
+    /// indexes. `LIMIT` is applied to the final projected or aggregate output.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -625,7 +626,7 @@ impl Catalog {
         let SelectStatement {
             projections,
             table: name,
-            predicate,
+            predicate_groups,
             order_by,
             limit,
         } = statement;
@@ -640,15 +641,7 @@ impl Catalog {
                 if let Some(order_by) = order_by {
                     resolve_order(table, order_by)?;
                 }
-                let selection = predicate
-                    .map(|predicate| {
-                        table.scan(&predicate.column, predicate.operator, &predicate.value)
-                    })
-                    .transpose()
-                    .map_err(|source| CatalogError::TableScan {
-                        name: name.clone(),
-                        source,
-                    })?;
+                let selection = scan_predicate_groups(table, predicate_groups, &name)?;
                 let count = table.count(selection.as_ref()).map_err(|source| {
                     CatalogError::TableReduction {
                         name: name.clone(),
@@ -680,12 +673,7 @@ impl Catalog {
                 let order = order_by
                     .map(|order_by| resolve_order(table, order_by))
                     .transpose()?;
-                let selection = predicate
-                    .map(|predicate| {
-                        table.scan(&predicate.column, predicate.operator, &predicate.value)
-                    })
-                    .transpose()
-                    .map_err(|source| CatalogError::TableScan { name, source })?;
+                let selection = scan_predicate_groups(table, predicate_groups, &name)?;
 
                 let (selection, ordered_rows, row_end, row_count) = match order {
                     Some((column_index, direction)) => {
@@ -761,6 +749,64 @@ impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
+
+fn scan_predicate_groups(
+    table: &Table,
+    predicate_groups: Vec<Vec<ComparisonPredicate>>,
+    table_name: &str,
+) -> Result<Option<RowSelection>, CatalogError> {
+    if predicate_groups.is_empty() || predicate_groups.iter().any(Vec::is_empty) {
+        return Ok(None);
+    }
+
+    let mut groups = predicate_groups.into_iter();
+    let mut selection = scan_predicate_group(
+        table,
+        groups
+            .next()
+            .expect("non-empty predicate groups were checked above"),
+        table_name,
+    )?;
+
+    for group in groups {
+        let next = scan_predicate_group(table, group, table_name)?;
+        selection.union(&next);
+    }
+
+    Ok(Some(selection))
+}
+
+fn scan_predicate_group(
+    table: &Table,
+    predicates: Vec<ComparisonPredicate>,
+    table_name: &str,
+) -> Result<RowSelection, CatalogError> {
+    let mut predicates = predicates.into_iter();
+    let first = predicates
+        .next()
+        .expect("empty predicate groups were checked by scan_predicate_groups");
+    let mut selection = scan_predicate(table, first, table_name)?;
+
+    for predicate in predicates {
+        let next = scan_predicate(table, predicate, table_name)?;
+        selection.intersect(&next);
+    }
+
+    Ok(selection)
+}
+
+fn scan_predicate(
+    table: &Table,
+    predicate: ComparisonPredicate,
+    table_name: &str,
+) -> Result<RowSelection, CatalogError> {
+    table
+        .scan(&predicate.column, predicate.operator, &predicate.value)
+        .map_err(|source| CatalogError::TableScan {
+            name: table_name.to_owned(),
+            source,
+        })
 }
 
 fn limited_row_bounds(

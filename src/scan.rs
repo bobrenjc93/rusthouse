@@ -1,8 +1,7 @@
 //! Typed comparison scans and compact row selections.
 //!
-//! This module deliberately covers one predicate primitive: comparing every
-//! value in one physical column with a same-typed literal. SQL parsing and
-//! predicate composition belong to later query-engine layers.
+//! This module covers comparing every value in one physical column with a
+//! same-typed literal and packed selection composition.
 
 pub use crate::sql::ComparisonOperator;
 use crate::{DataType, Table, Value};
@@ -138,6 +137,26 @@ impl RowSelection {
             .iter()
             .map(|byte| byte.count_ones() as usize)
             .sum()
+    }
+
+    /// Intersects another equally sized selection into this bitmap.
+    pub(crate) fn intersect(&mut self, other: &Self) {
+        self.combine(other, |selected, other_selected| selected & other_selected);
+    }
+
+    /// Unions another equally sized selection into this bitmap.
+    pub(crate) fn union(&mut self, other: &Self) {
+        self.combine(other, |selected, other_selected| selected | other_selected);
+    }
+
+    fn combine(&mut self, other: &Self, operation: impl Fn(u8, u8) -> u8) {
+        assert_eq!(
+            self.row_count, other.row_count,
+            "row selections from the same table must have equal lengths"
+        );
+        for (selected, other_selected) in self.bytes.iter_mut().zip(&other.bytes) {
+            *selected = operation(*selected, *other_selected);
+        }
     }
 
     fn select(&mut self, row: usize) {
@@ -280,5 +299,52 @@ fn select_matches<T: PartialEq + PartialOrd>(
         if operator.compare(value, literal) {
             selection.select(row);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Field;
+
+    #[test]
+    fn intersects_and_unions_packed_bytes_in_place_across_boundaries() {
+        let mut table = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
+        table
+            .insert_batch((0..18).map(|id| vec![Value::Int64(id)]))
+            .unwrap();
+
+        let mut selection = table
+            .scan(
+                "id",
+                ComparisonOperator::GreaterThanOrEqual,
+                &Value::Int64(7),
+            )
+            .unwrap();
+        let storage = selection.bytes.as_ptr();
+        let upper = table
+            .scan("id", ComparisonOperator::LessThanOrEqual, &Value::Int64(9))
+            .unwrap();
+        selection.intersect(&upper);
+
+        let mut other = table
+            .scan(
+                "id",
+                ComparisonOperator::GreaterThanOrEqual,
+                &Value::Int64(15),
+            )
+            .unwrap();
+        let other_upper = table
+            .scan("id", ComparisonOperator::LessThanOrEqual, &Value::Int64(17))
+            .unwrap();
+        other.intersect(&other_upper);
+        selection.union(&other);
+
+        assert_eq!(selection.bytes.as_ptr(), storage);
+        assert_eq!(selection.as_bytes(), [0x80, 0x83, 0x03]);
+        assert_eq!(
+            selection.selected_rows().collect::<Vec<_>>(),
+            [7, 8, 9, 15, 16, 17]
+        );
     }
 }

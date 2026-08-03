@@ -107,6 +107,92 @@ fn filters_rows_and_reports_empty_results() {
 }
 
 #[test]
+fn applies_and_before_or_with_or_without_group_parentheses() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE precedence (id Int64, active Bool)")
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO precedence VALUES \
+             (1, false), (2, true), (2, false), (3, true)",
+        )
+        .unwrap();
+
+    for where_clause in [
+        "id = 1 OR id = 2 AND active = true",
+        "(id = 1) OR (id = 2 AND active = true)",
+    ] {
+        let result = catalog
+            .execute_select(&format!("SELECT id FROM precedence WHERE {where_clause}"))
+            .unwrap();
+        assert_eq!(
+            result.row_indices().collect::<Vec<_>>(),
+            [0, 1],
+            "clause: {where_clause}"
+        );
+    }
+}
+
+#[test]
+fn executes_campaign_shaped_groups_across_all_physical_types() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE campaigns (campaign_id Int64, spend Float64, active Bool, channel String)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO campaigns VALUES \
+             (101, 10.0, true, 'email'), \
+             (101, 80.0, true, 'search'), \
+             (102, 75.0, false, 'search'), \
+             (103, 40.0, true, 'search'), \
+             (101, 90.0, false, 'email')",
+        )
+        .unwrap();
+
+    let predicate = "(campaign_id = 101 AND active = true) OR \
+                     (channel = 'search' AND spend >= 50.0)";
+    let result = catalog
+        .execute_select(&format!(
+            "SELECT campaign_id FROM campaigns WHERE {predicate}"
+        ))
+        .unwrap();
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [0, 1, 2]);
+
+    let count = catalog
+        .execute_select(&format!(
+            "SELECT COUNT(*) AS matches FROM campaigns WHERE {predicate}"
+        ))
+        .unwrap();
+    assert_eq!(count.scalar_value(), Some(&Value::Int64(3)));
+}
+
+#[test]
+fn unions_intersected_groups_across_packed_bitmap_boundaries() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE boundaries (id Int64)")
+        .unwrap();
+    catalog
+        .table_mut("boundaries")
+        .unwrap()
+        .insert_batch((0..18).map(|id| vec![Value::Int64(id)]))
+        .unwrap();
+
+    let result = catalog
+        .execute_select(
+            "SELECT id FROM boundaries \
+             WHERE (id >= 7 AND id <= 9) OR (id >= 15 AND id <= 17) \
+             ORDER BY id DESC LIMIT 5",
+        )
+        .unwrap();
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [17, 16, 15, 9, 8]);
+}
+
+#[test]
 fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
     let catalog = readings_catalog();
 
@@ -188,11 +274,11 @@ fn executes_an_already_parsed_statement() {
     let statement = SelectStatement {
         projections: SelectProjection::Columns(vec!["label".to_owned()]),
         table: "Readings".to_owned(),
-        predicate: Some(ComparisonPredicate {
+        predicate_groups: vec![vec![ComparisonPredicate {
             column: "sequence".to_owned(),
             operator: ComparisonOperator::GreaterThanOrEqual,
             value: Value::Int64(2),
-        }),
+        }]],
         order_by: None,
         limit: None,
     };
