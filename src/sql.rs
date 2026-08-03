@@ -191,6 +191,21 @@ impl<'a> Lexer<'a> {
                 continue;
             }
 
+            let offset = self.position;
+            if character == '-' && self.peek_next() == Some('-') {
+                self.skip_line_comment();
+                continue;
+            }
+            if character == '/' && self.peek_next() == Some('*') {
+                match self.skip_block_comment(offset) {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        tokens.push(error.into_token());
+                        break;
+                    }
+                }
+            }
+
             if tokens.len() >= MAX_BATCH_TOKENS {
                 tokens.push(Token {
                     kind: TokenKind::Failure(SqlErrorKind::LimitExceeded {
@@ -202,7 +217,6 @@ impl<'a> Lexer<'a> {
                 break;
             }
 
-            let offset = self.position;
             let kind = match character {
                 ',' => {
                     self.bump();
@@ -216,10 +230,6 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     TokenKind::Plus
                 }
-                '-' if self.peek_next() == Some('-') => {
-                    self.skip_line_comment();
-                    continue;
-                }
                 '-' => {
                     self.bump();
                     TokenKind::Minus
@@ -228,13 +238,6 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     TokenKind::Star
                 }
-                '/' if self.peek_next() == Some('*') => match self.skip_block_comment(offset) {
-                    Ok(()) => continue,
-                    Err(error) => {
-                        tokens.push(error.into_token());
-                        break;
-                    }
-                },
                 '\'' => match self.quoted('\'', "string literal", offset) {
                     Ok(value) => TokenKind::String(value),
                     Err(error) => {
@@ -586,7 +589,8 @@ impl Parser {
             }
             TokenKind::String(value) if sign.is_empty() => {
                 self.advance();
-                Ok((ScalarValue::String(value.clone()), format!("'{value}'")))
+                let default_name = string_literal_name(&value);
+                Ok((ScalarValue::String(value), default_name))
             }
             TokenKind::Word(word)
                 if sign.is_empty()
@@ -687,6 +691,19 @@ fn escape_for_diagnostic(value: &str) -> String {
     value.chars().flat_map(char::escape_default).collect()
 }
 
+fn string_literal_name(value: &str) -> String {
+    let mut name = String::with_capacity(value.len() + 2);
+    name.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            name.push('\'');
+        }
+        name.push(character);
+    }
+    name.push('\'');
+    name
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +777,30 @@ mod tests {
             assert!(
                 matches!(error.kind, SqlErrorKind::Syntax { ref message } if message.starts_with("invalid numeric literal")),
                 "unexpected error for {input}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_escaped_quotes_in_default_string_names() {
+        let results = execute_batch("SELECT 'it''s';").unwrap();
+
+        assert_eq!(results[0].columns[0].name, "'it''s'");
+        assert_eq!(
+            results[0].columns[0].value,
+            ScalarValue::String("it's".to_owned())
+        );
+    }
+
+    #[test]
+    fn trailing_comments_do_not_count_toward_the_token_limit() {
+        let batch = format!("SELECT 1;{}", ";".repeat(MAX_BATCH_TOKENS - 3));
+        assert_eq!(execute_batch(&batch).unwrap().len(), 1);
+
+        for comment in ["-- trailing comment", "/* trailing comment */"] {
+            assert_eq!(
+                execute_batch(&format!("{batch}{comment}")).unwrap().len(),
+                1
             );
         }
     }

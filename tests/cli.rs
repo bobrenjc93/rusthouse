@@ -54,6 +54,15 @@ fn executes_multiple_typed_selects_as_csv() {
 }
 
 #[test]
+fn unaliased_strings_preserve_escaped_quotes_in_csv_headers() {
+    let output = run_cli(&["--format", "csv"], b"SELECT 'it''s';");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "'it''s'\nit's\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn help_is_available_without_sql_input() {
     let output = run_cli(&["--help"], b"");
 
