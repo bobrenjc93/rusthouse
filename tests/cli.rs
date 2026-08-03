@@ -4,7 +4,7 @@ use std::process::{Command, Output, Stdio};
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
 };
-use rusthouse::{Catalog, DEFAULT_MAX_TABLES};
+use rusthouse::{Catalog, CatalogError, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, Value};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
 
@@ -319,6 +319,41 @@ fn reports_catalog_capacity_as_a_limit() {
             DEFAULT_MAX_TABLES + 1
         )
     );
+}
+
+#[test]
+fn reports_aggregate_result_bytes_as_a_limit() {
+    const VALUE_BYTES: usize = MAX_AGGREGATE_RESULT_BYTES / 2 + 1;
+    const REQUIRED_BYTES: usize = VALUE_BYTES * 2;
+
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE strings (value String)")
+        .unwrap();
+    catalog
+        .table_mut("strings")
+        .unwrap()
+        .insert_batch([vec![Value::String("x".repeat(VALUE_BYTES))]])
+        .unwrap();
+
+    let error = execute_batch(
+        Cursor::new(b"SELECT MIN(value), MAX(value) FROM strings\n"),
+        &mut catalog,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.exit_code(), 3);
+    assert!(matches!(
+        error,
+        BatchError::ExecutionLimit {
+            line: 1,
+            source: CatalogError::AggregateResultTooLarge {
+                limit: MAX_AGGREGATE_RESULT_BYTES,
+                required: REQUIRED_BYTES,
+                ..
+            },
+        }
+    ));
 }
 
 #[test]

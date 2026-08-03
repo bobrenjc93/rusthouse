@@ -20,6 +20,8 @@ use crate::{RowSelection, ScanError};
 
 /// Default maximum number of tables owned by one [`Catalog`].
 pub const DEFAULT_MAX_TABLES: usize = 1024;
+/// Maximum retained String payload bytes in one scalar aggregate row.
+pub const MAX_AGGREGATE_RESULT_BYTES: usize = 1024 * 1024;
 
 /// Resource limits applied by a [`Catalog`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +122,17 @@ pub enum CatalogError {
         /// Number of aggregate values whose storage could not be reserved.
         aggregate_count: usize,
     },
+    /// Retained String payloads in a scalar aggregate row exceed their bound.
+    AggregateResultTooLarge {
+        /// Name from the rejected statement.
+        name: String,
+        /// Field whose next extrema value would exceed the bound.
+        field: String,
+        /// Maximum retained String payload bytes.
+        limit: usize,
+        /// Total bytes required through the rejected aggregate.
+        required: usize,
+    },
     /// The field named by an `ORDER BY` clause does not exist in the table.
     OrderFieldNotFound {
         /// Case-sensitive name used in the clause.
@@ -194,6 +207,15 @@ impl fmt::Display for CatalogError {
             Self::AggregateAllocationFailed { aggregate_count } => write!(
                 formatter,
                 "could not reserve a result row for {aggregate_count} scalar aggregates"
+            ),
+            Self::AggregateResultTooLarge {
+                name,
+                field,
+                limit,
+                required,
+            } => write!(
+                formatter,
+                "aggregate result for table `{name}` requires {required} String payload bytes at field `{field}`; limit is {limit}"
             ),
             Self::OrderFieldNotFound { name } => {
                 write!(formatter, "ordered field `{name}` does not exist")
@@ -657,7 +679,9 @@ impl Catalog {
     /// The returned result borrows the source table and does not copy table
     /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
     /// For row projections, `ORDER BY` owns and sorts only selected row indexes.
-    /// `LIMIT` is applied to the final projected or aggregate output.
+    /// Scalar aggregate rows retain at most [`MAX_AGGREGATE_RESULT_BYTES`] of
+    /// String payloads. `LIMIT` is applied to the final projected or aggregate
+    /// output.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -679,6 +703,7 @@ impl Catalog {
             .get(&normalize_table_name(&name))
             .map(|entry| &entry.table)
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
+        let aggregate_result_byte_limit = MAX_AGGREGATE_RESULT_BYTES;
 
         match projections {
             SelectProjection::CountAll { alias } => execute_aggregates(
@@ -687,6 +712,7 @@ impl Catalog {
                 predicate,
                 order_by,
                 limit,
+                aggregate_result_byte_limit,
                 std::iter::once(AggregateProjection {
                     function: AggregateFunction::CountAll,
                     alias,
@@ -698,6 +724,7 @@ impl Catalog {
                 predicate,
                 order_by,
                 limit,
+                aggregate_result_byte_limit,
                 aggregates.into_iter(),
             ),
             projections => {
@@ -794,6 +821,7 @@ fn execute_aggregates<'a>(
     predicate: Option<ComparisonPredicate>,
     order_by: Option<OrderByClause>,
     limit: Option<usize>,
+    aggregate_result_byte_limit: usize,
     aggregates: impl ExactSizeIterator<Item = AggregateProjection>,
 ) -> Result<SelectResult<'a>, CatalogError> {
     let aggregate_count = aggregates.len();
@@ -815,12 +843,14 @@ fn execute_aggregates<'a>(
     scalars
         .try_reserve_exact(aggregate_count)
         .map_err(|_| CatalogError::AggregateAllocationFailed { aggregate_count })?;
+    let mut string_budget = AggregateStringBudget::new(aggregate_result_byte_limit);
     for aggregate in aggregates {
         scalars.push(execute_aggregate(
             table,
             table_name,
             selection.as_ref(),
             aggregate,
+            &mut string_budget,
         )?);
     }
 
@@ -841,6 +871,7 @@ fn execute_aggregate(
     table_name: &str,
     selection: Option<&RowSelection>,
     aggregate: AggregateProjection,
+    string_budget: &mut AggregateStringBudget,
 ) -> Result<ScalarResult, CatalogError> {
     let AggregateProjection { function, alias } = aggregate;
     match function {
@@ -874,27 +905,74 @@ fn execute_aggregate(
             Ok(scalar_result(alias, "avg", column, value))
         }
         AggregateFunction::Min { column } => {
+            let result = table.min_with_string_limit(&column, selection, string_budget.remaining());
             let value =
-                map_reduction(table_name, table.min(&column, selection))?.ok_or_else(|| {
+                map_extreme_reduction(table_name, string_budget, result)?.ok_or_else(|| {
                     CatalogError::EmptyAggregateInput {
                         name: table_name.to_owned(),
                         function: "MIN",
                         field: column.clone(),
                     }
                 })?;
+            string_budget.account(&value);
             Ok(scalar_result(alias, "min", column, value))
         }
         AggregateFunction::Max { column } => {
+            let result = table.max_with_string_limit(&column, selection, string_budget.remaining());
             let value =
-                map_reduction(table_name, table.max(&column, selection))?.ok_or_else(|| {
+                map_extreme_reduction(table_name, string_budget, result)?.ok_or_else(|| {
                     CatalogError::EmptyAggregateInput {
                         name: table_name.to_owned(),
                         function: "MAX",
                         field: column.clone(),
                     }
                 })?;
+            string_budget.account(&value);
             Ok(scalar_result(alias, "max", column, value))
         }
+    }
+}
+
+struct AggregateStringBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl AggregateStringBudget {
+    const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    const fn remaining(&self) -> usize {
+        self.limit - self.used
+    }
+
+    fn account(&mut self, value: &Value) {
+        if let Value::String(value) = value {
+            self.used = self
+                .used
+                .checked_add(value.len())
+                .expect("bounded aggregate String bytes cannot overflow");
+            debug_assert!(self.used <= self.limit);
+        }
+    }
+}
+
+fn map_extreme_reduction(
+    table_name: &str,
+    string_budget: &AggregateStringBudget,
+    result: Result<Option<Value>, ReductionError>,
+) -> Result<Option<Value>, CatalogError> {
+    match result {
+        Err(ReductionError::StringResultTooLarge {
+            field, required, ..
+        }) => Err(CatalogError::AggregateResultTooLarge {
+            name: table_name.to_owned(),
+            field,
+            limit: string_budget.limit,
+            required: string_budget.used.saturating_add(required),
+        }),
+        result => map_reduction(table_name, result),
     }
 }
 

@@ -2,8 +2,8 @@ use std::error::Error;
 
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, ComparisonOperator, ComparisonPredicate, DataType,
-    ParseErrorKind, ParseLimits, ReductionError, ScanError, SelectParseLimits, SelectProjection,
-    SelectResult, SelectStatement, Value,
+    MAX_AGGREGATE_RESULT_BYTES, ParseErrorKind, ParseLimits, ReductionError, ScanError,
+    SelectParseLimits, SelectProjection, SelectResult, SelectStatement, Value,
 };
 
 const fn scalar_value_through_const_api<'result, 'table>(
@@ -273,6 +273,46 @@ fn aggregate_failures_preserve_typed_column_type_overflow_and_empty_errors() {
                 field: "value".to_owned(),
                 row: 1,
             },
+        }
+    );
+}
+
+#[test]
+fn bounds_repeated_large_string_extrema_before_copying_over_the_limit() {
+    const STRING_BYTES: usize = 512 * 1024;
+
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE strings (payload String)")
+        .unwrap();
+    catalog
+        .table_mut("strings")
+        .unwrap()
+        .insert_batch([vec![Value::String("x".repeat(STRING_BYTES))]])
+        .unwrap();
+
+    let projection_count = SelectParseLimits::DEFAULT_MAX_PROJECTIONS;
+    let projections = (0..projection_count)
+        .map(|index| {
+            if index % 2 == 0 {
+                "MIN(payload)"
+            } else {
+                "MAX(payload)"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let error = catalog
+        .execute_select(&format!("SELECT {projections} FROM strings"))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        CatalogError::AggregateResultTooLarge {
+            name: "strings".to_owned(),
+            field: "payload".to_owned(),
+            limit: MAX_AGGREGATE_RESULT_BYTES,
+            required: MAX_AGGREGATE_RESULT_BYTES + STRING_BYTES,
         }
     );
 }
