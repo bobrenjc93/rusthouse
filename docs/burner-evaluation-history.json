@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "evaluations": {
+    "eval_69c46252": {
+      "name": "Analytical database capability",
+      "color": "#ff6b35"
+    },
+    "eval_ed4d7712": {
+      "name": "Rust engineering quality",
+      "color": "#7c5cff"
+    },
+    "eval_99d9f2c8": {
+      "name": "ClickHouse sustained parity",
+      "color": "#00a7a5"
+    },
+    "eval_36f48d7d": {
+      "name": "Benchmark integrity and anti-gaming",
+      "color": "#e6a700"
+    },
+    "eval_56a6f83a": {
+      "name": "ClickHouse feature comprehensiveness",
+      "color": "#d94f8a"
+    },
+    "eval_a8d9ce71": {
+      "name": "Evaluation progress accounting",
+      "color": "#2589bd"
+    }
+  },
+  "points": [
+    {
+      "key": "base:52971b0b7a2f2b9ad078b286ce0d06a3807b9c26",
+      "commit": "52971b0b7a2f2b9ad078b286ce0d06a3807b9c26",
+      "recordedAt": "2026-08-03T02:58:40.131Z",
+      "label": "base 52971b0",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_69c46252": 0,
+        "eval_ed4d7712": 20,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 80,
+        "eval_56a6f83a": 0,
+        "eval_a8d9ce71": 0
+      }
+    },
+    {
+      "key": "pr:289",
+      "recordedAt": "2026-08-03T02:58:40.131Z",
+      "label": "PR #289",
+      "kind": "composite",
+      "prNumber": 289,
+      "title": "YOLO generation 1: 3 reviewed improvements",
+      "scores": {
+        "eval_69c46252": 25,
+        "eval_ed4d7712": 65,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 15,
+        "eval_a8d9ce71": 0
+      }
+    }
+  ]
+}
