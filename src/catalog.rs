@@ -736,14 +736,9 @@ impl Catalog {
                 let selection = scan_predicate_groups(table, predicate_groups, &name)?;
 
                 let (selection, ordered_rows, row_end, row_count) = match order {
-                    Some((column_index, direction)) => {
-                        let rows = ordered_row_indices(
-                            table,
-                            column_index,
-                            direction,
-                            selection.as_ref(),
-                            limit,
-                        )?;
+                    Some(order_keys) => {
+                        let rows =
+                            ordered_row_indices(table, &order_keys, selection.as_ref(), limit)?;
                         let row_count = rows.len();
                         (None, Some(rows), 0, row_count)
                     }
@@ -815,7 +810,7 @@ fn execute_aggregates<'a>(
     table: &'a Table,
     table_name: &str,
     predicate_groups: Vec<Vec<ComparisonPredicate>>,
-    order_by: Option<OrderByClause>,
+    order_by: Option<Vec<OrderByClause>>,
     limit: Option<usize>,
     aggregate_result_byte_limit: usize,
     aggregates: impl ExactSizeIterator<Item = AggregateProjection>,
@@ -1071,22 +1066,26 @@ fn limited_row_bounds(
 
 fn resolve_order(
     table: &Table,
-    order_by: OrderByClause,
-) -> Result<(usize, OrderDirection), CatalogError> {
-    table
-        .fields()
-        .iter()
-        .position(|field| field.name() == order_by.column)
-        .map(|index| (index, order_by.direction))
-        .ok_or(CatalogError::OrderFieldNotFound {
-            name: order_by.column,
+    order_by: Vec<OrderByClause>,
+) -> Result<Vec<(usize, OrderDirection)>, CatalogError> {
+    order_by
+        .into_iter()
+        .map(|order_key| {
+            table
+                .fields()
+                .iter()
+                .position(|field| field.name() == order_key.column)
+                .map(|index| (index, order_key.direction))
+                .ok_or(CatalogError::OrderFieldNotFound {
+                    name: order_key.column,
+                })
         })
+        .collect()
 }
 
 fn ordered_row_indices(
     table: &Table,
-    column_index: usize,
-    direction: OrderDirection,
+    order_keys: &[(usize, OrderDirection)],
     selection: Option<&RowSelection>,
     limit: Option<usize>,
 ) -> Result<Vec<usize>, CatalogError> {
@@ -1099,14 +1098,19 @@ fn ordered_row_indices(
         None => rows.extend(0..table.len()),
     }
 
-    let column = &table.columns()[column_index];
     rows.sort_unstable_by(|left, right| {
-        let value_order = compare_column_rows(column, *left, *right);
-        let directed_order = match direction {
-            OrderDirection::Ascending => value_order,
-            OrderDirection::Descending => value_order.reverse(),
-        };
-        directed_order.then_with(|| left.cmp(right))
+        order_keys
+            .iter()
+            .map(|(column_index, direction)| {
+                let value_order =
+                    compare_column_rows(&table.columns()[*column_index], *left, *right);
+                match direction {
+                    OrderDirection::Ascending => value_order,
+                    OrderDirection::Descending => value_order.reverse(),
+                }
+            })
+            .find(|order| *order != Ordering::Equal)
+            .unwrap_or_else(|| left.cmp(right))
     });
     if let Some(limit) = limit {
         rows.truncate(limit);

@@ -527,6 +527,43 @@ fn orders_all_physical_types_and_preserves_source_order_for_ties() {
 }
 
 #[test]
+fn orders_lexicographically_by_hidden_mixed_keys_before_applying_limit() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE ranked (id Int64, segment String, score Float64, active Bool)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO ranked VALUES \
+             (0, 'beta', 10.0, true), \
+             (1, 'alpha', 20.0, true), \
+             (2, 'alpha', 20.0, true), \
+             (3, 'alpha', 5.0, false), \
+             (4, 'beta', 30.0, true), \
+             (5, 'alpha', 20.0, false)",
+        )
+        .unwrap();
+
+    let result = catalog
+        .execute_select(
+            "SELECT id FROM ranked WHERE active = true \
+             ORDER BY segment ASC, score DESC LIMIT 3",
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .fields()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        ["id"]
+    );
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [1, 2, 4]);
+}
+
+#[test]
 fn float_order_is_total_and_deterministic() {
     let mut catalog = Catalog::new();
     catalog
@@ -603,6 +640,15 @@ fn orders_empty_tables_and_reports_missing_order_fields() {
     assert_eq!(
         catalog
             .execute_select("SELECT id FROM empty ORDER BY missing")
+            .unwrap_err(),
+        CatalogError::OrderFieldNotFound {
+            name: "missing".to_owned(),
+        }
+    );
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT id FROM empty ORDER BY id, missing DESC LIMIT 0")
             .unwrap_err(),
         CatalogError::OrderFieldNotFound {
             name: "missing".to_owned(),
