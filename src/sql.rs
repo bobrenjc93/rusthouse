@@ -36,6 +36,30 @@ pub enum SelectProjection {
     Columns(Vec<String>),
     /// Count every input row, optionally naming the result field.
     CountAll { alias: Option<String> },
+    /// Compute one or more scalar aggregates over the same input rows.
+    Aggregates(Vec<AggregateProjection>),
+}
+
+/// One supported scalar aggregate expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateFunction {
+    /// Count every selected row.
+    CountAll,
+    /// Sum one numeric column.
+    Sum { column: String },
+    /// Average one numeric column.
+    Avg { column: String },
+    /// Find the minimum value of one column.
+    Min { column: String },
+    /// Find the maximum value of one column.
+    Max { column: String },
+}
+
+/// One scalar aggregate and its optional output name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateProjection {
+    pub function: AggregateFunction,
+    pub alias: Option<String>,
 }
 
 /// A comparison relationship supported by a `WHERE` predicate.
@@ -229,6 +253,7 @@ pub enum ParseErrorKind {
         limit: usize,
     },
     ExpectedProjection,
+    MixedAggregateProjection,
     TooManyProjections {
         limit: usize,
     },
@@ -301,7 +326,10 @@ impl fmt::Display for ParseErrorKind {
                 write!(formatter, "row value count exceeds limit of {limit}")
             }
             Self::ExpectedProjection => {
-                formatter.write_str("expected a column projection, '*', or COUNT(*)")
+                formatter.write_str("expected a column projection, '*', or scalar aggregate")
+            }
+            Self::MixedAggregateProjection => {
+                formatter.write_str("scalar aggregates cannot be mixed with raw column projections")
             }
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
@@ -434,13 +462,15 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 
 /// Parses one bounded `SELECT` statement.
 ///
-/// Projections are `*`, a non-empty list of unquoted column names, or the single
-/// aggregate `COUNT(*)` with an optional `AS` alias. The statement reads one
-/// table and may contain one `WHERE` comparison between a column and an
-/// `Int64`, `Float64`, `Bool`, or `String` literal. That may be followed by one
-/// `ORDER BY column [ASC|DESC]` clause and a nonnegative integer `LIMIT`. Other
-/// aliases, expressions, aggregates, compound predicates, and result modifiers
-/// are outside this intentionally narrow syntax boundary.
+/// Projections are `*`, a non-empty list of unquoted column names, or a
+/// non-empty aggregate-only list containing `COUNT(*)`, `SUM(column)`,
+/// `AVG(column)`, `MIN(column)`, and `MAX(column)`. Every aggregate may have an
+/// `AS` alias. The statement reads one table and may contain one `WHERE`
+/// comparison between a column and an `Int64`, `Float64`, `Bool`, or `String`
+/// literal. That may be followed by one `ORDER BY column [ASC|DESC]` clause and
+/// a nonnegative integer `LIMIT`. Raw-column mixing, other expressions,
+/// compound predicates, and other result modifiers are outside this
+/// intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -637,11 +667,39 @@ impl<'a> Parser<'a> {
             return Ok(SelectProjection::All);
         }
 
-        let mut columns = Vec::new();
+        if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
+            return Err(self.error(ParseErrorKind::ExpectedProjection));
+        }
+
+        let (first, first_position) = self.parse_identifier(IdentifierContext::Column)?;
+        self.skip_whitespace();
+        if let Some(kind) = aggregate_kind(&first)
+            && self.peek() == Some(b'(')
+        {
+            return self.parse_aggregate_projections(kind, first_position, max_projections);
+        }
+        if max_projections == 0 {
+            return Err(ParseError {
+                position: first_position,
+                kind: ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                },
+            });
+        }
+
+        let mut columns = vec![first];
         loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
             self.skip_whitespace();
             if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
                 return Err(self.error(ParseErrorKind::ExpectedProjection));
+            }
+            if self.peek() == Some(b'*') {
+                return Err(self.error(ParseErrorKind::MixedAggregateProjection));
             }
             if columns.len() == max_projections {
                 return Err(self.error(ParseErrorKind::TooManyProjections {
@@ -649,28 +707,102 @@ impl<'a> Parser<'a> {
                 }));
             }
 
-            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            let (column, column_position) = self.parse_identifier(IdentifierContext::Column)?;
             self.skip_whitespace();
-            if columns.is_empty()
-                && column.eq_ignore_ascii_case("COUNT")
-                && self.peek() == Some(b'(')
-            {
-                return self.parse_count_all();
+            if aggregate_kind(&column).is_some() && self.peek() == Some(b'(') {
+                return Err(ParseError {
+                    position: column_position,
+                    kind: ParseErrorKind::MixedAggregateProjection,
+                });
             }
             columns.push(column);
-
-            if self.peek() != Some(b',') {
-                break;
-            }
-            self.position += 1;
         }
 
         Ok(SelectProjection::Columns(columns))
     }
 
-    fn parse_count_all(&mut self) -> Result<SelectProjection, ParseError> {
+    fn parse_aggregate_projections(
+        &mut self,
+        first_kind: AggregateKind,
+        first_position: usize,
+        max_projections: usize,
+    ) -> Result<SelectProjection, ParseError> {
+        if max_projections == 0 {
+            return Err(ParseError {
+                position: first_position,
+                kind: ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                },
+            });
+        }
+
+        let mut aggregates = vec![self.parse_aggregate(first_kind)?];
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+            self.skip_whitespace();
+            if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
+                return Err(self.error(ParseErrorKind::ExpectedProjection));
+            }
+            if self.peek() == Some(b'*') {
+                return Err(self.error(ParseErrorKind::MixedAggregateProjection));
+            }
+            if aggregates.len() == max_projections {
+                return Err(self.error(ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                }));
+            }
+
+            let (function, function_position) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            let Some(kind) = aggregate_kind(&function) else {
+                return Err(ParseError {
+                    position: function_position,
+                    kind: ParseErrorKind::MixedAggregateProjection,
+                });
+            };
+            if self.peek() != Some(b'(') {
+                return Err(ParseError {
+                    position: function_position,
+                    kind: ParseErrorKind::MixedAggregateProjection,
+                });
+            }
+            aggregates.push(self.parse_aggregate(kind)?);
+        }
+
+        if aggregates.len() == 1 && matches!(aggregates[0].function, AggregateFunction::CountAll) {
+            let aggregate = aggregates.pop().expect("one aggregate was parsed");
+            return Ok(SelectProjection::CountAll {
+                alias: aggregate.alias,
+            });
+        }
+
+        Ok(SelectProjection::Aggregates(aggregates))
+    }
+
+    fn parse_aggregate(&mut self, kind: AggregateKind) -> Result<AggregateProjection, ParseError> {
         self.position += 1;
-        self.expect_byte(b'*', "'*'")?;
+        let function = match kind {
+            AggregateKind::Count => {
+                self.expect_byte(b'*', "'*'")?;
+                AggregateFunction::CountAll
+            }
+            AggregateKind::Sum => AggregateFunction::Sum {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+            AggregateKind::Avg => AggregateFunction::Avg {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+            AggregateKind::Min => AggregateFunction::Min {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+            AggregateKind::Max => AggregateFunction::Max {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+        };
         self.expect_byte(b')', "')'")?;
 
         let alias = if self.peek_token_is("AS") {
@@ -680,7 +812,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(SelectProjection::CountAll { alias })
+        Ok(AggregateProjection { function, alias })
     }
 
     fn parse_comparison(
@@ -1072,6 +1204,31 @@ fn invalid_identifier_offset(identifier: &str) -> Option<usize> {
     bytes
         .iter()
         .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+}
+
+#[derive(Clone, Copy)]
+enum AggregateKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+fn aggregate_kind(function: &str) -> Option<AggregateKind> {
+    if function.eq_ignore_ascii_case("COUNT") {
+        Some(AggregateKind::Count)
+    } else if function.eq_ignore_ascii_case("SUM") {
+        Some(AggregateKind::Sum)
+    } else if function.eq_ignore_ascii_case("AVG") {
+        Some(AggregateKind::Avg)
+    } else if function.eq_ignore_ascii_case("MIN") {
+        Some(AggregateKind::Min)
+    } else if function.eq_ignore_ascii_case("MAX") {
+        Some(AggregateKind::Max)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -1,7 +1,8 @@
 use rusthouse::{
-    ComparisonOperator, ComparisonPredicate, IdentifierContext, OrderByClause, OrderDirection,
-    ParseError, ParseErrorKind, SelectParseLimits, SelectProjection, SelectStatement, Value,
-    parse_select, parse_select_with_limits,
+    AggregateFunction, AggregateProjection, ComparisonOperator, ComparisonPredicate,
+    IdentifierContext, OrderByClause, OrderDirection, ParseError, ParseErrorKind,
+    SelectParseLimits, SelectProjection, SelectStatement, Value, parse_select,
+    parse_select_with_limits,
 };
 
 fn parse_error(input: &str) -> ParseError {
@@ -77,6 +78,58 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
         })
     );
     assert_eq!(modified.limit, Some(0));
+}
+
+#[test]
+fn parses_bounded_aggregate_only_lists_with_optional_aliases() {
+    let statement = parse_select(
+        "SELECT COUNT(*), SUM(sequence) AS total, avg(value), Min(label) AS first, MAX(active) \
+         FROM Events WHERE active = true",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statement.projections,
+        SelectProjection::Aggregates(vec![
+            AggregateProjection {
+                function: AggregateFunction::CountAll,
+                alias: None,
+            },
+            AggregateProjection {
+                function: AggregateFunction::Sum {
+                    column: "sequence".to_owned(),
+                },
+                alias: Some("total".to_owned()),
+            },
+            AggregateProjection {
+                function: AggregateFunction::Avg {
+                    column: "value".to_owned(),
+                },
+                alias: None,
+            },
+            AggregateProjection {
+                function: AggregateFunction::Min {
+                    column: "label".to_owned(),
+                },
+                alias: Some("first".to_owned()),
+            },
+            AggregateProjection {
+                function: AggregateFunction::Max {
+                    column: "active".to_owned(),
+                },
+                alias: None,
+            },
+        ])
+    );
+    assert_eq!(statement.table, "Events");
+    assert_eq!(
+        statement.predicate,
+        Some(ComparisonPredicate {
+            column: "active".to_owned(),
+            operator: ComparisonOperator::Equal,
+            value: Value::Bool(true),
+        })
+    );
 }
 
 #[test]
@@ -313,6 +366,15 @@ fn enforces_projection_limit_at_the_next_projection() {
 
     let count = "SELECT COUNT(*) FROM events";
     assert!(parse_select_with_limits(count, SelectParseLimits::new(count.len(), 1)).is_ok());
+
+    let aggregates = "SELECT COUNT(*), SUM(id), AVG(id) FROM events";
+    assert!(
+        parse_select_with_limits(aggregates, SelectParseLimits::new(aggregates.len(), 3)).is_ok()
+    );
+    let error = parse_select_with_limits(aggregates, SelectParseLimits::new(aggregates.len(), 2))
+        .unwrap_err();
+    assert_eq!(error.position, aggregates.find("AVG").unwrap());
+    assert_eq!(error.kind, ParseErrorKind::TooManyProjections { limit: 2 });
 }
 
 #[test]
@@ -398,20 +460,24 @@ fn reports_positioned_predicate_errors() {
 }
 
 #[test]
-fn rejects_aliases_aggregates_compound_predicates_and_unsupported_result_clauses() {
+fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
     let cases = [
         ("SELECT id AS event_id FROM events", "AS"),
-        ("SELECT SUM(id) FROM events", "("),
         ("SELECT COUNT(id) FROM events", "id"),
         ("SELECT COUNT(DISTINCT id) FROM events", "DISTINCT"),
-        ("SELECT COUNT(*), id FROM events", ","),
-        ("SELECT id, COUNT(*) FROM events", "("),
+        ("SELECT COUNT(*), id FROM events", "id"),
+        ("SELECT id, COUNT(*) FROM events", "COUNT"),
+        ("SELECT SUM(id), label FROM events", "label"),
+        ("SELECT label, MIN(label) FROM events", "MIN"),
         ("SELECT DISTINCT id FROM events", "id"),
+        ("SELECT DISTINCT COUNT(*) FROM events", "COUNT"),
         ("SELECT * FROM events AS e", "AS"),
         ("SELECT * FROM events WHERE id = 1 AND active = true", "AND"),
         ("SELECT * FROM events WHERE id = 1 OR id = 2", "OR"),
+        ("SELECT * FROM events WHERE id = NULL", "NULL"),
         ("SELECT COUNT(*) FROM events GROUP BY active", "GROUP"),
         ("SELECT * FROM events GROUP BY id", "GROUP"),
+        ("SELECT AVG(id) FROM events HAVING AVG(id) > 1", "HAVING"),
     ];
 
     for (input, marker) in cases {
@@ -419,6 +485,18 @@ fn rejects_aliases_aggregates_compound_predicates_and_unsupported_result_clauses
         assert_eq!(
             error.position,
             input.find(marker).unwrap(),
+            "input: {input:?}"
+        );
+    }
+
+    for input in [
+        "SELECT COUNT(*), id FROM events",
+        "SELECT COUNT(*), * FROM events",
+        "SELECT id, COUNT(*) FROM events",
+    ] {
+        assert_eq!(
+            parse_error(input).kind,
+            ParseErrorKind::MixedAggregateProjection,
             "input: {input:?}"
         );
     }
