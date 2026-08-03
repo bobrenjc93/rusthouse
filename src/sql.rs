@@ -352,7 +352,8 @@ impl<'a> Lexer<'a> {
         description: &str,
         offset: usize,
     ) -> Result<String, SqlError> {
-        debug_assert_eq!(self.bump(), Some(delimiter));
+        debug_assert_eq!(self.peek(), Some(delimiter));
+        self.bump();
         let mut value = String::new();
         loop {
             match self.bump() {
