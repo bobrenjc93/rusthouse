@@ -197,6 +197,22 @@ fn select_results_stream_projected_columns_and_selected_rows() {
 }
 
 #[test]
+fn count_limit_zero_writes_only_the_aggregate_header() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE events (id Int64)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO events VALUES (1), (2)")
+        .unwrap();
+
+    let result = catalog
+        .execute_select("SELECT COUNT(*) AS rows FROM events LIMIT 0")
+        .unwrap();
+    assert_eq!(render_select(&result), b"\"rows\"\n");
+}
+
+#[test]
 fn select_writer_returns_partial_failures_without_materializing_output() {
     let mut catalog = Catalog::new();
     catalog

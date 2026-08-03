@@ -38,6 +38,48 @@ fn parses_wildcard_and_named_projections() {
 }
 
 #[test]
+fn parses_count_all_with_an_optional_alias_and_predicate() {
+    assert_eq!(
+        parse_select("SELECT COUNT(*) FROM events").unwrap(),
+        SelectStatement {
+            projections: SelectProjection::CountAll { alias: None },
+            table: "events".to_owned(),
+            predicate: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+
+    assert_eq!(
+        parse_select("select count ( * ) as Matching from Events where active = true").unwrap(),
+        SelectStatement {
+            projections: SelectProjection::CountAll {
+                alias: Some("Matching".to_owned()),
+            },
+            table: "Events".to_owned(),
+            predicate: Some(ComparisonPredicate {
+                column: "active".to_owned(),
+                operator: ComparisonOperator::Equal,
+                value: Value::Bool(true),
+            }),
+            order_by: None,
+            limit: None,
+        }
+    );
+
+    let modified =
+        parse_select("SELECT COUNT(*) FROM events ORDER BY active DESC LIMIT 0").unwrap();
+    assert_eq!(
+        modified.order_by,
+        Some(OrderByClause {
+            column: "active".to_owned(),
+            direction: OrderDirection::Descending,
+        })
+    );
+    assert_eq!(modified.limit, Some(0));
+}
+
+#[test]
 fn parses_wildcard_adjacent_to_select_and_from_keywords() {
     let expected = SelectStatement {
         projections: SelectProjection::All,
@@ -252,12 +294,25 @@ fn enforces_projection_limit_at_the_next_projection() {
     assert_eq!(error.position, input.find("second").unwrap());
     assert_eq!(error.kind, ParseErrorKind::TooManyProjections { limit: 1 });
 
-    for input in ["SELECT id FROM events", "SELECT * FROM events"] {
+    for input in [
+        "SELECT id FROM events",
+        "SELECT * FROM events",
+        "SELECT COUNT(*) FROM events",
+    ] {
         let error =
             parse_select_with_limits(input, SelectParseLimits::new(input.len(), 0)).unwrap_err();
-        assert_eq!(error.position, input.find(['i', '*']).unwrap(), "{input:?}");
+        assert_eq!(
+            error.position,
+            input
+                .find("COUNT")
+                .unwrap_or_else(|| input.find(['i', '*']).unwrap()),
+            "{input:?}"
+        );
         assert_eq!(error.kind, ParseErrorKind::TooManyProjections { limit: 0 });
     }
+
+    let count = "SELECT COUNT(*) FROM events";
+    assert!(parse_select_with_limits(count, SelectParseLimits::new(count.len(), 1)).is_ok());
 }
 
 #[test]
@@ -346,10 +401,16 @@ fn reports_positioned_predicate_errors() {
 fn rejects_aliases_aggregates_compound_predicates_and_unsupported_result_clauses() {
     let cases = [
         ("SELECT id AS event_id FROM events", "AS"),
-        ("SELECT COUNT(*) FROM events", "("),
+        ("SELECT SUM(id) FROM events", "("),
+        ("SELECT COUNT(id) FROM events", "id"),
+        ("SELECT COUNT(DISTINCT id) FROM events", "DISTINCT"),
+        ("SELECT COUNT(*), id FROM events", ","),
+        ("SELECT id, COUNT(*) FROM events", "("),
+        ("SELECT DISTINCT id FROM events", "id"),
         ("SELECT * FROM events AS e", "AS"),
         ("SELECT * FROM events WHERE id = 1 AND active = true", "AND"),
         ("SELECT * FROM events WHERE id = 1 OR id = 2", "OR"),
+        ("SELECT COUNT(*) FROM events GROUP BY active", "GROUP"),
         ("SELECT * FROM events GROUP BY id", "GROUP"),
     ];
 

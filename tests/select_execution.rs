@@ -107,6 +107,82 @@ fn filters_rows_and_reports_empty_results() {
 }
 
 #[test]
+fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
+    let catalog = readings_catalog();
+
+    let all = catalog
+        .execute_select("SELECT COUNT(*) FROM readings")
+        .unwrap();
+    assert_eq!(
+        all.fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [("count()", DataType::Int64)]
+    );
+    assert_eq!(all.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(all.row_indices().collect::<Vec<_>>(), [0]);
+    assert_eq!(all.len(), 1);
+    assert!(!all.is_empty());
+
+    let filtered = catalog
+        .execute_select("SELECT COUNT(*) AS active_count FROM readings WHERE active = true")
+        .unwrap();
+    assert_eq!(
+        filtered
+            .fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [("active_count", DataType::Int64)]
+    );
+    assert_eq!(filtered.scalar_value(), Some(&Value::Int64(2)));
+
+    let no_matches = catalog
+        .execute_select("SELECT COUNT(*) FROM readings WHERE value > 100.0")
+        .unwrap();
+    assert_eq!(no_matches.scalar_value(), Some(&Value::Int64(0)));
+    assert_eq!(no_matches.len(), 1);
+
+    let mut empty_catalog = Catalog::new();
+    empty_catalog
+        .execute_create("CREATE TABLE empty (id Int64)")
+        .unwrap();
+    let empty = empty_catalog
+        .execute_select("SELECT COUNT(*) AS rows FROM empty")
+        .unwrap();
+    assert_eq!(empty.scalar_value(), Some(&Value::Int64(0)));
+    assert_eq!(empty.len(), 1);
+    assert!(!empty.is_empty());
+}
+
+#[test]
+fn applies_order_validation_and_limit_to_count_results() {
+    let catalog = readings_catalog();
+
+    let count = catalog
+        .execute_select("SELECT COUNT(*) FROM readings ORDER BY value DESC LIMIT 1")
+        .unwrap();
+    assert_eq!(count.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(count.row_indices().collect::<Vec<_>>(), [0]);
+
+    let suppressed = catalog
+        .execute_select("SELECT COUNT(*) AS matches FROM readings ORDER BY value LIMIT 0")
+        .unwrap();
+    assert_eq!(suppressed.fields().next().unwrap().name(), "matches");
+    assert_eq!(suppressed.scalar_value(), None);
+    assert!(suppressed.is_empty());
+    assert_eq!(suppressed.row_indices().next(), None);
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT COUNT(*) FROM readings ORDER BY missing")
+            .unwrap_err(),
+        CatalogError::OrderFieldNotFound {
+            name: "missing".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn executes_an_already_parsed_statement() {
     let catalog = readings_catalog();
     let statement = SelectStatement {
