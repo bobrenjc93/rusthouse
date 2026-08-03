@@ -386,7 +386,19 @@ impl<'input> Parser<'input> {
             return Err(ParseError::InvalidInt64 { offset: start });
         }
 
-        let literal = &self.input[start..self.position];
+        let end = self.position;
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b')') => {}
+            Some(_) => {
+                return Err(ParseError::InvalidInt64 {
+                    offset: self.position,
+                });
+            }
+            None => return Err(self.unexpected("')'")),
+        }
+
+        let literal = &self.input[start..end];
         literal
             .parse::<i64>()
             .map(Some)

@@ -82,6 +82,18 @@ fn rejects_overflow_malformed_literals_and_extra_rows_with_byte_offsets() {
             ParseError::InvalidInt64 { offset: 24 },
         ),
         (
+            "INSERT INTO t VALUES (9223372036854775808x)",
+            ParseError::InvalidInt64 { offset: 41 },
+        ),
+        (
+            "INSERT INTO t VALUES (99999999999999999999.0)",
+            ParseError::InvalidInt64 { offset: 42 },
+        ),
+        (
+            "INSERT INTO t VALUES (9223372036854775808 x)",
+            ParseError::InvalidInt64 { offset: 42 },
+        ),
+        (
             "INSERT INTO t VALUES (nope)",
             ParseError::InvalidInt64 { offset: 22 },
         ),
