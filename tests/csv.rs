@@ -197,7 +197,7 @@ fn select_results_stream_projected_columns_and_selected_rows() {
 }
 
 #[test]
-fn count_limit_zero_writes_only_the_aggregate_header() {
+fn aggregate_limit_zero_writes_only_the_aggregate_headers() {
     let mut catalog = Catalog::new();
     catalog
         .execute_create("CREATE TABLE events (id Int64)")
@@ -207,9 +207,9 @@ fn count_limit_zero_writes_only_the_aggregate_header() {
         .unwrap();
 
     let result = catalog
-        .execute_select("SELECT COUNT(*) AS rows FROM events LIMIT 0")
+        .execute_select("SELECT COUNT(*) AS rows, SUM(id) AS total FROM events LIMIT 0")
         .unwrap();
-    assert_eq!(render_select(&result), b"\"rows\"\n");
+    assert_eq!(render_select(&result), b"\"rows\",\"total\"\n");
 }
 
 #[test]

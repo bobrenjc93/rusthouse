@@ -305,13 +305,16 @@ fn is_catalog_limit(error: &CatalogError) -> bool {
                 | ParseErrorKind::TooManyRows { .. }
                 | ParseErrorKind::TooManyValues { .. }
                 | ParseErrorKind::TooManyProjections { .. }
+                | ParseErrorKind::TooManyPredicates { .. }
+                | ParseErrorKind::TooManyPredicateGroups { .. }
                 | ParseErrorKind::StringTooLong { .. }
         ),
         CatalogError::TableInsertion {
             source: TableError::RowLimitExceeded { .. },
             ..
         }
-        | CatalogError::TableLimitExceeded { .. } => true,
+        | CatalogError::TableLimitExceeded { .. }
+        | CatalogError::AggregateResultTooLarge { .. } => true,
         _ => false,
     }
 }

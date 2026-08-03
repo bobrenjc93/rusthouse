@@ -1,7 +1,8 @@
 use rusthouse::{
-    ComparisonOperator, ComparisonPredicate, IdentifierContext, OrderByClause, OrderDirection,
-    ParseError, ParseErrorKind, SelectParseLimits, SelectProjection, SelectStatement, Value,
-    parse_select, parse_select_with_limits,
+    AggregateFunction, AggregateProjection, ComparisonOperator, ComparisonPredicate,
+    IdentifierContext, OrderByClause, OrderDirection, ParseError, ParseErrorKind,
+    SelectParseLimits, SelectProjection, SelectStatement, Value, parse_select,
+    parse_select_with_limits,
 };
 
 fn parse_error(input: &str) -> ParseError {
@@ -15,7 +16,7 @@ fn parses_wildcard_and_named_projections() {
         SelectStatement {
             projections: SelectProjection::All,
             table: "events".to_owned(),
-            predicate: None,
+            predicate_groups: Vec::new(),
             order_by: None,
             limit: None,
         }
@@ -30,7 +31,7 @@ fn parses_wildcard_and_named_projections() {
                 "active".to_owned(),
             ]),
             table: "Events".to_owned(),
-            predicate: None,
+            predicate_groups: Vec::new(),
             order_by: None,
             limit: None,
         }
@@ -44,7 +45,7 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
         SelectStatement {
             projections: SelectProjection::CountAll { alias: None },
             table: "events".to_owned(),
-            predicate: None,
+            predicate_groups: Vec::new(),
             order_by: None,
             limit: None,
         }
@@ -57,11 +58,11 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
                 alias: Some("Matching".to_owned()),
             },
             table: "Events".to_owned(),
-            predicate: Some(ComparisonPredicate {
+            predicate_groups: vec![vec![ComparisonPredicate {
                 column: "active".to_owned(),
                 operator: ComparisonOperator::Equal,
                 value: Value::Bool(true),
-            }),
+            }]],
             order_by: None,
             limit: None,
         }
@@ -80,11 +81,63 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
 }
 
 #[test]
+fn parses_bounded_aggregate_only_lists_with_optional_aliases() {
+    let statement = parse_select(
+        "SELECT COUNT(*), SUM(sequence) AS total, avg(value), Min(label) AS first, MAX(active) \
+         FROM Events WHERE active = true",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statement.projections,
+        SelectProjection::Aggregates(vec![
+            AggregateProjection {
+                function: AggregateFunction::CountAll,
+                alias: None,
+            },
+            AggregateProjection {
+                function: AggregateFunction::Sum {
+                    column: "sequence".to_owned(),
+                },
+                alias: Some("total".to_owned()),
+            },
+            AggregateProjection {
+                function: AggregateFunction::Avg {
+                    column: "value".to_owned(),
+                },
+                alias: None,
+            },
+            AggregateProjection {
+                function: AggregateFunction::Min {
+                    column: "label".to_owned(),
+                },
+                alias: Some("first".to_owned()),
+            },
+            AggregateProjection {
+                function: AggregateFunction::Max {
+                    column: "active".to_owned(),
+                },
+                alias: None,
+            },
+        ])
+    );
+    assert_eq!(statement.table, "Events");
+    assert_eq!(
+        statement.predicate_groups,
+        vec![vec![ComparisonPredicate {
+            column: "active".to_owned(),
+            operator: ComparisonOperator::Equal,
+            value: Value::Bool(true),
+        }]]
+    );
+}
+
+#[test]
 fn parses_wildcard_adjacent_to_select_and_from_keywords() {
     let expected = SelectStatement {
         projections: SelectProjection::All,
         table: "events".to_owned(),
-        predicate: None,
+        predicate_groups: Vec::new(),
         order_by: None,
         limit: None,
     };
@@ -120,7 +173,7 @@ fn parses_single_column_ordering_and_limit_in_clause_order() {
             direction: OrderDirection::Descending,
         })
     );
-    assert!(descending.predicate.is_some());
+    assert_eq!(descending.predicate_groups.len(), 1);
     assert_eq!(descending.limit, Some(5));
 
     let explicit = parse_select("SELECT * FROM events ORDER BY score ASC LIMIT 0").unwrap();
@@ -236,12 +289,12 @@ fn parses_all_comparison_operators_without_required_whitespace() {
         let input = format!("SELECT id FROM events WHERE sequence{syntax}42");
         let statement = parse_select(&input).unwrap();
         assert_eq!(
-            statement.predicate,
-            Some(ComparisonPredicate {
+            statement.predicate_groups,
+            vec![vec![ComparisonPredicate {
                 column: "sequence".to_owned(),
                 operator,
                 value: Value::Int64(42),
-            }),
+            }]],
             "input: {input:?}"
         );
     }
@@ -259,11 +312,69 @@ fn predicates_reuse_every_supported_literal_type() {
     for (predicate, expected_value) in cases {
         let input = format!("SELECT * FROM readings WHERE {predicate}");
         assert_eq!(
-            parse_select(&input).unwrap().predicate.unwrap().value,
+            parse_select(&input).unwrap().predicate_groups[0][0].value,
             expected_value,
             "input: {input:?}"
         );
     }
+}
+
+#[test]
+fn parses_or_groups_with_and_precedence_and_optional_parentheses() {
+    let parenthesized = parse_select(
+        "SELECT campaign_id FROM campaigns WHERE \
+         (campaign_id = 41 AND active = true) OR \
+         (channel = 'search' AND spend >= 50.5) OR region = 'west'",
+    )
+    .unwrap();
+
+    assert_eq!(
+        parenthesized.predicate_groups,
+        vec![
+            vec![
+                ComparisonPredicate {
+                    column: "campaign_id".to_owned(),
+                    operator: ComparisonOperator::Equal,
+                    value: Value::Int64(41),
+                },
+                ComparisonPredicate {
+                    column: "active".to_owned(),
+                    operator: ComparisonOperator::Equal,
+                    value: Value::Bool(true),
+                },
+            ],
+            vec![
+                ComparisonPredicate {
+                    column: "channel".to_owned(),
+                    operator: ComparisonOperator::Equal,
+                    value: Value::String("search".to_owned()),
+                },
+                ComparisonPredicate {
+                    column: "spend".to_owned(),
+                    operator: ComparisonOperator::GreaterThanOrEqual,
+                    value: Value::Float64(50.5),
+                },
+            ],
+            vec![ComparisonPredicate {
+                column: "region".to_owned(),
+                operator: ComparisonOperator::Equal,
+                value: Value::String("west".to_owned()),
+            }],
+        ]
+    );
+
+    let unparenthesized = parse_select(
+        "SELECT * FROM campaigns WHERE campaign_id = 1 OR campaign_id = 2 AND active = true",
+    )
+    .unwrap();
+    assert_eq!(
+        unparenthesized
+            .predicate_groups
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
 }
 
 #[test]
@@ -313,6 +424,62 @@ fn enforces_projection_limit_at_the_next_projection() {
 
     let count = "SELECT COUNT(*) FROM events";
     assert!(parse_select_with_limits(count, SelectParseLimits::new(count.len(), 1)).is_ok());
+
+    let aggregates = "SELECT COUNT(*), SUM(id), AVG(id) FROM events";
+    assert!(
+        parse_select_with_limits(aggregates, SelectParseLimits::new(aggregates.len(), 3)).is_ok()
+    );
+    let error = parse_select_with_limits(aggregates, SelectParseLimits::new(aggregates.len(), 2))
+        .unwrap_err();
+    assert_eq!(error.position, aggregates.find("AVG").unwrap());
+    assert_eq!(error.kind, ParseErrorKind::TooManyProjections { limit: 2 });
+}
+
+#[test]
+fn enforces_total_predicate_and_predicate_group_limits() {
+    let input = "SELECT * FROM events WHERE (id = 1 AND active = true) OR (score >= 4.0)";
+
+    let exact = SelectParseLimits::new(input.len(), 1)
+        .with_max_predicates(3)
+        .with_max_predicate_groups(2);
+    assert!(parse_select_with_limits(input, exact).is_ok());
+
+    let predicate_error = parse_select_with_limits(
+        input,
+        exact.with_max_predicates(2).with_max_predicate_groups(3),
+    )
+    .unwrap_err();
+    assert_eq!(predicate_error.position, input.find("score").unwrap());
+    assert_eq!(
+        predicate_error.kind,
+        ParseErrorKind::TooManyPredicates { limit: 2 }
+    );
+
+    let group_error = parse_select_with_limits(
+        input,
+        exact.with_max_predicates(3).with_max_predicate_groups(1),
+    )
+    .unwrap_err();
+    assert_eq!(group_error.position, input.rfind('(').unwrap());
+    assert_eq!(
+        group_error.kind,
+        ParseErrorKind::TooManyPredicateGroups { limit: 1 }
+    );
+
+    let one = "SELECT * FROM events WHERE id = 1";
+    let no_predicates = SelectParseLimits::new(one.len(), 1).with_max_predicates(0);
+    assert_eq!(
+        parse_select_with_limits(one, no_predicates)
+            .unwrap_err()
+            .kind,
+        ParseErrorKind::TooManyPredicates { limit: 0 }
+    );
+
+    let no_groups = SelectParseLimits::new(one.len(), 1).with_max_predicate_groups(0);
+    assert_eq!(
+        parse_select_with_limits(one, no_groups).unwrap_err().kind,
+        ParseErrorKind::TooManyPredicateGroups { limit: 0 }
+    );
 }
 
 #[test]
@@ -398,20 +565,62 @@ fn reports_positioned_predicate_errors() {
 }
 
 #[test]
-fn rejects_aliases_aggregates_compound_predicates_and_unsupported_result_clauses() {
+fn rejects_malformed_group_parentheses_not_and_nested_expressions() {
+    let missing_close = "SELECT * FROM t WHERE (id = 1 AND active = true";
+    let error = parse_error(missing_close);
+    assert_eq!(error.position, missing_close.len());
+    assert_eq!(
+        error.kind,
+        ParseErrorKind::ExpectedToken { expected: "')'" }
+    );
+
+    let cases = [
+        ("SELECT * FROM t WHERE id = 1)", ")"),
+        ("SELECT * FROM t WHERE ((id = 1))", "(("),
+        ("SELECT * FROM t WHERE ()", ")"),
+        ("SELECT * FROM t WHERE (id = 1) AND active = true", "AND"),
+        ("SELECT * FROM t WHERE (id = 1 OR id = 2)", "OR"),
+        ("SELECT * FROM t WHERE NOT id = 1", "id"),
+    ];
+
+    for (input, marker) in cases {
+        let error = parse_error(input);
+        let expected_position = if marker == "((" {
+            input.find(marker).unwrap() + 1
+        } else {
+            input.find(marker).unwrap()
+        };
+        assert_eq!(error.position, expected_position, "input: {input:?}");
+    }
+
+    let trailing_or = "SELECT * FROM t WHERE id = 1 OR";
+    let error = parse_error(trailing_or);
+    assert_eq!(error.position, trailing_or.len());
+    assert_eq!(
+        error.kind,
+        ParseErrorKind::ExpectedIdentifier {
+            context: IdentifierContext::Column,
+        }
+    );
+}
+
+#[test]
+fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
     let cases = [
         ("SELECT id AS event_id FROM events", "AS"),
-        ("SELECT SUM(id) FROM events", "("),
         ("SELECT COUNT(id) FROM events", "id"),
         ("SELECT COUNT(DISTINCT id) FROM events", "DISTINCT"),
-        ("SELECT COUNT(*), id FROM events", ","),
-        ("SELECT id, COUNT(*) FROM events", "("),
+        ("SELECT COUNT(*), id FROM events", "id"),
+        ("SELECT id, COUNT(*) FROM events", "COUNT"),
+        ("SELECT SUM(id), label FROM events", "label"),
+        ("SELECT label, MIN(label) FROM events", "MIN"),
         ("SELECT DISTINCT id FROM events", "id"),
+        ("SELECT DISTINCT COUNT(*) FROM events", "COUNT"),
         ("SELECT * FROM events AS e", "AS"),
-        ("SELECT * FROM events WHERE id = 1 AND active = true", "AND"),
-        ("SELECT * FROM events WHERE id = 1 OR id = 2", "OR"),
+        ("SELECT * FROM events WHERE id = NULL", "NULL"),
         ("SELECT COUNT(*) FROM events GROUP BY active", "GROUP"),
         ("SELECT * FROM events GROUP BY id", "GROUP"),
+        ("SELECT AVG(id) FROM events HAVING AVG(id) > 1", "HAVING"),
     ];
 
     for (input, marker) in cases {
@@ -419,6 +628,18 @@ fn rejects_aliases_aggregates_compound_predicates_and_unsupported_result_clauses
         assert_eq!(
             error.position,
             input.find(marker).unwrap(),
+            "input: {input:?}"
+        );
+    }
+
+    for input in [
+        "SELECT COUNT(*), id FROM events",
+        "SELECT COUNT(*), * FROM events",
+        "SELECT id, COUNT(*) FROM events",
+    ] {
+        assert_eq!(
+            parse_error(input).kind,
+            ParseErrorKind::MixedAggregateProjection,
             "input: {input:?}"
         );
     }

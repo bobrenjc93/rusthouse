@@ -1,14 +1,61 @@
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
+use std::fs;
 use std::io::{Cursor, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
 };
-use rusthouse::{Catalog, DEFAULT_MAX_TABLES};
+use rusthouse::{Catalog, CatalogError, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, Value};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
+static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(test_name: &str) -> Self {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("cli-tests")
+            .join(format!("{test_name}-{}-{sequence}", std::process::id()));
+        fs::create_dir_all(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn snapshot(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).expect("remove test directory");
+    }
+}
 
 fn run(arguments: &[&str], input: &[u8]) -> Output {
+    run_command(arguments.iter().copied(), input)
+}
+
+#[cfg(unix)]
+fn run_os(arguments: &[&OsStr], input: &[u8]) -> Output {
+    run_command(arguments.iter().copied(), input)
+}
+
+fn run_command<I, S>(arguments: I, input: &[u8]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut child = Command::new(BINARY)
         .args(arguments)
         .stdin(Stdio::piped())
@@ -53,10 +100,15 @@ fn help_describes_the_bounded_batch_contract() {
         assert_eq!(output.status.code(), Some(0));
         assert!(output.stderr.is_empty());
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("Usage: rusthouse [--format csv]"));
+        assert!(stdout.contains(
+            "Usage: rusthouse [--format csv] [--load-table NAME=PATH] [--save-table NAME=PATH]"
+        ));
         assert!(stdout.contains("CREATE TABLE, INSERT INTO ... VALUES, and SELECT"));
         assert!(stdout.contains("--format csv"));
+        assert!(stdout.contains("--load-table NAME=PATH"));
+        assert!(stdout.contains("--save-table NAME=PATH"));
         assert!(stdout.contains("1048576 bytes per statement"));
+        assert!(stdout.contains("67108864 bytes per snapshot payload"));
         assert!(stdout.contains("4  unsupported statement"));
         assert!(stdout.contains("6  stdout write error"));
         assert_eq!(stdout.matches("Exit codes:").count(), 1);
@@ -71,6 +123,23 @@ fn rejects_arguments_with_the_usage_exit_code() {
         &["--format", "json"][..],
         &["--format", "CSV"][..],
         &["--format", "csv", "extra"][..],
+        &["--format", "csv", "--format", "csv"][..],
+        &["--load-table"][..],
+        &["--load-table", "events"][..],
+        &["--load-table", "=state.snapshot"][..],
+        &["--save-table", "events="][..],
+        &[
+            "--load-table",
+            "events=first.snapshot",
+            "--load-table",
+            "other=second.snapshot",
+        ][..],
+        &[
+            "--save-table",
+            "events=first.snapshot",
+            "--save-table",
+            "other=second.snapshot",
+        ][..],
     ] {
         let output = run(arguments, b"");
 
@@ -81,6 +150,263 @@ fn rejects_arguments_with_the_usage_exit_code() {
             "rusthouse: invalid arguments; try 'rusthouse --help'\n"
         );
     }
+}
+
+#[test]
+fn saves_reopens_and_selects_one_table_across_processes() {
+    let directory = TestDirectory::new("save-reopen-select");
+    let snapshot = directory.snapshot("events.snapshot");
+    let save = format!("Events={}", snapshot.display());
+    let saved = run(
+        &["--save-table", &save],
+        b"CREATE TABLE Events (id Int64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, true, 'first'), (2, false, 'second')\n",
+    );
+
+    assert_eq!(saved.status.code(), Some(0));
+    assert!(saved.stdout.is_empty());
+    assert!(saved.stderr.is_empty());
+    assert!(snapshot.exists());
+
+    let load = format!("reopened={}", snapshot.display());
+    let reopened = run(
+        &["--format", "csv", "--load-table", &load],
+        b"SELECT label, id FROM reopened WHERE active = true\n",
+    );
+
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"label\",\"id\"\n\"first\",1\n");
+}
+
+#[test]
+fn aggregates_or_groups_over_a_reopened_table() {
+    let directory = TestDirectory::new("snapshot-aggregate-or-groups");
+    let snapshot = directory.snapshot("events.snapshot");
+    let save = format!("events={}", snapshot.display());
+    let saved = run(
+        &["--save-table", &save],
+        b"CREATE TABLE events (id Int64, score Float64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, 1.5, true, 'west'), (2, 4.0, false, 'east'), (3, 9.5, true, 'north'), (4, 2.0, true, 'south')\n",
+    );
+    assert_eq!(saved.status.code(), Some(0));
+    assert!(saved.stdout.is_empty());
+    assert!(saved.stderr.is_empty());
+
+    let load = format!("restored={}", snapshot.display());
+    let reopened = run(
+        &["--load-table", &load],
+        b"SELECT COUNT(*) AS matches, SUM(id) AS total, AVG(score) AS mean, MIN(label) AS first, MAX(active) AS any_active FROM restored WHERE (active = true AND score >= 2.0) OR (label = 'east' AND id >= 2) OR id = 3\n",
+    );
+
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(
+        reopened.stdout,
+        b"\"matches\",\"total\",\"mean\",\"first\",\"any_active\"\n3,9,5.166666666666667,\"east\",true\n"
+    );
+}
+
+#[test]
+fn concurrent_saves_publish_one_complete_snapshot() {
+    const WRITERS: usize = 16;
+    const STRING_BYTES: usize = 256 * 1024;
+
+    let directory = TestDirectory::new("concurrent-saves");
+    let snapshot = directory.snapshot("events.snapshot");
+    let mapping = format!("events={}", snapshot.display());
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let writers = (0..WRITERS)
+        .map(|index| {
+            let barrier = Arc::clone(&barrier);
+            let mapping = mapping.clone();
+            std::thread::spawn(move || {
+                let label = format!("writer-{index}-{}", "x".repeat(STRING_BYTES));
+                let input = format!(
+                    "CREATE TABLE events (id Int64, label String)\n\
+                     INSERT INTO events VALUES ({index}, '{label}')\n"
+                );
+                barrier.wait();
+                run(&["--save-table", &mapping], input.as_bytes())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for writer in writers {
+        let output = writer.join().expect("join snapshot writer");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "concurrent save failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let reopened = run(&["--load-table", &mapping], b"SELECT id FROM events\n");
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    let stdout = String::from_utf8(reopened.stdout).unwrap();
+    let id = stdout.lines().nth(1).unwrap().parse::<usize>().unwrap();
+    assert!(id < WRITERS);
+}
+
+#[test]
+fn rejects_sidecar_paths_without_mutating_the_primary_snapshot() {
+    let directory = TestDirectory::new("reserved-sidecars");
+    let primary = directory.snapshot("primary.snapshot");
+    let temporary = directory.snapshot(".primary.snapshot.tmp");
+    let lock = directory.snapshot(".primary.snapshot.lock");
+    let primary_mapping = format!("events={}", primary.display());
+    let temporary_mapping = format!("events={}", temporary.display());
+    let lock_mapping = format!("events={}", lock.display());
+
+    let primary_save = run(
+        &["--save-table", &primary_mapping],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (7)\n",
+    );
+    assert_eq!(primary_save.status.code(), Some(0));
+
+    for mapping in [&temporary_mapping, &lock_mapping] {
+        let collision = run(
+            &["--save-table", mapping],
+            b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (99)\n",
+        );
+        assert_eq!(collision.status.code(), Some(1));
+        assert!(collision.stdout.is_empty());
+        assert!(
+            String::from_utf8(collision.stderr)
+                .unwrap()
+                .contains("is reserved for internal writer state")
+        );
+    }
+
+    let reopened = run(
+        &["--load-table", &primary_mapping],
+        b"SELECT id FROM events\n",
+    );
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"id\"\n7\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_non_utf8_snapshot_paths_during_argument_parsing() {
+    let directory = TestDirectory::new("non-utf8-path");
+    let mut snapshot_bytes = directory.0.as_os_str().as_bytes().to_vec();
+    snapshot_bytes.extend_from_slice(b"/events-\xff.snapshot");
+    let snapshot = PathBuf::from(OsString::from_vec(snapshot_bytes));
+
+    let mut mapping_bytes = b"events=".to_vec();
+    mapping_bytes.extend_from_slice(snapshot.as_os_str().as_bytes());
+    let mapping = OsString::from_vec(mapping_bytes);
+
+    let output = run_os(
+        &[OsStr::new("--load-table"), mapping.as_os_str()],
+        b"SELECT id FROM events\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "non-UTF-8 path was rejected as CLI usage: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with("rusthouse: could not load table `events` from ")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn saves_and_reopens_a_non_utf8_snapshot_path() {
+    let directory = TestDirectory::new("non-utf8-round-trip");
+    let mut snapshot_bytes = directory.0.as_os_str().as_bytes().to_vec();
+    snapshot_bytes.extend_from_slice(b"/events-\xff.snapshot");
+    let snapshot = PathBuf::from(OsString::from_vec(snapshot_bytes));
+
+    let mut mapping_bytes = b"events=".to_vec();
+    mapping_bytes.extend_from_slice(snapshot.as_os_str().as_bytes());
+    let mapping = OsString::from_vec(mapping_bytes);
+
+    let saved = run_os(
+        &[OsStr::new("--save-table"), mapping.as_os_str()],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (7)\n",
+    );
+    assert_eq!(saved.status.code(), Some(0));
+    assert!(saved.stderr.is_empty());
+    assert!(snapshot.exists());
+
+    let reopened = run_os(
+        &[OsStr::new("--load-table"), mapping.as_os_str()],
+        b"SELECT id FROM events\n",
+    );
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"id\"\n7\n");
+}
+
+#[test]
+fn rejects_a_corrupt_snapshot_before_processing_stdin() {
+    let directory = TestDirectory::new("corrupt-load");
+    let snapshot = directory.snapshot("corrupt.snapshot");
+    let mapping = format!("events={}", snapshot.display());
+    let saved = run(
+        &["--save-table", &mapping],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (1)\n",
+    );
+    assert_eq!(saved.status.code(), Some(0));
+
+    let mut bytes = fs::read(&snapshot).expect("read snapshot");
+    *bytes.last_mut().expect("nonempty snapshot") ^= 0xff;
+    fs::write(&snapshot, bytes).expect("corrupt snapshot");
+
+    let output = run(
+        &["--load-table", &mapping],
+        b"CREATE TABLE ignored (id Int64)\nSELECT id FROM ignored\n",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with(&format!(
+        "rusthouse: could not load table `events` from {}: ",
+        snapshot.display()
+    )));
+    assert!(stderr.contains("snapshot checksum mismatch"));
+}
+
+#[test]
+fn does_not_replace_a_snapshot_when_the_batch_fails() {
+    let directory = TestDirectory::new("failed-batch");
+    let snapshot = directory.snapshot("events.snapshot");
+    let mapping = format!("events={}", snapshot.display());
+    let initial = run(
+        &["--save-table", &mapping],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (1)\n",
+    );
+    assert_eq!(initial.status.code(), Some(0));
+
+    let failed = run(
+        &["--load-table", &mapping, "--save-table", &mapping],
+        b"INSERT INTO events VALUES (2)\nINSERT INTO events VALUES ('wrong')\n",
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(
+        String::from_utf8(failed.stderr)
+            .unwrap()
+            .contains("execution error on line 2")
+    );
+
+    let reopened = run(
+        &["--load-table", &mapping],
+        b"SELECT id FROM events ORDER BY id\n",
+    );
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"id\"\n1\n");
 }
 
 #[test]
@@ -205,6 +531,27 @@ fn writes_count_rows_for_all_filtered_and_empty_tables() {
 }
 
 #[test]
+fn writes_one_csv_row_for_a_filtered_aggregate_list() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, score Float64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, -2.0, true, 'first'), (2, 0.0, false, 'second'), (3, 4.0, true, 'third')\n\
+          SELECT COUNT(*), SUM(id) AS total_id, AVG(score), MIN(label) AS first_label, MAX(active) FROM events WHERE active = true\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"count()\",\"total_id\",\"avg(score)\",\"first_label\",\"max(active)\"\n",
+            "2,4,1,\"first\",true\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],
@@ -298,6 +645,41 @@ fn reports_catalog_capacity_as_a_limit() {
             DEFAULT_MAX_TABLES + 1
         )
     );
+}
+
+#[test]
+fn reports_aggregate_result_bytes_as_a_limit() {
+    const VALUE_BYTES: usize = MAX_AGGREGATE_RESULT_BYTES / 2 + 1;
+    const REQUIRED_BYTES: usize = VALUE_BYTES * 2;
+
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE strings (value String)")
+        .unwrap();
+    catalog
+        .table_mut("strings")
+        .unwrap()
+        .insert_batch([vec![Value::String("x".repeat(VALUE_BYTES))]])
+        .unwrap();
+
+    let error = execute_batch(
+        Cursor::new(b"SELECT MIN(value), MAX(value) FROM strings\n"),
+        &mut catalog,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.exit_code(), 3);
+    assert!(matches!(
+        error,
+        BatchError::ExecutionLimit {
+            line: 1,
+            source: CatalogError::AggregateResultTooLarge {
+                limit: MAX_AGGREGATE_RESULT_BYTES,
+                required: REQUIRED_BYTES,
+                ..
+            },
+        }
+    ));
 }
 
 #[test]

@@ -36,6 +36,30 @@ pub enum SelectProjection {
     Columns(Vec<String>),
     /// Count every input row, optionally naming the result field.
     CountAll { alias: Option<String> },
+    /// Compute one or more scalar aggregates over the same input rows.
+    Aggregates(Vec<AggregateProjection>),
+}
+
+/// One supported scalar aggregate expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateFunction {
+    /// Count every selected row.
+    CountAll,
+    /// Sum one numeric column.
+    Sum { column: String },
+    /// Average one numeric column.
+    Avg { column: String },
+    /// Find the minimum value of one column.
+    Min { column: String },
+    /// Find the maximum value of one column.
+    Max { column: String },
+}
+
+/// One scalar aggregate and its optional output name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateProjection {
+    pub function: AggregateFunction,
+    pub alias: Option<String>,
 }
 
 /// A comparison relationship supported by a `WHERE` predicate.
@@ -76,7 +100,9 @@ pub struct OrderByClause {
 pub struct SelectStatement {
     pub projections: SelectProjection,
     pub table: String,
-    pub predicate: Option<ComparisonPredicate>,
+    /// Disjunctive groups of comparisons. Comparisons within each group are
+    /// joined by `AND`; groups are joined by `OR`.
+    pub predicate_groups: Vec<Vec<ComparisonPredicate>>,
     pub order_by: Option<OrderByClause>,
     pub limit: Option<usize>,
 }
@@ -152,17 +178,37 @@ impl Default for InsertParseLimits {
 pub struct SelectParseLimits {
     pub max_input_bytes: usize,
     pub max_projections: usize,
+    pub max_predicates: usize,
+    pub max_predicate_groups: usize,
 }
 
 impl SelectParseLimits {
     pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
     pub const DEFAULT_MAX_PROJECTIONS: usize = 1024;
+    pub const DEFAULT_MAX_PREDICATES: usize = 1024;
+    pub const DEFAULT_MAX_PREDICATE_GROUPS: usize = 1024;
 
     pub const fn new(max_input_bytes: usize, max_projections: usize) -> Self {
         Self {
             max_input_bytes,
             max_projections,
+            max_predicates: Self::DEFAULT_MAX_PREDICATES,
+            max_predicate_groups: Self::DEFAULT_MAX_PREDICATE_GROUPS,
         }
+    }
+
+    /// Replaces the maximum total comparisons in a `WHERE` clause.
+    #[must_use]
+    pub const fn with_max_predicates(mut self, max_predicates: usize) -> Self {
+        self.max_predicates = max_predicates;
+        self
+    }
+
+    /// Replaces the maximum number of `OR` groups in a `WHERE` clause.
+    #[must_use]
+    pub const fn with_max_predicate_groups(mut self, max_predicate_groups: usize) -> Self {
+        self.max_predicate_groups = max_predicate_groups;
+        self
     }
 }
 
@@ -229,7 +275,14 @@ pub enum ParseErrorKind {
         limit: usize,
     },
     ExpectedProjection,
+    MixedAggregateProjection,
     TooManyProjections {
+        limit: usize,
+    },
+    TooManyPredicates {
+        limit: usize,
+    },
+    TooManyPredicateGroups {
         limit: usize,
     },
     ExpectedComparisonOperator,
@@ -301,10 +354,19 @@ impl fmt::Display for ParseErrorKind {
                 write!(formatter, "row value count exceeds limit of {limit}")
             }
             Self::ExpectedProjection => {
-                formatter.write_str("expected a column projection, '*', or COUNT(*)")
+                formatter.write_str("expected a column projection, '*', or scalar aggregate")
+            }
+            Self::MixedAggregateProjection => {
+                formatter.write_str("scalar aggregates cannot be mixed with raw column projections")
             }
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
+            }
+            Self::TooManyPredicates { limit } => {
+                write!(formatter, "predicate count exceeds limit of {limit}")
+            }
+            Self::TooManyPredicateGroups { limit } => {
+                write!(formatter, "predicate group count exceeds limit of {limit}")
             }
             Self::ExpectedComparisonOperator => {
                 formatter.write_str("expected a comparison operator")
@@ -434,13 +496,17 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 
 /// Parses one bounded `SELECT` statement.
 ///
-/// Projections are `*`, a non-empty list of unquoted column names, or the single
-/// aggregate `COUNT(*)` with an optional `AS` alias. The statement reads one
-/// table and may contain one `WHERE` comparison between a column and an
-/// `Int64`, `Float64`, `Bool`, or `String` literal. That may be followed by one
-/// `ORDER BY column [ASC|DESC]` clause and a nonnegative integer `LIMIT`. Other
-/// aliases, expressions, aggregates, compound predicates, and result modifiers
-/// are outside this intentionally narrow syntax boundary.
+/// Projections are `*`, a non-empty list of unquoted column names, or a
+/// non-empty aggregate-only list containing `COUNT(*)`, `SUM(column)`,
+/// `AVG(column)`, `MIN(column)`, and `MAX(column)`. Every aggregate may have an
+/// `AS` alias. The statement reads one table and may contain `WHERE` groups
+/// joined by `OR`, each containing
+/// column-to-literal comparisons joined by `AND`. One optional pair of
+/// parentheses may wrap each whole group. Literals may be `Int64`, `Float64`,
+/// `Bool`, or `String`. The clause may be followed by one `ORDER BY column
+/// [ASC|DESC]` clause and a nonnegative integer `LIMIT`. `NOT`, nested
+/// expressions, raw-column/aggregate mixing, and other predicate or result
+/// forms are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -577,11 +643,15 @@ impl<'a> Parser<'a> {
         let (table, _) = self.parse_identifier(IdentifierContext::Table)?;
 
         self.skip_whitespace();
-        let predicate = if self.peek_token_is("WHERE") {
+        let predicate_groups = if self.peek_token_is("WHERE") {
             self.parse_keyword("WHERE")?;
-            Some(self.parse_comparison(limits.max_input_bytes)?)
+            self.parse_predicate_groups(
+                limits.max_predicates,
+                limits.max_predicate_groups,
+                limits.max_input_bytes,
+            )?
         } else {
-            None
+            Vec::new()
         };
 
         self.skip_whitespace();
@@ -616,7 +686,7 @@ impl<'a> Parser<'a> {
         Ok(SelectStatement {
             projections,
             table,
-            predicate,
+            predicate_groups,
             order_by,
             limit,
         })
@@ -637,11 +707,39 @@ impl<'a> Parser<'a> {
             return Ok(SelectProjection::All);
         }
 
-        let mut columns = Vec::new();
+        if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
+            return Err(self.error(ParseErrorKind::ExpectedProjection));
+        }
+
+        let (first, first_position) = self.parse_identifier(IdentifierContext::Column)?;
+        self.skip_whitespace();
+        if let Some(kind) = aggregate_kind(&first)
+            && self.peek() == Some(b'(')
+        {
+            return self.parse_aggregate_projections(kind, first_position, max_projections);
+        }
+        if max_projections == 0 {
+            return Err(ParseError {
+                position: first_position,
+                kind: ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                },
+            });
+        }
+
+        let mut columns = vec![first];
         loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
             self.skip_whitespace();
             if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
                 return Err(self.error(ParseErrorKind::ExpectedProjection));
+            }
+            if self.peek() == Some(b'*') {
+                return Err(self.error(ParseErrorKind::MixedAggregateProjection));
             }
             if columns.len() == max_projections {
                 return Err(self.error(ParseErrorKind::TooManyProjections {
@@ -649,28 +747,102 @@ impl<'a> Parser<'a> {
                 }));
             }
 
-            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            let (column, column_position) = self.parse_identifier(IdentifierContext::Column)?;
             self.skip_whitespace();
-            if columns.is_empty()
-                && column.eq_ignore_ascii_case("COUNT")
-                && self.peek() == Some(b'(')
-            {
-                return self.parse_count_all();
+            if aggregate_kind(&column).is_some() && self.peek() == Some(b'(') {
+                return Err(ParseError {
+                    position: column_position,
+                    kind: ParseErrorKind::MixedAggregateProjection,
+                });
             }
             columns.push(column);
-
-            if self.peek() != Some(b',') {
-                break;
-            }
-            self.position += 1;
         }
 
         Ok(SelectProjection::Columns(columns))
     }
 
-    fn parse_count_all(&mut self) -> Result<SelectProjection, ParseError> {
+    fn parse_aggregate_projections(
+        &mut self,
+        first_kind: AggregateKind,
+        first_position: usize,
+        max_projections: usize,
+    ) -> Result<SelectProjection, ParseError> {
+        if max_projections == 0 {
+            return Err(ParseError {
+                position: first_position,
+                kind: ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                },
+            });
+        }
+
+        let mut aggregates = vec![self.parse_aggregate(first_kind)?];
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+            self.skip_whitespace();
+            if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
+                return Err(self.error(ParseErrorKind::ExpectedProjection));
+            }
+            if self.peek() == Some(b'*') {
+                return Err(self.error(ParseErrorKind::MixedAggregateProjection));
+            }
+            if aggregates.len() == max_projections {
+                return Err(self.error(ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                }));
+            }
+
+            let (function, function_position) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            let Some(kind) = aggregate_kind(&function) else {
+                return Err(ParseError {
+                    position: function_position,
+                    kind: ParseErrorKind::MixedAggregateProjection,
+                });
+            };
+            if self.peek() != Some(b'(') {
+                return Err(ParseError {
+                    position: function_position,
+                    kind: ParseErrorKind::MixedAggregateProjection,
+                });
+            }
+            aggregates.push(self.parse_aggregate(kind)?);
+        }
+
+        if aggregates.len() == 1 && matches!(aggregates[0].function, AggregateFunction::CountAll) {
+            let aggregate = aggregates.pop().expect("one aggregate was parsed");
+            return Ok(SelectProjection::CountAll {
+                alias: aggregate.alias,
+            });
+        }
+
+        Ok(SelectProjection::Aggregates(aggregates))
+    }
+
+    fn parse_aggregate(&mut self, kind: AggregateKind) -> Result<AggregateProjection, ParseError> {
         self.position += 1;
-        self.expect_byte(b'*', "'*'")?;
+        let function = match kind {
+            AggregateKind::Count => {
+                self.expect_byte(b'*', "'*'")?;
+                AggregateFunction::CountAll
+            }
+            AggregateKind::Sum => AggregateFunction::Sum {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+            AggregateKind::Avg => AggregateFunction::Avg {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+            AggregateKind::Min => AggregateFunction::Min {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+            AggregateKind::Max => AggregateFunction::Max {
+                column: self.parse_identifier(IdentifierContext::Column)?.0,
+            },
+        };
         self.expect_byte(b')', "')'")?;
 
         let alias = if self.peek_token_is("AS") {
@@ -680,7 +852,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(SelectProjection::CountAll { alias })
+        Ok(AggregateProjection { function, alias })
     }
 
     fn parse_comparison(
@@ -695,6 +867,61 @@ impl<'a> Parser<'a> {
             operator,
             value,
         })
+    }
+
+    fn parse_predicate_groups(
+        &mut self,
+        max_predicates: usize,
+        max_predicate_groups: usize,
+        max_string_bytes: usize,
+    ) -> Result<Vec<Vec<ComparisonPredicate>>, ParseError> {
+        let mut groups = Vec::new();
+        let mut predicate_count = 0;
+
+        loop {
+            self.skip_whitespace();
+            if groups.len() == max_predicate_groups {
+                return Err(self.error(ParseErrorKind::TooManyPredicateGroups {
+                    limit: max_predicate_groups,
+                }));
+            }
+
+            let parenthesized = self.peek() == Some(b'(');
+            if parenthesized {
+                self.position += 1;
+            }
+
+            let mut group = Vec::new();
+            loop {
+                self.skip_whitespace();
+                if predicate_count == max_predicates {
+                    return Err(self.error(ParseErrorKind::TooManyPredicates {
+                        limit: max_predicates,
+                    }));
+                }
+                group.push(self.parse_comparison(max_string_bytes)?);
+                predicate_count += 1;
+
+                self.skip_whitespace();
+                if !self.peek_token_is("AND") {
+                    break;
+                }
+                self.parse_keyword("AND")?;
+            }
+
+            if parenthesized {
+                self.expect_byte(b')', "')'")?;
+            }
+            groups.push(group);
+
+            self.skip_whitespace();
+            if !self.peek_token_is("OR") {
+                break;
+            }
+            self.parse_keyword("OR")?;
+        }
+
+        Ok(groups)
     }
 
     fn parse_comparison_column(&mut self) -> Result<String, ParseError> {
@@ -1072,6 +1299,31 @@ fn invalid_identifier_offset(identifier: &str) -> Option<usize> {
     bytes
         .iter()
         .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+}
+
+#[derive(Clone, Copy)]
+enum AggregateKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+fn aggregate_kind(function: &str) -> Option<AggregateKind> {
+    if function.eq_ignore_ascii_case("COUNT") {
+        Some(AggregateKind::Count)
+    } else if function.eq_ignore_ascii_case("SUM") {
+        Some(AggregateKind::Sum)
+    } else if function.eq_ignore_ascii_case("AVG") {
+        Some(AggregateKind::Avg)
+    } else if function.eq_ignore_ascii_case("MIN") {
+        Some(AggregateKind::Min)
+    } else if function.eq_ignore_ascii_case("MAX") {
+        Some(AggregateKind::Max)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]

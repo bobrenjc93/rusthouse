@@ -2,9 +2,15 @@ use std::error::Error;
 
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, ComparisonOperator, ComparisonPredicate, DataType,
-    ParseErrorKind, ParseLimits, ScanError, SelectParseLimits, SelectProjection, SelectStatement,
-    Value,
+    MAX_AGGREGATE_RESULT_BYTES, ParseErrorKind, ParseLimits, ReductionError, ScanError,
+    SelectParseLimits, SelectProjection, SelectResult, SelectStatement, Value,
 };
+
+const fn scalar_value_through_const_api<'result, 'table>(
+    result: &'result SelectResult<'table>,
+) -> Option<&'result Value> {
+    result.scalar_value()
+}
 
 fn readings_catalog() -> Catalog {
     let mut catalog = Catalog::new();
@@ -107,6 +113,97 @@ fn filters_rows_and_reports_empty_results() {
 }
 
 #[test]
+fn applies_and_before_or_with_or_without_group_parentheses() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE precedence (id Int64, active Bool)")
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO precedence VALUES \
+             (1, false), (2, true), (2, false), (3, true)",
+        )
+        .unwrap();
+
+    for where_clause in [
+        "id = 1 OR id = 2 AND active = true",
+        "(id = 1) OR (id = 2 AND active = true)",
+    ] {
+        let result = catalog
+            .execute_select(&format!("SELECT id FROM precedence WHERE {where_clause}"))
+            .unwrap();
+        assert_eq!(
+            result.row_indices().collect::<Vec<_>>(),
+            [0, 1],
+            "clause: {where_clause}"
+        );
+    }
+}
+
+#[test]
+fn executes_campaign_shaped_groups_across_all_physical_types() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE campaigns (campaign_id Int64, spend Float64, active Bool, channel String)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO campaigns VALUES \
+             (101, 10.0, true, 'email'), \
+             (101, 80.0, true, 'search'), \
+             (102, 75.0, false, 'search'), \
+             (103, 40.0, true, 'search'), \
+             (101, 90.0, false, 'email')",
+        )
+        .unwrap();
+
+    let predicate = "(campaign_id = 101 AND active = true) OR \
+                     (channel = 'search' AND spend >= 50.0)";
+    let result = catalog
+        .execute_select(&format!(
+            "SELECT campaign_id FROM campaigns WHERE {predicate}"
+        ))
+        .unwrap();
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [0, 1, 2]);
+
+    let aggregates = catalog
+        .execute_select(&format!(
+            "SELECT COUNT(*) AS matches, SUM(campaign_id) AS campaign_total \
+             FROM campaigns WHERE {predicate}"
+        ))
+        .unwrap();
+    assert_eq!(aggregates.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(
+        aggregates.scalar_values().collect::<Vec<_>>(),
+        [&Value::Int64(3), &Value::Int64(304)]
+    );
+}
+
+#[test]
+fn unions_intersected_groups_across_packed_bitmap_boundaries() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE boundaries (id Int64)")
+        .unwrap();
+    catalog
+        .table_mut("boundaries")
+        .unwrap()
+        .insert_batch((0..18).map(|id| vec![Value::Int64(id)]))
+        .unwrap();
+
+    let result = catalog
+        .execute_select(
+            "SELECT id FROM boundaries \
+             WHERE (id >= 7 AND id <= 9) OR (id >= 15 AND id <= 17) \
+             ORDER BY id DESC LIMIT 5",
+        )
+        .unwrap();
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [17, 16, 15, 9, 8]);
+}
+
+#[test]
 fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
     let catalog = readings_catalog();
 
@@ -119,7 +216,7 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
             .collect::<Vec<_>>(),
         [("count()", DataType::Int64)]
     );
-    assert_eq!(all.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(scalar_value_through_const_api(&all), Some(&Value::Int64(3)));
     assert_eq!(all.row_indices().collect::<Vec<_>>(), [0]);
     assert_eq!(all.len(), 1);
     assert!(!all.is_empty());
@@ -152,6 +249,163 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
     assert_eq!(empty.scalar_value(), Some(&Value::Int64(0)));
     assert_eq!(empty.len(), 1);
     assert!(!empty.is_empty());
+}
+
+#[test]
+fn executes_aggregate_lists_over_one_filtered_selection() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT COUNT(*), SUM(sequence) AS total_sequence, SUM(value), AVG(sequence), \
+             MIN(label) AS first_label, MAX(active) FROM readings WHERE active = true",
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [
+            ("count()", DataType::Int64),
+            ("total_sequence", DataType::Int64),
+            ("sum(value)", DataType::Float64),
+            ("avg(sequence)", DataType::Float64),
+            ("first_label", DataType::String),
+            ("max(active)", DataType::Bool),
+        ]
+    );
+    assert_eq!(
+        result.scalar_values().cloned().collect::<Vec<_>>(),
+        [
+            Value::Int64(2),
+            Value::Int64(4),
+            Value::Float64(2.0),
+            Value::Float64(2.0),
+            Value::String("first".to_owned()),
+            Value::Bool(true),
+        ]
+    );
+    assert_eq!(result.scalar_value(), Some(&Value::Int64(2)));
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [0]);
+    assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn count_and_sum_emit_zero_for_an_empty_aggregate_input() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE empty (integer Int64, float Float64)")
+        .unwrap();
+
+    let result = catalog
+        .execute_select("SELECT COUNT(*), SUM(integer), SUM(float) FROM empty")
+        .unwrap();
+    assert_eq!(
+        result.scalar_values().cloned().collect::<Vec<_>>(),
+        [Value::Int64(0), Value::Int64(0), Value::Float64(0.0),]
+    );
+}
+
+#[test]
+fn aggregate_failures_preserve_typed_column_type_overflow_and_empty_errors() {
+    let catalog = readings_catalog();
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT SUM(missing) FROM readings")
+            .unwrap_err(),
+        CatalogError::TableReduction {
+            name: "readings".to_owned(),
+            source: ReductionError::FieldNotFound {
+                name: "missing".to_owned(),
+            },
+        }
+    );
+    assert_eq!(
+        catalog
+            .execute_select("SELECT AVG(label) FROM readings")
+            .unwrap_err(),
+        CatalogError::TableReduction {
+            name: "readings".to_owned(),
+            source: ReductionError::NonNumericColumn {
+                field: "label".to_owned(),
+                data_type: DataType::String,
+            },
+        }
+    );
+
+    for (function, field) in [("AVG", "value"), ("MIN", "label"), ("MAX", "active")] {
+        let query = format!("SELECT {function}({field}) FROM readings WHERE sequence > 100");
+        assert_eq!(
+            catalog.execute_select(&query).unwrap_err(),
+            CatalogError::EmptyAggregateInput {
+                name: "readings".to_owned(),
+                function,
+                field: field.to_owned(),
+            }
+        );
+    }
+
+    let mut overflow = Catalog::new();
+    overflow
+        .execute_create("CREATE TABLE numbers (value Int64)")
+        .unwrap();
+    overflow
+        .execute_insert(&format!("INSERT INTO numbers VALUES ({}), (1)", i64::MAX))
+        .unwrap();
+    assert_eq!(
+        overflow
+            .execute_select("SELECT SUM(value) FROM numbers")
+            .unwrap_err(),
+        CatalogError::TableReduction {
+            name: "numbers".to_owned(),
+            source: ReductionError::Int64Overflow {
+                field: "value".to_owned(),
+                row: 1,
+            },
+        }
+    );
+}
+
+#[test]
+fn bounds_repeated_large_string_extrema_before_copying_over_the_limit() {
+    const STRING_BYTES: usize = 512 * 1024;
+
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE strings (payload String)")
+        .unwrap();
+    catalog
+        .table_mut("strings")
+        .unwrap()
+        .insert_batch([vec![Value::String("x".repeat(STRING_BYTES))]])
+        .unwrap();
+
+    let projection_count = SelectParseLimits::DEFAULT_MAX_PROJECTIONS;
+    let projections = (0..projection_count)
+        .map(|index| {
+            if index % 2 == 0 {
+                "MIN(payload)"
+            } else {
+                "MAX(payload)"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let error = catalog
+        .execute_select(&format!("SELECT {projections} FROM strings"))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        CatalogError::AggregateResultTooLarge {
+            name: "strings".to_owned(),
+            field: "payload".to_owned(),
+            limit: MAX_AGGREGATE_RESULT_BYTES,
+            required: MAX_AGGREGATE_RESULT_BYTES + STRING_BYTES,
+        }
+    );
 }
 
 #[test]
@@ -188,11 +442,11 @@ fn executes_an_already_parsed_statement() {
     let statement = SelectStatement {
         projections: SelectProjection::Columns(vec!["label".to_owned()]),
         table: "Readings".to_owned(),
-        predicate: Some(ComparisonPredicate {
+        predicate_groups: vec![vec![ComparisonPredicate {
             column: "sequence".to_owned(),
             operator: ComparisonOperator::GreaterThanOrEqual,
             value: Value::Int64(2),
-        }),
+        }]],
         order_by: None,
         limit: None,
     };
@@ -207,6 +461,23 @@ fn executes_an_already_parsed_statement() {
         ["label"]
     );
     assert_eq!(result.selected_rows().rev().collect::<Vec<_>>(), [2, 1]);
+}
+
+#[test]
+fn rejects_an_empty_manually_constructed_aggregate_list() {
+    let catalog = readings_catalog();
+    let statement = SelectStatement {
+        projections: SelectProjection::Aggregates(Vec::new()),
+        table: "readings".to_owned(),
+        predicate_groups: Vec::new(),
+        order_by: None,
+        limit: None,
+    };
+
+    assert_eq!(
+        catalog.select(statement).unwrap_err(),
+        CatalogError::EmptyAggregateProjection
+    );
 }
 
 #[test]

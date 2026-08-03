@@ -9,9 +9,10 @@ use std::path::Path;
 use crate::reduction::ReductionError;
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
-    CreateTableStatement, InsertParseLimits, InsertStatement, OrderByClause, OrderDirection,
-    ParseError, ParseLimits, SelectParseLimits, SelectProjection, SelectStatement,
-    parse_create_table_with_limits, parse_insert_with_limits, parse_select_with_limits,
+    AggregateFunction, AggregateProjection, ComparisonPredicate, CreateTableStatement,
+    InsertParseLimits, InsertStatement, OrderByClause, OrderDirection, ParseError, ParseLimits,
+    SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
+    parse_insert_with_limits, parse_select_with_limits,
 };
 use crate::storage::{Column, DEFAULT_ROW_LIMIT, DataType, Field, Table, TableError, Value};
 use crate::table_snapshot::TableSnapshotError;
@@ -19,6 +20,8 @@ use crate::{RowSelection, ScanError};
 
 /// Default maximum number of tables owned by one [`Catalog`].
 pub const DEFAULT_MAX_TABLES: usize = 1024;
+/// Maximum retained String payload bytes in one scalar aggregate row.
+pub const MAX_AGGREGATE_RESULT_BYTES: usize = 1024 * 1024;
 
 /// Resource limits applied by a [`Catalog`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +81,8 @@ impl Default for CatalogLimits {
 pub enum CatalogError {
     /// SQL could not be parsed as the supported statement syntax.
     Parse(ParseError),
+    /// A manually constructed aggregate projection list was empty.
+    EmptyAggregateProjection,
     /// The catalog already owns a table with this case-insensitive name.
     DuplicateTable {
         /// Name from the rejected statement.
@@ -112,6 +117,22 @@ pub enum CatalogError {
         /// Number of projected fields whose indexes could not be reserved.
         field_count: usize,
     },
+    /// Memory could not be reserved for a scalar aggregate result row.
+    AggregateAllocationFailed {
+        /// Number of aggregate values whose storage could not be reserved.
+        aggregate_count: usize,
+    },
+    /// Retained String payloads in a scalar aggregate row exceed their bound.
+    AggregateResultTooLarge {
+        /// Name from the rejected statement.
+        name: String,
+        /// Field whose next extrema value would exceed the bound.
+        field: String,
+        /// Maximum retained String payload bytes.
+        limit: usize,
+        /// Total bytes required through the rejected aggregate.
+        required: usize,
+    },
     /// The field named by an `ORDER BY` clause does not exist in the table.
     OrderFieldNotFound {
         /// Case-sensitive name used in the clause.
@@ -129,12 +150,21 @@ pub enum CatalogError {
         /// Scan validation or allocation failure.
         source: ScanError,
     },
-    /// A `COUNT(*)` reduction failed after its optional scan.
+    /// A scalar reduction failed after its optional scan.
     TableReduction {
         /// Name from the rejected statement.
         name: String,
         /// Reduction validation failure.
         source: ReductionError,
+    },
+    /// `AVG`, `MIN`, or `MAX` received no selected rows and cannot emit `NULL`.
+    EmptyAggregateInput {
+        /// Name from the rejected statement.
+        name: String,
+        /// SQL aggregate function which received no rows.
+        function: &'static str,
+        /// Case-sensitive aggregate input field.
+        field: String,
     },
     /// A row count could not be represented by the SQL `Int64` result type.
     CountOutOfRange {
@@ -156,6 +186,9 @@ impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(error) => error.fmt(formatter),
+            Self::EmptyAggregateProjection => {
+                formatter.write_str("aggregate projection list cannot be empty")
+            }
             Self::DuplicateTable { name } => write!(formatter, "table `{name}` already exists"),
             Self::TableNotFound { name } => write!(formatter, "table `{name}` does not exist"),
             Self::TableConstruction { name, source } => {
@@ -170,6 +203,19 @@ impl fmt::Display for CatalogError {
             Self::ProjectionAllocationFailed { field_count } => write!(
                 formatter,
                 "could not reserve indexes for {field_count} projected fields"
+            ),
+            Self::AggregateAllocationFailed { aggregate_count } => write!(
+                formatter,
+                "could not reserve a result row for {aggregate_count} scalar aggregates"
+            ),
+            Self::AggregateResultTooLarge {
+                name,
+                field,
+                limit,
+                required,
+            } => write!(
+                formatter,
+                "aggregate result for table `{name}` requires {required} String payload bytes at field `{field}`; limit is {limit}"
             ),
             Self::OrderFieldNotFound { name } => {
                 write!(formatter, "ordered field `{name}` does not exist")
@@ -186,6 +232,14 @@ impl fmt::Display for CatalogError {
             Self::TableReduction { name, source } => {
                 write!(formatter, "could not reduce table `{name}`: {source}")
             }
+            Self::EmptyAggregateInput {
+                name,
+                function,
+                field,
+            } => write!(
+                formatter,
+                "cannot compute {function}(`{field}`) for table `{name}` with no selected rows"
+            ),
             Self::CountOutOfRange { name, count } => write!(
                 formatter,
                 "table `{name}` count of {count} cannot be represented as Int64"
@@ -271,12 +325,12 @@ struct ScalarResult {
     value: Value,
 }
 
-/// The output of one projection or scalar aggregate and optional comparison scan.
+/// The output of one projection or scalar aggregate and optional comparison scans.
 ///
 /// A row projection owns only projected column indexes and, for a filtered
 /// query, a compact row-selection bitmap. Ordered results instead own their
 /// bounded row indexes. Schema and column values remain owned by the catalog's
-/// source table. A scalar aggregate owns its single field and value.
+/// source table. Scalar aggregates own their fields and single result row.
 #[derive(Debug)]
 pub struct SelectResult<'a> {
     table: &'a Table,
@@ -285,7 +339,7 @@ pub struct SelectResult<'a> {
     ordered_rows: Option<Vec<usize>>,
     row_end: usize,
     row_count: usize,
-    scalar: Option<ScalarResult>,
+    scalars: Vec<ScalarResult>,
 }
 
 impl<'a> SelectResult<'a> {
@@ -299,18 +353,13 @@ impl<'a> SelectResult<'a> {
     pub fn projected_fields(
         &self,
     ) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
-        let field_count = self.field_indices.len() + usize::from(self.scalar.is_some());
-        (0..field_count).map(|index| {
-            self.field_indices.get(index).map_or_else(
-                || {
-                    &self
-                        .scalar
-                        .as_ref()
-                        .expect("a non-projection field belongs to the scalar result")
-                        .field
-                },
-                |field_index| &self.table.fields()[*field_index],
-            )
+        let projected_count = self.field_indices.len();
+        (0..projected_count + self.scalars.len()).map(move |index| {
+            if index < projected_count {
+                &self.table.fields()[self.field_indices[index]]
+            } else {
+                &self.scalars[index - projected_count].field
+            }
         })
     }
 
@@ -335,16 +384,34 @@ impl<'a> SelectResult<'a> {
         SelectedRows::new(self)
     }
 
-    /// Returns the value for a scalar aggregate result.
+    /// Iterates over the values in a scalar aggregate result row.
+    ///
+    /// Row projections and scalar rows suppressed by `LIMIT 0` are empty.
+    pub fn scalar_values(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Value> + DoubleEndedIterator + '_ {
+        let scalars = if self.row_count == 0 {
+            &self.scalars[..0]
+        } else {
+            &self.scalars[..]
+        };
+        scalars.iter().map(|scalar| &scalar.value)
+    }
+
+    /// Returns the first value for a scalar aggregate result.
     ///
     /// Row projections and scalar rows suppressed by `LIMIT 0` return `None`.
     #[must_use]
     pub const fn scalar_value(&self) -> Option<&Value> {
-        match (&self.scalar, self.row_count) {
+        match (self.scalars.as_slice(), self.row_count) {
             (_, 0) => None,
-            (Some(scalar), _) => Some(&scalar.value),
-            (None, _) => None,
+            ([scalar, ..], _) => Some(&scalar.value),
+            ([], _) => None,
         }
+    }
+
+    pub(crate) fn is_scalar(&self) -> bool {
+        !self.scalars.is_empty()
     }
 
     /// Alias for [`Self::selected_rows`].
@@ -610,9 +677,12 @@ impl Catalog {
     /// Parses and executes one bounded `SELECT` statement.
     ///
     /// The returned result borrows the source table and does not copy table
-    /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
-    /// For row projections, `ORDER BY` owns and sorts only selected row indexes.
-    /// `LIMIT` is applied to the final projected or aggregate output.
+    /// rows. Each `WHERE` comparison is evaluated with [`Table::scan`]. Packed
+    /// selections are intersected within `AND` groups and unioned across `OR`
+    /// groups. For row projections, `ORDER BY` owns and sorts only selected row
+    /// indexes. Scalar aggregate rows retain at most
+    /// [`MAX_AGGREGATE_RESULT_BYTES`] of String payloads. `LIMIT` is applied to
+    /// the final projected or aggregate output.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -625,7 +695,7 @@ impl Catalog {
         let SelectStatement {
             projections,
             table: name,
-            predicate,
+            predicate_groups,
             order_by,
             limit,
         } = statement;
@@ -634,58 +704,36 @@ impl Catalog {
             .get(&normalize_table_name(&name))
             .map(|entry| &entry.table)
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
+        let aggregate_result_byte_limit = MAX_AGGREGATE_RESULT_BYTES;
 
         match projections {
-            SelectProjection::CountAll { alias } => {
-                if let Some(order_by) = order_by {
-                    resolve_order(table, order_by)?;
-                }
-                let selection = predicate
-                    .map(|predicate| {
-                        table.scan(&predicate.column, predicate.operator, &predicate.value)
-                    })
-                    .transpose()
-                    .map_err(|source| CatalogError::TableScan {
-                        name: name.clone(),
-                        source,
-                    })?;
-                let count = table.count(selection.as_ref()).map_err(|source| {
-                    CatalogError::TableReduction {
-                        name: name.clone(),
-                        source,
-                    }
-                })?;
-                let count = i64::try_from(count)
-                    .map_err(|_| CatalogError::CountOutOfRange { name, count })?;
-                let row_count = usize::from(limit != Some(0));
-
-                Ok(SelectResult {
-                    table,
-                    field_indices: Vec::new(),
-                    selection: None,
-                    ordered_rows: None,
-                    row_end: row_count,
-                    row_count,
-                    scalar: Some(ScalarResult {
-                        field: Field::new(
-                            alias.unwrap_or_else(|| "count()".to_owned()),
-                            DataType::Int64,
-                        ),
-                        value: Value::Int64(count),
-                    }),
-                })
-            }
+            SelectProjection::CountAll { alias } => execute_aggregates(
+                table,
+                &name,
+                predicate_groups,
+                order_by,
+                limit,
+                aggregate_result_byte_limit,
+                std::iter::once(AggregateProjection {
+                    function: AggregateFunction::CountAll,
+                    alias,
+                }),
+            ),
+            SelectProjection::Aggregates(aggregates) => execute_aggregates(
+                table,
+                &name,
+                predicate_groups,
+                order_by,
+                limit,
+                aggregate_result_byte_limit,
+                aggregates.into_iter(),
+            ),
             projections => {
                 let field_indices = resolve_projection(table, projections)?;
                 let order = order_by
                     .map(|order_by| resolve_order(table, order_by))
                     .transpose()?;
-                let selection = predicate
-                    .map(|predicate| {
-                        table.scan(&predicate.column, predicate.operator, &predicate.value)
-                    })
-                    .transpose()
-                    .map_err(|source| CatalogError::TableScan { name, source })?;
+                let selection = scan_predicate_groups(table, predicate_groups, &name)?;
 
                 let (selection, ordered_rows, row_end, row_count) = match order {
                     Some((column_index, direction)) => {
@@ -713,7 +761,7 @@ impl Catalog {
                     ordered_rows,
                     row_end,
                     row_count,
-                    scalar: None,
+                    scalars: Vec::new(),
                 })
             }
         }
@@ -761,6 +809,244 @@ impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
+
+fn execute_aggregates<'a>(
+    table: &'a Table,
+    table_name: &str,
+    predicate_groups: Vec<Vec<ComparisonPredicate>>,
+    order_by: Option<OrderByClause>,
+    limit: Option<usize>,
+    aggregate_result_byte_limit: usize,
+    aggregates: impl ExactSizeIterator<Item = AggregateProjection>,
+) -> Result<SelectResult<'a>, CatalogError> {
+    let aggregate_count = aggregates.len();
+    if aggregate_count == 0 {
+        return Err(CatalogError::EmptyAggregateProjection);
+    }
+    if let Some(order_by) = order_by {
+        resolve_order(table, order_by)?;
+    }
+    let selection = scan_predicate_groups(table, predicate_groups, table_name)?;
+
+    let mut scalars = Vec::new();
+    scalars
+        .try_reserve_exact(aggregate_count)
+        .map_err(|_| CatalogError::AggregateAllocationFailed { aggregate_count })?;
+    let mut string_budget = AggregateStringBudget::new(aggregate_result_byte_limit);
+    for aggregate in aggregates {
+        scalars.push(execute_aggregate(
+            table,
+            table_name,
+            selection.as_ref(),
+            aggregate,
+            &mut string_budget,
+        )?);
+    }
+
+    let row_count = usize::from(limit != Some(0));
+    Ok(SelectResult {
+        table,
+        field_indices: Vec::new(),
+        selection: None,
+        ordered_rows: None,
+        row_end: row_count,
+        row_count,
+        scalars,
+    })
+}
+
+fn execute_aggregate(
+    table: &Table,
+    table_name: &str,
+    selection: Option<&RowSelection>,
+    aggregate: AggregateProjection,
+    string_budget: &mut AggregateStringBudget,
+) -> Result<ScalarResult, CatalogError> {
+    let AggregateProjection { function, alias } = aggregate;
+    match function {
+        AggregateFunction::CountAll => {
+            let count = map_reduction(table_name, table.count(selection))?;
+            let count = i64::try_from(count).map_err(|_| CatalogError::CountOutOfRange {
+                name: table_name.to_owned(),
+                count,
+            })?;
+            Ok(ScalarResult {
+                field: Field::new(
+                    alias.unwrap_or_else(|| "count()".to_owned()),
+                    DataType::Int64,
+                ),
+                value: Value::Int64(count),
+            })
+        }
+        AggregateFunction::Sum { column } => {
+            let value = map_reduction(table_name, table.sum(&column, selection))?;
+            Ok(scalar_result(alias, "sum", column, value))
+        }
+        AggregateFunction::Avg { column } => {
+            let value =
+                map_reduction(table_name, table.avg(&column, selection))?.ok_or_else(|| {
+                    CatalogError::EmptyAggregateInput {
+                        name: table_name.to_owned(),
+                        function: "AVG",
+                        field: column.clone(),
+                    }
+                })?;
+            Ok(scalar_result(alias, "avg", column, value))
+        }
+        AggregateFunction::Min { column } => {
+            let result = table.min_with_string_limit(&column, selection, string_budget.remaining());
+            let value =
+                map_extreme_reduction(table_name, string_budget, result)?.ok_or_else(|| {
+                    CatalogError::EmptyAggregateInput {
+                        name: table_name.to_owned(),
+                        function: "MIN",
+                        field: column.clone(),
+                    }
+                })?;
+            string_budget.account(&value);
+            Ok(scalar_result(alias, "min", column, value))
+        }
+        AggregateFunction::Max { column } => {
+            let result = table.max_with_string_limit(&column, selection, string_budget.remaining());
+            let value =
+                map_extreme_reduction(table_name, string_budget, result)?.ok_or_else(|| {
+                    CatalogError::EmptyAggregateInput {
+                        name: table_name.to_owned(),
+                        function: "MAX",
+                        field: column.clone(),
+                    }
+                })?;
+            string_budget.account(&value);
+            Ok(scalar_result(alias, "max", column, value))
+        }
+    }
+}
+
+struct AggregateStringBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl AggregateStringBudget {
+    const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    const fn remaining(&self) -> usize {
+        self.limit - self.used
+    }
+
+    fn account(&mut self, value: &Value) {
+        if let Value::String(value) = value {
+            self.used = self
+                .used
+                .checked_add(value.len())
+                .expect("bounded aggregate String bytes cannot overflow");
+            debug_assert!(self.used <= self.limit);
+        }
+    }
+}
+
+fn map_extreme_reduction(
+    table_name: &str,
+    string_budget: &AggregateStringBudget,
+    result: Result<Option<Value>, ReductionError>,
+) -> Result<Option<Value>, CatalogError> {
+    match result {
+        Err(ReductionError::StringResultTooLarge {
+            field, required, ..
+        }) => Err(CatalogError::AggregateResultTooLarge {
+            name: table_name.to_owned(),
+            field,
+            limit: string_budget.limit,
+            required: string_budget.used.saturating_add(required),
+        }),
+        result => map_reduction(table_name, result),
+    }
+}
+
+fn map_reduction<T>(
+    table_name: &str,
+    result: Result<T, ReductionError>,
+) -> Result<T, CatalogError> {
+    result.map_err(|source| CatalogError::TableReduction {
+        name: table_name.to_owned(),
+        source,
+    })
+}
+
+fn scalar_result(
+    alias: Option<String>,
+    function: &'static str,
+    column: String,
+    value: Value,
+) -> ScalarResult {
+    ScalarResult {
+        field: Field::new(
+            alias.unwrap_or_else(|| format!("{function}({column})")),
+            value.data_type(),
+        ),
+        value,
+    }
+}
+
+fn scan_predicate_groups(
+    table: &Table,
+    predicate_groups: Vec<Vec<ComparisonPredicate>>,
+    table_name: &str,
+) -> Result<Option<RowSelection>, CatalogError> {
+    if predicate_groups.is_empty() || predicate_groups.iter().any(Vec::is_empty) {
+        return Ok(None);
+    }
+
+    let mut groups = predicate_groups.into_iter();
+    let mut selection = scan_predicate_group(
+        table,
+        groups
+            .next()
+            .expect("non-empty predicate groups were checked above"),
+        table_name,
+    )?;
+
+    for group in groups {
+        let next = scan_predicate_group(table, group, table_name)?;
+        selection.union(&next);
+    }
+
+    Ok(Some(selection))
+}
+
+fn scan_predicate_group(
+    table: &Table,
+    predicates: Vec<ComparisonPredicate>,
+    table_name: &str,
+) -> Result<RowSelection, CatalogError> {
+    let mut predicates = predicates.into_iter();
+    let first = predicates
+        .next()
+        .expect("empty predicate groups were checked by scan_predicate_groups");
+    let mut selection = scan_predicate(table, first, table_name)?;
+
+    for predicate in predicates {
+        let next = scan_predicate(table, predicate, table_name)?;
+        selection.intersect(&next);
+    }
+
+    Ok(selection)
+}
+
+fn scan_predicate(
+    table: &Table,
+    predicate: ComparisonPredicate,
+    table_name: &str,
+) -> Result<RowSelection, CatalogError> {
+    table
+        .scan(&predicate.column, predicate.operator, &predicate.value)
+        .map_err(|source| CatalogError::TableScan {
+            name: table_name.to_owned(),
+            source,
+        })
 }
 
 fn limited_row_bounds(
@@ -870,7 +1156,9 @@ fn resolve_projection(
     let field_count = match &projection {
         SelectProjection::All => table.fields().len(),
         SelectProjection::Columns(names) => names.len(),
-        SelectProjection::CountAll { .. } => unreachable!("counts are reduced before resolution"),
+        SelectProjection::CountAll { .. } | SelectProjection::Aggregates(_) => {
+            unreachable!("aggregates are reduced before projection resolution")
+        }
     };
     let mut indices = Vec::new();
     indices
@@ -889,7 +1177,9 @@ fn resolve_projection(
                 indices.push(index);
             }
         }
-        SelectProjection::CountAll { .. } => unreachable!("counts are reduced before resolution"),
+        SelectProjection::CountAll { .. } | SelectProjection::Aggregates(_) => {
+            unreachable!("aggregates are reduced before projection resolution")
+        }
     }
     Ok(indices)
 }
