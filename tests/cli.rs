@@ -13,7 +13,7 @@ use std::sync::{Arc, Barrier};
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
 };
-use rusthouse::{Catalog, DEFAULT_MAX_TABLES};
+use rusthouse::{Catalog, CatalogError, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, Value};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -503,6 +503,27 @@ fn writes_count_rows_for_all_filtered_and_empty_tables() {
 }
 
 #[test]
+fn writes_one_csv_row_for_a_filtered_aggregate_list() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, score Float64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, -2.0, true, 'first'), (2, 0.0, false, 'second'), (3, 4.0, true, 'third')\n\
+          SELECT COUNT(*), SUM(id) AS total_id, AVG(score), MIN(label) AS first_label, MAX(active) FROM events WHERE active = true\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"count()\",\"total_id\",\"avg(score)\",\"first_label\",\"max(active)\"\n",
+            "2,4,1,\"first\",true\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],
@@ -596,6 +617,41 @@ fn reports_catalog_capacity_as_a_limit() {
             DEFAULT_MAX_TABLES + 1
         )
     );
+}
+
+#[test]
+fn reports_aggregate_result_bytes_as_a_limit() {
+    const VALUE_BYTES: usize = MAX_AGGREGATE_RESULT_BYTES / 2 + 1;
+    const REQUIRED_BYTES: usize = VALUE_BYTES * 2;
+
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE strings (value String)")
+        .unwrap();
+    catalog
+        .table_mut("strings")
+        .unwrap()
+        .insert_batch([vec![Value::String("x".repeat(VALUE_BYTES))]])
+        .unwrap();
+
+    let error = execute_batch(
+        Cursor::new(b"SELECT MIN(value), MAX(value) FROM strings\n"),
+        &mut catalog,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.exit_code(), 3);
+    assert!(matches!(
+        error,
+        BatchError::ExecutionLimit {
+            line: 1,
+            source: CatalogError::AggregateResultTooLarge {
+                limit: MAX_AGGREGATE_RESULT_BYTES,
+                required: REQUIRED_BYTES,
+                ..
+            },
+        }
+    ));
 }
 
 #[test]
