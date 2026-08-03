@@ -24,7 +24,9 @@
 //! `.rhsnap-coordinator` file serializes temporary-file allocation and orphan
 //! reclamation, while payload writes remain concurrent. The next writer removes
 //! unlocked temporary files abandoned by dead writers, never a live writer's
-//! file. The last rename determines the visible snapshot.
+//! file. File names beginning with `.rhsnap-` (ASCII case-insensitively) are
+//! reserved for this protocol and rejected as snapshot destinations. The last
+//! rename determines the visible snapshot.
 
 use std::error::Error;
 use std::ffi::OsStr;
@@ -73,6 +75,8 @@ impl fmt::Display for SnapshotCorruption {
 pub enum SnapshotError {
     /// The requested snapshot path does not exist.
     Missing { path: PathBuf },
+    /// The path's file name belongs to the internal snapshot-write namespace.
+    ReservedPath { path: PathBuf },
     /// The payload length exceeds the store's configured bound.
     Oversized {
         payload_len: u64,
@@ -102,6 +106,11 @@ impl fmt::Display for SnapshotError {
             Self::Missing { path } => {
                 write!(formatter, "snapshot does not exist: {}", path.display())
             }
+            Self::ReservedPath { path } => write!(
+                formatter,
+                "snapshot path uses the reserved .rhsnap- namespace: {}",
+                path.display()
+            ),
             Self::Oversized {
                 payload_len,
                 max_payload_len,
@@ -213,6 +222,7 @@ impl SnapshotStore {
     /// so oversized or trailing files are never read into an unbounded buffer.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, SnapshotError> {
         let path = path.as_ref();
+        validate_snapshot_path(path)?;
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -375,21 +385,11 @@ impl Drop for OwnedTemporaryFile {
 fn create_sibling_temporary_file(
     path: &Path,
 ) -> Result<(PathBuf, OwnedTemporaryFile), SnapshotError> {
+    validate_snapshot_path(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    path.file_name().ok_or_else(|| {
-        io_failure(
-            "resolve",
-            path,
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "snapshot path must have a file name",
-            ),
-        )
-    })?;
-
     let coordinator_path = parent.join(TEMPORARY_COORDINATOR_NAME);
     let coordinator = OpenOptions::new()
         .read(true)
@@ -433,6 +433,28 @@ fn create_sibling_temporary_file(
             }
         }
     }
+}
+
+fn validate_snapshot_path(path: &Path) -> Result<(), SnapshotError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io_failure(
+            "resolve",
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot path must have a file name",
+            ),
+        )
+    })?;
+    if file_name.to_str().is_some_and(|name| {
+        name.get(..TEMPORARY_FILE_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TEMPORARY_FILE_PREFIX))
+    }) {
+        return Err(SnapshotError::ReservedPath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn reclaim_orphaned_temporary_files(parent: &Path) -> Result<(), SnapshotError> {
@@ -648,6 +670,35 @@ mod tests {
             fs::read(&temporary_path).expect("read unowned file"),
             b"another writer's bytes"
         );
+    }
+
+    #[test]
+    fn rejects_the_reserved_internal_namespace_without_touching_existing_files() {
+        let directory = TestDirectory::new("reserved-namespace");
+        let store = SnapshotStore::new(32);
+
+        for file_name in [
+            ".rhsnap-deadbeef-0000000000000000.tmp",
+            TEMPORARY_COORDINATOR_NAME,
+            ".rhsnap-future-protocol-file",
+            ".RHSNAP-case-insensitive-filesystem-collision",
+        ] {
+            let path = directory.0.join(file_name);
+            fs::write(&path, b"unrelated data").expect("create reserved-name file");
+
+            let write_error = store.write(&path, b"snapshot").unwrap_err();
+            assert!(
+                matches!(write_error, SnapshotError::ReservedPath { path: found } if found == path)
+            );
+            let read_error = store.read(&path).unwrap_err();
+            assert!(
+                matches!(read_error, SnapshotError::ReservedPath { path: found } if found == path)
+            );
+            assert_eq!(
+                fs::read(&path).expect("read reserved-name file"),
+                b"unrelated data"
+            );
+        }
     }
 
     #[test]
