@@ -442,6 +442,9 @@ impl Table {
                     current: self.row_count,
                 });
             }
+            batch
+                .try_reserve(1)
+                .map_err(|_| TableError::AllocationFailed { additional_rows: 1 })?;
             batch.push(row);
         }
 

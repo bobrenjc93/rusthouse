@@ -42,11 +42,26 @@ fn requires_the_exact_schema_header() {
 
     assert!(matches!(
         error,
-        CsvIngestError::HeaderMismatch { expected, actual }
-            if expected == ["integer", "float", "boolean", "text"]
-                && actual == ["float", "integer", "boolean", "text"]
+        CsvIngestError::HeaderMismatch {
+            expected_fields: 4,
+            actual_fields: 4,
+            first_mismatch: Some(0),
+        }
     ));
     assert!(table.is_empty());
+}
+
+#[test]
+fn quoted_header_delimiters_are_compared_as_one_schema_field() {
+    let mut table = Table::new(vec![Field::new("comma,name", DataType::String)]).unwrap();
+
+    assert_eq!(
+        table
+            .insert_csv(b"\"comma,name\"\n\"quoted,value\"\n".as_slice())
+            .unwrap(),
+        1
+    );
+    assert_eq!(table.string_column("comma,name").unwrap(), ["quoted,value"]);
 }
 
 #[test]
@@ -144,6 +159,48 @@ fn row_limit_accepts_exact_boundary_and_rolls_back_on_excess() {
         CsvIngestError::RowLimitExceeded { limit: 1 }
     ));
     assert!(limited.is_empty());
+}
+
+#[test]
+fn decoded_memory_limit_bounds_wide_empty_string_rows_at_exact_boundary() {
+    const FIELD_COUNT: usize = 256;
+
+    let fields = (0..FIELD_COUNT)
+        .map(|index| Field::new(format!("field_{index}"), DataType::String))
+        .collect::<Vec<_>>();
+    let header = fields.iter().map(Field::name).collect::<Vec<_>>().join(",");
+    let empty_row = ",".repeat(FIELD_COUNT - 1);
+    let csv = format!("{header}\n{empty_row}\n{empty_row}\n");
+    let decoded_bytes =
+        2 * (std::mem::size_of::<Vec<Value>>() + FIELD_COUNT * std::mem::size_of::<Value>());
+
+    let exact_limits = CsvIngestLimits::new(csv.len(), 2).with_max_decoded_bytes(decoded_bytes);
+    let mut exact = Table::new(fields.clone()).unwrap();
+    assert_eq!(
+        exact
+            .insert_csv_with_limits(csv.as_bytes(), exact_limits)
+            .unwrap(),
+        2
+    );
+
+    let mut limited = Table::new(fields).unwrap();
+    limited
+        .insert_batch(vec![vec![Value::String("seed".to_owned()); FIELD_COUNT]])
+        .unwrap();
+    let error = limited
+        .insert_csv_with_limits(
+            csv.as_bytes(),
+            CsvIngestLimits::new(csv.len(), 2).with_max_decoded_bytes(decoded_bytes - 1),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CsvIngestError::DecodedLimitExceeded { limit, required }
+            if limit == decoded_bytes - 1 && required == decoded_bytes
+    ));
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited.string_column("field_0").unwrap(), ["seed"]);
+    assert_eq!(limited.string_column("field_255").unwrap(), ["seed"]);
 }
 
 #[test]
