@@ -1,5 +1,6 @@
 //! Typed, in-memory columnar storage for one table.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
@@ -135,6 +136,11 @@ pub enum TableError {
         /// The duplicated, case-sensitive field name.
         name: String,
     },
+    /// Memory could not be reserved while validating a schema.
+    SchemaAllocationFailed {
+        /// Number of field names whose validation allocation failed.
+        field_count: usize,
+    },
     /// A batch would exceed the table's configured row limit.
     RowLimitExceeded {
         /// Configured maximum row count.
@@ -197,6 +203,10 @@ impl fmt::Display for TableError {
             Self::DuplicateField { name } => {
                 write!(formatter, "schema contains duplicate field `{name}`")
             }
+            Self::SchemaAllocationFailed { field_count } => write!(
+                formatter,
+                "could not reserve storage to validate {field_count} schema fields"
+            ),
             Self::RowLimitExceeded { limit, current } => write!(
                 formatter,
                 "batch exceeds row limit {limit}; table currently contains {current} rows"
@@ -239,7 +249,7 @@ impl fmt::Display for TableError {
 impl Error for TableError {}
 
 #[derive(Debug)]
-enum Column {
+pub(crate) enum Column {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     // Bytes avoid Vec<bool>'s proxy representation while retaining a compact,
@@ -277,6 +287,24 @@ impl Column {
             (Self::Bool(values), Value::Bool(value)) => values.push(u8::from(value)),
             (Self::String(values), Value::String(value)) => values.push(value),
             _ => unreachable!("values are type-checked before columns are mutated"),
+        }
+    }
+
+    pub(crate) const fn data_type(&self) -> DataType {
+        match self {
+            Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
+            Self::Bool(_) => DataType::Bool,
+            Self::String(_) => DataType::String,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Int64(values) => values.len(),
+            Self::Float64(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::String(values) => values.len(),
         }
     }
 }
@@ -367,6 +395,29 @@ impl Table {
     #[must_use]
     pub const fn row_limit(&self) -> usize {
         self.row_limit
+    }
+
+    pub(crate) fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    pub(crate) fn from_snapshot_parts(
+        fields: Vec<Field>,
+        columns: Vec<Column>,
+        row_count: usize,
+        row_limit: usize,
+    ) -> Self {
+        debug_assert_eq!(fields.len(), columns.len());
+        debug_assert!(row_count <= row_limit);
+        debug_assert!(fields.iter().zip(&columns).all(|(field, column)| {
+            field.data_type == column.data_type() && column.len() == row_count
+        }));
+        Self {
+            fields,
+            columns,
+            row_count,
+            row_limit,
+        }
     }
 
     /// Validates and appends a batch of owned rows.
@@ -492,21 +543,30 @@ impl Table {
     }
 }
 
-fn validate_fields(fields: &[Field]) -> Result<(), TableError> {
+pub(crate) fn validate_fields(fields: &[Field]) -> Result<(), TableError> {
     if fields.is_empty() {
         return Err(TableError::EmptySchema);
     }
+
+    let mut names = HashSet::new();
+    names
+        .try_reserve(fields.len())
+        .map_err(|_| TableError::SchemaAllocationFailed {
+            field_count: fields.len(),
+        })?;
     for (index, field) in fields.iter().enumerate() {
         if field.name.is_empty() {
             return Err(TableError::EmptyFieldName { index });
         }
-        if fields[..index]
-            .iter()
-            .any(|previous| previous.name == field.name)
-        {
-            return Err(TableError::DuplicateField {
-                name: field.name.clone(),
-            });
+        if !names.insert(field.name.as_str()) {
+            let mut name = String::new();
+            name.try_reserve_exact(field.name.len()).map_err(|_| {
+                TableError::SchemaAllocationFailed {
+                    field_count: fields.len(),
+                }
+            })?;
+            name.push_str(&field.name);
+            return Err(TableError::DuplicateField { name });
         }
     }
     Ok(())
