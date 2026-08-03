@@ -20,7 +20,7 @@ pub use grouping::{
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
     ColumnDefinition, CreateTableStatement, Identifier, InsertStatement, ParseError, ParseLimits,
-    parse_create_table, parse_insert,
+    SelectStatement, parse_create_table, parse_insert, parse_select,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,
