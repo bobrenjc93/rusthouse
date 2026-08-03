@@ -30,17 +30,20 @@ fn snapshot_round_trip(rows: &[Option<i64>]) -> Vec<Option<i64>> {
 fn borrowed_selects_and_restored_snapshots_produce_the_same_join() {
     let left = table(&[Some(7), None, Some(7), Some(9)]);
     let right = table(&[Some(7), Some(9), None, Some(7)]);
-    let left_select = parse_select("SELECT key FROM left_rows", ParseLimits::default()).unwrap();
-    let right_select = parse_select("SELECT key FROM right_rows", ParseLimits::default()).unwrap();
+    let left_select =
+        parse_select("SELECT key FROM left_rows LIMIT 3", ParseLimits::default()).unwrap();
+    let right_select =
+        parse_select("SELECT key FROM right_rows LIMIT 4", ParseLimits::default()).unwrap();
 
     let left_rows = execute_select("left_rows", &left, &left_select).unwrap();
     let right_rows = execute_select("right_rows", &right, &right_select).unwrap();
-    assert!(std::ptr::eq(left_rows, left.values()));
-    assert!(std::ptr::eq(right_rows, right.values()));
+    assert_eq!(left_rows, &[Some(7), None, Some(7)]);
+    assert!(std::ptr::eq(left_rows.as_ptr(), left.values().as_ptr()));
+    assert!(std::ptr::eq(right_rows.as_ptr(), right.values().as_ptr()));
 
     let restored_left = snapshot_round_trip(left_rows);
     let restored_right = snapshot_round_trip(right_rows);
-    let limits = JoinLimits::new(4, 5);
+    let limits = JoinLimits::new(4, 4);
 
     let live_matches = inner_equi_join_nullable_i64(left_rows, right_rows, limits).unwrap();
     let restored_matches =
@@ -54,6 +57,6 @@ fn borrowed_selects_and_restored_snapshots_produce_the_same_join() {
             .into_iter()
             .map(|pair| pair.into_pair())
             .collect::<Vec<_>>(),
-        vec![(0, 0), (0, 3), (2, 0), (2, 3), (3, 1)]
+        vec![(0, 0), (0, 3), (2, 0), (2, 3)]
     );
 }

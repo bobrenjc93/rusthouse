@@ -19,6 +19,14 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## SQL execution
+
+RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
+subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
+borrowed `SELECT` projections across multiple named tables. `SELECT` supports
+an optional nonnegative `LIMIT`; execution returns a prefix of the table's
+column storage without copying row values.
+
 ## Snapshot envelope
 
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit

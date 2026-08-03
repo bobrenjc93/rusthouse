@@ -102,7 +102,7 @@ pub fn execute_insert(
 /// `expected_table_name` and the table's column name are compared exactly
 /// with the identifiers retained by the parser, including ASCII case. The
 /// returned slice borrows the table's existing column storage without copying
-/// its values.
+/// its values. An optional `LIMIT` returns a prefix of that same storage.
 ///
 /// # Examples
 ///
@@ -140,5 +140,7 @@ pub fn execute_select<'table>(
         });
     }
 
-    Ok(table.values())
+    let values = table.values();
+    let row_count = statement.limit().unwrap_or(values.len()).min(values.len());
+    Ok(&values[..row_count])
 }

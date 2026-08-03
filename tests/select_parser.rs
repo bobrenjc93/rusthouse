@@ -14,7 +14,55 @@ fn parses_casing_whitespace_and_optional_semicolon() {
 
         assert_eq!(statement.column_name().as_str(), column_name, "{input:?}");
         assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
+        assert_eq!(statement.limit(), None, "{input:?}");
     }
+}
+
+#[test]
+fn parses_zero_exact_and_platform_maximum_limits() {
+    let cases = [
+        ("SELECT value FROM events LIMIT 0", 0),
+        ("select value from events limit 25;", 25),
+        (
+            &format!("SELECT value FROM events LiMiT {} ;", usize::MAX),
+            usize::MAX,
+        ),
+    ];
+
+    for (input, expected) in cases {
+        let statement = parse_select(input, ParseLimits::default()).unwrap();
+        assert_eq!(statement.limit(), Some(expected), "{input:?}");
+    }
+}
+
+#[test]
+fn rejects_malformed_and_overflowing_limits_with_byte_offsets() {
+    let malformed = [
+        "SELECT value FROM events LIMIT ",
+        "SELECT value FROM events LIMIT -1",
+        "SELECT value FROM events LIMIT 1.5",
+        "SELECT value FROM events LIMIT many",
+    ];
+
+    for input in malformed {
+        let value_offset = input.find("LIMIT").unwrap() + "LIMIT".len() + 1;
+        assert_eq!(
+            parse_select(input, ParseLimits::default()),
+            Err(ParseError::InvalidLimit {
+                offset: value_offset,
+            }),
+            "{input:?}"
+        );
+    }
+
+    let input = format!("SELECT value FROM events LIMIT {}0", usize::MAX);
+    let value_offset = input.find(usize::MAX.to_string().as_str()).unwrap();
+    assert_eq!(
+        parse_select(&input, ParseLimits::default()),
+        Err(ParseError::LimitOverflow {
+            offset: value_offset,
+        })
+    );
 }
 
 #[test]

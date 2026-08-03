@@ -42,6 +42,29 @@ fn returns_null_values_without_copying() {
 }
 
 #[test]
+fn applies_limit_as_a_borrowed_prefix() {
+    let table = table(true, &[Some(1), None, Some(3)]);
+
+    for (limit, expected) in [
+        (0, &[][..]),
+        (2, &[Some(1), None][..]),
+        (3, &[Some(1), None, Some(3)][..]),
+        (100, &[Some(1), None, Some(3)][..]),
+    ] {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings LIMIT {limit}"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        let values = execute_select("readings", &table, &statement).unwrap();
+
+        assert_eq!(values, expected, "LIMIT {limit}");
+        assert!(std::ptr::eq(values.as_ptr(), table.values().as_ptr()));
+    }
+}
+
+#[test]
 fn table_name_matching_is_exact_and_a_mismatch_does_not_mutate() {
     let statement = parse_select("SELECT value FROM Readings", ParseLimits::default()).unwrap();
     let table = table(true, &[Some(1), None]);
