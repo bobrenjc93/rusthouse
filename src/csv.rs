@@ -55,7 +55,8 @@ pub fn write_csv_with_names<W: Write + ?Sized>(table: &Table, writer: &mut W) ->
 /// Projected fields are emitted in statement order, including duplicate
 /// projections. Only selected rows are written, in result order. A scalar
 /// aggregate list emits one field per aggregate and one data row, unless `LIMIT
-/// 0` suppresses the data row. Source columns and their values are otherwise
+/// 0` suppresses the data row. Grouped counts emit their owned key/count rows
+/// in deterministic key order. Source columns and their values are otherwise
 /// borrowed directly; this function does not build a result table or copy
 /// selected values.
 ///
@@ -89,6 +90,16 @@ pub fn write_select_csv_with_names<W: Write + ?Sized>(
         write_quoted(field.name(), writer)?;
     }
     writer.write_all(b"\n")?;
+
+    if result.is_grouped() {
+        for (key, count) in result.grouped_rows() {
+            write_scalar_value(key, writer)?;
+            writer.write_all(b",")?;
+            write!(writer, "{count}")?;
+            writer.write_all(b"\n")?;
+        }
+        return Ok(());
+    }
 
     if result.is_scalar() {
         if !result.is_empty() {

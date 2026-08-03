@@ -256,6 +256,42 @@ fn group_limit_is_exact_and_never_truncates_results() {
 }
 
 #[test]
+fn grouped_string_byte_limit_is_total_exact_and_counts_distinct_keys_once() {
+    let mut table = Table::new(vec![Field::new("key", DataType::String)]).unwrap();
+    table
+        .insert_batch([
+            vec![Value::from("alpha")],
+            vec![Value::from("beta")],
+            vec![Value::from("alpha")],
+        ])
+        .unwrap();
+
+    let exact = table
+        .grouped_count_with_string_limit("key", None, 2, 9)
+        .unwrap();
+    assert_groups(
+        exact,
+        &[(Value::from("alpha"), 2), (Value::from("beta"), 1)],
+    );
+    assert_eq!(
+        table.grouped_count_with_string_limit("key", None, 2, 8),
+        Err(GroupedCountError::StringResultTooLarge {
+            field: "key".to_owned(),
+            limit: 8,
+            required: 9,
+        })
+    );
+
+    let no_rows = RowSelection::try_empty(table.len()).unwrap();
+    assert!(
+        table
+            .grouped_count_with_string_limit("key", Some(&no_rows), 0, 0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn grouping_reports_validation_errors_before_work() {
     let mut table = Table::new(vec![Field::new("key", DataType::Int64)]).unwrap();
     table.insert_batch([vec![Value::Int64(1)]]).unwrap();
