@@ -17,7 +17,7 @@ pub const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub const EXIT_EXECUTION_ERROR: u8 = 1;
 /// Exit status used for invalid command-line arguments.
 pub const EXIT_USAGE_ERROR: u8 = 2;
-/// Exit status used when a stdin resource limit is exceeded.
+/// Exit status used when an input or execution resource limit is exceeded.
 pub const EXIT_LIMIT_ERROR: u8 = 3;
 /// Exit status used for SQL statement families the CLI does not execute.
 pub const EXIT_UNSUPPORTED_STATEMENT: u8 = 4;

@@ -4,12 +4,12 @@ use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rusthouse::Catalog;
 use rusthouse::cli::{
     EXIT_EXECUTION_ERROR, EXIT_OUTPUT_ERROR, EXIT_USAGE_ERROR, MAX_BATCH_BYTES,
     MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch_with_output,
 };
 use rusthouse::snapshot::{DEFAULT_MAX_PAYLOAD_LEN, SnapshotStore};
+use rusthouse::{Catalog, MAX_AGGREGATE_RESULT_BYTES};
 
 const HELP_START: &str = "RustHouse bounded SQL batch processor
 
@@ -37,7 +37,7 @@ Exit codes:
   0  success
   1  malformed input, statement execution, or snapshot error
   2  invalid command-line usage
-  3  input limit exceeded
+  3  input or resource limit exceeded
   4  unsupported statement
   5  stdin read error
   6  stdout write error
@@ -100,7 +100,7 @@ fn write_help() -> ExitCode {
     let mut stdout = io::stdout().lock();
     let result = write!(
         stdout,
-        "{HELP_START}  {MAX_STATEMENT_BYTES} bytes per statement\n  {MAX_BATCH_BYTES} bytes of stdin\n  {MAX_BATCH_STATEMENTS} statements per batch\n  {DEFAULT_MAX_PAYLOAD_LEN} bytes per snapshot payload\n{HELP_END}"
+        "{HELP_START}  {MAX_STATEMENT_BYTES} bytes per statement\n  {MAX_BATCH_BYTES} bytes of stdin\n  {MAX_BATCH_STATEMENTS} statements per batch\n  {MAX_AGGREGATE_RESULT_BYTES} bytes of retained aggregate String results\n  {DEFAULT_MAX_PAYLOAD_LEN} bytes per snapshot payload\n{HELP_END}"
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,

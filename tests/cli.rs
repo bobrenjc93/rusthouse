@@ -108,7 +108,9 @@ fn help_describes_the_bounded_batch_contract() {
         assert!(stdout.contains("--load-table NAME=PATH"));
         assert!(stdout.contains("--save-table NAME=PATH"));
         assert!(stdout.contains("1048576 bytes per statement"));
+        assert!(stdout.contains("1048576 bytes of retained aggregate String results"));
         assert!(stdout.contains("67108864 bytes per snapshot payload"));
+        assert!(stdout.contains("3  input or resource limit exceeded"));
         assert!(stdout.contains("4  unsupported statement"));
         assert!(stdout.contains("6  stdout write error"));
         assert_eq!(stdout.matches("Exit codes:").count(), 1);
@@ -153,7 +155,7 @@ fn rejects_arguments_with_the_usage_exit_code() {
 }
 
 #[test]
-fn saves_reopens_and_selects_one_table_across_processes() {
+fn saves_reopens_aggregates_and_replaces_one_table_across_processes() {
     let directory = TestDirectory::new("save-reopen-select");
     let snapshot = directory.snapshot("events.snapshot");
     let save = format!("Events={}", snapshot.display());
@@ -168,15 +170,37 @@ fn saves_reopens_and_selects_one_table_across_processes() {
     assert!(saved.stderr.is_empty());
     assert!(snapshot.exists());
 
-    let load = format!("reopened={}", snapshot.display());
-    let reopened = run(
-        &["--format", "csv", "--load-table", &load],
-        b"SELECT label, id FROM reopened WHERE active = true\n",
+    let mapping = format!("reopened={}", snapshot.display());
+    let updated = run(
+        &[
+            "--format",
+            "csv",
+            "--load-table",
+            &mapping,
+            "--save-table",
+            &mapping,
+        ],
+        b"INSERT INTO reopened VALUES (3, true, 'third')\n\
+          SELECT COUNT(*), SUM(id) AS total_id, MAX(label) FROM reopened WHERE active = true\n",
     );
 
+    assert_eq!(updated.status.code(), Some(0));
+    assert!(updated.stderr.is_empty());
+    assert_eq!(
+        updated.stdout,
+        b"\"count()\",\"total_id\",\"max(label)\"\n2,4,\"third\"\n"
+    );
+
+    let reopened = run(
+        &["--load-table", &mapping],
+        b"SELECT label, id FROM reopened ORDER BY id\n",
+    );
     assert_eq!(reopened.status.code(), Some(0));
     assert!(reopened.stderr.is_empty());
-    assert_eq!(reopened.stdout, b"\"label\",\"id\"\n\"first\",1\n");
+    assert_eq!(
+        reopened.stdout,
+        b"\"label\",\"id\"\n\"first\",1\n\"second\",2\n\"third\",3\n"
+    );
 }
 
 #[test]
@@ -362,14 +386,14 @@ fn does_not_replace_a_snapshot_when_the_batch_fails() {
 
     let failed = run(
         &["--load-table", &mapping, "--save-table", &mapping],
-        b"INSERT INTO events VALUES (2)\nINSERT INTO events VALUES ('wrong')\n",
+        b"INSERT INTO events VALUES (2)\nSELECT AVG(id) FROM events WHERE id > 10\n",
     );
     assert_eq!(failed.status.code(), Some(1));
     assert!(failed.stdout.is_empty());
     assert!(
         String::from_utf8(failed.stderr)
             .unwrap()
-            .contains("execution error on line 2")
+            .contains("cannot compute AVG(`id`) for table `events` with no selected rows")
     );
 
     let reopened = run(
