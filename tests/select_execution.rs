@@ -588,6 +588,70 @@ fn filters_before_ordering_and_limits_after_ordering() {
 }
 
 #[test]
+fn bounded_ordering_matches_full_sort_deterministically() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE ranked (id Int64, integer Int64, float Float64, boolean Bool, text String, keep Bool)",
+        )
+        .unwrap();
+
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    let rows = (0..101_i64).map(|id| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let float = match id % 11 {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f64::from_bits(0x7ff8_0000_0000_0000 | id as u64),
+            _ => (state % 19) as f64 - 9.0,
+        };
+        let text = ["ant", "bee", "cat", "dog", "eel"][(state as usize) % 5];
+        vec![
+            Value::Int64(id),
+            Value::Int64((state % 17) as i64 - 8),
+            Value::Float64(float),
+            Value::Bool(state & 1 == 0),
+            Value::String(text.to_owned()),
+            Value::Bool(id % 3 != 0),
+        ]
+    });
+    catalog
+        .table_mut("ranked")
+        .unwrap()
+        .insert_batch(rows)
+        .unwrap();
+
+    for column in ["integer", "float", "boolean", "text"] {
+        for direction in ["ASC", "DESC"] {
+            for predicate in ["", " WHERE keep = true"] {
+                let full_query =
+                    format!("SELECT id FROM ranked{predicate} ORDER BY {column} {direction}");
+                let fully_sorted = catalog
+                    .execute_select(&full_query)
+                    .unwrap()
+                    .row_indices()
+                    .collect::<Vec<_>>();
+
+                for limit in [0, 1, 2, 7, 25, 64, 101, 102] {
+                    let bounded = catalog
+                        .execute_select(&format!("{full_query} LIMIT {limit}"))
+                        .unwrap()
+                        .row_indices()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        bounded,
+                        fully_sorted[..fully_sorted.len().min(limit)],
+                        "{column} {direction}{predicate} LIMIT {limit}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn orders_empty_tables_and_reports_missing_order_fields() {
     let mut catalog = Catalog::new();
     catalog
