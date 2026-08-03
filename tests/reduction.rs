@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rusthouse::{ComparisonOperator, DataType, Field, ReductionError, RowSelection, Table, Value};
 
 #[test]
@@ -123,6 +125,181 @@ fn count_distinct_uses_total_float_identity_for_nans_and_signed_zeroes() {
         .unwrap();
 
     assert_eq!(table.count_distinct("value", None), Ok(5));
+}
+
+#[test]
+fn reductions_differentially_match_straightforward_references() {
+    let mut state = 0xa409_3822_299f_31d0_u64;
+
+    for case in 0..128 {
+        state = next_state(state);
+        let row_count = state as usize % 97;
+        let mut integers = Vec::with_capacity(row_count);
+        let mut floats = Vec::with_capacity(row_count);
+        let mut booleans = Vec::with_capacity(row_count);
+        let mut strings = Vec::with_capacity(row_count);
+        let mut included = Vec::with_capacity(row_count);
+
+        for row in 0..row_count {
+            state = next_state(state);
+            integers.push((state % 2_001) as i64 - 1_000);
+            state = next_state(state);
+            floats.push((state % 2_001) as f64 / 4.0 - 250.0);
+            booleans.push(state & 1 == 0);
+            strings.push(format!("key-{}", state % 13));
+            included.push(!(state ^ row as u64).is_multiple_of(3));
+        }
+
+        let mut table = Table::new(vec![
+            Field::new("integer", DataType::Int64),
+            Field::new("float", DataType::Float64),
+            Field::new("boolean", DataType::Bool),
+            Field::new("text", DataType::String),
+            Field::new("include", DataType::Bool),
+        ])
+        .unwrap();
+        table
+            .insert_batch((0..row_count).map(|row| {
+                vec![
+                    Value::Int64(integers[row]),
+                    Value::Float64(floats[row]),
+                    Value::Bool(booleans[row]),
+                    Value::String(strings[row].clone()),
+                    Value::Bool(included[row]),
+                ]
+            }))
+            .unwrap();
+        let selection = table
+            .scan("include", ComparisonOperator::Equal, &Value::Bool(true))
+            .unwrap();
+
+        let all_rows = (0..row_count).collect::<Vec<_>>();
+        let selected_rows = included
+            .iter()
+            .enumerate()
+            .filter_map(|(row, include)| include.then_some(row))
+            .collect::<Vec<_>>();
+        check_reduction_references(
+            &table, None, &all_rows, &integers, &floats, &booleans, &strings, case,
+        );
+        check_reduction_references(
+            &table,
+            Some(&selection),
+            &selected_rows,
+            &integers,
+            &floats,
+            &booleans,
+            &strings,
+            case,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_reduction_references(
+    table: &Table,
+    selection: Option<&RowSelection>,
+    rows: &[usize],
+    integers: &[i64],
+    floats: &[f64],
+    booleans: &[bool],
+    strings: &[String],
+    case: usize,
+) {
+    let integer_values = rows.iter().map(|row| integers[*row]).collect::<Vec<_>>();
+    let float_values = rows.iter().map(|row| floats[*row]).collect::<Vec<_>>();
+    let boolean_values = rows.iter().map(|row| booleans[*row]).collect::<Vec<_>>();
+    let string_values = rows
+        .iter()
+        .map(|row| strings[*row].as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(table.count(selection), Ok(rows.len()), "case {case}");
+    assert_eq!(
+        table.sum("integer", selection),
+        Ok(Value::Int64(integer_values.iter().sum())),
+        "case {case}",
+    );
+    let expected_float_sum = float_values.iter().fold(0.0, |sum, value| sum + value);
+    let Value::Float64(actual_float_sum) = table.sum("float", selection).unwrap() else {
+        panic!("Float64 sum returned a different type in case {case}");
+    };
+    assert_eq!(
+        actual_float_sum.to_bits(),
+        expected_float_sum.to_bits(),
+        "case {case}"
+    );
+
+    for (field, expected) in [
+        (
+            "integer",
+            integer_values.iter().copied().collect::<HashSet<_>>().len(),
+        ),
+        (
+            "float",
+            float_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<HashSet<_>>()
+                .len(),
+        ),
+        (
+            "boolean",
+            boolean_values.iter().copied().collect::<HashSet<_>>().len(),
+        ),
+        (
+            "text",
+            string_values.iter().copied().collect::<HashSet<_>>().len(),
+        ),
+    ] {
+        assert_eq!(
+            table.count_distinct(field, selection),
+            Ok(expected),
+            "case {case}"
+        );
+    }
+
+    let expected_integer_average = (!rows.is_empty())
+        .then(|| Value::Float64(integer_values.iter().sum::<i64>() as f64 / rows.len() as f64));
+    let expected_float_average =
+        (!rows.is_empty()).then(|| Value::Float64(expected_float_sum / rows.len() as f64));
+    assert_eq!(
+        table.avg("integer", selection),
+        Ok(expected_integer_average),
+        "case {case}"
+    );
+    assert_eq!(
+        table.avg("float", selection),
+        Ok(expected_float_average),
+        "case {case}"
+    );
+
+    assert_eq!(
+        table.min("integer", selection),
+        Ok(integer_values.iter().min().copied().map(Value::Int64)),
+        "case {case}",
+    );
+    assert_eq!(
+        table.max("integer", selection),
+        Ok(integer_values.iter().max().copied().map(Value::Int64)),
+        "case {case}",
+    );
+    assert_eq!(
+        table.min("boolean", selection),
+        Ok(boolean_values.iter().min().copied().map(Value::Bool)),
+        "case {case}",
+    );
+    assert_eq!(
+        table.max("text", selection),
+        Ok(string_values.iter().max().map(|value| Value::from(*value))),
+        "case {case}",
+    );
+}
+
+const fn next_state(state: u64) -> u64 {
+    state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407)
 }
 
 #[test]

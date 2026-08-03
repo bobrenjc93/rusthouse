@@ -670,3 +670,83 @@ impl<'a> Decoder<'a> {
         Ok(&self.bytes[start..self.position])
     }
 }
+
+#[cfg(test)]
+mod decoder_property_tests {
+    use super::*;
+    use crate::Value;
+
+    #[test]
+    fn seeded_payload_mutations_are_panic_free_and_preserve_table_invariants() {
+        let mut table = Table::new(vec![
+            Field::new("id", DataType::Int64),
+            Field::new("score", DataType::Float64),
+            Field::new("active", DataType::Bool),
+            Field::new("label", DataType::String),
+        ])
+        .unwrap();
+        table
+            .insert_batch([
+                vec![
+                    Value::Int64(-7),
+                    Value::Float64(-0.0),
+                    Value::Bool(false),
+                    Value::from("east"),
+                ],
+                vec![
+                    Value::Int64(42),
+                    Value::Float64(f64::from_bits(0x7ff8_0000_0000_0001)),
+                    Value::Bool(true),
+                    Value::from("west"),
+                ],
+            ])
+            .unwrap();
+        let payload = encode_table(&table, 4096).unwrap();
+
+        for length in 0..=payload.len() {
+            decode_and_check(&payload[..length]);
+        }
+        for index in 0..payload.len() {
+            for bit in [0, 3, 7] {
+                let mut mutated = payload.clone();
+                mutated[index] ^= 1 << bit;
+                decode_and_check(&mutated);
+            }
+        }
+
+        let mut state = 0x1319_8a2e_0370_7344_u64;
+        for _ in 0..2_000 {
+            let mut mutated = payload.clone();
+            state = next_state(state);
+            let changes = 1 + state as usize % 8;
+            for _ in 0..changes {
+                state = next_state(state);
+                let index = state as usize % mutated.len();
+                state = next_state(state);
+                mutated[index] = state as u8;
+            }
+            state = next_state(state);
+            mutated.truncate(state as usize % (mutated.len() + 1));
+            decode_and_check(&mutated);
+        }
+    }
+
+    fn decode_and_check(payload: &[u8]) {
+        if let Ok(table) = decode_table(payload) {
+            assert_eq!(table.fields().len(), table.columns().len());
+            assert!(
+                table
+                    .columns()
+                    .iter()
+                    .all(|column| column.len() == table.len())
+            );
+            assert!(table.len() <= table.row_limit());
+        }
+    }
+
+    const fn next_state(state: u64) -> u64 {
+        state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493)
+    }
+}

@@ -1,4 +1,28 @@
 //! RustHouse is an experimental, compact analytical database.
+//!
+//! The catalog API provides a complete in-memory SQL workflow:
+//!
+//! ```
+//! use rusthouse::{Catalog, Value};
+//!
+//! let mut catalog = Catalog::new();
+//! catalog.execute_create("CREATE TABLE events (region String, user_id Int64)")?;
+//! catalog.execute_insert(
+//!     "INSERT INTO events VALUES ('east', 1), ('east', 1), ('west', 2)",
+//! )?;
+//!
+//! let grouped = catalog.execute_select(
+//!     "SELECT region, COUNT(*) AS events FROM events GROUP BY region",
+//! )?;
+//! assert_eq!(
+//!     grouped.grouped_rows().collect::<Vec<_>>(),
+//!     [(&Value::from("east"), 2), (&Value::from("west"), 1)],
+//! );
+//!
+//! let distinct = catalog.execute_select("SELECT COUNT(DISTINCT user_id) FROM events")?;
+//! assert_eq!(distinct.scalar_value(), Some(&Value::Int64(2)));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 pub mod catalog;
 pub mod cli;

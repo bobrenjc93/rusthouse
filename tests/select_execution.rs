@@ -891,7 +891,7 @@ fn filters_before_ordering_and_limits_after_ordering() {
 }
 
 #[test]
-fn bounded_ordering_matches_full_sort_deterministically() {
+fn bounded_top_k_differentially_matches_full_sort() {
     let mut catalog = Catalog::new();
     catalog
         .execute_create(

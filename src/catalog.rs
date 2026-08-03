@@ -1,23 +1,29 @@
 //! In-memory ownership and `CREATE TABLE`/`INSERT`/`SELECT` execution.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use crate::grouping::{GroupedCount, GroupedCountError};
+use crate::grouping::GroupedCountError;
 use crate::reduction::ReductionError;
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
     AggregateFunction, AggregateProjection, ComparisonPredicate, CreateTableStatement,
-    InsertParseLimits, InsertStatement, OrderByClause, OrderDirection, ParseError, ParseLimits,
-    SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
-    parse_insert_with_limits, parse_select_with_limits,
+    InsertParseLimits, InsertStatement, OrderByClause, ParseError, ParseLimits, SelectParseLimits,
+    SelectProjection, SelectStatement, parse_create_table_with_limits, parse_insert_with_limits,
+    parse_select_with_limits,
 };
-use crate::storage::{Column, DEFAULT_ROW_LIMIT, DataType, Field, Table, TableError, Value};
+use crate::storage::{DEFAULT_ROW_LIMIT, DataType, Field, Table, TableError, Value};
 use crate::table_snapshot::TableSnapshotError;
 use crate::{RowSelection, ScanError};
+
+mod ordering;
+mod result;
+
+use ordering::{ordered_row_indices, resolve_order};
+pub use result::SelectResult;
+use result::{GroupedResult, ScalarResult};
 
 /// Default maximum number of tables owned by one [`Catalog`].
 pub const DEFAULT_MAX_TABLES: usize = 1024;
@@ -363,225 +369,6 @@ impl From<TableSnapshotError> for CatalogSnapshotError {
 struct CatalogEntry {
     name: String,
     table: Table,
-}
-
-#[derive(Debug)]
-struct ScalarResult {
-    field: Field,
-    value: Value,
-}
-
-#[derive(Debug)]
-struct GroupedResult {
-    fields: [Field; 2],
-    groups: Vec<GroupedCount>,
-}
-
-/// The output of one projection, scalar aggregate, or grouped count and
-/// optional comparison scans.
-///
-/// A row projection owns only projected column indexes and, for a filtered
-/// query, a compact row-selection bitmap. Ordered results instead own their
-/// bounded row indexes. Schema and column values remain owned by the catalog's
-/// source table. Scalar aggregates own their fields and single result row;
-/// grouped counts own their output fields and sorted key/count rows.
-#[derive(Debug)]
-pub struct SelectResult<'a> {
-    table: &'a Table,
-    field_indices: Vec<usize>,
-    selection: Option<RowSelection>,
-    ordered_rows: Option<Vec<usize>>,
-    row_end: usize,
-    row_count: usize,
-    scalars: Vec<ScalarResult>,
-    grouped: Option<GroupedResult>,
-}
-
-impl<'a> SelectResult<'a> {
-    /// Returns the table whose schema and column values back this result.
-    #[must_use]
-    pub const fn table(&self) -> &'a Table {
-        self.table
-    }
-
-    /// Iterates over projected fields in statement order.
-    pub fn projected_fields(
-        &self,
-    ) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
-        let projected_count = self.field_indices.len();
-        let grouped_fields = self
-            .grouped
-            .as_ref()
-            .map_or(&[][..], |grouped| grouped.fields.as_slice());
-        let scalar_count = self.scalars.len();
-        (0..projected_count + scalar_count + grouped_fields.len()).map(move |index| {
-            if index < projected_count {
-                &self.table.fields()[self.field_indices[index]]
-            } else if index < projected_count + scalar_count {
-                &self.scalars[index - projected_count].field
-            } else {
-                &grouped_fields[index - projected_count - scalar_count]
-            }
-        })
-    }
-
-    /// Alias for [`Self::projected_fields`].
-    pub fn fields(&self) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
-        self.projected_fields()
-    }
-
-    pub(crate) fn projected_columns(
-        &self,
-    ) -> impl ExactSizeIterator<Item = &Column> + DoubleEndedIterator + '_ {
-        self.field_indices
-            .iter()
-            .map(|index| &self.table.columns()[*index])
-    }
-
-    /// Iterates over selected zero-based indexes in result order.
-    ///
-    /// Projection row indexes are also source table indexes. A scalar
-    /// aggregate has exactly one result row at index zero. Grouped result
-    /// indexes address the owned, deterministically ordered rows.
-    pub fn selected_rows(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        SelectedRows::new(self)
-    }
-
-    /// Iterates over the values in a scalar aggregate result row.
-    ///
-    /// Row projections and scalar rows suppressed by `LIMIT 0` are empty.
-    pub fn scalar_values(
-        &self,
-    ) -> impl ExactSizeIterator<Item = &Value> + DoubleEndedIterator + '_ {
-        let scalars = if self.row_count == 0 {
-            &self.scalars[..0]
-        } else {
-            &self.scalars[..]
-        };
-        scalars.iter().map(|scalar| &scalar.value)
-    }
-
-    /// Returns the first value for a scalar aggregate result.
-    ///
-    /// Row projections and scalar rows suppressed by `LIMIT 0` return `None`.
-    #[must_use]
-    pub const fn scalar_value(&self) -> Option<&Value> {
-        match (self.scalars.as_slice(), self.row_count) {
-            (_, 0) => None,
-            ([scalar, ..], _) => Some(&scalar.value),
-            ([], _) => None,
-        }
-    }
-
-    pub(crate) fn is_scalar(&self) -> bool {
-        !self.scalars.is_empty()
-    }
-
-    pub(crate) fn is_grouped(&self) -> bool {
-        self.grouped.is_some()
-    }
-
-    /// Iterates over owned key/count rows for a grouped count result.
-    ///
-    /// Other result shapes return an empty iterator. Counts have already been
-    /// validated as representable by the SQL `Int64` result type.
-    pub fn grouped_rows(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (&Value, i64)> + DoubleEndedIterator + '_ {
-        let groups = self
-            .grouped
-            .as_ref()
-            .map_or(&[][..], |grouped| grouped.groups.as_slice());
-        groups.iter().map(|group| {
-            let count = i64::try_from(group.count())
-                .expect("group counts are validated before SelectResult construction");
-            (group.value(), count)
-        })
-    }
-
-    /// Alias for [`Self::selected_rows`].
-    pub fn row_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        self.selected_rows()
-    }
-
-    /// Returns the number of output rows.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.row_count
-    }
-
-    /// Returns whether the result has no output rows.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-struct SelectedRows<'a> {
-    source: SelectedRowSource<'a>,
-}
-
-enum SelectedRowSource<'a> {
-    Ordered(std::slice::Iter<'a, usize>),
-    Natural {
-        rows: std::ops::Range<usize>,
-        selection: Option<&'a RowSelection>,
-    },
-}
-
-impl<'a> SelectedRows<'a> {
-    fn new(result: &'a SelectResult<'_>) -> Self {
-        let source = match &result.ordered_rows {
-            Some(rows) => SelectedRowSource::Ordered(rows.iter()),
-            None => SelectedRowSource::Natural {
-                rows: 0..result.row_end,
-                selection: result.selection.as_ref(),
-            },
-        };
-        Self { source }
-    }
-}
-
-impl Iterator for SelectedRows<'_> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.source {
-            SelectedRowSource::Ordered(rows) => rows.next().copied(),
-            SelectedRowSource::Natural { rows, selection } => rows.find(|row| {
-                selection.is_none_or(|selection| {
-                    selection
-                        .get(*row)
-                        .expect("selection and source table have the same row count")
-                })
-            }),
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match &self.source {
-            SelectedRowSource::Ordered(rows) => rows.size_hint(),
-            SelectedRowSource::Natural { rows, selection } => match selection {
-                None => rows.size_hint(),
-                Some(_) => (0, Some(rows.len())),
-            },
-        }
-    }
-}
-
-impl DoubleEndedIterator for SelectedRows<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        match &mut self.source {
-            SelectedRowSource::Ordered(rows) => rows.next_back().copied(),
-            SelectedRowSource::Natural { rows, selection } => rows.rfind(|row| {
-                selection.is_none_or(|selection| {
-                    selection
-                        .get(*row)
-                        .expect("selection and source table have the same row count")
-                })
-            }),
-        }
-    }
 }
 
 /// A bounded collection of named, in-memory tables.
@@ -1269,174 +1056,6 @@ fn limited_row_bounds(
     (row_end, row_count)
 }
 
-fn resolve_order(
-    table: &Table,
-    order_by: Vec<OrderByClause>,
-) -> Result<Vec<(usize, OrderDirection)>, CatalogError> {
-    order_by
-        .into_iter()
-        .map(|order_key| {
-            table
-                .fields()
-                .iter()
-                .position(|field| field.name() == order_key.column)
-                .map(|index| (index, order_key.direction))
-                .ok_or(CatalogError::OrderFieldNotFound {
-                    name: order_key.column,
-                })
-        })
-        .collect()
-}
-
-fn ordered_row_indices(
-    table: &Table,
-    order_keys: &[(usize, OrderDirection)],
-    selection: Option<&RowSelection>,
-    limit: Option<usize>,
-) -> Result<Vec<usize>, CatalogError> {
-    match limit {
-        Some(limit) => bounded_ordered_row_indices(table, order_keys, selection, limit),
-        None => fully_ordered_row_indices(table, order_keys, selection),
-    }
-}
-
-fn fully_ordered_row_indices(
-    table: &Table,
-    order_keys: &[(usize, OrderDirection)],
-    selection: Option<&RowSelection>,
-) -> Result<Vec<usize>, CatalogError> {
-    let row_count = selection.map_or(table.len(), RowSelection::selected_count);
-    let mut rows = try_order_row_buffer(row_count)?;
-    match selection {
-        Some(selection) => rows.extend(selection.selected_rows()),
-        None => rows.extend(0..table.len()),
-    }
-
-    let order = RowOrder::new(table, order_keys);
-    rows.sort_unstable_by(|left, right| order.compare(*left, *right));
-    Ok(rows)
-}
-
-fn bounded_ordered_row_indices(
-    table: &Table,
-    order_keys: &[(usize, OrderDirection)],
-    selection: Option<&RowSelection>,
-    limit: usize,
-) -> Result<Vec<usize>, CatalogError> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let row_count = selection.map_or(table.len(), RowSelection::selected_count);
-    let retained_count = row_count.min(limit);
-    let mut rows = try_order_row_buffer(retained_count)?;
-    let order = RowOrder::new(table, order_keys);
-
-    match selection {
-        Some(selection) => {
-            for row in selection.selected_rows() {
-                retain_top_row(&mut rows, row, retained_count, order);
-            }
-        }
-        None => {
-            for row in 0..table.len() {
-                retain_top_row(&mut rows, row, retained_count, order);
-            }
-        }
-    }
-
-    rows.sort_unstable_by(|left, right| order.compare(*left, *right));
-    Ok(rows)
-}
-
-fn try_order_row_buffer(row_count: usize) -> Result<Vec<usize>, CatalogError> {
-    let mut rows = Vec::new();
-    rows.try_reserve_exact(row_count)
-        .map_err(|_| CatalogError::OrderAllocationFailed { row_count })?;
-    Ok(rows)
-}
-
-#[derive(Clone, Copy)]
-struct RowOrder<'a> {
-    table: &'a Table,
-    order_keys: &'a [(usize, OrderDirection)],
-}
-
-impl<'a> RowOrder<'a> {
-    const fn new(table: &'a Table, order_keys: &'a [(usize, OrderDirection)]) -> Self {
-        Self { table, order_keys }
-    }
-
-    fn compare(self, left: usize, right: usize) -> Ordering {
-        self.order_keys
-            .iter()
-            .map(|(column_index, direction)| {
-                let value_order =
-                    compare_column_rows(&self.table.columns()[*column_index], left, right);
-                match direction {
-                    OrderDirection::Ascending => value_order,
-                    OrderDirection::Descending => value_order.reverse(),
-                }
-            })
-            .find(|order| *order != Ordering::Equal)
-            .unwrap_or_else(|| left.cmp(&right))
-    }
-}
-
-fn retain_top_row(rows: &mut Vec<usize>, row: usize, limit: usize, order: RowOrder<'_>) {
-    // This max-heap keeps the worst retained row at its root for replacement.
-    if rows.len() < limit {
-        rows.push(row);
-        sift_order_heap_up(rows, order);
-    } else if order.compare(row, rows[0]).is_lt() {
-        rows[0] = row;
-        sift_order_heap_down(rows, order);
-    }
-}
-
-fn sift_order_heap_up(rows: &mut [usize], order: RowOrder<'_>) {
-    let mut child = rows.len() - 1;
-    while child > 0 {
-        let parent = (child - 1) / 2;
-        if !order.compare(rows[parent], rows[child]).is_lt() {
-            break;
-        }
-        rows.swap(parent, child);
-        child = parent;
-    }
-}
-
-fn sift_order_heap_down(rows: &mut [usize], order: RowOrder<'_>) {
-    let mut parent = 0;
-    loop {
-        let left = parent * 2 + 1;
-        if left >= rows.len() {
-            break;
-        }
-        let right = left + 1;
-        let greater_child = if right < rows.len() && order.compare(rows[left], rows[right]).is_lt()
-        {
-            right
-        } else {
-            left
-        };
-        if !order.compare(rows[parent], rows[greater_child]).is_lt() {
-            break;
-        }
-        rows.swap(parent, greater_child);
-        parent = greater_child;
-    }
-}
-
-fn compare_column_rows(column: &Column, left: usize, right: usize) -> Ordering {
-    match column {
-        Column::Int64(values) => values[left].cmp(&values[right]),
-        Column::Float64(values) => values[left].total_cmp(&values[right]),
-        Column::Bool(values) => values[left].cmp(&values[right]),
-        Column::String(values) => values[left].cmp(&values[right]),
-    }
-}
-
 impl Default for Catalog {
     fn default() -> Self {
         Self::new()
@@ -1500,37 +1119,4 @@ fn resolve_projection(
         }
     }
     Ok(indices)
-}
-
-#[cfg(test)]
-mod ordered_row_tests {
-    use super::*;
-
-    #[test]
-    fn zero_and_empty_bounded_orders_have_no_row_buffer() {
-        let mut table = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
-        table
-            .insert_batch((0..4).map(|id| vec![Value::Int64(id)]))
-            .unwrap();
-        let order_keys = [(0, OrderDirection::Ascending)];
-
-        let zero = bounded_ordered_row_indices(&table, &order_keys, None, 0).unwrap();
-        assert!(zero.is_empty());
-        assert_eq!(zero.capacity(), 0);
-
-        let empty = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
-        let empty_rows = bounded_ordered_row_indices(&empty, &order_keys, None, 25).unwrap();
-        assert!(empty_rows.is_empty());
-        assert_eq!(empty_rows.capacity(), 0);
-    }
-
-    #[test]
-    fn order_row_buffer_reports_capacity_overflow() {
-        assert_eq!(
-            try_order_row_buffer(usize::MAX),
-            Err(CatalogError::OrderAllocationFailed {
-                row_count: usize::MAX,
-            })
-        );
-    }
 }
