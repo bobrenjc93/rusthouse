@@ -26,7 +26,9 @@ pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,
     scan_nullable_i64_nullness,
 };
-pub use snapshot::{SnapshotCodec, SnapshotError};
+pub use snapshot::{
+    NullableI64PayloadCodec, NullableI64PayloadError, SnapshotCodec, SnapshotError,
+};
 mod storage;
 
 pub use storage::{ColumnSchema, DataType, InsertError, Int64Table, Schema};
