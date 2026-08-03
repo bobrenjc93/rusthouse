@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod cli;
 pub mod csv;
+pub mod grouping;
 pub mod reduction;
 pub mod scan;
 pub mod snapshot;
@@ -15,6 +16,7 @@ pub use catalog::{
     MAX_AGGREGATE_RESULT_BYTES, SelectResult,
 };
 pub use csv::{write_csv_with_names, write_select_csv_with_names};
+pub use grouping::{GroupedCount, GroupedCountError};
 pub use reduction::ReductionError;
 pub use scan::{ComparisonOperator, RowSelection, ScanError, SelectionAllocationError};
 pub use sql::{
