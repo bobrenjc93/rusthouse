@@ -701,20 +701,52 @@ impl Catalog {
         path: impl AsRef<Path>,
         snapshots: &SnapshotStore,
     ) -> Result<&Table, CatalogSnapshotError> {
+        let (name, key) = self.preflight_table_load(name)?;
+        let table = snapshots.read_table(path)?;
+        self.insert_loaded_table(name, key, table)
+    }
+
+    /// Loads a primary table snapshot or an explicit fallback under `name`.
+    ///
+    /// Duplicate-name and table-count checks happen before either path is
+    /// opened. Fallback eligibility is defined by
+    /// [`SnapshotStore::read_with_fallback`]. Both snapshot generations are
+    /// fully validated and decoded before catalog allocation and insertion, so
+    /// every failure leaves the catalog's table set unchanged.
+    pub fn load_table_with_fallback(
+        &mut self,
+        name: &str,
+        primary_path: impl AsRef<Path>,
+        fallback_path: impl AsRef<Path>,
+        snapshots: &SnapshotStore,
+    ) -> Result<&Table, CatalogSnapshotError> {
+        let (name, key) = self.preflight_table_load(name)?;
+        let table = snapshots.read_table_with_fallback(primary_path, fallback_path)?;
+        self.insert_loaded_table(name, key, table)
+    }
+
+    fn preflight_table_load(&self, name: &str) -> Result<(String, String), CatalogError> {
         let name = name.to_owned();
         let key = normalize_table_name(&name);
 
         if self.tables.contains_key(&key) {
-            return Err(CatalogError::DuplicateTable { name }.into());
+            return Err(CatalogError::DuplicateTable { name });
         }
         if self.tables.len() == self.limits.max_tables {
             return Err(CatalogError::TableLimitExceeded {
                 limit: self.limits.max_tables,
-            }
-            .into());
+            });
         }
 
-        let table = snapshots.read_table(path)?;
+        Ok((name, key))
+    }
+
+    fn insert_loaded_table(
+        &mut self,
+        name: String,
+        key: String,
+        table: Table,
+    ) -> Result<&Table, CatalogSnapshotError> {
         self.tables
             .try_reserve(1)
             .map_err(|_| CatalogError::AllocationFailed)?;

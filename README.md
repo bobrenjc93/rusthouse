@@ -66,6 +66,11 @@ these options intentionally do not persist manifests, discovery metadata, a
 whole catalog, or a write-ahead log. Snapshot file names matching `.*.tmp` or
 `.*.lock` are reserved for atomic-writer sidecars.
 
+Embedded callers can recover a table with `Catalog::load_table_with_fallback`
+from an explicitly managed fallback after a missing, truncated, trailing, or
+checksum-invalid primary snapshot. Recovery applies the same payload bound to
+both paths; it does not create backups or add write-ahead logging.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
 
 <!-- burner-progress:start -->
