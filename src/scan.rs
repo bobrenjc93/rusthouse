@@ -4,28 +4,12 @@
 //! value in one physical column with a same-typed literal. SQL parsing and
 //! predicate composition belong to later query-engine layers.
 
+pub use crate::sql::ComparisonOperator;
 use crate::{DataType, Table, Value};
 use std::error::Error;
 use std::fmt;
 
 const BITS_PER_BYTE: usize = u8::BITS as usize;
-
-/// A comparison applied by [`Table::scan`] to each value in a column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ComparisonOperator {
-    /// Values compare equal (`=`).
-    Equal,
-    /// Values do not compare equal (`!=`).
-    NotEqual,
-    /// Column values are less than the literal (`<`).
-    LessThan,
-    /// Column values are less than or equal to the literal (`<=`).
-    LessThanOrEqual,
-    /// Column values are greater than the literal (`>`).
-    GreaterThan,
-    /// Column values are greater than or equal to the literal (`>=`).
-    GreaterThanOrEqual,
-}
 
 impl ComparisonOperator {
     fn compare<T: PartialEq + PartialOrd>(self, column_value: &T, literal: &T) -> bool {

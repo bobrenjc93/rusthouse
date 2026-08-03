@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, DataType, InsertParseLimits, ParseErrorKind, ParseLimits,
-    TableError,
+    TableError, parse_select,
 };
 
 #[test]
@@ -188,6 +188,27 @@ fn execute_insert_uses_the_catalogs_bounded_parser() {
     assert!(error.source().is_some());
     assert!(catalog.table("bounded").unwrap().is_empty());
     assert_eq!(catalog.limits().insert_parse, insert_limits);
+}
+
+#[test]
+fn parsed_select_predicate_scans_rows_inserted_through_the_catalog() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE Events (id Int64, active Bool)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO events VALUES (1, false), (2, true), (3, true)")
+        .unwrap();
+    let statement = parse_select("SELECT id FROM EVENTS WHERE id >= 2").unwrap();
+    let predicate = statement.predicate.unwrap();
+
+    let selection = catalog
+        .table(&statement.table)
+        .unwrap()
+        .scan(&predicate.column, predicate.operator, &predicate.value)
+        .unwrap();
+
+    assert_eq!(selection.selected_rows().collect::<Vec<_>>(), [1, 2]);
 }
 
 fn assert_original_event(catalog: &Catalog) {
