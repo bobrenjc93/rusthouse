@@ -26,7 +26,7 @@ pub enum ReductionError {
         /// The requested, case-sensitive field name.
         name: String,
     },
-    /// `SUM` was requested for a nonnumeric column.
+    /// A numeric reduction was requested for a nonnumeric column.
     NonNumericColumn {
         /// Name of the requested field.
         field: String,
@@ -107,6 +107,43 @@ impl Table {
                 };
                 Ok(Value::Float64(total))
             }
+            column => Err(ReductionError::NonNumericColumn {
+                field: field.to_owned(),
+                data_type: column.data_type(),
+            }),
+        }
+    }
+
+    /// Averages an `Int64` or `Float64` column over all or selected rows.
+    ///
+    /// Both input types produce a [`Value::Float64`]. Empty tables and
+    /// selections with no set bits return `None`. A supplied selection must
+    /// represent exactly [`Table::len`] rows.
+    ///
+    /// `Int64` values are summed exactly in an `i128` accumulator before the
+    /// total and row count are converted to `f64` and divided. `Float64`
+    /// values are added in ascending row order starting from `+0.0`, then
+    /// divided by the positive selected-row count using native IEEE 754
+    /// operations. Consequently NaN and infinities propagate according to
+    /// IEEE 754, intermediate finite overflow remains infinity, and an input
+    /// containing only signed zeroes averages to `+0.0`.
+    pub fn avg(
+        &self,
+        field: &str,
+        selection: Option<&RowSelection>,
+    ) -> Result<Option<Value>, ReductionError> {
+        validate_selection(self.len(), selection)?;
+
+        let column = self.reduction_column(field)?;
+        match column {
+            Column::Int64(values) => Ok(match selection {
+                Some(selection) => avg_int64(values, selection.selected_rows()),
+                None => avg_int64(values, 0..values.len()),
+            }),
+            Column::Float64(values) => Ok(match selection {
+                Some(selection) => avg_float64(values, selection.selected_rows()),
+                None => avg_float64(values, 0..values.len()),
+            }),
             column => Err(ReductionError::NonNumericColumn {
                 field: field.to_owned(),
                 data_type: column.data_type(),
@@ -222,6 +259,26 @@ fn sum_float64(values: &[f64], rows: impl Iterator<Item = usize>) -> f64 {
         total += values[row];
     }
     total
+}
+
+fn avg_int64(values: &[i64], rows: impl Iterator<Item = usize>) -> Option<Value> {
+    let mut total = 0_i128;
+    let mut count = 0_usize;
+    for row in rows {
+        total += i128::from(values[row]);
+        count += 1;
+    }
+    (count != 0).then(|| Value::Float64(total as f64 / count as f64))
+}
+
+fn avg_float64(values: &[f64], rows: impl Iterator<Item = usize>) -> Option<Value> {
+    let mut total = 0.0_f64;
+    let mut count = 0_usize;
+    for row in rows {
+        total += values[row];
+        count += 1;
+    }
+    (count != 0).then(|| Value::Float64(total / count as f64))
 }
 
 fn reduce_extreme(
