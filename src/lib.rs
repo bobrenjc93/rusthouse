@@ -4,11 +4,16 @@ mod input;
 mod sql;
 
 pub mod output;
+pub mod storage;
 
 pub use input::{InputError, MAX_SQL_INPUT_BYTES, read_sql_input};
 pub use sql::{
     Column, MAX_BATCH_STATEMENTS, MAX_BATCH_TOKENS, MAX_SELECT_PROJECTIONS, QueryResult,
     ScalarValue, SqlError, SqlErrorKind, execute_batch,
+};
+pub use storage::{
+    Column as StorageColumn, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table,
+    Value, ValueRef,
 };
 
 /// Returns the product name.
