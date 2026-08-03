@@ -16,15 +16,18 @@ pub use aggregate::{
 };
 pub use catalog::{Catalog, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
-pub use execution::{InsertExecutionError, SelectExecutionError, execute_insert, execute_select};
+pub use execution::{
+    InsertExecutionError, SelectExecutionError, execute_insert, execute_select,
+    execute_select_with_limits,
+};
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
 pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64};
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
-    ColumnDefinition, CreateTableStatement, Identifier, InsertStatement, ParseError, ParseLimits,
-    SelectStatement, parse_create_table, parse_insert, parse_select,
+    ColumnDefinition, CreateTableStatement, EqualityPredicate, Identifier, InsertStatement,
+    ParseError, ParseLimits, SelectStatement, parse_create_table, parse_insert, parse_select,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,

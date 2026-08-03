@@ -1,15 +1,16 @@
 //! Bounded ownership and SQL execution for named `Int64` tables.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
 use crate::execution::{
     InsertExecutionError, SelectExecutionError, execute_insert as execute_insert_statement,
-    execute_select as execute_select_statement,
+    execute_select_with_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    CreateTableStatement, InsertStatement, Int64Table, ParseError, ParseLimits, Schema,
+    CreateTableStatement, InsertStatement, Int64Table, ParseError, ParseLimits, ScanLimits, Schema,
     SelectStatement, parse_create_table, parse_insert, parse_select,
 };
 
@@ -84,8 +85,8 @@ impl From<ParseError> for CatalogError {
 /// A bounded in-memory catalog of named, one-column `Int64` tables.
 ///
 /// Names use the exact spelling retained by the parser. Failed creates and
-/// inserts leave all registered tables unchanged. SELECT results borrow their
-/// source table's column storage, including when an optional `LIMIT` is used.
+/// inserts leave all registered tables unchanged. Plain SELECT results borrow
+/// their source column storage; filtered results own their matching values.
 ///
 /// # Examples
 ///
@@ -107,7 +108,7 @@ impl From<ParseError> for CatalogError {
 ///     "SELECT value FROM readings LIMIT 1",
 ///     parse_limits,
 /// )?;
-/// assert_eq!(rows, &[Some(7)]);
+/// assert_eq!(rows.as_ref(), &[Some(7)]);
 /// # Ok::<(), rusthouse::CatalogError>(())
 /// ```
 #[derive(Debug, Clone)]
@@ -210,13 +211,48 @@ impl Catalog {
         &self,
         input: &str,
         parse_limits: ParseLimits,
-    ) -> Result<&[Option<i64>], CatalogError> {
+    ) -> Result<Cow<'_, [Option<i64>]>, CatalogError> {
+        self.execute_select_with_limits(
+            input,
+            parse_limits,
+            ScanLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+        )
+    }
+
+    /// Parses and executes a `SELECT` with explicit equality-scan bounds.
+    pub fn execute_select_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+    ) -> Result<Cow<'_, [Option<i64>]>, CatalogError> {
         let statement = parse_select(input, parse_limits)?;
-        self.select(&statement)
+        self.select_with_limits(&statement, scan_limits)
     }
 
     /// Executes one parsed projection `SELECT` against its exactly named table.
-    pub fn select(&self, statement: &SelectStatement) -> Result<&[Option<i64>], CatalogError> {
+    pub fn select(
+        &self,
+        statement: &SelectStatement,
+    ) -> Result<Cow<'_, [Option<i64>]>, CatalogError> {
+        self.select_with_limits(
+            statement,
+            ScanLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+        )
+    }
+
+    /// Executes a parsed projection `SELECT` with explicit equality-scan bounds.
+    pub fn select_with_limits(
+        &self,
+        statement: &SelectStatement,
+        scan_limits: ScanLimits,
+    ) -> Result<Cow<'_, [Option<i64>]>, CatalogError> {
         let name = statement.table_name().as_str();
         let table = self.tables.get(name).ok_or_else(|| {
             CatalogError::Select(SelectExecutionError::UnknownTable {
@@ -224,6 +260,7 @@ impl Catalog {
             })
         })?;
 
-        execute_select_statement(name, table, statement).map_err(CatalogError::Select)
+        execute_select_statement_with_limits(name, table, statement, scan_limits)
+            .map_err(CatalogError::Select)
     }
 }

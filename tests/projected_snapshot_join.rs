@@ -37,20 +37,21 @@ fn borrowed_selects_and_restored_snapshots_produce_the_same_join() {
 
     let left_rows = execute_select("left_rows", &left, &left_select).unwrap();
     let right_rows = execute_select("right_rows", &right, &right_select).unwrap();
-    assert_eq!(left_rows, &[Some(7), None, Some(7)]);
+    assert_eq!(left_rows.as_ref(), &[Some(7), None, Some(7)]);
     assert!(std::ptr::eq(left_rows.as_ptr(), left.values().as_ptr()));
     assert!(std::ptr::eq(right_rows.as_ptr(), right.values().as_ptr()));
 
-    let restored_left = snapshot_round_trip(left_rows);
-    let restored_right = snapshot_round_trip(right_rows);
+    let restored_left = snapshot_round_trip(left_rows.as_ref());
+    let restored_right = snapshot_round_trip(right_rows.as_ref());
     let limits = JoinLimits::new(4, 4);
 
-    let live_matches = inner_equi_join_nullable_i64(left_rows, right_rows, limits).unwrap();
+    let live_matches =
+        inner_equi_join_nullable_i64(left_rows.as_ref(), right_rows.as_ref(), limits).unwrap();
     let restored_matches =
         inner_equi_join_nullable_i64(&restored_left, &restored_right, limits).unwrap();
 
-    assert_eq!(restored_left, left_rows);
-    assert_eq!(restored_right, right_rows);
+    assert_eq!(restored_left, left_rows.as_ref());
+    assert_eq!(restored_right, right_rows.as_ref());
     assert_eq!(restored_matches, live_matches);
     assert_eq!(
         live_matches

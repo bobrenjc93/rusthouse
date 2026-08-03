@@ -1,5 +1,6 @@
 use rusthouse::{
-    Int64Table, ParseLimits, Schema, SelectExecutionError, execute_select, parse_select,
+    Int64Table, ParseLimits, ScanError, ScanLimits, Schema, SelectExecutionError, execute_select,
+    execute_select_with_limits, parse_select,
 };
 
 fn table(nullable: bool, values: &[Option<i64>]) -> Int64Table {
@@ -16,7 +17,7 @@ fn executes_a_parsed_select_against_an_empty_table() {
     let values = execute_select("readings", &table, &statement).unwrap();
 
     assert!(values.is_empty());
-    assert!(std::ptr::eq(values, table.values()));
+    assert!(std::ptr::eq(values.as_ref(), table.values()));
 }
 
 #[test]
@@ -26,8 +27,8 @@ fn borrows_populated_values_in_row_order() {
 
     let values = execute_select("readings", &table, &statement).unwrap();
 
-    assert_eq!(values, &[Some(i64::MIN), Some(0), Some(i64::MAX)]);
-    assert!(std::ptr::eq(values, table.values()));
+    assert_eq!(values.as_ref(), &[Some(i64::MIN), Some(0), Some(i64::MAX)]);
+    assert!(std::ptr::eq(values.as_ref(), table.values()));
 }
 
 #[test]
@@ -37,8 +38,8 @@ fn returns_null_values_without_copying() {
 
     let values = execute_select("readings", &table, &statement).unwrap();
 
-    assert_eq!(values, &[Some(1), None, Some(3)]);
-    assert!(std::ptr::eq(values, table.values()));
+    assert_eq!(values.as_ref(), &[Some(1), None, Some(3)]);
+    assert!(std::ptr::eq(values.as_ref(), table.values()));
 }
 
 #[test]
@@ -59,9 +60,109 @@ fn applies_limit_as_a_borrowed_prefix() {
 
         let values = execute_select("readings", &table, &statement).unwrap();
 
-        assert_eq!(values, expected, "LIMIT {limit}");
+        assert_eq!(values.as_ref(), expected, "LIMIT {limit}");
         assert!(std::ptr::eq(values.as_ptr(), table.values().as_ptr()));
     }
+}
+
+#[test]
+fn where_equality_returns_matches_in_source_order_and_excludes_nulls() {
+    let statement = parse_select(
+        "SELECT value FROM readings WHERE value = 7",
+        ParseLimits::default(),
+    )
+    .unwrap();
+    let table = table(true, &[Some(7), None, Some(2), Some(7), None, Some(7)]);
+
+    let values = execute_select("readings", &table, &statement).unwrap();
+
+    assert_eq!(values.as_ref(), &[Some(7), Some(7), Some(7)]);
+    assert!(matches!(values, std::borrow::Cow::Owned(_)));
+}
+
+#[test]
+fn where_equality_compares_int64_bounds_and_applies_limit_after_filtering() {
+    let table = table(
+        true,
+        &[
+            Some(i64::MIN),
+            Some(i64::MAX),
+            Some(i64::MIN),
+            None,
+            Some(i64::MIN),
+        ],
+    );
+    let minimum = parse_select(
+        "SELECT value FROM readings WHERE value = -9223372036854775808 LIMIT 2",
+        ParseLimits::default(),
+    )
+    .unwrap();
+    let maximum = parse_select(
+        "SELECT value FROM readings WHERE value = 9223372036854775807",
+        ParseLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        execute_select("readings", &table, &minimum)
+            .unwrap()
+            .as_ref(),
+        &[Some(i64::MIN), Some(i64::MIN)]
+    );
+    assert_eq!(
+        execute_select("readings", &table, &maximum)
+            .unwrap()
+            .as_ref(),
+        &[Some(i64::MAX)]
+    );
+}
+
+#[test]
+fn where_column_must_match_even_when_projection_is_valid() {
+    let statement = parse_select(
+        "SELECT value FROM readings WHERE other = 1",
+        ParseLimits::default(),
+    )
+    .unwrap();
+    let table = table(true, &[Some(1), None]);
+
+    assert_eq!(
+        execute_select("readings", &table, &statement),
+        Err(SelectExecutionError::UnknownColumn {
+            name: "other".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn where_execution_preserves_scan_input_and_result_limits() {
+    let statement = parse_select(
+        "SELECT value FROM readings WHERE value = 1",
+        ParseLimits::default(),
+    )
+    .unwrap();
+    let table = table(true, &[Some(1), None, Some(1)]);
+
+    assert_eq!(
+        execute_select_with_limits("readings", &table, &statement, ScanLimits::new(2, 3),),
+        Err(SelectExecutionError::Scan(ScanError::InputLimitExceeded {
+            rows: 3,
+            max_rows: 2,
+        }))
+    );
+    assert_eq!(
+        execute_select_with_limits("readings", &table, &statement, ScanLimits::new(3, 1),),
+        Err(SelectExecutionError::Scan(ScanError::ResultLimitExceeded {
+            rows: 2,
+            max_rows: 1,
+        }))
+    );
+    assert_eq!(
+        execute_select_with_limits("readings", &table, &statement, ScanLimits::new(3, 2),)
+            .unwrap()
+            .as_ref(),
+        &[Some(1), Some(1)]
+    );
 }
 
 #[test]
