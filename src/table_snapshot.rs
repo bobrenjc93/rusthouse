@@ -332,7 +332,15 @@ fn decode_table(payload: &[u8]) -> Result<Table, TableSnapshotError> {
         let name = decoder.string(location)?;
         fields.push(Field::new(name, data_type));
     }
-    validate_fields(&fields).map_err(TableSnapshotError::InvalidSchema)?;
+    validate_fields(&fields).map_err(|error| match error {
+        TableError::SchemaAllocationFailed { field_count } => {
+            TableSnapshotError::AllocationFailed {
+                location: TableSnapshotLocation::Schema,
+                requested: field_count as u64,
+            }
+        }
+        error => TableSnapshotError::InvalidSchema(error),
+    })?;
 
     let column_count_u64 = decoder.u64(TableSnapshotLocation::Schema)?;
     if column_count_u64 != field_count_u64 {

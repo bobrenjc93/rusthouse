@@ -3,6 +3,7 @@ use rusthouse::table_snapshot::{
     TABLE_PAYLOAD_MAGIC, TABLE_PAYLOAD_VERSION, TableSnapshotError, TableSnapshotLocation,
 };
 use rusthouse::{DataType, Field, Table, Value};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,6 +104,38 @@ fn round_trips_a_mixed_table_and_reopens_every_property() {
         reopened.string_column("region").unwrap(),
         ["", "northwest", "caf\u{e9}"]
     );
+}
+
+#[test]
+fn reopens_one_hundred_thousand_unique_fields_without_quadratic_validation() {
+    const FIELD_COUNT: u64 = 100_000;
+
+    let mut payload = header(0, 0, FIELD_COUNT);
+    payload.reserve(3_200_000);
+    let mut name = String::with_capacity(16);
+    for index in 0..FIELD_COUNT {
+        name.clear();
+        write!(&mut name, "column_{index}").unwrap();
+        field(&mut payload, INT64_TAG, name.as_bytes());
+    }
+    push_u64(&mut payload, FIELD_COUNT);
+    for _ in 0..FIELD_COUNT {
+        column_header(&mut payload, INT64_TAG, 0);
+    }
+
+    let directory = TestDirectory::new("large-schema");
+    let path = directory.snapshot();
+    let store = SnapshotStore::new(payload.len());
+    store.write(&path, &payload).unwrap();
+    let reopened = store.read_table(&path).unwrap();
+
+    assert_eq!(reopened.fields().len(), FIELD_COUNT as usize);
+    assert_eq!(reopened.fields()[0].name(), "column_0");
+    assert_eq!(
+        reopened.fields()[FIELD_COUNT as usize - 1].name(),
+        "column_99999"
+    );
+    assert!(reopened.is_empty());
 }
 
 #[test]
