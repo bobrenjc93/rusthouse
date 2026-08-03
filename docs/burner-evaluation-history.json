@@ -90,6 +90,38 @@
         "eval_56a6f83a": 20,
         "eval_a8d9ce71": 100
       }
+    },
+    {
+      "key": "base:172b0882fa52b671adeb20d4c426a5705712c4b3",
+      "commit": "172b0882fa52b671adeb20d4c426a5705712c4b3",
+      "recordedAt": "2026-08-03T04:55:51.453Z",
+      "label": "base 172b088",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_69c46252": 35,
+        "eval_ed4d7712": 65,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 20,
+        "eval_a8d9ce71": 75
+      }
+    },
+    {
+      "key": "pr:295",
+      "recordedAt": "2026-08-03T04:55:51.453Z",
+      "label": "PR #295",
+      "kind": "leaf",
+      "prNumber": 295,
+      "title": "Parse bounded INSERT INTO VALUES batches",
+      "scores": {
+        "eval_69c46252": 35,
+        "eval_ed4d7712": 65,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 20,
+        "eval_a8d9ce71": 100
+      }
     }
   ]
 }
