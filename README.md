@@ -19,6 +19,14 @@ The first useful release should support:
 
 The early implementation should favor Rust's standard library and a small dependency surface. Correctness, clear errors, bounded resource use, and a modular path toward vectorized execution matter more than superficial feature count.
 
+## Snapshot envelope
+
+`SnapshotCodec` encodes and validates bounded byte payloads using an explicit
+magic value, format version, declared length, and CRC-32 checksum. This defines
+the persistence corruption boundary without yet choosing catalog serialization
+or filesystem replacement. The exact version 1 layout is documented in
+[docs/snapshot-format.md](docs/snapshot-format.md).
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
