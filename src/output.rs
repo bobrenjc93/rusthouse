@@ -1,5 +1,6 @@
 use crate::QueryResult;
 use std::io::{self, Write};
+use unicode_width::UnicodeWidthStr;
 
 /// Supported result encodings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,7 +84,7 @@ fn write_table<W: Write>(result: &QueryResult, writer: &mut W) -> io::Result<()>
     let widths: Vec<usize> = names
         .iter()
         .zip(&values)
-        .map(|(name, value)| name.chars().count().max(value.chars().count()))
+        .map(|(name, value)| display_width(name).max(display_width(value)))
         .collect();
 
     write_table_row(names.iter().map(String::as_str), &widths, writer)?;
@@ -123,11 +124,15 @@ where
         }
         writer.write_all(field.as_bytes())?;
         writer.write_all(
-            " ".repeat(width.saturating_sub(field.chars().count()))
+            " ".repeat(width.saturating_sub(display_width(field)))
                 .as_bytes(),
         )?;
     }
     writer.write_all(b"\n")
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
 }
 
 #[cfg(test)]
@@ -168,6 +173,30 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "line\\nname   \n-------------\nfirst\\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn table_aligns_wide_and_combining_characters() {
+        let results = vec![QueryResult {
+            columns: vec![
+                Column {
+                    name: "表".to_owned(),
+                    value: ScalarValue::String("x".to_owned()),
+                },
+                Column {
+                    name: "e\u{301}".to_owned(),
+                    value: ScalarValue::String("xx".to_owned()),
+                },
+            ],
+        }];
+        let mut output = Vec::new();
+
+        write_results(&results, OutputFormat::Table, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "表 | e\u{301} \n---+---\nx  | xx\n"
         );
     }
 }

@@ -77,6 +77,26 @@ fn malformed_sql_has_a_stable_error_and_nonzero_status() {
 }
 
 #[test]
+fn diagnostics_escape_terminal_control_characters() {
+    let output = run_cli(&[], b"SELECT 1 \x1b;");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        "rusthouse: SQL syntax error at byte 10: unexpected character `\\u{1b}`\n"
+    );
+    assert!(!stderr.contains('\x1b'));
+
+    let output = run_cli(&[], b"SELECT \"\x1b\";");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("identifier `\\u{1b}`"));
+    assert!(!stderr.contains('\x1b'));
+}
+
+#[test]
 fn default_table_output_escapes_multiline_fields() {
     let output = run_cli(&[], b"SELECT 'first\nsecond' AS \"line\nname\";");
 
@@ -90,13 +110,35 @@ fn default_table_output_escapes_multiline_fields() {
 
 #[test]
 fn unsupported_clauses_have_a_stable_error_and_nonzero_status() {
-    let output = run_cli(&[], b"SELECT 1 AS one FROM numbers;");
+    let output = run_cli(&[], b"SELECT 1 AS one FROM numbers WHERE value = 1;");
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "rusthouse: unsupported SQL clause `FROM` at byte 17; only literal SELECT projections are supported\n"
+    );
+}
+
+#[test]
+fn near_limit_projection_batches_are_bounded() {
+    let mut input = String::with_capacity(MAX_SQL_INPUT_BYTES);
+    input.push_str("SELECT ");
+    while input.len() + 2 < MAX_SQL_INPUT_BYTES {
+        input.push_str("1,");
+    }
+    input.pop();
+    input.push(';');
+    assert!(input.len() >= MAX_SQL_INPUT_BYTES - 1);
+
+    let output = run_cli(&[], input.as_bytes());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("SQL projection limit exceeded")
     );
 }
 

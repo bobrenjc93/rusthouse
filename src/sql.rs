@@ -1,5 +1,12 @@
 use std::fmt;
 
+/// Maximum number of statements accepted in one SQL batch.
+pub const MAX_BATCH_STATEMENTS: usize = 256;
+/// Maximum number of lexical tokens accepted in one SQL batch.
+pub const MAX_BATCH_TOKENS: usize = 16_384;
+/// Maximum number of literal projections accepted in one `SELECT`.
+pub const MAX_SELECT_PROJECTIONS: usize = 1024;
+
 /// A scalar value produced by a literal projection.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScalarValue {
@@ -36,9 +43,19 @@ pub struct QueryResult {
 /// The category of a SQL error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SqlErrorKind {
-    Syntax { message: String },
-    UnsupportedClause { clause: String },
-    UnsupportedStatement { statement: String },
+    Syntax {
+        message: String,
+    },
+    UnsupportedClause {
+        clause: String,
+    },
+    UnsupportedStatement {
+        statement: String,
+    },
+    LimitExceeded {
+        resource: &'static str,
+        maximum: usize,
+    },
 }
 
 /// A SQL error with a one-based byte position.
@@ -75,6 +92,27 @@ impl SqlError {
             },
         }
     }
+
+    fn limit_exceeded(offset: usize, resource: &'static str, maximum: usize) -> Self {
+        Self {
+            byte_offset: offset + 1,
+            kind: SqlErrorKind::LimitExceeded { resource, maximum },
+        }
+    }
+
+    fn from_kind(offset: usize, kind: SqlErrorKind) -> Self {
+        Self {
+            byte_offset: offset + 1,
+            kind,
+        }
+    }
+
+    fn into_token(self) -> Token {
+        Token {
+            kind: TokenKind::Failure(self.kind),
+            offset: self.byte_offset - 1,
+        }
+    }
 }
 
 impl fmt::Display for SqlError {
@@ -97,6 +135,11 @@ impl fmt::Display for SqlError {
                 "unsupported SQL statement `{statement}` at byte {}; only SELECT is supported",
                 self.byte_offset
             ),
+            SqlErrorKind::LimitExceeded { resource, maximum } => write!(
+                f,
+                "SQL {resource} limit exceeded at byte {}; maximum is {maximum}",
+                self.byte_offset
+            ),
         }
     }
 }
@@ -105,7 +148,7 @@ impl std::error::Error for SqlError {}
 
 /// Parses and executes every statement in a SQL batch.
 pub fn execute_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
-    let tokens = Lexer::new(input).tokenize()?;
+    let tokens = Lexer::new(input).tokenize();
     Parser::new(tokens).parse_batch()
 }
 
@@ -120,6 +163,7 @@ enum TokenKind {
     Plus,
     Minus,
     Star,
+    Failure(SqlErrorKind),
     End,
 }
 
@@ -139,12 +183,23 @@ impl<'a> Lexer<'a> {
         Self { input, position: 0 }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>, SqlError> {
+    fn tokenize(mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
         while let Some(character) = self.peek() {
             if character.is_whitespace() {
                 self.bump();
                 continue;
+            }
+
+            if tokens.len() >= MAX_BATCH_TOKENS {
+                tokens.push(Token {
+                    kind: TokenKind::Failure(SqlErrorKind::LimitExceeded {
+                        resource: "token",
+                        maximum: MAX_BATCH_TOKENS,
+                    }),
+                    offset: self.position,
+                });
+                break;
             }
 
             let offset = self.position;
@@ -173,36 +228,65 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     TokenKind::Star
                 }
-                '/' if self.peek_next() == Some('*') => {
-                    self.skip_block_comment(offset)?;
-                    continue;
-                }
-                '\'' => TokenKind::String(self.quoted('\'', "string literal", offset)?),
-                '"' => {
-                    TokenKind::QuotedIdentifier(self.quoted('"', "quoted identifier", offset)?)
-                }
+                '/' if self.peek_next() == Some('*') => match self.skip_block_comment(offset) {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        tokens.push(error.into_token());
+                        break;
+                    }
+                },
+                '\'' => match self.quoted('\'', "string literal", offset) {
+                    Ok(value) => TokenKind::String(value),
+                    Err(error) => {
+                        tokens.push(error.into_token());
+                        break;
+                    }
+                },
+                '"' => match self.quoted('"', "quoted identifier", offset) {
+                    Ok(value) => TokenKind::QuotedIdentifier(value),
+                    Err(error) => {
+                        tokens.push(error.into_token());
+                        break;
+                    }
+                },
                 '.' if self.peek_next().is_some_and(|next| next.is_ascii_digit()) => {
-                    TokenKind::Number(self.number(offset)?)
+                    match self.number(offset) {
+                        Ok(value) => TokenKind::Number(value),
+                        Err(error) => {
+                            tokens.push(error.into_token());
+                            break;
+                        }
+                    }
                 }
-                value if value.is_ascii_digit() => TokenKind::Number(self.number(offset)?),
+                value if value.is_ascii_digit() => match self.number(offset) {
+                    Ok(value) => TokenKind::Number(value),
+                    Err(error) => {
+                        tokens.push(error.into_token());
+                        break;
+                    }
+                },
                 value if value.is_ascii_alphabetic() || value == '_' => {
                     TokenKind::Word(self.word())
                 }
                 value => {
-                    return Err(SqlError::syntax(
-                        offset,
-                        format!("unexpected character `{value}`"),
-                    ));
+                    self.bump();
+                    TokenKind::Failure(SqlErrorKind::Syntax {
+                        message: format!("unexpected character `{}`", value.escape_default()),
+                    })
                 }
             };
+            let failed = matches!(kind, TokenKind::Failure(_));
             tokens.push(Token { kind, offset });
+            if failed {
+                break;
+            }
         }
 
         tokens.push(Token {
             kind: TokenKind::End,
             offset: self.input.len(),
         });
-        Ok(tokens)
+        tokens
     }
 
     fn peek(&self) -> Option<char> {
@@ -356,6 +440,13 @@ impl Parser {
                 self.advance();
                 continue;
             }
+            if results.len() >= MAX_BATCH_STATEMENTS {
+                return Err(SqlError::limit_exceeded(
+                    self.current().offset,
+                    "statement",
+                    MAX_BATCH_STATEMENTS,
+                ));
+            }
             results.push(self.parse_statement()?);
             match &self.current().kind {
                 TokenKind::Semicolon => self.advance(),
@@ -365,6 +456,9 @@ impl Parser {
                         self.current().offset,
                         "expected `;` between SELECT statements",
                     ));
+                }
+                TokenKind::Failure(kind) => {
+                    return Err(SqlError::from_kind(self.current().offset, kind.clone()));
                 }
                 _ => {
                     return Err(SqlError::syntax(
@@ -387,6 +481,9 @@ impl Parser {
             TokenKind::Word(word) => {
                 return Err(SqlError::unsupported_statement(self.current().offset, word));
             }
+            TokenKind::Failure(kind) => {
+                return Err(SqlError::from_kind(self.current().offset, kind.clone()));
+            }
             _ => {
                 return Err(SqlError::syntax(
                     self.current().offset,
@@ -397,6 +494,13 @@ impl Parser {
 
         let mut columns = Vec::new();
         loop {
+            if columns.len() >= MAX_SELECT_PROJECTIONS {
+                return Err(SqlError::limit_exceeded(
+                    self.current().offset,
+                    "projection",
+                    MAX_SELECT_PROJECTIONS,
+                ));
+            }
             columns.push(self.parse_select_item()?);
             match &self.current().kind {
                 TokenKind::Comma => {
@@ -405,6 +509,9 @@ impl Parser {
                 TokenKind::Semicolon | TokenKind::End => break,
                 TokenKind::Word(word) if is_unsupported_clause(word) => {
                     return Err(SqlError::unsupported_clause(self.current().offset, word));
+                }
+                TokenKind::Failure(kind) => {
+                    return Err(SqlError::from_kind(self.current().offset, kind.clone()));
                 }
                 _ => {
                     return Err(SqlError::syntax(
@@ -490,6 +597,7 @@ impl Parser {
                 let value = word.eq_ignore_ascii_case("TRUE");
                 Ok((ScalarValue::Boolean(value), value.to_string()))
             }
+            TokenKind::Failure(kind) => Err(SqlError::from_kind(token.offset, kind)),
             TokenKind::End | TokenKind::Semicolon | TokenKind::Comma => Err(SqlError::syntax(
                 token.offset,
                 "expected an integer, float, boolean, or string literal",
@@ -510,6 +618,7 @@ impl Parser {
             TokenKind::Word(alias) | TokenKind::QuotedIdentifier(alias) if !alias.is_empty() => {
                 alias
             }
+            TokenKind::Failure(kind) => return Err(SqlError::from_kind(token.offset, kind)),
             _ => return Err(SqlError::syntax(token.offset, message)),
         };
         self.advance();
@@ -561,14 +670,21 @@ fn describe_token(token: &TokenKind) -> String {
     match token {
         TokenKind::Word(value) | TokenKind::Number(value) => format!("`{value}`"),
         TokenKind::String(_) => "a string literal".to_owned(),
-        TokenKind::QuotedIdentifier(value) => format!("identifier `{value}`"),
+        TokenKind::QuotedIdentifier(value) => {
+            format!("identifier `{}`", escape_for_diagnostic(value))
+        }
         TokenKind::Comma => "`,`".to_owned(),
         TokenKind::Semicolon => "`;`".to_owned(),
         TokenKind::Plus => "`+`".to_owned(),
         TokenKind::Minus => "`-`".to_owned(),
         TokenKind::Star => "`*`".to_owned(),
+        TokenKind::Failure(_) => "an invalid token".to_owned(),
         TokenKind::End => "the end of input".to_owned(),
     }
+}
+
+fn escape_for_diagnostic(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 #[cfg(test)]
@@ -615,10 +731,19 @@ mod tests {
 
     #[test]
     fn reports_unsupported_clauses() {
-        let error = execute_batch("SELECT 1 AS one FROM numbers;").unwrap_err();
+        let error = execute_batch("SELECT 1 FROM numbers WHERE value = 1;").unwrap_err();
         assert!(matches!(
             error.kind,
             SqlErrorKind::UnsupportedClause { ref clause } if clause == "FROM"
+        ));
+    }
+
+    #[test]
+    fn reports_unsupported_statements_before_later_lexical_failures() {
+        let error = execute_batch("CREATE TABLE values (value Int64);").unwrap_err();
+        assert!(matches!(
+            error.kind,
+            SqlErrorKind::UnsupportedStatement { ref statement } if statement == "CREATE"
         ));
     }
 
@@ -637,5 +762,43 @@ mod tests {
                 "unexpected error for {input}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn bounds_projection_statement_and_token_counts() {
+        let projections = format!(
+            "SELECT {};",
+            std::iter::repeat_n("1", MAX_SELECT_PROJECTIONS + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let error = execute_batch(&projections).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            SqlErrorKind::LimitExceeded {
+                resource: "projection",
+                maximum: MAX_SELECT_PROJECTIONS
+            }
+        ));
+
+        let statements = "SELECT 1;".repeat(MAX_BATCH_STATEMENTS + 1);
+        let error = execute_batch(&statements).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            SqlErrorKind::LimitExceeded {
+                resource: "statement",
+                maximum: MAX_BATCH_STATEMENTS
+            }
+        ));
+
+        let tokens = ";".repeat(MAX_BATCH_TOKENS + 1);
+        let error = execute_batch(&tokens).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            SqlErrorKind::LimitExceeded {
+                resource: "token",
+                maximum: MAX_BATCH_TOKENS
+            }
+        ));
     }
 }

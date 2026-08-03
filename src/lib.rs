@@ -6,7 +6,10 @@ mod sql;
 pub mod output;
 
 pub use input::{InputError, MAX_SQL_INPUT_BYTES, read_sql_input};
-pub use sql::{Column, QueryResult, ScalarValue, SqlError, SqlErrorKind, execute_batch};
+pub use sql::{
+    Column, MAX_BATCH_STATEMENTS, MAX_BATCH_TOKENS, MAX_SELECT_PROJECTIONS, QueryResult,
+    ScalarValue, SqlError, SqlErrorKind, execute_batch,
+};
 
 /// Returns the product name.
 pub fn product_name() -> &'static str {
