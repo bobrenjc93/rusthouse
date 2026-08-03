@@ -97,6 +97,36 @@ fn executes_multiple_typed_selects_as_csv() {
 }
 
 #[test]
+fn evaluates_int64_arithmetic_with_precedence_aliases_and_negative_operands() {
+    let output = run_cli(
+        &["--format", "csv"],
+        b"SELECT 2 + 3 * 4 AS precedence, -5 * -2 + +1 signed_value;",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "precedence,signed_value\n14,11\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn arithmetic_overflow_emits_no_partial_batch_results() {
+    let output = run_cli(
+        &["--format", "csv"],
+        b"SELECT 1 AS completed; SELECT 9223372036854775807 + 1 AS overflowed;",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "rusthouse: SQL evaluation error at byte 51: Int64 overflow while evaluating operator `+`\n"
+    );
+}
+
+#[test]
 fn unaliased_strings_preserve_escaped_quotes_in_csv_headers() {
     let output = run_cli(&["--format", "csv"], b"SELECT 'it''s';");
 

@@ -27,6 +27,9 @@ pub enum SqlErrorKind {
     Syntax {
         message: String,
     },
+    Evaluation {
+        message: String,
+    },
     UnsupportedClause {
         clause: String,
     },
@@ -61,6 +64,15 @@ impl SqlError {
             byte_offset: offset + 1,
             kind: SqlErrorKind::UnsupportedClause {
                 clause: clause.to_ascii_uppercase(),
+            },
+        }
+    }
+
+    fn evaluation(offset: usize, message: impl Into<String>) -> Self {
+        Self {
+            byte_offset: offset + 1,
+            kind: SqlErrorKind::Evaluation {
+                message: message.into(),
             },
         }
     }
@@ -106,6 +118,11 @@ impl fmt::Display for SqlError {
                     self.byte_offset
                 )
             }
+            SqlErrorKind::Evaluation { message } => write!(
+                f,
+                "SQL evaluation error at byte {}: {message}",
+                self.byte_offset
+            ),
             SqlErrorKind::UnsupportedClause { clause } => write!(
                 f,
                 "unsupported SQL clause `{clause}` at byte {}; only literal SELECT projections are supported",
@@ -511,7 +528,7 @@ impl Parser {
     }
 
     fn parse_select_item(&mut self) -> Result<ResultColumn, SqlError> {
-        let (value, default_name) = self.parse_literal()?;
+        let (value, default_name) = self.parse_expression()?;
         let name = if self.current_word_is("AS") {
             self.advance();
             self.parse_alias("expected an alias after AS")?
@@ -528,6 +545,38 @@ impl Parser {
         };
 
         Ok(ResultColumn { name, value })
+    }
+
+    fn parse_expression(&mut self) -> Result<(Value, String), SqlError> {
+        let (mut value, mut default_name) = self.parse_multiplicative_expression()?;
+
+        while matches!(self.current().kind, TokenKind::Plus | TokenKind::Minus) {
+            let operator = self.current().clone();
+            self.advance();
+            let (right, right_name) = self.parse_multiplicative_expression()?;
+            value = evaluate_int64_binary(value, &operator, right)?;
+            default_name.push(' ');
+            default_name.push_str(operator_symbol(&operator.kind));
+            default_name.push(' ');
+            default_name.push_str(&right_name);
+        }
+
+        Ok((value, default_name))
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<(Value, String), SqlError> {
+        let (mut value, mut default_name) = self.parse_literal()?;
+
+        while matches!(self.current().kind, TokenKind::Star) {
+            let operator = self.current().clone();
+            self.advance();
+            let (right, right_name) = self.parse_literal()?;
+            value = evaluate_int64_binary(value, &operator, right)?;
+            default_name.push_str(" * ");
+            default_name.push_str(&right_name);
+        }
+
+        Ok((value, default_name))
     }
 
     fn parse_literal(&mut self) -> Result<(Value, String), SqlError> {
@@ -621,6 +670,38 @@ impl Parser {
 
     fn advance(&mut self) {
         self.position += 1;
+    }
+}
+
+fn evaluate_int64_binary(left: Value, operator: &Token, right: Value) -> Result<Value, SqlError> {
+    let symbol = operator_symbol(&operator.kind);
+    let (Value::Int64(left), Value::Int64(right)) = (left, right) else {
+        return Err(SqlError::evaluation(
+            operator.offset,
+            format!("operator `{symbol}` requires Int64 operands"),
+        ));
+    };
+    let value = match operator.kind {
+        TokenKind::Plus => left.checked_add(right),
+        TokenKind::Minus => left.checked_sub(right),
+        TokenKind::Star => left.checked_mul(right),
+        _ => unreachable!("only arithmetic operators are evaluated"),
+    }
+    .ok_or_else(|| {
+        SqlError::evaluation(
+            operator.offset,
+            format!("Int64 overflow while evaluating operator `{symbol}`"),
+        )
+    })?;
+    Ok(Value::Int64(value))
+}
+
+fn operator_symbol(operator: &TokenKind) -> &'static str {
+    match operator {
+        TokenKind::Plus => "+",
+        TokenKind::Minus => "-",
+        TokenKind::Star => "*",
+        _ => unreachable!("only arithmetic operators have symbols"),
     }
 }
 
@@ -719,6 +800,66 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn evaluates_int64_arithmetic_with_precedence_and_aliases() {
+        let results = execute_batch(
+            "SELECT 2 + 3 * 4 AS explicit_name, 20 - 6 - 3 implicit_name, 5 * 4 + 1;",
+        )
+        .unwrap();
+
+        assert_eq!(
+            results[0].columns,
+            vec![
+                ResultColumn {
+                    name: "explicit_name".to_owned(),
+                    value: Value::Int64(14),
+                },
+                ResultColumn {
+                    name: "implicit_name".to_owned(),
+                    value: Value::Int64(11),
+                },
+                ResultColumn {
+                    name: "5 * 4 + 1".to_owned(),
+                    value: Value::Int64(21),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn evaluates_arithmetic_with_signed_operands() {
+        let results =
+            execute_batch("SELECT -2 * -3 + +4 AS value, -10 - -3 AS difference;").unwrap();
+
+        assert_eq!(results[0].columns[0].value, Value::Int64(10));
+        assert_eq!(results[0].columns[1].value, Value::Int64(-7));
+    }
+
+    #[test]
+    fn reports_int64_arithmetic_overflow_as_evaluation_errors() {
+        for input in [
+            "SELECT 9223372036854775807 + 1;",
+            "SELECT -9223372036854775808 - 1;",
+            "SELECT 3037000500 * 3037000500;",
+        ] {
+            let error = execute_batch(input).unwrap_err();
+            assert!(
+                matches!(error.kind, SqlErrorKind::Evaluation { ref message } if message.contains("Int64 overflow")),
+                "unexpected error for {input}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_requires_int64_operands() {
+        let error = execute_batch("SELECT 1.5 + 2;").unwrap_err();
+        assert!(matches!(
+            error.kind,
+            SqlErrorKind::Evaluation { ref message }
+                if message == "operator `+` requires Int64 operands"
+        ));
     }
 
     #[test]

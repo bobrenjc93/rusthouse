@@ -32,8 +32,10 @@ cargo run -- --help
 
 The CLI reads a SQL batch from standard input. It currently executes `SELECT`
 statements without `FROM`, with integer, float, boolean, and single-quoted
-string literals. Projections may use `AS` aliases or implicit aliases. Escape a
-single quote inside a string by doubling it.
+string literals. Integer projections support checked `+`, `-`, and `*`
+arithmetic with standard precedence and unary signs. Projections may use `AS`
+aliases or implicit aliases. Escape a single quote inside a string by doubling
+it.
 
 ```bash
 printf "SELECT 42 AS answer, 3.5 AS ratio, TRUE AS ready, 'it''s ready' AS message;\n" \
