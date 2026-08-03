@@ -222,7 +222,7 @@ impl Catalog {
         )
     }
 
-    /// Parses and executes a `SELECT` with explicit equality-scan bounds.
+    /// Parses and executes a `SELECT` with explicit comparison-scan bounds.
     pub fn execute_select_with_limits(
         &self,
         input: &str,
@@ -247,7 +247,7 @@ impl Catalog {
         )
     }
 
-    /// Executes a parsed projection `SELECT` with explicit equality-scan bounds.
+    /// Executes a parsed projection `SELECT` with explicit comparison-scan bounds.
     pub fn select_with_limits(
         &self,
         statement: &SelectStatement,

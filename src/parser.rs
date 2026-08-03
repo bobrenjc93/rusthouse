@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::order::{NullOrder, OrderDirection};
+use crate::scan::ComparisonOperator;
 use crate::storage::DataType;
 
 /// Default maximum size of a SQL statement, in bytes.
@@ -123,17 +124,23 @@ impl InsertStatement {
     }
 }
 
-/// A column-to-`Int64` equality predicate in a `WHERE` clause.
+/// A column-to-`Int64` comparison predicate in a `WHERE` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EqualityPredicate {
+pub struct ComparisonPredicate {
     column_name: Identifier,
+    operator: ComparisonOperator,
     value: i64,
 }
 
-impl EqualityPredicate {
+impl ComparisonPredicate {
     /// Returns the compared column name.
     pub fn column_name(&self) -> &Identifier {
         &self.column_name
+    }
+
+    /// Returns the comparison applied to the column and literal.
+    pub const fn operator(&self) -> ComparisonOperator {
+        self.operator
     }
 
     /// Returns the non-`NULL` `Int64` comparison value.
@@ -141,6 +148,9 @@ impl EqualityPredicate {
         self.value
     }
 }
+
+/// Backwards-compatible name for the original equality-only predicate type.
+pub type EqualityPredicate = ComparisonPredicate;
 
 /// An explicit single-column `ORDER BY` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +182,7 @@ impl OrderByClause {
 pub struct SelectStatement {
     column_name: Identifier,
     table_name: Identifier,
-    predicate: Option<EqualityPredicate>,
+    predicate: Option<ComparisonPredicate>,
     order_by: Option<OrderByClause>,
     limit: Option<usize>,
 }
@@ -188,8 +198,8 @@ impl SelectStatement {
         &self.table_name
     }
 
-    /// Returns the optional `WHERE` equality predicate.
-    pub fn predicate(&self) -> Option<&EqualityPredicate> {
+    /// Returns the optional `WHERE` comparison predicate.
+    pub fn predicate(&self) -> Option<&ComparisonPredicate> {
         self.predicate.as_ref()
     }
 
@@ -363,15 +373,15 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 ///
 /// ```text
 /// SELECT identifier FROM identifier
-///     [WHERE identifier = Int64]
+///     [WHERE identifier (= | != | <> | < | <= | > | >=) Int64]
 ///     [ORDER BY identifier (ASC | DESC) NULLS (FIRST | LAST)]
 ///     [LIMIT unsigned-integer] [;]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
-/// around the equality operator and before or after the optional clauses and
+/// around the comparison operator and before or after the optional clauses and
 /// semicolon. `ORDER BY`, when present, requires an explicit direction, `NULL`
-/// placement, and following `LIMIT`. The equality value is a signed decimal
+/// placement, and following `LIMIT`. The comparison value is a signed decimal
 /// `Int64`; `LIMIT` accepts zero and must fit in `usize`. Statement limits and
 /// all reported offsets are measured in bytes.
 ///
@@ -519,11 +529,15 @@ impl<'input> Parser<'input> {
             self.require_whitespace("whitespace after WHERE")?;
             let column_name = self.parse_identifier()?;
             self.skip_whitespace();
-            self.expect_byte(b'=', "'='")?;
+            let operator = self.parse_comparison_operator()?;
             self.skip_whitespace();
             let value = self.parse_where_int64()?;
             self.skip_whitespace();
-            Some(EqualityPredicate { column_name, value })
+            Some(ComparisonPredicate {
+                column_name,
+                operator,
+                value,
+            })
         } else {
             None
         };
@@ -597,6 +611,48 @@ impl<'input> Parser<'input> {
             order_by,
             limit,
         })
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator, ParseError> {
+        let start = self.position;
+        let operator = match (self.peek(), self.bytes.get(self.position + 1).copied()) {
+            (Some(b'='), _) => {
+                self.position += 1;
+                ComparisonOperator::Eq
+            }
+            (Some(b'!'), Some(b'=')) => {
+                self.position += 2;
+                ComparisonOperator::Ne
+            }
+            (Some(b'<'), Some(b'>')) => {
+                self.position += 2;
+                ComparisonOperator::Ne
+            }
+            (Some(b'<'), Some(b'=')) => {
+                self.position += 2;
+                ComparisonOperator::Le
+            }
+            (Some(b'<'), _) => {
+                self.position += 1;
+                ComparisonOperator::Lt
+            }
+            (Some(b'>'), Some(b'=')) => {
+                self.position += 2;
+                ComparisonOperator::Ge
+            }
+            (Some(b'>'), _) => {
+                self.position += 1;
+                ComparisonOperator::Gt
+            }
+            _ => return Err(self.unexpected("comparison operator")),
+        };
+
+        if self.peek().is_some_and(is_comparison_operator_byte) {
+            self.position = start;
+            return Err(self.unexpected("comparison operator"));
+        }
+
+        Ok(operator)
     }
 
     fn parse_where_int64(&mut self) -> Result<i64, ParseError> {
@@ -833,4 +889,8 @@ fn is_identifier_start(byte: u8) -> bool {
 
 fn is_identifier_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_comparison_operator_byte(byte: u8) -> bool {
+    matches!(byte, b'=' | b'!' | b'<' | b'>')
 }
