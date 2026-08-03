@@ -3,13 +3,16 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
+use crate::snapshot::SnapshotStore;
 use crate::sql::{
     CreateTableStatement, InsertParseLimits, InsertStatement, ParseError, ParseLimits,
     SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
     parse_insert_with_limits, parse_select_with_limits,
 };
-use crate::storage::{DEFAULT_ROW_LIMIT, Field, Table, TableError};
+use crate::storage::{Column, DEFAULT_ROW_LIMIT, Field, Table, TableError};
+use crate::table_snapshot::TableSnapshotError;
 use crate::{RowSelection, ScanError};
 
 /// Default maximum number of tables owned by one [`Catalog`].
@@ -174,6 +177,45 @@ impl From<ParseError> for CatalogError {
     }
 }
 
+/// A typed failure while saving or loading one catalog-owned table snapshot.
+#[derive(Debug)]
+pub enum CatalogSnapshotError {
+    /// Catalog lookup, duplicate-name, table-count, or allocation failure.
+    Catalog(CatalogError),
+    /// Snapshot encoding, filesystem, integrity, or decoding failure.
+    Snapshot(TableSnapshotError),
+}
+
+impl fmt::Display for CatalogSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Catalog(error) => error.fmt(formatter),
+            Self::Snapshot(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CatalogSnapshotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Catalog(error) => Some(error),
+            Self::Snapshot(error) => Some(error),
+        }
+    }
+}
+
+impl From<CatalogError> for CatalogSnapshotError {
+    fn from(error: CatalogError) -> Self {
+        Self::Catalog(error)
+    }
+}
+
+impl From<TableSnapshotError> for CatalogSnapshotError {
+    fn from(error: TableSnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 #[derive(Debug)]
 struct CatalogEntry {
     name: String,
@@ -211,6 +253,14 @@ impl<'a> SelectResult<'a> {
     /// Alias for [`Self::projected_fields`].
     pub fn fields(&self) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
         self.projected_fields()
+    }
+
+    pub(crate) fn projected_columns(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Column> + DoubleEndedIterator + '_ {
+        self.field_indices
+            .iter()
+            .map(|index| &self.table.columns()[*index])
     }
 
     /// Iterates over selected zero-based indexes in source table order.
@@ -329,6 +379,66 @@ impl Catalog {
             .tables
             .get(&key)
             .expect("the table was inserted immediately above")
+            .table)
+    }
+
+    /// Saves one named catalog table in the single-table snapshot format.
+    ///
+    /// Lookup is ASCII case-insensitive. The snapshot store controls the
+    /// maximum encoded payload size and atomically replaces `path`.
+    pub fn save_table(
+        &self,
+        name: &str,
+        path: impl AsRef<Path>,
+        snapshots: &SnapshotStore,
+    ) -> Result<(), CatalogSnapshotError> {
+        let table = self.table(name)?;
+        snapshots.write_table(path, table)?;
+        Ok(())
+    }
+
+    /// Loads one table snapshot under a caller-supplied catalog name.
+    ///
+    /// Names use the same ASCII case-insensitive identity as tables created
+    /// through SQL. Duplicate-name and table-count checks happen before any
+    /// snapshot I/O. The snapshot is fully read and decoded, and catalog
+    /// allocation succeeds, before the table is inserted. Every failure before
+    /// insertion therefore leaves the catalog's table set unchanged.
+    pub fn load_table(
+        &mut self,
+        name: &str,
+        path: impl AsRef<Path>,
+        snapshots: &SnapshotStore,
+    ) -> Result<&Table, CatalogSnapshotError> {
+        let name = name.to_owned();
+        let key = normalize_table_name(&name);
+
+        if self.tables.contains_key(&key) {
+            return Err(CatalogError::DuplicateTable { name }.into());
+        }
+        if self.tables.len() == self.limits.max_tables {
+            return Err(CatalogError::TableLimitExceeded {
+                limit: self.limits.max_tables,
+            }
+            .into());
+        }
+
+        let table = snapshots.read_table(path)?;
+        self.tables
+            .try_reserve(1)
+            .map_err(|_| CatalogError::AllocationFailed)?;
+        let previous = self
+            .tables
+            .insert(key.clone(), CatalogEntry { name, table });
+        debug_assert!(
+            previous.is_none(),
+            "duplicates are checked before loading the snapshot"
+        );
+
+        Ok(&self
+            .tables
+            .get(&key)
+            .expect("the loaded table was inserted immediately above")
             .table)
     }
 

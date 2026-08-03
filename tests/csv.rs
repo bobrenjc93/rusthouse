@@ -1,4 +1,7 @@
-use rusthouse::{DataType, Field, Table, Value, write_csv_with_names};
+use rusthouse::{
+    Catalog, DataType, Field, SelectResult, Table, Value, write_csv_with_names,
+    write_select_csv_with_names,
+};
 use std::io;
 
 #[test]
@@ -150,10 +153,71 @@ fn returns_every_partial_writer_failure_without_buffering_the_table() {
     assert_eq!(complete.bytes, expected);
 }
 
+#[test]
+fn select_results_stream_projected_columns_and_selected_rows() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE events (id Int64, active Bool, label String, score Float64)")
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO events VALUES \
+             (1, true, 'first', 1.5), \
+             (2, false, 'second', 2.5), \
+             (3, true, 'a \"quoted\" value', 3.5)",
+        )
+        .unwrap();
+
+    let result = catalog
+        .execute_select("SELECT label, id, label FROM events WHERE active = true")
+        .unwrap();
+
+    assert_eq!(
+        render_select(&result),
+        concat!(
+            "\"label\",\"id\",\"label\"\n",
+            "\"first\",1,\"first\"\n",
+            "\"a \"\"quoted\"\" value\",3,\"a \"\"quoted\"\" value\"\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn select_writer_returns_partial_failures_without_materializing_output() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE events (id Int64, label String)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO events VALUES (1, 'some \"text\"')")
+        .unwrap();
+    let result = catalog
+        .execute_select("SELECT label, id FROM events")
+        .unwrap();
+    let expected = render_select(&result);
+
+    for limit in 0..expected.len() {
+        let mut writer = FailAfter::new(limit);
+        let error = write_select_csv_with_names(&result, &mut writer).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other, "limit {limit}");
+        assert_eq!(error.to_string(), "intentional writer failure");
+        assert_eq!(writer.bytes, expected[..limit], "limit {limit}");
+    }
+}
+
 fn render(table: &Table) -> Vec<u8> {
     let mut output = Vec::new();
     let writer: &mut dyn io::Write = &mut output;
     write_csv_with_names(table, writer).unwrap();
+    output
+}
+
+fn render_select(result: &SelectResult<'_>) -> Vec<u8> {
+    let mut output = Vec::new();
+    let writer: &mut dyn io::Write = &mut output;
+    write_select_csv_with_names(result, writer).unwrap();
     output
 }
 
