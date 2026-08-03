@@ -13,7 +13,7 @@ use std::sync::{Arc, Barrier};
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
 };
-use rusthouse::{Catalog, DEFAULT_MAX_TABLES};
+use rusthouse::{Catalog, DEFAULT_MAX_TABLES, SelectParseLimits};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -153,7 +153,7 @@ fn rejects_arguments_with_the_usage_exit_code() {
 }
 
 #[test]
-fn saves_reopens_and_selects_one_table_across_processes() {
+fn saves_reopens_and_conjunctively_filters_one_table_across_processes() {
     let directory = TestDirectory::new("save-reopen-select");
     let snapshot = directory.snapshot("events.snapshot");
     let save = format!("Events={}", snapshot.display());
@@ -171,7 +171,8 @@ fn saves_reopens_and_selects_one_table_across_processes() {
     let load = format!("reopened={}", snapshot.display());
     let reopened = run(
         &["--format", "csv", "--load-table", &load],
-        b"SELECT label, id FROM reopened WHERE active = true\n",
+        b"SELECT label, id FROM reopened \
+          WHERE active = true AND id >= 1 AND label != 'second'\n",
     );
 
     assert_eq!(reopened.status.code(), Some(0));
@@ -594,6 +595,29 @@ fn reports_catalog_capacity_as_a_limit() {
         format!(
             "rusthouse: resource limit exceeded on line {}: catalog table count exceeds limit of {DEFAULT_MAX_TABLES}\n",
             DEFAULT_MAX_TABLES + 1
+        )
+    );
+}
+
+#[test]
+fn reports_the_predicate_count_bound_as_a_limit() {
+    let predicates = std::iter::repeat_n("id = 1", SelectParseLimits::DEFAULT_MAX_PREDICATES + 1)
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let input =
+        format!("CREATE TABLE events (id Int64)\nSELECT id FROM events WHERE {predicates}\n");
+
+    let output = run(&[], input.as_bytes());
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "rusthouse: resource limit exceeded on line 2: SQL parse error at byte {}: predicate count exceeds limit of {}\n",
+            "SELECT id FROM events WHERE ".len()
+                + "id = 1 AND ".len() * SelectParseLimits::DEFAULT_MAX_PREDICATES,
+            SelectParseLimits::DEFAULT_MAX_PREDICATES
         )
     );
 }
