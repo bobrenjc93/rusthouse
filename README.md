@@ -26,6 +26,8 @@ subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
 `Int64` predicates through `WHERE column operator literal`, where `operator` is
 `=`, `!=`, `<>`, `<`, `<=`, `>`, or `>=`, and an optional nonnegative `LIMIT`.
+Scalar `SELECT COUNT(*)` and `SELECT COUNT(column)` use explicit aggregate row
+bounds and preserve SQL `NULL` semantics.
 The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a
