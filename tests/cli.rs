@@ -533,6 +533,31 @@ fn writes_count_rows_for_all_filtered_and_empty_tables() {
 }
 
 #[test]
+fn writes_filtered_distinct_counts_with_aliases_and_empty_inputs() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, score Float64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, 1.5, true, 'east'), (1, 1.5, true, 'east'), (2, 2.5, false, 'west'), (3, 3.5, true, 'north')\n\
+          CREATE TABLE empty (value String)\n\
+          SELECT COUNT(DISTINCT id) AS ids, COUNT(DISTINCT score), COUNT(DISTINCT active), COUNT(DISTINCT label) AS labels FROM events WHERE active = true\n\
+          SELECT COUNT(DISTINCT value) FROM empty\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"ids\",\"count(distinct score)\",\"count(distinct active)\",\"labels\"\n",
+            "2,2,1,2\n",
+            "\"count(distinct value)\"\n",
+            "0\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
 fn writes_one_csv_row_for_a_filtered_aggregate_list() {
     let output = run(
         &["--format", "csv"],
