@@ -7,11 +7,13 @@ use std::fmt;
 
 use crate::execution::{
     InsertExecutionError, SelectExecutionError, execute_insert as execute_insert_statement,
+    execute_scalar_count as execute_scalar_count_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    CreateTableStatement, InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits,
-    ScanLimits, Schema, SelectStatement, parse_create_table, parse_insert, parse_select,
+    AggregateLimits, CreateTableStatement, InsertStatement, Int64Table, OrderLimits, ParseError,
+    ParseLimits, ScalarCountStatement, ScanLimits, Schema, SelectStatement, parse_create_table,
+    parse_insert, parse_scalar_count, parse_select,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -204,6 +206,33 @@ impl Catalog {
         })?;
 
         execute_insert_statement(name, table, statement).map_err(CatalogError::Insert)
+    }
+
+    /// Parses and executes one scalar `COUNT` with explicit resource bounds.
+    pub fn execute_scalar_count(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<u64, CatalogError> {
+        let statement = parse_scalar_count(input, parse_limits)?;
+        self.scalar_count(&statement, aggregate_limits)
+    }
+
+    /// Executes a parsed scalar `COUNT` against its exactly named table.
+    pub fn scalar_count(
+        &self,
+        statement: &ScalarCountStatement,
+        limits: AggregateLimits,
+    ) -> Result<u64, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Select(SelectExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_scalar_count_statement(name, table, statement, limits).map_err(CatalogError::Select)
     }
 
     /// Parses and executes one bounded projection `SELECT` statement.
