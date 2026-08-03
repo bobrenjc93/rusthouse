@@ -9,14 +9,15 @@ use crate::execution::{
     InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError,
     execute_insert as execute_insert_statement,
     execute_scalar_count as execute_scalar_count_statement,
+    execute_scalar_sum as execute_scalar_sum_statement,
     execute_select_distinct as execute_select_distinct_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
     AggregateLimits, CreateTableStatement, DistinctLimits, InsertStatement, Int64Table,
-    OrderLimits, ParseError, ParseLimits, ScalarCountStatement, ScanLimits, Schema,
-    SelectDistinctStatement, SelectStatement, parse_create_table, parse_insert, parse_scalar_count,
-    parse_select, parse_select_distinct,
+    OrderLimits, ParseError, ParseLimits, ScalarCountStatement, ScalarSumStatement, ScanLimits,
+    Schema, SelectDistinctStatement, SelectStatement, parse_create_table, parse_insert,
+    parse_scalar_count, parse_scalar_sum, parse_select, parse_select_distinct,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -244,6 +245,33 @@ impl Catalog {
         execute_scalar_count_statement(name, table, statement, limits).map_err(CatalogError::Select)
     }
 
+    /// Parses and executes one scalar `SUM` with explicit resource bounds.
+    pub fn execute_scalar_sum(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
+        let statement = parse_scalar_sum(input, parse_limits)?;
+        self.scalar_sum(&statement, aggregate_limits)
+    }
+
+    /// Executes a parsed scalar `SUM` against its exactly named table.
+    pub fn scalar_sum(
+        &self,
+        statement: &ScalarSumStatement,
+        limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Select(SelectExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_scalar_sum_statement(name, table, statement, limits).map_err(CatalogError::Select)
+    }
+
     /// Parses and executes one bounded projection `SELECT` statement.
     pub fn execute_select(
         &self,
@@ -260,7 +288,7 @@ impl Catalog {
         )
     }
 
-    /// Parses and executes a `SELECT` with explicit comparison-scan bounds.
+    /// Parses and executes a `SELECT` with explicit predicate-scan bounds.
     pub fn execute_select_with_limits(
         &self,
         input: &str,
@@ -285,7 +313,7 @@ impl Catalog {
         )
     }
 
-    /// Executes a parsed projection `SELECT` with explicit comparison-scan bounds.
+    /// Executes a parsed projection `SELECT` with explicit predicate-scan bounds.
     pub fn select_with_limits(
         &self,
         statement: &SelectStatement,

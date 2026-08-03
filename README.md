@@ -25,17 +25,24 @@ RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
 `Int64` predicates through `WHERE column operator literal`, where `operator` is
-`=`, `!=`, `<>`, `<`, `<=`, `>`, or `>=`, and an optional nonnegative `LIMIT`.
-Scalar `SELECT COUNT(*)` and `SELECT COUNT(column)` use explicit aggregate row
-bounds and preserve SQL `NULL` semantics.
+`=`, `!=`, `<>`, `<`, `<=`, `>`, or `>=`, as well as `WHERE column IS NULL` and
+`WHERE column IS NOT NULL`. Both forms accept an optional nonnegative `LIMIT`.
+Scalar `SELECT COUNT(*)`, `SELECT COUNT(column)`, and `SELECT SUM(column)` use
+explicit aggregate row bounds and preserve SQL `NULL` semantics.
 The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a
 prefix of the table's column storage;
-filtered projections return matching non-`NULL` values in source order through
-the bounded comparison scan. `SELECT DISTINCT column FROM table` uses explicit
-input-row and distinct-value limits and returns deterministic `NULL`-first,
-ascending values.
+filtered projections return matching values in source order through bounded
+comparison and nullness scans. `SELECT DISTINCT column FROM table` uses
+explicit input-row and distinct-value limits and returns deterministic
+`NULL`-first, ascending values.
+
+For concurrent in-process access, `SharedCatalog` wraps a catalog in an
+`Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE` and `INSERT` with a
+write lock, allow `SELECT` operations through read locks, and return owned
+projection rows. Existing catalog failures remain typed, and lock poisoning is
+reported separately.
 
 ## Snapshot envelope
 
