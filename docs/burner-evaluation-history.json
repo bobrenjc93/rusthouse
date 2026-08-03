@@ -314,6 +314,38 @@
         "eval_56a6f83a": 30,
         "eval_a8d9ce71": 100
       }
+    },
+    {
+      "key": "base:dc3f3b7efda023eefbd0dafb625367108a3dabec",
+      "commit": "dc3f3b7efda023eefbd0dafb625367108a3dabec",
+      "recordedAt": "2026-08-03T12:28:39.300Z",
+      "label": "base dc3f3b7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_69c46252": 55,
+        "eval_ed4d7712": 80,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 30,
+        "eval_a8d9ce71": 100
+      }
+    },
+    {
+      "key": "pr:330",
+      "recordedAt": "2026-08-03T12:28:39.300Z",
+      "label": "PR #330",
+      "kind": "composite",
+      "prNumber": 330,
+      "title": "YOLO generation 16: 3 reviewed improvements",
+      "scores": {
+        "eval_69c46252": 60,
+        "eval_ed4d7712": 80,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 30,
+        "eval_a8d9ce71": 100
+      }
     }
   ]
 }

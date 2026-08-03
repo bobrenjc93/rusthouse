@@ -103,7 +103,7 @@ pub struct SelectStatement {
     /// Disjunctive groups of comparisons. Comparisons within each group are
     /// joined by `AND`; groups are joined by `OR`.
     pub predicate_groups: Vec<Vec<ComparisonPredicate>>,
-    pub order_by: Option<OrderByClause>,
+    pub order_by: Option<Vec<OrderByClause>>,
     pub limit: Option<usize>,
 }
 
@@ -180,6 +180,7 @@ pub struct SelectParseLimits {
     pub max_projections: usize,
     pub max_predicates: usize,
     pub max_predicate_groups: usize,
+    pub max_order_keys: usize,
 }
 
 impl SelectParseLimits {
@@ -187,6 +188,7 @@ impl SelectParseLimits {
     pub const DEFAULT_MAX_PROJECTIONS: usize = 1024;
     pub const DEFAULT_MAX_PREDICATES: usize = 1024;
     pub const DEFAULT_MAX_PREDICATE_GROUPS: usize = 1024;
+    pub const DEFAULT_MAX_ORDER_KEYS: usize = 1024;
 
     pub const fn new(max_input_bytes: usize, max_projections: usize) -> Self {
         Self {
@@ -194,6 +196,7 @@ impl SelectParseLimits {
             max_projections,
             max_predicates: Self::DEFAULT_MAX_PREDICATES,
             max_predicate_groups: Self::DEFAULT_MAX_PREDICATE_GROUPS,
+            max_order_keys: Self::DEFAULT_MAX_ORDER_KEYS,
         }
     }
 
@@ -208,6 +211,13 @@ impl SelectParseLimits {
     #[must_use]
     pub const fn with_max_predicate_groups(mut self, max_predicate_groups: usize) -> Self {
         self.max_predicate_groups = max_predicate_groups;
+        self
+    }
+
+    /// Replaces the maximum number of columns in an `ORDER BY` clause.
+    #[must_use]
+    pub const fn with_max_order_keys(mut self, max_order_keys: usize) -> Self {
+        self.max_order_keys = max_order_keys;
         self
     }
 }
@@ -283,6 +293,9 @@ pub enum ParseErrorKind {
         limit: usize,
     },
     TooManyPredicateGroups {
+        limit: usize,
+    },
+    TooManyOrderKeys {
         limit: usize,
     },
     ExpectedComparisonOperator,
@@ -367,6 +380,9 @@ impl fmt::Display for ParseErrorKind {
             }
             Self::TooManyPredicateGroups { limit } => {
                 write!(formatter, "predicate group count exceeds limit of {limit}")
+            }
+            Self::TooManyOrderKeys { limit } => {
+                write!(formatter, "order key count exceeds limit of {limit}")
             }
             Self::ExpectedComparisonOperator => {
                 formatter.write_str("expected a comparison operator")
@@ -503,8 +519,8 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 /// joined by `OR`, each containing
 /// column-to-literal comparisons joined by `AND`. One optional pair of
 /// parentheses may wrap each whole group. Literals may be `Int64`, `Float64`,
-/// `Bool`, or `String`. The clause may be followed by one `ORDER BY column
-/// [ASC|DESC]` clause and a nonnegative integer `LIMIT`. `NOT`, nested
+/// `Bool`, or `String`. The clause may be followed by one bounded `ORDER BY`
+/// list of `column [ASC|DESC]` keys and a nonnegative integer `LIMIT`. `NOT`, nested
 /// expressions, raw-column/aggregate mixing, and other predicate or result
 /// forms are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
@@ -658,18 +674,7 @@ impl<'a> Parser<'a> {
         let order_by = if self.peek_token_is("ORDER") {
             self.parse_keyword("ORDER")?;
             self.parse_keyword("BY")?;
-            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
-            self.skip_whitespace();
-            let direction = if self.peek_token_is("ASC") {
-                self.parse_keyword("ASC")?;
-                OrderDirection::Ascending
-            } else if self.peek_token_is("DESC") {
-                self.parse_keyword("DESC")?;
-                OrderDirection::Descending
-            } else {
-                OrderDirection::Ascending
-            };
-            Some(OrderByClause { column, direction })
+            Some(self.parse_order_keys(limits.max_order_keys)?)
         } else {
             None
         };
@@ -690,6 +695,41 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
         })
+    }
+
+    fn parse_order_keys(
+        &mut self,
+        max_order_keys: usize,
+    ) -> Result<Vec<OrderByClause>, ParseError> {
+        let mut order_keys = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if order_keys.len() == max_order_keys {
+                return Err(self.error(ParseErrorKind::TooManyOrderKeys {
+                    limit: max_order_keys,
+                }));
+            }
+
+            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            let direction = if self.peek_token_is("ASC") {
+                self.parse_keyword("ASC")?;
+                OrderDirection::Ascending
+            } else if self.peek_token_is("DESC") {
+                self.parse_keyword("DESC")?;
+                OrderDirection::Descending
+            } else {
+                OrderDirection::Ascending
+            };
+            order_keys.push(OrderByClause { column, direction });
+
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+        }
+        Ok(order_keys)
     }
 
     fn parse_projections(

@@ -527,6 +527,43 @@ fn orders_all_physical_types_and_preserves_source_order_for_ties() {
 }
 
 #[test]
+fn orders_lexicographically_by_hidden_mixed_keys_before_applying_limit() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE ranked (id Int64, segment String, score Float64, active Bool)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO ranked VALUES \
+             (0, 'beta', 10.0, true), \
+             (1, 'alpha', 20.0, true), \
+             (2, 'alpha', 20.0, true), \
+             (3, 'alpha', 5.0, false), \
+             (4, 'beta', 30.0, true), \
+             (5, 'alpha', 20.0, false)",
+        )
+        .unwrap();
+
+    let result = catalog
+        .execute_select(
+            "SELECT id FROM ranked WHERE active = true \
+             ORDER BY segment ASC, score DESC LIMIT 3",
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .fields()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        ["id"]
+    );
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [1, 2, 4]);
+}
+
+#[test]
 fn float_order_is_total_and_deterministic() {
     let mut catalog = Catalog::new();
     catalog
@@ -588,6 +625,79 @@ fn filters_before_ordering_and_limits_after_ordering() {
 }
 
 #[test]
+fn bounded_ordering_matches_full_sort_deterministically() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE ranked (id Int64, integer Int64, float Float64, boolean Bool, text String, keep Bool)",
+        )
+        .unwrap();
+
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    let rows = (0..101_i64).map(|id| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let float = match id % 11 {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f64::from_bits(0x7ff8_0000_0000_0000 | id as u64),
+            _ => (state % 19) as f64 - 9.0,
+        };
+        let text = ["ant", "bee", "cat", "dog", "eel"][(state as usize) % 5];
+        vec![
+            Value::Int64(id),
+            Value::Int64((state % 17) as i64 - 8),
+            Value::Float64(float),
+            Value::Bool(state & 1 == 0),
+            Value::String(text.to_owned()),
+            Value::Bool(id % 3 != 0),
+        ]
+    });
+    catalog
+        .table_mut("ranked")
+        .unwrap()
+        .insert_batch(rows)
+        .unwrap();
+
+    for order_by in [
+        "integer ASC",
+        "integer DESC",
+        "float ASC",
+        "float DESC",
+        "boolean ASC",
+        "boolean DESC",
+        "text ASC",
+        "text DESC",
+        "integer ASC, float DESC",
+        "boolean DESC, text ASC, integer DESC",
+        "float DESC, boolean ASC, text DESC",
+    ] {
+        for predicate in ["", " WHERE keep = true"] {
+            let full_query = format!("SELECT id FROM ranked{predicate} ORDER BY {order_by}");
+            let fully_sorted = catalog
+                .execute_select(&full_query)
+                .unwrap()
+                .row_indices()
+                .collect::<Vec<_>>();
+
+            for limit in [0, 1, 2, 7, 25, 64, 101, 102] {
+                let bounded = catalog
+                    .execute_select(&format!("{full_query} LIMIT {limit}"))
+                    .unwrap()
+                    .row_indices()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    bounded,
+                    fully_sorted[..fully_sorted.len().min(limit)],
+                    "{order_by}{predicate} LIMIT {limit}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn orders_empty_tables_and_reports_missing_order_fields() {
     let mut catalog = Catalog::new();
     catalog
@@ -603,6 +713,15 @@ fn orders_empty_tables_and_reports_missing_order_fields() {
     assert_eq!(
         catalog
             .execute_select("SELECT id FROM empty ORDER BY missing")
+            .unwrap_err(),
+        CatalogError::OrderFieldNotFound {
+            name: "missing".to_owned(),
+        }
+    );
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT id FROM empty ORDER BY id, missing DESC LIMIT 0")
             .unwrap_err(),
         CatalogError::OrderFieldNotFound {
             name: "missing".to_owned(),

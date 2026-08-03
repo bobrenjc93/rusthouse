@@ -13,7 +13,9 @@ use std::sync::{Arc, Barrier};
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
 };
-use rusthouse::{Catalog, CatalogError, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, Value};
+use rusthouse::{
+    Catalog, CatalogError, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, SelectParseLimits, Value,
+};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -643,6 +645,32 @@ fn reports_catalog_capacity_as_a_limit() {
         format!(
             "rusthouse: resource limit exceeded on line {}: catalog table count exceeds limit of {DEFAULT_MAX_TABLES}\n",
             DEFAULT_MAX_TABLES + 1
+        )
+    );
+}
+
+#[test]
+fn reports_excessive_order_keys_as_a_resource_limit() {
+    let limit = SelectParseLimits::DEFAULT_MAX_ORDER_KEYS;
+    let mut input = String::from("SELECT id FROM events ORDER BY ");
+    for key in 0..=limit {
+        if key != 0 {
+            input.push_str(", ");
+        }
+        input.push_str("id");
+    }
+    let excess_key_position = input.rfind("id").unwrap();
+    input.push('\n');
+
+    let output = run(&[], input.as_bytes());
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "rusthouse: resource limit exceeded on line 1: SQL parse error at byte \
+             {excess_key_position}: order key count exceeds limit of {limit}\n"
         )
     );
 }

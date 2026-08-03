@@ -140,7 +140,7 @@ pub enum CatalogError {
     },
     /// Memory could not be reserved for ordered row indexes.
     OrderAllocationFailed {
-        /// Number of selected rows whose indexes could not be reserved.
+        /// Number of row indexes the executor attempted to reserve.
         row_count: usize,
     },
     /// A `WHERE` comparison could not be scanned against its target table.
@@ -679,7 +679,8 @@ impl Catalog {
     /// The returned result borrows the source table and does not copy table
     /// rows. Each `WHERE` comparison is evaluated with [`Table::scan`]. Packed
     /// selections are intersected within `AND` groups and unioned across `OR`
-    /// groups. For row projections, `ORDER BY` owns and sorts only selected row
+    /// groups. For row projections, unlimited `ORDER BY` owns and sorts all
+    /// selected row indexes, while `ORDER BY ... LIMIT k` retains at most `k`
     /// indexes. Scalar aggregate rows retain at most
     /// [`MAX_AGGREGATE_RESULT_BYTES`] of String payloads. `LIMIT` is applied to
     /// the final projected or aggregate output.
@@ -736,14 +737,9 @@ impl Catalog {
                 let selection = scan_predicate_groups(table, predicate_groups, &name)?;
 
                 let (selection, ordered_rows, row_end, row_count) = match order {
-                    Some((column_index, direction)) => {
-                        let rows = ordered_row_indices(
-                            table,
-                            column_index,
-                            direction,
-                            selection.as_ref(),
-                            limit,
-                        )?;
+                    Some(order_keys) => {
+                        let rows =
+                            ordered_row_indices(table, &order_keys, selection.as_ref(), limit)?;
                         let row_count = rows.len();
                         (None, Some(rows), 0, row_count)
                     }
@@ -815,7 +811,7 @@ fn execute_aggregates<'a>(
     table: &'a Table,
     table_name: &str,
     predicate_groups: Vec<Vec<ComparisonPredicate>>,
-    order_by: Option<OrderByClause>,
+    order_by: Option<Vec<OrderByClause>>,
     limit: Option<usize>,
     aggregate_result_byte_limit: usize,
     aggregates: impl ExactSizeIterator<Item = AggregateProjection>,
@@ -1071,47 +1067,161 @@ fn limited_row_bounds(
 
 fn resolve_order(
     table: &Table,
-    order_by: OrderByClause,
-) -> Result<(usize, OrderDirection), CatalogError> {
-    table
-        .fields()
-        .iter()
-        .position(|field| field.name() == order_by.column)
-        .map(|index| (index, order_by.direction))
-        .ok_or(CatalogError::OrderFieldNotFound {
-            name: order_by.column,
+    order_by: Vec<OrderByClause>,
+) -> Result<Vec<(usize, OrderDirection)>, CatalogError> {
+    order_by
+        .into_iter()
+        .map(|order_key| {
+            table
+                .fields()
+                .iter()
+                .position(|field| field.name() == order_key.column)
+                .map(|index| (index, order_key.direction))
+                .ok_or(CatalogError::OrderFieldNotFound {
+                    name: order_key.column,
+                })
         })
+        .collect()
 }
 
 fn ordered_row_indices(
     table: &Table,
-    column_index: usize,
-    direction: OrderDirection,
+    order_keys: &[(usize, OrderDirection)],
     selection: Option<&RowSelection>,
     limit: Option<usize>,
 ) -> Result<Vec<usize>, CatalogError> {
+    match limit {
+        Some(limit) => bounded_ordered_row_indices(table, order_keys, selection, limit),
+        None => fully_ordered_row_indices(table, order_keys, selection),
+    }
+}
+
+fn fully_ordered_row_indices(
+    table: &Table,
+    order_keys: &[(usize, OrderDirection)],
+    selection: Option<&RowSelection>,
+) -> Result<Vec<usize>, CatalogError> {
     let row_count = selection.map_or(table.len(), RowSelection::selected_count);
-    let mut rows = Vec::new();
-    rows.try_reserve_exact(row_count)
-        .map_err(|_| CatalogError::OrderAllocationFailed { row_count })?;
+    let mut rows = try_order_row_buffer(row_count)?;
     match selection {
         Some(selection) => rows.extend(selection.selected_rows()),
         None => rows.extend(0..table.len()),
     }
 
-    let column = &table.columns()[column_index];
-    rows.sort_unstable_by(|left, right| {
-        let value_order = compare_column_rows(column, *left, *right);
-        let directed_order = match direction {
-            OrderDirection::Ascending => value_order,
-            OrderDirection::Descending => value_order.reverse(),
-        };
-        directed_order.then_with(|| left.cmp(right))
-    });
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
+    let order = RowOrder::new(table, order_keys);
+    rows.sort_unstable_by(|left, right| order.compare(*left, *right));
     Ok(rows)
+}
+
+fn bounded_ordered_row_indices(
+    table: &Table,
+    order_keys: &[(usize, OrderDirection)],
+    selection: Option<&RowSelection>,
+    limit: usize,
+) -> Result<Vec<usize>, CatalogError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let row_count = selection.map_or(table.len(), RowSelection::selected_count);
+    let retained_count = row_count.min(limit);
+    let mut rows = try_order_row_buffer(retained_count)?;
+    let order = RowOrder::new(table, order_keys);
+
+    match selection {
+        Some(selection) => {
+            for row in selection.selected_rows() {
+                retain_top_row(&mut rows, row, retained_count, order);
+            }
+        }
+        None => {
+            for row in 0..table.len() {
+                retain_top_row(&mut rows, row, retained_count, order);
+            }
+        }
+    }
+
+    rows.sort_unstable_by(|left, right| order.compare(*left, *right));
+    Ok(rows)
+}
+
+fn try_order_row_buffer(row_count: usize) -> Result<Vec<usize>, CatalogError> {
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(row_count)
+        .map_err(|_| CatalogError::OrderAllocationFailed { row_count })?;
+    Ok(rows)
+}
+
+#[derive(Clone, Copy)]
+struct RowOrder<'a> {
+    table: &'a Table,
+    order_keys: &'a [(usize, OrderDirection)],
+}
+
+impl<'a> RowOrder<'a> {
+    const fn new(table: &'a Table, order_keys: &'a [(usize, OrderDirection)]) -> Self {
+        Self { table, order_keys }
+    }
+
+    fn compare(self, left: usize, right: usize) -> Ordering {
+        self.order_keys
+            .iter()
+            .map(|(column_index, direction)| {
+                let value_order =
+                    compare_column_rows(&self.table.columns()[*column_index], left, right);
+                match direction {
+                    OrderDirection::Ascending => value_order,
+                    OrderDirection::Descending => value_order.reverse(),
+                }
+            })
+            .find(|order| *order != Ordering::Equal)
+            .unwrap_or_else(|| left.cmp(&right))
+    }
+}
+
+fn retain_top_row(rows: &mut Vec<usize>, row: usize, limit: usize, order: RowOrder<'_>) {
+    // This max-heap keeps the worst retained row at its root for replacement.
+    if rows.len() < limit {
+        rows.push(row);
+        sift_order_heap_up(rows, order);
+    } else if order.compare(row, rows[0]).is_lt() {
+        rows[0] = row;
+        sift_order_heap_down(rows, order);
+    }
+}
+
+fn sift_order_heap_up(rows: &mut [usize], order: RowOrder<'_>) {
+    let mut child = rows.len() - 1;
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        if !order.compare(rows[parent], rows[child]).is_lt() {
+            break;
+        }
+        rows.swap(parent, child);
+        child = parent;
+    }
+}
+
+fn sift_order_heap_down(rows: &mut [usize], order: RowOrder<'_>) {
+    let mut parent = 0;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= rows.len() {
+            break;
+        }
+        let right = left + 1;
+        let greater_child = if right < rows.len() && order.compare(rows[left], rows[right]).is_lt()
+        {
+            right
+        } else {
+            left
+        };
+        if !order.compare(rows[parent], rows[greater_child]).is_lt() {
+            break;
+        }
+        rows.swap(parent, greater_child);
+        parent = greater_child;
+    }
 }
 
 fn compare_column_rows(column: &Column, left: usize, right: usize) -> Ordering {
@@ -1182,4 +1292,37 @@ fn resolve_projection(
         }
     }
     Ok(indices)
+}
+
+#[cfg(test)]
+mod ordered_row_tests {
+    use super::*;
+
+    #[test]
+    fn zero_and_empty_bounded_orders_have_no_row_buffer() {
+        let mut table = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
+        table
+            .insert_batch((0..4).map(|id| vec![Value::Int64(id)]))
+            .unwrap();
+        let order_keys = [(0, OrderDirection::Ascending)];
+
+        let zero = bounded_ordered_row_indices(&table, &order_keys, None, 0).unwrap();
+        assert!(zero.is_empty());
+        assert_eq!(zero.capacity(), 0);
+
+        let empty = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
+        let empty_rows = bounded_ordered_row_indices(&empty, &order_keys, None, 25).unwrap();
+        assert!(empty_rows.is_empty());
+        assert_eq!(empty_rows.capacity(), 0);
+    }
+
+    #[test]
+    fn order_row_buffer_reports_capacity_overflow() {
+        assert_eq!(
+            try_order_row_buffer(usize::MAX),
+            Err(CatalogError::OrderAllocationFailed {
+                row_count: usize::MAX,
+            })
+        );
+    }
 }
