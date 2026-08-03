@@ -256,6 +256,44 @@ fn loads_a_table_from_an_explicit_fallback_snapshot() {
 }
 
 #[test]
+fn fallback_recovered_tables_support_grouped_and_distinct_counts() {
+    let directory = TestDirectory::new("fallback-counts");
+    let primary = directory.named_snapshot("primary.snapshot");
+    let fallback = directory.named_snapshot("fallback.snapshot");
+    let snapshots = SnapshotStore::new(4 * 1024);
+    let mut source = Catalog::new();
+    source
+        .execute_create("CREATE TABLE source (region String, customer Int64)")
+        .unwrap();
+    source
+        .execute_insert("INSERT INTO source VALUES ('east', 1), ('east', 1), ('west', 2)")
+        .unwrap();
+    source.save_table("source", &fallback, &snapshots).unwrap();
+    fs::write(&primary, b"truncated").unwrap();
+
+    let mut recovered = Catalog::new();
+    recovered
+        .load_table_with_fallback("events", &primary, &fallback, &snapshots)
+        .unwrap();
+
+    let grouped = recovered
+        .execute_select("SELECT region, COUNT(*) FROM events GROUP BY region")
+        .unwrap();
+    assert_eq!(
+        grouped.grouped_rows().collect::<Vec<_>>(),
+        [
+            (&rusthouse::Value::from("east"), 2),
+            (&rusthouse::Value::from("west"), 1),
+        ]
+    );
+
+    let distinct = recovered
+        .execute_select("SELECT COUNT(DISTINCT customer) FROM events")
+        .unwrap();
+    assert_eq!(distinct.scalar_value(), Some(&rusthouse::Value::Int64(2)));
+}
+
+#[test]
 fn invalid_fallback_generations_and_size_limits_leave_catalog_unchanged() {
     let directory = TestDirectory::new("fallback-rollback");
     let primary = directory.named_snapshot("primary.snapshot");

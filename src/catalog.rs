@@ -710,9 +710,9 @@ impl Catalog {
     ///
     /// Duplicate-name and table-count checks happen before either path is
     /// opened. Fallback eligibility is defined by
-    /// [`SnapshotStore::read_with_fallback`]. Both snapshot generations are
-    /// fully validated and decoded before catalog allocation and insertion, so
-    /// every failure leaves the catalog's table set unchanged.
+    /// [`SnapshotStore::read_with_fallback`]. The selected snapshot is fully
+    /// envelope-validated and decoded before catalog allocation and insertion,
+    /// so every failure leaves the catalog's table set unchanged.
     pub fn load_table_with_fallback(
         &mut self,
         name: &str,
