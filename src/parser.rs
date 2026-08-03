@@ -127,6 +127,7 @@ impl InsertStatement {
 pub struct SelectStatement {
     column_name: Identifier,
     table_name: Identifier,
+    limit: Option<usize>,
 }
 
 impl SelectStatement {
@@ -138,6 +139,11 @@ impl SelectStatement {
     /// Returns the source table name.
     pub fn table_name(&self) -> &Identifier {
         &self.table_name
+    }
+
+    /// Returns the maximum number of rows requested by the statement.
+    pub const fn limit(&self) -> Option<usize> {
+        self.limit
     }
 }
 
@@ -163,6 +169,10 @@ pub enum ParseError {
     InvalidInt64 { offset: usize },
     /// A syntactically valid decimal integer is outside the `Int64` range.
     Int64Overflow { offset: usize },
+    /// A `LIMIT` value is not an unsigned decimal integer.
+    InvalidLimit { offset: usize },
+    /// A syntactically valid `LIMIT` value is outside the platform row-index range.
+    LimitOverflow { offset: usize },
     /// Another row follows the single row supported by the grammar.
     ExtraRows { offset: usize },
     /// Non-whitespace input remained after the closing parenthesis.
@@ -192,6 +202,12 @@ impl fmt::Display for ParseError {
             }
             Self::Int64Overflow { offset } => {
                 write!(formatter, "Int64 literal at byte {offset} is out of range")
+            }
+            Self::InvalidLimit { offset } => {
+                write!(formatter, "invalid LIMIT value at byte {offset}")
+            }
+            Self::LimitOverflow { offset } => {
+                write!(formatter, "LIMIT value at byte {offset} is out of range")
             }
             Self::ExtraRows { offset } => {
                 write!(
@@ -289,12 +305,13 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 /// accepted grammar is:
 ///
 /// ```text
-/// SELECT identifier FROM identifier [;]
+/// SELECT identifier FROM identifier [LIMIT unsigned-integer] [;]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
-/// before or after the optional semicolon. Statement limits and all reported
-/// offsets are measured in bytes.
+/// before or after the optional `LIMIT` and semicolon. `LIMIT` accepts zero and
+/// must fit in `usize`. Statement limits and all reported offsets are measured
+/// in bytes.
 ///
 /// # Examples
 ///
@@ -302,12 +319,13 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 /// use rusthouse::{ParseLimits, parse_select};
 ///
 /// let statement = parse_select(
-///     "SELECT event_id FROM events;",
+///     "SELECT event_id FROM events LIMIT 10;",
 ///     ParseLimits::default(),
 /// )?;
 ///
 /// assert_eq!(statement.column_name().as_str(), "event_id");
 /// assert_eq!(statement.table_name().as_str(), "events");
+/// assert_eq!(statement.limit(), Some(10));
 /// # Ok::<(), rusthouse::ParseError>(())
 /// ```
 pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement, ParseError> {
@@ -434,6 +452,16 @@ impl<'input> Parser<'input> {
         let table_name = self.parse_identifier()?;
         self.skip_whitespace();
 
+        let limit = if self.keyword_at_position("LIMIT") {
+            self.expect_keyword("LIMIT")?;
+            self.require_whitespace("whitespace after LIMIT")?;
+            let limit = self.parse_limit()?;
+            self.skip_whitespace();
+            Some(limit)
+        } else {
+            None
+        };
+
         if self.peek() == Some(b';') {
             self.position += 1;
             self.skip_whitespace();
@@ -447,7 +475,27 @@ impl<'input> Parser<'input> {
         Ok(SelectStatement {
             column_name,
             table_name,
+            limit,
         })
+    }
+
+    fn parse_limit(&mut self) -> Result<usize, ParseError> {
+        let start = self.position;
+        while self
+            .peek()
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && byte != b';')
+        {
+            self.position += 1;
+        }
+
+        let literal = &self.input[start..self.position];
+        if literal.is_empty() || !literal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseError::InvalidLimit { offset: start });
+        }
+
+        literal
+            .parse()
+            .map_err(|_| ParseError::LimitOverflow { offset: start })
     }
 
     fn parse_int64_value(&mut self) -> Result<Option<i64>, ParseError> {

@@ -1,8 +1,9 @@
 # Snapshot envelope format
 
-RustHouse snapshot payloads use a versioned binary envelope. The envelope is a
-corruption and resource boundary only: catalog serialization and atomic file
-replacement are deliberately outside this format.
+RustHouse snapshots use a versioned binary envelope. The envelope provides a
+corruption and resource boundary. The first defined payload serializes nullable
+`Int64` rows; catalog serialization and atomic file replacement remain outside
+this format.
 
 ## Version 1 layout
 
@@ -35,3 +36,32 @@ payload above that bound. Decoding validates, in order:
 Short input, trailing input, incompatible formats, unsupported versions,
 oversized declarations, and checksum mismatches produce distinct typed errors.
 The decoder borrows the payload from the input and performs no allocation.
+
+## Nullable Int64 row payload
+
+`NullableI64PayloadCodec` defines a deterministic payload for one nullable
+`Int64` column. It is intended to be encoded as the opaque payload of a version
+1 snapshot envelope. All integers are little-endian, and rows retain their
+input order.
+
+| Offset | Size | Field | Value |
+| ---: | ---: | --- | --- |
+| 0 | 8 | Row count | Number of rows (`u64`) |
+| 8 | Variable | Rows | Exactly `row count` tagged rows |
+
+Each row begins with a one-byte tag:
+
+| Tag | Following bytes | Meaning |
+| ---: | ---: | --- |
+| `0x00` | 0 | `NULL` |
+| `0x01` | 8 | Present signed `Int64` value (`i64`) |
+
+No padding or trailing bytes are permitted. For example, `[NULL, -1]` is
+encoded as the row count `02 00 00 00 00 00 00 00`, followed by `00`, then
+`01 ff ff ff ff ff ff ff ff`.
+
+Callers configure inclusive row and payload-byte limits. Both limits are
+checked during encoding before allocation. Decoding checks the input byte
+length and declared row count before allocation, validates every tag and value,
+rejects truncation and trailing data, and only then allocates the decoded row
+vector. The payload-byte limit includes the row-count field, tags, and values.
