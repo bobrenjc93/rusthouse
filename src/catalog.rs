@@ -1,4 +1,4 @@
-//! In-memory ownership and `CREATE TABLE`/`INSERT` execution.
+//! In-memory ownership and `CREATE TABLE`/`INSERT`/`SELECT` execution.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -6,9 +6,11 @@ use std::fmt;
 
 use crate::sql::{
     CreateTableStatement, InsertParseLimits, InsertStatement, ParseError, ParseLimits,
-    parse_create_table_with_limits, parse_insert_with_limits,
+    SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
+    parse_insert_with_limits, parse_select_with_limits,
 };
 use crate::storage::{DEFAULT_ROW_LIMIT, Field, Table, TableError};
+use crate::{RowSelection, ScanError};
 
 /// Default maximum number of tables owned by one [`Catalog`].
 pub const DEFAULT_MAX_TABLES: usize = 1024;
@@ -20,6 +22,8 @@ pub struct CatalogLimits {
     pub parse: ParseLimits,
     /// Limits applied while parsing each `INSERT` statement.
     pub insert_parse: InsertParseLimits,
+    /// Limits applied while parsing each `SELECT` statement.
+    pub select_parse: SelectParseLimits,
     /// Maximum number of tables the catalog may own.
     pub max_tables: usize,
     /// Maximum number of rows accepted by each newly created table.
@@ -33,6 +37,7 @@ impl CatalogLimits {
         Self {
             parse,
             insert_parse: default_insert_parse_limits(),
+            select_parse: default_select_parse_limits(),
             max_tables,
             max_rows_per_table,
         }
@@ -42,6 +47,13 @@ impl CatalogLimits {
     #[must_use]
     pub const fn with_insert_parse_limits(mut self, insert_parse: InsertParseLimits) -> Self {
         self.insert_parse = insert_parse;
+        self
+    }
+
+    /// Replaces the limits applied while parsing `SELECT` statements.
+    #[must_use]
+    pub const fn with_select_parse_limits(mut self, select_parse: SelectParseLimits) -> Self {
+        self.select_parse = select_parse;
         self
     }
 }
@@ -85,6 +97,23 @@ pub enum CatalogError {
         /// Storage-layer validation or capacity failure.
         source: TableError,
     },
+    /// A requested projection field does not exist in the table schema.
+    ProjectionFieldNotFound {
+        /// Case-sensitive name used in the projection.
+        name: String,
+    },
+    /// Memory could not be reserved for resolved projection indexes.
+    ProjectionAllocationFailed {
+        /// Number of projected fields whose indexes could not be reserved.
+        field_count: usize,
+    },
+    /// A `WHERE` comparison could not be scanned against its target table.
+    TableScan {
+        /// Name from the rejected statement.
+        name: String,
+        /// Scan validation or allocation failure.
+        source: ScanError,
+    },
     /// Creating another table would exceed the configured catalog bound.
     TableLimitExceeded {
         /// Maximum number of tables allowed in the catalog.
@@ -106,6 +135,16 @@ impl fmt::Display for CatalogError {
             Self::TableInsertion { name, source } => {
                 write!(formatter, "could not insert into table `{name}`: {source}")
             }
+            Self::ProjectionFieldNotFound { name } => {
+                write!(formatter, "projected field `{name}` does not exist")
+            }
+            Self::ProjectionAllocationFailed { field_count } => write!(
+                formatter,
+                "could not reserve indexes for {field_count} projected fields"
+            ),
+            Self::TableScan { name, source } => {
+                write!(formatter, "could not scan table `{name}`: {source}")
+            }
             Self::TableLimitExceeded { limit } => {
                 write!(formatter, "catalog table count exceeds limit of {limit}")
             }
@@ -123,6 +162,7 @@ impl Error for CatalogError {
             Self::TableConstruction { source, .. } | Self::TableInsertion { source, .. } => {
                 Some(source)
             }
+            Self::TableScan { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -138,6 +178,69 @@ impl From<ParseError> for CatalogError {
 struct CatalogEntry {
     name: String,
     table: Table,
+}
+
+/// The borrowed output of one projection and optional comparison scan.
+///
+/// The result owns only projected column indexes and, for a filtered query, a
+/// compact row-selection bitmap. Schema and column values remain owned by the
+/// catalog's source table.
+#[derive(Debug)]
+pub struct SelectResult<'a> {
+    table: &'a Table,
+    field_indices: Vec<usize>,
+    selection: Option<RowSelection>,
+}
+
+impl<'a> SelectResult<'a> {
+    /// Returns the table whose schema and column values back this result.
+    #[must_use]
+    pub const fn table(&self) -> &'a Table {
+        self.table
+    }
+
+    /// Iterates over projected fields in statement order.
+    pub fn projected_fields(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
+        self.field_indices
+            .iter()
+            .map(|index| &self.table.fields()[*index])
+    }
+
+    /// Alias for [`Self::projected_fields`].
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
+        self.projected_fields()
+    }
+
+    /// Iterates over selected zero-based indexes in source table order.
+    pub fn selected_rows(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        (0..self.table.len()).filter(|row| match &self.selection {
+            Some(selection) => selection
+                .get(*row)
+                .expect("selection and source table have the same row count"),
+            None => true,
+        })
+    }
+
+    /// Alias for [`Self::selected_rows`].
+    pub fn row_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.selected_rows()
+    }
+
+    /// Returns the number of selected rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.selection
+            .as_ref()
+            .map_or(self.table.len(), RowSelection::selected_count)
+    }
+
+    /// Returns whether no source rows matched the query.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A bounded collection of named, in-memory tables.
@@ -255,6 +358,43 @@ impl Catalog {
             .map_err(|source| CatalogError::TableInsertion { name, source })
     }
 
+    /// Parses and executes one bounded projection `SELECT` statement.
+    ///
+    /// The returned result borrows the source table and does not copy table
+    /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
+    pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
+        let statement = parse_select_with_limits(input, self.limits.select_parse)?;
+        self.select(statement)
+    }
+
+    /// Executes an already parsed projection `SELECT` statement.
+    ///
+    /// This is the typed execution boundary used by [`Self::execute_select`].
+    pub fn select(&self, statement: SelectStatement) -> Result<SelectResult<'_>, CatalogError> {
+        let SelectStatement {
+            projections,
+            table: name,
+            predicate,
+        } = statement;
+        let table = self
+            .tables
+            .get(&normalize_table_name(&name))
+            .map(|entry| &entry.table)
+            .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
+
+        let field_indices = resolve_projection(table, projections)?;
+        let selection = predicate
+            .map(|predicate| table.scan(&predicate.column, predicate.operator, &predicate.value))
+            .transpose()
+            .map_err(|source| CatalogError::TableScan { name, source })?;
+
+        Ok(SelectResult {
+            table,
+            field_indices,
+            selection,
+        })
+    }
+
     /// Returns a table by ASCII case-insensitive name.
     pub fn table(&self, name: &str) -> Result<&Table, CatalogError> {
         self.tables
@@ -314,6 +454,42 @@ const fn default_insert_parse_limits() -> InsertParseLimits {
     )
 }
 
+const fn default_select_parse_limits() -> SelectParseLimits {
+    SelectParseLimits::new(
+        SelectParseLimits::DEFAULT_MAX_INPUT_BYTES,
+        SelectParseLimits::DEFAULT_MAX_PROJECTIONS,
+    )
+}
+
 fn normalize_table_name(name: &str) -> String {
     name.to_ascii_lowercase()
+}
+
+fn resolve_projection(
+    table: &Table,
+    projection: SelectProjection,
+) -> Result<Vec<usize>, CatalogError> {
+    let field_count = match &projection {
+        SelectProjection::All => table.fields().len(),
+        SelectProjection::Columns(names) => names.len(),
+    };
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(field_count)
+        .map_err(|_| CatalogError::ProjectionAllocationFailed { field_count })?;
+
+    match projection {
+        SelectProjection::All => indices.extend(0..field_count),
+        SelectProjection::Columns(names) => {
+            for name in names {
+                let index = table
+                    .fields()
+                    .iter()
+                    .position(|field| field.name() == name)
+                    .ok_or(CatalogError::ProjectionFieldNotFound { name })?;
+                indices.push(index);
+            }
+        }
+    }
+    Ok(indices)
 }
