@@ -58,6 +58,38 @@
         "eval_56a6f83a": 15,
         "eval_a8d9ce71": 0
       }
+    },
+    {
+      "key": "base:ee0cc4cde9ad2fcf00db1c6839e249108ffb8581",
+      "commit": "ee0cc4cde9ad2fcf00db1c6839e249108ffb8581",
+      "recordedAt": "2026-08-03T03:44:15.187Z",
+      "label": "base ee0cc4c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_69c46252": 25,
+        "eval_ed4d7712": 65,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 15,
+        "eval_a8d9ce71": 0
+      }
+    },
+    {
+      "key": "pr:291",
+      "recordedAt": "2026-08-03T03:44:15.187Z",
+      "label": "PR #291",
+      "kind": "leaf",
+      "prNumber": 291,
+      "title": "Persist and reopen one columnar table",
+      "scores": {
+        "eval_69c46252": 30,
+        "eval_ed4d7712": 65,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 20,
+        "eval_a8d9ce71": 100
+      }
     }
   ]
 }
