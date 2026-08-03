@@ -1,5 +1,6 @@
 //! In-memory ownership and `CREATE TABLE`/`INSERT`/`SELECT` execution.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -7,9 +8,9 @@ use std::path::Path;
 
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
-    CreateTableStatement, InsertParseLimits, InsertStatement, ParseError, ParseLimits,
-    SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
-    parse_insert_with_limits, parse_select_with_limits,
+    CreateTableStatement, InsertParseLimits, InsertStatement, OrderByClause, OrderDirection,
+    ParseError, ParseLimits, SelectParseLimits, SelectProjection, SelectStatement,
+    parse_create_table_with_limits, parse_insert_with_limits, parse_select_with_limits,
 };
 use crate::storage::{Column, DEFAULT_ROW_LIMIT, Field, Table, TableError};
 use crate::table_snapshot::TableSnapshotError;
@@ -110,6 +111,16 @@ pub enum CatalogError {
         /// Number of projected fields whose indexes could not be reserved.
         field_count: usize,
     },
+    /// The field named by an `ORDER BY` clause does not exist in the table.
+    OrderFieldNotFound {
+        /// Case-sensitive name used in the clause.
+        name: String,
+    },
+    /// Memory could not be reserved for ordered row indexes.
+    OrderAllocationFailed {
+        /// Number of selected rows whose indexes could not be reserved.
+        row_count: usize,
+    },
     /// A `WHERE` comparison could not be scanned against its target table.
     TableScan {
         /// Name from the rejected statement.
@@ -145,6 +156,15 @@ impl fmt::Display for CatalogError {
                 formatter,
                 "could not reserve indexes for {field_count} projected fields"
             ),
+            Self::OrderFieldNotFound { name } => {
+                write!(formatter, "ordered field `{name}` does not exist")
+            }
+            Self::OrderAllocationFailed { row_count } => {
+                write!(
+                    formatter,
+                    "could not reserve indexes for {row_count} ordered rows"
+                )
+            }
             Self::TableScan { name, source } => {
                 write!(formatter, "could not scan table `{name}`: {source}")
             }
@@ -224,14 +244,18 @@ struct CatalogEntry {
 
 /// The borrowed output of one projection and optional comparison scan.
 ///
-/// The result owns only projected column indexes and, for a filtered query, a
-/// compact row-selection bitmap. Schema and column values remain owned by the
-/// catalog's source table.
+/// The result owns only projected column indexes and, for an unordered filtered
+/// query, a compact row-selection bitmap. Ordered results instead own their
+/// bounded row indexes. Schema and column values remain owned by the source
+/// table.
 #[derive(Debug)]
 pub struct SelectResult<'a> {
     table: &'a Table,
     field_indices: Vec<usize>,
     selection: Option<RowSelection>,
+    ordered_rows: Option<Vec<usize>>,
+    row_end: usize,
+    row_count: usize,
 }
 
 impl<'a> SelectResult<'a> {
@@ -263,14 +287,9 @@ impl<'a> SelectResult<'a> {
             .map(|index| &self.table.columns()[*index])
     }
 
-    /// Iterates over selected zero-based indexes in source table order.
+    /// Iterates over selected zero-based indexes in result order.
     pub fn selected_rows(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        (0..self.table.len()).filter(|row| match &self.selection {
-            Some(selection) => selection
-                .get(*row)
-                .expect("selection and source table have the same row count"),
-            None => true,
-        })
+        SelectedRows::new(self)
     }
 
     /// Alias for [`Self::selected_rows`].
@@ -281,15 +300,80 @@ impl<'a> SelectResult<'a> {
     /// Returns the number of selected rows.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.selection
-            .as_ref()
-            .map_or(self.table.len(), RowSelection::selected_count)
+        self.row_count
     }
 
-    /// Returns whether no source rows matched the query.
+    /// Returns whether the result contains no rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+struct SelectedRows<'a> {
+    source: SelectedRowSource<'a>,
+}
+
+enum SelectedRowSource<'a> {
+    Ordered(std::slice::Iter<'a, usize>),
+    Natural {
+        rows: std::ops::Range<usize>,
+        selection: Option<&'a RowSelection>,
+    },
+}
+
+impl<'a> SelectedRows<'a> {
+    fn new(result: &'a SelectResult<'_>) -> Self {
+        let source = match &result.ordered_rows {
+            Some(rows) => SelectedRowSource::Ordered(rows.iter()),
+            None => SelectedRowSource::Natural {
+                rows: 0..result.row_end,
+                selection: result.selection.as_ref(),
+            },
+        };
+        Self { source }
+    }
+}
+
+impl Iterator for SelectedRows<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            SelectedRowSource::Ordered(rows) => rows.next().copied(),
+            SelectedRowSource::Natural { rows, selection } => rows.find(|row| {
+                selection.is_none_or(|selection| {
+                    selection
+                        .get(*row)
+                        .expect("selection and source table have the same row count")
+                })
+            }),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.source {
+            SelectedRowSource::Ordered(rows) => rows.size_hint(),
+            SelectedRowSource::Natural { rows, selection } => match selection {
+                None => rows.size_hint(),
+                Some(_) => (0, Some(rows.len())),
+            },
+        }
+    }
+}
+
+impl DoubleEndedIterator for SelectedRows<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            SelectedRowSource::Ordered(rows) => rows.next_back().copied(),
+            SelectedRowSource::Natural { rows, selection } => rows.rfind(|row| {
+                selection.is_none_or(|selection| {
+                    selection
+                        .get(*row)
+                        .expect("selection and source table have the same row count")
+                })
+            }),
+        }
     }
 }
 
@@ -472,6 +556,8 @@ impl Catalog {
     ///
     /// The returned result borrows the source table and does not copy table
     /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
+    /// `ORDER BY` owns and sorts only selected row indexes, and `LIMIT` is
+    /// applied after filtering and ordering.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -485,6 +571,8 @@ impl Catalog {
             projections,
             table: name,
             predicate,
+            order_by,
+            limit,
         } = statement;
         let table = self
             .tables
@@ -493,15 +581,35 @@ impl Catalog {
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
 
         let field_indices = resolve_projection(table, projections)?;
+        let order = order_by
+            .map(|order_by| resolve_order(table, order_by))
+            .transpose()?;
         let selection = predicate
             .map(|predicate| table.scan(&predicate.column, predicate.operator, &predicate.value))
             .transpose()
             .map_err(|source| CatalogError::TableScan { name, source })?;
 
+        let (selection, ordered_rows, row_end, row_count) = match order {
+            Some((column_index, direction)) => {
+                let rows =
+                    ordered_row_indices(table, column_index, direction, selection.as_ref(), limit)?;
+                let row_count = rows.len();
+                (None, Some(rows), 0, row_count)
+            }
+            None => {
+                let (row_end, row_count) =
+                    limited_row_bounds(table.len(), selection.as_ref(), limit);
+                (selection, None, row_end, row_count)
+            }
+        };
+
         Ok(SelectResult {
             table,
             field_indices,
             selection,
+            ordered_rows,
+            row_end,
+            row_count,
         })
     }
 
@@ -546,6 +654,80 @@ impl Catalog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
+    }
+}
+
+fn limited_row_bounds(
+    table_rows: usize,
+    selection: Option<&RowSelection>,
+    limit: Option<usize>,
+) -> (usize, usize) {
+    let selected_count = selection.map_or(table_rows, RowSelection::selected_count);
+    let row_count = limit.map_or(selected_count, |limit| selected_count.min(limit));
+    let row_end = match selection {
+        None => row_count,
+        Some(_) if row_count == 0 => 0,
+        Some(selection) if row_count < selected_count => selection
+            .selected_rows()
+            .nth(row_count - 1)
+            .map_or(0, |row| row + 1),
+        Some(_) => table_rows,
+    };
+
+    (row_end, row_count)
+}
+
+fn resolve_order(
+    table: &Table,
+    order_by: OrderByClause,
+) -> Result<(usize, OrderDirection), CatalogError> {
+    table
+        .fields()
+        .iter()
+        .position(|field| field.name() == order_by.column)
+        .map(|index| (index, order_by.direction))
+        .ok_or(CatalogError::OrderFieldNotFound {
+            name: order_by.column,
+        })
+}
+
+fn ordered_row_indices(
+    table: &Table,
+    column_index: usize,
+    direction: OrderDirection,
+    selection: Option<&RowSelection>,
+    limit: Option<usize>,
+) -> Result<Vec<usize>, CatalogError> {
+    let row_count = selection.map_or(table.len(), RowSelection::selected_count);
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(row_count)
+        .map_err(|_| CatalogError::OrderAllocationFailed { row_count })?;
+    match selection {
+        Some(selection) => rows.extend(selection.selected_rows()),
+        None => rows.extend(0..table.len()),
+    }
+
+    let column = &table.columns()[column_index];
+    rows.sort_unstable_by(|left, right| {
+        let value_order = compare_column_rows(column, *left, *right);
+        let directed_order = match direction {
+            OrderDirection::Ascending => value_order,
+            OrderDirection::Descending => value_order.reverse(),
+        };
+        directed_order.then_with(|| left.cmp(right))
+    });
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
+}
+
+fn compare_column_rows(column: &Column, left: usize, right: usize) -> Ordering {
+    match column {
+        Column::Int64(values) => values[left].cmp(&values[right]),
+        Column::Float64(values) => values[left].total_cmp(&values[right]),
+        Column::Bool(values) => values[left].cmp(&values[right]),
+        Column::String(values) => values[left].cmp(&values[right]),
     }
 }
 
