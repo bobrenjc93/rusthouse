@@ -84,6 +84,8 @@ pub enum SnapshotError {
     UnsupportedVersion { found: u16, supported: u16 },
     /// Bytes follow the end of the declared payload.
     TrailingData { expected_len: u64, actual_len: u64 },
+    /// Memory could not be reserved for the bounded payload.
+    AllocationFailed { requested_len: u64 },
     /// A filesystem operation failed for a reason not represented above.
     Io {
         operation: &'static str,
@@ -123,6 +125,10 @@ impl fmt::Display for SnapshotError {
             } => write!(
                 formatter,
                 "snapshot has trailing data: expected {expected_len} bytes, found {actual_len}"
+            ),
+            Self::AllocationFailed { requested_len } => write!(
+                formatter,
+                "could not reserve memory for a {requested_len}-byte snapshot payload"
             ),
             Self::Io {
                 operation,
@@ -294,7 +300,13 @@ impl SnapshotStore {
                 .expect("snapshot checksum has a fixed width"),
         );
         let payload_size = usize::try_from(payload_len).map_err(|_| self.oversized(payload_len))?;
-        let mut payload = vec![0; payload_size];
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_size)
+            .map_err(|_| SnapshotError::AllocationFailed {
+                requested_len: payload_len,
+            })?;
+        payload.resize(payload_size, 0);
         read_exact(&mut file, &mut payload, path, expected_len)?;
 
         let actual_checksum = crc32(&payload);
