@@ -1,5 +1,8 @@
+use std::fs;
 use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
@@ -7,6 +10,31 @@ use rusthouse::cli::{
 use rusthouse::{Catalog, DEFAULT_MAX_TABLES};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
+static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(test_name: &str) -> Self {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("cli-tests")
+            .join(format!("{test_name}-{}-{sequence}", std::process::id()));
+        fs::create_dir_all(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn snapshot(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).expect("remove test directory");
+    }
+}
 
 fn run(arguments: &[&str], input: &[u8]) -> Output {
     let mut child = Command::new(BINARY)
@@ -53,10 +81,15 @@ fn help_describes_the_bounded_batch_contract() {
         assert_eq!(output.status.code(), Some(0));
         assert!(output.stderr.is_empty());
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("Usage: rusthouse [--format csv]"));
+        assert!(stdout.contains(
+            "Usage: rusthouse [--format csv] [--load-table NAME=PATH] [--save-table NAME=PATH]"
+        ));
         assert!(stdout.contains("CREATE TABLE, INSERT INTO ... VALUES, and SELECT"));
         assert!(stdout.contains("--format csv"));
+        assert!(stdout.contains("--load-table NAME=PATH"));
+        assert!(stdout.contains("--save-table NAME=PATH"));
         assert!(stdout.contains("1048576 bytes per statement"));
+        assert!(stdout.contains("67108864 bytes per snapshot payload"));
         assert!(stdout.contains("4  unsupported statement"));
         assert!(stdout.contains("6  stdout write error"));
         assert_eq!(stdout.matches("Exit codes:").count(), 1);
@@ -71,6 +104,23 @@ fn rejects_arguments_with_the_usage_exit_code() {
         &["--format", "json"][..],
         &["--format", "CSV"][..],
         &["--format", "csv", "extra"][..],
+        &["--format", "csv", "--format", "csv"][..],
+        &["--load-table"][..],
+        &["--load-table", "events"][..],
+        &["--load-table", "=state.snapshot"][..],
+        &["--save-table", "events="][..],
+        &[
+            "--load-table",
+            "events=first.snapshot",
+            "--load-table",
+            "other=second.snapshot",
+        ][..],
+        &[
+            "--save-table",
+            "events=first.snapshot",
+            "--save-table",
+            "other=second.snapshot",
+        ][..],
     ] {
         let output = run(arguments, b"");
 
@@ -81,6 +131,95 @@ fn rejects_arguments_with_the_usage_exit_code() {
             "rusthouse: invalid arguments; try 'rusthouse --help'\n"
         );
     }
+}
+
+#[test]
+fn saves_reopens_and_selects_one_table_across_processes() {
+    let directory = TestDirectory::new("save-reopen-select");
+    let snapshot = directory.snapshot("events.snapshot");
+    let save = format!("Events={}", snapshot.display());
+    let saved = run(
+        &["--save-table", &save],
+        b"CREATE TABLE Events (id Int64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, true, 'first'), (2, false, 'second')\n",
+    );
+
+    assert_eq!(saved.status.code(), Some(0));
+    assert!(saved.stdout.is_empty());
+    assert!(saved.stderr.is_empty());
+    assert!(snapshot.exists());
+
+    let load = format!("reopened={}", snapshot.display());
+    let reopened = run(
+        &["--format", "csv", "--load-table", &load],
+        b"SELECT label, id FROM reopened WHERE active = true\n",
+    );
+
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"label\",\"id\"\n\"first\",1\n");
+}
+
+#[test]
+fn rejects_a_corrupt_snapshot_before_processing_stdin() {
+    let directory = TestDirectory::new("corrupt-load");
+    let snapshot = directory.snapshot("corrupt.snapshot");
+    let mapping = format!("events={}", snapshot.display());
+    let saved = run(
+        &["--save-table", &mapping],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (1)\n",
+    );
+    assert_eq!(saved.status.code(), Some(0));
+
+    let mut bytes = fs::read(&snapshot).expect("read snapshot");
+    *bytes.last_mut().expect("nonempty snapshot") ^= 0xff;
+    fs::write(&snapshot, bytes).expect("corrupt snapshot");
+
+    let output = run(
+        &["--load-table", &mapping],
+        b"CREATE TABLE ignored (id Int64)\nSELECT id FROM ignored\n",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with(&format!(
+        "rusthouse: could not load table `events` from {}: ",
+        snapshot.display()
+    )));
+    assert!(stderr.contains("snapshot checksum mismatch"));
+}
+
+#[test]
+fn does_not_replace_a_snapshot_when_the_batch_fails() {
+    let directory = TestDirectory::new("failed-batch");
+    let snapshot = directory.snapshot("events.snapshot");
+    let mapping = format!("events={}", snapshot.display());
+    let initial = run(
+        &["--save-table", &mapping],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (1)\n",
+    );
+    assert_eq!(initial.status.code(), Some(0));
+
+    let failed = run(
+        &["--load-table", &mapping, "--save-table", &mapping],
+        b"INSERT INTO events VALUES (2)\nINSERT INTO events VALUES ('wrong')\n",
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert!(
+        String::from_utf8(failed.stderr)
+            .unwrap()
+            .contains("execution error on line 2")
+    );
+
+    let reopened = run(
+        &["--load-table", &mapping],
+        b"SELECT id FROM events ORDER BY id\n",
+    );
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"id\"\n1\n");
 }
 
 #[test]
