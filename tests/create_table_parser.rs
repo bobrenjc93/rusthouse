@@ -1,0 +1,186 @@
+use rusthouse::{DataType, ParseError, ParseLimits, parse_create_table};
+
+#[test]
+fn parses_whitespace_casing_and_nullability_table() {
+    let cases = [
+        ("CREATE TABLE events (value Int64)", "events", "value", true),
+        (
+            "  create\ttable\nMetrics\r(Reading\tint64 null)  ",
+            "Metrics",
+            "Reading",
+            true,
+        ),
+        (
+            "CrEaTe TABLE _hourly (event_2 INT64 NoT NuLl)",
+            "_hourly",
+            "event_2",
+            false,
+        ),
+    ];
+
+    for (input, table_name, column_name, nullable) in cases {
+        let statement = parse_create_table(input, ParseLimits::default()).unwrap();
+
+        assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
+        assert_eq!(statement.column().name().as_str(), column_name, "{input:?}");
+        assert_eq!(statement.column().data_type(), DataType::Int64, "{input:?}");
+        assert_eq!(statement.column().is_nullable(), nullable, "{input:?}");
+    }
+}
+
+#[test]
+fn accepts_statement_and_identifiers_exactly_at_their_limits() {
+    let input = "CREATE TABLE table123 (column45 Int64 NOT NULL)";
+    let statement = parse_create_table(input, ParseLimits::new(input.len(), 8)).unwrap();
+
+    assert_eq!(statement.table_name().as_str(), "table123");
+    assert_eq!(statement.column().name().as_str(), "column45");
+}
+
+#[test]
+fn rejects_inputs_over_resource_limits_with_typed_errors() {
+    let cases = [
+        (
+            "CREATE TABLE t (c Int64)",
+            ParseLimits::new(23, 8),
+            ParseError::StatementTooLong {
+                bytes: 24,
+                max_bytes: 23,
+            },
+        ),
+        (
+            "CREATE TABLE table1234 (c Int64)",
+            ParseLimits::new(64, 8),
+            ParseError::IdentifierTooLong {
+                offset: 13,
+                bytes: 9,
+                max_bytes: 8,
+            },
+        ),
+        (
+            "CREATE TABLE t (column456 Int64)",
+            ParseLimits::new(64, 8),
+            ParseError::IdentifierTooLong {
+                offset: 16,
+                bytes: 9,
+                max_bytes: 8,
+            },
+        ),
+    ];
+
+    for (input, limits, expected) in cases {
+        assert_eq!(
+            parse_create_table(input, limits),
+            Err(expected),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_statements_with_byte_offsets() {
+    let cases = [
+        (
+            "",
+            ParseError::UnexpectedInput {
+                offset: 0,
+                expected: "CREATE",
+            },
+        ),
+        (
+            "CREAT TABLE t (c Int64)",
+            ParseError::UnexpectedInput {
+                offset: 0,
+                expected: "CREATE",
+            },
+        ),
+        (
+            "CREATE TABLE (c Int64)",
+            ParseError::UnexpectedInput {
+                offset: 13,
+                expected: "identifier",
+            },
+        ),
+        (
+            "CREATE TABLE t c Int64)",
+            ParseError::UnexpectedInput {
+                offset: 15,
+                expected: "'('",
+            },
+        ),
+        (
+            "CREATE TABLE t (c Float64)",
+            ParseError::UnexpectedInput {
+                offset: 18,
+                expected: "Int64",
+            },
+        ),
+        (
+            "CREATE TABLE t (c Int64, d Int64)",
+            ParseError::UnexpectedInput {
+                offset: 23,
+                expected: "NULL, NOT NULL, or ')'",
+            },
+        ),
+        (
+            "CREATE TABLE t (c Int64 NOT)",
+            ParseError::UnexpectedInput {
+                offset: 27,
+                expected: "whitespace after NOT",
+            },
+        ),
+        (
+            "CREATE TABLE t (c Int64 NOT MAYBE)",
+            ParseError::UnexpectedInput {
+                offset: 28,
+                expected: "NULL",
+            },
+        ),
+        (
+            "CREATE TABLE t (c Int64",
+            ParseError::UnexpectedInput {
+                offset: 23,
+                expected: "NULL, NOT NULL, or ')'",
+            },
+        ),
+        (
+            "CREATE TABLE t (c Int64 NULL NULL)",
+            ParseError::UnexpectedInput {
+                offset: 29,
+                expected: "')'",
+            },
+        ),
+        (
+            "CREATE TABLE café (c Int64)",
+            ParseError::UnexpectedInput {
+                offset: 16,
+                expected: "'('",
+            },
+        ),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(
+            parse_create_table(input, ParseLimits::default()),
+            Err(expected),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_non_whitespace_trailing_input_at_its_first_byte() {
+    let cases = [
+        ("CREATE TABLE t (c Int64);", 24),
+        ("CREATE TABLE t (c Int64) extra", 25),
+        ("\nCREATE TABLE t (c Int64)\tSELECT", 26),
+    ];
+
+    for (input, offset) in cases {
+        assert_eq!(
+            parse_create_table(input, ParseLimits::default()),
+            Err(ParseError::TrailingInput { offset }),
+            "{input:?}"
+        );
+    }
+}
