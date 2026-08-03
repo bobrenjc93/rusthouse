@@ -1,8 +1,7 @@
 //! Selection-aware reductions over typed table columns.
 //!
-//! These are storage-level aggregate primitives. SQL aggregate parsing,
-//! grouping, and nullable aggregate semantics belong to a later
-//! query-execution layer.
+//! These are storage-level aggregate primitives. SQL aggregation and grouping
+//! are implemented by the query planner, which maintains per-group state.
 
 use crate::scan::RowSelection;
 use crate::storage::Column;

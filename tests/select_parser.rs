@@ -1,7 +1,7 @@
 use rusthouse::{
-    ComparisonOperator, ComparisonPredicate, IdentifierContext, ParseError, ParseErrorKind,
-    SelectParseLimits, SelectProjection, SelectStatement, Value, parse_select,
-    parse_select_with_limits,
+    AggregateFunction, ComparisonOperator, ComparisonPredicate, IdentifierContext,
+    OrderByExpression, ParseError, ParseErrorKind, SelectExpression, SelectParseLimits,
+    SelectProjection, SelectStatement, Value, parse_select, parse_select_with_limits,
 };
 
 fn parse_error(input: &str) -> ParseError {
@@ -16,6 +16,8 @@ fn parses_wildcard_and_named_projections() {
             projections: SelectProjection::All,
             table: "events".to_owned(),
             predicate: None,
+            group_by: Vec::new(),
+            order_by: Vec::new(),
             limit: None,
         }
     );
@@ -30,6 +32,8 @@ fn parses_wildcard_and_named_projections() {
             ]),
             table: "Events".to_owned(),
             predicate: None,
+            group_by: Vec::new(),
+            order_by: Vec::new(),
             limit: None,
         }
     );
@@ -41,6 +45,8 @@ fn parses_wildcard_adjacent_to_select_and_from_keywords() {
         projections: SelectProjection::All,
         table: "events".to_owned(),
         predicate: None,
+        group_by: Vec::new(),
+        order_by: Vec::new(),
         limit: None,
     };
 
@@ -112,6 +118,69 @@ fn reports_positioned_malformed_and_overflowing_limits() {
         ParseErrorKind::LimitOutOfRange {
             literal: format!("{}0", usize::MAX),
         }
+    );
+}
+
+#[test]
+fn parses_aggregate_alias_group_order_and_limit_clauses() {
+    let statement = parse_select(
+        "SELECT active, COUNT(*) AS rows, sum(value) AS total, AVG(value) AS mean \
+         FROM events WHERE id >= 2 GROUP BY active ORDER BY rows DESC, active ASC LIMIT 3",
+    )
+    .unwrap();
+    let SelectProjection::Expressions(items) = statement.projections else {
+        panic!("aggregate projections should use expression items");
+    };
+    assert_eq!(items.len(), 4);
+    assert_eq!(
+        items[0].expression,
+        SelectExpression::Column("active".into())
+    );
+    assert_eq!(items[1].alias.as_deref(), Some("rows"));
+    assert_eq!(
+        items[1].expression,
+        SelectExpression::Aggregate {
+            function: AggregateFunction::Count,
+            argument: None,
+        }
+    );
+    assert_eq!(statement.group_by, ["active"]);
+    assert_eq!(
+        statement.order_by,
+        [
+            OrderByExpression {
+                field: "rows".into(),
+                descending: true,
+            },
+            OrderByExpression {
+                field: "active".into(),
+                descending: false,
+            },
+        ]
+    );
+    assert_eq!(statement.limit, Some(3));
+}
+
+#[test]
+fn reports_invalid_aggregate_functions_and_arguments() {
+    let unknown = parse_error("SELECT median(value) FROM events");
+    assert_eq!(unknown.position, "SELECT ".len());
+    assert_eq!(
+        unknown.kind,
+        ParseErrorKind::UnknownAggregateFunction {
+            name: "median".into()
+        }
+    );
+
+    assert!(matches!(
+        parse_error("SELECT SUM(*) FROM events").kind,
+        ParseErrorKind::InvalidAggregateArgument {
+            function: AggregateFunction::Sum
+        }
+    ));
+    assert_eq!(
+        parse_error("SELECT AVG() FROM events").kind,
+        ParseErrorKind::ExpectedAggregateArgument
     );
 }
 
@@ -280,15 +349,11 @@ fn reports_positioned_predicate_errors() {
 }
 
 #[test]
-fn rejects_aliases_aggregates_compound_predicates_and_result_clauses() {
+fn rejects_table_aliases_and_compound_predicates() {
     let cases = [
-        ("SELECT id AS event_id FROM events", "AS"),
-        ("SELECT COUNT(*) FROM events", "("),
         ("SELECT * FROM events AS e", "AS"),
         ("SELECT * FROM events WHERE id = 1 AND active = true", "AND"),
         ("SELECT * FROM events WHERE id = 1 OR id = 2", "OR"),
-        ("SELECT * FROM events GROUP BY id", "GROUP"),
-        ("SELECT * FROM events ORDER BY id", "ORDER"),
     ];
 
     for (input, marker) in cases {

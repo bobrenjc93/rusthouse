@@ -401,6 +401,17 @@ impl Table {
         &self.columns
     }
 
+    pub(crate) fn value_at(&self, column: usize, row: usize) -> Value {
+        debug_assert!(column < self.columns.len());
+        debug_assert!(row < self.row_count);
+        match &self.columns[column] {
+            Column::Int64(values) => Value::Int64(values[row]),
+            Column::Float64(values) => Value::Float64(values[row]),
+            Column::Bool(values) => Value::Bool(values[row] != 0),
+            Column::String(values) => Value::String(values[row].clone()),
+        }
+    }
+
     pub(crate) fn from_snapshot_parts(
         fields: Vec<Field>,
         columns: Vec<Column>,

@@ -34,6 +34,57 @@ pub enum SelectProjection {
     All,
     /// Return the named columns in the specified order.
     Columns(Vec<String>),
+    /// Evaluate typed projection expressions in the specified order.
+    Expressions(Vec<SelectItem>),
+}
+
+/// An aggregate function supported by the bounded query engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggregateFunction {
+    /// Returns the canonical lowercase SQL spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
+}
+
+/// One scalar or aggregate expression in a `SELECT` projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectExpression {
+    Column(String),
+    Aggregate {
+        function: AggregateFunction,
+        /// `None` represents the `*` argument accepted by `COUNT(*)`.
+        argument: Option<String>,
+    },
+}
+
+/// A projection expression and its optional output alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectItem {
+    pub expression: SelectExpression,
+    pub alias: Option<String>,
+}
+
+/// One projected output field used to order a query result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderByExpression {
+    pub field: String,
+    pub descending: bool,
 }
 
 /// A comparison relationship supported by a `WHERE` predicate.
@@ -61,6 +112,8 @@ pub struct SelectStatement {
     pub projections: SelectProjection,
     pub table: String,
     pub predicate: Option<ComparisonPredicate>,
+    pub group_by: Vec<String>,
+    pub order_by: Vec<OrderByExpression>,
     pub limit: Option<usize>,
 }
 
@@ -215,6 +268,13 @@ pub enum ParseErrorKind {
     TooManyProjections {
         limit: usize,
     },
+    UnknownAggregateFunction {
+        name: String,
+    },
+    ExpectedAggregateArgument,
+    InvalidAggregateArgument {
+        function: AggregateFunction,
+    },
     ExpectedComparisonOperator,
     InvalidComparisonOperator {
         operator: String,
@@ -286,6 +346,15 @@ impl fmt::Display for ParseErrorKind {
             Self::ExpectedProjection => formatter.write_str("expected a column projection or '*'"),
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
+            }
+            Self::UnknownAggregateFunction { name } => {
+                write!(formatter, "unknown aggregate function {name:?}")
+            }
+            Self::ExpectedAggregateArgument => {
+                formatter.write_str("expected an aggregate column or '*'")
+            }
+            Self::InvalidAggregateArgument { function } => {
+                write!(formatter, "{} does not accept '*'", function.as_str())
             }
             Self::ExpectedComparisonOperator => {
                 formatter.write_str("expected a comparison operator")
@@ -565,6 +634,24 @@ impl<'a> Parser<'a> {
         };
 
         self.skip_whitespace();
+        let group_by = if self.peek_token_is("GROUP") {
+            self.parse_keyword("GROUP")?;
+            self.parse_keyword("BY")?;
+            self.parse_identifier_list(limits.max_projections)?
+        } else {
+            Vec::new()
+        };
+
+        self.skip_whitespace();
+        let order_by = if self.peek_token_is("ORDER") {
+            self.parse_keyword("ORDER")?;
+            self.parse_keyword("BY")?;
+            self.parse_order_by(limits.max_projections)?
+        } else {
+            Vec::new()
+        };
+
+        self.skip_whitespace();
         let limit = if self.peek_token_is("LIMIT") {
             self.parse_keyword("LIMIT")?;
             Some(self.parse_limit()?)
@@ -577,6 +664,8 @@ impl<'a> Parser<'a> {
             projections,
             table,
             predicate,
+            group_by,
+            order_by,
             limit,
         })
     }
@@ -596,20 +685,57 @@ impl<'a> Parser<'a> {
             return Ok(SelectProjection::All);
         }
 
-        let mut columns = Vec::new();
+        let mut items = Vec::new();
+        let mut all_plain_columns = true;
         loop {
             self.skip_whitespace();
             if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
                 return Err(self.error(ParseErrorKind::ExpectedProjection));
             }
-            if columns.len() == max_projections {
+            if items.len() == max_projections {
                 return Err(self.error(ParseErrorKind::TooManyProjections {
                     limit: max_projections,
                 }));
             }
 
-            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
-            columns.push(column);
+            let (name, name_position) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            let expression = if self.peek() == Some(b'(') {
+                all_plain_columns = false;
+                self.position += 1;
+                let function = aggregate_function(&name).ok_or_else(|| ParseError {
+                    position: name_position,
+                    kind: ParseErrorKind::UnknownAggregateFunction { name: name.clone() },
+                })?;
+                self.skip_whitespace();
+                let argument = if self.peek() == Some(b'*') {
+                    self.position += 1;
+                    if function != AggregateFunction::Count {
+                        return Err(
+                            self.error(ParseErrorKind::InvalidAggregateArgument { function })
+                        );
+                    }
+                    None
+                } else if self.peek() == Some(b')') {
+                    return Err(self.error(ParseErrorKind::ExpectedAggregateArgument));
+                } else {
+                    Some(self.parse_identifier(IdentifierContext::Column)?.0)
+                };
+                self.expect_byte(b')', "')'")?;
+                SelectExpression::Aggregate { function, argument }
+            } else {
+                SelectExpression::Column(name)
+            };
+
+            self.skip_whitespace();
+            let alias = if self.peek_token_is("AS") {
+                all_plain_columns = false;
+                self.parse_keyword("AS")?;
+                Some(self.parse_identifier(IdentifierContext::Column)?.0)
+            } else {
+                None
+            };
+            items.push(SelectItem { expression, alias });
 
             self.skip_whitespace();
             if self.peek() != Some(b',') {
@@ -618,7 +744,64 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
 
-        Ok(SelectProjection::Columns(columns))
+        if all_plain_columns {
+            Ok(SelectProjection::Columns(
+                items
+                    .into_iter()
+                    .map(|item| match item.expression {
+                        SelectExpression::Column(name) => name,
+                        SelectExpression::Aggregate { .. } => {
+                            unreachable!("plain projections contain only columns")
+                        }
+                    })
+                    .collect(),
+            ))
+        } else {
+            Ok(SelectProjection::Expressions(items))
+        }
+    }
+
+    fn parse_identifier_list(&mut self, limit: usize) -> Result<Vec<String>, ParseError> {
+        let mut fields = Vec::new();
+        loop {
+            if fields.len() == limit {
+                return Err(self.error(ParseErrorKind::TooManyProjections { limit }));
+            }
+            fields.push(self.parse_identifier(IdentifierContext::Column)?.0);
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+        }
+        Ok(fields)
+    }
+
+    fn parse_order_by(&mut self, limit: usize) -> Result<Vec<OrderByExpression>, ParseError> {
+        let mut expressions = Vec::new();
+        loop {
+            if expressions.len() == limit {
+                return Err(self.error(ParseErrorKind::TooManyProjections { limit }));
+            }
+            let field = self.parse_identifier(IdentifierContext::Column)?.0;
+            self.skip_whitespace();
+            let descending = if self.peek_token_is("DESC") {
+                self.parse_keyword("DESC")?;
+                true
+            } else {
+                if self.peek_token_is("ASC") {
+                    self.parse_keyword("ASC")?;
+                }
+                false
+            };
+            expressions.push(OrderByExpression { field, descending });
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+        }
+        Ok(expressions)
     }
 
     fn parse_comparison(
@@ -1058,6 +1241,22 @@ fn numeric_literal_kind(literal: &str) -> Option<NumericLiteralKind> {
     }
 
     (position == bytes.len()).then_some(kind)
+}
+
+fn aggregate_function(name: &str) -> Option<AggregateFunction> {
+    if name.eq_ignore_ascii_case("COUNT") {
+        Some(AggregateFunction::Count)
+    } else if name.eq_ignore_ascii_case("SUM") {
+        Some(AggregateFunction::Sum)
+    } else if name.eq_ignore_ascii_case("MIN") {
+        Some(AggregateFunction::Min)
+    } else if name.eq_ignore_ascii_case("MAX") {
+        Some(AggregateFunction::Max)
+    } else if name.eq_ignore_ascii_case("AVG") {
+        Some(AggregateFunction::Avg)
+    } else {
+        None
+    }
 }
 
 fn is_whitespace(byte: u8) -> bool {

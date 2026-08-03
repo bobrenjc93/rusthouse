@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod cli;
 pub mod csv;
+pub mod query;
 pub mod reduction;
 pub mod scan;
 pub mod snapshot;
@@ -14,13 +15,15 @@ pub use catalog::{
     Catalog, CatalogError, CatalogLimits, CatalogSnapshotError, DEFAULT_MAX_TABLES, SelectResult,
 };
 pub use csv::{write_csv_with_names, write_select_csv_with_names};
+pub use query::{QueryError, QueryPlan};
 pub use reduction::ReductionError;
 pub use scan::{ComparisonOperator, RowSelection, ScanError, SelectionAllocationError};
 pub use sql::{
-    ColumnDefinition, ComparisonPredicate, CreateTableStatement, IdentifierContext,
-    InsertParseLimits, InsertStatement, ParseError, ParseErrorKind, ParseLimits, SelectParseLimits,
-    SelectProjection, SelectStatement, parse_create_table, parse_create_table_with_limits,
-    parse_insert, parse_insert_with_limits, parse_select, parse_select_with_limits,
+    AggregateFunction, ColumnDefinition, ComparisonPredicate, CreateTableStatement,
+    IdentifierContext, InsertParseLimits, InsertStatement, OrderByExpression, ParseError,
+    ParseErrorKind, ParseLimits, SelectExpression, SelectItem, SelectParseLimits, SelectProjection,
+    SelectStatement, parse_create_table, parse_create_table_with_limits, parse_insert,
+    parse_insert_with_limits, parse_select, parse_select_with_limits,
 };
 pub use storage::{DataType, Field, Table, TableError, Value};
 pub use table_snapshot::{TableSnapshotError, TableSnapshotLocation};

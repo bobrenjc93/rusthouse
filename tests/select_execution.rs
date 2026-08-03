@@ -1,9 +1,9 @@
 use std::error::Error;
 
 use rusthouse::{
-    Catalog, CatalogError, CatalogLimits, ComparisonOperator, ComparisonPredicate, DataType,
-    ParseErrorKind, ParseLimits, ScanError, SelectParseLimits, SelectProjection, SelectStatement,
-    Value,
+    AggregateFunction, Catalog, CatalogError, CatalogLimits, ComparisonOperator,
+    ComparisonPredicate, DataType, ParseErrorKind, ParseLimits, QueryError, ScanError,
+    SelectParseLimits, SelectProjection, SelectStatement, Value,
 };
 
 fn readings_catalog() -> Catalog {
@@ -117,6 +117,8 @@ fn executes_an_already_parsed_statement() {
             operator: ComparisonOperator::GreaterThanOrEqual,
             value: Value::Int64(2),
         }),
+        group_by: Vec::new(),
+        order_by: Vec::new(),
         limit: None,
     };
 
@@ -162,6 +164,122 @@ fn applies_limit_after_filtering_in_source_order() {
     assert_eq!(result.selected_rows().collect::<Vec<_>>(), [1]);
     assert_eq!(result.row_indices().rev().collect::<Vec<_>>(), [1]);
     assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn executes_filtered_global_aggregates_with_typed_outputs() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT count(*) AS rows, sum(sequence) AS total, min(label) AS first, \
+             max(label) AS last, avg(value) AS mean \
+             FROM readings WHERE active = true",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert!(!std::ptr::eq(
+        result.table(),
+        catalog.table("readings").unwrap()
+    ));
+    assert_eq!(result.table().int64_column("rows").unwrap(), [2]);
+    assert_eq!(result.table().int64_column("total").unwrap(), [4]);
+    assert_eq!(result.table().string_column("first").unwrap(), ["first"]);
+    assert_eq!(result.table().string_column("last").unwrap(), ["third"]);
+    assert_eq!(result.table().float64_column("mean").unwrap(), [1.0]);
+}
+
+#[test]
+fn groups_orders_and_limits_after_filtering() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT active, count(*) AS rows, sum(sequence) AS total \
+             FROM readings WHERE sequence >= 1 GROUP BY active \
+             ORDER BY rows DESC, active ASC LIMIT 1",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result
+            .table()
+            .bool_column("active")
+            .unwrap()
+            .collect::<Vec<_>>(),
+        [true]
+    );
+    assert_eq!(result.table().int64_column("rows").unwrap(), [2]);
+    assert_eq!(result.table().int64_column("total").unwrap(), [4]);
+}
+
+#[test]
+fn orders_aliased_row_projections_before_limiting() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT label AS name, sequence FROM readings \
+             WHERE sequence >= 2 ORDER BY sequence DESC LIMIT 1",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.table().string_column("name").unwrap(), ["third"]);
+    assert_eq!(result.table().int64_column("sequence").unwrap(), [3]);
+}
+
+#[test]
+fn empty_global_aggregates_return_one_typed_row() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT count(*) AS rows, sum(sequence) AS total, min(label) AS first, \
+             avg(value) AS mean FROM readings WHERE sequence > 100",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.table().int64_column("rows").unwrap(), [0]);
+    assert_eq!(result.table().int64_column("total").unwrap(), [0]);
+    assert_eq!(result.table().string_column("first").unwrap(), [""]);
+    assert!(result.table().float64_column("mean").unwrap()[0].is_nan());
+}
+
+#[test]
+fn reports_grouping_aggregate_and_order_planning_errors() {
+    let catalog = readings_catalog();
+
+    assert!(matches!(
+        catalog
+            .execute_select("SELECT label, count(*) FROM readings")
+            .unwrap_err(),
+        CatalogError::Query {
+            source: QueryError::UngroupedColumn { ref name },
+            ..
+        } if name == "label"
+    ));
+    assert!(matches!(
+        catalog
+            .execute_select("SELECT sum(label) FROM readings")
+            .unwrap_err(),
+        CatalogError::Query {
+            source: QueryError::NonNumericAggregate {
+                function: AggregateFunction::Sum,
+                ref field,
+                data_type: DataType::String,
+            },
+            ..
+        } if field == "label"
+    ));
+    assert!(matches!(
+        catalog
+            .execute_select("SELECT label AS name FROM readings ORDER BY missing")
+            .unwrap_err(),
+        CatalogError::Query {
+            source: QueryError::OrderFieldNotFound { ref name },
+            ..
+        } if name == "missing"
+    ));
 }
 
 #[test]

@@ -189,6 +189,23 @@ fn applies_limit_before_streaming_select_rows() {
 }
 
 #[test]
+fn streams_grouped_aggregate_results_in_order() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, category String, score Float64)\n\
+          INSERT INTO events VALUES (1, 'a', 1.5), (2, 'b', 7.0), (3, 'a', 2.5)\n\
+          SELECT category, count(*) AS rows, sum(score) AS total FROM events GROUP BY category ORDER BY total DESC\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        b"\"category\",\"rows\",\"total\"\n\"b\",1,7\n\"a\",2,4\n"
+    );
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],

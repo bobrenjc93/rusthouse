@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+use crate::query::{QueryError, QueryPlan};
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
     CreateTableStatement, InsertParseLimits, InsertStatement, ParseError, ParseLimits,
@@ -117,6 +118,13 @@ pub enum CatalogError {
         /// Scan validation or allocation failure.
         source: ScanError,
     },
+    /// A nontrivial query could not be planned or executed.
+    Query {
+        /// Name of the query's source table.
+        name: String,
+        /// Typed planning or execution failure.
+        source: QueryError,
+    },
     /// Creating another table would exceed the configured catalog bound.
     TableLimitExceeded {
         /// Maximum number of tables allowed in the catalog.
@@ -148,6 +156,12 @@ impl fmt::Display for CatalogError {
             Self::TableScan { name, source } => {
                 write!(formatter, "could not scan table `{name}`: {source}")
             }
+            Self::Query { name, source } => {
+                write!(
+                    formatter,
+                    "could not execute query on table `{name}`: {source}"
+                )
+            }
             Self::TableLimitExceeded { limit } => {
                 write!(formatter, "catalog table count exceeds limit of {limit}")
             }
@@ -166,6 +180,7 @@ impl Error for CatalogError {
                 Some(source)
             }
             Self::TableScan { source, .. } => Some(source),
+            Self::Query { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -222,25 +237,34 @@ struct CatalogEntry {
     table: Table,
 }
 
-/// The borrowed output of one projection and optional comparison scan.
+/// The output of one planned projection and optional comparison scan.
 ///
-/// The result owns only projected column indexes and, for a filtered query, a
-/// compact row-selection bitmap. A limit is represented by scalar row bounds;
-/// schema and column values remain owned by the catalog's source table.
+/// Simple projections borrow schema and values from the catalog and own only
+/// projected indexes plus an optional row-selection bitmap. Queries that need
+/// aggregation, grouping, aliases, or ordering own a materialized result table.
 #[derive(Debug)]
 pub struct SelectResult<'a> {
-    table: &'a Table,
+    source: SelectSource<'a>,
     field_indices: Vec<usize>,
     selection: Option<RowSelection>,
     row_end: usize,
     row_count: usize,
 }
 
+#[derive(Debug)]
+enum SelectSource<'a> {
+    Borrowed(&'a Table),
+    Owned(Table),
+}
+
 impl<'a> SelectResult<'a> {
     /// Returns the table whose schema and column values back this result.
     #[must_use]
-    pub const fn table(&self) -> &'a Table {
-        self.table
+    pub fn table(&self) -> &Table {
+        match &self.source {
+            SelectSource::Borrowed(table) => table,
+            SelectSource::Owned(table) => table,
+        }
     }
 
     /// Iterates over projected fields in statement order.
@@ -249,7 +273,7 @@ impl<'a> SelectResult<'a> {
     ) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
         self.field_indices
             .iter()
-            .map(|index| &self.table.fields()[*index])
+            .map(|index| &self.table().fields()[*index])
     }
 
     /// Alias for [`Self::projected_fields`].
@@ -262,7 +286,7 @@ impl<'a> SelectResult<'a> {
     ) -> impl ExactSizeIterator<Item = &Column> + DoubleEndedIterator + '_ {
         self.field_indices
             .iter()
-            .map(|index| &self.table.columns()[*index])
+            .map(|index| &self.table().columns()[*index])
     }
 
     /// Iterates over selected zero-based indexes in source table order.
@@ -470,8 +494,9 @@ impl Catalog {
 
     /// Parses and executes one bounded projection `SELECT` statement.
     ///
-    /// The returned result borrows the source table and does not copy table
-    /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
+    /// Simple projections borrow the source table without copying rows.
+    /// Aggregation, grouping, aliases, or ordering produce a typed materialized
+    /// table. An optional `WHERE` comparison is evaluated before either path.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -485,6 +510,8 @@ impl Catalog {
             projections,
             table: name,
             predicate,
+            group_by,
+            order_by,
             limit,
         } = statement;
         let table = self
@@ -493,15 +520,50 @@ impl Catalog {
             .map(|entry| &entry.table)
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
 
-        let field_indices = resolve_projection(table, projections)?;
         let selection = predicate
             .map(|predicate| table.scan(&predicate.column, predicate.operator, &predicate.value))
             .transpose()
-            .map_err(|source| CatalogError::TableScan { name, source })?;
+            .map_err(|source| CatalogError::TableScan {
+                name: name.clone(),
+                source,
+            })?;
+
+        let requires_planning = matches!(projections, SelectProjection::Expressions(_))
+            || !group_by.is_empty()
+            || !order_by.is_empty();
+        if requires_planning {
+            let statement = SelectStatement {
+                projections,
+                table: name.clone(),
+                predicate: None,
+                group_by,
+                order_by,
+                limit,
+            };
+            let plan =
+                QueryPlan::build(table, &statement).map_err(|source| CatalogError::Query {
+                    name: name.clone(),
+                    source,
+                })?;
+            let result = plan
+                .execute(table, selection.as_ref())
+                .map_err(|source| CatalogError::Query { name, source })?;
+            let row_count = result.len();
+            let field_indices = (0..result.fields().len()).collect();
+            return Ok(SelectResult {
+                source: SelectSource::Owned(result),
+                field_indices,
+                selection: None,
+                row_end: row_count,
+                row_count,
+            });
+        }
+
+        let field_indices = resolve_projection(table, projections)?;
         let (row_end, row_count) = limited_row_bounds(table.len(), selection.as_ref(), limit);
 
         Ok(SelectResult {
-            table,
+            source: SelectSource::Borrowed(table),
             field_indices,
             selection,
             row_end,
@@ -606,6 +668,9 @@ fn resolve_projection(
     let field_count = match &projection {
         SelectProjection::All => table.fields().len(),
         SelectProjection::Columns(names) => names.len(),
+        SelectProjection::Expressions(_) => {
+            unreachable!("expression projections use the query planner")
+        }
     };
     let mut indices = Vec::new();
     indices
@@ -623,6 +688,9 @@ fn resolve_projection(
                     .ok_or(CatalogError::ProjectionFieldNotFound { name })?;
                 indices.push(index);
             }
+        }
+        SelectProjection::Expressions(_) => {
+            unreachable!("expression projections use the query planner")
         }
     }
     Ok(indices)

@@ -47,6 +47,11 @@ CSVWithNames. `--format csv` is accepted for ClickHouse-style invocations and
 is also the default. Run `cargo run -- --help` for the input limits and stable
 exit-code contract.
 
+The bounded query planner supports projected columns and aliases, one typed
+`WHERE` comparison, `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, multi-column
+`GROUP BY`, projected-field `ORDER BY`, and `LIMIT`. Simple projections remain
+borrowed; grouping and ordering produce a typed materialized result.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
 
 <!-- burner-progress:start -->
