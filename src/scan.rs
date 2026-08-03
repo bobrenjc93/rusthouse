@@ -33,6 +33,24 @@ impl ComparisonOperator {
     }
 }
 
+/// A SQL nullness predicate supported by a nullable scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullPredicate {
+    /// Match `NULL` values (`IS NULL`).
+    IsNull,
+    /// Match non-`NULL` values (`IS NOT NULL`).
+    IsNotNull,
+}
+
+impl NullPredicate {
+    fn matches(self, value: Option<i64>) -> bool {
+        match self {
+            Self::IsNull => value.is_none(),
+            Self::IsNotNull => value.is_some(),
+        }
+    }
+}
+
 /// Resource bounds applied to a scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
@@ -114,6 +132,49 @@ pub fn scan_nullable_i64(
     comparison_value: i64,
     limits: ScanLimits,
 ) -> Result<Vec<usize>, ScanError> {
+    scan_matching_rows(values, limits, |value| {
+        value.is_some_and(|value| operator.matches(value, comparison_value))
+    })
+}
+
+/// Returns row indices whose values match a SQL nullness predicate.
+///
+/// `None` values represent SQL `NULL`. [`NullPredicate::IsNull`] selects those
+/// values, while [`NullPredicate::IsNotNull`] selects every present value.
+/// Returned indices are in ascending source-row order.
+///
+/// The input bound is checked before any rows are inspected. The scan stops as
+/// soon as one more result than allowed is found and returns
+/// [`ScanError::ResultLimitExceeded`] without returning a partial result.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{NullPredicate, ScanLimits, scan_nullable_i64_nullness};
+///
+/// let values = [Some(4), None, Some(9), None];
+/// let rows = scan_nullable_i64_nullness(
+///     &values,
+///     NullPredicate::IsNull,
+///     ScanLimits::new(values.len(), 2),
+/// )?;
+///
+/// assert_eq!(rows, vec![1, 3]);
+/// # Ok::<(), rusthouse::ScanError>(())
+/// ```
+pub fn scan_nullable_i64_nullness(
+    values: &[Option<i64>],
+    predicate: NullPredicate,
+    limits: ScanLimits,
+) -> Result<Vec<usize>, ScanError> {
+    scan_matching_rows(values, limits, |value| predicate.matches(value))
+}
+
+fn scan_matching_rows(
+    values: &[Option<i64>],
+    limits: ScanLimits,
+    matches: impl Fn(Option<i64>) -> bool,
+) -> Result<Vec<usize>, ScanError> {
     if values.len() > limits.max_input_rows {
         return Err(ScanError::InputLimitExceeded {
             rows: values.len(),
@@ -123,12 +184,8 @@ pub fn scan_nullable_i64(
 
     let mut matching_rows = Vec::new();
 
-    for (row_index, value) in values.iter().enumerate() {
-        let Some(value) = value else {
-            continue;
-        };
-
-        if operator.matches(*value, comparison_value) {
+    for (row_index, value) in values.iter().copied().enumerate() {
+        if matches(value) {
             if matching_rows.len() == limits.max_result_rows {
                 return Err(ScanError::ResultLimitExceeded {
                     rows: matching_rows.len().saturating_add(1),

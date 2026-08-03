@@ -122,6 +122,25 @@ impl InsertStatement {
     }
 }
 
+/// The typed syntax tree for a one-column `SELECT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectStatement {
+    column_name: Identifier,
+    table_name: Identifier,
+}
+
+impl SelectStatement {
+    /// Returns the projected column name.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns the source table name.
+    pub fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+}
+
 /// An error produced while parsing a bounded SQL statement.
 ///
 /// Offsets and sizes are byte-based, matching Rust string indexing.
@@ -263,6 +282,40 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
     Parser::new(input, limits.max_identifier_bytes).parse_insert()
 }
 
+/// Parses one `SELECT` statement containing one column and one table.
+///
+/// Keywords are ASCII case-insensitive. The column and table identifiers
+/// follow the same rules and bounds as [`parse_create_table`]. The complete
+/// accepted grammar is:
+///
+/// ```text
+/// SELECT identifier FROM identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, including whitespace
+/// before or after the optional semicolon. Statement limits and all reported
+/// offsets are measured in bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, parse_select};
+///
+/// let statement = parse_select(
+///     "SELECT event_id FROM events;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert_eq!(statement.column_name().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_select()
+}
+
 fn validate_statement_length(input: &str, limits: ParseLimits) -> Result<(), ParseError> {
     if input.len() > limits.max_statement_bytes {
         return Err(ParseError::StatementTooLong {
@@ -367,6 +420,36 @@ impl<'input> Parser<'input> {
         Ok(InsertStatement { table_name, value })
     }
 
+    fn parse_select(mut self) -> Result<SelectStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        if self.keyword_at_position("FROM") && !self.keyword_follows_current_word("FROM") {
+            return Err(self.unexpected("identifier"));
+        }
+        let column_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(SelectStatement {
+            column_name,
+            table_name,
+        })
+    }
+
     fn parse_int64_value(&mut self) -> Result<Option<i64>, ParseError> {
         let start = self.position;
         if self.keyword_at_position("NULL") {
@@ -467,6 +550,27 @@ impl<'input> Parser<'input> {
     fn keyword_at_position(&self, keyword: &str) -> bool {
         self.word_end(self.position)
             .is_some_and(|end| self.input[self.position..end].eq_ignore_ascii_case(keyword))
+    }
+
+    fn keyword_follows_current_word(&self, keyword: &str) -> bool {
+        let Some(current_end) = self.word_end(self.position) else {
+            return false;
+        };
+
+        let mut next_start = current_end;
+        while self
+            .bytes
+            .get(next_start)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            next_start += 1;
+        }
+        if next_start == current_end {
+            return false;
+        }
+
+        self.word_end(next_start)
+            .is_some_and(|next_end| self.input[next_start..next_end].eq_ignore_ascii_case(keyword))
     }
 
     fn word_end(&self, start: usize) -> Option<usize> {
