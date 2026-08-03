@@ -1,5 +1,41 @@
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rusthouse::snapshot::{SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
-use rusthouse::{SnapshotCodec, SnapshotError};
+use rusthouse::{SnapshotCodec, SnapshotError, SnapshotFileError};
+
+static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-tests");
+        fs::create_dir_all(&base).unwrap();
+
+        loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        }
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
 
 #[test]
 fn round_trips_empty_and_binary_payloads() {
@@ -143,4 +179,53 @@ fn rejects_bytes_after_the_declared_payload() {
             actual_len: SNAPSHOT_HEADER_LEN + 3,
         })
     );
+}
+
+#[test]
+fn creates_a_synced_envelope_that_decodes_from_disk() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let codec = SnapshotCodec::new(8);
+
+    codec.create_new_file(&path, b"payload").unwrap();
+
+    let envelope = fs::read(path).unwrap();
+    assert_eq!(codec.decode(&envelope), Ok(&b"payload"[..]));
+}
+
+#[test]
+fn preserves_an_existing_destination() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let original = b"existing data that is not an envelope";
+    fs::write(&path, original).unwrap();
+
+    let error = SnapshotCodec::new(8)
+        .create_new_file(&path, b"payload")
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SnapshotFileError::Create(ref source) if source.kind() == ErrorKind::AlreadyExists
+    ));
+    assert_eq!(fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn rejects_an_oversized_payload_without_creating_a_file() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+
+    let error = SnapshotCodec::new(2)
+        .create_new_file(&path, &[1, 2, 3])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SnapshotFileError::Encode(SnapshotError::PayloadTooLarge {
+            payload_len: 3,
+            max_payload_len: 2,
+        })
+    ));
+    assert!(!path.exists());
 }

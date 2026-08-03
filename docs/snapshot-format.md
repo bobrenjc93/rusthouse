@@ -37,6 +37,17 @@ Short input, trailing input, incompatible formats, unsupported versions,
 oversized declarations, and checksum mismatches produce distinct typed errors.
 The decoder borrows the payload from the input and performs no allocation.
 
+## Creating an envelope file
+
+`SnapshotCodec::create_new_file` validates and encodes the complete payload
+before accessing the filesystem. It then exclusively creates the destination,
+writes the complete envelope, and synchronizes the file contents and metadata.
+An existing destination is never replaced or truncated. Encoding, creation,
+writing, and synchronization failures are reported as distinct typed errors.
+
+This create-only operation does not use temporary files, replace paths, or
+synchronize the parent directory.
+
 ## Nullable Int64 row payload
 
 `NullableI64PayloadCodec` defines a deterministic payload for one nullable
