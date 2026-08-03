@@ -325,7 +325,7 @@ struct ScalarResult {
     value: Value,
 }
 
-/// The output of one projection or scalar aggregate and optional comparison scan.
+/// The output of one projection or scalar aggregate and optional comparison scans.
 ///
 /// A row projection owns only projected column indexes and, for a filtered
 /// query, a compact row-selection bitmap. Ordered results instead own their
@@ -677,11 +677,11 @@ impl Catalog {
     /// Parses and executes one bounded `SELECT` statement.
     ///
     /// The returned result borrows the source table and does not copy table
-    /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
-    /// For row projections, `ORDER BY` owns and sorts only selected row indexes.
-    /// Scalar aggregate rows retain at most [`MAX_AGGREGATE_RESULT_BYTES`] of
-    /// String payloads. `LIMIT` is applied to the final projected or aggregate
-    /// output.
+    /// rows. Each `WHERE` comparison is evaluated with [`Table::scan`] and the
+    /// packed selections are intersected. For row projections, `ORDER BY` owns
+    /// and sorts only selected row indexes. Scalar aggregate rows retain at most
+    /// [`MAX_AGGREGATE_RESULT_BYTES`] of String payloads. `LIMIT` is applied to
+    /// the final projected or aggregate output.
     pub fn execute_select(&self, input: &str) -> Result<SelectResult<'_>, CatalogError> {
         let statement = parse_select_with_limits(input, self.limits.select_parse)?;
         self.select(statement)
@@ -694,7 +694,7 @@ impl Catalog {
         let SelectStatement {
             projections,
             table: name,
-            predicate,
+            predicates,
             order_by,
             limit,
         } = statement;
@@ -709,7 +709,7 @@ impl Catalog {
             SelectProjection::CountAll { alias } => execute_aggregates(
                 table,
                 &name,
-                predicate,
+                predicates,
                 order_by,
                 limit,
                 aggregate_result_byte_limit,
@@ -721,7 +721,7 @@ impl Catalog {
             SelectProjection::Aggregates(aggregates) => execute_aggregates(
                 table,
                 &name,
-                predicate,
+                predicates,
                 order_by,
                 limit,
                 aggregate_result_byte_limit,
@@ -732,12 +732,7 @@ impl Catalog {
                 let order = order_by
                     .map(|order_by| resolve_order(table, order_by))
                     .transpose()?;
-                let selection = predicate
-                    .map(|predicate| {
-                        table.scan(&predicate.column, predicate.operator, &predicate.value)
-                    })
-                    .transpose()
-                    .map_err(|source| CatalogError::TableScan { name, source })?;
+                let selection = scan_predicates(table, predicates, &name)?;
 
                 let (selection, ordered_rows, row_end, row_count) = match order {
                     Some((column_index, direction)) => {
@@ -818,7 +813,7 @@ impl Catalog {
 fn execute_aggregates<'a>(
     table: &'a Table,
     table_name: &str,
-    predicate: Option<ComparisonPredicate>,
+    predicates: Vec<ComparisonPredicate>,
     order_by: Option<OrderByClause>,
     limit: Option<usize>,
     aggregate_result_byte_limit: usize,
@@ -831,13 +826,7 @@ fn execute_aggregates<'a>(
     if let Some(order_by) = order_by {
         resolve_order(table, order_by)?;
     }
-    let selection = predicate
-        .map(|predicate| table.scan(&predicate.column, predicate.operator, &predicate.value))
-        .transpose()
-        .map_err(|source| CatalogError::TableScan {
-            name: table_name.to_owned(),
-            source,
-        })?;
+    let selection = scan_predicates(table, predicates, table_name)?;
 
     let mut scalars = Vec::new();
     scalars
@@ -999,6 +988,34 @@ fn scalar_result(
         ),
         value,
     }
+}
+
+fn scan_predicates(
+    table: &Table,
+    predicates: Vec<ComparisonPredicate>,
+    table_name: &str,
+) -> Result<Option<RowSelection>, CatalogError> {
+    let mut predicates = predicates.into_iter();
+    let Some(first) = predicates.next() else {
+        return Ok(None);
+    };
+    let mut selection = table
+        .scan(&first.column, first.operator, &first.value)
+        .map_err(|source| CatalogError::TableScan {
+            name: table_name.to_owned(),
+            source,
+        })?;
+
+    for predicate in predicates {
+        let next = table
+            .scan(&predicate.column, predicate.operator, &predicate.value)
+            .map_err(|source| CatalogError::TableScan {
+                name: table_name.to_owned(),
+                source,
+            })?;
+        selection.intersect(&next);
+    }
+    Ok(Some(selection))
 }
 
 fn limited_row_bounds(

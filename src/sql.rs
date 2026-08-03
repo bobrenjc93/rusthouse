@@ -100,7 +100,7 @@ pub struct OrderByClause {
 pub struct SelectStatement {
     pub projections: SelectProjection,
     pub table: String,
-    pub predicate: Option<ComparisonPredicate>,
+    pub predicates: Vec<ComparisonPredicate>,
     pub order_by: Option<OrderByClause>,
     pub limit: Option<usize>,
 }
@@ -176,17 +176,27 @@ impl Default for InsertParseLimits {
 pub struct SelectParseLimits {
     pub max_input_bytes: usize,
     pub max_projections: usize,
+    pub max_predicates: usize,
 }
 
 impl SelectParseLimits {
     pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
     pub const DEFAULT_MAX_PROJECTIONS: usize = 1024;
+    pub const DEFAULT_MAX_PREDICATES: usize = 1024;
 
     pub const fn new(max_input_bytes: usize, max_projections: usize) -> Self {
         Self {
             max_input_bytes,
             max_projections,
+            max_predicates: Self::DEFAULT_MAX_PREDICATES,
         }
+    }
+
+    /// Replaces the maximum number of comparisons in a `WHERE` clause.
+    #[must_use]
+    pub const fn with_max_predicates(mut self, max_predicates: usize) -> Self {
+        self.max_predicates = max_predicates;
+        self
     }
 }
 
@@ -255,6 +265,9 @@ pub enum ParseErrorKind {
     ExpectedProjection,
     MixedAggregateProjection,
     TooManyProjections {
+        limit: usize,
+    },
+    TooManyPredicates {
         limit: usize,
     },
     ExpectedComparisonOperator,
@@ -333,6 +346,9 @@ impl fmt::Display for ParseErrorKind {
             }
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
+            }
+            Self::TooManyPredicates { limit } => {
+                write!(formatter, "predicate count exceeds limit of {limit}")
             }
             Self::ExpectedComparisonOperator => {
                 formatter.write_str("expected a comparison operator")
@@ -465,12 +481,12 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 /// Projections are `*`, a non-empty list of unquoted column names, or a
 /// non-empty aggregate-only list containing `COUNT(*)`, `SUM(column)`,
 /// `AVG(column)`, `MIN(column)`, and `MAX(column)`. Every aggregate may have an
-/// `AS` alias. The statement reads one table and may contain one `WHERE`
-/// comparison between a column and an `Int64`, `Float64`, `Bool`, or `String`
-/// literal. That may be followed by one `ORDER BY column [ASC|DESC]` clause and
-/// a nonnegative integer `LIMIT`. Raw-column mixing, other expressions,
-/// compound predicates, and other result modifiers are outside this
-/// intentionally narrow syntax boundary.
+/// `AS` alias. The statement reads one table and may contain a flat `WHERE`
+/// chain of column-to-literal comparisons joined by `AND`. Literals may be
+/// `Int64`, `Float64`, `Bool`, or `String`. That may be followed by one
+/// `ORDER BY column [ASC|DESC]` clause and a nonnegative integer `LIMIT`.
+/// Raw-column mixing, other expressions and predicate forms, and other result
+/// modifiers are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -607,11 +623,11 @@ impl<'a> Parser<'a> {
         let (table, _) = self.parse_identifier(IdentifierContext::Table)?;
 
         self.skip_whitespace();
-        let predicate = if self.peek_token_is("WHERE") {
+        let predicates = if self.peek_token_is("WHERE") {
             self.parse_keyword("WHERE")?;
-            Some(self.parse_comparison(limits.max_input_bytes)?)
+            self.parse_predicates(limits.max_predicates, limits.max_input_bytes)?
         } else {
-            None
+            Vec::new()
         };
 
         self.skip_whitespace();
@@ -646,7 +662,7 @@ impl<'a> Parser<'a> {
         Ok(SelectStatement {
             projections,
             table,
-            predicate,
+            predicates,
             order_by,
             limit,
         })
@@ -827,6 +843,30 @@ impl<'a> Parser<'a> {
             operator,
             value,
         })
+    }
+
+    fn parse_predicates(
+        &mut self,
+        max_predicates: usize,
+        max_string_bytes: usize,
+    ) -> Result<Vec<ComparisonPredicate>, ParseError> {
+        let mut predicates = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if predicates.len() == max_predicates {
+                return Err(self.error(ParseErrorKind::TooManyPredicates {
+                    limit: max_predicates,
+                }));
+            }
+            predicates.push(self.parse_comparison(max_string_bytes)?);
+
+            self.skip_whitespace();
+            if !self.peek_token_is("AND") {
+                break;
+            }
+            self.parse_keyword("AND")?;
+        }
+        Ok(predicates)
     }
 
     fn parse_comparison_column(&mut self) -> Result<String, ParseError> {

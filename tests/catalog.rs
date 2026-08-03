@@ -200,7 +200,7 @@ fn parsed_select_predicate_scans_rows_inserted_through_the_catalog() {
         .execute_insert("INSERT INTO events VALUES (1, false), (2, true), (3, true)")
         .unwrap();
     let statement = parse_select("SELECT id FROM EVENTS WHERE id >= 2").unwrap();
-    let predicate = statement.predicate.unwrap();
+    let predicate = statement.predicates.into_iter().next().unwrap();
 
     let selection = catalog
         .table(&statement.table)

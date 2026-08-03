@@ -16,7 +16,7 @@ fn parses_wildcard_and_named_projections() {
         SelectStatement {
             projections: SelectProjection::All,
             table: "events".to_owned(),
-            predicate: None,
+            predicates: Vec::new(),
             order_by: None,
             limit: None,
         }
@@ -31,7 +31,7 @@ fn parses_wildcard_and_named_projections() {
                 "active".to_owned(),
             ]),
             table: "Events".to_owned(),
-            predicate: None,
+            predicates: Vec::new(),
             order_by: None,
             limit: None,
         }
@@ -45,7 +45,7 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
         SelectStatement {
             projections: SelectProjection::CountAll { alias: None },
             table: "events".to_owned(),
-            predicate: None,
+            predicates: Vec::new(),
             order_by: None,
             limit: None,
         }
@@ -58,11 +58,11 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
                 alias: Some("Matching".to_owned()),
             },
             table: "Events".to_owned(),
-            predicate: Some(ComparisonPredicate {
+            predicates: vec![ComparisonPredicate {
                 column: "active".to_owned(),
                 operator: ComparisonOperator::Equal,
                 value: Value::Bool(true),
-            }),
+            }],
             order_by: None,
             limit: None,
         }
@@ -123,12 +123,12 @@ fn parses_bounded_aggregate_only_lists_with_optional_aliases() {
     );
     assert_eq!(statement.table, "Events");
     assert_eq!(
-        statement.predicate,
-        Some(ComparisonPredicate {
+        statement.predicates,
+        [ComparisonPredicate {
             column: "active".to_owned(),
             operator: ComparisonOperator::Equal,
             value: Value::Bool(true),
-        })
+        }]
     );
 }
 
@@ -137,7 +137,7 @@ fn parses_wildcard_adjacent_to_select_and_from_keywords() {
     let expected = SelectStatement {
         projections: SelectProjection::All,
         table: "events".to_owned(),
-        predicate: None,
+        predicates: Vec::new(),
         order_by: None,
         limit: None,
     };
@@ -173,7 +173,7 @@ fn parses_single_column_ordering_and_limit_in_clause_order() {
             direction: OrderDirection::Descending,
         })
     );
-    assert!(descending.predicate.is_some());
+    assert_eq!(descending.predicates.len(), 1);
     assert_eq!(descending.limit, Some(5));
 
     let explicit = parse_select("SELECT * FROM events ORDER BY score ASC LIMIT 0").unwrap();
@@ -289,12 +289,12 @@ fn parses_all_comparison_operators_without_required_whitespace() {
         let input = format!("SELECT id FROM events WHERE sequence{syntax}42");
         let statement = parse_select(&input).unwrap();
         assert_eq!(
-            statement.predicate,
-            Some(ComparisonPredicate {
+            statement.predicates,
+            vec![ComparisonPredicate {
                 column: "sequence".to_owned(),
                 operator,
                 value: Value::Int64(42),
-            }),
+            }],
             "input: {input:?}"
         );
     }
@@ -312,11 +312,52 @@ fn predicates_reuse_every_supported_literal_type() {
     for (predicate, expected_value) in cases {
         let input = format!("SELECT * FROM readings WHERE {predicate}");
         assert_eq!(
-            parse_select(&input).unwrap().predicate.unwrap().value,
+            parse_select(&input)
+                .unwrap()
+                .predicates
+                .into_iter()
+                .next()
+                .unwrap()
+                .value,
             expected_value,
             "input: {input:?}"
         );
     }
+}
+
+#[test]
+fn parses_a_flat_case_insensitive_and_chain() {
+    let statement = parse_select(
+        "SELECT id FROM readings WHERE id >= 2 aNd ratio < 5.5 AND active = true AND label != 'skip' LIMIT 3",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statement.predicates,
+        [
+            ComparisonPredicate {
+                column: "id".to_owned(),
+                operator: ComparisonOperator::GreaterThanOrEqual,
+                value: Value::Int64(2),
+            },
+            ComparisonPredicate {
+                column: "ratio".to_owned(),
+                operator: ComparisonOperator::LessThan,
+                value: Value::Float64(5.5),
+            },
+            ComparisonPredicate {
+                column: "active".to_owned(),
+                operator: ComparisonOperator::Equal,
+                value: Value::Bool(true),
+            },
+            ComparisonPredicate {
+                column: "label".to_owned(),
+                operator: ComparisonOperator::NotEqual,
+                value: Value::String("skip".to_owned()),
+            },
+        ]
+    );
+    assert_eq!(statement.limit, Some(3));
 }
 
 #[test]
@@ -375,6 +416,31 @@ fn enforces_projection_limit_at_the_next_projection() {
         .unwrap_err();
     assert_eq!(error.position, aggregates.find("AVG").unwrap());
     assert_eq!(error.kind, ParseErrorKind::TooManyProjections { limit: 2 });
+}
+
+#[test]
+fn enforces_predicate_limit_at_the_next_comparison() {
+    let two = "SELECT * FROM events WHERE id >= 1 AND active = true";
+    let limits = SelectParseLimits::new(two.len(), 1).with_max_predicates(2);
+    assert!(parse_select_with_limits(two, limits).is_ok());
+
+    let three = "SELECT * FROM events WHERE id >= 1 AND active = true AND label != 'hidden'";
+    let error = parse_select_with_limits(
+        three,
+        SelectParseLimits::new(three.len(), 1).with_max_predicates(2),
+    )
+    .unwrap_err();
+    assert_eq!(error.position, three.find("label").unwrap());
+    assert_eq!(error.kind, ParseErrorKind::TooManyPredicates { limit: 2 });
+
+    let one = "SELECT * FROM events WHERE id = 1";
+    let error = parse_select_with_limits(
+        one,
+        SelectParseLimits::new(one.len(), 1).with_max_predicates(0),
+    )
+    .unwrap_err();
+    assert_eq!(error.position, one.find("id =").unwrap());
+    assert_eq!(error.kind, ParseErrorKind::TooManyPredicates { limit: 0 });
 }
 
 #[test]
@@ -445,6 +511,13 @@ fn reports_positioned_predicate_errors() {
             "SELECT * FROM t WHERE id =".len(),
             ParseErrorKind::ExpectedValue,
         ),
+        (
+            "SELECT * FROM t WHERE id = 1 AND",
+            "SELECT * FROM t WHERE id = 1 AND".len(),
+            ParseErrorKind::ExpectedIdentifier {
+                context: IdentifierContext::Column,
+            },
+        ),
     ];
 
     for (input, position, kind) in cases {
@@ -472,9 +545,11 @@ fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
         ("SELECT DISTINCT id FROM events", "id"),
         ("SELECT DISTINCT COUNT(*) FROM events", "COUNT"),
         ("SELECT * FROM events AS e", "AS"),
-        ("SELECT * FROM events WHERE id = 1 AND active = true", "AND"),
         ("SELECT * FROM events WHERE id = 1 OR id = 2", "OR"),
         ("SELECT * FROM events WHERE id = NULL", "NULL"),
+        ("SELECT * FROM events WHERE NOT active = true", "active"),
+        ("SELECT * FROM events WHERE (id = 1)", "("),
+        ("SELECT * FROM events WHERE id = 1 AND (active = true)", "("),
         ("SELECT COUNT(*) FROM events GROUP BY active", "GROUP"),
         ("SELECT * FROM events GROUP BY id", "GROUP"),
         ("SELECT AVG(id) FROM events HAVING AVG(id) > 1", "HAVING"),
