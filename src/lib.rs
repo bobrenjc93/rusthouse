@@ -4,6 +4,7 @@ pub mod aggregate;
 pub mod csv;
 pub mod execution;
 pub mod grouping;
+pub mod join;
 pub mod order;
 pub mod parser;
 pub mod scan;
@@ -17,6 +18,7 @@ pub use execution::{InsertExecutionError, execute_insert};
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
+pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64};
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
     ColumnDefinition, CreateTableStatement, Identifier, InsertStatement, ParseError, ParseLimits,
