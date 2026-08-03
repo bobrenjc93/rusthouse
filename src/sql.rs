@@ -1,4 +1,4 @@
-use crate::Value;
+use crate::{Value, input::MAX_SQL_INPUT_BYTES};
 use std::fmt;
 
 /// Maximum number of statements accepted in one SQL batch.
@@ -145,7 +145,18 @@ impl fmt::Display for SqlError {
 impl std::error::Error for SqlError {}
 
 /// Parses and executes every statement in a SQL batch.
+///
+/// Batches larger than [`MAX_SQL_INPUT_BYTES`] bytes are rejected before
+/// lexing, at the first byte beyond the limit.
 pub fn execute_batch(input: &str) -> Result<Vec<QueryResult>, SqlError> {
+    if input.len() > MAX_SQL_INPUT_BYTES {
+        return Err(SqlError::limit_exceeded(
+            MAX_SQL_INPUT_BYTES,
+            "input byte",
+            MAX_SQL_INPUT_BYTES,
+        ));
+    }
+
     let tokens = Lexer::new(input).tokenize();
     Parser::new(tokens).parse_batch()
 }
