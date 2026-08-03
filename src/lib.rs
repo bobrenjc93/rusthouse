@@ -7,7 +7,7 @@ pub mod sql;
 pub mod storage;
 pub mod table_snapshot;
 
-pub use catalog::{Catalog, CatalogError, CatalogLimits, DEFAULT_MAX_TABLES};
+pub use catalog::{Catalog, CatalogError, CatalogLimits, DEFAULT_MAX_TABLES, SelectResult};
 pub use scan::{ComparisonOperator, RowSelection, ScanError, SelectionAllocationError};
 pub use sql::{
     ColumnDefinition, ComparisonPredicate, CreateTableStatement, IdentifierContext,
