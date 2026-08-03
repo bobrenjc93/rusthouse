@@ -72,6 +72,15 @@ pub enum GroupedCountError {
         /// Caller-supplied maximum number of groups.
         limit: usize,
     },
+    /// Owned distinct String keys would exceed the caller's byte limit.
+    StringResultTooLarge {
+        /// Name of the grouped field.
+        field: String,
+        /// Maximum total owned String payload bytes.
+        limit: usize,
+        /// Total distinct String payload bytes required by the result.
+        required: usize,
+    },
     /// Incrementing a group's row count would exceed the `usize` range.
     CountOverflow {
         /// Name of the grouped field.
@@ -105,6 +114,14 @@ impl fmt::Display for GroupedCountError {
             Self::GroupLimitExceeded { field, limit } => write!(
                 formatter,
                 "grouped count for field `{field}` exceeds group limit {limit}"
+            ),
+            Self::StringResultTooLarge {
+                field,
+                limit,
+                required,
+            } => write!(
+                formatter,
+                "grouped count for field `{field}` requires {required} owned String bytes; limit is {limit}"
             ),
             Self::CountOverflow { field } => {
                 write!(formatter, "grouped count for field `{field}` overflowed")
@@ -141,14 +158,33 @@ impl Table {
     /// more than `max_groups` distinct values, this method returns
     /// [`GroupedCountError::GroupLimitExceeded`] rather than a truncated result.
     /// Group storage and owned String keys are allocated fallibly, and counts
-    /// use checked arithmetic. Accumulation takes expected linear time in the
-    /// selected row count, followed by an in-place `O(g log g)` sort for `g`
-    /// distinct groups; retained memory is proportional to `g`.
+    /// use checked arithmetic. This compatibility entry point does not limit
+    /// total String key bytes; bounded callers should use
+    /// [`Self::grouped_count_with_string_limit`]. Accumulation takes expected
+    /// linear time in the selected row count, followed by an in-place
+    /// `O(g log g)` sort for `g` distinct groups.
     pub fn grouped_count(
         &self,
         field: &str,
         selection: Option<&RowSelection>,
         max_groups: usize,
+    ) -> Result<Vec<GroupedCount>, GroupedCountError> {
+        self.grouped_count_with_string_limit(field, selection, max_groups, usize::MAX)
+    }
+
+    /// Returns bounded distinct values and counts in ascending key order.
+    ///
+    /// This has the same grouping semantics and group-count bound as
+    /// [`Self::grouped_count`]. Before copying any distinct String key, it sums
+    /// their payload lengths and returns
+    /// [`GroupedCountError::StringResultTooLarge`] if the result would retain
+    /// more than `max_string_bytes`. Duplicate keys consume the budget once.
+    pub fn grouped_count_with_string_limit(
+        &self,
+        field: &str,
+        selection: Option<&RowSelection>,
+        max_groups: usize,
+        max_string_bytes: usize,
     ) -> Result<Vec<GroupedCount>, GroupedCountError> {
         validate_selection(self.len(), selection)?;
         let column_index = self
@@ -163,7 +199,7 @@ impl Table {
             Some(selection) => group_column(field, column, selection.selected_rows(), max_groups)?,
             None => group_column(field, column, 0..self.len(), max_groups)?,
         };
-        materialize_groups(field, groups)
+        materialize_groups(field, groups, max_string_bytes)
     }
 }
 
@@ -280,7 +316,9 @@ fn group_keys<'a>(
 fn materialize_groups(
     field: &str,
     groups: HashMap<GroupKey<'_>, usize>,
+    max_string_bytes: usize,
 ) -> Result<Vec<GroupedCount>, GroupedCountError> {
+    validate_grouped_string_bytes(field, &groups, max_string_bytes)?;
     let mut result = Vec::new();
     reserve_group_results(&mut result, groups.len())?;
     for (key, count) in groups {
@@ -291,6 +329,27 @@ fn materialize_groups(
     }
     result.sort_unstable_by(|left, right| compare_values(&left.value, &right.value));
     Ok(result)
+}
+
+fn validate_grouped_string_bytes(
+    field: &str,
+    groups: &HashMap<GroupKey<'_>, usize>,
+    limit: usize,
+) -> Result<(), GroupedCountError> {
+    let mut required = 0usize;
+    for key in groups.keys() {
+        if let GroupKey::String(value) = key {
+            required = required.saturating_add(value.len());
+        }
+    }
+    if required > limit {
+        return Err(GroupedCountError::StringResultTooLarge {
+            field: field.to_owned(),
+            limit,
+            required,
+        });
+    }
+    Ok(())
 }
 
 impl GroupKey<'_> {

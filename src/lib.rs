@@ -12,8 +12,8 @@ pub mod storage;
 pub mod table_snapshot;
 
 pub use catalog::{
-    Catalog, CatalogError, CatalogLimits, CatalogSnapshotError, DEFAULT_MAX_TABLES,
-    MAX_AGGREGATE_RESULT_BYTES, SelectResult,
+    Catalog, CatalogError, CatalogLimits, CatalogSnapshotError, DEFAULT_MAX_GROUPED_RESULT_BYTES,
+    DEFAULT_MAX_GROUPS, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, SelectResult,
 };
 pub use csv::{write_csv_with_names, write_select_csv_with_names};
 pub use grouping::{GroupedCount, GroupedCountError};

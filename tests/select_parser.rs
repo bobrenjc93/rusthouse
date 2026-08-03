@@ -133,6 +133,41 @@ fn parses_bounded_aggregate_only_lists_with_optional_aliases() {
 }
 
 #[test]
+fn parses_one_matching_group_key_and_count_alias() {
+    assert_eq!(
+        parse_select(
+            "sElEcT channel, CoUnT(*) AS events FROM Campaigns \
+             WHERE active = true GROUP BY channel",
+        )
+        .unwrap(),
+        SelectStatement {
+            projections: SelectProjection::GroupedCount {
+                key: "channel".to_owned(),
+                alias: Some("events".to_owned()),
+            },
+            table: "Campaigns".to_owned(),
+            predicate_groups: vec![vec![ComparisonPredicate {
+                column: "active".to_owned(),
+                operator: ComparisonOperator::Equal,
+                value: Value::Bool(true),
+            }]],
+            order_by: None,
+            limit: None,
+        }
+    );
+
+    assert_eq!(
+        parse_select("SELECT id, COUNT(*) FROM events GROUP BY id")
+            .unwrap()
+            .projections,
+        SelectProjection::GroupedCount {
+            key: "id".to_owned(),
+            alias: None,
+        }
+    );
+}
+
+#[test]
 fn parses_wildcard_adjacent_to_select_and_from_keywords() {
     let expected = SelectStatement {
         projections: SelectProjection::All,
@@ -644,7 +679,6 @@ fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
         ("SELECT COUNT(id) FROM events", "id"),
         ("SELECT COUNT(DISTINCT id) FROM events", "DISTINCT"),
         ("SELECT COUNT(*), id FROM events", "id"),
-        ("SELECT id, COUNT(*) FROM events", "COUNT"),
         ("SELECT SUM(id), label FROM events", "label"),
         ("SELECT label, MIN(label) FROM events", "MIN"),
         ("SELECT DISTINCT id FROM events", "id"),
@@ -668,11 +702,59 @@ fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
     for input in [
         "SELECT COUNT(*), id FROM events",
         "SELECT COUNT(*), * FROM events",
-        "SELECT id, COUNT(*) FROM events",
     ] {
         assert_eq!(
             parse_error(input).kind,
             ParseErrorKind::MixedAggregateProjection,
+            "input: {input:?}"
+        );
+    }
+
+    let missing_group = "SELECT id, COUNT(*) FROM events";
+    let error = parse_error(missing_group);
+    assert_eq!(error.position, missing_group.len());
+    assert_eq!(
+        error.kind,
+        ParseErrorKind::ExpectedKeyword {
+            expected: "GROUP",
+            found: None,
+        }
+    );
+
+    let mismatch = "SELECT id, COUNT(*) FROM events GROUP BY active";
+    let error = parse_error(mismatch);
+    assert_eq!(error.position, mismatch.find("active").unwrap());
+    assert_eq!(
+        error.kind,
+        ParseErrorKind::GroupKeyMismatch {
+            projected: "id".to_owned(),
+            grouped: "active".to_owned(),
+        }
+    );
+
+    for (input, marker) in [
+        ("SELECT id, SUM(id) FROM events GROUP BY id", "SUM"),
+        (
+            "SELECT id, COUNT(*) FROM events GROUP BY id, active",
+            ", active",
+        ),
+        (
+            "SELECT id, COUNT(*) FROM events GROUP BY id HAVING COUNT(*) > 1",
+            "HAVING",
+        ),
+        (
+            "SELECT id, COUNT(*) FROM events GROUP BY id ORDER BY id",
+            "ORDER",
+        ),
+        (
+            "SELECT id, COUNT(*) FROM events GROUP BY id LIMIT 1",
+            "LIMIT",
+        ),
+    ] {
+        let error = parse_error(input);
+        assert_eq!(
+            error.position,
+            input.find(marker).unwrap(),
             "input: {input:?}"
         );
     }
