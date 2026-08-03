@@ -218,6 +218,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 100
       }
+    },
+    {
+      "key": "pr:373",
+      "recordedAt": "2026-08-03T22:09:37.676Z",
+      "label": "PR #373",
+      "kind": "leaf",
+      "prNumber": 373,
+      "title": "Expose ORDER BY LIMIT through SQL",
+      "scores": {
+        "eval_9fbdfec0": 40,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 0,
+        "eval_63df825b": 90,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 100
+      }
     }
   ]
 }
