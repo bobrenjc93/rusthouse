@@ -223,15 +223,15 @@ fn ordered_execution_enforces_exact_and_exceeded_operator_bounds() {
 #[test]
 fn orders_filtered_rows_and_applies_limit_after_filtering() {
     let statement = parse_select(
-        "SELECT value FROM readings WHERE value = 7 ORDER BY value DESC NULLS LAST LIMIT 2",
+        "SELECT value FROM readings WHERE value >= 7 ORDER BY value DESC NULLS LAST LIMIT 2",
         ParseLimits::default(),
     )
     .unwrap();
-    let table = table(true, &[Some(7), None, Some(2), Some(7), Some(7)]);
+    let table = table(true, &[Some(7), None, Some(2), Some(9), Some(7)]);
 
     let values = execute_select("readings", &table, &statement).unwrap();
 
-    assert_eq!(values.as_ref(), &[Some(7), Some(7)]);
+    assert_eq!(values.as_ref(), &[Some(9), Some(7)]);
     assert!(matches!(values, std::borrow::Cow::Owned(_)));
 }
 
@@ -253,102 +253,195 @@ fn order_column_must_match_even_for_zero_limit() {
 }
 
 #[test]
-fn where_equality_returns_matches_in_source_order_and_excludes_nulls() {
-    let statement = parse_select(
-        "SELECT value FROM readings WHERE value = 7",
-        ParseLimits::default(),
-    )
-    .unwrap();
-    let table = table(true, &[Some(7), None, Some(2), Some(7), None, Some(7)]);
+fn executes_every_where_comparison_operator_and_excludes_nulls() {
+    let table = table(
+        true,
+        &[
+            None,
+            Some(i64::MIN),
+            Some(-2),
+            Some(0),
+            Some(2),
+            Some(i64::MAX),
+            None,
+        ],
+    );
+    let cases = [
+        ("=", vec![Some(0)]),
+        (
+            "!=",
+            vec![Some(i64::MIN), Some(-2), Some(2), Some(i64::MAX)],
+        ),
+        (
+            "<>",
+            vec![Some(i64::MIN), Some(-2), Some(2), Some(i64::MAX)],
+        ),
+        ("<", vec![Some(i64::MIN), Some(-2)]),
+        ("<=", vec![Some(i64::MIN), Some(-2), Some(0)]),
+        (">", vec![Some(2), Some(i64::MAX)]),
+        (">=", vec![Some(0), Some(2), Some(i64::MAX)]),
+    ];
 
-    let values = execute_select("readings", &table, &statement).unwrap();
+    for (operator, expected) in cases {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {operator} 0"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+        let values = execute_select("readings", &table, &statement).unwrap();
 
-    assert_eq!(values.as_ref(), &[Some(7), Some(7), Some(7)]);
-    assert!(matches!(values, std::borrow::Cow::Owned(_)));
+        assert_eq!(values.as_ref(), expected, "operator {operator}");
+        assert!(matches!(values, std::borrow::Cow::Owned(_)));
+    }
 }
 
 #[test]
-fn where_equality_compares_int64_bounds_and_applies_limit_after_filtering() {
+fn where_comparisons_handle_int64_extremes_without_overflow() {
     let table = table(
         true,
         &[
             Some(i64::MIN),
+            Some(-1),
             Some(i64::MAX),
             Some(i64::MIN),
             None,
-            Some(i64::MIN),
+            Some(i64::MAX),
         ],
     );
-    let minimum = parse_select(
-        "SELECT value FROM readings WHERE value = -9223372036854775808 LIMIT 2",
-        ParseLimits::default(),
-    )
-    .unwrap();
-    let maximum = parse_select(
-        "SELECT value FROM readings WHERE value = 9223372036854775807",
-        ParseLimits::default(),
-    )
-    .unwrap();
+    let cases = [
+        ("=", i64::MIN, vec![Some(i64::MIN), Some(i64::MIN)]),
+        (
+            "!=",
+            i64::MIN,
+            vec![Some(-1), Some(i64::MAX), Some(i64::MAX)],
+        ),
+        (
+            "<>",
+            i64::MAX,
+            vec![Some(i64::MIN), Some(-1), Some(i64::MIN)],
+        ),
+        ("<", i64::MIN, vec![]),
+        ("<=", i64::MIN, vec![Some(i64::MIN), Some(i64::MIN)]),
+        (">", i64::MAX, vec![]),
+        (">=", i64::MAX, vec![Some(i64::MAX), Some(i64::MAX)]),
+    ];
 
-    assert_eq!(
-        execute_select("readings", &table, &minimum)
-            .unwrap()
-            .as_ref(),
-        &[Some(i64::MIN), Some(i64::MIN)]
-    );
-    assert_eq!(
-        execute_select("readings", &table, &maximum)
-            .unwrap()
-            .as_ref(),
-        &[Some(i64::MAX)]
-    );
+    for (operator, comparison_value, expected) in cases {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {operator} {comparison_value}"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_select("readings", &table, &statement)
+                .unwrap()
+                .as_ref(),
+            expected,
+            "operator {operator}"
+        );
+    }
 }
 
 #[test]
-fn where_column_must_match_even_when_projection_is_valid() {
-    let statement = parse_select(
-        "SELECT value FROM readings WHERE other = 1",
-        ParseLimits::default(),
-    )
-    .unwrap();
+fn where_column_must_match_for_every_operator() {
     let table = table(true, &[Some(1), None]);
 
-    assert_eq!(
-        execute_select("readings", &table, &statement),
-        Err(SelectExecutionError::UnknownColumn {
-            name: "other".to_owned(),
-        })
-    );
+    for operator in ["=", "!=", "<>", "<", "<=", ">", ">="] {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE other {operator} 1"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_select("readings", &table, &statement),
+            Err(SelectExecutionError::UnknownColumn {
+                name: "other".to_owned(),
+            }),
+            "operator {operator}"
+        );
+    }
 }
 
 #[test]
-fn where_execution_preserves_scan_input_and_result_limits() {
+fn every_where_operator_preserves_scan_input_and_result_limits() {
+    let table = table(true, &[Some(1), None, Some(1), Some(2), Some(3)]);
+    let cases = [
+        ("=", 1, vec![Some(1), Some(1)]),
+        ("!=", 1, vec![Some(2), Some(3)]),
+        ("<>", 1, vec![Some(2), Some(3)]),
+        ("<", 2, vec![Some(1), Some(1)]),
+        ("<=", 1, vec![Some(1), Some(1)]),
+        (">", 1, vec![Some(2), Some(3)]),
+        (">=", 2, vec![Some(2), Some(3)]),
+    ];
+
+    for (operator, comparison_value, expected) in cases {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {operator} {comparison_value}"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_select_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(4, expected.len()),
+            ),
+            Err(SelectExecutionError::Scan(ScanError::InputLimitExceeded {
+                rows: 5,
+                max_rows: 4,
+            })),
+            "input bound for {operator}"
+        );
+        assert_eq!(
+            execute_select_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(5, expected.len() - 1),
+            ),
+            Err(SelectExecutionError::Scan(ScanError::ResultLimitExceeded {
+                rows: expected.len(),
+                max_rows: expected.len() - 1,
+            })),
+            "result bound for {operator}"
+        );
+        assert_eq!(
+            execute_select_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(5, expected.len()),
+            )
+            .unwrap()
+            .as_ref(),
+            expected,
+            "exact bounds for {operator}"
+        );
+    }
+}
+
+#[test]
+fn where_comparison_preserves_source_order_and_applies_limit_after_filtering() {
     let statement = parse_select(
-        "SELECT value FROM readings WHERE value = 1",
+        "SELECT value FROM readings WHERE value != 7 LIMIT 3",
         ParseLimits::default(),
     )
     .unwrap();
-    let table = table(true, &[Some(1), None, Some(1)]);
+    let table = table(
+        true,
+        &[Some(7), None, Some(3), Some(9), Some(3), None, Some(10)],
+    );
 
     assert_eq!(
-        execute_select_with_limits("readings", &table, &statement, ScanLimits::new(2, 3),),
-        Err(SelectExecutionError::Scan(ScanError::InputLimitExceeded {
-            rows: 3,
-            max_rows: 2,
-        }))
-    );
-    assert_eq!(
-        execute_select_with_limits("readings", &table, &statement, ScanLimits::new(3, 1),),
-        Err(SelectExecutionError::Scan(ScanError::ResultLimitExceeded {
-            rows: 2,
-            max_rows: 1,
-        }))
-    );
-    assert_eq!(
-        execute_select_with_limits("readings", &table, &statement, ScanLimits::new(3, 2),)
+        execute_select("readings", &table, &statement)
             .unwrap()
             .as_ref(),
-        &[Some(1), Some(1)]
+        &[Some(3), Some(9), Some(3)]
     );
 }
 

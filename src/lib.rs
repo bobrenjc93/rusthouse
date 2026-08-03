@@ -28,9 +28,9 @@ pub use grouping::{
 pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64};
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
-    ColumnDefinition, CreateTableStatement, EqualityPredicate, Identifier, InsertStatement,
-    OrderByClause, ParseError, ParseLimits, SelectStatement, parse_create_table, parse_insert,
-    parse_select,
+    ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
+    InsertStatement, OrderByClause, ParseError, ParseLimits, SelectStatement, parse_create_table,
+    parse_insert, parse_select,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,

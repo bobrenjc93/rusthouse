@@ -5,8 +5,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ComparisonOperator, InsertError, InsertStatement, Int64Table, OrderError, OrderLimits,
-    ScanError, ScanLimits, SelectStatement, order_nullable_i64, scan_nullable_i64,
+    InsertError, InsertStatement, Int64Table, OrderError, OrderLimits, ScanError, ScanLimits,
+    SelectStatement, order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -49,7 +49,7 @@ pub enum SelectExecutionError {
     UnknownTable { name: String },
     /// The statement names a column other than the table's only column.
     UnknownColumn { name: String },
-    /// The bounded equality scan rejected the input or result size.
+    /// The bounded comparison scan rejected the input or result size.
     Scan(ScanError),
     /// The bounded top-k order operation rejected the input or requested limit.
     Order(OrderError),
@@ -132,7 +132,7 @@ pub fn execute_insert(
 /// `expected_table_name` and the table's column name are compared exactly
 /// with the identifiers retained by the parser, including ASCII case. An
 /// unfiltered, unordered result borrows the table's existing column storage.
-/// A `WHERE` equality predicate uses a bounded scan, while `ORDER BY ... LIMIT`
+/// A `WHERE` comparison predicate uses a bounded scan, while `ORDER BY ... LIMIT`
 /// uses the bounded top-k operator and owns the ordered values. Use
 /// [`execute_select_with_order_limits`] for explicit bounds on both operators.
 ///
@@ -169,7 +169,7 @@ pub fn execute_select<'table>(
     )
 }
 
-/// Executes one parsed `SELECT` with explicit equality-scan resource bounds.
+/// Executes one parsed `SELECT` with explicit comparison-scan resource bounds.
 ///
 /// Plain projections do not scan and therefore do not consume these bounds.
 /// Filtered projections preserve source-row order and exclude `NULL` because
@@ -237,7 +237,7 @@ pub fn execute_select_with_order_limits<'table>(
             Some(predicate) => {
                 let matching_rows = scan_nullable_i64(
                     values,
-                    ComparisonOperator::Eq,
+                    predicate.operator(),
                     predicate.value(),
                     scan_limits,
                 )?;
@@ -269,12 +269,8 @@ pub fn execute_select_with_order_limits<'table>(
         return Ok(Cow::Borrowed(&values[..limit.min(values.len())]));
     };
 
-    let matching_rows = scan_nullable_i64(
-        values,
-        ComparisonOperator::Eq,
-        predicate.value(),
-        scan_limits,
-    )?;
+    let matching_rows =
+        scan_nullable_i64(values, predicate.operator(), predicate.value(), scan_limits)?;
     let selected = matching_rows
         .into_iter()
         .take(limit)

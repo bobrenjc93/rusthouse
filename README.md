@@ -24,8 +24,9 @@ The early implementation should favor Rust's standard library and a small depend
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
-`Int64` equality predicates through `WHERE column = literal` and an optional
-nonnegative `LIMIT`. The explicit
+`Int64` predicates through `WHERE column operator literal`, where `operator` is
+`=`, `!=`, `<>`, `<`, `<=`, `>`, or `>=`, and an optional nonnegative `LIMIT`.
+The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a
 prefix of the table's column storage;
