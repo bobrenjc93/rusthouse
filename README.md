@@ -63,7 +63,8 @@ printf '%s\n' 'SELECT id FROM restored ORDER BY id' \
 
 Each option may be supplied at most once. The snapshot payload limit is 64 MiB;
 these options intentionally do not persist manifests, discovery metadata, a
-whole catalog, or a write-ahead log.
+whole catalog, or a write-ahead log. Snapshot file names matching `.*.tmp` or
+`.*.lock` are reserved for atomic-writer sidecars.
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
 

@@ -21,6 +21,7 @@ statements execute in one in-memory catalog. Supported statement forms are
 CREATE TABLE, INSERT INTO ... VALUES, and SELECT. Each SELECT result is written
 to stdout as CSVWithNames; CREATE and INSERT produce no output. A table snapshot
 is loaded before stdin is read and saved only after the complete batch succeeds.
+Snapshot file names matching .*.tmp or .*.lock are reserved for writer sidecars.
 
 Options:
   --format csv            Write SELECT results as CSVWithNames (the default)

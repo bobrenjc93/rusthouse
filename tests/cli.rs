@@ -222,6 +222,45 @@ fn concurrent_saves_publish_one_complete_snapshot() {
     assert!(id < WRITERS);
 }
 
+#[test]
+fn rejects_sidecar_paths_without_mutating_the_primary_snapshot() {
+    let directory = TestDirectory::new("reserved-sidecars");
+    let primary = directory.snapshot("primary.snapshot");
+    let temporary = directory.snapshot(".primary.snapshot.tmp");
+    let lock = directory.snapshot(".primary.snapshot.lock");
+    let primary_mapping = format!("events={}", primary.display());
+    let temporary_mapping = format!("events={}", temporary.display());
+    let lock_mapping = format!("events={}", lock.display());
+
+    let primary_save = run(
+        &["--save-table", &primary_mapping],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (7)\n",
+    );
+    assert_eq!(primary_save.status.code(), Some(0));
+
+    for mapping in [&temporary_mapping, &lock_mapping] {
+        let collision = run(
+            &["--save-table", mapping],
+            b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (99)\n",
+        );
+        assert_eq!(collision.status.code(), Some(1));
+        assert!(collision.stdout.is_empty());
+        assert!(
+            String::from_utf8(collision.stderr)
+                .unwrap()
+                .contains("is reserved for internal writer state")
+        );
+    }
+
+    let reopened = run(
+        &["--load-table", &primary_mapping],
+        b"SELECT id FROM events\n",
+    );
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"id\"\n7\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn preserves_non_utf8_snapshot_paths_during_argument_parsing() {

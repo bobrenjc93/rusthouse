@@ -87,6 +87,8 @@ pub enum SnapshotError {
     TrailingData { expected_len: u64, actual_len: u64 },
     /// Memory could not be reserved for the bounded payload.
     AllocationFailed { requested_len: u64 },
+    /// The file name belongs to the snapshot writer's sidecar namespace.
+    ReservedPath { path: PathBuf },
     /// A filesystem operation failed for a reason not represented above.
     Io {
         operation: &'static str,
@@ -130,6 +132,11 @@ impl fmt::Display for SnapshotError {
             Self::AllocationFailed { requested_len } => write!(
                 formatter,
                 "could not reserve memory for a {requested_len}-byte snapshot payload"
+            ),
+            Self::ReservedPath { path } => write!(
+                formatter,
+                "snapshot path {} is reserved for internal writer state",
+                path.display()
             ),
             Self::Io {
                 operation,
@@ -227,6 +234,7 @@ impl SnapshotStore {
     /// so oversized or trailing files are never read into an unbounded buffer.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, SnapshotError> {
         let path = path.as_ref();
+        validate_snapshot_path(path)?;
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -354,6 +362,7 @@ fn encode_header(payload_len: u64, checksum: u32) -> [u8; SNAPSHOT_HEADER_LEN] {
 }
 
 fn sibling_write_paths(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), SnapshotError> {
+    validate_snapshot_path(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -379,6 +388,33 @@ fn sibling_write_paths(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), Snaps
         parent.join(temporary_name),
         parent.join(sibling_name),
     ))
+}
+
+fn validate_snapshot_path(path: &Path) -> Result<(), SnapshotError> {
+    let Some(file_name) = path.file_name() else {
+        return Err(io_failure(
+            "resolve",
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot path must have a file name",
+            ),
+        ));
+    };
+    let file_name = file_name.as_encoded_bytes();
+    if file_name.first() == Some(&b'.')
+        && [b".tmp".as_slice(), b".lock".as_slice()]
+            .iter()
+            .any(|suffix| {
+                file_name.len() > suffix.len()
+                    && file_name[file_name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            })
+    {
+        return Err(SnapshotError::ReservedPath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn acquire_writer_lock(path: &Path) -> Result<File, SnapshotError> {
@@ -535,6 +571,32 @@ mod tests {
         assert_eq!(store.read(&path).expect("read replacement"), b"replacement");
         assert!(directory.0.join(".state.snapshot.lock").exists());
         assert!(!directory.0.join(".state.snapshot.tmp").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn rejects_cross_destination_sidecar_collisions_without_mutating_the_primary() {
+        let directory = TestDirectory::new("reserved-sidecars");
+        let path = directory.snapshot();
+        let temporary_path = directory.0.join(".state.snapshot.tmp");
+        let lock_path = directory.0.join(".state.snapshot.lock");
+        let uppercase_temporary_path = directory.0.join(".STATE.SNAPSHOT.TMP");
+        let store = SnapshotStore::new(32);
+        store.write(&path, b"primary").unwrap();
+
+        for reserved_path in [&temporary_path, &lock_path, &uppercase_temporary_path] {
+            assert!(matches!(
+                store.write(reserved_path, b"collision").unwrap_err(),
+                SnapshotError::ReservedPath { path } if path == *reserved_path
+            ));
+            assert!(matches!(
+                store.read(reserved_path).unwrap_err(),
+                SnapshotError::ReservedPath { path } if path == *reserved_path
+            ));
+        }
+
+        assert_eq!(store.read(&path).unwrap(), b"primary");
+        assert!(!temporary_path.exists());
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 
