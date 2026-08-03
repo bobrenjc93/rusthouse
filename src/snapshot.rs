@@ -18,11 +18,11 @@
 //! The checksum uses polynomial `0xedb8_8320`, an initial value of
 //! `0xffff_ffff`, and a final XOR of `0xffff_ffff`.
 //!
-//! Writes use a `.<file-name>.tmp` sibling, sync that file, atomically rename
-//! it over the destination, and sync the parent directory on Unix. A stale
-//! sibling from an interrupted write is discarded by the next write and is
-//! never considered when reading. Callers must serialize writes to the same
-//! destination path.
+//! Each write exclusively creates a `.<file-name>.<process-id>.<sequence>.tmp`
+//! sibling, syncs that file, atomically renames it over the destination, and
+//! syncs the parent directory on Unix. Concurrent writers never share or
+//! remove each other's temporary files; the last rename determines the visible
+//! snapshot.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -187,37 +187,23 @@ impl SnapshotStore {
         let path = path.as_ref();
         self.validate_payload_len(payload.len() as u64)?;
 
-        let (parent, temporary_path) = sibling_temporary_path(path)?;
-        remove_stale_temporary_file(&temporary_path)?;
+        let (parent, mut temporary) = create_sibling_temporary_file(path)?;
+        let temporary_path = temporary.path().to_path_buf();
+        let header = encode_header(payload.len() as u64, crc32(payload));
+        temporary
+            .file_mut()
+            .write_all(&header)
+            .and_then(|()| temporary.file_mut().write_all(payload))
+            .map_err(|source| io_failure("write temporary", &temporary_path, source))?;
+        temporary
+            .file_mut()
+            .sync_all()
+            .map_err(|source| io_failure("sync temporary", &temporary_path, source))?;
+        temporary.close();
 
-        let write_result = (|| {
-            let mut temporary_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)
-                .map_err(|source| io_failure("create temporary", &temporary_path, source))?;
-
-            let header = encode_header(payload.len() as u64, crc32(payload));
-            temporary_file
-                .write_all(&header)
-                .and_then(|()| temporary_file.write_all(payload))
-                .map_err(|source| io_failure("write temporary", &temporary_path, source))?;
-            temporary_file
-                .sync_all()
-                .map_err(|source| io_failure("sync temporary", &temporary_path, source))?;
-            drop(temporary_file);
-
-            fs::rename(&temporary_path, path)
-                .map_err(|source| io_failure("replace", path, source))?;
-            sync_parent_directory(&parent)?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temporary_path);
-        }
-
-        write_result
+        fs::rename(&temporary_path, path).map_err(|source| io_failure("replace", path, source))?;
+        temporary.mark_published();
+        sync_parent_directory(&parent)
     }
 
     /// Opens, validates, and returns the opaque payload at `path`.
@@ -352,7 +338,46 @@ fn encode_header(payload_len: u64, checksum: u32) -> [u8; SNAPSHOT_HEADER_LEN] {
     header
 }
 
-fn sibling_temporary_path(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
+static NEXT_TEMPORARY_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct OwnedTemporaryFile {
+    path: PathBuf,
+    file: Option<File>,
+    published: bool,
+}
+
+impl OwnedTemporaryFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("temporary file is open until it is synced")
+    }
+
+    fn close(&mut self) {
+        drop(self.file.take());
+    }
+
+    fn mark_published(&mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for OwnedTemporaryFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.published {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_sibling_temporary_file(
+    path: &Path,
+) -> Result<(PathBuf, OwnedTemporaryFile), SnapshotError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -368,17 +393,33 @@ fn sibling_temporary_path(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotErr
         )
     })?;
 
-    let mut temporary_name = OsString::from(".");
-    temporary_name.push(file_name);
-    temporary_name.push(".tmp");
-    Ok((parent.to_path_buf(), parent.join(temporary_name)))
-}
+    loop {
+        let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".{}.{sequence}.tmp", std::process::id()));
+        let temporary_path = parent.join(temporary_name);
 
-fn remove_stale_temporary_file(path: &Path) -> Result<(), SnapshotError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io_failure("remove stale temporary", path, source)),
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => {
+                return Ok((
+                    parent.to_path_buf(),
+                    OwnedTemporaryFile {
+                        path: temporary_path,
+                        file: Some(file),
+                        published: false,
+                    },
+                ));
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(io_failure("create temporary", &temporary_path, source));
+            }
+        }
     }
 }
 
@@ -457,7 +498,9 @@ const fn crc32_table() -> [u32; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -509,21 +552,95 @@ mod tests {
             .expect("replace snapshot");
 
         assert_eq!(store.read(&path).expect("read replacement"), b"replacement");
-        assert!(!directory.0.join(".state.snapshot.tmp").exists());
+        assert!(snapshot_temporary_files(&directory.0).is_empty());
     }
 
     #[test]
-    fn recovers_from_a_stale_temporary_file() {
-        let directory = TestDirectory::new("stale-temporary");
+    fn does_not_remove_an_unowned_temporary_file() {
+        let directory = TestDirectory::new("unowned-temporary");
         let path = directory.snapshot();
         let temporary_path = directory.0.join(".state.snapshot.tmp");
         let store = SnapshotStore::new(32);
 
-        fs::write(&temporary_path, b"incomplete previous write").expect("create stale file");
-        store.write(&path, b"current").expect("recover and write");
+        fs::write(&temporary_path, b"another writer's bytes").expect("create unowned file");
+        store.write(&path, b"current").expect("write snapshot");
 
         assert_eq!(store.read(&path).expect("read snapshot"), b"current");
-        assert!(!temporary_path.exists());
+        assert_eq!(
+            fs::read(&temporary_path).expect("read unowned file"),
+            b"another writer's bytes"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_publish_only_complete_snapshots_and_leave_no_temporary_files() {
+        const WRITER_COUNT: usize = 8;
+        const WRITES_PER_WRITER: usize = 8;
+        const PAYLOAD_LEN: usize = 128 * 1024;
+
+        let directory = TestDirectory::new("concurrent-writers");
+        let path = Arc::new(directory.snapshot());
+        let store = SnapshotStore::new(PAYLOAD_LEN);
+        let payloads = Arc::new(
+            (0..WRITER_COUNT)
+                .flat_map(|writer| {
+                    (0..WRITES_PER_WRITER)
+                        .map(move |write| test_payload(writer, write, PAYLOAD_LEN))
+                })
+                .collect::<Vec<_>>(),
+        );
+        store
+            .write(path.as_ref(), &payloads[0])
+            .expect("write initial snapshot");
+
+        let start = Arc::new(Barrier::new(WRITER_COUNT + 1));
+        let reading = Arc::new(AtomicBool::new(true));
+        let reader = {
+            let path = Arc::clone(&path);
+            let payloads = Arc::clone(&payloads);
+            let reading = Arc::clone(&reading);
+            thread::spawn(move || {
+                let store = SnapshotStore::new(PAYLOAD_LEN);
+                while reading.load(Ordering::Acquire) {
+                    let reopened = store.read(path.as_ref()).expect("reopen snapshot");
+                    assert_complete_test_payload(&reopened, &payloads, WRITES_PER_WRITER);
+                    thread::yield_now();
+                }
+            })
+        };
+
+        let writers = (0..WRITER_COUNT)
+            .map(|writer| {
+                let path = Arc::clone(&path);
+                let payloads = Arc::clone(&payloads);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    let store = SnapshotStore::new(PAYLOAD_LEN);
+                    start.wait();
+                    for write in 0..WRITES_PER_WRITER {
+                        let payload = &payloads[writer * WRITES_PER_WRITER + write];
+                        store.write(path.as_ref(), payload).expect("write snapshot");
+                        let reopened = store.read(path.as_ref()).expect("reopen snapshot");
+                        assert_complete_test_payload(&reopened, &payloads, WRITES_PER_WRITER);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        let writer_results = writers
+            .into_iter()
+            .map(thread::JoinHandle::join)
+            .collect::<Vec<_>>();
+        reading.store(false, Ordering::Release);
+        reader.join().expect("reader thread succeeds");
+        for result in writer_results {
+            result.expect("writer thread succeeds");
+        }
+
+        let reopened = store.read(path.as_ref()).expect("reopen final snapshot");
+        assert_complete_test_payload(&reopened, &payloads, WRITES_PER_WRITER);
+        assert!(snapshot_temporary_files(&directory.0).is_empty());
     }
 
     #[test]
@@ -549,7 +666,7 @@ mod tests {
             }
         ));
         assert!(!path.exists());
-        assert!(!directory.0.join(".state.snapshot.tmp").exists());
+        assert!(snapshot_temporary_files(&directory.0).is_empty());
     }
 
     #[test]
@@ -662,5 +779,40 @@ mod tests {
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    fn test_payload(writer: usize, write: usize, len: usize) -> Vec<u8> {
+        let mut payload = vec![(writer as u8).wrapping_mul(31).wrapping_add(write as u8); len];
+        payload[..8].copy_from_slice(&(writer as u64).to_le_bytes());
+        payload[8..16].copy_from_slice(&(write as u64).to_le_bytes());
+        payload
+    }
+
+    fn assert_complete_test_payload(
+        payload: &[u8],
+        expected: &[Vec<u8>],
+        writes_per_writer: usize,
+    ) {
+        assert!(payload.len() >= 16, "payload contains its writer identity");
+        let writer = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+        let write = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+        let expected_payload = expected
+            .get(writer * writes_per_writer + write)
+            .expect("payload identifies a known write");
+        assert_eq!(payload, expected_payload);
+    }
+
+    fn snapshot_temporary_files(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .expect("read test directory")
+            .map(|entry| entry.expect("read directory entry").path())
+            .filter(|path| {
+                let name = path
+                    .file_name()
+                    .expect("directory entry has a name")
+                    .to_string_lossy();
+                name.starts_with(".state.snapshot.") && name.ends_with(".tmp")
+            })
+            .collect()
     }
 }
