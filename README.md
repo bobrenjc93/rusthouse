@@ -11,7 +11,7 @@ The first useful release should support:
 - typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
-- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, multi-key `ORDER BY`, and `LIMIT`;
+- projections, `WHERE` comparisons, `COUNT`, `COUNT(DISTINCT column)`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, multi-key `ORDER BY`, and `LIMIT`;
 - a batch/interactive CLI with readable table, CSV, and JSON output;
 - durable local snapshots with an explicit, documented file format;
 - an HTTP endpoint for executing SQL;

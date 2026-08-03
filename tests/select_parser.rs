@@ -81,9 +81,37 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
 }
 
 #[test]
+fn parses_count_distinct_with_an_optional_alias_and_predicate() {
+    let statement = parse_select(
+        "select count ( distinct campaign_id ) as unique_campaigns from Events where active = true",
+    )
+    .unwrap();
+
+    assert_eq!(
+        statement,
+        SelectStatement {
+            projections: SelectProjection::Aggregates(vec![AggregateProjection {
+                function: AggregateFunction::CountDistinct {
+                    column: "campaign_id".to_owned(),
+                },
+                alias: Some("unique_campaigns".to_owned()),
+            }]),
+            table: "Events".to_owned(),
+            predicate_groups: vec![vec![ComparisonPredicate {
+                column: "active".to_owned(),
+                operator: ComparisonOperator::Equal,
+                value: Value::Bool(true),
+            }]],
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
 fn parses_bounded_aggregate_only_lists_with_optional_aliases() {
     let statement = parse_select(
-        "SELECT COUNT(*), SUM(sequence) AS total, avg(value), Min(label) AS first, MAX(active) \
+        "SELECT COUNT(*), COUNT(DISTINCT sequence) AS unique_sequences, SUM(sequence) AS total, avg(value), Min(label) AS first, MAX(active) \
          FROM Events WHERE active = true",
     )
     .unwrap();
@@ -94,6 +122,12 @@ fn parses_bounded_aggregate_only_lists_with_optional_aliases() {
             AggregateProjection {
                 function: AggregateFunction::CountAll,
                 alias: None,
+            },
+            AggregateProjection {
+                function: AggregateFunction::CountDistinct {
+                    column: "sequence".to_owned(),
+                },
+                alias: Some("unique_sequences".to_owned()),
             },
             AggregateProjection {
                 function: AggregateFunction::Sum {
@@ -642,8 +676,8 @@ fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
     let cases = [
         ("SELECT id AS event_id FROM events", "AS"),
         ("SELECT COUNT(id) FROM events", "id"),
-        ("SELECT COUNT(DISTINCT id) FROM events", "DISTINCT"),
         ("SELECT COUNT(*), id FROM events", "id"),
+        ("SELECT COUNT(DISTINCT id), label FROM events", "label"),
         ("SELECT id, COUNT(*) FROM events", "COUNT"),
         ("SELECT SUM(id), label FROM events", "label"),
         ("SELECT label, MIN(label) FROM events", "MIN"),
@@ -667,6 +701,7 @@ fn rejects_raw_aggregate_mixing_and_unsupported_select_features() {
 
     for input in [
         "SELECT COUNT(*), id FROM events",
+        "SELECT COUNT(DISTINCT id), label FROM events",
         "SELECT COUNT(*), * FROM events",
         "SELECT id, COUNT(*) FROM events",
     ] {

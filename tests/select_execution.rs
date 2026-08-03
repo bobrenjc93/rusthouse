@@ -252,6 +252,97 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
 }
 
 #[test]
+fn counts_distinct_values_with_filters_aliases_and_empty_inputs() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE events (id Int64, score Float64, active Bool, label String, include Bool)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO events VALUES \
+             (1, 1.5, true, 'east', true), \
+             (1, 1.5, true, 'east', true), \
+             (2, 2.5, false, 'west', true), \
+             (3, 3.5, false, 'north', false)",
+        )
+        .unwrap();
+
+    let result = catalog
+        .execute_select(
+            "SELECT COUNT(DISTINCT id) AS ids, COUNT(DISTINCT score), \
+             COUNT(DISTINCT active), COUNT(DISTINCT label) AS labels \
+             FROM events WHERE include = true",
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [
+            ("ids", DataType::Int64),
+            ("count(distinct score)", DataType::Int64),
+            ("count(distinct active)", DataType::Int64),
+            ("labels", DataType::Int64),
+        ]
+    );
+    assert_eq!(
+        result.scalar_values().cloned().collect::<Vec<_>>(),
+        [
+            Value::Int64(2),
+            Value::Int64(2),
+            Value::Int64(2),
+            Value::Int64(2),
+        ]
+    );
+
+    let no_matches = catalog
+        .execute_select("SELECT COUNT(DISTINCT label) FROM events WHERE id > 100")
+        .unwrap();
+    assert_eq!(no_matches.scalar_value(), Some(&Value::Int64(0)));
+
+    let mut empty = Catalog::new();
+    empty
+        .execute_create("CREATE TABLE empty (value String)")
+        .unwrap();
+    assert_eq!(
+        empty
+            .execute_select("SELECT COUNT(DISTINCT value) FROM empty")
+            .unwrap()
+            .scalar_value(),
+        Some(&Value::Int64(0))
+    );
+}
+
+#[test]
+fn count_distinct_preserves_nan_bit_identity_through_sql() {
+    let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let other_nan = f64::from_bits(0x7ff8_0000_0000_0002);
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE floats (value Float64)")
+        .unwrap();
+    catalog
+        .table_mut("floats")
+        .unwrap()
+        .insert_batch([
+            vec![Value::Float64(nan)],
+            vec![Value::Float64(nan)],
+            vec![Value::Float64(other_nan)],
+            vec![Value::Float64(-0.0)],
+            vec![Value::Float64(0.0)],
+        ])
+        .unwrap();
+
+    let result = catalog
+        .execute_select("SELECT COUNT(DISTINCT value) AS unique_values FROM floats")
+        .unwrap();
+    assert_eq!(result.scalar_value(), Some(&Value::Int64(4)));
+}
+
+#[test]
 fn executes_aggregate_lists_over_one_filtered_selection() {
     let catalog = readings_catalog();
     let result = catalog
