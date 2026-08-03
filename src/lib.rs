@@ -1,7 +1,11 @@
 //! RustHouse is an experimental, compact analytical database.
 
+pub mod parser;
 pub mod scan;
 
+pub use parser::{
+    ColumnDefinition, CreateTableStatement, Identifier, ParseError, ParseLimits, parse_create_table,
+};
 pub use scan::{ComparisonOperator, ScanError, ScanLimits, scan_nullable_i64};
 mod storage;
 
