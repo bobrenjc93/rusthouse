@@ -17,11 +17,11 @@ pub use csv::{write_csv_with_names, write_select_csv_with_names};
 pub use reduction::ReductionError;
 pub use scan::{ComparisonOperator, RowSelection, ScanError, SelectionAllocationError};
 pub use sql::{
-    ColumnDefinition, ComparisonPredicate, CreateTableStatement, IdentifierContext,
-    InsertParseLimits, InsertStatement, OrderByClause, OrderDirection, ParseError, ParseErrorKind,
-    ParseLimits, SelectParseLimits, SelectProjection, SelectStatement, parse_create_table,
-    parse_create_table_with_limits, parse_insert, parse_insert_with_limits, parse_select,
-    parse_select_with_limits,
+    AggregateFunction, AggregateProjection, ColumnDefinition, ComparisonPredicate,
+    CreateTableStatement, IdentifierContext, InsertParseLimits, InsertStatement, OrderByClause,
+    OrderDirection, ParseError, ParseErrorKind, ParseLimits, SelectParseLimits, SelectProjection,
+    SelectStatement, parse_create_table, parse_create_table_with_limits, parse_insert,
+    parse_insert_with_limits, parse_select, parse_select_with_limits,
 };
 pub use storage::{DataType, Field, Table, TableError, Value};
 pub use table_snapshot::{TableSnapshotError, TableSnapshotLocation};

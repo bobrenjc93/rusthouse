@@ -2,8 +2,8 @@ use std::error::Error;
 
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, ComparisonOperator, ComparisonPredicate, DataType,
-    ParseErrorKind, ParseLimits, ScanError, SelectParseLimits, SelectProjection, SelectStatement,
-    Value,
+    ParseErrorKind, ParseLimits, ReductionError, ScanError, SelectParseLimits, SelectProjection,
+    SelectStatement, Value,
 };
 
 fn readings_catalog() -> Catalog {
@@ -155,6 +155,123 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
 }
 
 #[test]
+fn executes_aggregate_lists_over_one_filtered_selection() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT COUNT(*), SUM(sequence) AS total_sequence, SUM(value), AVG(sequence), \
+             MIN(label) AS first_label, MAX(active) FROM readings WHERE active = true",
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [
+            ("count()", DataType::Int64),
+            ("total_sequence", DataType::Int64),
+            ("sum(value)", DataType::Float64),
+            ("avg(sequence)", DataType::Float64),
+            ("first_label", DataType::String),
+            ("max(active)", DataType::Bool),
+        ]
+    );
+    assert_eq!(
+        result.scalar_values().cloned().collect::<Vec<_>>(),
+        [
+            Value::Int64(2),
+            Value::Int64(4),
+            Value::Float64(2.0),
+            Value::Float64(2.0),
+            Value::String("first".to_owned()),
+            Value::Bool(true),
+        ]
+    );
+    assert_eq!(result.scalar_value(), Some(&Value::Int64(2)));
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [0]);
+    assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn count_and_sum_emit_zero_for_an_empty_aggregate_input() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE empty (integer Int64, float Float64)")
+        .unwrap();
+
+    let result = catalog
+        .execute_select("SELECT COUNT(*), SUM(integer), SUM(float) FROM empty")
+        .unwrap();
+    assert_eq!(
+        result.scalar_values().cloned().collect::<Vec<_>>(),
+        [Value::Int64(0), Value::Int64(0), Value::Float64(0.0),]
+    );
+}
+
+#[test]
+fn aggregate_failures_preserve_typed_column_type_overflow_and_empty_errors() {
+    let catalog = readings_catalog();
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT SUM(missing) FROM readings")
+            .unwrap_err(),
+        CatalogError::TableReduction {
+            name: "readings".to_owned(),
+            source: ReductionError::FieldNotFound {
+                name: "missing".to_owned(),
+            },
+        }
+    );
+    assert_eq!(
+        catalog
+            .execute_select("SELECT AVG(label) FROM readings")
+            .unwrap_err(),
+        CatalogError::TableReduction {
+            name: "readings".to_owned(),
+            source: ReductionError::NonNumericColumn {
+                field: "label".to_owned(),
+                data_type: DataType::String,
+            },
+        }
+    );
+
+    for (function, field) in [("AVG", "value"), ("MIN", "label"), ("MAX", "active")] {
+        let query = format!("SELECT {function}({field}) FROM readings WHERE sequence > 100");
+        assert_eq!(
+            catalog.execute_select(&query).unwrap_err(),
+            CatalogError::EmptyAggregateInput {
+                name: "readings".to_owned(),
+                function,
+                field: field.to_owned(),
+            }
+        );
+    }
+
+    let mut overflow = Catalog::new();
+    overflow
+        .execute_create("CREATE TABLE numbers (value Int64)")
+        .unwrap();
+    overflow
+        .execute_insert(&format!("INSERT INTO numbers VALUES ({}), (1)", i64::MAX))
+        .unwrap();
+    assert_eq!(
+        overflow
+            .execute_select("SELECT SUM(value) FROM numbers")
+            .unwrap_err(),
+        CatalogError::TableReduction {
+            name: "numbers".to_owned(),
+            source: ReductionError::Int64Overflow {
+                field: "value".to_owned(),
+                row: 1,
+            },
+        }
+    );
+}
+
+#[test]
 fn applies_order_validation_and_limit_to_count_results() {
     let catalog = readings_catalog();
 
@@ -207,6 +324,23 @@ fn executes_an_already_parsed_statement() {
         ["label"]
     );
     assert_eq!(result.selected_rows().rev().collect::<Vec<_>>(), [2, 1]);
+}
+
+#[test]
+fn rejects_an_empty_manually_constructed_aggregate_list() {
+    let catalog = readings_catalog();
+    let statement = SelectStatement {
+        projections: SelectProjection::Aggregates(Vec::new()),
+        table: "readings".to_owned(),
+        predicate: None,
+        order_by: None,
+        limit: None,
+    };
+
+    assert_eq!(
+        catalog.select(statement).unwrap_err(),
+        CatalogError::EmptyAggregateProjection
+    );
 }
 
 #[test]

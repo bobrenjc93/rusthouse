@@ -205,6 +205,27 @@ fn writes_count_rows_for_all_filtered_and_empty_tables() {
 }
 
 #[test]
+fn writes_one_csv_row_for_a_filtered_aggregate_list() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, score Float64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, -2.0, true, 'first'), (2, 0.0, false, 'second'), (3, 4.0, true, 'third')\n\
+          SELECT COUNT(*), SUM(id) AS total_id, AVG(score), MIN(label) AS first_label, MAX(active) FROM events WHERE active = true\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"count()\",\"total_id\",\"avg(score)\",\"first_label\",\"max(active)\"\n",
+            "2,4,1,\"first\",true\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],

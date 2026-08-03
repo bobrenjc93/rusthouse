@@ -54,10 +54,10 @@ pub fn write_csv_with_names<W: Write + ?Sized>(table: &Table, writer: &mut W) ->
 ///
 /// Projected fields are emitted in statement order, including duplicate
 /// projections. Only selected rows are written, in result order. A scalar
-/// aggregate emits one field and one data row, including for an empty or fully
-/// filtered source table, unless `LIMIT 0` suppresses the data row. Source columns
-/// and their values are otherwise borrowed directly; this function does not build
-/// a result table or copy selected values.
+/// aggregate list emits one field per aggregate and one data row, unless `LIMIT
+/// 0` suppresses the data row. Source columns and their values are otherwise
+/// borrowed directly; this function does not build a result table or copy
+/// selected values.
 ///
 /// Encoding, record termination, and writer-error behavior match
 /// [`write_csv_with_names`]. A result with no selected rows emits only its
@@ -90,9 +90,16 @@ pub fn write_select_csv_with_names<W: Write + ?Sized>(
     }
     writer.write_all(b"\n")?;
 
-    if let Some(value) = result.scalar_value() {
-        write_scalar_value(value, writer)?;
-        writer.write_all(b"\n")?;
+    if result.is_scalar() {
+        if !result.is_empty() {
+            for (index, value) in result.scalar_values().enumerate() {
+                if index != 0 {
+                    writer.write_all(b",")?;
+                }
+                write_scalar_value(value, writer)?;
+            }
+            writer.write_all(b"\n")?;
+        }
         return Ok(());
     }
 
