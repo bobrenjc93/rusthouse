@@ -1,6 +1,6 @@
 //! Bounded ordering over nullable typed columns.
 
-use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::error::Error;
 use std::fmt;
 
@@ -74,8 +74,9 @@ impl Error for OrderError {}
 /// by [`NullOrder`] and is independent of [`OrderDirection`]. Rows with equal
 /// values, including `NULL` rows, retain their source order.
 ///
-/// The input-row and requested-`LIMIT` bounds are both checked before the
-/// result index vector is allocated. A `limit` of zero returns no rows after
+/// The input-row and requested-`LIMIT` bounds are both checked before any
+/// result storage is allocated. The selection heap retains at most
+/// `min(limit, values.len())` rows. A `limit` of zero returns no rows after
 /// those validations have succeeded.
 ///
 /// # Examples
@@ -122,35 +123,59 @@ pub fn order_nullable_i64(
         return Ok(Vec::new());
     }
 
-    let mut row_indices: Vec<_> = (0..values.len()).collect();
-    row_indices.sort_unstable_by(|&left, &right| {
-        compare_values(values[left], values[right], direction, null_order)
-            .then_with(|| left.cmp(&right))
-    });
-    row_indices.truncate(limit);
+    let retained_rows = limit.min(values.len());
+    let mut top_rows = BinaryHeap::with_capacity(retained_rows);
 
-    Ok(row_indices)
+    for (source_index, &value) in values.iter().enumerate() {
+        let candidate = OrderKey::new(value, source_index, direction, null_order);
+
+        if top_rows.len() < retained_rows {
+            top_rows.push(candidate);
+        } else if let Some(mut worst) = top_rows.peek_mut() {
+            if candidate < *worst {
+                *worst = candidate;
+            }
+        }
+    }
+
+    Ok(top_rows
+        .into_sorted_vec()
+        .into_iter()
+        .map(|row| row.source_index)
+        .collect())
 }
 
-fn compare_values(
-    left: Option<i64>,
-    right: Option<i64>,
-    direction: OrderDirection,
-    null_order: NullOrder,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => match null_order {
-            NullOrder::First => Ordering::Less,
-            NullOrder::Last => Ordering::Greater,
-        },
-        (Some(_), None) => match null_order {
-            NullOrder::First => Ordering::Greater,
-            NullOrder::Last => Ordering::Less,
-        },
-        (Some(left), Some(right)) => match direction {
-            OrderDirection::Asc => left.cmp(&right),
-            OrderDirection::Desc => right.cmp(&left),
-        },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderKey {
+    null_rank: u8,
+    value_rank: u64,
+    source_index: usize,
+}
+
+impl OrderKey {
+    fn new(
+        value: Option<i64>,
+        source_index: usize,
+        direction: OrderDirection,
+        null_order: NullOrder,
+    ) -> Self {
+        let null_rank = match (value, null_order) {
+            (None, NullOrder::First) | (Some(_), NullOrder::Last) => 0,
+            (Some(_), NullOrder::First) | (None, NullOrder::Last) => 1,
+        };
+        let value_rank = value.map_or(0, |value| {
+            // Flipping the sign bit maps signed order onto unsigned order.
+            let ascending_rank = (value as u64) ^ (1_u64 << 63);
+            match direction {
+                OrderDirection::Asc => ascending_rank,
+                OrderDirection::Desc => !ascending_rank,
+            }
+        });
+
+        Self {
+            null_rank,
+            value_rank,
+            source_index,
+        }
     }
 }
