@@ -28,4 +28,30 @@ cargo test
 cargo run -- --help
 ```
 
+## CLI
+
+The CLI reads a SQL batch from standard input. It currently executes `SELECT`
+statements without `FROM`, with integer, float, boolean, and single-quoted
+string literals. Projections may use `AS` aliases or implicit aliases. Escape a
+single quote inside a string by doubling it.
+
+```bash
+printf "SELECT 42 AS answer, 3.5 AS ratio, TRUE AS ready, 'it''s ready' AS message;\n" \
+  | cargo run -- --format csv
+```
+
+Statements in a batch are separated by semicolons. CSV is selected with
+`--format csv`; the default output is a readable table. The CLI accepts at most
+1 MiB of UTF-8 SQL, 16,384 lexical tokens, and 256 statements per batch, plus
+1,024 projections per statement. It reports malformed SQL and unsupported
+clauses on standard error with a nonzero exit status.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->
