@@ -257,6 +257,25 @@ impl ScalarCountStatement {
     }
 }
 
+/// The typed syntax tree for a scalar `SUM` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarSumStatement {
+    column_name: Identifier,
+    table_name: Identifier,
+}
+
+impl ScalarSumStatement {
+    /// Returns the summed column.
+    pub const fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns the source table name.
+    pub const fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+}
+
 /// The typed syntax tree for a one-column `SELECT DISTINCT` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectDistinctStatement {
@@ -506,6 +525,45 @@ pub fn parse_scalar_count(
     validate_statement_length(input, limits)?;
 
     Parser::new(input, limits.max_identifier_bytes).parse_scalar_count()
+}
+
+/// Parses one scalar `SUM(column)` statement.
+///
+/// Keywords are ASCII case-insensitive. The column and table identifiers
+/// follow the same rules and bounds as [`parse_create_table`]. The complete
+/// accepted grammar is:
+///
+/// ```text
+/// SELECT SUM(identifier) FROM identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, including whitespace
+/// around the aggregate argument and before or after the optional semicolon.
+/// Aliases, predicates, grouping, ordering, and limits are outside this narrow
+/// scalar grammar. Statement limits and all reported offsets are measured in
+/// bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, parse_scalar_sum};
+///
+/// let statement = parse_scalar_sum(
+///     "SELECT SUM(event_id) FROM events;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert_eq!(statement.column_name().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_scalar_sum(
+    input: &str,
+    limits: ParseLimits,
+) -> Result<ScalarSumStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_scalar_sum()
 }
 
 /// Parses one `SELECT DISTINCT` statement containing one column and one table.
@@ -828,6 +886,39 @@ impl<'input> Parser<'input> {
 
         Ok(ScalarCountStatement {
             argument,
+            table_name,
+        })
+    }
+
+    fn parse_scalar_sum(mut self) -> Result<ScalarSumStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        self.expect_keyword("SUM")?;
+        self.skip_whitespace();
+        self.expect_byte(b'(', "'('")?;
+        self.skip_whitespace();
+        let column_name = self.parse_identifier()?;
+        self.skip_whitespace();
+        self.expect_byte(b')', "')'")?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(ScalarSumStatement {
+            column_name,
             table_name,
         })
     }
