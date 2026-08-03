@@ -295,6 +295,7 @@ impl ScalarCountArgument {
 pub struct ScalarCountStatement {
     argument: ScalarCountArgument,
     table_name: Identifier,
+    predicate: Option<ComparisonPredicate>,
 }
 
 impl ScalarCountStatement {
@@ -311,6 +312,11 @@ impl ScalarCountStatement {
     /// Returns the source table name.
     pub const fn table_name(&self) -> &Identifier {
         &self.table_name
+    }
+
+    /// Returns the optional `WHERE` comparison predicate.
+    pub const fn predicate(&self) -> Option<&ComparisonPredicate> {
+        self.predicate.as_ref()
     }
 }
 
@@ -553,14 +559,15 @@ pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement,
 /// complete accepted grammar is:
 ///
 /// ```text
-/// SELECT COUNT(* | identifier) FROM identifier [;]
+/// SELECT COUNT(* | identifier) FROM identifier
+///     [WHERE identifier (= | != | <> | < | <= | > | >=) Int64] [;]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
 /// around the aggregate argument and before or after the optional semicolon.
-/// Aliases, predicates, grouping, ordering, and limits are outside this narrow
-/// scalar grammar. Statement limits and all reported offsets are measured in
-/// bytes.
+/// Aliases, nullness predicates, grouping, ordering, and limits are outside
+/// this narrow scalar grammar. Statement limits and all reported offsets are
+/// measured in bytes.
 ///
 /// # Examples
 ///
@@ -951,6 +958,24 @@ impl<'input> Parser<'input> {
         let table_name = self.parse_identifier()?;
         self.skip_whitespace();
 
+        let predicate = if self.keyword_at_position("WHERE") {
+            self.expect_keyword("WHERE")?;
+            self.require_whitespace("whitespace after WHERE")?;
+            let column_name = self.parse_identifier()?;
+            self.skip_whitespace();
+            let operator = self.parse_comparison_operator()?;
+            self.skip_whitespace();
+            let value = self.parse_where_int64()?;
+            self.skip_whitespace();
+            Some(ComparisonPredicate {
+                column_name,
+                operator,
+                value,
+            })
+        } else {
+            None
+        };
+
         if self.peek() == Some(b';') {
             self.position += 1;
             self.skip_whitespace();
@@ -964,6 +989,7 @@ impl<'input> Parser<'input> {
         Ok(ScalarCountStatement {
             argument,
             table_name,
+            predicate,
         })
     }
 

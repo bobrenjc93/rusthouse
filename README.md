@@ -27,8 +27,9 @@ subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `Int64` predicates through `WHERE column operator literal`, where `operator` is
 `=`, `!=`, `<>`, `<`, `<=`, `>`, or `>=`, as well as `WHERE column IS NULL` and
 `WHERE column IS NOT NULL`. Both forms accept an optional nonnegative `LIMIT`.
-Scalar `SELECT COUNT(*)`, `SELECT COUNT(column)`, and `SELECT SUM(column)` use
-explicit aggregate row bounds and preserve SQL `NULL` semantics.
+Scalar `SELECT COUNT(*)` and `SELECT COUNT(column)` support the same comparison
+filters with explicit scan and aggregate row bounds. They and `SELECT
+SUM(column)` preserve SQL `NULL` semantics.
 The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a

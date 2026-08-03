@@ -1,4 +1,6 @@
-use rusthouse::{ParseError, ParseLimits, ScalarCountArgument, parse_scalar_count};
+use rusthouse::{
+    ComparisonOperator, ParseError, ParseLimits, ScalarCountArgument, parse_scalar_count,
+};
 
 #[test]
 fn parses_star_and_column_counts_with_an_optional_semicolon() {
@@ -25,11 +27,38 @@ fn parses_star_and_column_counts_with_an_optional_semicolon() {
             "{input:?}"
         );
         assert_eq!(statement.table_name().as_str(), expected_table, "{input:?}");
+        assert_eq!(statement.predicate(), None, "{input:?}");
         assert_eq!(
             matches!(statement.argument(), ScalarCountArgument::Star),
             expected_column.is_none(),
             "{input:?}"
         );
+    }
+}
+
+#[test]
+fn parses_both_count_forms_with_every_comparison_operator() {
+    let cases = [
+        ("=", ComparisonOperator::Eq),
+        ("!=", ComparisonOperator::Ne),
+        ("<>", ComparisonOperator::Ne),
+        ("<", ComparisonOperator::Lt),
+        ("<=", ComparisonOperator::Le),
+        (">", ComparisonOperator::Gt),
+        (">=", ComparisonOperator::Ge),
+    ];
+
+    for argument in ["*", "value"] {
+        for (operator, expected_operator) in cases {
+            let input =
+                format!("SELECT COUNT({argument}) FROM readings WHERE value {operator} -7;");
+            let statement = parse_scalar_count(&input, ParseLimits::default()).unwrap();
+            let predicate = statement.predicate().unwrap();
+
+            assert_eq!(predicate.column_name().as_str(), "value", "{input:?}");
+            assert_eq!(predicate.operator(), expected_operator, "{input:?}");
+            assert_eq!(predicate.value(), -7, "{input:?}");
+        }
     }
 }
 
@@ -51,6 +80,7 @@ fn applies_statement_and_identifier_byte_bounds() {
     for (input, identifier) in [
         ("SELECT COUNT(column123) FROM t", "column123"),
         ("SELECT COUNT(*) FROM table1234", "table1234"),
+        ("SELECT COUNT(*) FROM t WHERE predicate1 = 0", "predicate1"),
     ] {
         assert_eq!(
             parse_scalar_count(input, ParseLimits::new(input.len(), 8)),
@@ -72,7 +102,8 @@ fn rejects_unsupported_aggregate_shapes_and_extra_clauses() {
         "SELECT COUNT(1) FROM t",
         "SELECT COUNT(c, d) FROM t",
         "SELECT COUNT(*) AS total FROM t",
-        "SELECT COUNT(*) FROM t WHERE c = 1",
+        "SELECT COUNT(*) FROM t WHERE c IS NULL",
+        "SELECT COUNT(*) FROM t WHERE c = 1 AND c = 2",
         "SELECT COUNT(*) FROM t GROUP BY c",
         "SELECT COUNT(*) FROM t LIMIT 1",
         "SELECT COUNT(*) FROM t;;",
