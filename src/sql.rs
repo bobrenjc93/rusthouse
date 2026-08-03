@@ -38,6 +38,8 @@ pub enum SelectProjection {
     CountAll { alias: Option<String> },
     /// Compute one or more scalar aggregates over the same input rows.
     Aggregates(Vec<AggregateProjection>),
+    /// Count rows for each distinct value of one projected and grouped key.
+    GroupedCount { key: String, alias: Option<String> },
 }
 
 /// One supported scalar aggregate expression.
@@ -286,6 +288,10 @@ pub enum ParseErrorKind {
     },
     ExpectedProjection,
     MixedAggregateProjection,
+    GroupKeyMismatch {
+        projected: String,
+        grouped: String,
+    },
     TooManyProjections {
         limit: usize,
     },
@@ -372,6 +378,10 @@ impl fmt::Display for ParseErrorKind {
             Self::MixedAggregateProjection => {
                 formatter.write_str("scalar aggregates cannot be mixed with raw column projections")
             }
+            Self::GroupKeyMismatch { projected, grouped } => write!(
+                formatter,
+                "projected group key {projected:?} does not match GROUP BY key {grouped:?}"
+            ),
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
             }
@@ -515,14 +525,17 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 /// Projections are `*`, a non-empty list of unquoted column names, or a
 /// non-empty aggregate-only list containing `COUNT(*)`, `SUM(column)`,
 /// `AVG(column)`, `MIN(column)`, and `MAX(column)`. Every aggregate may have an
-/// `AS` alias. The statement reads one table and may contain `WHERE` groups
+/// `AS` alias. A one-column grouped count has the exact projection
+/// `key, COUNT(*) [AS alias]` and requires a matching `GROUP BY key`. The
+/// statement reads one table and may contain `WHERE` groups
 /// joined by `OR`, each containing
 /// column-to-literal comparisons joined by `AND`. One optional pair of
 /// parentheses may wrap each whole group. Literals may be `Int64`, `Float64`,
 /// `Bool`, or `String`. The clause may be followed by one bounded `ORDER BY`
 /// list of `column [ASC|DESC]` keys and a nonnegative integer `LIMIT`. `NOT`, nested
-/// expressions, raw-column/aggregate mixing, and other predicate or result
-/// forms are outside this intentionally narrow syntax boundary.
+/// expressions, other grouped aggregates, multiple grouping keys, grouped
+/// ordering, `HAVING`, raw-column/aggregate mixing, and other predicate or
+/// result forms are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -671,7 +684,25 @@ impl<'a> Parser<'a> {
         };
 
         self.skip_whitespace();
-        let order_by = if self.peek_token_is("ORDER") {
+        if let SelectProjection::GroupedCount { key, .. } = &projections {
+            self.parse_keyword("GROUP")?;
+            self.parse_keyword("BY")?;
+            let (grouped_key, grouped_key_position) =
+                self.parse_identifier(IdentifierContext::Column)?;
+            if grouped_key != *key {
+                return Err(ParseError {
+                    position: grouped_key_position,
+                    kind: ParseErrorKind::GroupKeyMismatch {
+                        projected: key.clone(),
+                        grouped: grouped_key,
+                    },
+                });
+            }
+        }
+
+        self.skip_whitespace();
+        let grouped = matches!(projections, SelectProjection::GroupedCount { .. });
+        let order_by = if !grouped && self.peek_token_is("ORDER") {
             self.parse_keyword("ORDER")?;
             self.parse_keyword("BY")?;
             Some(self.parse_order_keys(limits.max_order_keys)?)
@@ -680,7 +711,7 @@ impl<'a> Parser<'a> {
         };
 
         self.skip_whitespace();
-        let limit = if self.peek_token_is("LIMIT") {
+        let limit = if !grouped && self.peek_token_is("LIMIT") {
             self.parse_keyword("LIMIT")?;
             Some(self.parse_limit()?)
         } else {
@@ -789,7 +820,16 @@ impl<'a> Parser<'a> {
 
             let (column, column_position) = self.parse_identifier(IdentifierContext::Column)?;
             self.skip_whitespace();
-            if aggregate_kind(&column).is_some() && self.peek() == Some(b'(') {
+            if let Some(kind) = aggregate_kind(&column)
+                && self.peek() == Some(b'(')
+            {
+                if columns.len() == 1 && kind == AggregateKind::Count {
+                    let aggregate = self.parse_aggregate(kind)?;
+                    return Ok(SelectProjection::GroupedCount {
+                        key: columns.pop().expect("one grouping key was parsed"),
+                        alias: aggregate.alias,
+                    });
+                }
                 return Err(ParseError {
                     position: column_position,
                     kind: ParseErrorKind::MixedAggregateProjection,
@@ -1341,7 +1381,7 @@ fn invalid_identifier_offset(identifier: &str) -> Option<usize> {
         .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AggregateKind {
     Count,
     Sum,

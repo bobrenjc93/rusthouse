@@ -14,7 +14,8 @@ use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
 };
 use rusthouse::{
-    Catalog, CatalogError, DEFAULT_MAX_TABLES, MAX_AGGREGATE_RESULT_BYTES, SelectParseLimits, Value,
+    Catalog, CatalogError, CatalogLimits, DEFAULT_MAX_TABLES, GroupedCountError,
+    MAX_AGGREGATE_RESULT_BYTES, SelectParseLimits, Value,
 };
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rusthouse");
@@ -551,6 +552,63 @@ fn writes_one_csv_row_for_a_filtered_aggregate_list() {
         )
         .as_bytes()
     );
+}
+
+#[test]
+fn writes_grouped_counts_for_every_type_with_filtering_and_empty_results() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE groups (integer Int64, float Float64, boolean Bool, text String)\n\
+          INSERT INTO groups VALUES (4, 2.5, true, 'pear'), (-2, -1.0, false, 'apple'), (4, 2.5, false, 'pear'), (0, 9.0, true, 'banana'), (-2, -1.0, false, 'apple')\n\
+          SELECT integer, COUNT(*) FROM groups GROUP BY integer\n\
+          SELECT float, COUNT(*) AS rows FROM groups GROUP BY float\n\
+          SELECT boolean, COUNT(*) FROM groups GROUP BY boolean\n\
+          SELECT text, COUNT(*) FROM groups WHERE boolean = true GROUP BY text\n\
+          SELECT text, COUNT(*) AS matches FROM groups WHERE integer > 100 GROUP BY text\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"integer\",\"count()\"\n-2,2\n0,1\n4,2\n",
+            "\"float\",\"rows\"\n-1,2\n2.5,2\n9,1\n",
+            "\"boolean\",\"count()\"\nfalse,3\ntrue,2\n",
+            "\"text\",\"count()\"\n\"banana\",1\n\"pear\",1\n",
+            "\"text\",\"matches\"\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn reports_the_group_limit_as_a_cli_resource_limit() {
+    let limits = CatalogLimits::default().with_max_groups_per_query(1);
+    let mut catalog = Catalog::with_limits(limits);
+    catalog
+        .execute_create("CREATE TABLE groups (key String)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO groups VALUES ('a'), ('b')")
+        .unwrap();
+
+    let error = execute_batch(
+        Cursor::new(b"SELECT key, COUNT(*) FROM groups GROUP BY key\n"),
+        &mut catalog,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 3);
+    assert!(matches!(
+        error,
+        BatchError::ExecutionLimit {
+            line: 1,
+            source: CatalogError::TableGrouping {
+                source: GroupedCountError::GroupLimitExceeded { limit: 1, .. },
+                ..
+            },
+        }
+    ));
 }
 
 #[test]

@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+use crate::grouping::{GroupedCount, GroupedCountError};
 use crate::reduction::ReductionError;
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
@@ -20,6 +21,8 @@ use crate::{RowSelection, ScanError};
 
 /// Default maximum number of tables owned by one [`Catalog`].
 pub const DEFAULT_MAX_TABLES: usize = 1024;
+/// Default maximum number of distinct groups produced by one grouped query.
+pub const DEFAULT_MAX_GROUPS: usize = 100_000;
 /// Maximum retained String payload bytes in one scalar aggregate row.
 pub const MAX_AGGREGATE_RESULT_BYTES: usize = 1024 * 1024;
 
@@ -36,6 +39,8 @@ pub struct CatalogLimits {
     pub max_tables: usize,
     /// Maximum number of rows accepted by each newly created table.
     pub max_rows_per_table: usize,
+    /// Maximum number of distinct groups produced by one `SELECT`.
+    pub max_groups_per_query: usize,
 }
 
 impl CatalogLimits {
@@ -48,6 +53,7 @@ impl CatalogLimits {
             select_parse: default_select_parse_limits(),
             max_tables,
             max_rows_per_table,
+            max_groups_per_query: DEFAULT_MAX_GROUPS,
         }
     }
 
@@ -62,6 +68,13 @@ impl CatalogLimits {
     #[must_use]
     pub const fn with_select_parse_limits(mut self, select_parse: SelectParseLimits) -> Self {
         self.select_parse = select_parse;
+        self
+    }
+
+    /// Replaces the maximum number of distinct groups produced by one query.
+    #[must_use]
+    pub const fn with_max_groups_per_query(mut self, max_groups_per_query: usize) -> Self {
+        self.max_groups_per_query = max_groups_per_query;
         self
     }
 }
@@ -83,6 +96,10 @@ pub enum CatalogError {
     Parse(ParseError),
     /// A manually constructed aggregate projection list was empty.
     EmptyAggregateProjection,
+    /// A manually constructed grouped count requested unsupported ordering.
+    GroupedOrderingUnsupported,
+    /// A manually constructed grouped count requested an unsupported row limit.
+    GroupedLimitUnsupported,
     /// The catalog already owns a table with this case-insensitive name.
     DuplicateTable {
         /// Name from the rejected statement.
@@ -157,6 +174,13 @@ pub enum CatalogError {
         /// Reduction validation failure.
         source: ReductionError,
     },
+    /// A grouped count failed after its optional scan.
+    TableGrouping {
+        /// Name from the rejected statement.
+        name: String,
+        /// Grouping validation, capacity, arithmetic, or allocation failure.
+        source: GroupedCountError,
+    },
     /// `AVG`, `MIN`, or `MAX` received no selected rows and cannot emit `NULL`.
     EmptyAggregateInput {
         /// Name from the rejected statement.
@@ -188,6 +212,12 @@ impl fmt::Display for CatalogError {
             Self::Parse(error) => error.fmt(formatter),
             Self::EmptyAggregateProjection => {
                 formatter.write_str("aggregate projection list cannot be empty")
+            }
+            Self::GroupedOrderingUnsupported => {
+                formatter.write_str("ORDER BY is not supported for grouped counts")
+            }
+            Self::GroupedLimitUnsupported => {
+                formatter.write_str("LIMIT is not supported for grouped counts")
             }
             Self::DuplicateTable { name } => write!(formatter, "table `{name}` already exists"),
             Self::TableNotFound { name } => write!(formatter, "table `{name}` does not exist"),
@@ -232,6 +262,9 @@ impl fmt::Display for CatalogError {
             Self::TableReduction { name, source } => {
                 write!(formatter, "could not reduce table `{name}`: {source}")
             }
+            Self::TableGrouping { name, source } => {
+                write!(formatter, "could not group table `{name}`: {source}")
+            }
             Self::EmptyAggregateInput {
                 name,
                 function,
@@ -263,6 +296,7 @@ impl Error for CatalogError {
             }
             Self::TableScan { source, .. } => Some(source),
             Self::TableReduction { source, .. } => Some(source),
+            Self::TableGrouping { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -325,12 +359,20 @@ struct ScalarResult {
     value: Value,
 }
 
-/// The output of one projection or scalar aggregate and optional comparison scans.
+#[derive(Debug)]
+struct GroupedResult {
+    fields: [Field; 2],
+    groups: Vec<GroupedCount>,
+}
+
+/// The output of one projection, scalar aggregate, or grouped count and
+/// optional comparison scans.
 ///
 /// A row projection owns only projected column indexes and, for a filtered
 /// query, a compact row-selection bitmap. Ordered results instead own their
 /// bounded row indexes. Schema and column values remain owned by the catalog's
-/// source table. Scalar aggregates own their fields and single result row.
+/// source table. Scalar aggregates own their fields and single result row;
+/// grouped counts own their output fields and sorted key/count rows.
 #[derive(Debug)]
 pub struct SelectResult<'a> {
     table: &'a Table,
@@ -340,6 +382,7 @@ pub struct SelectResult<'a> {
     row_end: usize,
     row_count: usize,
     scalars: Vec<ScalarResult>,
+    grouped: Option<GroupedResult>,
 }
 
 impl<'a> SelectResult<'a> {
@@ -354,11 +397,18 @@ impl<'a> SelectResult<'a> {
         &self,
     ) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
         let projected_count = self.field_indices.len();
-        (0..projected_count + self.scalars.len()).map(move |index| {
+        let grouped_fields = self
+            .grouped
+            .as_ref()
+            .map_or(&[][..], |grouped| grouped.fields.as_slice());
+        let scalar_count = self.scalars.len();
+        (0..projected_count + scalar_count + grouped_fields.len()).map(move |index| {
             if index < projected_count {
                 &self.table.fields()[self.field_indices[index]]
-            } else {
+            } else if index < projected_count + scalar_count {
                 &self.scalars[index - projected_count].field
+            } else {
+                &grouped_fields[index - projected_count - scalar_count]
             }
         })
     }
@@ -379,7 +429,8 @@ impl<'a> SelectResult<'a> {
     /// Iterates over selected zero-based indexes in result order.
     ///
     /// Projection row indexes are also source table indexes. A scalar
-    /// aggregate has exactly one result row at index zero.
+    /// aggregate has exactly one result row at index zero. Grouped result
+    /// indexes address the owned, deterministically ordered rows.
     pub fn selected_rows(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
         SelectedRows::new(self)
     }
@@ -412,6 +463,28 @@ impl<'a> SelectResult<'a> {
 
     pub(crate) fn is_scalar(&self) -> bool {
         !self.scalars.is_empty()
+    }
+
+    pub(crate) fn is_grouped(&self) -> bool {
+        self.grouped.is_some()
+    }
+
+    /// Iterates over owned key/count rows for a grouped count result.
+    ///
+    /// Other result shapes return an empty iterator. Counts have already been
+    /// validated as representable by the SQL `Int64` result type.
+    pub fn grouped_rows(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&Value, i64)> + DoubleEndedIterator + '_ {
+        let groups = self
+            .grouped
+            .as_ref()
+            .map_or(&[][..], |grouped| grouped.groups.as_slice());
+        groups.iter().map(|group| {
+            let count = i64::try_from(group.count())
+                .expect("group counts are validated before SelectResult construction");
+            (group.value(), count)
+        })
     }
 
     /// Alias for [`Self::selected_rows`].
@@ -706,6 +779,7 @@ impl Catalog {
             .map(|entry| &entry.table)
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
         let aggregate_result_byte_limit = MAX_AGGREGATE_RESULT_BYTES;
+        let max_groups = self.limits.max_groups_per_query;
 
         match projections {
             SelectProjection::CountAll { alias } => execute_aggregates(
@@ -729,6 +803,15 @@ impl Catalog {
                 aggregate_result_byte_limit,
                 aggregates.into_iter(),
             ),
+            SelectProjection::GroupedCount { key, alias } => {
+                if order_by.is_some() {
+                    return Err(CatalogError::GroupedOrderingUnsupported);
+                }
+                if limit.is_some() {
+                    return Err(CatalogError::GroupedLimitUnsupported);
+                }
+                execute_grouped_count(table, &name, predicate_groups, max_groups, key, alias)
+            }
             projections => {
                 let field_indices = resolve_projection(table, projections)?;
                 let order = order_by
@@ -758,6 +841,7 @@ impl Catalog {
                     row_end,
                     row_count,
                     scalars: Vec::new(),
+                    grouped: None,
                 })
             }
         }
@@ -849,6 +933,57 @@ fn execute_aggregates<'a>(
         row_end: row_count,
         row_count,
         scalars,
+        grouped: None,
+    })
+}
+
+fn execute_grouped_count<'a>(
+    table: &'a Table,
+    table_name: &str,
+    predicate_groups: Vec<Vec<ComparisonPredicate>>,
+    max_groups: usize,
+    key: String,
+    alias: Option<String>,
+) -> Result<SelectResult<'a>, CatalogError> {
+    let selection = scan_predicate_groups(table, predicate_groups, table_name)?;
+    let groups = table
+        .grouped_count(&key, selection.as_ref(), max_groups)
+        .map_err(|source| CatalogError::TableGrouping {
+            name: table_name.to_owned(),
+            source,
+        })?;
+    for group in &groups {
+        i64::try_from(group.count()).map_err(|_| CatalogError::CountOutOfRange {
+            name: table_name.to_owned(),
+            count: group.count(),
+        })?;
+    }
+
+    let key_type = table
+        .fields()
+        .iter()
+        .find(|field| field.name() == key)
+        .expect("grouped_count resolved the grouping field")
+        .data_type();
+    let row_count = groups.len();
+    Ok(SelectResult {
+        table,
+        field_indices: Vec::new(),
+        selection: None,
+        ordered_rows: None,
+        row_end: row_count,
+        row_count,
+        scalars: Vec::new(),
+        grouped: Some(GroupedResult {
+            fields: [
+                Field::new(key, key_type),
+                Field::new(
+                    alias.unwrap_or_else(|| "count()".to_owned()),
+                    DataType::Int64,
+                ),
+            ],
+            groups,
+        }),
     })
 }
 
@@ -1266,7 +1401,9 @@ fn resolve_projection(
     let field_count = match &projection {
         SelectProjection::All => table.fields().len(),
         SelectProjection::Columns(names) => names.len(),
-        SelectProjection::CountAll { .. } | SelectProjection::Aggregates(_) => {
+        SelectProjection::CountAll { .. }
+        | SelectProjection::Aggregates(_)
+        | SelectProjection::GroupedCount { .. } => {
             unreachable!("aggregates are reduced before projection resolution")
         }
     };
@@ -1287,7 +1424,9 @@ fn resolve_projection(
                 indices.push(index);
             }
         }
-        SelectProjection::CountAll { .. } | SelectProjection::Aggregates(_) => {
+        SelectProjection::CountAll { .. }
+        | SelectProjection::Aggregates(_)
+        | SelectProjection::GroupedCount { .. } => {
             unreachable!("aggregates are reduced before projection resolution")
         }
     }

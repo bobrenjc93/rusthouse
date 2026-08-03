@@ -182,6 +182,142 @@ fn executes_campaign_shaped_groups_across_all_physical_types() {
 }
 
 #[test]
+fn executes_owned_grouped_counts_for_every_type_in_key_order() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE groups (integer Int64, float Float64, boolean Bool, text String)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO groups VALUES \
+             (4, 2.5, true, 'pear'), \
+             (-2, -1.0, false, 'apple'), \
+             (4, 2.5, false, 'pear'), \
+             (0, 9.0, true, 'banana'), \
+             (-2, -1.0, false, 'apple')",
+        )
+        .unwrap();
+
+    let cases = [
+        (
+            "integer",
+            vec![
+                (Value::Int64(-2), 2),
+                (Value::Int64(0), 1),
+                (Value::Int64(4), 2),
+            ],
+        ),
+        (
+            "float",
+            vec![
+                (Value::Float64(-1.0), 2),
+                (Value::Float64(2.5), 2),
+                (Value::Float64(9.0), 1),
+            ],
+        ),
+        (
+            "boolean",
+            vec![(Value::Bool(false), 3), (Value::Bool(true), 2)],
+        ),
+        (
+            "text",
+            vec![
+                (Value::from("apple"), 2),
+                (Value::from("banana"), 1),
+                (Value::from("pear"), 2),
+            ],
+        ),
+    ];
+
+    for (key, expected) in cases {
+        let result = catalog
+            .execute_select(&format!(
+                "SELECT {key}, COUNT(*) AS rows FROM groups GROUP BY {key}"
+            ))
+            .unwrap();
+        assert_eq!(
+            result
+                .fields()
+                .map(|field| (field.name(), field.data_type()))
+                .collect::<Vec<_>>(),
+            [(key, expected[0].0.data_type()), ("rows", DataType::Int64)]
+        );
+        assert_eq!(
+            result
+                .grouped_rows()
+                .map(|(value, count)| (value.clone(), count))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            result.row_indices().collect::<Vec<_>>(),
+            (0..result.len()).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn grouped_counts_filter_before_grouping_and_return_empty_results() {
+    let catalog = readings_catalog();
+
+    let filtered = catalog
+        .execute_select("SELECT active, COUNT(*) FROM readings WHERE sequence >= 2 GROUP BY active")
+        .unwrap();
+    assert_eq!(
+        filtered.grouped_rows().collect::<Vec<_>>(),
+        [(&Value::Bool(false), 1), (&Value::Bool(true), 1)]
+    );
+
+    let empty = catalog
+        .execute_select(
+            "SELECT label, COUNT(*) AS matches FROM readings \
+             WHERE sequence > 100 GROUP BY label",
+        )
+        .unwrap();
+    assert_eq!(
+        empty
+            .fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [("label", DataType::String), ("matches", DataType::Int64)]
+    );
+    assert!(empty.grouped_rows().next().is_none());
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn grouped_counts_enforce_the_catalog_group_limit_without_truncating() {
+    let limits = CatalogLimits::default().with_max_groups_per_query(2);
+    let mut catalog = Catalog::with_limits(limits);
+    catalog
+        .execute_create("CREATE TABLE groups (key Int64)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO groups VALUES (2), (1), (3), (1)")
+        .unwrap();
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT key, COUNT(*) FROM groups GROUP BY key")
+            .unwrap_err(),
+        CatalogError::TableGrouping {
+            name: "groups".to_owned(),
+            source: rusthouse::GroupedCountError::GroupLimitExceeded {
+                field: "key".to_owned(),
+                limit: 2,
+            },
+        }
+    );
+
+    let empty = catalog
+        .execute_select("SELECT key, COUNT(*) FROM groups WHERE key > 10 GROUP BY key")
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn unions_intersected_groups_across_packed_bitmap_boundaries() {
     let mut catalog = Catalog::new();
     catalog

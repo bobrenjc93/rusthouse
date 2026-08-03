@@ -4,7 +4,10 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead, Write};
 
-use crate::{Catalog, CatalogError, ParseErrorKind, TableError, write_select_csv_with_names};
+use crate::{
+    Catalog, CatalogError, GroupedCountError, ParseErrorKind, TableError,
+    write_select_csv_with_names,
+};
 
 /// Maximum number of SQL statements accepted in one process invocation.
 pub const MAX_BATCH_STATEMENTS: usize = 10_000;
@@ -315,7 +318,11 @@ fn is_catalog_limit(error: &CatalogError) -> bool {
             ..
         }
         | CatalogError::TableLimitExceeded { .. }
-        | CatalogError::AggregateResultTooLarge { .. } => true,
+        | CatalogError::AggregateResultTooLarge { .. }
+        | CatalogError::TableGrouping {
+            source: GroupedCountError::GroupLimitExceeded { .. },
+            ..
+        } => true,
         _ => false,
     }
 }
