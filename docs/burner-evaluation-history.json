@@ -154,6 +154,38 @@
         "eval_56a6f83a": 20,
         "eval_a8d9ce71": 100
       }
+    },
+    {
+      "key": "base:abf7b14f867d7e148c2b1661a53982b310624e16",
+      "commit": "abf7b14f867d7e148c2b1661a53982b310624e16",
+      "recordedAt": "2026-08-03T06:52:44.840Z",
+      "label": "base abf7b14",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_69c46252": 40,
+        "eval_ed4d7712": 70,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 20,
+        "eval_a8d9ce71": 100
+      }
+    },
+    {
+      "key": "pr:303",
+      "recordedAt": "2026-08-03T06:52:44.840Z",
+      "label": "PR #303",
+      "kind": "leaf",
+      "prNumber": 303,
+      "title": "Execute simple SELECTs as borrowed results",
+      "scores": {
+        "eval_69c46252": 45,
+        "eval_ed4d7712": 70,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 20,
+        "eval_a8d9ce71": 100
+      }
     }
   ]
 }
