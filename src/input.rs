@@ -33,29 +33,16 @@ impl std::error::Error for InputError {
     }
 }
 
-/// Reads a bounded SQL batch and drains the reader even when the limit is exceeded.
+/// Reads a SQL batch through the first byte beyond the configured limit.
 pub fn read_sql_input<R: Read>(mut reader: R) -> Result<String, InputError> {
     let mut input = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut too_large = false;
+    reader
+        .by_ref()
+        .take((MAX_SQL_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(InputError::Io)?;
 
-    loop {
-        let read = reader.read(&mut buffer).map_err(InputError::Io)?;
-        if read == 0 {
-            break;
-        }
-
-        if !too_large {
-            if input.len() + read <= MAX_SQL_INPUT_BYTES {
-                input.extend_from_slice(&buffer[..read]);
-            } else {
-                too_large = true;
-                input.clear();
-            }
-        }
-    }
-
-    if too_large {
+    if input.len() > MAX_SQL_INPUT_BYTES {
         return Err(InputError::TooLarge {
             maximum: MAX_SQL_INPUT_BYTES,
         });
@@ -89,9 +76,8 @@ mod tests {
     }
 
     #[test]
-    fn drains_oversized_input() {
+    fn stops_after_the_first_excess_byte() {
         let bytes = vec![b'x'; MAX_SQL_INPUT_BYTES + 17_000];
-        let expected = bytes.len();
         let mut reader = CountingReader {
             inner: Cursor::new(bytes),
             bytes_read: 0,
@@ -100,6 +86,6 @@ mod tests {
         let error = read_sql_input(&mut reader).unwrap_err();
 
         assert!(matches!(error, InputError::TooLarge { .. }));
-        assert_eq!(reader.bytes_read, expected);
+        assert_eq!(reader.bytes_read, MAX_SQL_INPUT_BYTES + 1);
     }
 }

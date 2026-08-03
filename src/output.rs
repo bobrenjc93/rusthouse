@@ -70,23 +70,23 @@ fn write_csv_field<W: Write>(field: &str, writer: &mut W) -> io::Result<()> {
 }
 
 fn write_table<W: Write>(result: &QueryResult, writer: &mut W) -> io::Result<()> {
+    let names: Vec<String> = result
+        .columns
+        .iter()
+        .map(|column| escape_table_field(&column.name))
+        .collect();
     let values: Vec<String> = result
         .columns
         .iter()
-        .map(|column| column.value.to_output_string())
+        .map(|column| escape_table_field(&column.value.to_output_string()))
         .collect();
-    let widths: Vec<usize> = result
-        .columns
+    let widths: Vec<usize> = names
         .iter()
         .zip(&values)
-        .map(|(column, value)| column.name.chars().count().max(value.chars().count()))
+        .map(|(name, value)| name.chars().count().max(value.chars().count()))
         .collect();
 
-    write_table_row(
-        result.columns.iter().map(|column| column.name.as_str()),
-        &widths,
-        writer,
-    )?;
+    write_table_row(names.iter().map(String::as_str), &widths, writer)?;
     for (index, width) in widths.iter().enumerate() {
         if index > 0 {
             writer.write_all(b"-+-")?;
@@ -95,6 +95,21 @@ fn write_table<W: Write>(result: &QueryResult, writer: &mut W) -> io::Result<()>
     }
     writer.write_all(b"\n")?;
     write_table_row(values.iter().map(String::as_str), &widths, writer)
+}
+
+fn escape_table_field(field: &str) -> String {
+    let mut escaped = String::with_capacity(field.len());
+    for character in field.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            value if value.is_control() => escaped.extend(value.escape_unicode()),
+            value => escaped.push(value),
+        }
+    }
+    escaped
 }
 
 fn write_table_row<'a, W, I>(fields: I, widths: &[usize], writer: &mut W) -> io::Result<()>
@@ -135,6 +150,24 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "\"message,text\"\n\"say \"\"hello\"\"\nagain\"\n"
+        );
+    }
+
+    #[test]
+    fn table_escapes_control_characters_in_names_and_values() {
+        let results = vec![QueryResult {
+            columns: vec![Column {
+                name: "line\nname".to_owned(),
+                value: ScalarValue::String("first\nsecond".to_owned()),
+            }],
+        }];
+        let mut output = Vec::new();
+
+        write_results(&results, OutputFormat::Table, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "line\\nname   \n-------------\nfirst\\nsecond\n"
         );
     }
 }

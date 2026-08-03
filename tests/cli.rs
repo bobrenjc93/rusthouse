@@ -3,6 +3,14 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 fn run_cli(arguments: &[&str], input: &[u8]) -> Output {
+    run_cli_with_input_policy(arguments, input, false)
+}
+
+fn run_cli_allowing_closed_stdin(arguments: &[&str], input: &[u8]) -> Output {
+    run_cli_with_input_policy(arguments, input, true)
+}
+
+fn run_cli_with_input_policy(arguments: &[&str], input: &[u8], allow_broken_pipe: bool) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(arguments)
         .stdin(Stdio::piped())
@@ -11,12 +19,17 @@ fn run_cli(arguments: &[&str], input: &[u8]) -> Output {
         .spawn()
         .expect("CLI should start");
 
-    child
+    let write_result = child
         .stdin
         .take()
         .expect("stdin should be piped")
-        .write_all(input)
-        .expect("SQL input should be written");
+        .write_all(input);
+    if let Err(error) = write_result {
+        assert!(
+            allow_broken_pipe && error.kind() == std::io::ErrorKind::BrokenPipe,
+            "unexpected error writing SQL input: {error}"
+        );
+    }
     child.wait_with_output().expect("CLI should finish")
 }
 
@@ -64,6 +77,18 @@ fn malformed_sql_has_a_stable_error_and_nonzero_status() {
 }
 
 #[test]
+fn default_table_output_escapes_multiline_fields() {
+    let output = run_cli(&[], b"SELECT 'first\nsecond' AS \"line\nname\";");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "line\\nname   \n-------------\nfirst\\nsecond\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn unsupported_clauses_have_a_stable_error_and_nonzero_status() {
     let output = run_cli(&[], b"SELECT 1 AS one FROM numbers;");
 
@@ -77,8 +102,8 @@ fn unsupported_clauses_have_a_stable_error_and_nonzero_status() {
 
 #[test]
 fn oversized_input_is_rejected() {
-    let input = vec![b' '; MAX_SQL_INPUT_BYTES + 1];
-    let output = run_cli(&[], &input);
+    let input = vec![b' '; MAX_SQL_INPUT_BYTES * 4];
+    let output = run_cli_allowing_closed_stdin(&[], &input);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());

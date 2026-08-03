@@ -257,6 +257,24 @@ impl<'a> Lexer<'a> {
                 self.bump();
             }
         }
+        if self
+            .peek()
+            .is_some_and(|value| value.is_ascii_alphabetic() || value == '_')
+        {
+            while self
+                .peek()
+                .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_')
+            {
+                self.bump();
+            }
+            return Err(SqlError::syntax(
+                offset,
+                format!(
+                    "invalid numeric literal `{}`",
+                    &self.input[offset..self.position]
+                ),
+            ));
+        }
         Ok(self.input[offset..self.position].to_owned())
     }
 
@@ -608,5 +626,16 @@ mod tests {
     fn rejects_non_finite_and_out_of_range_numbers() {
         assert!(execute_batch("SELECT 1e999 AS huge;").is_err());
         assert!(execute_batch("SELECT 9223372036854775808 AS huge;").is_err());
+    }
+
+    #[test]
+    fn rejects_identifier_characters_attached_to_numbers() {
+        for input in ["SELECT 123abc;", "SELECT 12.5value;", "SELECT 1e2seconds;"] {
+            let error = execute_batch(input).unwrap_err();
+            assert!(
+                matches!(error.kind, SqlErrorKind::Syntax { ref message } if message.starts_with("invalid numeric literal")),
+                "unexpected error for {input}: {error}"
+            );
+        }
     }
 }
