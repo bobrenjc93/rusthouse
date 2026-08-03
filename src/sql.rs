@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-pub use crate::storage::DataType;
+pub use crate::storage::{DataType, Value};
 
 /// One named, typed column in a table declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,13 @@ pub struct ColumnDefinition {
 pub struct CreateTableStatement {
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
+}
+
+/// The syntax tree produced for an `INSERT INTO ... VALUES` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertStatement {
+    pub name: String,
+    pub rows: Vec<Vec<Value>>,
 }
 
 /// Resource limits applied before and during parsing.
@@ -45,6 +52,47 @@ impl Default for ParseLimits {
     }
 }
 
+/// Resource limits applied before and during `INSERT` parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertParseLimits {
+    pub max_input_bytes: usize,
+    pub max_rows: usize,
+    pub max_values_per_row: usize,
+    pub max_string_bytes: usize,
+}
+
+impl InsertParseLimits {
+    pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
+    pub const DEFAULT_MAX_ROWS: usize = 100_000;
+    pub const DEFAULT_MAX_VALUES_PER_ROW: usize = 1024;
+    pub const DEFAULT_MAX_STRING_BYTES: usize = 1024 * 1024;
+
+    pub const fn new(
+        max_input_bytes: usize,
+        max_rows: usize,
+        max_values_per_row: usize,
+        max_string_bytes: usize,
+    ) -> Self {
+        Self {
+            max_input_bytes,
+            max_rows,
+            max_values_per_row,
+            max_string_bytes,
+        }
+    }
+}
+
+impl Default for InsertParseLimits {
+    fn default() -> Self {
+        Self::new(
+            Self::DEFAULT_MAX_INPUT_BYTES,
+            Self::DEFAULT_MAX_ROWS,
+            Self::DEFAULT_MAX_VALUES_PER_ROW,
+            Self::DEFAULT_MAX_STRING_BYTES,
+        )
+    }
+}
+
 /// The role of an identifier which failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentifierContext {
@@ -61,7 +109,7 @@ impl fmt::Display for IdentifierContext {
     }
 }
 
-/// A specific reason that a `CREATE TABLE` statement could not be parsed.
+/// A specific reason that a supported SQL statement could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseErrorKind {
     InputTooLong {
@@ -92,6 +140,27 @@ pub enum ParseErrorKind {
         type_name: String,
     },
     TooManyColumns {
+        limit: usize,
+    },
+    TooManyRows {
+        limit: usize,
+    },
+    EmptyRow,
+    TooManyValues {
+        limit: usize,
+    },
+    ExpectedValue,
+    InvalidLiteral {
+        literal: String,
+    },
+    IntegerLiteralOutOfRange {
+        literal: String,
+    },
+    FloatLiteralOutOfRange {
+        literal: String,
+    },
+    UnterminatedString,
+    StringTooLong {
         limit: usize,
     },
     TrailingSyntax,
@@ -129,6 +198,33 @@ impl fmt::Display for ParseErrorKind {
             }
             Self::TooManyColumns { limit } => {
                 write!(formatter, "column count exceeds limit of {limit}")
+            }
+            Self::TooManyRows { limit } => {
+                write!(formatter, "row count exceeds limit of {limit}")
+            }
+            Self::EmptyRow => formatter.write_str("row contains no values"),
+            Self::TooManyValues { limit } => {
+                write!(formatter, "row value count exceeds limit of {limit}")
+            }
+            Self::ExpectedValue => formatter.write_str("expected a literal value"),
+            Self::InvalidLiteral { literal } => {
+                write!(formatter, "invalid literal {literal:?}")
+            }
+            Self::IntegerLiteralOutOfRange { literal } => {
+                write!(
+                    formatter,
+                    "integer literal {literal:?} is outside the Int64 range"
+                )
+            }
+            Self::FloatLiteralOutOfRange { literal } => {
+                write!(
+                    formatter,
+                    "float literal {literal:?} is outside the Float64 range"
+                )
+            }
+            Self::UnterminatedString => formatter.write_str("unterminated string literal"),
+            Self::StringTooLong { limit } => {
+                write!(formatter, "decoded string exceeds limit of {limit} bytes")
             }
             Self::TrailingSyntax => formatter.write_str("trailing syntax after statement"),
         }
@@ -179,25 +275,53 @@ pub fn parse_create_table_with_limits(
         });
     }
 
-    Parser::new(input, limits.max_columns).parse()
+    Parser::new(input).parse_create_table(limits.max_columns)
+}
+
+/// Parses one bounded `INSERT INTO ... VALUES` statement using the default limits.
+pub fn parse_insert(input: &str) -> Result<InsertStatement, ParseError> {
+    parse_insert_with_limits(input, InsertParseLimits::default())
+}
+
+/// Parses one bounded `INSERT INTO ... VALUES` statement.
+///
+/// The parser accepts one or more non-empty rows containing `Int64`, `Float64`,
+/// `Bool`, and single-quoted `String` literals. A quote inside a string is
+/// escaped by doubling it (`'can''t'`). String limits apply to decoded UTF-8
+/// bytes, after doubled quotes have been reduced to one byte. Catalog lookup,
+/// schema validation, and table mutation are deliberately outside this syntax
+/// boundary.
+pub fn parse_insert_with_limits(
+    input: &str,
+    limits: InsertParseLimits,
+) -> Result<InsertStatement, ParseError> {
+    if input.len() > limits.max_input_bytes {
+        return Err(ParseError {
+            position: limits.max_input_bytes,
+            kind: ParseErrorKind::InputTooLong {
+                limit: limits.max_input_bytes,
+                actual: input.len(),
+            },
+        });
+    }
+
+    Parser::new(input).parse_insert(limits)
 }
 
 struct Parser<'a> {
     input: &'a str,
     position: usize,
-    max_columns: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, max_columns: usize) -> Self {
-        Self {
-            input,
-            position: 0,
-            max_columns,
-        }
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
     }
 
-    fn parse(mut self) -> Result<CreateTableStatement, ParseError> {
+    fn parse_create_table(
+        mut self,
+        max_columns: usize,
+    ) -> Result<CreateTableStatement, ParseError> {
         self.parse_keyword("CREATE")?;
         self.parse_keyword("TABLE")?;
         let (name, _) = self.parse_identifier(IdentifierContext::Table)?;
@@ -211,10 +335,8 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() || matches!(self.peek(), Some(b')' | b',')) {
                 return Err(self.error(ParseErrorKind::EmptyColumn));
             }
-            if columns.len() == self.max_columns {
-                return Err(self.error(ParseErrorKind::TooManyColumns {
-                    limit: self.max_columns,
-                }));
+            if columns.len() == max_columns {
+                return Err(self.error(ParseErrorKind::TooManyColumns { limit: max_columns }));
             }
 
             let (column_name, column_position) =
@@ -262,6 +384,183 @@ impl<'a> Parser<'a> {
         }
 
         Ok(CreateTableStatement { name, columns })
+    }
+
+    fn parse_insert(mut self, limits: InsertParseLimits) -> Result<InsertStatement, ParseError> {
+        self.parse_keyword("INSERT")?;
+        self.parse_keyword("INTO")?;
+        let (name, _) = self.parse_identifier(IdentifierContext::Table)?;
+        self.parse_keyword("VALUES")?;
+
+        let mut rows = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some(b'(') {
+                return Err(self.error(ParseErrorKind::ExpectedToken { expected: "'('" }));
+            }
+            if rows.len() == limits.max_rows {
+                return Err(self.error(ParseErrorKind::TooManyRows {
+                    limit: limits.max_rows,
+                }));
+            }
+            self.position += 1;
+
+            let row = self.parse_row(limits)?;
+            rows.push(row);
+
+            self.skip_whitespace();
+            if self.peek() == Some(b',') {
+                self.position += 1;
+                continue;
+            }
+            break;
+        }
+
+        self.finish_statement()?;
+        Ok(InsertStatement { name, rows })
+    }
+
+    fn parse_row(&mut self, limits: InsertParseLimits) -> Result<Vec<Value>, ParseError> {
+        let mut values = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(b')') {
+                return Err(self.error(if values.is_empty() {
+                    ParseErrorKind::EmptyRow
+                } else {
+                    ParseErrorKind::ExpectedValue
+                }));
+            }
+            if values.len() == limits.max_values_per_row {
+                return Err(self.error(ParseErrorKind::TooManyValues {
+                    limit: limits.max_values_per_row,
+                }));
+            }
+
+            values.push(self.parse_value(limits.max_string_bytes)?);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.position += 1,
+                Some(b')') => {
+                    self.position += 1;
+                    return Ok(values);
+                }
+                _ => {
+                    return Err(self.error(ParseErrorKind::ExpectedToken {
+                        expected: "',' or ')'",
+                    }));
+                }
+            }
+        }
+    }
+
+    fn parse_value(&mut self, max_string_bytes: usize) -> Result<Value, ParseError> {
+        self.skip_whitespace();
+        let start = self.position;
+        if self.peek() == Some(b'\'') {
+            return self.parse_string(max_string_bytes).map(Value::String);
+        }
+
+        let literal = self.take_token();
+        if literal.is_empty() {
+            return Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::ExpectedValue,
+            });
+        }
+        if literal.eq_ignore_ascii_case("true") {
+            return Ok(Value::Bool(true));
+        }
+        if literal.eq_ignore_ascii_case("false") {
+            return Ok(Value::Bool(false));
+        }
+
+        match numeric_literal_kind(literal) {
+            Some(NumericLiteralKind::Integer) => {
+                literal
+                    .parse::<i64>()
+                    .map(Value::Int64)
+                    .map_err(|_| ParseError {
+                        position: start,
+                        kind: ParseErrorKind::IntegerLiteralOutOfRange {
+                            literal: literal.to_owned(),
+                        },
+                    })
+            }
+            Some(NumericLiteralKind::Float) => {
+                let value = literal.parse::<f64>().map_err(|_| ParseError {
+                    position: start,
+                    kind: ParseErrorKind::InvalidLiteral {
+                        literal: literal.to_owned(),
+                    },
+                })?;
+                if value.is_finite() {
+                    Ok(Value::Float64(value))
+                } else {
+                    Err(ParseError {
+                        position: start,
+                        kind: ParseErrorKind::FloatLiteralOutOfRange {
+                            literal: literal.to_owned(),
+                        },
+                    })
+                }
+            }
+            None => Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::InvalidLiteral {
+                    literal: literal.to_owned(),
+                },
+            }),
+        }
+    }
+
+    fn parse_string(&mut self, max_bytes: usize) -> Result<String, ParseError> {
+        self.position += 1;
+        let mut value = String::new();
+
+        loop {
+            let segment_start = self.position;
+            while self.peek().is_some_and(|byte| byte != b'\'') {
+                self.position += 1;
+            }
+
+            let segment = &self.input[segment_start..self.position];
+            let remaining = max_bytes.saturating_sub(value.len());
+            if segment.len() > remaining {
+                return Err(ParseError {
+                    position: segment_start + remaining,
+                    kind: ParseErrorKind::StringTooLong { limit: max_bytes },
+                });
+            }
+            value.push_str(segment);
+
+            if self.peek().is_none() {
+                return Err(self.error(ParseErrorKind::UnterminatedString));
+            }
+            if self.input.as_bytes().get(self.position + 1) == Some(&b'\'') {
+                if value.len() == max_bytes {
+                    return Err(self.error(ParseErrorKind::StringTooLong { limit: max_bytes }));
+                }
+                value.push('\'');
+                self.position += 2;
+            } else {
+                self.position += 1;
+                return Ok(value);
+            }
+        }
+    }
+
+    fn finish_statement(&mut self) -> Result<(), ParseError> {
+        self.skip_whitespace();
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.peek().is_some() {
+            return Err(self.error(ParseErrorKind::TrailingSyntax));
+        }
+        Ok(())
     }
 
     fn parse_keyword(&mut self, expected: &'static str) -> Result<(), ParseError> {
@@ -388,6 +687,54 @@ fn invalid_identifier_offset(identifier: &str) -> Option<usize> {
     bytes
         .iter()
         .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+}
+
+#[derive(Clone, Copy)]
+enum NumericLiteralKind {
+    Integer,
+    Float,
+}
+
+fn numeric_literal_kind(literal: &str) -> Option<NumericLiteralKind> {
+    let bytes = literal.as_bytes();
+    let mut position = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let integer_start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    let integer_digits = position - integer_start;
+
+    let mut kind = NumericLiteralKind::Integer;
+    let mut fractional_digits = 0;
+    if bytes.get(position) == Some(&b'.') {
+        kind = NumericLiteralKind::Float;
+        position += 1;
+        let fractional_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        fractional_digits = position - fractional_start;
+    }
+    if integer_digits == 0 && fractional_digits == 0 {
+        return None;
+    }
+
+    if matches!(bytes.get(position), Some(b'e' | b'E')) {
+        kind = NumericLiteralKind::Float;
+        position += 1;
+        if matches!(bytes.get(position), Some(b'+' | b'-')) {
+            position += 1;
+        }
+        let exponent_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position == exponent_start {
+            return None;
+        }
+    }
+
+    (position == bytes.len()).then_some(kind)
 }
 
 fn is_whitespace(byte: u8) -> bool {
