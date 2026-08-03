@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::snapshot::{SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
-use rusthouse::{SnapshotCodec, SnapshotError, SnapshotFileError};
+use rusthouse::{
+    Catalog, CatalogLimits, DistinctLimits, NullableI64PayloadCodec, ParseLimits, SnapshotCodec,
+    SnapshotError, SnapshotFileError, distinct_nullable_i64,
+};
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -228,4 +231,40 @@ fn rejects_an_oversized_payload_without_creating_a_file() {
         })
     ));
     assert!(!path.exists());
+}
+
+#[test]
+fn snapshots_distinct_values_from_a_filtered_sql_projection() {
+    let parse_limits = ParseLimits::default();
+    let mut catalog = Catalog::new(CatalogLimits::new(1, 4));
+    catalog
+        .execute_create("CREATE TABLE readings (value Int64 NULL)", parse_limits)
+        .unwrap();
+    for input in [
+        "INSERT INTO readings VALUES (7)",
+        "INSERT INTO readings VALUES (NULL)",
+        "INSERT INTO readings VALUES (9)",
+        "INSERT INTO readings VALUES (7)",
+    ] {
+        catalog.execute_insert(input, parse_limits).unwrap();
+    }
+
+    let filtered = catalog
+        .execute_select("SELECT value FROM readings WHERE value = 7", parse_limits)
+        .unwrap();
+    let distinct =
+        distinct_nullable_i64(filtered.as_ref(), DistinctLimits::new(filtered.len(), 1)).unwrap();
+    assert_eq!(distinct, [Some(7)]);
+
+    let payload_codec = NullableI64PayloadCodec::new(1, 17);
+    let payload = payload_codec.encode(&distinct).unwrap();
+    let snapshot_codec = SnapshotCodec::new(payload.len());
+    let directory = TestDirectory::new();
+    let path = directory.join("readings.snapshot");
+
+    snapshot_codec.create_new_file(&path, &payload).unwrap();
+
+    let envelope = fs::read(path).unwrap();
+    let decoded_payload = snapshot_codec.decode(&envelope).unwrap();
+    assert_eq!(payload_codec.decode(decoded_payload).unwrap(), distinct);
 }
