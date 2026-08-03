@@ -22,7 +22,7 @@ pub use parser::{
     ColumnDefinition, CreateTableStatement, Identifier, ParseError, ParseLimits, parse_create_table,
 };
 pub use scan::{ComparisonOperator, ScanError, ScanLimits, scan_nullable_i64};
-pub use snapshot::{SnapshotCodec, SnapshotError};
+pub use snapshot::{SnapshotCodec, SnapshotError, SnapshotLoadError};
 mod storage;
 
 pub use storage::{ColumnSchema, DataType, InsertError, Int64Table, Schema};
