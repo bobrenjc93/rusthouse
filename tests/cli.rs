@@ -180,6 +180,34 @@ fn saves_reopens_and_selects_one_table_across_processes() {
 }
 
 #[test]
+fn aggregates_or_groups_over_a_reopened_table() {
+    let directory = TestDirectory::new("snapshot-aggregate-or-groups");
+    let snapshot = directory.snapshot("events.snapshot");
+    let save = format!("events={}", snapshot.display());
+    let saved = run(
+        &["--save-table", &save],
+        b"CREATE TABLE events (id Int64, score Float64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, 1.5, true, 'west'), (2, 4.0, false, 'east'), (3, 9.5, true, 'north'), (4, 2.0, true, 'south')\n",
+    );
+    assert_eq!(saved.status.code(), Some(0));
+    assert!(saved.stdout.is_empty());
+    assert!(saved.stderr.is_empty());
+
+    let load = format!("restored={}", snapshot.display());
+    let reopened = run(
+        &["--load-table", &load],
+        b"SELECT COUNT(*) AS matches, SUM(id) AS total, AVG(score) AS mean, MIN(label) AS first, MAX(active) AS any_active FROM restored WHERE (active = true AND score >= 2.0) OR (label = 'east' AND id >= 2) OR id = 3\n",
+    );
+
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(
+        reopened.stdout,
+        b"\"matches\",\"total\",\"mean\",\"first\",\"any_active\"\n3,9,5.166666666666667,\"east\",true\n"
+    );
+}
+
+#[test]
 fn concurrent_saves_publish_one_complete_snapshot() {
     const WRITERS: usize = 16;
     const STRING_BYTES: usize = 256 * 1024;
