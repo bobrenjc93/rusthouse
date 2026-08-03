@@ -47,6 +47,8 @@ pub enum SelectProjection {
 pub enum AggregateFunction {
     /// Count every selected row.
     CountAll,
+    /// Count distinct values of one column.
+    CountDistinct { column: String },
     /// Sum one numeric column.
     Sum { column: String },
     /// Average one numeric column.
@@ -523,19 +525,19 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 /// Parses one bounded `SELECT` statement.
 ///
 /// Projections are `*`, a non-empty list of unquoted column names, or a
-/// non-empty aggregate-only list containing `COUNT(*)`, `SUM(column)`,
-/// `AVG(column)`, `MIN(column)`, and `MAX(column)`. Every aggregate may have an
-/// `AS` alias. A one-column grouped count has the exact projection
-/// `key, COUNT(*) [AS alias]` and requires a matching `GROUP BY key`. The
-/// statement reads one table and may contain `WHERE` groups
-/// joined by `OR`, each containing
-/// column-to-literal comparisons joined by `AND`. One optional pair of
-/// parentheses may wrap each whole group. Literals may be `Int64`, `Float64`,
-/// `Bool`, or `String`. The clause may be followed by one bounded `ORDER BY`
-/// list of `column [ASC|DESC]` keys and a nonnegative integer `LIMIT`. `NOT`, nested
-/// expressions, other grouped aggregates, multiple grouping keys, grouped
-/// ordering, `HAVING`, raw-column/aggregate mixing, and other predicate or
-/// result forms are outside this intentionally narrow syntax boundary.
+/// non-empty aggregate-only list containing `COUNT(*)`, `COUNT(DISTINCT
+/// column)`, `SUM(column)`, `AVG(column)`, `MIN(column)`, and `MAX(column)`.
+/// Every aggregate may have an `AS` alias. A one-column grouped count has the
+/// exact projection `key, COUNT(*) [AS alias]` and requires a matching `GROUP
+/// BY key`. The statement reads one table and may contain `WHERE` groups joined
+/// by `OR`, each containing column-to-literal comparisons joined by `AND`. One
+/// optional pair of parentheses may wrap each whole group. Literals may be
+/// `Int64`, `Float64`, `Bool`, or `String`. The clause may be followed by one
+/// bounded `ORDER BY` list of `column [ASC|DESC]` keys and a nonnegative integer
+/// `LIMIT`. `NOT`, nested expressions, other grouped aggregates, multiple
+/// grouping keys, grouped ordering, `HAVING`, raw-column/aggregate mixing, and
+/// other predicate or result forms are outside this intentionally narrow syntax
+/// boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -825,10 +827,12 @@ impl<'a> Parser<'a> {
             {
                 if columns.len() == 1 && kind == AggregateKind::Count {
                     let aggregate = self.parse_aggregate(kind)?;
-                    return Ok(SelectProjection::GroupedCount {
-                        key: columns.pop().expect("one grouping key was parsed"),
-                        alias: aggregate.alias,
-                    });
+                    if matches!(aggregate.function, AggregateFunction::CountAll) {
+                        return Ok(SelectProjection::GroupedCount {
+                            key: columns.pop().expect("one grouping key was parsed"),
+                            alias: aggregate.alias,
+                        });
+                    }
                 }
                 return Err(ParseError {
                     position: column_position,
@@ -907,8 +911,16 @@ impl<'a> Parser<'a> {
         self.position += 1;
         let function = match kind {
             AggregateKind::Count => {
-                self.expect_byte(b'*', "'*'")?;
-                AggregateFunction::CountAll
+                self.skip_whitespace();
+                if self.peek() == Some(b'*') {
+                    self.position += 1;
+                    AggregateFunction::CountAll
+                } else {
+                    self.parse_keyword("DISTINCT")?;
+                    AggregateFunction::CountDistinct {
+                        column: self.parse_identifier(IdentifierContext::Column)?.0,
+                    }
+                }
             }
             AggregateKind::Sum => AggregateFunction::Sum {
                 column: self.parse_identifier(IdentifierContext::Column)?.0,

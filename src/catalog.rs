@@ -1033,6 +1033,20 @@ fn execute_aggregate(
                 value: Value::Int64(count),
             })
         }
+        AggregateFunction::CountDistinct { column } => {
+            let count = map_reduction(table_name, table.count_distinct(&column, selection))?;
+            let count = i64::try_from(count).map_err(|_| CatalogError::CountOutOfRange {
+                name: table_name.to_owned(),
+                count,
+            })?;
+            Ok(ScalarResult {
+                field: Field::new(
+                    alias.unwrap_or_else(|| format!("count(distinct {column})")),
+                    DataType::Int64,
+                ),
+                value: Value::Int64(count),
+            })
+        }
         AggregateFunction::Sum { column } => {
             let value = map_reduction(table_name, table.sum(&column, selection))?;
             Ok(scalar_result(alias, "sum", column, value))

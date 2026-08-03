@@ -44,6 +44,88 @@ fn count_and_sum_cover_full_and_selected_numeric_inputs() {
 }
 
 #[test]
+fn count_distinct_covers_duplicates_and_selections_for_every_physical_type() {
+    let mut table = Table::new(vec![
+        Field::new("integer", DataType::Int64),
+        Field::new("float", DataType::Float64),
+        Field::new("boolean", DataType::Bool),
+        Field::new("text", DataType::String),
+        Field::new("include", DataType::Bool),
+    ])
+    .unwrap();
+    table
+        .insert_batch([
+            filtered_row(1, 1.5, true, "one", true),
+            filtered_row(1, 1.5, true, "one", true),
+            filtered_row(2, 2.5, false, "two", true),
+            filtered_row(3, 3.5, false, "three", false),
+        ])
+        .unwrap();
+    let selection = table
+        .scan("include", ComparisonOperator::Equal, &Value::Bool(true))
+        .unwrap();
+
+    for (field, all, selected) in [
+        ("integer", 3, 2),
+        ("float", 3, 2),
+        ("boolean", 2, 2),
+        ("text", 3, 2),
+    ] {
+        assert_eq!(table.count_distinct(field, None), Ok(all));
+        assert_eq!(table.count_distinct(field, Some(&selection)), Ok(selected));
+    }
+}
+
+#[test]
+fn count_distinct_returns_zero_for_empty_inputs_and_validates_before_allocating() {
+    let empty = all_types_table();
+    let empty_selection = RowSelection::try_empty(0).unwrap();
+    for field in ["integer", "float", "boolean", "text"] {
+        assert_eq!(empty.count_distinct(field, None), Ok(0));
+        assert_eq!(empty.count_distinct(field, Some(&empty_selection)), Ok(0));
+    }
+
+    let mut populated = all_types_table();
+    populated.insert_batch([row(1, 1.0, true, "one")]).unwrap();
+    let no_rows = RowSelection::try_empty(1).unwrap();
+    assert_eq!(populated.count_distinct("text", Some(&no_rows)), Ok(0));
+    assert_eq!(
+        populated.count_distinct("missing", None),
+        Err(ReductionError::FieldNotFound {
+            name: "missing".to_owned(),
+        })
+    );
+    assert_eq!(
+        populated.count_distinct("integer", Some(&RowSelection::try_empty(2).unwrap())),
+        Err(ReductionError::SelectionLengthMismatch {
+            table_rows: 1,
+            selection_rows: 2,
+        })
+    );
+}
+
+#[test]
+fn count_distinct_uses_total_float_identity_for_nans_and_signed_zeroes() {
+    let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let other_nan = f64::from_bits(0x7ff8_0000_0000_0002);
+    let negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
+    let mut table = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    table
+        .insert_batch([
+            vec![Value::Float64(nan)],
+            vec![Value::Float64(nan)],
+            vec![Value::Float64(other_nan)],
+            vec![Value::Float64(negative_nan)],
+            vec![Value::Float64(-0.0)],
+            vec![Value::Float64(0.0)],
+            vec![Value::Float64(0.0)],
+        ])
+        .unwrap();
+
+    assert_eq!(table.count_distinct("value", None), Ok(5));
+}
+
+#[test]
 fn int64_sum_checks_both_overflow_directions_and_honors_selection() {
     let mut positive = Table::new(vec![
         Field::new("value", DataType::Int64),
