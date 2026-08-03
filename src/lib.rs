@@ -1,4 +1,31 @@
 //! RustHouse is an experimental, compact analytical database.
+//!
+//! The primary embedded interface is [`Catalog`], which owns typed columnar
+//! tables and executes the crate's bounded SQL subset. Lower-level callers can
+//! use [`Table`] directly for scans, reductions, and grouped counts.
+//!
+//! # Example
+//!
+//! ```
+//! use rusthouse::{Catalog, Value};
+//!
+//! let mut catalog = Catalog::new();
+//! catalog.execute_create("CREATE TABLE events (active Bool)")?;
+//! catalog.execute_insert("INSERT INTO events VALUES (true), (false), (true)")?;
+//!
+//! let result = catalog.execute_select(
+//!     "SELECT active, COUNT(*) AS rows FROM events GROUP BY active",
+//! )?;
+//! let groups = result
+//!     .grouped_rows()
+//!     .map(|(value, count)| (value.clone(), count))
+//!     .collect::<Vec<_>>();
+//! assert_eq!(
+//!     groups,
+//!     [(Value::Bool(false), 1), (Value::Bool(true), 2)],
+//! );
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 pub mod catalog;
 pub mod cli;
