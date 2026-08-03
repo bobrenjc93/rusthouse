@@ -18,11 +18,12 @@
 //! The checksum uses polynomial `0xedb8_8320`, an initial value of
 //! `0xffff_ffff`, and a final XOR of `0xffff_ffff`.
 //!
-//! Writes use a writer-unique `.<file-name>.tmp.<pid>.<sequence>` sibling, sync
-//! that file, atomically rename it over the destination, and sync the parent
-//! directory on Unix. Concurrent writers can publish in either order, but each
-//! published snapshot is complete. Stale temporary siblings are ignored when
-//! reading and never conflict with later writers.
+//! Writers serialize through a persistent `.<file-name>.lock` sibling. While
+//! holding that cross-process lock, a writer reclaims any stale
+//! `.<file-name>.tmp`, writes and syncs a complete replacement there, atomically
+//! renames it over the destination, and syncs the parent directory on Unix. A
+//! process exit releases the lock, allowing the next writer to clean up an
+//! interrupted temporary file without racing an active writer.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -42,8 +43,6 @@ pub const SNAPSHOT_HEADER_LEN: usize = 22;
 
 /// The default maximum payload size: 64 MiB.
 pub const DEFAULT_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
-
-static NEXT_TEMPORARY_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Details about a snapshot that failed integrity validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +188,14 @@ impl SnapshotStore {
         let path = path.as_ref();
         self.validate_payload_len(payload.len() as u64)?;
 
-        let (parent, temporary_path, mut temporary_file) = create_temporary_file(path)?;
+        let (parent, temporary_path, lock_path) = sibling_write_paths(path)?;
+        let _writer_lock = acquire_writer_lock(&lock_path)?;
+        remove_stale_temporary_file(&temporary_path)?;
+        let mut temporary_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|source| io_failure("create temporary", &temporary_path, source))?;
 
         let write_result = (|| {
             let header = encode_header(payload.len() as u64, crc32(payload));
@@ -347,7 +353,7 @@ fn encode_header(payload_len: u64, checksum: u32) -> [u8; SNAPSHOT_HEADER_LEN] {
     header
 }
 
-fn create_temporary_file(path: &Path) -> Result<(PathBuf, PathBuf, File), SnapshotError> {
+fn sibling_write_paths(path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), SnapshotError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -363,23 +369,36 @@ fn create_temporary_file(path: &Path) -> Result<(PathBuf, PathBuf, File), Snapsh
         )
     })?;
 
-    loop {
-        let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut temporary_name = OsString::from(".");
-        temporary_name.push(file_name);
-        temporary_name.push(format!(".tmp.{}.{sequence}", std::process::id()));
-        let temporary_path = parent.join(temporary_name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary_path)
-        {
-            Ok(file) => return Ok((parent.to_path_buf(), temporary_path, file)),
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(source) => {
-                return Err(io_failure("create temporary", &temporary_path, source));
-            }
-        }
+    let mut sibling_name = OsString::from(".");
+    sibling_name.push(file_name);
+    let mut temporary_name = sibling_name.clone();
+    temporary_name.push(".tmp");
+    sibling_name.push(".lock");
+    Ok((
+        parent.to_path_buf(),
+        parent.join(temporary_name),
+        parent.join(sibling_name),
+    ))
+}
+
+fn acquire_writer_lock(path: &Path) -> Result<File, SnapshotError> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| io_failure("open writer lock", path, source))?;
+    lock.lock()
+        .map_err(|source| io_failure("lock writer", path, source))?;
+    Ok(lock)
+}
+
+fn remove_stale_temporary_file(path: &Path) -> Result<(), SnapshotError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_failure("remove stale temporary", path, source)),
     }
 }
 
@@ -458,9 +477,13 @@ const fn crc32_table() -> [u32; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    const INTERRUPTED_WRITER_PATH: &str = "RUSTHOUSE_TEST_INTERRUPTED_WRITER_PATH";
+    const INTERRUPTED_WRITER_READY: &str = "RUSTHOUSE_TEST_INTERRUPTED_WRITER_READY";
 
     struct TestDirectory(PathBuf);
 
@@ -510,14 +533,16 @@ mod tests {
             .expect("replace snapshot");
 
         assert_eq!(store.read(&path).expect("read replacement"), b"replacement");
-        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert!(directory.0.join(".state.snapshot.lock").exists());
+        assert!(!directory.0.join(".state.snapshot.tmp").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 
     #[test]
-    fn ignores_a_stale_temporary_file_from_an_interrupted_writer() {
+    fn reclaims_a_stale_temporary_file_from_an_interrupted_writer() {
         let directory = TestDirectory::new("stale-temporary");
         let path = directory.snapshot();
-        let temporary_path = directory.0.join(".state.snapshot.tmp.999999.0");
+        let temporary_path = directory.0.join(".state.snapshot.tmp");
         let store = SnapshotStore::new(32);
 
         fs::write(&temporary_path, b"incomplete previous write").expect("create stale file");
@@ -526,10 +551,78 @@ mod tests {
             .expect("write current snapshot");
 
         assert_eq!(store.read(&path).expect("read snapshot"), b"current");
-        assert_eq!(
-            fs::read(&temporary_path).unwrap(),
-            b"incomplete previous write"
-        );
+        assert!(!temporary_path.exists());
+        assert!(directory.0.join(".state.snapshot.lock").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn repeated_interrupted_writers_leave_one_reclaimable_temporary_file() {
+        let directory = TestDirectory::new("interrupted-writers");
+        let path = directory.snapshot();
+        let temporary_path = directory.0.join(".state.snapshot.tmp");
+        let ready_path = directory.0.join(".interrupted-writer-ready");
+
+        for _ in 0..3 {
+            run_and_kill_interrupted_writer(&path, &ready_path);
+            assert!(temporary_path.exists());
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+        }
+
+        SnapshotStore::new(32)
+            .write(&path, b"recovered")
+            .expect("reclaim interrupted write");
+
+        assert!(!temporary_path.exists());
+        assert_eq!(SnapshotStore::new(32).read(&path).unwrap(), b"recovered");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper invoked by the interrupted-writer test"]
+    fn interrupted_snapshot_writer_process() {
+        let Some(path) = std::env::var_os(INTERRUPTED_WRITER_PATH) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let ready_path = PathBuf::from(std::env::var_os(INTERRUPTED_WRITER_READY).unwrap());
+        let (_, temporary_path, lock_path) = sibling_write_paths(&path).unwrap();
+        let _writer_lock = acquire_writer_lock(&lock_path).unwrap();
+        fs::write(temporary_path, vec![0xaa; 1024 * 1024]).unwrap();
+        fs::write(ready_path, b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    fn run_and_kill_interrupted_writer(path: &Path, ready_path: &Path) {
+        let _ = fs::remove_file(ready_path);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("snapshot::tests::interrupted_snapshot_writer_process")
+            .arg("--nocapture")
+            .env(INTERRUPTED_WRITER_PATH, path)
+            .env(INTERRUPTED_WRITER_READY, ready_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start interrupted writer");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready_path.exists() {
+            if child.try_wait().unwrap().is_some() {
+                panic!("interrupted writer exited before creating its temporary file");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("interrupted writer did not create its temporary file");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        child.kill().expect("kill interrupted writer");
+        child.wait().expect("reap interrupted writer");
+        fs::remove_file(ready_path).expect("remove interrupted writer signal");
     }
 
     #[test]
