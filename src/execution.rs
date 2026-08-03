@@ -14,7 +14,7 @@ use crate::{
 pub enum InsertExecutionError {
     /// The statement names a table other than the one supplied for execution.
     UnknownTable { name: String },
-    /// The destination table rejected the value.
+    /// The destination table rejected the values.
     Insert(InsertError),
 }
 
@@ -22,7 +22,7 @@ impl fmt::Display for InsertExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
-            Self::Insert(error) => write!(formatter, "could not insert row: {error}"),
+            Self::Insert(error) => write!(formatter, "could not insert rows: {error}"),
         }
     }
 }
@@ -82,9 +82,9 @@ impl From<ScanError> for SelectExecutionError {
 ///
 /// `expected_table_name` is compared exactly with the identifier retained by
 /// the parser, including ASCII case. A mismatch is reported as an unknown
-/// table without consulting or mutating `table`. On a match, storage
-/// nullability and row-cap errors are preserved in [`InsertExecutionError`]
-/// and also leave the table unchanged.
+/// table without consulting or mutating `table`. On a match, all statement
+/// values are appended atomically. Storage nullability and row-cap errors are
+/// preserved in [`InsertExecutionError`] and leave the table unchanged.
 ///
 /// # Examples
 ///
@@ -94,13 +94,13 @@ impl From<ScanError> for SelectExecutionError {
 /// };
 ///
 /// let statement = parse_insert(
-///     "INSERT INTO readings VALUES (7)",
+///     "INSERT INTO readings VALUES (7), (8)",
 ///     ParseLimits::default(),
 /// )?;
-/// let mut table = Int64Table::new(Schema::int64("value", false), 1);
+/// let mut table = Int64Table::new(Schema::int64("value", false), 2);
 ///
 /// execute_insert("readings", &mut table, &statement)?;
-/// assert_eq!(table.values(), &[Some(7)]);
+/// assert_eq!(table.values(), &[Some(7), Some(8)]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn execute_insert(
@@ -114,7 +114,7 @@ pub fn execute_insert(
         });
     }
 
-    table.append(statement.value()).map_err(Into::into)
+    table.append_batch(statement.values()).map_err(Into::into)
 }
 
 /// Executes one parsed `SELECT` against one explicitly named table.

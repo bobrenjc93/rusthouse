@@ -3,31 +3,46 @@ use rusthouse::{ParseError, ParseLimits, parse_insert};
 #[test]
 fn parses_casing_whitespace_null_and_integer_extremes() {
     let cases = [
-        ("INSERT INTO events VALUES (0)", "events", Some(0)),
+        ("INSERT INTO events VALUES (0)", "events", vec![Some(0)]),
         (
             "  insert\tinto\nMetrics\rvalues\t( +42 )  ",
             "Metrics",
-            Some(42),
+            vec![Some(42)],
         ),
         (
             "InSeRt INTO _hourly VaLuEs (-9223372036854775808)",
             "_hourly",
-            Some(i64::MIN),
+            vec![Some(i64::MIN)],
         ),
         (
             "INSERT INTO maximum VALUES (9223372036854775807)",
             "maximum",
-            Some(i64::MAX),
+            vec![Some(i64::MAX)],
         ),
-        ("insert into nullable values (nUlL)", "nullable", None),
+        ("insert into nullable values (nUlL)", "nullable", vec![None]),
     ];
 
-    for (input, table_name, value) in cases {
+    for (input, table_name, values) in cases {
         let statement = parse_insert(input, ParseLimits::default()).unwrap();
 
         assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
-        assert_eq!(statement.value(), value, "{input:?}");
+        assert_eq!(statement.values(), values, "{input:?}");
     }
+}
+
+#[test]
+fn parses_multiple_rows_in_order_with_separator_whitespace() {
+    let input = concat!(
+        "INSERT INTO readings VALUES ",
+        "(-9223372036854775808),\n(NULL) , ( +0 ),(9223372036854775807)"
+    );
+
+    let statement = parse_insert(input, ParseLimits::default()).unwrap();
+
+    assert_eq!(
+        statement.values(),
+        &[Some(i64::MIN), None, Some(0), Some(i64::MAX)]
+    );
 }
 
 #[test]
@@ -36,7 +51,7 @@ fn accepts_statement_and_identifier_exactly_at_their_limits() {
     let statement = parse_insert(input, ParseLimits::new(input.len(), 8)).unwrap();
 
     assert_eq!(statement.table_name().as_str(), "table123");
-    assert_eq!(statement.value(), Some(-1));
+    assert_eq!(statement.values(), &[Some(-1)]);
 }
 
 #[test]
@@ -67,7 +82,7 @@ fn rejects_inputs_over_resource_limits_with_typed_errors() {
 }
 
 #[test]
-fn rejects_overflow_malformed_literals_and_extra_rows_with_byte_offsets() {
+fn rejects_overflow_and_malformed_literals_with_byte_offsets() {
     let cases = [
         (
             "INSERT INTO t VALUES (9223372036854775808)",
@@ -105,13 +120,45 @@ fn rejects_overflow_malformed_literals_and_extra_rows_with_byte_offsets() {
             "INSERT INTO t VALUES (1, 2)",
             ParseError::InvalidInt64 { offset: 23 },
         ),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(
+            parse_insert(input, ParseLimits::default()),
+            Err(expected),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_later_rows_with_byte_offsets() {
+    let cases = [
         (
-            "INSERT INTO t VALUES (1), (2)",
-            ParseError::ExtraRows { offset: 24 },
+            "INSERT INTO t VALUES (1), ()",
+            ParseError::InvalidInt64 { offset: 27 },
         ),
         (
-            "INSERT INTO t VALUES (1)  ,\n(2)",
-            ParseError::ExtraRows { offset: 26 },
+            "INSERT INTO t VALUES (1), (NULLx)",
+            ParseError::InvalidInt64 { offset: 27 },
+        ),
+        (
+            "INSERT INTO t VALUES (1), (2), (9223372036854775808)",
+            ParseError::Int64Overflow { offset: 32 },
+        ),
+        (
+            "INSERT INTO t VALUES (1), (2",
+            ParseError::UnexpectedInput {
+                offset: 28,
+                expected: "')'",
+            },
+        ),
+        (
+            "INSERT INTO t VALUES (1),",
+            ParseError::UnexpectedInput {
+                offset: 25,
+                expected: "'('",
+            },
         ),
     ];
 
