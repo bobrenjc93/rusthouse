@@ -1,4 +1,4 @@
-use rusthouse::{ParseError, ParseLimits, parse_select};
+use rusthouse::{ParseError, ParseLimits, parse_create_table, parse_select};
 
 #[test]
 fn parses_casing_whitespace_and_optional_semicolon() {
@@ -15,6 +15,15 @@ fn parses_casing_whitespace_and_optional_semicolon() {
         assert_eq!(statement.column_name().as_str(), column_name, "{input:?}");
         assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
     }
+}
+
+#[test]
+fn selects_a_from_identifier_accepted_by_create_table() {
+    let create = parse_create_table("CREATE TABLE t (FROM Int64)", ParseLimits::default()).unwrap();
+    let select = parse_select("SELECT FROM FROM t", ParseLimits::default()).unwrap();
+
+    assert_eq!(select.column_name(), create.column().name());
+    assert_eq!(select.table_name(), create.table_name());
 }
 
 #[test]
