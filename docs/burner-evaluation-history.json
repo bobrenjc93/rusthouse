@@ -122,6 +122,38 @@
         "eval_c88a7f3d": 20,
         "eval_d04acec3": 100
       }
+    },
+    {
+      "key": "base:9d57f8efbb7d21faed8577aacbb9a43578163baf",
+      "commit": "9d57f8efbb7d21faed8577aacbb9a43578163baf",
+      "recordedAt": "2026-08-03T19:14:12.252Z",
+      "label": "base 9d57f8e",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_9fbdfec0": 25,
+        "eval_29146f21": 85,
+        "eval_d43b14a4": 0,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 20,
+        "eval_d04acec3": 100
+      }
+    },
+    {
+      "key": "pr:358",
+      "recordedAt": "2026-08-03T19:14:12.252Z",
+      "label": "PR #358",
+      "kind": "leaf",
+      "prNumber": 358,
+      "title": "Parse one-row Int64 INSERT statements",
+      "scores": {
+        "eval_9fbdfec0": 25,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 0,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 20,
+        "eval_d04acec3": 100
+      }
     }
   ]
 }
