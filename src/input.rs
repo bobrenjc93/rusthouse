@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::{self, Read};
 
-/// Maximum SQL batch size accepted by the CLI.
+/// Maximum SQL batch size accepted by input readers and execution APIs.
 pub const MAX_SQL_INPUT_BYTES: usize = 1024 * 1024;
 
 /// An error encountered while reading a SQL batch.
