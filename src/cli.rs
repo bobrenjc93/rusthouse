@@ -2,9 +2,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 
-use crate::{Catalog, CatalogError, ParseErrorKind, TableError};
+use crate::{Catalog, CatalogError, ParseErrorKind, TableError, write_select_csv_with_names};
 
 /// Maximum number of SQL statements accepted in one process invocation.
 pub const MAX_BATCH_STATEMENTS: usize = 10_000;
@@ -23,6 +23,8 @@ pub const EXIT_LIMIT_ERROR: u8 = 3;
 pub const EXIT_UNSUPPORTED_STATEMENT: u8 = 4;
 /// Exit status used when stdin cannot be read.
 pub const EXIT_INPUT_ERROR: u8 = 5;
+/// Exit status used when a SELECT result cannot be written.
+pub const EXIT_OUTPUT_ERROR: u8 = 6;
 
 /// Counts completed work in a successful stdin batch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,9 +35,11 @@ pub struct BatchSummary {
     pub tables_created: usize,
     /// Number of rows inserted.
     pub rows_inserted: usize,
+    /// Number of SELECT results written completely.
+    pub selects_written: usize,
 }
 
-/// A deterministic failure at the command's stdin boundary.
+/// A deterministic failure at the command's batch I/O boundary.
 #[derive(Debug)]
 pub enum BatchError {
     /// A physical input line exceeded [`MAX_STATEMENT_BYTES`].
@@ -71,7 +75,7 @@ pub enum BatchError {
         /// One-based physical input line.
         line: usize,
     },
-    /// The statement does not begin with `CREATE` or `INSERT`.
+    /// The statement does not begin with `CREATE`, `INSERT`, or `SELECT`.
     UnsupportedStatement {
         /// One-based physical input line.
         line: usize,
@@ -90,6 +94,13 @@ pub enum BatchError {
         /// Underlying input failure.
         source: io::Error,
     },
+    /// Writing a SELECT result failed.
+    OutputWrite {
+        /// One-based physical input line containing the SELECT statement.
+        line: usize,
+        /// Underlying output failure.
+        source: io::Error,
+    },
 }
 
 impl BatchError {
@@ -103,6 +114,7 @@ impl BatchError {
             | Self::ExecutionLimit { .. } => EXIT_LIMIT_ERROR,
             Self::UnsupportedStatement { .. } => EXIT_UNSUPPORTED_STATEMENT,
             Self::InputRead { .. } => EXIT_INPUT_ERROR,
+            Self::OutputWrite { .. } => EXIT_OUTPUT_ERROR,
             Self::InvalidUtf8 { .. } | Self::Execution { .. } => EXIT_EXECUTION_ERROR,
         }
     }
@@ -137,7 +149,7 @@ impl fmt::Display for BatchError {
             }
             Self::UnsupportedStatement { line } => write!(
                 formatter,
-                "unsupported statement on line {line}: expected CREATE TABLE or INSERT INTO"
+                "unsupported statement on line {line}: expected CREATE TABLE, INSERT INTO, or SELECT"
             ),
             Self::Execution { line, source } => {
                 write!(formatter, "execution error on line {line}: {source}")
@@ -146,6 +158,12 @@ impl fmt::Display for BatchError {
                 write!(
                     formatter,
                     "input error on line {line}: could not read stdin"
+                )
+            }
+            Self::OutputWrite { line, .. } => {
+                write!(
+                    formatter,
+                    "output error on line {line}: could not write SELECT result"
                 )
             }
         }
@@ -157,6 +175,7 @@ impl Error for BatchError {
         match self {
             Self::ExecutionLimit { source, .. } | Self::Execution { source, .. } => Some(source),
             Self::InputRead { source, .. } => Some(source),
+            Self::OutputWrite { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -164,12 +183,27 @@ impl Error for BatchError {
 
 /// Executes one SQL statement per nonempty input line in a shared [`Catalog`].
 ///
-/// Only current `CREATE TABLE` and `INSERT INTO ... VALUES` syntax is dispatched.
-/// Processing stops at the first error; statements completed before it remain in
-/// `catalog`. The input buffer never grows beyond one bounded physical line.
+/// Current `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT` syntax is
+/// dispatched. SELECT results are executed but discarded; use
+/// [`execute_batch_with_output`] to stream them. Processing stops at the first
+/// error; statements completed before it remain in `catalog`. The input buffer
+/// never grows beyond one bounded physical line.
 pub fn execute_batch<R: BufRead>(
+    input: R,
+    catalog: &mut Catalog,
+) -> Result<BatchSummary, BatchError> {
+    execute_batch_with_output(input, catalog, &mut io::sink())
+}
+
+/// Executes a bounded stdin batch and streams every SELECT as `CSVWithNames`.
+///
+/// Results are written in statement order without buffering a result table.
+/// A write failure stops the batch immediately and is reported against the
+/// SELECT statement's physical input line.
+pub fn execute_batch_with_output<R: BufRead, W: Write + ?Sized>(
     mut input: R,
     catalog: &mut Catalog,
+    output: &mut W,
 ) -> Result<BatchSummary, BatchError> {
     let mut summary = BatchSummary::default();
     let mut total_bytes = 0;
@@ -231,6 +265,18 @@ pub fn execute_batch<R: BufRead>(
                     .execute_insert(statement)
                     .map_err(|source| execution_error(line_number, source))?;
                 summary.rows_inserted += inserted;
+            }
+            StatementKind::Select => {
+                let result = catalog
+                    .execute_select(statement)
+                    .map_err(|source| execution_error(line_number, source))?;
+                write_select_csv_with_names(&result, output).map_err(|source| {
+                    BatchError::OutputWrite {
+                        line: line_number,
+                        source,
+                    }
+                })?;
+                summary.selects_written += 1;
             }
             StatementKind::Unsupported => {
                 return Err(BatchError::UnsupportedStatement { line: line_number });
@@ -295,6 +341,7 @@ fn strip_line_ending(line: &mut Vec<u8>) {
 enum StatementKind {
     Create,
     Insert,
+    Select,
     Unsupported,
 }
 
@@ -313,6 +360,8 @@ fn statement_kind(statement: &str) -> Option<StatementKind> {
         Some(StatementKind::Create)
     } else if keyword.eq_ignore_ascii_case(b"INSERT") {
         Some(StatementKind::Insert)
+    } else if keyword.eq_ignore_ascii_case(b"SELECT") {
+        Some(StatementKind::Select)
     } else {
         Some(StatementKind::Unsupported)
     }

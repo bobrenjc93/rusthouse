@@ -11,7 +11,7 @@ pub mod storage;
 pub mod table_snapshot;
 
 pub use catalog::{Catalog, CatalogError, CatalogLimits, DEFAULT_MAX_TABLES, SelectResult};
-pub use csv::write_csv_with_names;
+pub use csv::{write_csv_with_names, write_select_csv_with_names};
 pub use reduction::ReductionError;
 pub use scan::{ComparisonOperator, RowSelection, ScanError, SelectionAllocationError};
 pub use sql::{
