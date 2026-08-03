@@ -3,6 +3,7 @@
 pub mod aggregate;
 pub mod catalog;
 pub mod csv;
+pub mod distinct;
 pub mod execution;
 pub mod grouping;
 pub mod join;
@@ -16,6 +17,7 @@ pub use aggregate::{
 };
 pub use catalog::{Catalog, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
+pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
     InsertExecutionError, SelectExecutionError, execute_insert, execute_select,
     execute_select_with_limits,
