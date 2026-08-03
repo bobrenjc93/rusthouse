@@ -17,7 +17,8 @@ pub use grouping::{
 };
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
-    ColumnDefinition, CreateTableStatement, Identifier, ParseError, ParseLimits, parse_create_table,
+    ColumnDefinition, CreateTableStatement, Identifier, InsertStatement, ParseError, ParseLimits,
+    parse_create_table, parse_insert,
 };
 pub use scan::{ComparisonOperator, ScanError, ScanLimits, scan_nullable_i64};
 pub use snapshot::{SnapshotCodec, SnapshotError};

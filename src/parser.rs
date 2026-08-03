@@ -103,6 +103,25 @@ impl CreateTableStatement {
     }
 }
 
+/// The typed syntax tree for a one-row, one-column `INSERT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertStatement {
+    table_name: Identifier,
+    value: Option<i64>,
+}
+
+impl InsertStatement {
+    /// Returns the destination table name.
+    pub fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+
+    /// Returns the statement's only value. `None` represents SQL `NULL`.
+    pub fn value(&self) -> Option<i64> {
+        self.value
+    }
+}
+
 /// An error produced while parsing a bounded SQL statement.
 ///
 /// Offsets and sizes are byte-based, matching Rust string indexing.
@@ -121,6 +140,12 @@ pub enum ParseError {
         offset: usize,
         expected: &'static str,
     },
+    /// A value token is not `NULL` or a decimal `Int64` literal.
+    InvalidInt64 { offset: usize },
+    /// A syntactically valid decimal integer is outside the `Int64` range.
+    Int64Overflow { offset: usize },
+    /// Another row follows the single row supported by the grammar.
+    ExtraRows { offset: usize },
     /// Non-whitespace input remained after the closing parenthesis.
     TrailingInput { offset: usize },
 }
@@ -142,6 +167,18 @@ impl fmt::Display for ParseError {
             ),
             Self::UnexpectedInput { offset, expected } => {
                 write!(formatter, "expected {expected} at byte {offset}")
+            }
+            Self::InvalidInt64 { offset } => {
+                write!(formatter, "invalid Int64 literal at byte {offset}")
+            }
+            Self::Int64Overflow { offset } => {
+                write!(formatter, "Int64 literal at byte {offset} is out of range")
+            }
+            Self::ExtraRows { offset } => {
+                write!(
+                    formatter,
+                    "additional INSERT row at byte {offset} is not supported"
+                )
             }
             Self::TrailingInput { offset } => {
                 write!(formatter, "unexpected trailing input at byte {offset}")
@@ -187,6 +224,46 @@ pub fn parse_create_table(
     input: &str,
     limits: ParseLimits,
 ) -> Result<CreateTableStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_create_table()
+}
+
+/// Parses one `INSERT INTO` statement containing one `Int64` or `NULL` value.
+///
+/// Keywords are ASCII case-insensitive. The table identifier follows the same
+/// rules and bounds as [`parse_create_table`]. Decimal values may have a
+/// leading `+` or `-`. The complete accepted grammar is:
+///
+/// ```text
+/// INSERT INTO identifier VALUES (Int64 | NULL)
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted. Batches, multiple
+/// values, and semicolon terminators are outside this deliberately narrow
+/// grammar. Statement limits and all reported offsets are measured in bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, parse_insert};
+///
+/// let statement = parse_insert(
+///     "INSERT INTO events VALUES (-7)",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// assert_eq!(statement.value(), Some(-7));
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_insert()
+}
+
+fn validate_statement_length(input: &str, limits: ParseLimits) -> Result<(), ParseError> {
     if input.len() > limits.max_statement_bytes {
         return Err(ParseError::StatementTooLong {
             bytes: input.len(),
@@ -194,7 +271,7 @@ pub fn parse_create_table(
         });
     }
 
-    Parser::new(input, limits.max_identifier_bytes).parse()
+    Ok(())
 }
 
 struct Parser<'input> {
@@ -214,7 +291,7 @@ impl<'input> Parser<'input> {
         }
     }
 
-    fn parse(mut self) -> Result<CreateTableStatement, ParseError> {
+    fn parse_create_table(mut self) -> Result<CreateTableStatement, ParseError> {
         self.skip_whitespace();
         self.expect_keyword("CREATE")?;
         self.require_whitespace("whitespace after CREATE")?;
@@ -248,6 +325,72 @@ impl<'input> Parser<'input> {
                 nullable,
             },
         })
+    }
+
+    fn parse_insert(mut self) -> Result<InsertStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("INSERT")?;
+        self.require_whitespace("whitespace after INSERT")?;
+        self.expect_keyword("INTO")?;
+        self.require_whitespace("whitespace after INTO")?;
+        let table_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before VALUES")?;
+        self.expect_keyword("VALUES")?;
+        self.skip_whitespace();
+        self.expect_byte(b'(', "'('")?;
+        self.skip_whitespace();
+        let value = self.parse_int64_value()?;
+        self.skip_whitespace();
+
+        match self.peek() {
+            Some(b')') => self.position += 1,
+            Some(_) => {
+                return Err(ParseError::InvalidInt64 {
+                    offset: self.position,
+                });
+            }
+            None => return Err(self.unexpected("')'")),
+        }
+        self.skip_whitespace();
+
+        if self.peek() == Some(b',') {
+            return Err(ParseError::ExtraRows {
+                offset: self.position,
+            });
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(InsertStatement { table_name, value })
+    }
+
+    fn parse_int64_value(&mut self) -> Result<Option<i64>, ParseError> {
+        let start = self.position;
+        if self.keyword_at_position("NULL") {
+            self.expect_keyword("NULL")?;
+            return Ok(None);
+        }
+
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.position += 1;
+        }
+        let digits_start = self.position;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.position += 1;
+        }
+
+        if self.position == digits_start {
+            return Err(ParseError::InvalidInt64 { offset: start });
+        }
+
+        let literal = &self.input[start..self.position];
+        literal
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| ParseError::Int64Overflow { offset: start })
     }
 
     fn parse_nullability(&mut self) -> Result<bool, ParseError> {
