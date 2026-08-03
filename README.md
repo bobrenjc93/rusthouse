@@ -27,6 +27,14 @@ the persistence corruption boundary without yet choosing catalog serialization
 or filesystem replacement. The exact version 1 layout is documented in
 [docs/snapshot-format.md](docs/snapshot-format.md).
 
+## CSV ingestion
+
+`ingest_csv_with_names` atomically appends a bounded one-column
+`CSVWithNames` subset to an `Int64Table`. The header must exactly match the
+schema column, and each LF- or CRLF-delimited record must be an unquoted decimal
+`Int64` or `NULL`. Callers supply byte and row limits; format, limit,
+nullability, or table-cap failures leave the table unchanged.
+
 ## Development model
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
