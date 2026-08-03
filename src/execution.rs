@@ -1,9 +1,13 @@
 //! Execution boundaries connecting parsed SQL to storage.
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 
-use crate::{InsertError, InsertStatement, Int64Table, SelectStatement};
+use crate::{
+    ComparisonOperator, InsertError, InsertStatement, Int64Table, ScanError, ScanLimits,
+    SelectStatement, scan_nullable_i64,
+};
 
 /// An error produced while executing a parsed [`InsertStatement`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +49,8 @@ pub enum SelectExecutionError {
     UnknownTable { name: String },
     /// The statement names a column other than the table's only column.
     UnknownColumn { name: String },
+    /// The bounded equality scan rejected the input or result size.
+    Scan(ScanError),
 }
 
 impl fmt::Display for SelectExecutionError {
@@ -52,11 +58,25 @@ impl fmt::Display for SelectExecutionError {
         match self {
             Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
             Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
+            Self::Scan(error) => write!(formatter, "could not scan rows: {error}"),
         }
     }
 }
 
-impl Error for SelectExecutionError {}
+impl Error for SelectExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scan(error) => Some(error),
+            Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
+        }
+    }
+}
+
+impl From<ScanError> for SelectExecutionError {
+    fn from(error: ScanError) -> Self {
+        Self::Scan(error)
+    }
+}
 
 /// Executes one parsed `INSERT` against one explicitly named table.
 ///
@@ -101,8 +121,11 @@ pub fn execute_insert(
 ///
 /// `expected_table_name` and the table's column name are compared exactly
 /// with the identifiers retained by the parser, including ASCII case. The
-/// returned slice borrows the table's existing column storage without copying
-/// its values. An optional `LIMIT` returns a prefix of that same storage.
+/// An unfiltered result borrows the table's existing column storage without
+/// copying its values. A `WHERE` equality predicate uses a scan bounded to the
+/// table's current row count and owns the selected values. Use
+/// [`execute_select_with_limits`] when the caller needs stricter scan bounds.
+/// An optional `LIMIT` is applied after filtering.
 ///
 /// # Examples
 ///
@@ -119,15 +142,35 @@ pub fn execute_insert(
 /// table.append_batch(&[Some(7), None])?;
 ///
 /// let values = execute_select("readings", &table, &statement)?;
-/// assert_eq!(values, &[Some(7), None]);
-/// assert!(std::ptr::eq(values, table.values()));
+/// assert_eq!(values.as_ref(), &[Some(7), None]);
+/// assert!(matches!(values, std::borrow::Cow::Borrowed(_)));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn execute_select<'table>(
     expected_table_name: &str,
     table: &'table Int64Table,
     statement: &SelectStatement,
-) -> Result<&'table [Option<i64>], SelectExecutionError> {
+) -> Result<Cow<'table, [Option<i64>]>, SelectExecutionError> {
+    let rows = table.values().len();
+    execute_select_with_limits(
+        expected_table_name,
+        table,
+        statement,
+        ScanLimits::new(rows, rows),
+    )
+}
+
+/// Executes one parsed `SELECT` with explicit equality-scan resource bounds.
+///
+/// Plain projections do not scan and therefore do not consume these bounds.
+/// Filtered projections preserve source-row order and exclude `NULL` because
+/// they delegate predicate evaluation to [`scan_nullable_i64`].
+pub fn execute_select_with_limits<'table>(
+    expected_table_name: &str,
+    table: &'table Int64Table,
+    statement: &SelectStatement,
+    scan_limits: ScanLimits,
+) -> Result<Cow<'table, [Option<i64>]>, SelectExecutionError> {
     if statement.table_name().as_str() != expected_table_name {
         return Err(SelectExecutionError::UnknownTable {
             name: statement.table_name().as_str().to_owned(),
@@ -141,6 +184,29 @@ pub fn execute_select<'table>(
     }
 
     let values = table.values();
-    let row_count = statement.limit().unwrap_or(values.len()).min(values.len());
-    Ok(&values[..row_count])
+    let limit = statement.limit().unwrap_or(values.len());
+
+    let Some(predicate) = statement.predicate() else {
+        return Ok(Cow::Borrowed(&values[..limit.min(values.len())]));
+    };
+
+    if predicate.column_name().as_str() != table.schema().column().name() {
+        return Err(SelectExecutionError::UnknownColumn {
+            name: predicate.column_name().as_str().to_owned(),
+        });
+    }
+
+    let matching_rows = scan_nullable_i64(
+        values,
+        ComparisonOperator::Eq,
+        predicate.value(),
+        scan_limits,
+    )?;
+    let selected = matching_rows
+        .into_iter()
+        .take(limit)
+        .map(|row_index| values[row_index])
+        .collect();
+
+    Ok(Cow::Owned(selected))
 }

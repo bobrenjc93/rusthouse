@@ -122,11 +122,31 @@ impl InsertStatement {
     }
 }
 
+/// A column-to-`Int64` equality predicate in a `WHERE` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqualityPredicate {
+    column_name: Identifier,
+    value: i64,
+}
+
+impl EqualityPredicate {
+    /// Returns the compared column name.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns the non-`NULL` `Int64` comparison value.
+    pub const fn value(&self) -> i64 {
+        self.value
+    }
+}
+
 /// The typed syntax tree for a one-column `SELECT` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStatement {
     column_name: Identifier,
     table_name: Identifier,
+    predicate: Option<EqualityPredicate>,
     limit: Option<usize>,
 }
 
@@ -139,6 +159,11 @@ impl SelectStatement {
     /// Returns the source table name.
     pub fn table_name(&self) -> &Identifier {
         &self.table_name
+    }
+
+    /// Returns the optional `WHERE` equality predicate.
+    pub fn predicate(&self) -> Option<&EqualityPredicate> {
+        self.predicate.as_ref()
     }
 
     /// Returns the maximum number of rows requested by the statement.
@@ -305,13 +330,16 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 /// accepted grammar is:
 ///
 /// ```text
-/// SELECT identifier FROM identifier [LIMIT unsigned-integer] [;]
+/// SELECT identifier FROM identifier
+///     [WHERE identifier = Int64]
+///     [LIMIT unsigned-integer] [;]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
-/// before or after the optional `LIMIT` and semicolon. `LIMIT` accepts zero and
-/// must fit in `usize`. Statement limits and all reported offsets are measured
-/// in bytes.
+/// around the equality operator and before or after the optional `LIMIT` and
+/// semicolon. The equality value is a signed decimal `Int64`; `LIMIT` accepts
+/// zero and must fit in `usize`. Statement limits and all reported offsets are
+/// measured in bytes.
 ///
 /// # Examples
 ///
@@ -452,6 +480,20 @@ impl<'input> Parser<'input> {
         let table_name = self.parse_identifier()?;
         self.skip_whitespace();
 
+        let predicate = if self.keyword_at_position("WHERE") {
+            self.expect_keyword("WHERE")?;
+            self.require_whitespace("whitespace after WHERE")?;
+            let column_name = self.parse_identifier()?;
+            self.skip_whitespace();
+            self.expect_byte(b'=', "'='")?;
+            self.skip_whitespace();
+            let value = self.parse_where_int64()?;
+            self.skip_whitespace();
+            Some(EqualityPredicate { column_name, value })
+        } else {
+            None
+        };
+
         let limit = if self.keyword_at_position("LIMIT") {
             self.expect_keyword("LIMIT")?;
             self.require_whitespace("whitespace after LIMIT")?;
@@ -475,8 +517,38 @@ impl<'input> Parser<'input> {
         Ok(SelectStatement {
             column_name,
             table_name,
+            predicate,
             limit,
         })
+    }
+
+    fn parse_where_int64(&mut self) -> Result<i64, ParseError> {
+        let start = self.position;
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.position += 1;
+        }
+        let digits_start = self.position;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.position += 1;
+        }
+
+        if self.position == digits_start {
+            return Err(ParseError::InvalidInt64 { offset: start });
+        }
+
+        let end = self.position;
+        if self
+            .peek()
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && byte != b';')
+        {
+            return Err(ParseError::InvalidInt64 {
+                offset: self.position,
+            });
+        }
+
+        self.input[start..end]
+            .parse()
+            .map_err(|_| ParseError::Int64Overflow { offset: start })
     }
 
     fn parse_limit(&mut self) -> Result<usize, ParseError> {
