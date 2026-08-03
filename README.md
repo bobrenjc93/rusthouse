@@ -47,3 +47,11 @@ Statements in a batch are separated by semicolons. CSV is selected with
 clauses on standard error with a nonzero exit status.
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->
