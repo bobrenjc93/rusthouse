@@ -28,6 +28,22 @@ cargo test
 cargo run -- --help
 ```
 
+## Batch CLI
+
+The command reads UTF-8 SQL from stdin, one statement per nonempty line. The
+lines share one in-memory catalog for the life of the process:
+
+```bash
+printf '%s\n' \
+  'CREATE TABLE events (id Int64, active Bool)' \
+  'INSERT INTO events VALUES (1, true), (2, false)' \
+  | cargo run --quiet
+```
+
+The current CLI accepts `CREATE TABLE` and `INSERT INTO ... VALUES` only and is
+silent on success. It does not execute `SELECT` or format query results yet.
+Run `cargo run -- --help` for the input limits and stable exit-code contract.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
 
 <!-- burner-progress:start -->
