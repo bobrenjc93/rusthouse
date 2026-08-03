@@ -47,6 +47,25 @@ CSVWithNames. `--format csv` is accepted for ClickHouse-style invocations and
 is also the default. Run `cargo run -- --help` for the input limits and stable
 exit-code contract.
 
+One table can be carried across invocations with a bounded snapshot. The load
+happens before stdin is processed, and the atomic save happens only after every
+statement and output write in the batch succeeds:
+
+```bash
+printf '%s\n' \
+  'CREATE TABLE events (id Int64)' \
+  'INSERT INTO events VALUES (1), (2)' \
+  | cargo run --quiet -- --save-table events=events.snapshot
+
+printf '%s\n' 'SELECT id FROM restored ORDER BY id' \
+  | cargo run --quiet -- --load-table restored=events.snapshot
+```
+
+Each option may be supplied at most once. The snapshot payload limit is 64 MiB;
+these options intentionally do not persist manifests, discovery metadata, a
+whole catalog, or a write-ahead log. Snapshot file names matching `.*.tmp` or
+`.*.lock` are reserved for atomic-writer sidecars.
+
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
 
 <!-- burner-progress:start -->
