@@ -53,7 +53,7 @@ pub fn write_csv_with_names<W: Write + ?Sized>(table: &Table, writer: &mut W) ->
 /// Writes a borrowed [`SelectResult`] in ClickHouse's `CSVWithNames` shape.
 ///
 /// Projected fields are emitted in statement order, including duplicate
-/// projections. Only selected rows are written, in source table order. The
+/// projections. Only selected rows are written, in result order. The
 /// source columns and their values are borrowed directly; this function does
 /// not build a result table or copy selected values.
 ///

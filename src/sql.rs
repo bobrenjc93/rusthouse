@@ -55,12 +55,28 @@ pub struct ComparisonPredicate {
     pub value: Value,
 }
 
+/// The direction applied to one `ORDER BY` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDirection {
+    Ascending,
+    Descending,
+}
+
+/// One column and direction from an `ORDER BY` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderByClause {
+    pub column: String,
+    pub direction: OrderDirection,
+}
+
 /// The syntax tree produced for a bounded `SELECT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub projections: SelectProjection,
     pub table: String,
     pub predicate: Option<ComparisonPredicate>,
+    pub order_by: Option<OrderByClause>,
+    pub limit: Option<usize>,
 }
 
 /// Resource limits applied before and during parsing.
@@ -218,6 +234,13 @@ pub enum ParseErrorKind {
     InvalidComparisonOperator {
         operator: String,
     },
+    ExpectedLimit,
+    InvalidLimit {
+        literal: String,
+    },
+    LimitOutOfRange {
+        literal: String,
+    },
     ExpectedValue,
     InvalidLiteral {
         literal: String,
@@ -284,6 +307,19 @@ impl fmt::Display for ParseErrorKind {
             }
             Self::InvalidComparisonOperator { operator } => {
                 write!(formatter, "invalid comparison operator {operator:?}")
+            }
+            Self::ExpectedLimit => formatter.write_str("expected a nonnegative integer limit"),
+            Self::InvalidLimit { literal } => {
+                write!(
+                    formatter,
+                    "invalid limit {literal:?}; expected a nonnegative integer"
+                )
+            }
+            Self::LimitOutOfRange { literal } => {
+                write!(
+                    formatter,
+                    "limit {literal:?} is outside the supported range"
+                )
             }
             Self::ExpectedValue => formatter.write_str("expected a literal value"),
             Self::InvalidLiteral { literal } => {
@@ -396,9 +432,10 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 ///
 /// Projections are either `*` or a non-empty list of unquoted column names.
 /// The statement reads one table and may contain one `WHERE` comparison between
-/// a column and an `Int64`, `Float64`, `Bool`, or `String` literal. Aliases,
-/// expressions, aggregates, compound predicates, and result modifiers are
-/// outside this intentionally narrow syntax boundary.
+/// a column and an `Int64`, `Float64`, `Bool`, or `String` literal. That may be
+/// followed by one `ORDER BY column [ASC|DESC]` clause and a nonnegative integer
+/// `LIMIT`. Aliases, expressions, aggregates, compound predicates, and other
+/// result modifiers are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -542,11 +579,41 @@ impl<'a> Parser<'a> {
             None
         };
 
+        self.skip_whitespace();
+        let order_by = if self.peek_token_is("ORDER") {
+            self.parse_keyword("ORDER")?;
+            self.parse_keyword("BY")?;
+            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            let direction = if self.peek_token_is("ASC") {
+                self.parse_keyword("ASC")?;
+                OrderDirection::Ascending
+            } else if self.peek_token_is("DESC") {
+                self.parse_keyword("DESC")?;
+                OrderDirection::Descending
+            } else {
+                OrderDirection::Ascending
+            };
+            Some(OrderByClause { column, direction })
+        } else {
+            None
+        };
+
+        self.skip_whitespace();
+        let limit = if self.peek_token_is("LIMIT") {
+            self.parse_keyword("LIMIT")?;
+            Some(self.parse_limit()?)
+        } else {
+            None
+        };
+
         self.finish_statement()?;
         Ok(SelectStatement {
             projections,
             table,
             predicate,
+            order_by,
+            limit,
         })
     }
 
@@ -667,6 +734,33 @@ impl<'a> Parser<'a> {
                 },
             }),
         }
+    }
+
+    fn parse_limit(&mut self) -> Result<usize, ParseError> {
+        self.skip_whitespace();
+        let start = self.position;
+        let literal = self.take_token();
+        if literal.is_empty() {
+            return Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::ExpectedLimit,
+            });
+        }
+        if !literal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::InvalidLimit {
+                    literal: literal.to_owned(),
+                },
+            });
+        }
+
+        literal.parse().map_err(|_| ParseError {
+            position: start,
+            kind: ParseErrorKind::LimitOutOfRange {
+                literal: literal.to_owned(),
+            },
+        })
     }
 
     fn parse_row(&mut self, limits: InsertParseLimits) -> Result<Vec<Value>, ParseError> {

@@ -181,6 +181,19 @@ fn select_results_stream_projected_columns_and_selected_rows() {
         )
         .as_bytes()
     );
+
+    let ordered = catalog
+        .execute_select("SELECT label, id FROM events ORDER BY score DESC LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        render_select(&ordered),
+        concat!(
+            "\"label\",\"id\"\n",
+            "\"a \"\"quoted\"\" value\",3\n",
+            "\"second\",2\n",
+        )
+        .as_bytes()
+    );
 }
 
 #[test]
