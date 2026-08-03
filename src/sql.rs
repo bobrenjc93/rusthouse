@@ -100,7 +100,9 @@ pub struct OrderByClause {
 pub struct SelectStatement {
     pub projections: SelectProjection,
     pub table: String,
-    pub predicate: Option<ComparisonPredicate>,
+    /// Disjunctive groups of comparisons. Comparisons within each group are
+    /// joined by `AND`; groups are joined by `OR`.
+    pub predicate_groups: Vec<Vec<ComparisonPredicate>>,
     pub order_by: Option<OrderByClause>,
     pub limit: Option<usize>,
 }
@@ -176,17 +178,37 @@ impl Default for InsertParseLimits {
 pub struct SelectParseLimits {
     pub max_input_bytes: usize,
     pub max_projections: usize,
+    pub max_predicates: usize,
+    pub max_predicate_groups: usize,
 }
 
 impl SelectParseLimits {
     pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
     pub const DEFAULT_MAX_PROJECTIONS: usize = 1024;
+    pub const DEFAULT_MAX_PREDICATES: usize = 1024;
+    pub const DEFAULT_MAX_PREDICATE_GROUPS: usize = 1024;
 
     pub const fn new(max_input_bytes: usize, max_projections: usize) -> Self {
         Self {
             max_input_bytes,
             max_projections,
+            max_predicates: Self::DEFAULT_MAX_PREDICATES,
+            max_predicate_groups: Self::DEFAULT_MAX_PREDICATE_GROUPS,
         }
+    }
+
+    /// Replaces the maximum total comparisons in a `WHERE` clause.
+    #[must_use]
+    pub const fn with_max_predicates(mut self, max_predicates: usize) -> Self {
+        self.max_predicates = max_predicates;
+        self
+    }
+
+    /// Replaces the maximum number of `OR` groups in a `WHERE` clause.
+    #[must_use]
+    pub const fn with_max_predicate_groups(mut self, max_predicate_groups: usize) -> Self {
+        self.max_predicate_groups = max_predicate_groups;
+        self
     }
 }
 
@@ -255,6 +277,12 @@ pub enum ParseErrorKind {
     ExpectedProjection,
     MixedAggregateProjection,
     TooManyProjections {
+        limit: usize,
+    },
+    TooManyPredicates {
+        limit: usize,
+    },
+    TooManyPredicateGroups {
         limit: usize,
     },
     ExpectedComparisonOperator,
@@ -333,6 +361,12 @@ impl fmt::Display for ParseErrorKind {
             }
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
+            }
+            Self::TooManyPredicates { limit } => {
+                write!(formatter, "predicate count exceeds limit of {limit}")
+            }
+            Self::TooManyPredicateGroups { limit } => {
+                write!(formatter, "predicate group count exceeds limit of {limit}")
             }
             Self::ExpectedComparisonOperator => {
                 formatter.write_str("expected a comparison operator")
@@ -465,12 +499,14 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 /// Projections are `*`, a non-empty list of unquoted column names, or a
 /// non-empty aggregate-only list containing `COUNT(*)`, `SUM(column)`,
 /// `AVG(column)`, `MIN(column)`, and `MAX(column)`. Every aggregate may have an
-/// `AS` alias. The statement reads one table and may contain one `WHERE`
-/// comparison between a column and an `Int64`, `Float64`, `Bool`, or `String`
-/// literal. That may be followed by one `ORDER BY column [ASC|DESC]` clause and
-/// a nonnegative integer `LIMIT`. Raw-column mixing, other expressions,
-/// compound predicates, and other result modifiers are outside this
-/// intentionally narrow syntax boundary.
+/// `AS` alias. The statement reads one table and may contain `WHERE` groups
+/// joined by `OR`, each containing
+/// column-to-literal comparisons joined by `AND`. One optional pair of
+/// parentheses may wrap each whole group. Literals may be `Int64`, `Float64`,
+/// `Bool`, or `String`. The clause may be followed by one `ORDER BY column
+/// [ASC|DESC]` clause and a nonnegative integer `LIMIT`. `NOT`, nested
+/// expressions, raw-column/aggregate mixing, and other predicate or result
+/// forms are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -607,11 +643,15 @@ impl<'a> Parser<'a> {
         let (table, _) = self.parse_identifier(IdentifierContext::Table)?;
 
         self.skip_whitespace();
-        let predicate = if self.peek_token_is("WHERE") {
+        let predicate_groups = if self.peek_token_is("WHERE") {
             self.parse_keyword("WHERE")?;
-            Some(self.parse_comparison(limits.max_input_bytes)?)
+            self.parse_predicate_groups(
+                limits.max_predicates,
+                limits.max_predicate_groups,
+                limits.max_input_bytes,
+            )?
         } else {
-            None
+            Vec::new()
         };
 
         self.skip_whitespace();
@@ -646,7 +686,7 @@ impl<'a> Parser<'a> {
         Ok(SelectStatement {
             projections,
             table,
-            predicate,
+            predicate_groups,
             order_by,
             limit,
         })
@@ -827,6 +867,61 @@ impl<'a> Parser<'a> {
             operator,
             value,
         })
+    }
+
+    fn parse_predicate_groups(
+        &mut self,
+        max_predicates: usize,
+        max_predicate_groups: usize,
+        max_string_bytes: usize,
+    ) -> Result<Vec<Vec<ComparisonPredicate>>, ParseError> {
+        let mut groups = Vec::new();
+        let mut predicate_count = 0;
+
+        loop {
+            self.skip_whitespace();
+            if groups.len() == max_predicate_groups {
+                return Err(self.error(ParseErrorKind::TooManyPredicateGroups {
+                    limit: max_predicate_groups,
+                }));
+            }
+
+            let parenthesized = self.peek() == Some(b'(');
+            if parenthesized {
+                self.position += 1;
+            }
+
+            let mut group = Vec::new();
+            loop {
+                self.skip_whitespace();
+                if predicate_count == max_predicates {
+                    return Err(self.error(ParseErrorKind::TooManyPredicates {
+                        limit: max_predicates,
+                    }));
+                }
+                group.push(self.parse_comparison(max_string_bytes)?);
+                predicate_count += 1;
+
+                self.skip_whitespace();
+                if !self.peek_token_is("AND") {
+                    break;
+                }
+                self.parse_keyword("AND")?;
+            }
+
+            if parenthesized {
+                self.expect_byte(b')', "')'")?;
+            }
+            groups.push(group);
+
+            self.skip_whitespace();
+            if !self.peek_token_is("OR") {
+                break;
+            }
+            self.parse_keyword("OR")?;
+        }
+
+        Ok(groups)
     }
 
     fn parse_comparison_column(&mut self) -> Result<String, ParseError> {
