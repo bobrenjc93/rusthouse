@@ -20,7 +20,10 @@ pub use parser::{
     ColumnDefinition, CreateTableStatement, Identifier, InsertStatement, ParseError, ParseLimits,
     parse_create_table, parse_insert,
 };
-pub use scan::{ComparisonOperator, ScanError, ScanLimits, scan_nullable_i64};
+pub use scan::{
+    ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,
+    scan_nullable_i64_nullness,
+};
 pub use snapshot::{SnapshotCodec, SnapshotError};
 mod storage;
 
