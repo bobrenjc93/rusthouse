@@ -1,11 +1,14 @@
 //! Versioned, bounded envelopes for snapshot payloads.
 //!
-//! This module defines only the byte envelope. It does not choose a catalog
-//! serialization or perform filesystem I/O. See `docs/snapshot-format.md` for
-//! the stable binary layout.
+//! This module defines the byte envelope and bounded loading from one file. It
+//! does not choose a catalog serialization or persistence strategy. See
+//! `docs/snapshot-format.md` for the stable binary layout.
 
 use std::error::Error;
 use std::fmt;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 /// Magic bytes at the start of every RustHouse snapshot envelope.
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"RHOUSESN";
@@ -90,6 +93,61 @@ impl fmt::Display for SnapshotError {
 
 impl Error for SnapshotError {}
 
+/// An error produced while opening, reading, or validating a snapshot file.
+#[derive(Debug)]
+pub enum SnapshotLoadError {
+    /// The snapshot path could not be opened for reading.
+    Open { path: PathBuf, source: io::Error },
+    /// An error occurred while reading an opened snapshot file.
+    Read { path: PathBuf, source: io::Error },
+    /// The file contains more bytes than the codec can accept.
+    FileTooLarge { max_envelope_len: usize },
+    /// The bounded file contents failed envelope validation.
+    Validation(SnapshotError),
+}
+
+impl fmt::Display for SnapshotLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { path, source } => {
+                write!(
+                    formatter,
+                    "failed to open snapshot {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Read { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read snapshot {}: {source}",
+                    path.display()
+                )
+            }
+            Self::FileTooLarge { max_envelope_len } => write!(
+                formatter,
+                "snapshot file exceeds the maximum envelope size of {max_envelope_len} bytes"
+            ),
+            Self::Validation(source) => write!(formatter, "invalid snapshot envelope: {source}"),
+        }
+    }
+}
+
+impl Error for SnapshotLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open { source, .. } | Self::Read { source, .. } => Some(source),
+            Self::Validation(source) => Some(source),
+            Self::FileTooLarge { .. } => None,
+        }
+    }
+}
+
+impl From<SnapshotError> for SnapshotLoadError {
+    fn from(error: SnapshotError) -> Self {
+        Self::Validation(error)
+    }
+}
+
 /// Encodes and decodes snapshot envelopes up to a fixed payload size.
 ///
 /// Decoding returns a slice borrowed from the input and does not allocate.
@@ -122,6 +180,11 @@ impl SnapshotCodec {
     /// Returns the maximum payload size accepted by this codec.
     pub const fn max_payload_len(self) -> usize {
         self.max_payload_len
+    }
+
+    /// Returns the largest envelope that can be accepted on this platform.
+    pub const fn max_envelope_len(self) -> usize {
+        SNAPSHOT_HEADER_LEN.saturating_add(self.max_payload_len)
     }
 
     /// Wraps a payload in a version 1 snapshot envelope.
@@ -218,6 +281,40 @@ impl SnapshotCodec {
         }
 
         Ok(payload)
+    }
+
+    /// Opens, boundedly reads, and validates one snapshot file.
+    ///
+    /// At most [`SnapshotCodec::max_envelope_len`] plus one detection byte is
+    /// read from the file. The extra byte distinguishes an oversized file from
+    /// an envelope that exactly reaches the configured limit. On success, the
+    /// owned payload is returned without the envelope header.
+    pub fn load(self, path: impl AsRef<Path>) -> Result<Vec<u8>, SnapshotLoadError> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|source| SnapshotLoadError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let max_envelope_len = self.max_envelope_len();
+        let read_limit = max_envelope_len.saturating_add(1);
+        let read_limit = u64::try_from(read_limit).unwrap_or(u64::MAX);
+        let mut envelope = Vec::new();
+
+        file.take(read_limit)
+            .read_to_end(&mut envelope)
+            .map_err(|source| SnapshotLoadError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        if envelope.len() > max_envelope_len {
+            return Err(SnapshotLoadError::FileTooLarge { max_envelope_len });
+        }
+
+        let payload_len = self.decode(&envelope)?.len();
+        envelope.copy_within(SNAPSHOT_HEADER_LEN.., 0);
+        envelope.truncate(payload_len);
+        Ok(envelope)
     }
 }
 

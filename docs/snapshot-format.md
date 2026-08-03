@@ -35,3 +35,11 @@ payload above that bound. Decoding validates, in order:
 Short input, trailing input, incompatible formats, unsupported versions,
 oversized declarations, and checksum mismatches produce distinct typed errors.
 The decoder borrows the payload from the input and performs no allocation.
+
+## Bounded file loading
+
+`SnapshotCodec::load` opens and reads one path, validates the envelope, and
+returns its owned payload. It reads at most the maximum envelope size (the
+22-byte header plus the configured payload limit) and one extra byte used only
+to detect an oversized file. Open failures, read failures, oversized files, and
+envelope validation failures are distinct `SnapshotLoadError` variants.
