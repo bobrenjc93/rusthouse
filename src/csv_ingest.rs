@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Read};
 use std::mem;
+use std::str;
 
 /// Default maximum size of one CSV import: 64 MiB.
 pub const DEFAULT_CSV_INPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -22,9 +23,9 @@ pub const DEFAULT_CSV_ROWS: usize = 1_000_000;
 pub const DEFAULT_CSV_DECODED_BYTES: usize = 64 * 1024 * 1024;
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
-// `read_record` keeps the reader's scratch record and the caller-owned
-// `StringRecord` live together while a row is converted.
-const PARSER_RECORD_COPIES: usize = 2;
+// Three empty ByteRecord boxes (manual byte/string headers and the caller
+// record) plus the reader's other fixed heap state fit within this bound.
+const PARSER_FIXED_BYTES: usize = 1024;
 
 /// Resource limits for one CSV import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,10 +277,11 @@ impl Table {
             limit: limits.max_decoded_bytes,
             required: usize::MAX,
         })?;
-        let first_mismatch = first_header_mismatch(
-            &csv_bytes[shape.header_start..shape.header_end],
-            self.fields(),
-        );
+        let header = &csv_bytes[shape.header_start..shape.header_end];
+        if str::from_utf8(header).is_err() {
+            return Err(CsvIngestError::Csv(invalid_utf8_csv_error()));
+        }
+        let first_mismatch = first_header_mismatch(header, self.fields());
         if shape.header_fields != self.fields().len() || first_mismatch.is_some() {
             return Err(CsvIngestError::HeaderMismatch {
                 expected_fields: self.fields().len(),
@@ -340,10 +342,13 @@ impl Table {
         )?;
 
         let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
+            .has_headers(true)
             .flexible(true)
             .buffer_capacity(READ_BUFFER_BYTES)
             .from_reader(&csv_bytes[shape.data_start..]);
+        // `csv` otherwise retains byte and string clones of the first data
+        // record even when `has_headers(false)` is used.
+        reader.set_byte_headers(csv::ByteRecord::new());
 
         let mut record = csv::StringRecord::new();
         let mut rows = Vec::new();
@@ -725,27 +730,53 @@ fn parser_working_bytes(shape: CsvShape, limit: usize) -> Result<usize, CsvInges
     if shape.data_rows == 0 {
         return Ok(0);
     }
-    let field_indexes = shape
-        .max_data_fields
-        .checked_mul(mem::size_of::<usize>())
-        .ok_or(CsvIngestError::DecodedLimitExceeded {
+    let payload_capacity = geometric_csv_capacity(shape.max_data_record_bytes).ok_or(
+        CsvIngestError::DecodedLimitExceeded {
             limit,
             required: usize::MAX,
-        })?;
-    let one_record = shape
-        .max_data_record_bytes
-        .checked_add(field_indexes)
-        .ok_or(CsvIngestError::DecodedLimitExceeded {
+        },
+    )?;
+    let field_capacity = geometric_csv_capacity(shape.max_data_fields).ok_or(
+        CsvIngestError::DecodedLimitExceeded {
             limit,
             required: usize::MAX,
-        })?;
-    one_record
-        .checked_mul(PARSER_RECORD_COPIES)
-        .and_then(|bytes| bytes.checked_add(READ_BUFFER_BYTES))
+        },
+    )?;
+    let field_indexes = field_capacity.checked_mul(mem::size_of::<usize>()).ok_or(
+        CsvIngestError::DecodedLimitExceeded {
+            limit,
+            required: usize::MAX,
+        },
+    )?;
+    READ_BUFFER_BYTES
+        .checked_add(PARSER_FIXED_BYTES)
+        .and_then(|bytes| bytes.checked_add(payload_capacity))
+        .and_then(|bytes| bytes.checked_add(field_indexes))
         .ok_or(CsvIngestError::DecodedLimitExceeded {
             limit,
             required: usize::MAX,
         })
+}
+
+fn geometric_csv_capacity(required: usize) -> Option<usize> {
+    if required == 0 {
+        Some(0)
+    } else {
+        required.max(4).checked_next_power_of_two()
+    }
+}
+
+fn invalid_utf8_csv_error() -> csv::Error {
+    // `csv::Error` has no public constructor. Header bytes were already
+    // validated allocation-free, so parse a fixed one-byte fixture solely to
+    // return the crate's documented UTF-8 error kind without copying input.
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(&b"\xff\n"[..]);
+    let mut record = csv::StringRecord::new();
+    reader
+        .read_record(&mut record)
+        .expect_err("the fixed invalid UTF-8 record must be rejected")
 }
 
 fn ensure_decoded_limit(

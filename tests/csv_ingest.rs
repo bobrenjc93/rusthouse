@@ -217,12 +217,25 @@ fn width_mismatch_still_reports_an_overlapping_name_mismatch() {
 }
 
 #[test]
+fn invalid_utf8_header_is_reported_as_a_csv_error() {
+    let mut table = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
+
+    assert!(matches!(
+        table.insert_csv([0xff, b'\n'].as_slice()),
+        Err(CsvIngestError::Csv(error))
+            if matches!(error.kind(), csv::ErrorKind::Utf8 { .. })
+    ));
+    assert!(table.is_empty());
+}
+
+#[test]
 fn invalid_value_diagnostics_do_not_exceed_the_exact_decoded_limit() {
-    const VALUE_BYTES: usize = 128 * 1024;
+    const VALUE_BYTES: usize = 1024 * 1024 + 1;
 
     let invalid = "x".repeat(VALUE_BYTES);
     let csv = format!("number\n{invalid}\n");
-    let parser_bytes = 8 * 1024 + 2 * (VALUE_BYTES + std::mem::size_of::<usize>());
+    let parser_bytes =
+        8 * 1024 + 1024 + VALUE_BYTES.next_power_of_two() + 4 * std::mem::size_of::<usize>();
     let exact_bytes =
         parser_bytes + std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>();
 
@@ -300,8 +313,10 @@ fn decoded_memory_limit_bounds_wide_empty_string_rows_at_exact_boundary() {
     let csv = format!("{header}\n{empty_row}\n{empty_row}\n");
     let staged_bytes =
         2 * (std::mem::size_of::<Vec<Value>>() + FIELD_COUNT * std::mem::size_of::<Value>());
-    let parser_bytes =
-        8 * 1024 + 2 * (empty_row.len() + FIELD_COUNT * std::mem::size_of::<usize>());
+    let parser_bytes = 8 * 1024
+        + 1024
+        + empty_row.len().next_power_of_two()
+        + FIELD_COUNT.next_power_of_two() * std::mem::size_of::<usize>();
     let commit_bytes = 2 * std::mem::size_of::<Vec<Value>>();
     let decoded_bytes = (staged_bytes + parser_bytes).max(staged_bytes + commit_bytes);
 
