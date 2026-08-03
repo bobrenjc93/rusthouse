@@ -7,6 +7,7 @@ use crate::scan::RowSelection;
 use crate::storage::Column;
 use crate::{Table, Value};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -76,7 +77,7 @@ pub enum GroupedCountError {
         /// Name of the grouped field.
         field: String,
     },
-    /// Memory could not be reserved for the bounded group result.
+    /// Memory could not be reserved for grouped-count state or its result.
     GroupAllocationFailed {
         /// Number of group entries requested from the allocator.
         requested_groups: usize,
@@ -140,7 +141,9 @@ impl Table {
     /// more than `max_groups` distinct values, this method returns
     /// [`GroupedCountError::GroupLimitExceeded`] rather than a truncated result.
     /// Group storage and owned String keys are allocated fallibly, and counts
-    /// use checked arithmetic.
+    /// use checked arithmetic. Accumulation takes expected linear time in the
+    /// selected row count, followed by an in-place `O(g log g)` sort for `g`
+    /// distinct groups; retained memory is proportional to `g`.
     pub fn grouped_count(
         &self,
         field: &str,
@@ -156,21 +159,11 @@ impl Table {
                 name: field.to_owned(),
             })?;
         let column = &self.columns()[column_index];
-        let selected_count = selection.map_or_else(|| self.len(), RowSelection::selected_count);
-
-        let mut groups = Vec::new();
-        reserve_groups(&mut groups, selected_count.min(max_groups))?;
-        match selection {
-            Some(selection) => group_column(
-                field,
-                column,
-                selection.selected_rows(),
-                max_groups,
-                &mut groups,
-            )?,
-            None => group_column(field, column, 0..self.len(), max_groups, &mut groups)?,
-        }
-        Ok(groups)
+        let groups = match selection {
+            Some(selection) => group_column(field, column, selection.selected_rows(), max_groups)?,
+            None => group_column(field, column, 0..self.len(), max_groups)?,
+        };
+        materialize_groups(field, groups)
     }
 }
 
@@ -189,7 +182,25 @@ fn validate_selection(
     Ok(())
 }
 
-fn reserve_groups(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GroupKey<'a> {
+    Int64(i64),
+    Float64(u64),
+    Bool(bool),
+    String(&'a str),
+}
+
+fn reserve_group_entries(
+    groups: &mut HashMap<GroupKey<'_>, usize>,
+    additional: usize,
+    requested_groups: usize,
+) -> Result<(), GroupedCountError> {
+    groups
+        .try_reserve(additional)
+        .map_err(|_| GroupedCountError::GroupAllocationFailed { requested_groups })
+}
+
+fn reserve_group_results(
     groups: &mut Vec<GroupedCount>,
     requested_groups: usize,
 ) -> Result<(), GroupedCountError> {
@@ -198,78 +209,99 @@ fn reserve_groups(
         .map_err(|_| GroupedCountError::GroupAllocationFailed { requested_groups })
 }
 
-fn group_column(
+fn group_column<'a>(
     field: &str,
-    column: &Column,
+    column: &'a Column,
     rows: impl Iterator<Item = usize>,
     max_groups: usize,
-    groups: &mut Vec<GroupedCount>,
-) -> Result<(), GroupedCountError> {
+) -> Result<HashMap<GroupKey<'a>, usize>, GroupedCountError> {
+    let mut groups = HashMap::new();
     match column {
-        Column::Int64(values) => group_values(
+        Column::Int64(values) => group_keys(
             field,
-            rows,
+            rows.map(|row| GroupKey::Int64(values[row])),
             max_groups,
-            groups,
-            |value, row| compare_value_to_i64(value, values[row]),
-            |row| Ok(Value::Int64(values[row])),
+            &mut groups,
         ),
-        Column::Float64(values) => group_values(
+        Column::Float64(values) => group_keys(
             field,
-            rows,
+            rows.map(|row| GroupKey::Float64(values[row].to_bits())),
             max_groups,
-            groups,
-            |value, row| compare_value_to_f64(value, values[row]),
-            |row| Ok(Value::Float64(values[row])),
+            &mut groups,
         ),
-        Column::Bool(values) => group_values(
+        Column::Bool(values) => group_keys(
             field,
-            rows,
+            rows.map(|row| GroupKey::Bool(values[row] != 0)),
             max_groups,
-            groups,
-            |value, row| compare_value_to_bool(value, values[row] != 0),
-            |row| Ok(Value::Bool(values[row] != 0)),
+            &mut groups,
         ),
-        Column::String(values) => group_values(
+        Column::String(values) => group_keys(
             field,
-            rows,
+            rows.map(|row| GroupKey::String(&values[row])),
             max_groups,
-            groups,
-            |value, row| compare_value_to_str(value, &values[row]),
-            |row| copy_string_value(field, &values[row]),
+            &mut groups,
         ),
-    }
+    }?;
+    Ok(groups)
 }
 
-fn group_values(
+fn group_keys<'a>(
     field: &str,
-    rows: impl Iterator<Item = usize>,
+    keys: impl Iterator<Item = GroupKey<'a>>,
     max_groups: usize,
-    groups: &mut Vec<GroupedCount>,
-    compare: impl Fn(&Value, usize) -> Ordering,
-    make_value: impl Fn(usize) -> Result<Value, GroupedCountError>,
+    groups: &mut HashMap<GroupKey<'a>, usize>,
 ) -> Result<(), GroupedCountError> {
-    for row in rows {
-        match groups.binary_search_by(|group| compare(&group.value, row)) {
-            Ok(index) => increment_count(field, &mut groups[index].count)?,
-            Err(index) => {
-                if groups.len() == max_groups {
-                    return Err(GroupedCountError::GroupLimitExceeded {
-                        field: field.to_owned(),
-                        limit: max_groups,
-                    });
-                }
-                groups.insert(
-                    index,
-                    GroupedCount {
-                        value: make_value(row)?,
-                        count: 1,
-                    },
-                );
-            }
+    for key in keys {
+        if let Some(count) = groups.get_mut(&key) {
+            increment_count(field, count)?;
+            continue;
         }
+
+        if groups.len() == max_groups {
+            return Err(GroupedCountError::GroupLimitExceeded {
+                field: field.to_owned(),
+                limit: max_groups,
+            });
+        }
+        let requested_groups =
+            groups
+                .len()
+                .checked_add(1)
+                .ok_or(GroupedCountError::GroupAllocationFailed {
+                    requested_groups: usize::MAX,
+                })?;
+        reserve_group_entries(groups, 1, requested_groups)?;
+        let previous = groups.insert(key, 1);
+        debug_assert!(previous.is_none());
     }
     Ok(())
+}
+
+fn materialize_groups(
+    field: &str,
+    groups: HashMap<GroupKey<'_>, usize>,
+) -> Result<Vec<GroupedCount>, GroupedCountError> {
+    let mut result = Vec::new();
+    reserve_group_results(&mut result, groups.len())?;
+    for (key, count) in groups {
+        result.push(GroupedCount {
+            value: key.into_value(field)?,
+            count,
+        });
+    }
+    result.sort_unstable_by(|left, right| compare_values(&left.value, &right.value));
+    Ok(result)
+}
+
+impl GroupKey<'_> {
+    fn into_value(self, field: &str) -> Result<Value, GroupedCountError> {
+        match self {
+            Self::Int64(value) => Ok(Value::Int64(value)),
+            Self::Float64(bits) => Ok(Value::Float64(f64::from_bits(bits))),
+            Self::Bool(value) => Ok(Value::Bool(value)),
+            Self::String(value) => copy_string_value(field, value),
+        }
+    }
 }
 
 fn increment_count(field: &str, count: &mut usize) -> Result<(), GroupedCountError> {
@@ -298,32 +330,14 @@ fn reserve_string(field: &str, required_bytes: usize) -> Result<String, GroupedC
     Ok(value)
 }
 
-fn compare_value_to_i64(value: &Value, other: i64) -> Ordering {
-    let Value::Int64(value) = value else {
-        unreachable!("a grouped result contains values from one physical column")
-    };
-    value.cmp(&other)
-}
-
-fn compare_value_to_f64(value: &Value, other: f64) -> Ordering {
-    let Value::Float64(value) = value else {
-        unreachable!("a grouped result contains values from one physical column")
-    };
-    value.total_cmp(&other)
-}
-
-fn compare_value_to_bool(value: &Value, other: bool) -> Ordering {
-    let Value::Bool(value) = value else {
-        unreachable!("a grouped result contains values from one physical column")
-    };
-    value.cmp(&other)
-}
-
-fn compare_value_to_str(value: &Value, other: &str) -> Ordering {
-    let Value::String(value) = value else {
-        unreachable!("a grouped result contains values from one physical column")
-    };
-    value.as_str().cmp(other)
+fn compare_values(left: &Value, right: &Value) -> Ordering {
+    match (left, right) {
+        (Value::Int64(left), Value::Int64(right)) => left.cmp(right),
+        (Value::Float64(left), Value::Float64(right)) => left.total_cmp(right),
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        (Value::String(left), Value::String(right)) => left.cmp(right),
+        _ => unreachable!("a grouped result contains values from one physical column"),
+    }
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
@@ -342,9 +356,17 @@ mod tests {
 
     #[test]
     fn reports_group_capacity_allocation_errors() {
-        let mut groups = Vec::new();
+        let mut entries: HashMap<GroupKey<'_>, usize> = HashMap::new();
         assert_eq!(
-            reserve_groups(&mut groups, usize::MAX),
+            reserve_group_entries(&mut entries, usize::MAX, usize::MAX),
+            Err(GroupedCountError::GroupAllocationFailed {
+                requested_groups: usize::MAX,
+            })
+        );
+
+        let mut result = Vec::new();
+        assert_eq!(
+            reserve_group_results(&mut result, usize::MAX),
             Err(GroupedCountError::GroupAllocationFailed {
                 requested_groups: usize::MAX,
             })

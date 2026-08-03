@@ -139,6 +139,43 @@ fn duplicate_heavy_input_keeps_checked_exact_counts() {
 }
 
 #[test]
+fn reverse_ordered_high_cardinality_input_sorts_after_accumulation() {
+    const ROWS: i64 = 100_000;
+
+    let mut table = Table::new(vec![Field::new("key", DataType::Int64)]).unwrap();
+    table
+        .insert_batch((0..ROWS).rev().map(|key| vec![Value::Int64(key)]))
+        .unwrap();
+
+    let groups = table.grouped_count("key", None, ROWS as usize).unwrap();
+    assert_eq!(groups.len(), ROWS as usize);
+    for (expected, group) in groups.iter().enumerate() {
+        assert_eq!(group.value(), &Value::Int64(expected as i64));
+        assert_eq!(group.count(), 1);
+    }
+}
+
+#[test]
+fn permissive_limit_does_not_leave_low_cardinality_result_row_sized() {
+    const ROWS: usize = 100_000;
+
+    let mut table = Table::new(vec![Field::new("key", DataType::Bool)]).unwrap();
+    table
+        .insert_batch((0..ROWS).map(|row| vec![Value::Bool(row % 2 == 0)]))
+        .unwrap();
+
+    let groups = table.grouped_count("key", None, usize::MAX).unwrap();
+    assert!(groups.capacity() < ROWS);
+    assert_groups(
+        groups,
+        &[
+            (Value::Bool(false), ROWS / 2),
+            (Value::Bool(true), ROWS / 2),
+        ],
+    );
+}
+
+#[test]
 fn float_groups_use_total_order_for_nans_and_signed_zero() {
     let negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
     let positive_signaling_nan = f64::from_bits(0x7ff0_0000_0000_0001);
