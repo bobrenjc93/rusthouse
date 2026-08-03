@@ -1,9 +1,10 @@
 //! Transactional CSV ingestion for [`Table`].
 //!
 //! CSV input must start with a header whose names and order exactly match the
-//! destination schema. The complete bounded input is parsed and converted
-//! before [`Table::insert_batch`] is called, so malformed input never appends a
-//! partial batch.
+//! destination schema. Header fields are decoded and compared directly from
+//! the bounded input without staging allocations. The complete data suffix is
+//! parsed and converted before [`Table::insert_batch`] is called, so malformed
+//! input never appends a partial batch.
 
 use crate::{DataType, Field, Table, TableError, Value};
 use std::error::Error;
@@ -96,8 +97,6 @@ pub enum CsvIngestAllocation {
     RowValues,
     /// An owned string cell.
     StringValue,
-    /// Owned details for an error report.
-    ErrorDetail,
 }
 
 impl fmt::Display for CsvIngestAllocation {
@@ -107,7 +106,6 @@ impl fmt::Display for CsvIngestAllocation {
             Self::RowCollection => "CSV row collection",
             Self::RowValues => "CSV row values",
             Self::StringValue => "CSV string value",
-            Self::ErrorDetail => "CSV error detail",
         };
         formatter.write_str(name)
     }
@@ -166,12 +164,10 @@ pub enum CsvIngestError {
         row: usize,
         /// Zero-based field position.
         column: usize,
-        /// Name of the schema field.
-        field: String,
         /// Type required by the schema.
         expected: DataType,
-        /// Original CSV field value.
-        value: String,
+        /// Length of the rejected decoded field in bytes.
+        value_bytes: usize,
     },
     /// The `csv` parser rejected malformed or non-UTF-8 input.
     Csv(csv::Error),
@@ -225,12 +221,11 @@ impl fmt::Display for CsvIngestError {
             Self::InvalidValue {
                 row,
                 column,
-                field,
                 expected,
-                value,
+                value_bytes,
             } => write!(
                 formatter,
-                "CSV data row {row}, column {column} (`{field}`) value {value:?} is not {expected}"
+                "CSV data row {row}, column {column} has a {value_bytes}-byte value that is not {expected}"
             ),
             Self::Csv(error) => write!(formatter, "invalid CSV input: {error}"),
             Self::Table(error) => write!(formatter, "could not insert CSV batch: {error}"),
@@ -276,6 +271,33 @@ impl Table {
         limits: CsvIngestLimits,
     ) -> Result<usize, CsvIngestError> {
         let bytes = read_bounded(input, limits.max_input_bytes)?;
+        let csv_bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+        let shape = scan_csv_shape(csv_bytes).ok_or(CsvIngestError::DecodedLimitExceeded {
+            limit: limits.max_decoded_bytes,
+            required: usize::MAX,
+        })?;
+        let first_mismatch = first_header_mismatch(
+            &csv_bytes[shape.header_start..shape.header_end],
+            self.fields(),
+        );
+        if shape.header_fields != self.fields().len() || first_mismatch.is_some() {
+            return Err(CsvIngestError::HeaderMismatch {
+                expected_fields: self.fields().len(),
+                actual_fields: shape.header_fields,
+                first_mismatch,
+            });
+        }
+        if shape.data_rows > limits.max_rows {
+            return Err(CsvIngestError::RowLimitExceeded {
+                limit: limits.max_rows,
+            });
+        }
+        if shape.data_rows == 0 {
+            return self
+                .insert_batch(Vec::<Vec<Value>>::new())
+                .map_err(CsvIngestError::Table);
+        }
+
         let fixed_value_bytes = self
             .fields()
             .len()
@@ -284,22 +306,6 @@ impl Table {
                 limit: limits.max_decoded_bytes,
                 required: usize::MAX,
             })?;
-        let shape = scan_csv_shape(&bytes).ok_or(CsvIngestError::DecodedLimitExceeded {
-            limit: limits.max_decoded_bytes,
-            required: usize::MAX,
-        })?;
-        if shape.header_fields != self.fields().len() {
-            return Err(CsvIngestError::HeaderMismatch {
-                expected_fields: self.fields().len(),
-                actual_fields: shape.header_fields,
-                first_mismatch: None,
-            });
-        }
-        if shape.data_rows > limits.max_rows {
-            return Err(CsvIngestError::RowLimitExceeded {
-                limit: limits.max_rows,
-            });
-        }
 
         let minimum_data_bytes = shape
             .data_cells
@@ -337,26 +343,9 @@ impl Table {
             .has_headers(false)
             .flexible(true)
             .buffer_capacity(READ_BUFFER_BYTES)
-            .from_reader(bytes.as_slice());
+            .from_reader(&csv_bytes[shape.data_start..]);
 
         let mut record = csv::StringRecord::new();
-        let has_header = reader
-            .read_record(&mut record)
-            .map_err(CsvIngestError::Csv)?;
-        debug_assert!(has_header, "shape scan found a header record");
-        let first_mismatch = record
-            .iter()
-            .zip(self.fields())
-            .position(|(actual, expected)| actual != expected.name());
-        if record.len() != self.fields().len() || first_mismatch.is_some() {
-            return Err(CsvIngestError::HeaderMismatch {
-                expected_fields: self.fields().len(),
-                actual_fields: record.len(),
-                first_mismatch,
-            });
-        }
-        record = csv::StringRecord::new();
-
         let mut rows = Vec::new();
         let mut decoded_bytes = 0_usize;
         let mut row_index = 0_usize;
@@ -556,6 +545,9 @@ fn reserve_input_bytes(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CsvShape {
     header_fields: usize,
+    header_start: usize,
+    header_end: usize,
+    data_start: usize,
     data_rows: usize,
     data_cells: usize,
     max_data_fields: usize,
@@ -563,11 +555,10 @@ struct CsvShape {
 }
 
 fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let mut shape = CsvShape::default();
     let mut saw_header = false;
     let mut fields = 1_usize;
-    let mut record_bytes = 0_usize;
+    let mut record_start = 0_usize;
     let mut index = 0_usize;
     let mut record_started = false;
     let mut at_field_start = true;
@@ -577,7 +568,6 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
         if in_quotes {
             if byte == b'"' {
                 if bytes.get(index + 1) == Some(&b'"') {
-                    record_bytes = record_bytes.checked_add(2)?;
                     index += 2;
                     continue;
                 }
@@ -591,35 +581,46 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
                 }
                 b',' => {
                     fields = fields.checked_add(1)?;
-                    record_bytes = record_bytes.checked_add(1)?;
                     record_started = true;
                     at_field_start = true;
                     index += 1;
                     continue;
                 }
                 b'\r' | b'\n' => {
+                    let terminator_bytes =
+                        usize::from(byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) + 1;
                     if record_started {
-                        finish_shape_record(&mut shape, &mut saw_header, fields, record_bytes)?;
+                        finish_shape_record(
+                            &mut shape,
+                            &mut saw_header,
+                            fields,
+                            record_start,
+                            index,
+                            index.checked_add(terminator_bytes)?,
+                        )?;
                     }
                     fields = 1;
-                    record_bytes = 0;
                     record_started = false;
                     at_field_start = true;
-                    if byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
-                        index += 1;
-                    }
-                    index += 1;
+                    index = index.checked_add(terminator_bytes)?;
+                    record_start = index;
                     continue;
                 }
                 _ => record_started = true,
             }
         }
-        record_bytes = record_bytes.checked_add(1)?;
         at_field_start = false;
         index += 1;
     }
     if record_started {
-        finish_shape_record(&mut shape, &mut saw_header, fields, record_bytes)?;
+        finish_shape_record(
+            &mut shape,
+            &mut saw_header,
+            fields,
+            record_start,
+            bytes.len(),
+            bytes.len(),
+        )?;
     }
     Some(shape)
 }
@@ -628,10 +629,16 @@ fn finish_shape_record(
     shape: &mut CsvShape,
     saw_header: &mut bool,
     fields: usize,
-    record_bytes: usize,
+    record_start: usize,
+    record_end: usize,
+    data_start: usize,
 ) -> Option<()> {
+    let record_bytes = record_end.checked_sub(record_start)?;
     if !*saw_header {
         shape.header_fields = fields;
+        shape.header_start = record_start;
+        shape.header_end = record_end;
+        shape.data_start = data_start;
         *saw_header = true;
     } else {
         shape.data_rows = shape.data_rows.checked_add(1)?;
@@ -640,6 +647,78 @@ fn finish_shape_record(
         shape.max_data_record_bytes = shape.max_data_record_bytes.max(record_bytes);
     }
     Some(())
+}
+
+fn first_header_mismatch(header: &[u8], fields: &[Field]) -> Option<usize> {
+    if header.is_empty() {
+        return None;
+    }
+
+    let mut column = 0_usize;
+    let mut field_start = 0_usize;
+    let mut index = 0_usize;
+    let mut at_field_start = true;
+    let mut in_quotes = false;
+    while index <= header.len() {
+        let at_end = index == header.len();
+        if at_end || (!in_quotes && header[index] == b',') {
+            if let Some(field) = fields.get(column)
+                && !csv_field_equals(&header[field_start..index], field.name().as_bytes())
+            {
+                return Some(column);
+            }
+            column += 1;
+            field_start = index.saturating_add(1);
+            at_field_start = true;
+            index += 1;
+            continue;
+        }
+
+        let byte = header[index];
+        if in_quotes {
+            if byte == b'"' {
+                if header.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                    continue;
+                }
+                in_quotes = false;
+            }
+        } else if byte == b'"' && at_field_start {
+            in_quotes = true;
+        }
+        at_field_start = false;
+        index += 1;
+    }
+    None
+}
+
+fn csv_field_equals(raw: &[u8], expected: &[u8]) -> bool {
+    if raw.first() != Some(&b'"') {
+        return raw == expected;
+    }
+
+    let mut raw_index = 1_usize;
+    let mut expected_index = 0_usize;
+    while raw_index < raw.len() {
+        let byte = raw[raw_index];
+        if byte == b'"' {
+            if raw.get(raw_index + 1) == Some(&b'"') {
+                if expected.get(expected_index) != Some(&b'"') {
+                    return false;
+                }
+                raw_index += 2;
+                expected_index += 1;
+                continue;
+            }
+            return raw_index + 1 == raw.len() && expected_index == expected.len();
+        }
+        if expected.get(expected_index) != Some(&byte) {
+            return false;
+        }
+        raw_index += 1;
+        expected_index += 1;
+    }
+    false
 }
 
 fn parser_working_bytes(shape: CsvShape, limit: usize) -> Result<usize, CsvIngestError> {
@@ -713,32 +792,17 @@ fn convert_value(
     row: usize,
     column: usize,
 ) -> Result<Value, CsvIngestError> {
-    let invalid = || -> Result<Value, CsvIngestError> {
-        Err(CsvIngestError::InvalidValue {
-            row,
-            column,
-            field: copy_string(field.name(), CsvIngestAllocation::ErrorDetail)?,
-            expected: field.data_type(),
-            value: copy_string(raw, CsvIngestAllocation::ErrorDetail)?,
-        })
+    let invalid = || CsvIngestError::InvalidValue {
+        row,
+        column,
+        expected: field.data_type(),
+        value_bytes: raw.len(),
     };
 
     match field.data_type() {
-        DataType::Int64 => raw
-            .parse()
-            .map(Value::Int64)
-            .map_err(|_| ())
-            .or_else(|()| invalid()),
-        DataType::Float64 => raw
-            .parse()
-            .map(Value::Float64)
-            .map_err(|_| ())
-            .or_else(|()| invalid()),
-        DataType::Bool => raw
-            .parse()
-            .map(Value::Bool)
-            .map_err(|_| ())
-            .or_else(|()| invalid()),
+        DataType::Int64 => raw.parse().map(Value::Int64).map_err(|_| invalid()),
+        DataType::Float64 => raw.parse().map(Value::Float64).map_err(|_| invalid()),
+        DataType::Bool => raw.parse().map(Value::Bool).map_err(|_| invalid()),
         DataType::String => copy_string(raw, CsvIngestAllocation::StringValue).map(Value::String),
     }
 }

@@ -109,9 +109,8 @@ fn invalid_typed_value_rolls_back_the_complete_import() {
             row: 1,
             column: 2,
             expected: DataType::Bool,
-            ref value,
-            ..
-        } if value == "TRUE"
+            value_bytes: 4,
+        }
     ));
     assert_seed_unchanged(&table);
 }
@@ -176,6 +175,81 @@ fn header_only_import_succeeds_with_zero_row_and_decoded_limits() {
         0
     );
     assert!(table.is_empty());
+}
+
+#[test]
+fn large_header_is_compared_without_decoded_staging() {
+    const HEADER_BYTES: usize = 1024 * 1024;
+
+    let name = "h".repeat(HEADER_BYTES);
+    let csv = format!("{name}\n");
+    let mut table = Table::new(vec![Field::new(name, DataType::String)]).unwrap();
+
+    assert_eq!(
+        table
+            .insert_csv_with_limits(
+                csv.as_bytes(),
+                CsvIngestLimits::new(csv.len(), 0).with_max_decoded_bytes(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(table.is_empty());
+}
+
+#[test]
+fn width_mismatch_still_reports_an_overlapping_name_mismatch() {
+    let mut table = Table::new(vec![
+        Field::new("id", DataType::Int64),
+        Field::new("name", DataType::String),
+    ])
+    .unwrap();
+
+    assert!(matches!(
+        table.insert_csv(b"wrong\n".as_slice()),
+        Err(CsvIngestError::HeaderMismatch {
+            expected_fields: 2,
+            actual_fields: 1,
+            first_mismatch: Some(0),
+        })
+    ));
+    assert!(table.is_empty());
+}
+
+#[test]
+fn invalid_value_diagnostics_do_not_exceed_the_exact_decoded_limit() {
+    const VALUE_BYTES: usize = 128 * 1024;
+
+    let invalid = "x".repeat(VALUE_BYTES);
+    let csv = format!("number\n{invalid}\n");
+    let parser_bytes = 8 * 1024 + 2 * (VALUE_BYTES + std::mem::size_of::<usize>());
+    let exact_bytes =
+        parser_bytes + std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<Value>();
+
+    let mut too_small = Table::new(vec![Field::new("number", DataType::Int64)]).unwrap();
+    assert!(matches!(
+        too_small.insert_csv_with_limits(
+            csv.as_bytes(),
+            CsvIngestLimits::new(csv.len(), 1).with_max_decoded_bytes(exact_bytes - 1),
+        ),
+        Err(CsvIngestError::DecodedLimitExceeded { limit, required })
+            if limit == exact_bytes - 1 && required == exact_bytes
+    ));
+
+    let mut exact = Table::new(vec![Field::new("number", DataType::Int64)]).unwrap();
+    assert!(matches!(
+        exact.insert_csv_with_limits(
+            csv.as_bytes(),
+            CsvIngestLimits::new(csv.len(), 1).with_max_decoded_bytes(exact_bytes),
+        ),
+        Err(CsvIngestError::InvalidValue {
+            row: 0,
+            column: 0,
+            expected: DataType::Int64,
+            value_bytes: VALUE_BYTES,
+        })
+    ));
+    assert!(exact.is_empty());
 }
 
 #[test]
