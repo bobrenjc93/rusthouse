@@ -26,6 +26,25 @@ fn run(arguments: &[&str], input: &[u8]) -> Output {
     child.wait_with_output().expect("wait for rusthouse")
 }
 
+fn run_with_closed_stdout(arguments: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(BINARY)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start rusthouse");
+
+    drop(child.stdout.take().expect("piped stdout"));
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input)
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for rusthouse")
+}
+
 #[test]
 fn help_describes_the_bounded_batch_contract() {
     for argument in ["--help", "-h"] {
@@ -34,24 +53,34 @@ fn help_describes_the_bounded_batch_contract() {
         assert_eq!(output.status.code(), Some(0));
         assert!(output.stderr.is_empty());
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(stdout.contains("Usage: rusthouse [--help]"));
-        assert!(stdout.contains("CREATE TABLE and INSERT INTO ... VALUES"));
+        assert!(stdout.contains("Usage: rusthouse [--format csv]"));
+        assert!(stdout.contains("CREATE TABLE, INSERT INTO ... VALUES, and SELECT"));
+        assert!(stdout.contains("--format csv"));
         assert!(stdout.contains("1048576 bytes per statement"));
         assert!(stdout.contains("4  unsupported statement"));
+        assert!(stdout.contains("6  stdout write error"));
         assert_eq!(stdout.matches("Exit codes:").count(), 1);
     }
 }
 
 #[test]
 fn rejects_arguments_with_the_usage_exit_code() {
-    let output = run(&["--unknown"], b"");
+    for arguments in [
+        &["--unknown"][..],
+        &["--format"][..],
+        &["--format", "json"][..],
+        &["--format", "CSV"][..],
+        &["--format", "csv", "extra"][..],
+    ] {
+        let output = run(arguments, b"");
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "rusthouse: invalid arguments; try 'rusthouse --help'\n"
-    );
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "rusthouse: invalid arguments; try 'rusthouse --help'\n"
+        );
+    }
 }
 
 #[test]
@@ -95,12 +124,86 @@ fn rejects_non_utf8_and_unsupported_statements_deterministically() {
         "rusthouse: input error on line 1: statement is not valid UTF-8\n"
     );
 
-    let select = run(&[], b"SELECT * FROM events\n");
-    assert_eq!(select.status.code(), Some(4));
-    assert!(select.stdout.is_empty());
+    let unsupported = run(&[], b"DELETE FROM events\n");
+    assert_eq!(unsupported.status.code(), Some(4));
+    assert!(unsupported.stdout.is_empty());
     assert_eq!(
-        String::from_utf8(select.stderr).unwrap(),
-        "rusthouse: unsupported statement on line 1: expected CREATE TABLE or INSERT INTO\n"
+        String::from_utf8(unsupported.stderr).unwrap(),
+        "rusthouse: unsupported statement on line 1: expected CREATE TABLE, INSERT INTO, or SELECT\n"
+    );
+}
+
+#[test]
+fn writes_each_select_with_projected_columns_and_filtered_rows() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, active Bool, label String)\n\
+          INSERT INTO events VALUES (1, true, 'first'), (2, false, 'second'), (3, true, 'third')\n\
+          SELECT label, id, label FROM events WHERE active = true\n\
+          SELECT active FROM events WHERE id >= 2\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"label\",\"id\",\"label\"\n",
+            "\"first\",1,\"first\"\n",
+            "\"third\",3,\"third\"\n",
+            "\"active\"\n",
+            "false\n",
+            "true\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn writes_only_projected_headers_for_empty_results() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, label String)\n\
+          INSERT INTO events VALUES (1, 'first')\n\
+          SELECT label, id FROM events WHERE id > 10\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"\"label\",\"id\"\n");
+}
+
+#[test]
+fn escapes_select_strings_as_csv() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE messages (id Int64, body String)\n\
+          INSERT INTO messages VALUES (7, 'comma, \"quote\" and apostrophe ''')\n\
+          SELECT body, id FROM messages\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        b"\"body\",\"id\"\n\"comma, \"\"quote\"\" and apostrophe '\",7\n"
+    );
+}
+
+#[test]
+fn reports_stdout_failures_against_the_select_line() {
+    let output = run_with_closed_stdout(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64)\n\
+          INSERT INTO events VALUES (1)\n\
+          SELECT id FROM events\n",
+    );
+
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "rusthouse: output error on line 3: could not write SELECT result\n"
     );
 }
 

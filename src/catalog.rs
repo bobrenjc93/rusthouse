@@ -9,7 +9,7 @@ use crate::sql::{
     SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
     parse_insert_with_limits, parse_select_with_limits,
 };
-use crate::storage::{DEFAULT_ROW_LIMIT, Field, Table, TableError};
+use crate::storage::{Column, DEFAULT_ROW_LIMIT, Field, Table, TableError};
 use crate::{RowSelection, ScanError};
 
 /// Default maximum number of tables owned by one [`Catalog`].
@@ -211,6 +211,14 @@ impl<'a> SelectResult<'a> {
     /// Alias for [`Self::projected_fields`].
     pub fn fields(&self) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
         self.projected_fields()
+    }
+
+    pub(crate) fn projected_columns(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Column> + DoubleEndedIterator + '_ {
+        self.field_indices
+            .iter()
+            .map(|index| &self.table.columns()[*index])
     }
 
     /// Iterates over selected zero-based indexes in source table order.

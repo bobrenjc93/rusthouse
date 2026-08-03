@@ -1,5 +1,6 @@
 //! Streaming CSV output formats.
 
+use crate::SelectResult;
 use crate::storage::{Column, Table};
 use std::io::{self, Write};
 
@@ -38,6 +39,57 @@ pub fn write_csv_with_names<W: Write + ?Sized>(table: &Table, writer: &mut W) ->
 
     for row in 0..table.len() {
         for (index, column) in table.columns().iter().enumerate() {
+            if index != 0 {
+                writer.write_all(b",")?;
+            }
+            write_value(column, row, writer)?;
+        }
+        writer.write_all(b"\n")?;
+    }
+
+    Ok(())
+}
+
+/// Writes a borrowed [`SelectResult`] in ClickHouse's `CSVWithNames` shape.
+///
+/// Projected fields are emitted in statement order, including duplicate
+/// projections. Only selected rows are written, in source table order. The
+/// source columns and their values are borrowed directly; this function does
+/// not build a result table or copy selected values.
+///
+/// Encoding, record termination, and writer-error behavior match
+/// [`write_csv_with_names`]. A result with no selected rows emits only its
+/// projected header record.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{Catalog, write_select_csv_with_names};
+///
+/// let mut catalog = Catalog::new();
+/// catalog.execute_create("CREATE TABLE events (id Int64, label String)")?;
+/// catalog.execute_insert("INSERT INTO events VALUES (1, 'north'), (2, 'south')")?;
+/// let result = catalog.execute_select("SELECT label, id FROM events WHERE id = 2")?;
+///
+/// let mut csv = Vec::new();
+/// write_select_csv_with_names(&result, &mut csv)?;
+/// assert_eq!(csv, b"\"label\",\"id\"\n\"south\",2\n");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn write_select_csv_with_names<W: Write + ?Sized>(
+    result: &SelectResult<'_>,
+    writer: &mut W,
+) -> io::Result<()> {
+    for (index, field) in result.projected_fields().enumerate() {
+        if index != 0 {
+            writer.write_all(b",")?;
+        }
+        write_quoted(field.name(), writer)?;
+    }
+    writer.write_all(b"\n")?;
+
+    for row in result.selected_rows() {
+        for (index, column) in result.projected_columns().enumerate() {
             if index != 0 {
                 writer.write_all(b",")?;
             }
