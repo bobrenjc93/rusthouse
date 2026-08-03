@@ -107,6 +107,54 @@ fn filters_rows_and_reports_empty_results() {
 }
 
 #[test]
+fn intersects_comparisons_across_all_physical_types() {
+    let catalog = readings_catalog();
+
+    let result = catalog
+        .execute_select(
+            "SELECT sequence FROM readings \
+             WHERE sequence >= 1 AND value < 5.0 AND active = true AND label != 'first'",
+        )
+        .unwrap();
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [2]);
+
+    let no_matches = catalog
+        .execute_select(
+            "SELECT sequence FROM readings WHERE active = false AND sequence > 2 AND label = 'third'",
+        )
+        .unwrap();
+    assert!(no_matches.is_empty());
+}
+
+#[test]
+fn intersects_across_packed_bitmap_boundaries_before_limiting() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE boundaries (id Int64)")
+        .unwrap();
+    catalog
+        .table_mut("boundaries")
+        .unwrap()
+        .insert_batch((0..17).map(|id| vec![Value::Int64(id)]))
+        .unwrap();
+
+    let result = catalog
+        .execute_select(
+            "SELECT id FROM boundaries WHERE id >= 7 AND id <= 16 ORDER BY id DESC LIMIT 3",
+        )
+        .unwrap();
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [16, 15, 14]);
+
+    let all = catalog
+        .execute_select("SELECT id FROM boundaries WHERE id >= 7 AND id <= 16")
+        .unwrap();
+    assert_eq!(
+        all.row_indices().collect::<Vec<_>>(),
+        (7..=16).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
     let catalog = readings_catalog();
 
@@ -125,7 +173,9 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
     assert!(!all.is_empty());
 
     let filtered = catalog
-        .execute_select("SELECT COUNT(*) AS active_count FROM readings WHERE active = true")
+        .execute_select(
+            "SELECT COUNT(*) AS active_count FROM readings WHERE active = true AND sequence > 1",
+        )
         .unwrap();
     assert_eq!(
         filtered
@@ -134,7 +184,7 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
             .collect::<Vec<_>>(),
         [("active_count", DataType::Int64)]
     );
-    assert_eq!(filtered.scalar_value(), Some(&Value::Int64(2)));
+    assert_eq!(filtered.scalar_value(), Some(&Value::Int64(1)));
 
     let no_matches = catalog
         .execute_select("SELECT COUNT(*) FROM readings WHERE value > 100.0")
@@ -188,11 +238,11 @@ fn executes_an_already_parsed_statement() {
     let statement = SelectStatement {
         projections: SelectProjection::Columns(vec!["label".to_owned()]),
         table: "Readings".to_owned(),
-        predicate: Some(ComparisonPredicate {
+        predicates: vec![ComparisonPredicate {
             column: "sequence".to_owned(),
             operator: ComparisonOperator::GreaterThanOrEqual,
             value: Value::Int64(2),
-        }),
+        }],
         order_by: None,
         limit: None,
     };
@@ -422,6 +472,34 @@ fn reports_parse_lookup_projection_and_scan_failures_with_typed_errors() {
                 field: "sequence".to_owned(),
                 column_type: DataType::Int64,
                 literal_type: DataType::String,
+            },
+        }
+    );
+
+    assert_eq!(
+        catalog
+            .execute_select(
+                "SELECT sequence FROM readings WHERE sequence > 100 AND active = 'true'",
+            )
+            .unwrap_err(),
+        CatalogError::TableScan {
+            name: "readings".to_owned(),
+            source: ScanError::TypeMismatch {
+                field: "active".to_owned(),
+                column_type: DataType::Bool,
+                literal_type: DataType::String,
+            },
+        }
+    );
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT sequence FROM readings WHERE active = true AND absent = 1")
+            .unwrap_err(),
+        CatalogError::TableScan {
+            name: "readings".to_owned(),
+            source: ScanError::FieldNotFound {
+                name: "absent".to_owned(),
             },
         }
     );
