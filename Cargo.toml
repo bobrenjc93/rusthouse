@@ -7,3 +7,4 @@ license = "MIT"
 repository = "https://github.com/bobrenjc93/rusthouse"
 
 [dependencies]
+unicode-width = "0.2"
