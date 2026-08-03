@@ -2,7 +2,7 @@ use rusthouse::snapshot::{SnapshotError, SnapshotStore};
 use rusthouse::table_snapshot::{
     TABLE_PAYLOAD_MAGIC, TABLE_PAYLOAD_VERSION, TableSnapshotError, TableSnapshotLocation,
 };
-use rusthouse::{DataType, Field, Table, Value};
+use rusthouse::{Catalog, CatalogLimits, DataType, Field, ParseLimits, Table, Value};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,6 +104,58 @@ fn round_trips_a_mixed_table_and_reopens_every_property() {
         reopened.string_column("region").unwrap(),
         ["", "northwest", "caf\u{e9}"]
     );
+}
+
+#[test]
+fn sql_created_catalog_table_round_trips_through_snapshot() {
+    let limits = CatalogLimits::new(ParseLimits::default(), 1, 5);
+    let mut catalog = Catalog::with_limits(limits);
+    catalog
+        .execute_create(
+            "CREATE TABLE Events (Sequence Int64, Reading Float64, Healthy Bool, Region String)",
+        )
+        .unwrap();
+    catalog
+        .table_mut("events")
+        .unwrap()
+        .insert_batch([vec![
+            Value::Int64(42),
+            Value::Float64(3.5),
+            Value::Bool(true),
+            Value::String("northwest".to_owned()),
+        ]])
+        .unwrap();
+
+    let directory = TestDirectory::new("sql-catalog-round-trip");
+    let path = directory.snapshot();
+    let store = SnapshotStore::new(4 * 1024);
+    store
+        .write_table(&path, catalog.table("EVENTS").unwrap())
+        .unwrap();
+    let reopened = store.read_table(&path).unwrap();
+
+    let schema: Vec<_> = reopened
+        .fields()
+        .iter()
+        .map(|field| (field.name(), field.data_type()))
+        .collect();
+    assert_eq!(
+        schema,
+        [
+            ("Sequence", DataType::Int64),
+            ("Reading", DataType::Float64),
+            ("Healthy", DataType::Bool),
+            ("Region", DataType::String),
+        ]
+    );
+    assert_eq!(reopened.row_limit(), 5);
+    assert_eq!(reopened.int64_column("Sequence").unwrap(), [42]);
+    assert_eq!(reopened.float64_column("Reading").unwrap(), [3.5]);
+    assert_eq!(
+        reopened.bool_column("Healthy").unwrap().collect::<Vec<_>>(),
+        [true]
+    );
+    assert_eq!(reopened.string_column("Region").unwrap(), ["northwest"]);
 }
 
 #[test]
