@@ -199,6 +199,16 @@ impl<'a> SelectResult<'a> {
         self.table
     }
 
+    /// Returns the optional row selection produced by the query predicate.
+    ///
+    /// An unfiltered query returns `None`, representing every source row. The
+    /// selection can be passed directly to selection-aware table operations
+    /// such as [`Table::count`] and [`Table::sum`].
+    #[must_use]
+    pub const fn selection(&self) -> Option<&RowSelection> {
+        self.selection.as_ref()
+    }
+
     /// Iterates over projected fields in statement order.
     pub fn projected_fields(
         &self,

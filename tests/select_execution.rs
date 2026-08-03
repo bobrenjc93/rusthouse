@@ -107,6 +107,32 @@ fn filters_rows_and_reports_empty_results() {
 }
 
 #[test]
+fn exposes_query_selections_to_count_and_sum_reductions() {
+    let catalog = readings_catalog();
+
+    let filtered = catalog
+        .execute_select("SELECT sequence FROM readings WHERE active = true")
+        .unwrap();
+    assert_eq!(
+        filtered.table().count(filtered.selection()),
+        Ok(filtered.len())
+    );
+    assert_eq!(
+        filtered.table().sum("sequence", filtered.selection()),
+        Ok(Value::Int64(4))
+    );
+
+    let unfiltered = catalog
+        .execute_select("SELECT value FROM readings")
+        .unwrap();
+    assert!(unfiltered.selection().is_none());
+    assert_eq!(
+        unfiltered.table().sum("value", unfiltered.selection()),
+        Ok(Value::Float64(2.0))
+    );
+}
+
+#[test]
 fn executes_an_already_parsed_statement() {
     let catalog = readings_catalog();
     let statement = SelectStatement {
