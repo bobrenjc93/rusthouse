@@ -163,6 +163,219 @@ fn sum_reports_missing_and_nonnumeric_columns() {
 }
 
 #[test]
+fn avg_covers_full_and_selected_numeric_inputs() {
+    let mut table = all_types_table();
+    table
+        .insert_batch([
+            row(-7, 1.25, false, "skip"),
+            row(12, -3.5, true, "keep"),
+            row(4, 0.75, true, "keep"),
+        ])
+        .unwrap();
+    let selection = table
+        .scan("boolean", ComparisonOperator::Equal, &Value::Bool(true))
+        .unwrap();
+
+    assert_eq!(table.avg("integer", None), Ok(Some(Value::Float64(3.0))));
+    assert_eq!(table.avg("float", None), Ok(Some(Value::Float64(-0.5))));
+    assert_eq!(
+        table.avg("integer", Some(&selection)),
+        Ok(Some(Value::Float64(8.0)))
+    );
+    assert_eq!(
+        table.avg("float", Some(&selection)),
+        Ok(Some(Value::Float64(-1.375)))
+    );
+}
+
+#[test]
+fn avg_returns_none_for_empty_tables_and_selections() {
+    let empty = all_types_table();
+    let empty_table_selection = RowSelection::try_empty(0).unwrap();
+
+    for field in ["integer", "float"] {
+        assert_eq!(empty.avg(field, None), Ok(None));
+        assert_eq!(empty.avg(field, Some(&empty_table_selection)), Ok(None));
+    }
+
+    let mut populated = all_types_table();
+    populated
+        .insert_batch([row(1, 1.0, true, "present")])
+        .unwrap();
+    let empty_selection = RowSelection::try_empty(1).unwrap();
+    for field in ["integer", "float"] {
+        assert_eq!(populated.avg(field, Some(&empty_selection)), Ok(None));
+    }
+}
+
+#[test]
+fn int64_avg_uses_a_wide_exact_accumulator() {
+    let mut repeated_maximum = Table::new(vec![Field::new("value", DataType::Int64)]).unwrap();
+    repeated_maximum
+        .insert_batch([vec![Value::Int64(i64::MAX)], vec![Value::Int64(i64::MAX)]])
+        .unwrap();
+    assert_eq!(
+        repeated_maximum.avg("value", None),
+        Ok(Some(Value::Float64(i64::MAX as f64)))
+    );
+
+    let mut cancellation = Table::new(vec![Field::new("value", DataType::Int64)]).unwrap();
+    cancellation
+        .insert_batch([vec![Value::Int64(i64::MAX)], vec![Value::Int64(i64::MIN)]])
+        .unwrap();
+    assert_eq!(
+        cancellation.avg("value", None),
+        Ok(Some(Value::Float64(-0.5)))
+    );
+
+    let mut exact_quotient = Table::new(vec![Field::new("value", DataType::Int64)]).unwrap();
+    exact_quotient
+        .insert_batch([
+            vec![Value::Int64(9_007_199_254_740_991)],
+            vec![Value::Int64(1)],
+            vec![Value::Int64(1)],
+        ])
+        .unwrap();
+    assert_eq!(
+        exact_quotient.avg("value", None),
+        Ok(Some(Value::Float64(3_002_399_751_580_331.0)))
+    );
+}
+
+#[test]
+fn int64_avg_rounds_halfway_results_to_even() {
+    const BASE: i64 = 9_007_199_254_740_992;
+    let mut table = Table::new(vec![
+        Field::new("even_lower", DataType::Int64),
+        Field::new("even_upper", DataType::Int64),
+    ])
+    .unwrap();
+    table
+        .insert_batch([
+            vec![Value::Int64(BASE), Value::Int64(BASE + 2)],
+            vec![Value::Int64(BASE + 2), Value::Int64(BASE + 4)],
+        ])
+        .unwrap();
+
+    assert_eq!(
+        table.avg("even_lower", None),
+        Ok(Some(Value::Float64(BASE as f64)))
+    );
+    assert_eq!(
+        table.avg("even_upper", None),
+        Ok(Some(Value::Float64((BASE + 4) as f64)))
+    );
+}
+
+#[test]
+fn float64_avg_resists_finite_overflow_and_uses_ieee_754_operations() {
+    let mut overflow = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    overflow
+        .insert_batch([
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(f64::MAX)],
+        ])
+        .unwrap();
+    assert_eq!(
+        overflow.avg("value", None),
+        Ok(Some(Value::Float64(f64::MAX)))
+    );
+
+    let mut cancellation = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    cancellation
+        .insert_batch([
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(f64::MAX)],
+            vec![Value::Float64(-f64::MAX)],
+        ])
+        .unwrap();
+    assert_eq!(
+        cancellation.avg("value", None),
+        Ok(Some(Value::Float64(f64::MAX / 3.0)))
+    );
+
+    let mut infinities = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    infinities
+        .insert_batch([
+            vec![Value::Float64(f64::INFINITY)],
+            vec![Value::Float64(f64::NEG_INFINITY)],
+        ])
+        .unwrap();
+    let positive = infinities
+        .scan(
+            "value",
+            ComparisonOperator::Equal,
+            &Value::Float64(f64::INFINITY),
+        )
+        .unwrap();
+    let negative = infinities
+        .scan(
+            "value",
+            ComparisonOperator::Equal,
+            &Value::Float64(f64::NEG_INFINITY),
+        )
+        .unwrap();
+    assert_eq!(
+        infinities.avg("value", Some(&positive)),
+        Ok(Some(Value::Float64(f64::INFINITY)))
+    );
+    assert_eq!(
+        infinities.avg("value", Some(&negative)),
+        Ok(Some(Value::Float64(f64::NEG_INFINITY)))
+    );
+    assert_avg_is_nan(&infinities);
+
+    let mut nan = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    nan.insert_batch([vec![Value::Float64(1.0)], vec![Value::Float64(f64::NAN)]])
+        .unwrap();
+    assert_avg_is_nan(&nan);
+}
+
+#[test]
+fn float64_avg_of_signed_zeroes_is_positive_zero() {
+    let mut table = Table::new(vec![Field::new("value", DataType::Float64)]).unwrap();
+    table
+        .insert_batch([vec![Value::Float64(-0.0)], vec![Value::Float64(-0.0)]])
+        .unwrap();
+
+    let Some(Value::Float64(average)) = table.avg("value", None).unwrap() else {
+        panic!("nonempty Float64 averages must produce a Float64 value");
+    };
+    assert_eq!(average.to_bits(), 0.0_f64.to_bits());
+}
+
+#[test]
+fn avg_reports_validation_errors() {
+    let mut table = all_types_table();
+    table.insert_batch([row(1, 1.0, true, "one")]).unwrap();
+
+    assert_eq!(
+        table.avg("missing", None),
+        Err(ReductionError::FieldNotFound {
+            name: "missing".to_owned(),
+        })
+    );
+    for (field, data_type) in [("boolean", DataType::Bool), ("text", DataType::String)] {
+        assert_eq!(
+            table.avg(field, None),
+            Err(ReductionError::NonNumericColumn {
+                field: field.to_owned(),
+                data_type,
+            })
+        );
+    }
+
+    let selection = RowSelection::try_empty(2).unwrap();
+    assert_eq!(
+        table.avg("integer", Some(&selection)),
+        Err(ReductionError::SelectionLengthMismatch {
+            table_rows: 1,
+            selection_rows: 2,
+        })
+    );
+}
+
+#[test]
 fn min_and_max_preserve_every_physical_type_for_full_inputs() {
     let mut table = all_types_table();
     table
@@ -367,4 +580,11 @@ fn assert_float_bits(value: Option<Value>, expected: u64) {
         panic!("Float64 extrema must produce a Float64 value");
     };
     assert_eq!(value.to_bits(), expected);
+}
+
+fn assert_avg_is_nan(table: &Table) {
+    let Some(Value::Float64(average)) = table.avg("value", None).unwrap() else {
+        panic!("nonempty Float64 averages must produce a Float64 value");
+    };
+    assert!(average.is_nan());
 }
