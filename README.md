@@ -37,12 +37,15 @@ lines share one in-memory catalog for the life of the process:
 printf '%s\n' \
   'CREATE TABLE events (id Int64, active Bool)' \
   'INSERT INTO events VALUES (1, true), (2, false)' \
-  | cargo run --quiet
+  'SELECT active, id FROM events WHERE id >= 2' \
+  | cargo run --quiet -- --format csv
 ```
 
-The current CLI accepts `CREATE TABLE` and `INSERT INTO ... VALUES` only and is
-silent on success. It does not execute `SELECT` or format query results yet.
-Run `cargo run -- --help` for the input limits and stable exit-code contract.
+`CREATE TABLE` and `INSERT INTO ... VALUES` are silent on success. Each
+`SELECT` writes its projected header and selected rows to stdout as
+CSVWithNames. `--format csv` is accepted for ClickHouse-style invocations and
+is also the default. Run `cargo run -- --help` for the input limits and stable
+exit-code contract.
 
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
 
