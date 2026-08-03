@@ -1,5 +1,6 @@
 use rusthouse::{
-    Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value, ValueRef,
+    Column, ColumnSchema, DataType, InsertError, InsertRowsError, Schema, SchemaError, Table,
+    Value, ValueRef,
 };
 
 fn analytics_schema() -> Schema {
@@ -139,6 +140,159 @@ fn rejects_rows_beyond_capacity_without_mutation() {
         &["north".to_owned(), "south".to_owned()]
     );
     assert!(table.columns().iter().all(|column| column.len() == 2));
+}
+
+#[test]
+fn atomically_inserts_mixed_type_rows() {
+    let mut table = Table::new(analytics_schema(), 3);
+
+    table
+        .insert_rows(vec![
+            vec![
+                Value::Int64(7),
+                Value::Float64(2.5),
+                Value::Bool(true),
+                Value::String("north".to_owned()),
+            ],
+            vec![
+                Value::Int64(11),
+                Value::Float64(8.75),
+                Value::Bool(false),
+                Value::String("south".to_owned()),
+            ],
+        ])
+        .unwrap();
+
+    assert_eq!(table.row_count(), 2);
+    assert_eq!(table.column("id").unwrap().as_int64(), Some(&[7, 11][..]));
+    assert_eq!(
+        table.column("score").unwrap().as_float64(),
+        Some(&[2.5, 8.75][..])
+    );
+    assert_eq!(
+        table.column("active").unwrap().as_bool(),
+        Some(&[true, false][..])
+    );
+    assert_eq!(
+        table.column("label").unwrap().as_string().unwrap(),
+        &["north".to_owned(), "south".to_owned()]
+    );
+}
+
+#[test]
+fn batch_arity_failure_reports_row_and_leaves_table_unchanged() {
+    let mut table = populated_table();
+    let before = table.clone();
+
+    let error = table
+        .insert_rows(vec![
+            vec![
+                Value::Int64(13),
+                Value::Float64(1.25),
+                Value::Bool(true),
+                Value::String("east".to_owned()),
+            ],
+            vec![Value::Int64(17), Value::Float64(4.0)],
+        ])
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        InsertRowsError::InvalidRow {
+            row_index: 1,
+            source: InsertError::ArityMismatch {
+                expected: 4,
+                actual: 2,
+            },
+        }
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn batch_type_failure_reports_row_and_leaves_table_unchanged() {
+    let mut table = Table::new(analytics_schema(), 4);
+    table
+        .insert_row(vec![
+            Value::Int64(7),
+            Value::Float64(2.5),
+            Value::Bool(true),
+            Value::String("north".to_owned()),
+        ])
+        .unwrap();
+    let before = table.clone();
+
+    let error = table
+        .insert_rows(vec![
+            vec![
+                Value::Int64(11),
+                Value::Float64(8.75),
+                Value::Bool(false),
+                Value::String("south".to_owned()),
+            ],
+            vec![
+                Value::Int64(13),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::String("east".to_owned()),
+            ],
+        ])
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        InsertRowsError::InvalidRow {
+            row_index: 1,
+            source: InsertError::TypeMismatch {
+                column_index: 1,
+                column_name: "score".to_owned(),
+                expected: DataType::Float64,
+                actual: DataType::Bool,
+            },
+        }
+    );
+    assert_eq!(table, before);
+}
+
+#[test]
+fn batch_capacity_failure_leaves_table_unchanged() {
+    let mut table = Table::new(analytics_schema(), 2);
+    table
+        .insert_row(vec![
+            Value::Int64(7),
+            Value::Float64(2.5),
+            Value::Bool(true),
+            Value::String("north".to_owned()),
+        ])
+        .unwrap();
+    let before = table.clone();
+
+    let error = table
+        .insert_rows(vec![
+            vec![
+                Value::Int64(11),
+                Value::Float64(8.75),
+                Value::Bool(false),
+                Value::String("south".to_owned()),
+            ],
+            vec![
+                Value::Int64(13),
+                Value::Float64(1.25),
+                Value::Bool(true),
+                Value::String("east".to_owned()),
+            ],
+        ])
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        InsertRowsError::RowLimitExceeded {
+            limit: 2,
+            remaining: 1,
+            attempted: 2,
+        }
+    );
+    assert_eq!(table, before);
 }
 
 fn assert_table_is_empty(table: &Table) {

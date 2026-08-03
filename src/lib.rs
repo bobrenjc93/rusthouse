@@ -3,16 +3,22 @@
 mod input;
 mod sql;
 
+pub mod aggregate;
 pub mod output;
 pub mod storage;
 
+pub use aggregate::{
+    AggregateError, AggregateFunction, Int64AggregateResult, aggregate_int64, avg_int64,
+    count_int64, max_int64, min_int64, sum_int64,
+};
 pub use input::{InputError, MAX_SQL_INPUT_BYTES, read_sql_input};
 pub use sql::{
     MAX_BATCH_STATEMENTS, MAX_BATCH_TOKENS, MAX_SELECT_PROJECTIONS, QueryResult, ResultColumn,
     SqlError, SqlErrorKind, execute_batch,
 };
 pub use storage::{
-    Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value, ValueRef,
+    Column, ColumnSchema, DataType, InsertError, InsertRowsError, Schema, SchemaError, Table,
+    Value, ValueRef,
 };
 
 /// Returns the product name.
