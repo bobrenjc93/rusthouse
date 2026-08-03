@@ -27,6 +27,10 @@ impl TestDirectory {
     fn snapshot(&self) -> PathBuf {
         self.0.join("table.snapshot")
     }
+
+    fn named_snapshot(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
 }
 
 impl Drop for TestDirectory {
@@ -187,6 +191,19 @@ fn duplicate_and_capacity_failures_precede_snapshot_reads() {
         CatalogSnapshotError::Catalog(CatalogError::DuplicateTable { ref name })
             if name == "ReTaInEd"
     ));
+    let fallback_duplicate = catalog
+        .load_table_with_fallback(
+            "ReTaInEd",
+            &missing_path,
+            directory.named_snapshot("also-missing.snapshot"),
+            &snapshots,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        fallback_duplicate,
+        CatalogSnapshotError::Catalog(CatalogError::DuplicateTable { ref name })
+            if name == "ReTaInEd"
+    ));
     assert_retained_only(&catalog);
 
     let capacity = catalog
@@ -195,6 +212,92 @@ fn duplicate_and_capacity_failures_precede_snapshot_reads() {
     assert!(matches!(
         capacity,
         CatalogSnapshotError::Catalog(CatalogError::TableLimitExceeded { limit: 1 })
+    ));
+    let fallback_capacity = catalog
+        .load_table_with_fallback(
+            "another",
+            &missing_path,
+            directory.named_snapshot("also-missing.snapshot"),
+            &snapshots,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        fallback_capacity,
+        CatalogSnapshotError::Catalog(CatalogError::TableLimitExceeded { limit: 1 })
+    ));
+    assert_retained_only(&catalog);
+}
+
+#[test]
+fn loads_a_table_from_an_explicit_fallback_snapshot() {
+    let directory = TestDirectory::new("fallback-success");
+    let primary = directory.named_snapshot("primary.snapshot");
+    let fallback = directory.named_snapshot("fallback.snapshot");
+    let snapshots = SnapshotStore::new(1024);
+    let mut source = Catalog::new();
+    source
+        .execute_create("CREATE TABLE source (id Int64)")
+        .unwrap();
+    source
+        .execute_insert("INSERT INTO source VALUES (11), (12)")
+        .unwrap();
+    source.save_table("source", &fallback, &snapshots).unwrap();
+    fs::write(&primary, b"short").unwrap();
+
+    let mut catalog = catalog_with_retained_table(3);
+    let loaded = catalog
+        .load_table_with_fallback("Recovered", &primary, &fallback, &snapshots)
+        .unwrap();
+
+    assert_eq!(loaded.int64_column("id").unwrap(), [11, 12]);
+    let mut table_names = catalog.table_names().collect::<Vec<_>>();
+    table_names.sort_unstable();
+    assert_eq!(table_names, ["Recovered", "retained"]);
+}
+
+#[test]
+fn invalid_fallback_generations_and_size_limits_leave_catalog_unchanged() {
+    let directory = TestDirectory::new("fallback-rollback");
+    let primary = directory.named_snapshot("primary.snapshot");
+    let fallback = directory.named_snapshot("fallback.snapshot");
+    let writer = SnapshotStore::new(1024);
+    writer.write(&primary, b"primary").unwrap();
+    let mut bytes = fs::read(&primary).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xff;
+    fs::write(&primary, bytes).unwrap();
+    fs::write(&fallback, b"short").unwrap();
+    let mut catalog = catalog_with_retained_table(3);
+
+    let invalid = catalog
+        .load_table_with_fallback("Invalid", &primary, &fallback, &writer)
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        CatalogSnapshotError::Snapshot(TableSnapshotError::Envelope(
+            SnapshotError::FallbackFailed { primary, fallback }
+        )) if matches!(
+            *primary,
+            SnapshotError::Corrupt(rusthouse::snapshot::SnapshotCorruption::ChecksumMismatch { .. })
+        ) && matches!(*fallback, SnapshotError::Truncated { .. })
+    ));
+    assert_retained_only(&catalog);
+
+    let mut source = Catalog::new();
+    source
+        .execute_create("CREATE TABLE source (id Int64)")
+        .unwrap();
+    source.save_table("source", &fallback, &writer).unwrap();
+    fs::remove_file(&primary).unwrap();
+
+    let oversized = catalog
+        .load_table_with_fallback("Oversized", &primary, &fallback, &SnapshotStore::new(4))
+        .unwrap_err();
+    assert!(matches!(
+        oversized,
+        CatalogSnapshotError::Snapshot(TableSnapshotError::Envelope(
+            SnapshotError::FallbackFailed { primary, fallback }
+        )) if matches!(*primary, SnapshotError::Missing { .. })
+            && matches!(*fallback, SnapshotError::Oversized { max_payload_len: 4, .. })
     ));
     assert_retained_only(&catalog);
 }
