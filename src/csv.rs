@@ -1,7 +1,7 @@
 //! Streaming CSV output formats.
 
 use crate::SelectResult;
-use crate::storage::{Column, Table};
+use crate::storage::{Column, Table, Value};
 use std::io::{self, Write};
 
 /// Writes a table in ClickHouse's `CSVWithNames` shape.
@@ -53,9 +53,11 @@ pub fn write_csv_with_names<W: Write + ?Sized>(table: &Table, writer: &mut W) ->
 /// Writes a borrowed [`SelectResult`] in ClickHouse's `CSVWithNames` shape.
 ///
 /// Projected fields are emitted in statement order, including duplicate
-/// projections. Only selected rows are written, in source table order. The
-/// source columns and their values are borrowed directly; this function does
-/// not build a result table or copy selected values.
+/// projections. Only selected rows are written, in source table order. A
+/// scalar aggregate emits exactly one field and one data row, including for an
+/// empty or fully filtered source table. Source columns and their values are
+/// otherwise borrowed directly; this function does not build a result table or
+/// copy selected values.
 ///
 /// Encoding, record termination, and writer-error behavior match
 /// [`write_csv_with_names`]. A result with no selected rows emits only its
@@ -88,6 +90,12 @@ pub fn write_select_csv_with_names<W: Write + ?Sized>(
     }
     writer.write_all(b"\n")?;
 
+    if let Some(value) = result.scalar_value() {
+        write_scalar_value(value, writer)?;
+        writer.write_all(b"\n")?;
+        return Ok(());
+    }
+
     for row in result.selected_rows() {
         for (index, column) in result.projected_columns().enumerate() {
             if index != 0 {
@@ -99,6 +107,15 @@ pub fn write_select_csv_with_names<W: Write + ?Sized>(
     }
 
     Ok(())
+}
+
+fn write_scalar_value<W: Write + ?Sized>(value: &Value, writer: &mut W) -> io::Result<()> {
+    match value {
+        Value::Int64(value) => write!(writer, "{value}"),
+        Value::Float64(value) => write_float(*value, writer),
+        Value::Bool(value) => writer.write_all(if *value { b"true" } else { b"false" }),
+        Value::String(value) => write_quoted(value, writer),
+    }
 }
 
 fn write_header<W: Write + ?Sized>(table: &Table, writer: &mut W) -> io::Result<()> {

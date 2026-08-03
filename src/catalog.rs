@@ -5,13 +5,14 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+use crate::reduction::ReductionError;
 use crate::snapshot::SnapshotStore;
 use crate::sql::{
     CreateTableStatement, InsertParseLimits, InsertStatement, ParseError, ParseLimits,
     SelectParseLimits, SelectProjection, SelectStatement, parse_create_table_with_limits,
     parse_insert_with_limits, parse_select_with_limits,
 };
-use crate::storage::{Column, DEFAULT_ROW_LIMIT, Field, Table, TableError};
+use crate::storage::{Column, DEFAULT_ROW_LIMIT, DataType, Field, Table, TableError, Value};
 use crate::table_snapshot::TableSnapshotError;
 use crate::{RowSelection, ScanError};
 
@@ -117,6 +118,20 @@ pub enum CatalogError {
         /// Scan validation or allocation failure.
         source: ScanError,
     },
+    /// A `COUNT(*)` reduction failed after its optional scan.
+    TableReduction {
+        /// Name from the rejected statement.
+        name: String,
+        /// Reduction validation failure.
+        source: ReductionError,
+    },
+    /// A row count could not be represented by the SQL `Int64` result type.
+    CountOutOfRange {
+        /// Name from the rejected statement.
+        name: String,
+        /// Number of rows produced by the storage reduction.
+        count: usize,
+    },
     /// Creating another table would exceed the configured catalog bound.
     TableLimitExceeded {
         /// Maximum number of tables allowed in the catalog.
@@ -148,6 +163,13 @@ impl fmt::Display for CatalogError {
             Self::TableScan { name, source } => {
                 write!(formatter, "could not scan table `{name}`: {source}")
             }
+            Self::TableReduction { name, source } => {
+                write!(formatter, "could not reduce table `{name}`: {source}")
+            }
+            Self::CountOutOfRange { name, count } => write!(
+                formatter,
+                "table `{name}` count of {count} cannot be represented as Int64"
+            ),
             Self::TableLimitExceeded { limit } => {
                 write!(formatter, "catalog table count exceeds limit of {limit}")
             }
@@ -166,6 +188,7 @@ impl Error for CatalogError {
                 Some(source)
             }
             Self::TableScan { source, .. } => Some(source),
+            Self::TableReduction { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -222,16 +245,24 @@ struct CatalogEntry {
     table: Table,
 }
 
-/// The borrowed output of one projection and optional comparison scan.
+#[derive(Debug)]
+struct ScalarResult {
+    field: Field,
+    value: Value,
+}
+
+/// The output of one projection or scalar aggregate and optional comparison scan.
 ///
-/// The result owns only projected column indexes and, for a filtered query, a
-/// compact row-selection bitmap. Schema and column values remain owned by the
-/// catalog's source table.
+/// A row projection owns only projected column indexes and, for a filtered
+/// query, a compact row-selection bitmap. Schema and column values remain owned
+/// by the catalog's source table. A scalar aggregate owns its single field and
+/// value.
 #[derive(Debug)]
 pub struct SelectResult<'a> {
     table: &'a Table,
     field_indices: Vec<usize>,
     selection: Option<RowSelection>,
+    scalar: Option<ScalarResult>,
 }
 
 impl<'a> SelectResult<'a> {
@@ -245,9 +276,19 @@ impl<'a> SelectResult<'a> {
     pub fn projected_fields(
         &self,
     ) -> impl ExactSizeIterator<Item = &Field> + DoubleEndedIterator + '_ {
-        self.field_indices
-            .iter()
-            .map(|index| &self.table.fields()[*index])
+        let field_count = self.field_indices.len() + usize::from(self.scalar.is_some());
+        (0..field_count).map(|index| {
+            self.field_indices.get(index).map_or_else(
+                || {
+                    &self
+                        .scalar
+                        .as_ref()
+                        .expect("a non-projection field belongs to the scalar result")
+                        .field
+                },
+                |field_index| &self.table.fields()[*field_index],
+            )
+        })
     }
 
     /// Alias for [`Self::projected_fields`].
@@ -263,14 +304,34 @@ impl<'a> SelectResult<'a> {
             .map(|index| &self.table.columns()[*index])
     }
 
-    /// Iterates over selected zero-based indexes in source table order.
+    /// Iterates over selected zero-based result row indexes.
+    ///
+    /// Projection row indexes are also source table indexes. A scalar
+    /// aggregate has exactly one result row at index zero.
     pub fn selected_rows(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        (0..self.table.len()).filter(|row| match &self.selection {
-            Some(selection) => selection
+        let row_count = if self.scalar.is_some() {
+            1
+        } else {
+            self.table.len()
+        };
+        (0..row_count).filter(|row| match (&self.scalar, &self.selection) {
+            (Some(_), _) => true,
+            (None, Some(selection)) => selection
                 .get(*row)
                 .expect("selection and source table have the same row count"),
-            None => true,
+            (None, None) => true,
         })
+    }
+
+    /// Returns the value for a scalar aggregate result.
+    ///
+    /// Row projections return `None`.
+    #[must_use]
+    pub const fn scalar_value(&self) -> Option<&Value> {
+        match &self.scalar {
+            Some(scalar) => Some(&scalar.value),
+            None => None,
+        }
     }
 
     /// Alias for [`Self::selected_rows`].
@@ -278,15 +339,19 @@ impl<'a> SelectResult<'a> {
         self.selected_rows()
     }
 
-    /// Returns the number of selected rows.
+    /// Returns the number of output rows.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.selection
-            .as_ref()
-            .map_or(self.table.len(), RowSelection::selected_count)
+        if self.scalar.is_some() {
+            1
+        } else {
+            self.selection
+                .as_ref()
+                .map_or(self.table.len(), RowSelection::selected_count)
+        }
     }
 
-    /// Returns whether no source rows matched the query.
+    /// Returns whether the result has no output rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -468,7 +533,7 @@ impl Catalog {
             .map_err(|source| CatalogError::TableInsertion { name, source })
     }
 
-    /// Parses and executes one bounded projection `SELECT` statement.
+    /// Parses and executes one bounded `SELECT` statement.
     ///
     /// The returned result borrows the source table and does not copy table
     /// rows. An optional `WHERE` comparison is evaluated with [`Table::scan`].
@@ -477,7 +542,7 @@ impl Catalog {
         self.select(statement)
     }
 
-    /// Executes an already parsed projection `SELECT` statement.
+    /// Executes an already parsed `SELECT` statement.
     ///
     /// This is the typed execution boundary used by [`Self::execute_select`].
     pub fn select(&self, statement: SelectStatement) -> Result<SelectResult<'_>, CatalogError> {
@@ -492,17 +557,56 @@ impl Catalog {
             .map(|entry| &entry.table)
             .ok_or_else(|| CatalogError::TableNotFound { name: name.clone() })?;
 
-        let field_indices = resolve_projection(table, projections)?;
-        let selection = predicate
-            .map(|predicate| table.scan(&predicate.column, predicate.operator, &predicate.value))
-            .transpose()
-            .map_err(|source| CatalogError::TableScan { name, source })?;
+        match projections {
+            SelectProjection::CountAll { alias } => {
+                let selection = predicate
+                    .map(|predicate| {
+                        table.scan(&predicate.column, predicate.operator, &predicate.value)
+                    })
+                    .transpose()
+                    .map_err(|source| CatalogError::TableScan {
+                        name: name.clone(),
+                        source,
+                    })?;
+                let count = table.count(selection.as_ref()).map_err(|source| {
+                    CatalogError::TableReduction {
+                        name: name.clone(),
+                        source,
+                    }
+                })?;
+                let count = i64::try_from(count)
+                    .map_err(|_| CatalogError::CountOutOfRange { name, count })?;
 
-        Ok(SelectResult {
-            table,
-            field_indices,
-            selection,
-        })
+                Ok(SelectResult {
+                    table,
+                    field_indices: Vec::new(),
+                    selection: None,
+                    scalar: Some(ScalarResult {
+                        field: Field::new(
+                            alias.unwrap_or_else(|| "count()".to_owned()),
+                            DataType::Int64,
+                        ),
+                        value: Value::Int64(count),
+                    }),
+                })
+            }
+            projections => {
+                let field_indices = resolve_projection(table, projections)?;
+                let selection = predicate
+                    .map(|predicate| {
+                        table.scan(&predicate.column, predicate.operator, &predicate.value)
+                    })
+                    .transpose()
+                    .map_err(|source| CatalogError::TableScan { name, source })?;
+
+                Ok(SelectResult {
+                    table,
+                    field_indices,
+                    selection,
+                    scalar: None,
+                })
+            }
+        }
     }
 
     /// Returns a table by ASCII case-insensitive name.
@@ -582,6 +686,7 @@ fn resolve_projection(
     let field_count = match &projection {
         SelectProjection::All => table.fields().len(),
         SelectProjection::Columns(names) => names.len(),
+        SelectProjection::CountAll { .. } => unreachable!("counts are reduced before resolution"),
     };
     let mut indices = Vec::new();
     indices
@@ -600,6 +705,7 @@ fn resolve_projection(
                 indices.push(index);
             }
         }
+        SelectProjection::CountAll { .. } => unreachable!("counts are reduced before resolution"),
     }
     Ok(indices)
 }
