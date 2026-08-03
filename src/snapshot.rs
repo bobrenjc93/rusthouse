@@ -87,6 +87,13 @@ pub enum SnapshotError {
     TrailingData { expected_len: u64, actual_len: u64 },
     /// Memory could not be reserved for the bounded payload.
     AllocationFailed { requested_len: u64 },
+    /// The primary snapshot was eligible for recovery, but the fallback also failed.
+    FallbackFailed {
+        /// Missing or integrity failure which caused the fallback to be tried.
+        primary: Box<SnapshotError>,
+        /// Failure returned while reading the caller-supplied fallback.
+        fallback: Box<SnapshotError>,
+    },
     /// The file name belongs to the snapshot writer's sidecar namespace.
     ReservedPath { path: PathBuf },
     /// A filesystem operation failed for a reason not represented above.
@@ -133,6 +140,10 @@ impl fmt::Display for SnapshotError {
                 formatter,
                 "could not reserve memory for a {requested_len}-byte snapshot payload"
             ),
+            Self::FallbackFailed { primary, fallback } => write!(
+                formatter,
+                "primary snapshot failed ({primary}); fallback snapshot failed ({fallback})"
+            ),
             Self::ReservedPath { path } => write!(
                 formatter,
                 "snapshot path {} is reserved for internal writer state",
@@ -155,6 +166,7 @@ impl Error for SnapshotError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Corrupt(corruption) => Some(corruption),
+            Self::FallbackFailed { fallback, .. } => Some(fallback.as_ref()),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -331,6 +343,31 @@ impl SnapshotStore {
         Ok(payload)
     }
 
+    /// Reads `primary_path`, using `fallback_path` only for a recoverable failure.
+    ///
+    /// Missing, truncated, trailing, and checksum-invalid primary snapshots
+    /// are recoverable. Other primary failures are returned directly without
+    /// opening the fallback. Both failures are retained if fallback recovery
+    /// is attempted and fails. Each path is independently subject to this
+    /// store's payload size bound.
+    pub fn read_with_fallback(
+        &self,
+        primary_path: impl AsRef<Path>,
+        fallback_path: impl AsRef<Path>,
+    ) -> Result<Vec<u8>, SnapshotError> {
+        match self.read(primary_path) {
+            Ok(payload) => Ok(payload),
+            Err(primary) if primary.allows_fallback() => {
+                self.read(fallback_path)
+                    .map_err(|fallback| SnapshotError::FallbackFailed {
+                        primary: Box::new(primary),
+                        fallback: Box::new(fallback),
+                    })
+            }
+            Err(primary) => Err(primary),
+        }
+    }
+
     fn validate_payload_len(&self, payload_len: u64) -> Result<(), SnapshotError> {
         if payload_len > self.max_payload_len as u64 {
             return Err(self.oversized(payload_len));
@@ -343,6 +380,18 @@ impl SnapshotStore {
             payload_len,
             max_payload_len: self.max_payload_len as u64,
         }
+    }
+}
+
+impl SnapshotError {
+    fn allows_fallback(&self) -> bool {
+        matches!(
+            self,
+            Self::Missing { .. }
+                | Self::Truncated { .. }
+                | Self::TrailingData { .. }
+                | Self::Corrupt(SnapshotCorruption::ChecksumMismatch { .. })
+        )
     }
 }
 
@@ -694,6 +743,125 @@ mod tests {
 
         let error = SnapshotStore::default().read(&path).unwrap_err();
         assert!(matches!(error, SnapshotError::Missing { path: found } if found == path));
+    }
+
+    #[test]
+    fn reads_an_explicit_fallback_for_each_recoverable_primary_failure() {
+        let directory = TestDirectory::new("fallback-recovery");
+        let primary = directory.snapshot();
+        let fallback = directory.0.join("fallback.snapshot");
+        let store = SnapshotStore::new(32);
+        store.write(&fallback, b"fallback").unwrap();
+
+        store.write(&primary, b"primary").unwrap();
+        assert_eq!(
+            store.read_with_fallback(&primary, &fallback).unwrap(),
+            b"primary"
+        );
+        fs::remove_file(&primary).unwrap();
+        assert_eq!(
+            store.read_with_fallback(&primary, &fallback).unwrap(),
+            b"fallback"
+        );
+        assert!(!primary.exists());
+
+        fs::write(&primary, &SNAPSHOT_MAGIC[..4]).unwrap();
+        assert_eq!(
+            store.read_with_fallback(&primary, &fallback).unwrap(),
+            b"fallback"
+        );
+
+        store.write(&primary, b"primary").unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&primary)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        assert_eq!(
+            store.read_with_fallback(&primary, &fallback).unwrap(),
+            b"fallback"
+        );
+
+        store.write(&primary, b"primary").unwrap();
+        let mut bytes = fs::read(&primary).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&primary, bytes).unwrap();
+        assert_eq!(
+            store.read_with_fallback(&primary, &fallback).unwrap(),
+            b"fallback"
+        );
+    }
+
+    #[test]
+    fn reports_both_invalid_snapshot_generations() {
+        let directory = TestDirectory::new("invalid-generations");
+        let primary = directory.snapshot();
+        let fallback = directory.0.join("fallback.snapshot");
+        let store = SnapshotStore::new(32);
+
+        store.write(&primary, b"primary").unwrap();
+        let mut bytes = fs::read(&primary).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&primary, bytes).unwrap();
+        fs::write(&fallback, &SNAPSHOT_MAGIC[..4]).unwrap();
+
+        let error = store.read_with_fallback(&primary, &fallback).unwrap_err();
+        let SnapshotError::FallbackFailed { primary, fallback } = error else {
+            panic!("expected both snapshot generation errors")
+        };
+        assert!(matches!(
+            *primary,
+            SnapshotError::Corrupt(SnapshotCorruption::ChecksumMismatch { .. })
+        ));
+        assert!(matches!(
+            *fallback,
+            SnapshotError::Truncated {
+                expected_len: 22,
+                actual_len: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn fallback_reads_enforce_size_limits_without_broadening_recovery() {
+        let directory = TestDirectory::new("fallback-limits");
+        let primary = directory.snapshot();
+        let fallback = directory.0.join("fallback.snapshot");
+        SnapshotStore::new(32).write(&fallback, b"four").unwrap();
+        let bounded = SnapshotStore::new(3);
+
+        let error = bounded.read_with_fallback(&primary, &fallback).unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotError::FallbackFailed { primary, fallback }
+                if matches!(*primary, SnapshotError::Missing { .. })
+                    && matches!(
+                        *fallback,
+                        SnapshotError::Oversized {
+                            payload_len: 4,
+                            max_payload_len: 3
+                        }
+                    )
+        ));
+
+        fs::rename(&fallback, &primary).unwrap();
+        SnapshotStore::new(32).write(&fallback, b"ok").unwrap();
+        assert!(matches!(
+            bounded.read_with_fallback(&primary, &fallback).unwrap_err(),
+            SnapshotError::Oversized {
+                payload_len: 4,
+                max_payload_len: 3
+            }
+        ));
+
+        let mut invalid_magic = encode_header(0, crc32(b""));
+        invalid_magic[0] ^= 0xff;
+        fs::write(&primary, invalid_magic).unwrap();
+        assert!(matches!(
+            bounded.read_with_fallback(&primary, &fallback).unwrap_err(),
+            SnapshotError::Corrupt(SnapshotCorruption::InvalidMagic { .. })
+        ));
     }
 
     #[test]
