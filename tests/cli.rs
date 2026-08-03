@@ -1,16 +1,28 @@
 use rusthouse::MAX_SQL_INPUT_BYTES;
+use std::ffi::OsString;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 fn run_cli(arguments: &[&str], input: &[u8]) -> Output {
-    run_cli_with_input_policy(arguments, input, false)
+    let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+    run_cli_with_input_policy(&arguments, input, false)
 }
 
 fn run_cli_allowing_closed_stdin(arguments: &[&str], input: &[u8]) -> Output {
-    run_cli_with_input_policy(arguments, input, true)
+    let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+    run_cli_with_input_policy(&arguments, input, true)
 }
 
-fn run_cli_with_input_policy(arguments: &[&str], input: &[u8], allow_broken_pipe: bool) -> Output {
+#[cfg(unix)]
+fn run_cli_os(arguments: &[OsString], input: &[u8]) -> Output {
+    run_cli_with_input_policy(arguments, input, false)
+}
+
+fn run_cli_with_input_policy(
+    arguments: &[OsString],
+    input: &[u8],
+    allow_broken_pipe: bool,
+) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(arguments)
         .stdin(Stdio::piped())
@@ -31,6 +43,37 @@ fn run_cli_with_input_policy(arguments: &[&str], input: &[u8], allow_broken_pipe
         );
     }
     child.wait_with_output().expect("CLI should finish")
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_arguments_are_usage_errors() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let output = run_cli_os(&[OsString::from_vec(vec![b'-', 0xff])], b"");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "rusthouse: argument is not valid UTF-8\n\
+         Try 'rusthouse --help' for more information.\n"
+    );
+}
+
+#[test]
+fn argument_diagnostics_escape_terminal_controls() {
+    let output = run_cli(&["bad\x1b\nargument"], b"");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        "rusthouse: unrecognized argument `bad\\u{1b}\\nargument`\n\
+         Try 'rusthouse --help' for more information.\n"
+    );
+    assert!(!stderr.contains('\x1b'));
 }
 
 #[test]
