@@ -260,7 +260,7 @@ impl Catalog {
         )
     }
 
-    /// Parses and executes a `SELECT` with explicit comparison-scan bounds.
+    /// Parses and executes a `SELECT` with explicit predicate-scan bounds.
     pub fn execute_select_with_limits(
         &self,
         input: &str,
@@ -285,7 +285,7 @@ impl Catalog {
         )
     }
 
-    /// Executes a parsed projection `SELECT` with explicit comparison-scan bounds.
+    /// Executes a parsed projection `SELECT` with explicit predicate-scan bounds.
     pub fn select_with_limits(
         &self,
         statement: &SelectStatement,

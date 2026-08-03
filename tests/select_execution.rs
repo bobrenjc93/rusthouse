@@ -446,6 +446,186 @@ fn where_comparison_preserves_source_order_and_applies_limit_after_filtering() {
 }
 
 #[test]
+fn where_nullness_predicates_preserve_source_order_on_mixed_input() {
+    let table = table(
+        true,
+        &[None, Some(8), None, Some(-3), Some(8), None, Some(5)],
+    );
+    let cases = [
+        ("IS NULL", vec![None, None, None]),
+        ("IS NOT NULL", vec![Some(8), Some(-3), Some(8), Some(5)]),
+    ];
+
+    for (predicate, expected) in cases {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {predicate}"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+        let values = execute_select("readings", &table, &statement).unwrap();
+
+        assert_eq!(values.as_ref(), expected, "{predicate}");
+        assert!(matches!(values, std::borrow::Cow::Owned(_)), "{predicate}");
+    }
+}
+
+#[test]
+fn where_nullness_predicates_partition_all_null_input() {
+    let table = table(true, &[None, None, None]);
+
+    for (predicate, expected) in [
+        ("IS NULL", &[None, None, None][..]),
+        ("IS NOT NULL", &[][..]),
+    ] {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {predicate};"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_select("readings", &table, &statement)
+                .unwrap()
+                .as_ref(),
+            expected,
+            "{predicate}"
+        );
+    }
+}
+
+#[test]
+fn where_nullness_limits_apply_after_filtering() {
+    let table = table(
+        true,
+        &[None, Some(4), Some(1), None, Some(9), None, Some(2)],
+    );
+    let cases = [
+        ("IS NULL", 2, &[None, None][..]),
+        ("IS NULL", 10, &[None, None, None][..]),
+        ("IS NOT NULL", 0, &[][..]),
+        ("IS NOT NULL", 3, &[Some(4), Some(1), Some(9)][..]),
+    ];
+
+    for (predicate, limit, expected) in cases {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {predicate} LIMIT {limit}"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_select("readings", &table, &statement)
+                .unwrap()
+                .as_ref(),
+            expected,
+            "{predicate} LIMIT {limit}"
+        );
+    }
+}
+
+#[test]
+fn where_nullness_preserves_scan_input_and_result_bounds() {
+    let table = table(true, &[None, Some(1), None, Some(2)]);
+
+    for (predicate, expected) in [
+        ("IS NULL", &[None, None][..]),
+        ("IS NOT NULL", &[Some(1), Some(2)][..]),
+    ] {
+        let statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {predicate} LIMIT 1"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_select_with_limits("readings", &table, &statement, ScanLimits::new(3, 2),),
+            Err(SelectExecutionError::Scan(ScanError::InputLimitExceeded {
+                rows: 4,
+                max_rows: 3,
+            })),
+            "input bound for {predicate}"
+        );
+        assert_eq!(
+            execute_select_with_limits("readings", &table, &statement, ScanLimits::new(4, 1),),
+            Err(SelectExecutionError::Scan(ScanError::ResultLimitExceeded {
+                rows: 2,
+                max_rows: 1,
+            })),
+            "result bound for {predicate}"
+        );
+
+        let exact_statement = parse_select(
+            &format!("SELECT value FROM readings WHERE value {predicate}"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            execute_select_with_limits(
+                "readings",
+                &table,
+                &exact_statement,
+                ScanLimits::new(4, 2),
+            )
+            .unwrap()
+            .as_ref(),
+            expected,
+            "exact bounds for {predicate}"
+        );
+    }
+}
+
+#[test]
+fn where_nullness_validates_table_projection_and_predicate_identifiers() {
+    let table = table(true, &[Some(1), None]);
+    let cases = [
+        (
+            "SELECT value FROM other WHERE value IS NULL",
+            SelectExecutionError::UnknownTable {
+                name: "other".to_owned(),
+            },
+        ),
+        (
+            "SELECT other FROM readings WHERE value IS NULL",
+            SelectExecutionError::UnknownColumn {
+                name: "other".to_owned(),
+            },
+        ),
+        (
+            "SELECT value FROM readings WHERE other IS NOT NULL",
+            SelectExecutionError::UnknownColumn {
+                name: "other".to_owned(),
+            },
+        ),
+    ];
+
+    for (input, expected) in cases {
+        let statement = parse_select(input, ParseLimits::default()).unwrap();
+        assert_eq!(
+            execute_select("readings", &table, &statement),
+            Err(expected),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn orders_rows_selected_by_a_nullness_predicate() {
+    let table = table(true, &[Some(4), None, Some(1), Some(9), None]);
+    let statement = parse_select(
+        "SELECT value FROM readings WHERE value IS NOT NULL ORDER BY value DESC NULLS LAST LIMIT 2",
+        ParseLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        execute_select("readings", &table, &statement)
+            .unwrap()
+            .as_ref(),
+        &[Some(9), Some(4)]
+    );
+}
+
+#[test]
 fn table_name_matching_is_exact_and_a_mismatch_does_not_mutate() {
     let statement = parse_select("SELECT value FROM Readings", ParseLimits::default()).unwrap();
     let table = table(true, &[Some(1), None]);

@@ -7,8 +7,8 @@ use std::fmt;
 use crate::{
     AggregateError, AggregateLimits, DistinctError, DistinctLimits, InsertError, InsertStatement,
     Int64Table, OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScanError, ScanLimits,
-    SelectDistinctStatement, SelectStatement, count_nullable_i64, distinct_nullable_i64,
-    order_nullable_i64, scan_nullable_i64,
+    SelectDistinctStatement, SelectPredicate, SelectStatement, count_nullable_i64,
+    distinct_nullable_i64, order_nullable_i64, scan_nullable_i64, scan_nullable_i64_nullness,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -51,7 +51,7 @@ pub enum SelectExecutionError {
     UnknownTable { name: String },
     /// The statement names a column other than the table's only column.
     UnknownColumn { name: String },
-    /// The bounded comparison scan rejected the input or result size.
+    /// The bounded predicate scan rejected the input or result size.
     Scan(ScanError),
     /// The bounded top-k order operation rejected the input or requested limit.
     Order(OrderError),
@@ -242,8 +242,8 @@ pub fn execute_scalar_count(
 /// `expected_table_name` and the table's column name are compared exactly
 /// with the identifiers retained by the parser, including ASCII case. An
 /// unfiltered, unordered result borrows the table's existing column storage.
-/// A `WHERE` comparison predicate uses a bounded scan, while `ORDER BY ... LIMIT`
-/// uses the bounded top-k operator and owns the ordered values. Use
+/// A `WHERE` predicate uses its corresponding bounded scan, while
+/// `ORDER BY ... LIMIT` uses the bounded top-k operator and owns the ordered values. Use
 /// [`execute_select_with_order_limits`] for explicit bounds on both operators.
 ///
 /// # Examples
@@ -279,11 +279,11 @@ pub fn execute_select<'table>(
     )
 }
 
-/// Executes one parsed `SELECT` with explicit comparison-scan resource bounds.
+/// Executes one parsed `SELECT` with explicit predicate-scan resource bounds.
 ///
 /// Plain projections do not scan and therefore do not consume these bounds.
-/// Filtered projections preserve source-row order and exclude `NULL` because
-/// they delegate predicate evaluation to [`scan_nullable_i64`].
+/// Filtered projections preserve source-row order and delegate predicate
+/// evaluation to the corresponding bounded comparison or nullness scan.
 pub fn execute_select_with_limits<'table>(
     expected_table_name: &str,
     table: &'table Int64Table,
@@ -328,7 +328,7 @@ pub fn execute_select_with_order_limits<'table>(
     let values = table.values();
     let limit = statement.limit().unwrap_or(values.len());
 
-    if let Some(predicate) = statement.predicate() {
+    if let Some(predicate) = statement.where_predicate() {
         if predicate.column_name().as_str() != table.schema().column().name() {
             return Err(SelectExecutionError::UnknownColumn {
                 name: predicate.column_name().as_str().to_owned(),
@@ -343,14 +343,9 @@ pub fn execute_select_with_order_limits<'table>(
             });
         }
 
-        let order_input = match statement.predicate() {
+        let order_input = match statement.where_predicate() {
             Some(predicate) => {
-                let matching_rows = scan_nullable_i64(
-                    values,
-                    predicate.operator(),
-                    predicate.value(),
-                    scan_limits,
-                )?;
+                let matching_rows = scan_select_predicate(values, predicate, scan_limits)?;
                 Cow::Owned(
                     matching_rows
                         .into_iter()
@@ -375,12 +370,11 @@ pub fn execute_select_with_order_limits<'table>(
         return Ok(Cow::Owned(selected));
     }
 
-    let Some(predicate) = statement.predicate() else {
+    let Some(predicate) = statement.where_predicate() else {
         return Ok(Cow::Borrowed(&values[..limit.min(values.len())]));
     };
 
-    let matching_rows =
-        scan_nullable_i64(values, predicate.operator(), predicate.value(), scan_limits)?;
+    let matching_rows = scan_select_predicate(values, predicate, scan_limits)?;
     let selected = matching_rows
         .into_iter()
         .take(limit)
@@ -388,6 +382,21 @@ pub fn execute_select_with_order_limits<'table>(
         .collect();
 
     Ok(Cow::Owned(selected))
+}
+
+fn scan_select_predicate(
+    values: &[Option<i64>],
+    predicate: &SelectPredicate,
+    limits: ScanLimits,
+) -> Result<Vec<usize>, ScanError> {
+    match predicate {
+        SelectPredicate::Comparison(predicate) => {
+            scan_nullable_i64(values, predicate.operator(), predicate.value(), limits)
+        }
+        SelectPredicate::Nullness(predicate) => {
+            scan_nullable_i64_nullness(values, predicate.predicate(), limits)
+        }
+    }
 }
 
 /// Executes one parsed `SELECT DISTINCT` with explicit resource bounds.

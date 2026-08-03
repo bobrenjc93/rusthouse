@@ -1,6 +1,6 @@
 use rusthouse::{
-    ComparisonOperator, NullOrder, OrderDirection, ParseError, ParseLimits, parse_create_table,
-    parse_select,
+    ComparisonOperator, NullOrder, NullPredicate, OrderDirection, ParseError, ParseLimits,
+    SelectPredicate, parse_create_table, parse_select,
 };
 
 #[test]
@@ -148,6 +148,63 @@ fn parses_where_comparison_casing_whitespace_bounds_and_limit() {
 }
 
 #[test]
+fn parses_both_where_nullness_predicates_with_limits_and_semicolons() {
+    let cases = [
+        (
+            "SELECT value FROM events WHERE value IS NULL",
+            NullPredicate::IsNull,
+            None,
+        ),
+        (
+            " select value from events where value\tis\nnull limit 0; ",
+            NullPredicate::IsNull,
+            Some(0),
+        ),
+        (
+            "SELECT value FROM events WhErE value IS NOT NULL LIMIT 7 ;",
+            NullPredicate::IsNotNull,
+            Some(7),
+        ),
+    ];
+
+    for (input, expected, limit) in cases {
+        let statement = parse_select(input, ParseLimits::default()).unwrap();
+        let predicate = statement.nullness_predicate().unwrap();
+
+        assert_eq!(predicate.column_name().as_str(), "value", "{input:?}");
+        assert_eq!(predicate.predicate(), expected, "{input:?}");
+        assert_eq!(statement.limit(), limit, "{input:?}");
+        assert_eq!(statement.predicate(), None, "{input:?}");
+        assert!(
+            matches!(
+                statement.where_predicate(),
+                Some(SelectPredicate::Nullness(_))
+            ),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_where_nullness_predicates() {
+    for input in [
+        "SELECT c FROM t WHERE c IS",
+        "SELECT c FROM t WHERE c IS ",
+        "SELECT c FROM t WHERE c IS NOT",
+        "SELECT c FROM t WHERE c IS NOT ",
+        "SELECT c FROM t WHERE c IS MAYBE",
+        "SELECT c FROM t WHERE c IS NOT MAYBE",
+        "SELECT c FROM t WHERE c ISNULL",
+        "SELECT c FROM t WHERE c IS NULL NULL",
+    ] {
+        assert!(
+            parse_select(input, ParseLimits::default()).is_err(),
+            "{input:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_invalid_and_overflowing_where_literals_with_byte_offsets() {
     let invalid = [
         "SELECT c FROM t WHERE c = ",
@@ -189,6 +246,19 @@ fn rejects_invalid_and_overflowing_where_literals_with_byte_offsets() {
 #[test]
 fn bounds_the_where_identifier() {
     let input = "SELECT c FROM t WHERE column123 = 1";
+    assert_eq!(
+        parse_select(input, ParseLimits::new(input.len(), 8)),
+        Err(ParseError::IdentifierTooLong {
+            offset: input.find("column123").unwrap(),
+            bytes: 9,
+            max_bytes: 8,
+        })
+    );
+}
+
+#[test]
+fn bounds_the_where_nullness_identifier() {
+    let input = "SELECT c FROM t WHERE column123 IS NULL";
     assert_eq!(
         parse_select(input, ParseLimits::new(input.len(), 8)),
         Err(ParseError::IdentifierTooLong {
