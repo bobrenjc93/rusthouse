@@ -1,4 +1,6 @@
-use rusthouse::{Catalog, CatalogError, ParseLimits, materialize_create_table, parse_create_table};
+use rusthouse::{
+    Catalog, CatalogError, ParseLimits, materialize_create_table, parse_create_table, parse_insert,
+};
 
 fn table_entry(name: &str, row_cap: usize) -> rusthouse::TableEntry {
     let statement = parse_create_table(
@@ -46,6 +48,29 @@ fn mutable_lookup_updates_the_registered_table() {
         .unwrap();
 
     assert_eq!(catalog.get("events").unwrap().table().values(), &[Some(41)]);
+}
+
+#[test]
+fn parsed_create_catalog_and_insert_statement_compose() {
+    let create = parse_create_table(
+        "CREATE TABLE Events (value Int64 NOT NULL)",
+        ParseLimits::default(),
+    )
+    .unwrap();
+    let mut catalog = Catalog::new();
+    catalog
+        .register(materialize_create_table(create, 1))
+        .unwrap();
+
+    let insert = parse_insert("INSERT INTO Events VALUES (-7)", ParseLimits::default()).unwrap();
+    catalog
+        .get_mut(insert.table_name().as_str())
+        .unwrap()
+        .table_mut()
+        .append(insert.value())
+        .unwrap();
+
+    assert_eq!(catalog.get("Events").unwrap().table().values(), &[Some(-7)]);
 }
 
 #[test]
