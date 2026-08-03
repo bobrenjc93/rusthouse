@@ -174,6 +174,21 @@ fn writes_only_projected_headers_for_empty_results() {
 }
 
 #[test]
+fn applies_limit_before_streaming_select_rows() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, active Bool)\n\
+          INSERT INTO events VALUES (1, true), (2, false), (3, true), (4, true)\n\
+          SELECT id FROM events WHERE active = true LIMIT 2\n\
+          SELECT active, id FROM events LIMIT 0\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"\"id\"\n1\n3\n\"active\",\"id\"\n");
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],

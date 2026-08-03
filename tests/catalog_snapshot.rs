@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusthouse::snapshot::{SnapshotError, SnapshotStore};
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, CatalogSnapshotError, DataType, ParseLimits,
-    TableSnapshotError,
+    TableSnapshotError, write_select_csv_with_names,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -81,6 +81,33 @@ fn saves_and_loads_a_mixed_table_under_a_new_name() {
         ["ImportedReadings"]
     );
     assert_eq!(reopened.table("importedreadings").unwrap().len(), 2);
+}
+
+#[test]
+fn reopened_tables_support_limited_streaming_selects() {
+    let directory = TestDirectory::new("limited-select");
+    let path = directory.snapshot();
+    let snapshots = SnapshotStore::default();
+    let mut original = Catalog::new();
+    original
+        .execute_create("CREATE TABLE events (id Int64, active Bool)")
+        .unwrap();
+    original
+        .execute_insert("INSERT INTO events VALUES (1, true), (2, false), (3, true)")
+        .unwrap();
+    original.save_table("events", &path, &snapshots).unwrap();
+
+    let mut reopened = Catalog::new();
+    reopened
+        .load_table("archived_events", &path, &snapshots)
+        .unwrap();
+    let result = reopened
+        .execute_select("SELECT id FROM archived_events WHERE active = true LIMIT 1")
+        .unwrap();
+    let mut output = Vec::new();
+    write_select_csv_with_names(&result, &mut output).unwrap();
+
+    assert_eq!(output, b"\"id\"\n1\n");
 }
 
 #[test]
