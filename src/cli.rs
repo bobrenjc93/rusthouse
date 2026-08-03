@@ -311,7 +311,8 @@ fn is_catalog_limit(error: &CatalogError) -> bool {
             source: TableError::RowLimitExceeded { .. },
             ..
         }
-        | CatalogError::TableLimitExceeded { .. } => true,
+        | CatalogError::TableLimitExceeded { .. }
+        | CatalogError::AggregateResultTooLarge { .. } => true,
         _ => false,
     }
 }

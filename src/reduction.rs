@@ -40,6 +40,22 @@ pub enum ReductionError {
         /// Zero-based table row whose value caused the overflow.
         row: usize,
     },
+    /// A selected String extreme exceeds its caller's retained-result budget.
+    StringResultTooLarge {
+        /// Name of the field being reduced.
+        field: String,
+        /// Remaining bytes available to this result.
+        limit: usize,
+        /// Bytes required by the selected String value.
+        required: usize,
+    },
+    /// Memory could not be reserved while copying a selected String extreme.
+    StringAllocationFailed {
+        /// Name of the field being reduced.
+        field: String,
+        /// Bytes requested for the selected String value.
+        required: usize,
+    },
 }
 
 impl fmt::Display for ReductionError {
@@ -62,6 +78,18 @@ impl fmt::Display for ReductionError {
                     "summing Int64 field `{field}` overflowed at row {row}"
                 )
             }
+            Self::StringResultTooLarge {
+                field,
+                limit,
+                required,
+            } => write!(
+                formatter,
+                "String extreme for field `{field}` requires {required} bytes; limit is {limit}"
+            ),
+            Self::StringAllocationFailed { field, required } => write!(
+                formatter,
+                "could not reserve {required} bytes for String extreme of field `{field}`"
+            ),
         }
     }
 }
@@ -163,13 +191,23 @@ impl Table {
     /// value ordering. `Float64` values use [`f64::total_cmp`], including NaNs:
     /// `-0.0` sorts below `+0.0`, and NaN sign, payload, and signaling state
     /// participate in a deterministic total order. Empty tables and selections
-    /// with no set bits return `None`.
+    /// with no set bits return `None`. Selected String values are copied with
+    /// fallible allocation.
     pub fn min(
         &self,
         field: &str,
         selection: Option<&RowSelection>,
     ) -> Result<Option<Value>, ReductionError> {
-        self.extreme(field, selection, Extreme::Minimum)
+        self.extreme(field, selection, Extreme::Minimum, usize::MAX)
+    }
+
+    pub(crate) fn min_with_string_limit(
+        &self,
+        field: &str,
+        selection: Option<&RowSelection>,
+        string_limit: usize,
+    ) -> Result<Option<Value>, ReductionError> {
+        self.extreme(field, selection, Extreme::Minimum, string_limit)
     }
 
     /// Finds the maximum value of a column over all or selected rows.
@@ -182,7 +220,16 @@ impl Table {
         field: &str,
         selection: Option<&RowSelection>,
     ) -> Result<Option<Value>, ReductionError> {
-        self.extreme(field, selection, Extreme::Maximum)
+        self.extreme(field, selection, Extreme::Maximum, usize::MAX)
+    }
+
+    pub(crate) fn max_with_string_limit(
+        &self,
+        field: &str,
+        selection: Option<&RowSelection>,
+        string_limit: usize,
+    ) -> Result<Option<Value>, ReductionError> {
+        self.extreme(field, selection, Extreme::Maximum, string_limit)
     }
 
     fn extreme(
@@ -190,13 +237,20 @@ impl Table {
         field: &str,
         selection: Option<&RowSelection>,
         extreme: Extreme,
+        string_limit: usize,
     ) -> Result<Option<Value>, ReductionError> {
         validate_selection(self.len(), selection)?;
         let column = self.reduction_column(field)?;
-        Ok(match selection {
-            Some(selection) => reduce_extreme(column, selection.selected_rows(), extreme),
-            None => reduce_extreme(column, 0..self.len(), extreme),
-        })
+        match selection {
+            Some(selection) => reduce_extreme(
+                field,
+                column,
+                selection.selected_rows(),
+                extreme,
+                string_limit,
+            ),
+            None => reduce_extreme(field, column, 0..self.len(), extreme, string_limit),
+        }
     }
 
     fn reduction_column(&self, field: &str) -> Result<&Column, ReductionError> {
@@ -387,21 +441,45 @@ fn update_float_mean(mean: f64, value: f64, count: usize) -> f64 {
 }
 
 fn reduce_extreme(
+    field: &str,
     column: &Column,
     rows: impl Iterator<Item = usize>,
     extreme: Extreme,
-) -> Option<Value> {
+    string_limit: usize,
+) -> Result<Option<Value>, ReductionError> {
     match column {
         Column::Int64(values) => {
-            extreme_index(values, rows, i64::cmp, extreme).map(|row| Value::Int64(values[row]))
+            Ok(extreme_index(values, rows, i64::cmp, extreme).map(|row| Value::Int64(values[row])))
         }
-        Column::Float64(values) => extreme_index(values, rows, f64::total_cmp, extreme)
-            .map(|row| Value::Float64(values[row])),
+        Column::Float64(values) => Ok(extreme_index(values, rows, f64::total_cmp, extreme)
+            .map(|row| Value::Float64(values[row]))),
         Column::Bool(values) => {
-            extreme_index(values, rows, u8::cmp, extreme).map(|row| Value::Bool(values[row] != 0))
+            Ok(extreme_index(values, rows, u8::cmp, extreme)
+                .map(|row| Value::Bool(values[row] != 0)))
         }
-        Column::String(values) => extreme_index(values, rows, String::cmp, extreme)
-            .map(|row| Value::String(values[row].clone())),
+        Column::String(values) => {
+            let Some(row) = extreme_index(values, rows, String::cmp, extreme) else {
+                return Ok(None);
+            };
+            let source = &values[row];
+            if source.len() > string_limit {
+                return Err(ReductionError::StringResultTooLarge {
+                    field: field.to_owned(),
+                    limit: string_limit,
+                    required: source.len(),
+                });
+            }
+
+            let mut value = String::new();
+            value.try_reserve_exact(source.len()).map_err(|_| {
+                ReductionError::StringAllocationFailed {
+                    field: field.to_owned(),
+                    required: source.len(),
+                }
+            })?;
+            value.push_str(source);
+            Ok(Some(Value::String(value)))
+        }
     }
 }
 
