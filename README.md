@@ -23,12 +23,21 @@ The early implementation should favor Rust's standard library and a small depend
 
 RustHouse is the dogfood project for [Burner](https://github.com/bobrenjc93/burner). Plain-language repository evaluations establish a baseline. Burner then gives isolated implementation ideas to Codex authors, runs an independent reviewer/author revision loop until approval, reruns the evaluations on the exact candidate branch, and opens impact-stamped pull requests.
 
-```bash
-cargo test
-cargo run -- --help
-```
-
 The repository begins as a deliberately tiny seed. Substantial functionality should arrive through Burner-managed pull requests so the measured history remains visible.
+
+## Local quality gate
+
+RustHouse supports Rust 1.85 and pins Rust 1.85.0 in `rust-toolchain.toml`. With
+[`rustup`](https://rustup.rs/) installed, run the same checks as CI from the
+repository root:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo test --doc --all-features
+```
 
 <!-- burner-progress:start -->
 ## Burner evaluation progress
