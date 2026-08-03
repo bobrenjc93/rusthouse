@@ -6,9 +6,11 @@ pub mod storage;
 pub mod table_snapshot;
 
 pub use sql::{
-    ColumnDefinition, CreateTableStatement, IdentifierContext, InsertParseLimits, InsertStatement,
-    ParseError, ParseErrorKind, ParseLimits, parse_create_table, parse_create_table_with_limits,
-    parse_insert, parse_insert_with_limits,
+    ColumnDefinition, ComparisonOperator, ComparisonPredicate, CreateTableStatement,
+    IdentifierContext, InsertParseLimits, InsertStatement, ParseError, ParseErrorKind, ParseLimits,
+    SelectParseLimits, SelectProjection, SelectStatement, parse_create_table,
+    parse_create_table_with_limits, parse_insert, parse_insert_with_limits, parse_select,
+    parse_select_with_limits,
 };
 pub use storage::{DataType, Field, Table, TableError, Value};
 pub use table_snapshot::{TableSnapshotError, TableSnapshotLocation};

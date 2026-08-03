@@ -27,6 +27,42 @@ pub struct InsertStatement {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// The columns requested by a `SELECT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectProjection {
+    /// Expand every column in the table at planning time.
+    All,
+    /// Return the named columns in the specified order.
+    Columns(Vec<String>),
+}
+
+/// A comparison relationship supported by a `WHERE` predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonOperator {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+/// One column-to-literal comparison in a `WHERE` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonPredicate {
+    pub column: String,
+    pub operator: ComparisonOperator,
+    pub value: Value,
+}
+
+/// The syntax tree produced for a bounded `SELECT` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectStatement {
+    pub projections: SelectProjection,
+    pub table: String,
+    pub predicate: Option<ComparisonPredicate>,
+}
+
 /// Resource limits applied before and during parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseLimits {
@@ -93,6 +129,31 @@ impl Default for InsertParseLimits {
     }
 }
 
+/// Resource limits applied before and during `SELECT` parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectParseLimits {
+    pub max_input_bytes: usize,
+    pub max_projections: usize,
+}
+
+impl SelectParseLimits {
+    pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
+    pub const DEFAULT_MAX_PROJECTIONS: usize = 1024;
+
+    pub const fn new(max_input_bytes: usize, max_projections: usize) -> Self {
+        Self {
+            max_input_bytes,
+            max_projections,
+        }
+    }
+}
+
+impl Default for SelectParseLimits {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_MAX_INPUT_BYTES, Self::DEFAULT_MAX_PROJECTIONS)
+    }
+}
+
 /// The role of an identifier which failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentifierContext {
@@ -148,6 +209,14 @@ pub enum ParseErrorKind {
     EmptyRow,
     TooManyValues {
         limit: usize,
+    },
+    ExpectedProjection,
+    TooManyProjections {
+        limit: usize,
+    },
+    ExpectedComparisonOperator,
+    InvalidComparisonOperator {
+        operator: String,
     },
     ExpectedValue,
     InvalidLiteral {
@@ -205,6 +274,16 @@ impl fmt::Display for ParseErrorKind {
             Self::EmptyRow => formatter.write_str("row contains no values"),
             Self::TooManyValues { limit } => {
                 write!(formatter, "row value count exceeds limit of {limit}")
+            }
+            Self::ExpectedProjection => formatter.write_str("expected a column projection or '*'"),
+            Self::TooManyProjections { limit } => {
+                write!(formatter, "projection count exceeds limit of {limit}")
+            }
+            Self::ExpectedComparisonOperator => {
+                formatter.write_str("expected a comparison operator")
+            }
+            Self::InvalidComparisonOperator { operator } => {
+                write!(formatter, "invalid comparison operator {operator:?}")
             }
             Self::ExpectedValue => formatter.write_str("expected a literal value"),
             Self::InvalidLiteral { literal } => {
@@ -306,6 +385,35 @@ pub fn parse_insert_with_limits(
     }
 
     Parser::new(input).parse_insert(limits)
+}
+
+/// Parses one bounded `SELECT` statement using the default limits.
+pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
+    parse_select_with_limits(input, SelectParseLimits::default())
+}
+
+/// Parses one bounded `SELECT` statement.
+///
+/// Projections are either `*` or a non-empty list of unquoted column names.
+/// The statement reads one table and may contain one `WHERE` comparison between
+/// a column and an `Int64`, `Float64`, `Bool`, or `String` literal. Aliases,
+/// expressions, aggregates, compound predicates, and result modifiers are
+/// outside this intentionally narrow syntax boundary.
+pub fn parse_select_with_limits(
+    input: &str,
+    limits: SelectParseLimits,
+) -> Result<SelectStatement, ParseError> {
+    if input.len() > limits.max_input_bytes {
+        return Err(ParseError {
+            position: limits.max_input_bytes,
+            kind: ParseErrorKind::InputTooLong {
+                limit: limits.max_input_bytes,
+                actual: input.len(),
+            },
+        });
+    }
+
+    Parser::new(input).parse_select(limits)
 }
 
 struct Parser<'a> {
@@ -418,6 +526,147 @@ impl<'a> Parser<'a> {
 
         self.finish_statement()?;
         Ok(InsertStatement { name, rows })
+    }
+
+    fn parse_select(mut self, limits: SelectParseLimits) -> Result<SelectStatement, ParseError> {
+        self.parse_keyword("SELECT")?;
+        let projections = self.parse_projections(limits.max_projections)?;
+        self.parse_keyword("FROM")?;
+        let (table, _) = self.parse_identifier(IdentifierContext::Table)?;
+
+        self.skip_whitespace();
+        let predicate = if self.peek_token_is("WHERE") {
+            self.parse_keyword("WHERE")?;
+            Some(self.parse_comparison(limits.max_input_bytes)?)
+        } else {
+            None
+        };
+
+        self.finish_statement()?;
+        Ok(SelectStatement {
+            projections,
+            table,
+            predicate,
+        })
+    }
+
+    fn parse_projections(
+        &mut self,
+        max_projections: usize,
+    ) -> Result<SelectProjection, ParseError> {
+        self.skip_whitespace();
+        if self.peek() == Some(b'*') {
+            if max_projections == 0 {
+                return Err(self.error(ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                }));
+            }
+            self.position += 1;
+            return Ok(SelectProjection::All);
+        }
+
+        let mut columns = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek().is_none() || self.peek() == Some(b',') || self.peek_token_is("FROM") {
+                return Err(self.error(ParseErrorKind::ExpectedProjection));
+            }
+            if columns.len() == max_projections {
+                return Err(self.error(ParseErrorKind::TooManyProjections {
+                    limit: max_projections,
+                }));
+            }
+
+            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            columns.push(column);
+
+            self.skip_whitespace();
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+        }
+
+        Ok(SelectProjection::Columns(columns))
+    }
+
+    fn parse_comparison(
+        &mut self,
+        max_string_bytes: usize,
+    ) -> Result<ComparisonPredicate, ParseError> {
+        let column = self.parse_comparison_column()?;
+        let operator = self.parse_comparison_operator()?;
+        let value = self.parse_value(max_string_bytes)?;
+        Ok(ComparisonPredicate {
+            column,
+            operator,
+            value,
+        })
+    }
+
+    fn parse_comparison_column(&mut self) -> Result<String, ParseError> {
+        self.skip_whitespace();
+        let start = self.position;
+        while let Some(byte) = self.peek() {
+            if is_whitespace(byte)
+                || matches!(byte, b'(' | b')' | b',' | b';' | b'=' | b'!' | b'<' | b'>')
+            {
+                break;
+            }
+            self.position += 1;
+        }
+
+        let identifier = &self.input[start..self.position];
+        if identifier.is_empty() {
+            return Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::ExpectedIdentifier {
+                    context: IdentifierContext::Column,
+                },
+            });
+        }
+        if let Some(offset) = invalid_identifier_offset(identifier) {
+            return Err(ParseError {
+                position: start + offset,
+                kind: ParseErrorKind::InvalidIdentifier {
+                    context: IdentifierContext::Column,
+                    identifier: identifier.to_owned(),
+                },
+            });
+        }
+
+        Ok(identifier.to_owned())
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator, ParseError> {
+        self.skip_whitespace();
+        let start = self.position;
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b'=' | b'!' | b'<' | b'>'))
+        {
+            self.position += 1;
+        }
+
+        let operator = &self.input[start..self.position];
+        match operator {
+            "=" => Ok(ComparisonOperator::Equal),
+            "!=" | "<>" => Ok(ComparisonOperator::NotEqual),
+            "<" => Ok(ComparisonOperator::LessThan),
+            "<=" => Ok(ComparisonOperator::LessThanOrEqual),
+            ">" => Ok(ComparisonOperator::GreaterThan),
+            ">=" => Ok(ComparisonOperator::GreaterThanOrEqual),
+            "" => Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::ExpectedComparisonOperator,
+            }),
+            _ => Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::InvalidComparisonOperator {
+                    operator: operator.to_owned(),
+                },
+            }),
+        }
     }
 
     fn parse_row(&mut self, limits: InsertParseLimits) -> Result<Vec<Value>, ParseError> {
@@ -655,6 +904,22 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
         &self.input[start..self.position]
+    }
+
+    fn peek_token_is(&self, expected: &str) -> bool {
+        let bytes = self.input.as_bytes();
+        let mut position = self.position;
+        while bytes.get(position).copied().is_some_and(is_whitespace) {
+            position += 1;
+        }
+        let start = position;
+        while let Some(byte) = bytes.get(position) {
+            if is_whitespace(*byte) || matches!(byte, b'(' | b')' | b',' | b';') {
+                break;
+            }
+            position += 1;
+        }
+        self.input[start..position].eq_ignore_ascii_case(expected)
     }
 
     fn skip_whitespace(&mut self) {
