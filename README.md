@@ -24,10 +24,13 @@ The early implementation should favor Rust's standard library and a small depend
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
-`Int64` equality predicates through `WHERE column = literal` and an optional
-nonnegative `LIMIT`. Plain projections borrow a prefix of the table's column
-storage; filtered projections return matching non-`NULL` values in source
-order through the bounded comparison scan.
+`Int64` equality predicates through `WHERE column = literal`, an optional
+nonnegative `LIMIT`, and the exact grouped aggregate form
+`SELECT column, COUNT(*) FROM table GROUP BY column`. Plain projections borrow
+a prefix of the table's column storage; filtered projections return matching
+non-`NULL` values in source order through the bounded comparison scan. Grouped
+counts require explicit input-row and distinct-group limits and return `NULL`
+first, followed by non-`NULL` keys in ascending order.
 
 ## Snapshot envelope
 

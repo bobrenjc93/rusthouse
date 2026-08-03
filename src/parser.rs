@@ -172,6 +172,31 @@ impl SelectStatement {
     }
 }
 
+/// The typed syntax tree for a one-column grouped `COUNT(*)` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedCountStatement {
+    column_name: Identifier,
+    table_name: Identifier,
+    group_by_column_name: Identifier,
+}
+
+impl GroupedCountStatement {
+    /// Returns the selected group-key column name.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns the source table name.
+    pub fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+
+    /// Returns the `GROUP BY` column name.
+    pub fn group_by_column_name(&self) -> &Identifier {
+        &self.group_by_column_name
+    }
+}
+
 /// An error produced while parsing a bounded SQL statement.
 ///
 /// Offsets and sizes are byte-based, matching Rust string indexing.
@@ -362,6 +387,45 @@ pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement,
     Parser::new(input, limits.max_identifier_bytes).parse_select()
 }
 
+/// Parses one grouped `COUNT(*)` statement over one column and one table.
+///
+/// Keywords are ASCII case-insensitive. All three identifiers follow the same
+/// rules and bounds as [`parse_create_table`]. The complete accepted grammar is:
+///
+/// ```text
+/// SELECT identifier, COUNT(*) FROM identifier GROUP BY identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, as is whitespace around
+/// the comma and before or after the optional semicolon. The selected and
+/// grouped identifiers are retained independently so execution can report an
+/// exact mismatch. Statement limits and all reported offsets are measured in
+/// bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, parse_grouped_count};
+///
+/// let statement = parse_grouped_count(
+///     "SELECT event_id, COUNT(*) FROM events GROUP BY event_id;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert_eq!(statement.column_name().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// assert_eq!(statement.group_by_column_name().as_str(), "event_id");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_grouped_count(
+    input: &str,
+    limits: ParseLimits,
+) -> Result<GroupedCountStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_grouped_count()
+}
+
 fn validate_statement_length(input: &str, limits: ParseLimits) -> Result<(), ParseError> {
     if input.len() > limits.max_statement_bytes {
         return Err(ParseError::StatementTooLong {
@@ -519,6 +583,47 @@ impl<'input> Parser<'input> {
             table_name,
             predicate,
             limit,
+        })
+    }
+
+    fn parse_grouped_count(mut self) -> Result<GroupedCountStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        let column_name = self.parse_identifier()?;
+        self.skip_whitespace();
+        self.expect_byte(b',', "','")?;
+        self.skip_whitespace();
+        self.expect_keyword("COUNT")?;
+        self.expect_byte(b'(', "'('")?;
+        self.expect_byte(b'*', "'*'")?;
+        self.expect_byte(b')', "')'")?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before GROUP BY")?;
+        self.expect_keyword("GROUP")?;
+        self.require_whitespace("whitespace after GROUP")?;
+        self.expect_keyword("BY")?;
+        self.require_whitespace("whitespace after BY")?;
+        let group_by_column_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(GroupedCountStatement {
+            column_name,
+            table_name,
+            group_by_column_name,
         })
     }
 
