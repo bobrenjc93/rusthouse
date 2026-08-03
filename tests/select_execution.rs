@@ -117,6 +117,7 @@ fn executes_an_already_parsed_statement() {
             operator: ComparisonOperator::GreaterThanOrEqual,
             value: Value::Int64(2),
         }),
+        limit: None,
     };
 
     let result = catalog.select(statement).unwrap();
@@ -129,6 +130,38 @@ fn executes_an_already_parsed_statement() {
         ["label"]
     );
     assert_eq!(result.selected_rows().rev().collect::<Vec<_>>(), [2, 1]);
+}
+
+#[test]
+fn limits_unfiltered_results_at_zero_exact_and_oversized_bounds() {
+    let catalog = readings_catalog();
+    let cases: [(usize, &[usize]); 3] = [(0, &[]), (3, &[0, 1, 2]), (100, &[0, 1, 2])];
+
+    for (limit, expected) in cases {
+        let result = catalog
+            .execute_select(&format!("SELECT label FROM readings LIMIT {limit}"))
+            .unwrap();
+
+        assert!(std::ptr::eq(
+            result.table(),
+            catalog.table("readings").unwrap()
+        ));
+        assert_eq!(result.selected_rows().collect::<Vec<_>>(), expected);
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(result.is_empty(), expected.is_empty());
+    }
+}
+
+#[test]
+fn applies_limit_after_filtering_in_source_order() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select("SELECT label FROM readings WHERE sequence > 1 LIMIT 1")
+        .unwrap();
+
+    assert_eq!(result.selected_rows().collect::<Vec<_>>(), [1]);
+    assert_eq!(result.row_indices().rev().collect::<Vec<_>>(), [1]);
+    assert_eq!(result.len(), 1);
 }
 
 #[test]

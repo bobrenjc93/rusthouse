@@ -16,6 +16,7 @@ fn parses_wildcard_and_named_projections() {
             projections: SelectProjection::All,
             table: "events".to_owned(),
             predicate: None,
+            limit: None,
         }
     );
 
@@ -29,6 +30,7 @@ fn parses_wildcard_and_named_projections() {
             ]),
             table: "Events".to_owned(),
             predicate: None,
+            limit: None,
         }
     );
 }
@@ -39,6 +41,7 @@ fn parses_wildcard_adjacent_to_select_and_from_keywords() {
         projections: SelectProjection::All,
         table: "events".to_owned(),
         predicate: None,
+        limit: None,
     };
 
     for input in [
@@ -48,6 +51,68 @@ fn parses_wildcard_adjacent_to_select_and_from_keywords() {
     ] {
         assert_eq!(parse_select(input).unwrap(), expected, "input: {input:?}");
     }
+}
+
+#[test]
+fn parses_limit_after_the_table_or_predicate() {
+    let unfiltered = parse_select("SELECT * FROM events LIMIT 0").unwrap();
+    assert_eq!(unfiltered.limit, Some(0));
+    assert_eq!(unfiltered.predicate, None);
+
+    let filtered = parse_select("SELECT id FROM events WHERE active = true LiMiT 25;").unwrap();
+    assert_eq!(filtered.limit, Some(25));
+    assert!(filtered.predicate.is_some());
+
+    let maximum = parse_select(&format!("SELECT * FROM events LIMIT {}", usize::MAX)).unwrap();
+    assert_eq!(maximum.limit, Some(usize::MAX));
+}
+
+#[test]
+fn reports_positioned_malformed_and_overflowing_limits() {
+    let malformed = [
+        ("SELECT * FROM t LIMIT", ParseErrorKind::ExpectedLimit),
+        (
+            "SELECT * FROM t LIMIT -1",
+            ParseErrorKind::InvalidLimit {
+                literal: "-1".to_owned(),
+            },
+        ),
+        (
+            "SELECT * FROM t LIMIT 1.5",
+            ParseErrorKind::InvalidLimit {
+                literal: "1.5".to_owned(),
+            },
+        ),
+        (
+            "SELECT * FROM t LIMIT many",
+            ParseErrorKind::InvalidLimit {
+                literal: "many".to_owned(),
+            },
+        ),
+    ];
+
+    for (input, kind) in malformed {
+        let error = parse_error(input);
+        let after_keyword = input.find("LIMIT").unwrap() + "LIMIT".len();
+        let expected_position = input[after_keyword..]
+            .find(|character: char| !character.is_ascii_whitespace())
+            .map_or(input.len(), |offset| after_keyword + offset);
+        assert_eq!(error.position, expected_position, "input: {input:?}");
+        assert_eq!(error.kind, kind, "input: {input:?}");
+    }
+
+    let overflow = format!("SELECT * FROM t LIMIT {}0", usize::MAX);
+    let error = parse_error(&overflow);
+    assert_eq!(
+        error.position,
+        overflow.find(usize::MAX.to_string().as_str()).unwrap()
+    );
+    assert_eq!(
+        error.kind,
+        ParseErrorKind::LimitOutOfRange {
+            literal: format!("{}0", usize::MAX),
+        }
+    );
 }
 
 #[test]
@@ -224,7 +289,6 @@ fn rejects_aliases_aggregates_compound_predicates_and_result_clauses() {
         ("SELECT * FROM events WHERE id = 1 OR id = 2", "OR"),
         ("SELECT * FROM events GROUP BY id", "GROUP"),
         ("SELECT * FROM events ORDER BY id", "ORDER"),
-        ("SELECT * FROM events LIMIT 10", "LIMIT"),
     ];
 
     for (input, marker) in cases {
