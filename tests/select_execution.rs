@@ -3,8 +3,14 @@ use std::error::Error;
 use rusthouse::{
     Catalog, CatalogError, CatalogLimits, ComparisonOperator, ComparisonPredicate, DataType,
     ParseErrorKind, ParseLimits, ReductionError, ScanError, SelectParseLimits, SelectProjection,
-    SelectStatement, Value,
+    SelectResult, SelectStatement, Value,
 };
+
+const fn scalar_value_through_const_api<'result, 'table>(
+    result: &'result SelectResult<'table>,
+) -> Option<&'result Value> {
+    result.scalar_value()
+}
 
 fn readings_catalog() -> Catalog {
     let mut catalog = Catalog::new();
@@ -119,7 +125,7 @@ fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
             .collect::<Vec<_>>(),
         [("count()", DataType::Int64)]
     );
-    assert_eq!(all.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(scalar_value_through_const_api(&all), Some(&Value::Int64(3)));
     assert_eq!(all.row_indices().collect::<Vec<_>>(), [0]);
     assert_eq!(all.len(), 1);
     assert!(!all.is_empty());

@@ -380,13 +380,11 @@ impl<'a> SelectResult<'a> {
     ///
     /// Row projections and scalar rows suppressed by `LIMIT 0` return `None`.
     #[must_use]
-    pub fn scalar_value(&self) -> Option<&Value> {
-        match (&self.scalars, self.row_count) {
+    pub const fn scalar_value(&self) -> Option<&Value> {
+        match (self.scalars.as_slice(), self.row_count) {
             (_, 0) => None,
-            (scalars, _) => match scalars.first() {
-                Some(scalar) => Some(&scalar.value),
-                None => None,
-            },
+            ([scalar, ..], _) => Some(&scalar.value),
+            ([], _) => None,
         }
     }
 
