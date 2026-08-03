@@ -2,6 +2,7 @@
 
 pub mod aggregate;
 pub mod csv;
+pub mod execution;
 pub mod grouping;
 pub mod order;
 pub mod parser;
@@ -12,6 +13,7 @@ pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, RowSelection, aggregate_nullable_i64,
 };
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
+pub use execution::{InsertExecutionError, execute_insert};
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
