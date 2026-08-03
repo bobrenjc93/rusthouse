@@ -1,4 +1,6 @@
-use rusthouse::{ParseError, ParseLimits, parse_create_table, parse_select};
+use rusthouse::{
+    NullOrder, OrderDirection, ParseError, ParseLimits, parse_create_table, parse_select,
+};
 
 #[test]
 fn parses_casing_whitespace_and_optional_semicolon() {
@@ -15,7 +17,63 @@ fn parses_casing_whitespace_and_optional_semicolon() {
         assert_eq!(statement.column_name().as_str(), column_name, "{input:?}");
         assert_eq!(statement.table_name().as_str(), table_name, "{input:?}");
         assert_eq!(statement.predicate(), None, "{input:?}");
+        assert_eq!(statement.order_by(), None, "{input:?}");
         assert_eq!(statement.limit(), None, "{input:?}");
+    }
+}
+
+#[test]
+fn parses_explicit_order_direction_null_placement_and_limit() {
+    let cases = [
+        (
+            "SELECT value FROM events ORDER BY value ASC NULLS FIRST LIMIT 7",
+            OrderDirection::Asc,
+            NullOrder::First,
+        ),
+        (
+            "select value from events order by value asc nulls last limit 7;",
+            OrderDirection::Asc,
+            NullOrder::Last,
+        ),
+        (
+            "SELECT value FROM events ORDER\tBY\nvalue DESC NULLS FIRST LIMIT 7 ; ",
+            OrderDirection::Desc,
+            NullOrder::First,
+        ),
+        (
+            "SELECT value FROM events ORDER BY value DESC NULLS LAST LIMIT 7",
+            OrderDirection::Desc,
+            NullOrder::Last,
+        ),
+    ];
+
+    for (input, direction, null_order) in cases {
+        let statement = parse_select(input, ParseLimits::default()).unwrap();
+        let order_by = statement.order_by().unwrap();
+
+        assert_eq!(order_by.column_name().as_str(), "value", "{input:?}");
+        assert_eq!(order_by.direction(), direction, "{input:?}");
+        assert_eq!(order_by.null_order(), null_order, "{input:?}");
+        assert_eq!(statement.limit(), Some(7), "{input:?}");
+    }
+}
+
+#[test]
+fn order_by_requires_every_explicit_component_and_a_limit() {
+    for input in [
+        "SELECT c FROM t ORDER c ASC NULLS FIRST LIMIT 1",
+        "SELECT c FROM t ORDER BY c NULLS FIRST LIMIT 1",
+        "SELECT c FROM t ORDER BY c ASC FIRST LIMIT 1",
+        "SELECT c FROM t ORDER BY c ASC NULLS LIMIT 1",
+        "SELECT c FROM t ORDER BY c ASC NULLS FIRST",
+    ] {
+        assert!(
+            matches!(
+                parse_select(input, ParseLimits::default()),
+                Err(ParseError::UnexpectedInput { .. })
+            ),
+            "{input:?}"
+        );
     }
 }
 

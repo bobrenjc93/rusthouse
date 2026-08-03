@@ -25,9 +25,12 @@ RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
 `Int64` equality predicates through `WHERE column = literal` and an optional
-nonnegative `LIMIT`. Plain projections borrow a prefix of the table's column
-storage; filtered projections return matching non-`NULL` values in source
-order through the bounded comparison scan.
+nonnegative `LIMIT`. The explicit
+`ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
+operator and materializes rows in stable order. Plain projections borrow a
+prefix of the table's column storage;
+filtered projections return matching non-`NULL` values in source order through
+the bounded comparison scan.
 
 ## Snapshot envelope
 

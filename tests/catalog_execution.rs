@@ -1,6 +1,6 @@
 use rusthouse::{
-    Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError, ParseError,
-    ParseLimits, ScanError, ScanLimits, SelectExecutionError,
+    Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError, OrderError,
+    ParseError, ParseLimits, ScanError, ScanLimits, SelectExecutionError,
 };
 
 fn catalog(max_tables: usize, max_rows_per_table: usize) -> Catalog {
@@ -68,6 +68,46 @@ fn executes_where_equality_end_to_end_with_null_semantics() {
 
     assert_eq!(selected.as_ref(), &[Some(7), Some(7)]);
     assert!(matches!(selected, std::borrow::Cow::Owned(_)));
+}
+
+#[test]
+fn executes_order_by_limit_end_to_end_with_catalog_bounds() {
+    let limits = ParseLimits::default();
+    let mut catalog = catalog(1, 4);
+    catalog
+        .execute_create("CREATE TABLE readings (value Int64 NULL)", limits)
+        .unwrap();
+    for input in [
+        "INSERT INTO readings VALUES (7)",
+        "INSERT INTO readings VALUES (NULL)",
+        "INSERT INTO readings VALUES (-2)",
+        "INSERT INTO readings VALUES (7)",
+    ] {
+        catalog.execute_insert(input, limits).unwrap();
+    }
+
+    assert_eq!(
+        catalog
+            .execute_select(
+                "SELECT value FROM readings ORDER BY value DESC NULLS LAST LIMIT 4;",
+                limits,
+            )
+            .unwrap()
+            .as_ref(),
+        &[Some(7), Some(7), Some(-2), None]
+    );
+    assert_eq!(
+        catalog.execute_select(
+            "SELECT value FROM readings ORDER BY value DESC NULLS LAST LIMIT 5",
+            limits,
+        ),
+        Err(CatalogError::Select(SelectExecutionError::Order(
+            OrderError::LimitExceeded {
+                limit: 5,
+                max_limit: 4,
+            }
+        )))
+    );
 }
 
 #[test]

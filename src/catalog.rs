@@ -7,11 +7,11 @@ use std::fmt;
 
 use crate::execution::{
     InsertExecutionError, SelectExecutionError, execute_insert as execute_insert_statement,
-    execute_select_with_limits as execute_select_statement_with_limits,
+    execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    CreateTableStatement, InsertStatement, Int64Table, ParseError, ParseLimits, ScanLimits, Schema,
-    SelectStatement, parse_create_table, parse_insert, parse_select,
+    CreateTableStatement, InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits,
+    ScanLimits, Schema, SelectStatement, parse_create_table, parse_insert, parse_select,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -260,7 +260,16 @@ impl Catalog {
             })
         })?;
 
-        execute_select_statement_with_limits(name, table, statement, scan_limits)
-            .map_err(CatalogError::Select)
+        execute_select_statement_with_limits(
+            name,
+            table,
+            statement,
+            scan_limits,
+            OrderLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+        )
+        .map_err(CatalogError::Select)
     }
 }
