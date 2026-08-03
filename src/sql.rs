@@ -898,7 +898,7 @@ impl<'a> Parser<'a> {
     fn take_token(&mut self) -> &'a str {
         let start = self.position;
         while let Some(byte) = self.peek() {
-            if is_whitespace(byte) || matches!(byte, b'(' | b')' | b',' | b';') {
+            if is_whitespace(byte) || matches!(byte, b'(' | b')' | b',' | b';' | b'*') {
                 break;
             }
             self.position += 1;
@@ -914,7 +914,7 @@ impl<'a> Parser<'a> {
         }
         let start = position;
         while let Some(byte) = bytes.get(position) {
-            if is_whitespace(*byte) || matches!(byte, b'(' | b')' | b',' | b';') {
+            if is_whitespace(*byte) || matches!(byte, b'(' | b')' | b',' | b';' | b'*') {
                 break;
             }
             position += 1;

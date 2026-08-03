@@ -34,6 +34,23 @@ fn parses_wildcard_and_named_projections() {
 }
 
 #[test]
+fn parses_wildcard_adjacent_to_select_and_from_keywords() {
+    let expected = SelectStatement {
+        projections: SelectProjection::All,
+        table: "events".to_owned(),
+        predicate: None,
+    };
+
+    for input in [
+        "SELECT* FROM events",
+        "SELECT *FROM events",
+        "SELECT*FROM events",
+    ] {
+        assert_eq!(parse_select(input).unwrap(), expected, "input: {input:?}");
+    }
+}
+
+#[test]
 fn parses_all_comparison_operators_without_required_whitespace() {
     let cases = [
         ("=", ComparisonOperator::Equal),
