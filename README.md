@@ -22,9 +22,11 @@ The early implementation should favor Rust's standard library and a small depend
 ## Snapshot envelope
 
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit
-magic value, format version, declared length, and CRC-32 checksum. This defines
-the persistence corruption boundary without yet choosing catalog serialization
-or filesystem replacement. The exact version 1 layout is documented in
+magic value, format version, declared length, and CRC-32 checksum.
+`NullableI64PayloadCodec` provides the first deterministic storage payload: a
+bounded row count and tagged nullable `Int64` values. These define the current
+persistence corruption boundary without yet choosing catalog serialization or
+filesystem replacement. The exact layouts are documented in
 [docs/snapshot-format.md](docs/snapshot-format.md).
 
 ## CSV ingestion
