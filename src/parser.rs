@@ -204,6 +204,49 @@ impl SelectStatement {
     }
 }
 
+/// The argument to a scalar `COUNT` aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarCountArgument {
+    /// Count every input row, including rows containing `NULL`.
+    Star,
+    /// Count non-`NULL` values in the named column.
+    Column(Identifier),
+}
+
+impl ScalarCountArgument {
+    /// Returns the counted column, or `None` for `COUNT(*)`.
+    pub const fn column_name(&self) -> Option<&Identifier> {
+        match self {
+            Self::Star => None,
+            Self::Column(column_name) => Some(column_name),
+        }
+    }
+}
+
+/// The typed syntax tree for a scalar `COUNT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarCountStatement {
+    argument: ScalarCountArgument,
+    table_name: Identifier,
+}
+
+impl ScalarCountStatement {
+    /// Returns whether the aggregate counts all rows or one column.
+    pub const fn argument(&self) -> &ScalarCountArgument {
+        &self.argument
+    }
+
+    /// Returns the counted column, or `None` for `COUNT(*)`.
+    pub const fn column_name(&self) -> Option<&Identifier> {
+        self.argument.column_name()
+    }
+
+    /// Returns the source table name.
+    pub const fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+}
+
 /// An error produced while parsing a bounded SQL statement.
 ///
 /// Offsets and sizes are byte-based, matching Rust string indexing.
@@ -394,6 +437,46 @@ pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement,
     validate_statement_length(input, limits)?;
 
     Parser::new(input, limits.max_identifier_bytes).parse_select()
+}
+
+/// Parses one scalar `COUNT(*)` or `COUNT(column)` statement.
+///
+/// Keywords are ASCII case-insensitive. The optional column argument and table
+/// identifier follow the same rules and bounds as [`parse_create_table`]. The
+/// complete accepted grammar is:
+///
+/// ```text
+/// SELECT COUNT(* | identifier) FROM identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, including whitespace
+/// around the aggregate argument and before or after the optional semicolon.
+/// Aliases, predicates, grouping, ordering, and limits are outside this narrow
+/// scalar grammar. Statement limits and all reported offsets are measured in
+/// bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, ScalarCountArgument, parse_scalar_count};
+///
+/// let statement = parse_scalar_count(
+///     "SELECT COUNT(event_id) FROM events;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert!(matches!(statement.argument(), ScalarCountArgument::Column(_)));
+/// assert_eq!(statement.column_name().unwrap().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_scalar_count(
+    input: &str,
+    limits: ParseLimits,
+) -> Result<ScalarCountStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_scalar_count()
 }
 
 fn validate_statement_length(input: &str, limits: ParseLimits) -> Result<(), ParseError> {
@@ -596,6 +679,44 @@ impl<'input> Parser<'input> {
             predicate,
             order_by,
             limit,
+        })
+    }
+
+    fn parse_scalar_count(mut self) -> Result<ScalarCountStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        self.expect_keyword("COUNT")?;
+        self.skip_whitespace();
+        self.expect_byte(b'(', "'('")?;
+        self.skip_whitespace();
+        let argument = if self.peek() == Some(b'*') {
+            self.position += 1;
+            ScalarCountArgument::Star
+        } else {
+            ScalarCountArgument::Column(self.parse_identifier()?)
+        };
+        self.skip_whitespace();
+        self.expect_byte(b')', "')'")?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(ScalarCountStatement {
+            argument,
+            table_name,
         })
     }
 

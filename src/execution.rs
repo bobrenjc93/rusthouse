@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ComparisonOperator, InsertError, InsertStatement, Int64Table, OrderError, OrderLimits,
-    ScanError, ScanLimits, SelectStatement, order_nullable_i64, scan_nullable_i64,
+    AggregateError, AggregateLimits, ComparisonOperator, InsertError, InsertStatement, Int64Table,
+    OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScanError, ScanLimits,
+    SelectStatement, aggregate_nullable_i64, order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -42,7 +43,7 @@ impl From<InsertError> for InsertExecutionError {
     }
 }
 
-/// An error produced while executing a parsed [`SelectStatement`].
+/// An error produced while executing a parsed projection or scalar `SELECT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectExecutionError {
     /// The statement names a table other than the one supplied for execution.
@@ -53,6 +54,8 @@ pub enum SelectExecutionError {
     Scan(ScanError),
     /// The bounded top-k order operation rejected the input or requested limit.
     Order(OrderError),
+    /// The bounded aggregate operation rejected the input or selection size.
+    Aggregate(AggregateError),
 }
 
 impl fmt::Display for SelectExecutionError {
@@ -62,6 +65,7 @@ impl fmt::Display for SelectExecutionError {
             Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
             Self::Scan(error) => write!(formatter, "could not scan rows: {error}"),
             Self::Order(error) => write!(formatter, "could not order rows: {error}"),
+            Self::Aggregate(error) => write!(formatter, "could not aggregate rows: {error}"),
         }
     }
 }
@@ -71,6 +75,7 @@ impl Error for SelectExecutionError {
         match self {
             Self::Scan(error) => Some(error),
             Self::Order(error) => Some(error),
+            Self::Aggregate(error) => Some(error),
             Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
         }
     }
@@ -85,6 +90,12 @@ impl From<ScanError> for SelectExecutionError {
 impl From<OrderError> for SelectExecutionError {
     fn from(error: OrderError) -> Self {
         Self::Order(error)
+    }
+}
+
+impl From<AggregateError> for SelectExecutionError {
+    fn from(error: AggregateError) -> Self {
+        Self::Aggregate(error)
     }
 }
 
@@ -125,6 +136,66 @@ pub fn execute_insert(
     }
 
     table.append(statement.value()).map_err(Into::into)
+}
+
+/// Executes one parsed scalar `COUNT` with explicit resource bounds.
+///
+/// The expected table name and optional column name are compared exactly with
+/// the identifiers retained by the parser, including ASCII case. On a match,
+/// execution delegates to [`aggregate_nullable_i64`]: `COUNT(*)` includes all
+/// rows, while `COUNT(column)` excludes `NULL`. Both aggregate row caps are
+/// supplied explicitly by the caller.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{
+///     AggregateLimits, Int64Table, ParseLimits, Schema, execute_scalar_count,
+///     parse_scalar_count,
+/// };
+///
+/// let statement = parse_scalar_count(
+///     "SELECT COUNT(value) FROM readings",
+///     ParseLimits::default(),
+/// )?;
+/// let mut table = Int64Table::new(Schema::int64("value", true), 2);
+/// table.append_batch(&[Some(7), None])?;
+///
+/// let count = execute_scalar_count(
+///     "readings",
+///     &table,
+///     &statement,
+///     AggregateLimits::new(2, 2),
+/// )?;
+/// assert_eq!(count, 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn execute_scalar_count(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &ScalarCountStatement,
+    limits: AggregateLimits,
+) -> Result<u64, SelectExecutionError> {
+    if statement.table_name().as_str() != expected_table_name {
+        return Err(SelectExecutionError::UnknownTable {
+            name: statement.table_name().as_str().to_owned(),
+        });
+    }
+
+    if let Some(column_name) = statement.column_name() {
+        if column_name.as_str() != table.schema().column().name() {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: column_name.as_str().to_owned(),
+            });
+        }
+    }
+
+    let aggregates = aggregate_nullable_i64(table.values(), RowSelection::All, limits)?;
+    Ok(if statement.column_name().is_some() {
+        aggregates.count_column()
+    } else {
+        aggregates.count_star()
+    })
 }
 
 /// Executes one parsed `SELECT` against one explicitly named table.
