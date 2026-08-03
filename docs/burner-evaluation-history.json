@@ -218,6 +218,38 @@
         "eval_56a6f83a": 25,
         "eval_a8d9ce71": 100
       }
+    },
+    {
+      "key": "base:a671f83fd534c7802ac0afb3ab95fac43f849d16",
+      "commit": "a671f83fd534c7802ac0afb3ab95fac43f849d16",
+      "recordedAt": "2026-08-03T08:39:37.230Z",
+      "label": "base a671f83",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_69c46252": 45,
+        "eval_ed4d7712": 70,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 25,
+        "eval_a8d9ce71": 100
+      }
+    },
+    {
+      "key": "pr:314",
+      "recordedAt": "2026-08-03T08:39:37.230Z",
+      "label": "PR #314",
+      "kind": "composite",
+      "prNumber": 314,
+      "title": "YOLO generation 7: 2 reviewed improvements · recovery 1/1",
+      "scores": {
+        "eval_69c46252": 50,
+        "eval_ed4d7712": 75,
+        "eval_99d9f2c8": 0,
+        "eval_36f48d7d": 90,
+        "eval_56a6f83a": 30,
+        "eval_a8d9ce71": 100
+      }
     }
   ]
 }
