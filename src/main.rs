@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -124,7 +124,7 @@ enum Action {
     Help,
 }
 
-fn parse_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<Action, ()> {
+fn parse_arguments(arguments: impl Iterator<Item = OsString>) -> Result<Action, ()> {
     let mut arguments = arguments.peekable();
     if arguments
         .peek()
@@ -164,15 +164,18 @@ fn parse_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) -> Resul
     Ok(Action::Run(options))
 }
 
-fn parse_table_snapshot_argument(
-    argument: std::ffi::OsString,
-) -> Result<TableSnapshotArgument, ()> {
-    let argument = argument.into_string().map_err(|_| ())?;
-    let (name, path) = argument.split_once('=').ok_or(())?;
+fn parse_table_snapshot_argument(argument: OsString) -> Result<TableSnapshotArgument, ()> {
+    let bytes = argument.as_encoded_bytes();
+    let separator = bytes.iter().position(|byte| *byte == b'=').ok_or(())?;
+    let name = std::str::from_utf8(&bytes[..separator]).map_err(|_| ())?;
+    let path = &bytes[separator + 1..];
     if !valid_table_name(name) || path.is_empty() {
         return Err(());
     }
 
+    // OsStr's encoded form is self-synchronizing, and ASCII '=' is a valid
+    // boundary, so the suffix remains an encoded substring of `argument`.
+    let path = unsafe { OsStr::from_encoded_bytes_unchecked(path) };
     Ok(TableSnapshotArgument {
         name: name.to_owned(),
         path: PathBuf::from(path),

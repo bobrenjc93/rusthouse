@@ -18,11 +18,11 @@
 //! The checksum uses polynomial `0xedb8_8320`, an initial value of
 //! `0xffff_ffff`, and a final XOR of `0xffff_ffff`.
 //!
-//! Writes use a `.<file-name>.tmp` sibling, sync that file, atomically rename
-//! it over the destination, and sync the parent directory on Unix. A stale
-//! sibling from an interrupted write is discarded by the next write and is
-//! never considered when reading. Callers must serialize writes to the same
-//! destination path.
+//! Writes use a writer-unique `.<file-name>.tmp.<pid>.<sequence>` sibling, sync
+//! that file, atomically rename it over the destination, and sync the parent
+//! directory on Unix. Concurrent writers can publish in either order, but each
+//! published snapshot is complete. Stale temporary siblings are ignored when
+//! reading and never conflict with later writers.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -42,6 +42,8 @@ pub const SNAPSHOT_HEADER_LEN: usize = 22;
 
 /// The default maximum payload size: 64 MiB.
 pub const DEFAULT_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+
+static NEXT_TEMPORARY_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Details about a snapshot that failed integrity validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,16 +189,9 @@ impl SnapshotStore {
         let path = path.as_ref();
         self.validate_payload_len(payload.len() as u64)?;
 
-        let (parent, temporary_path) = sibling_temporary_path(path)?;
-        remove_stale_temporary_file(&temporary_path)?;
+        let (parent, temporary_path, mut temporary_file) = create_temporary_file(path)?;
 
         let write_result = (|| {
-            let mut temporary_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)
-                .map_err(|source| io_failure("create temporary", &temporary_path, source))?;
-
             let header = encode_header(payload.len() as u64, crc32(payload));
             temporary_file
                 .write_all(&header)
@@ -352,7 +347,7 @@ fn encode_header(payload_len: u64, checksum: u32) -> [u8; SNAPSHOT_HEADER_LEN] {
     header
 }
 
-fn sibling_temporary_path(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotError> {
+fn create_temporary_file(path: &Path) -> Result<(PathBuf, PathBuf, File), SnapshotError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -368,17 +363,23 @@ fn sibling_temporary_path(path: &Path) -> Result<(PathBuf, PathBuf), SnapshotErr
         )
     })?;
 
-    let mut temporary_name = OsString::from(".");
-    temporary_name.push(file_name);
-    temporary_name.push(".tmp");
-    Ok((parent.to_path_buf(), parent.join(temporary_name)))
-}
-
-fn remove_stale_temporary_file(path: &Path) -> Result<(), SnapshotError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io_failure("remove stale temporary", path, source)),
+    loop {
+        let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".tmp.{}.{sequence}", std::process::id()));
+        let temporary_path = parent.join(temporary_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => return Ok((parent.to_path_buf(), temporary_path, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(io_failure("create temporary", &temporary_path, source));
+            }
+        }
     }
 }
 
@@ -509,21 +510,26 @@ mod tests {
             .expect("replace snapshot");
 
         assert_eq!(store.read(&path).expect("read replacement"), b"replacement");
-        assert!(!directory.0.join(".state.snapshot.tmp").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 
     #[test]
-    fn recovers_from_a_stale_temporary_file() {
+    fn ignores_a_stale_temporary_file_from_an_interrupted_writer() {
         let directory = TestDirectory::new("stale-temporary");
         let path = directory.snapshot();
-        let temporary_path = directory.0.join(".state.snapshot.tmp");
+        let temporary_path = directory.0.join(".state.snapshot.tmp.999999.0");
         let store = SnapshotStore::new(32);
 
         fs::write(&temporary_path, b"incomplete previous write").expect("create stale file");
-        store.write(&path, b"current").expect("recover and write");
+        store
+            .write(&path, b"current")
+            .expect("write current snapshot");
 
         assert_eq!(store.read(&path).expect("read snapshot"), b"current");
-        assert!(!temporary_path.exists());
+        assert_eq!(
+            fs::read(&temporary_path).unwrap(),
+            b"incomplete previous write"
+        );
     }
 
     #[test]
@@ -549,7 +555,7 @@ mod tests {
             }
         ));
         assert!(!path.exists());
-        assert!(!directory.0.join(".state.snapshot.tmp").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
     }
 
     #[test]

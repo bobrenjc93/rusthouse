@@ -1,8 +1,14 @@
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Cursor, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use rusthouse::cli::{
     BatchError, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MAX_STATEMENT_BYTES, execute_batch,
@@ -37,6 +43,19 @@ impl Drop for TestDirectory {
 }
 
 fn run(arguments: &[&str], input: &[u8]) -> Output {
+    run_command(arguments.iter().copied(), input)
+}
+
+#[cfg(unix)]
+fn run_os(arguments: &[&OsStr], input: &[u8]) -> Output {
+    run_command(arguments.iter().copied(), input)
+}
+
+fn run_command<I, S>(arguments: I, input: &[u8]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut child = Command::new(BINARY)
         .args(arguments)
         .stdin(Stdio::piped())
@@ -158,6 +177,107 @@ fn saves_reopens_and_selects_one_table_across_processes() {
     assert_eq!(reopened.status.code(), Some(0));
     assert!(reopened.stderr.is_empty());
     assert_eq!(reopened.stdout, b"\"label\",\"id\"\n\"first\",1\n");
+}
+
+#[test]
+fn concurrent_saves_publish_one_complete_snapshot() {
+    const WRITERS: usize = 16;
+    const STRING_BYTES: usize = 256 * 1024;
+
+    let directory = TestDirectory::new("concurrent-saves");
+    let snapshot = directory.snapshot("events.snapshot");
+    let mapping = format!("events={}", snapshot.display());
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let writers = (0..WRITERS)
+        .map(|index| {
+            let barrier = Arc::clone(&barrier);
+            let mapping = mapping.clone();
+            std::thread::spawn(move || {
+                let label = format!("writer-{index}-{}", "x".repeat(STRING_BYTES));
+                let input = format!(
+                    "CREATE TABLE events (id Int64, label String)\n\
+                     INSERT INTO events VALUES ({index}, '{label}')\n"
+                );
+                barrier.wait();
+                run(&["--save-table", &mapping], input.as_bytes())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for writer in writers {
+        let output = writer.join().expect("join snapshot writer");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "concurrent save failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let reopened = run(&["--load-table", &mapping], b"SELECT id FROM events\n");
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    let stdout = String::from_utf8(reopened.stdout).unwrap();
+    let id = stdout.lines().nth(1).unwrap().parse::<usize>().unwrap();
+    assert!(id < WRITERS);
+}
+
+#[cfg(unix)]
+#[test]
+fn preserves_non_utf8_snapshot_paths_during_argument_parsing() {
+    let directory = TestDirectory::new("non-utf8-path");
+    let mut snapshot_bytes = directory.0.as_os_str().as_bytes().to_vec();
+    snapshot_bytes.extend_from_slice(b"/events-\xff.snapshot");
+    let snapshot = PathBuf::from(OsString::from_vec(snapshot_bytes));
+
+    let mut mapping_bytes = b"events=".to_vec();
+    mapping_bytes.extend_from_slice(snapshot.as_os_str().as_bytes());
+    let mapping = OsString::from_vec(mapping_bytes);
+
+    let output = run_os(
+        &[OsStr::new("--load-table"), mapping.as_os_str()],
+        b"SELECT id FROM events\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "non-UTF-8 path was rejected as CLI usage: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with("rusthouse: could not load table `events` from ")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn saves_and_reopens_a_non_utf8_snapshot_path() {
+    let directory = TestDirectory::new("non-utf8-round-trip");
+    let mut snapshot_bytes = directory.0.as_os_str().as_bytes().to_vec();
+    snapshot_bytes.extend_from_slice(b"/events-\xff.snapshot");
+    let snapshot = PathBuf::from(OsString::from_vec(snapshot_bytes));
+
+    let mut mapping_bytes = b"events=".to_vec();
+    mapping_bytes.extend_from_slice(snapshot.as_os_str().as_bytes());
+    let mapping = OsString::from_vec(mapping_bytes);
+
+    let saved = run_os(
+        &[OsStr::new("--save-table"), mapping.as_os_str()],
+        b"CREATE TABLE events (id Int64)\nINSERT INTO events VALUES (7)\n",
+    );
+    assert_eq!(saved.status.code(), Some(0));
+    assert!(saved.stderr.is_empty());
+    assert!(snapshot.exists());
+
+    let reopened = run_os(
+        &[OsStr::new("--load-table"), mapping.as_os_str()],
+        b"SELECT id FROM events\n",
+    );
+    assert_eq!(reopened.status.code(), Some(0));
+    assert!(reopened.stderr.is_empty());
+    assert_eq!(reopened.stdout, b"\"id\"\n7\n");
 }
 
 #[test]
