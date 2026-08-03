@@ -96,7 +96,7 @@ fn kernels_match_a_deterministic_reference_model() {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            if state.is_multiple_of(5) {
+            if state % 5 == 0 {
                 values.push(None);
             } else {
                 values.push(Some(((state >> 16) % 2_000_001) as i64 - 1_000_000));
