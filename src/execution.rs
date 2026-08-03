@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ComparisonOperator, InsertError, InsertStatement, Int64Table, OrderError, OrderLimits,
-    ScanError, ScanLimits, SelectStatement, order_nullable_i64, scan_nullable_i64,
+    ComparisonOperator, GroupedCountError, GroupedCountLimits, GroupedCountStatement, InsertError,
+    InsertStatement, Int64Table, NullableI64GroupedCount, OrderError, OrderLimits, ScanError,
+    ScanLimits, SelectStatement, grouped_count_nullable_i64, order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -42,7 +43,7 @@ impl From<InsertError> for InsertExecutionError {
     }
 }
 
-/// An error produced while executing a parsed [`SelectStatement`].
+/// An error produced while executing a parsed projection or grouped `SELECT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectExecutionError {
     /// The statement names a table other than the one supplied for execution.
@@ -53,6 +54,8 @@ pub enum SelectExecutionError {
     Scan(ScanError),
     /// The bounded top-k order operation rejected the input or requested limit.
     Order(OrderError),
+    /// The bounded grouped-count operator rejected the input or result size.
+    GroupedCount(GroupedCountError),
 }
 
 impl fmt::Display for SelectExecutionError {
@@ -62,6 +65,7 @@ impl fmt::Display for SelectExecutionError {
             Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
             Self::Scan(error) => write!(formatter, "could not scan rows: {error}"),
             Self::Order(error) => write!(formatter, "could not order rows: {error}"),
+            Self::GroupedCount(error) => write!(formatter, "could not group rows: {error}"),
         }
     }
 }
@@ -71,6 +75,7 @@ impl Error for SelectExecutionError {
         match self {
             Self::Scan(error) => Some(error),
             Self::Order(error) => Some(error),
+            Self::GroupedCount(error) => Some(error),
             Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
         }
     }
@@ -85,6 +90,12 @@ impl From<ScanError> for SelectExecutionError {
 impl From<OrderError> for SelectExecutionError {
     fn from(error: OrderError) -> Self {
         Self::Order(error)
+    }
+}
+
+impl From<GroupedCountError> for SelectExecutionError {
+    fn from(error: GroupedCountError) -> Self {
+        Self::GroupedCount(error)
     }
 }
 
@@ -125,6 +136,62 @@ pub fn execute_insert(
     }
 
     table.append_batch(statement.values()).map_err(Into::into)
+}
+
+/// Executes one parsed grouped `COUNT(*)` with explicit resource bounds.
+///
+/// The expected table name, selected column, and `GROUP BY` column are compared
+/// exactly, including ASCII case. On a match, execution delegates to
+/// [`grouped_count_nullable_i64`], preserving its deterministic `NULL`-first
+/// ordering and its input-row and distinct-group limit errors.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{
+///     GroupedCountLimits, Int64Table, ParseLimits, Schema, execute_grouped_count,
+///     parse_grouped_count,
+/// };
+///
+/// let statement = parse_grouped_count(
+///     "SELECT value, COUNT(*) FROM readings GROUP BY value",
+///     ParseLimits::default(),
+/// )?;
+/// let mut table = Int64Table::new(Schema::int64("value", true), 3);
+/// table.append_batch(&[Some(7), None, Some(7)])?;
+///
+/// let groups = execute_grouped_count(
+///     "readings",
+///     &table,
+///     &statement,
+///     GroupedCountLimits::new(3, 2),
+/// )?;
+/// let pairs: Vec<_> = groups.into_iter().map(|group| group.into_pair()).collect();
+/// assert_eq!(pairs, vec![(None, 1), (Some(7), 2)]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn execute_grouped_count(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &GroupedCountStatement,
+    limits: GroupedCountLimits,
+) -> Result<Vec<NullableI64GroupedCount>, SelectExecutionError> {
+    if statement.table_name().as_str() != expected_table_name {
+        return Err(SelectExecutionError::UnknownTable {
+            name: statement.table_name().as_str().to_owned(),
+        });
+    }
+
+    let stored_column_name = table.schema().column().name();
+    for column_name in [statement.column_name(), statement.group_by_column_name()] {
+        if column_name.as_str() != stored_column_name {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: column_name.as_str().to_owned(),
+            });
+        }
+    }
+
+    grouped_count_nullable_i64(table.values(), limits).map_err(Into::into)
 }
 
 /// Executes one parsed `SELECT` against one explicitly named table.

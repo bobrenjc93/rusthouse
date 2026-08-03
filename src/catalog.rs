@@ -6,12 +6,15 @@ use std::error::Error;
 use std::fmt;
 
 use crate::execution::{
-    InsertExecutionError, SelectExecutionError, execute_insert as execute_insert_statement,
+    InsertExecutionError, SelectExecutionError,
+    execute_grouped_count as execute_grouped_count_statement,
+    execute_insert as execute_insert_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    CreateTableStatement, InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits,
-    ScanLimits, Schema, SelectStatement, parse_create_table, parse_insert, parse_select,
+    CreateTableStatement, GroupedCountLimits, GroupedCountStatement, InsertStatement, Int64Table,
+    NullableI64GroupedCount, OrderLimits, ParseError, ParseLimits, ScanLimits, Schema,
+    SelectStatement, parse_create_table, parse_grouped_count, parse_insert, parse_select,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -86,7 +89,7 @@ impl From<ParseError> for CatalogError {
 ///
 /// Names use the exact spelling retained by the parser. Failed creates and
 /// inserts leave all registered tables unchanged. Plain SELECT results borrow
-/// their source column storage; filtered results own their matching values.
+/// their source column storage; filtered and grouped results own their values.
 ///
 /// # Examples
 ///
@@ -204,6 +207,34 @@ impl Catalog {
         })?;
 
         execute_insert_statement(name, table, statement).map_err(CatalogError::Insert)
+    }
+
+    /// Parses and executes one grouped `COUNT(*)` with explicit resource bounds.
+    pub fn execute_grouped_count(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        grouped_count_limits: GroupedCountLimits,
+    ) -> Result<Vec<NullableI64GroupedCount>, CatalogError> {
+        let statement = parse_grouped_count(input, parse_limits)?;
+        self.grouped_count(&statement, grouped_count_limits)
+    }
+
+    /// Executes a parsed grouped `COUNT(*)` against its exactly named table.
+    pub fn grouped_count(
+        &self,
+        statement: &GroupedCountStatement,
+        limits: GroupedCountLimits,
+    ) -> Result<Vec<NullableI64GroupedCount>, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Select(SelectExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_grouped_count_statement(name, table, statement, limits)
+            .map_err(CatalogError::Select)
     }
 
     /// Parses and executes one bounded projection `SELECT` statement.
