@@ -219,6 +219,52 @@ fn insert_preserves_lookup_storage_and_nullability_errors() {
 }
 
 #[test]
+fn multi_row_insert_is_atomic_for_parse_and_storage_failures() {
+    let limits = ParseLimits::default();
+    let mut catalog = catalog(1, 3);
+    catalog
+        .execute_create("CREATE TABLE events (value Int64 NOT NULL)", limits)
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO events VALUES (1)", limits)
+        .unwrap();
+
+    assert!(matches!(
+        catalog.execute_insert("INSERT INTO events VALUES (2), (invalid)", limits),
+        Err(CatalogError::Parse(ParseError::InvalidInt64 { .. }))
+    ));
+    assert_eq!(catalog.table("events").unwrap().values(), &[Some(1)]);
+
+    assert!(matches!(
+        catalog.execute_insert("INSERT INTO events VALUES (2), (NULL)", limits),
+        Err(CatalogError::Insert(InsertExecutionError::Insert(
+            InsertError::NullNotAllowed { .. }
+        )))
+    ));
+    assert_eq!(catalog.table("events").unwrap().values(), &[Some(1)]);
+
+    assert!(matches!(
+        catalog.execute_insert("INSERT INTO events VALUES (2), (3), (4)", limits),
+        Err(CatalogError::Insert(InsertExecutionError::Insert(
+            InsertError::RowCapExceeded {
+                row_cap: 3,
+                current_rows: 1,
+                incoming_rows: 3,
+            }
+        )))
+    ));
+    assert_eq!(catalog.table("events").unwrap().values(), &[Some(1)]);
+
+    catalog
+        .execute_insert("INSERT INTO events VALUES (2), (3)", limits)
+        .unwrap();
+    assert_eq!(
+        catalog.table("events").unwrap().values(),
+        &[Some(1), Some(2), Some(3)]
+    );
+}
+
+#[test]
 fn select_preserves_unknown_table_and_column_errors() {
     let limits = ParseLimits::default();
     let mut catalog = catalog(1, 1);

@@ -104,11 +104,11 @@ impl CreateTableStatement {
     }
 }
 
-/// The typed syntax tree for a one-row, one-column `INSERT` statement.
+/// The typed syntax tree for a one-column, one-or-more-row `INSERT` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertStatement {
     table_name: Identifier,
-    value: Option<i64>,
+    values: Vec<Option<i64>>,
 }
 
 impl InsertStatement {
@@ -117,9 +117,9 @@ impl InsertStatement {
         &self.table_name
     }
 
-    /// Returns the statement's only value. `None` represents SQL `NULL`.
-    pub fn value(&self) -> Option<i64> {
-        self.value
+    /// Returns the statement's values in row order. `None` represents SQL `NULL`.
+    pub fn values(&self) -> &[Option<i64>] {
+        &self.values
     }
 }
 
@@ -230,8 +230,6 @@ pub enum ParseError {
     InvalidLimit { offset: usize },
     /// A syntactically valid `LIMIT` value is outside the platform row-index range.
     LimitOverflow { offset: usize },
-    /// Another row follows the single row supported by the grammar.
-    ExtraRows { offset: usize },
     /// Non-whitespace input remained after the closing parenthesis.
     TrailingInput { offset: usize },
 }
@@ -265,12 +263,6 @@ impl fmt::Display for ParseError {
             }
             Self::LimitOverflow { offset } => {
                 write!(formatter, "LIMIT value at byte {offset} is out of range")
-            }
-            Self::ExtraRows { offset } => {
-                write!(
-                    formatter,
-                    "additional INSERT row at byte {offset} is not supported"
-                )
             }
             Self::TrailingInput { offset } => {
                 write!(formatter, "unexpected trailing input at byte {offset}")
@@ -321,19 +313,20 @@ pub fn parse_create_table(
     Parser::new(input, limits.max_identifier_bytes).parse_create_table()
 }
 
-/// Parses one `INSERT INTO` statement containing one `Int64` or `NULL` value.
+/// Parses one `INSERT INTO` statement containing one or more `Int64` or `NULL` rows.
 ///
 /// Keywords are ASCII case-insensitive. The table identifier follows the same
 /// rules and bounds as [`parse_create_table`]. Decimal values may have a
 /// leading `+` or `-`. The complete accepted grammar is:
 ///
 /// ```text
-/// INSERT INTO identifier VALUES (Int64 | NULL)
+/// INSERT INTO identifier VALUES (Int64 | NULL) [, (Int64 | NULL)]*
 /// ```
 ///
-/// Leading and trailing ASCII whitespace is accepted. Batches, multiple
-/// values, and semicolon terminators are outside this deliberately narrow
-/// grammar. Statement limits and all reported offsets are measured in bytes.
+/// Leading and trailing ASCII whitespace is accepted, including around row
+/// separators. Multiple values within one row and semicolon terminators are
+/// outside this deliberately narrow grammar. Statement limits and all reported
+/// offsets are measured in bytes.
 ///
 /// # Examples
 ///
@@ -341,12 +334,12 @@ pub fn parse_create_table(
 /// use rusthouse::{ParseLimits, parse_insert};
 ///
 /// let statement = parse_insert(
-///     "INSERT INTO events VALUES (-7)",
+///     "INSERT INTO events VALUES (-7), (NULL)",
 ///     ParseLimits::default(),
 /// )?;
 ///
 /// assert_eq!(statement.table_name().as_str(), "events");
-/// assert_eq!(statement.value(), Some(-7));
+/// assert_eq!(statement.values(), &[Some(-7), None]);
 /// # Ok::<(), rusthouse::ParseError>(())
 /// ```
 pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement, ParseError> {
@@ -470,34 +463,40 @@ impl<'input> Parser<'input> {
         self.require_whitespace("whitespace before VALUES")?;
         self.expect_keyword("VALUES")?;
         self.skip_whitespace();
-        self.expect_byte(b'(', "'('")?;
-        self.skip_whitespace();
-        let value = self.parse_int64_value()?;
-        self.skip_whitespace();
 
-        match self.peek() {
-            Some(b')') => self.position += 1,
-            Some(_) => {
-                return Err(ParseError::InvalidInt64 {
-                    offset: self.position,
-                });
+        let mut values = Vec::new();
+        loop {
+            self.expect_byte(b'(', "'('")?;
+            self.skip_whitespace();
+            let value = self.parse_int64_value()?;
+            self.skip_whitespace();
+
+            match self.peek() {
+                Some(b')') => self.position += 1,
+                Some(_) => {
+                    return Err(ParseError::InvalidInt64 {
+                        offset: self.position,
+                    });
+                }
+                None => return Err(self.unexpected("')'")),
             }
-            None => return Err(self.unexpected("')'")),
-        }
-        self.skip_whitespace();
+            values.push(value);
+            self.skip_whitespace();
 
-        if self.peek() == Some(b',') {
-            return Err(ParseError::ExtraRows {
-                offset: self.position,
-            });
+            if self.peek() != Some(b',') {
+                break;
+            }
+            self.position += 1;
+            self.skip_whitespace();
         }
+
         if self.position != self.bytes.len() {
             return Err(ParseError::TrailingInput {
                 offset: self.position,
             });
         }
 
-        Ok(InsertStatement { table_name, value })
+        Ok(InsertStatement { table_name, values })
     }
 
     fn parse_select(mut self) -> Result<SelectStatement, ParseError> {
