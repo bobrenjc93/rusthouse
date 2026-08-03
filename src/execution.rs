@@ -5,8 +5,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ComparisonOperator, InsertError, InsertStatement, Int64Table, ScanError, ScanLimits,
-    SelectStatement, scan_nullable_i64,
+    ComparisonOperator, InsertError, InsertStatement, Int64Table, OrderError, OrderLimits,
+    ScanError, ScanLimits, SelectStatement, order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -51,6 +51,8 @@ pub enum SelectExecutionError {
     UnknownColumn { name: String },
     /// The bounded equality scan rejected the input or result size.
     Scan(ScanError),
+    /// The bounded top-k order operation rejected the input or requested limit.
+    Order(OrderError),
 }
 
 impl fmt::Display for SelectExecutionError {
@@ -59,6 +61,7 @@ impl fmt::Display for SelectExecutionError {
             Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
             Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
             Self::Scan(error) => write!(formatter, "could not scan rows: {error}"),
+            Self::Order(error) => write!(formatter, "could not order rows: {error}"),
         }
     }
 }
@@ -67,6 +70,7 @@ impl Error for SelectExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Scan(error) => Some(error),
+            Self::Order(error) => Some(error),
             Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
         }
     }
@@ -75,6 +79,12 @@ impl Error for SelectExecutionError {
 impl From<ScanError> for SelectExecutionError {
     fn from(error: ScanError) -> Self {
         Self::Scan(error)
+    }
+}
+
+impl From<OrderError> for SelectExecutionError {
+    fn from(error: OrderError) -> Self {
+        Self::Order(error)
     }
 }
 
@@ -120,12 +130,11 @@ pub fn execute_insert(
 /// Executes one parsed `SELECT` against one explicitly named table.
 ///
 /// `expected_table_name` and the table's column name are compared exactly
-/// with the identifiers retained by the parser, including ASCII case. The
-/// An unfiltered result borrows the table's existing column storage without
-/// copying its values. A `WHERE` equality predicate uses a scan bounded to the
-/// table's current row count and owns the selected values. Use
-/// [`execute_select_with_limits`] when the caller needs stricter scan bounds.
-/// An optional `LIMIT` is applied after filtering.
+/// with the identifiers retained by the parser, including ASCII case. An
+/// unfiltered, unordered result borrows the table's existing column storage.
+/// A `WHERE` equality predicate uses a bounded scan, while `ORDER BY ... LIMIT`
+/// uses the bounded top-k operator and owns the ordered values. Use
+/// [`execute_select_with_order_limits`] for explicit bounds on both operators.
 ///
 /// # Examples
 ///
@@ -171,6 +180,29 @@ pub fn execute_select_with_limits<'table>(
     statement: &SelectStatement,
     scan_limits: ScanLimits,
 ) -> Result<Cow<'table, [Option<i64>]>, SelectExecutionError> {
+    let rows = table.values().len();
+    let requested_limit = statement.limit().unwrap_or(rows);
+    execute_select_with_order_limits(
+        expected_table_name,
+        table,
+        statement,
+        scan_limits,
+        OrderLimits::new(rows, requested_limit),
+    )
+}
+
+/// Executes one parsed `SELECT` with explicit scan and top-k order bounds.
+///
+/// Ordered projections are materialized in the source-index order returned by
+/// [`order_nullable_i64`]. Unordered projections retain the borrowing behavior
+/// of [`execute_select_with_limits`].
+pub fn execute_select_with_order_limits<'table>(
+    expected_table_name: &str,
+    table: &'table Int64Table,
+    statement: &SelectStatement,
+    scan_limits: ScanLimits,
+    order_limits: OrderLimits,
+) -> Result<Cow<'table, [Option<i64>]>, SelectExecutionError> {
     if statement.table_name().as_str() != expected_table_name {
         return Err(SelectExecutionError::UnknownTable {
             name: statement.table_name().as_str().to_owned(),
@@ -186,15 +218,56 @@ pub fn execute_select_with_limits<'table>(
     let values = table.values();
     let limit = statement.limit().unwrap_or(values.len());
 
+    if let Some(predicate) = statement.predicate() {
+        if predicate.column_name().as_str() != table.schema().column().name() {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: predicate.column_name().as_str().to_owned(),
+            });
+        }
+    }
+
+    if let Some(order_by) = statement.order_by() {
+        if order_by.column_name().as_str() != table.schema().column().name() {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: order_by.column_name().as_str().to_owned(),
+            });
+        }
+
+        let order_input = match statement.predicate() {
+            Some(predicate) => {
+                let matching_rows = scan_nullable_i64(
+                    values,
+                    ComparisonOperator::Eq,
+                    predicate.value(),
+                    scan_limits,
+                )?;
+                Cow::Owned(
+                    matching_rows
+                        .into_iter()
+                        .map(|row_index| values[row_index])
+                        .collect::<Vec<_>>(),
+                )
+            }
+            None => Cow::Borrowed(values),
+        };
+        let ordered_rows = order_nullable_i64(
+            order_input.as_ref(),
+            order_by.direction(),
+            order_by.null_order(),
+            limit,
+            order_limits,
+        )?;
+        let selected = ordered_rows
+            .into_iter()
+            .map(|row_index| order_input[row_index])
+            .collect();
+
+        return Ok(Cow::Owned(selected));
+    }
+
     let Some(predicate) = statement.predicate() else {
         return Ok(Cow::Borrowed(&values[..limit.min(values.len())]));
     };
-
-    if predicate.column_name().as_str() != table.schema().column().name() {
-        return Err(SelectExecutionError::UnknownColumn {
-            name: predicate.column_name().as_str().to_owned(),
-        });
-    }
 
     let matching_rows = scan_nullable_i64(
         values,

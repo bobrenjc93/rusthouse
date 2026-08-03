@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::order::{NullOrder, OrderDirection};
 use crate::storage::DataType;
 
 /// Default maximum size of a SQL statement, in bytes.
@@ -141,12 +142,38 @@ impl EqualityPredicate {
     }
 }
 
+/// An explicit single-column `ORDER BY` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderByClause {
+    column_name: Identifier,
+    direction: OrderDirection,
+    null_order: NullOrder,
+}
+
+impl OrderByClause {
+    /// Returns the column used as the ordering key.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns whether values are ordered ascending or descending.
+    pub const fn direction(&self) -> OrderDirection {
+        self.direction
+    }
+
+    /// Returns the explicit placement of `NULL` values.
+    pub const fn null_order(&self) -> NullOrder {
+        self.null_order
+    }
+}
+
 /// The typed syntax tree for a one-column `SELECT` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStatement {
     column_name: Identifier,
     table_name: Identifier,
     predicate: Option<EqualityPredicate>,
+    order_by: Option<OrderByClause>,
     limit: Option<usize>,
 }
 
@@ -164,6 +191,11 @@ impl SelectStatement {
     /// Returns the optional `WHERE` equality predicate.
     pub fn predicate(&self) -> Option<&EqualityPredicate> {
         self.predicate.as_ref()
+    }
+
+    /// Returns the optional explicit single-column ordering clause.
+    pub fn order_by(&self) -> Option<&OrderByClause> {
+        self.order_by.as_ref()
     }
 
     /// Returns the maximum number of rows requested by the statement.
@@ -332,14 +364,16 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 /// ```text
 /// SELECT identifier FROM identifier
 ///     [WHERE identifier = Int64]
+///     [ORDER BY identifier (ASC | DESC) NULLS (FIRST | LAST)]
 ///     [LIMIT unsigned-integer] [;]
 /// ```
 ///
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
-/// around the equality operator and before or after the optional `LIMIT` and
-/// semicolon. The equality value is a signed decimal `Int64`; `LIMIT` accepts
-/// zero and must fit in `usize`. Statement limits and all reported offsets are
-/// measured in bytes.
+/// around the equality operator and before or after the optional clauses and
+/// semicolon. `ORDER BY`, when present, requires an explicit direction, `NULL`
+/// placement, and following `LIMIT`. The equality value is a signed decimal
+/// `Int64`; `LIMIT` accepts zero and must fit in `usize`. Statement limits and
+/// all reported offsets are measured in bytes.
 ///
 /// # Examples
 ///
@@ -494,6 +528,44 @@ impl<'input> Parser<'input> {
             None
         };
 
+        let order_by = if self.keyword_at_position("ORDER") {
+            self.expect_keyword("ORDER")?;
+            self.require_whitespace("whitespace after ORDER")?;
+            self.expect_keyword("BY")?;
+            self.require_whitespace("whitespace after BY")?;
+            let column_name = self.parse_identifier()?;
+            self.require_whitespace("whitespace before ASC or DESC")?;
+            let direction = if self.keyword_at_position("ASC") {
+                self.expect_keyword("ASC")?;
+                OrderDirection::Asc
+            } else if self.keyword_at_position("DESC") {
+                self.expect_keyword("DESC")?;
+                OrderDirection::Desc
+            } else {
+                return Err(self.unexpected("ASC or DESC"));
+            };
+            self.require_whitespace("whitespace before NULLS")?;
+            self.expect_keyword("NULLS")?;
+            self.require_whitespace("whitespace after NULLS")?;
+            let null_order = if self.keyword_at_position("FIRST") {
+                self.expect_keyword("FIRST")?;
+                NullOrder::First
+            } else if self.keyword_at_position("LAST") {
+                self.expect_keyword("LAST")?;
+                NullOrder::Last
+            } else {
+                return Err(self.unexpected("FIRST or LAST"));
+            };
+            self.skip_whitespace();
+            Some(OrderByClause {
+                column_name,
+                direction,
+                null_order,
+            })
+        } else {
+            None
+        };
+
         let limit = if self.keyword_at_position("LIMIT") {
             self.expect_keyword("LIMIT")?;
             self.require_whitespace("whitespace after LIMIT")?;
@@ -503,6 +575,10 @@ impl<'input> Parser<'input> {
         } else {
             None
         };
+
+        if order_by.is_some() && limit.is_none() {
+            return Err(self.unexpected("LIMIT"));
+        }
 
         if self.peek() == Some(b';') {
             self.position += 1;
@@ -518,6 +594,7 @@ impl<'input> Parser<'input> {
             column_name,
             table_name,
             predicate,
+            order_by,
             limit,
         })
     }
