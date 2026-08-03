@@ -45,6 +45,16 @@ fn populated_input_distinguishes_rows_from_non_null_values() {
 }
 
 #[test]
+fn counts_values_even_when_their_sum_would_overflow() {
+    for values in [[Some(i64::MAX), Some(1)], [Some(i64::MIN), Some(-1)]] {
+        let table = table(&values);
+
+        assert_eq!(execute("SELECT COUNT(*) FROM readings", &table), 2);
+        assert_eq!(execute("SELECT COUNT(value) FROM readings", &table), 2);
+    }
+}
+
+#[test]
 fn validates_table_and_column_identifiers_before_aggregation() {
     let table = table(&[Some(1), None]);
     let cases = [

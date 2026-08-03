@@ -13,7 +13,8 @@ pub mod scan;
 pub mod snapshot;
 
 pub use aggregate::{
-    AggregateError, AggregateLimits, NullableI64Aggregates, RowSelection, aggregate_nullable_i64,
+    AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
+    aggregate_nullable_i64, count_nullable_i64,
 };
 pub use catalog::{Catalog, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};

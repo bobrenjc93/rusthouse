@@ -7,7 +7,7 @@ use std::fmt;
 use crate::{
     AggregateError, AggregateLimits, ComparisonOperator, InsertError, InsertStatement, Int64Table,
     OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScanError, ScanLimits,
-    SelectStatement, aggregate_nullable_i64, order_nullable_i64, scan_nullable_i64,
+    SelectStatement, count_nullable_i64, order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -142,7 +142,7 @@ pub fn execute_insert(
 ///
 /// The expected table name and optional column name are compared exactly with
 /// the identifiers retained by the parser, including ASCII case. On a match,
-/// execution delegates to [`aggregate_nullable_i64`]: `COUNT(*)` includes all
+/// execution delegates to [`count_nullable_i64`]: `COUNT(*)` includes all
 /// rows, while `COUNT(column)` excludes `NULL`. Both aggregate row caps are
 /// supplied explicitly by the caller.
 ///
@@ -190,11 +190,11 @@ pub fn execute_scalar_count(
         }
     }
 
-    let aggregates = aggregate_nullable_i64(table.values(), RowSelection::All, limits)?;
+    let counts = count_nullable_i64(table.values(), RowSelection::All, limits)?;
     Ok(if statement.column_name().is_some() {
-        aggregates.count_column()
+        counts.count_column()
     } else {
-        aggregates.count_star()
+        counts.count_star()
     })
 }
 

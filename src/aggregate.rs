@@ -43,6 +43,25 @@ impl AggregateLimits {
     }
 }
 
+/// The SQL counts computed for a nullable `Int64` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NullableI64Counts {
+    count_star: u64,
+    count_column: u64,
+}
+
+impl NullableI64Counts {
+    /// Returns `COUNT(*)`, including rows whose column value is `NULL`.
+    pub const fn count_star(self) -> u64 {
+        self.count_star
+    }
+
+    /// Returns `COUNT(column)`, excluding `NULL` values.
+    pub const fn count_column(self) -> u64 {
+        self.count_column
+    }
+}
+
 /// The SQL aggregates computed for a nullable `Int64` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NullableI64Aggregates {
@@ -127,6 +146,32 @@ impl fmt::Display for AggregateError {
 
 impl Error for AggregateError {}
 
+/// Computes `COUNT(*)` and `COUNT(column)` without evaluating other aggregates.
+///
+/// `None` values represent SQL `NULL`: they contribute to `COUNT(*)`, but not
+/// to `COUNT(column)`. Bounds and explicit selections have the same validation
+/// semantics as [`aggregate_nullable_i64`]. Values are never summed, so valid
+/// counts cannot fail because an unrelated `SUM(column)` would overflow.
+pub fn count_nullable_i64(
+    values: &[Option<i64>],
+    selection: RowSelection<'_>,
+    limits: AggregateLimits,
+) -> Result<NullableI64Counts, AggregateError> {
+    let selected_rows = validate_aggregate_input(values.len(), selection, limits)?;
+    let count_column = match selection {
+        RowSelection::All => values.iter().filter(|value| value.is_some()).count(),
+        RowSelection::Indices(indices) => indices
+            .iter()
+            .filter(|&&index| values[index].is_some())
+            .count(),
+    };
+
+    Ok(NullableI64Counts {
+        count_star: selected_rows as u64,
+        count_column: count_column as u64,
+    })
+}
+
 /// Computes `COUNT(*)`, `COUNT(column)`, and `SUM(column)` for nullable `i64`
 /// values.
 ///
@@ -165,14 +210,29 @@ pub fn aggregate_nullable_i64(
     selection: RowSelection<'_>,
     limits: AggregateLimits,
 ) -> Result<NullableI64Aggregates, AggregateError> {
-    if values.len() > limits.max_input_rows {
+    let selected_rows = validate_aggregate_input(values.len(), selection, limits)?;
+    let count_star = selected_rows as u64;
+    match selection {
+        RowSelection::All => aggregate_values(values.iter().copied(), count_star),
+        RowSelection::Indices(indices) => {
+            aggregate_values(indices.iter().map(|&index| values[index]), count_star)
+        }
+    }
+}
+
+fn validate_aggregate_input(
+    input_rows: usize,
+    selection: RowSelection<'_>,
+    limits: AggregateLimits,
+) -> Result<usize, AggregateError> {
+    if input_rows > limits.max_input_rows {
         return Err(AggregateError::InputLimitExceeded {
-            rows: values.len(),
+            rows: input_rows,
             max_rows: limits.max_input_rows,
         });
     }
 
-    let selected_rows = selection.row_count(values.len());
+    let selected_rows = selection.row_count(input_rows);
     if selected_rows > limits.max_selected_rows {
         return Err(AggregateError::SelectionLimitExceeded {
             rows: selected_rows,
@@ -181,16 +241,10 @@ pub fn aggregate_nullable_i64(
     }
 
     if let RowSelection::Indices(indices) = selection {
-        validate_selection(indices, values.len())?;
+        validate_selection(indices, input_rows)?;
     }
 
-    let count_star = selected_rows as u64;
-    match selection {
-        RowSelection::All => aggregate_values(values.iter().copied(), count_star),
-        RowSelection::Indices(indices) => {
-            aggregate_values(indices.iter().map(|&index| values[index]), count_star)
-        }
-    }
+    Ok(selected_rows)
 }
 
 fn validate_selection(indices: &[usize], input_rows: usize) -> Result<(), AggregateError> {
