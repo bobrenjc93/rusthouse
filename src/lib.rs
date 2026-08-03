@@ -6,7 +6,9 @@ pub mod sql;
 pub mod storage;
 pub mod table_snapshot;
 
-pub use csv_ingest::{CsvIngestAllocation, CsvIngestError, CsvIngestLimits};
+pub use csv_ingest::{
+    CsvErrorPosition, CsvIngestAllocation, CsvIngestError, CsvIngestLimits, CsvInputError,
+};
 pub use sql::{
     ColumnDefinition, CreateTableStatement, IdentifierContext, ParseError, ParseErrorKind,
     ParseLimits, parse_create_table, parse_create_table_with_limits,

@@ -1,4 +1,6 @@
-use rusthouse::{CsvIngestError, CsvIngestLimits, DataType, Field, Table, TableError, Value};
+use rusthouse::{
+    CsvIngestError, CsvIngestLimits, CsvInputError, DataType, Field, Table, TableError, Value,
+};
 use std::io::{self, Read};
 
 fn full_schema() -> Vec<Field> {
@@ -221,11 +223,72 @@ fn invalid_utf8_header_is_reported_as_a_csv_error() {
     let mut table = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
 
     assert!(matches!(
-        table.insert_csv([0xff, b'\n'].as_slice()),
-        Err(CsvIngestError::Csv(error))
-            if matches!(error.kind(), csv::ErrorKind::Utf8 { .. })
+        table.insert_csv_with_limits(
+            [0xff, b'\n'].as_slice(),
+            CsvIngestLimits::new(2, 0).with_max_decoded_bytes(0),
+        ),
+        Err(CsvIngestError::Csv(CsvInputError::InvalidUtf8Header {
+            position,
+            field: 0,
+            valid_up_to: 0,
+        })) if position.byte == 0 && position.line == 1 && position.record == 0
     ));
     assert!(table.is_empty());
+}
+
+#[test]
+fn data_csv_errors_keep_original_input_positions() {
+    let mut table = Table::new(vec![Field::new("text", DataType::String)]).unwrap();
+    let csv = b"text\nok\n\xff\n";
+
+    assert!(matches!(
+        table.insert_csv(csv.as_slice()),
+        Err(CsvIngestError::Csv(CsvInputError::Parser(error)))
+            if error.position().is_some_and(|position| {
+                position.byte() == 8 && position.line() == 3 && position.record() == 2
+            })
+    ));
+    assert!(table.is_empty());
+}
+
+#[test]
+fn escaped_quote_payload_uses_decoded_size_for_the_exact_limit() {
+    const DECODED_QUOTES: usize = 200 * 1024;
+
+    let encoded = "\"\"".repeat(DECODED_QUOTES);
+    let csv = format!("text\n\"{encoded}\"\n");
+    let parser_bytes =
+        8 * 1024 + 1024 + DECODED_QUOTES.next_power_of_two() + 4 * std::mem::size_of::<usize>();
+    let exact_bytes = parser_bytes
+        + std::mem::size_of::<Vec<Value>>()
+        + std::mem::size_of::<Value>()
+        + DECODED_QUOTES;
+    assert!(exact_bytes < 600 * 1024);
+
+    let mut too_small = Table::new(vec![Field::new("text", DataType::String)]).unwrap();
+    assert!(matches!(
+        too_small.insert_csv_with_limits(
+            csv.as_bytes(),
+            CsvIngestLimits::new(csv.len(), 1).with_max_decoded_bytes(exact_bytes - 1),
+        ),
+        Err(CsvIngestError::DecodedLimitExceeded { limit, required })
+            if limit == exact_bytes - 1 && required == exact_bytes
+    ));
+
+    let mut exact = Table::new(vec![Field::new("text", DataType::String)]).unwrap();
+    assert_eq!(
+        exact
+            .insert_csv_with_limits(
+                csv.as_bytes(),
+                CsvIngestLimits::new(csv.len(), 1).with_max_decoded_bytes(exact_bytes),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        exact.string_column("text").unwrap()[0].len(),
+        DECODED_QUOTES
+    );
 }
 
 #[test]
@@ -313,10 +376,8 @@ fn decoded_memory_limit_bounds_wide_empty_string_rows_at_exact_boundary() {
     let csv = format!("{header}\n{empty_row}\n{empty_row}\n");
     let staged_bytes =
         2 * (std::mem::size_of::<Vec<Value>>() + FIELD_COUNT * std::mem::size_of::<Value>());
-    let parser_bytes = 8 * 1024
-        + 1024
-        + empty_row.len().next_power_of_two()
-        + FIELD_COUNT.next_power_of_two() * std::mem::size_of::<usize>();
+    let parser_bytes =
+        8 * 1024 + 1024 + FIELD_COUNT.next_power_of_two() * std::mem::size_of::<usize>();
     let commit_bytes = 2 * std::mem::size_of::<Vec<Value>>();
     let decoded_bytes = (staged_bytes + parser_bytes).max(staged_bytes + commit_bytes);
 

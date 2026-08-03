@@ -9,7 +9,7 @@
 use crate::{DataType, Field, Table, TableError, Value};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 use std::mem;
 use std::str;
 
@@ -112,6 +112,59 @@ impl fmt::Display for CsvIngestAllocation {
     }
 }
 
+/// Location of a CSV record in the original bounded input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsvErrorPosition {
+    /// Zero-based byte offset at the start of the record.
+    pub byte: u64,
+    /// One-based physical line number at the start of the record.
+    pub line: u64,
+    /// Zero-based logical record number, including the header.
+    pub record: u64,
+}
+
+/// A parser or UTF-8 failure with locations relative to the original input.
+#[derive(Debug)]
+pub enum CsvInputError {
+    /// The allocation-free header decoder found invalid UTF-8.
+    InvalidUtf8Header {
+        /// Location of the header record in the original input.
+        position: CsvErrorPosition,
+        /// Zero-based header field containing the invalid byte sequence.
+        field: usize,
+        /// Valid decoded bytes preceding the invalid byte in that field.
+        valid_up_to: usize,
+    },
+    /// The `csv` parser rejected a data record.
+    Parser(csv::Error),
+}
+
+impl fmt::Display for CsvInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUtf8Header {
+                position,
+                field,
+                valid_up_to,
+            } => write!(
+                formatter,
+                "CSV parse error: record {} (line {}, field: {}, byte: {}): invalid UTF-8 after {valid_up_to} bytes",
+                position.record, position.line, field, position.byte
+            ),
+            Self::Parser(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CsvInputError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Parser(error) => Some(error),
+            Self::InvalidUtf8Header { .. } => None,
+        }
+    }
+}
+
 /// A typed failure from transactional CSV ingestion.
 #[derive(Debug)]
 pub enum CsvIngestError {
@@ -170,8 +223,8 @@ pub enum CsvIngestError {
         /// Length of the rejected decoded field in bytes.
         value_bytes: usize,
     },
-    /// The `csv` parser rejected malformed or non-UTF-8 input.
-    Csv(csv::Error),
+    /// CSV decoding rejected malformed or non-UTF-8 input.
+    Csv(CsvInputError),
     /// The validated batch could not be committed to the table.
     Table(TableError),
 }
@@ -278,8 +331,16 @@ impl Table {
             required: usize::MAX,
         })?;
         let header = &csv_bytes[shape.header_start..shape.header_end];
-        if str::from_utf8(header).is_err() {
-            return Err(CsvIngestError::Csv(invalid_utf8_csv_error()));
+        if let Some((field, valid_up_to)) = header_utf8_error(header) {
+            return Err(CsvIngestError::Csv(CsvInputError::InvalidUtf8Header {
+                position: CsvErrorPosition {
+                    byte: (bytes.len() - csv_bytes.len() + shape.header_start) as u64,
+                    line: line_number_at(csv_bytes, shape.header_start),
+                    record: 0,
+                },
+                field,
+                valid_up_to,
+            }));
         }
         let first_mismatch = first_header_mismatch(header, self.fields());
         if shape.header_fields != self.fields().len() || first_mismatch.is_some() {
@@ -345,19 +406,22 @@ impl Table {
             .has_headers(true)
             .flexible(true)
             .buffer_capacity(READ_BUFFER_BYTES)
-            .from_reader(&csv_bytes[shape.data_start..]);
+            .from_reader(Cursor::new(bytes.as_slice()));
         // `csv` otherwise retains byte and string clones of the first data
         // record even when `has_headers(false)` is used.
         reader.set_byte_headers(csv::ByteRecord::new());
+        let mut data_position = csv::Position::new();
+        data_position
+            .set_byte((bytes.len() - csv_bytes.len() + shape.data_start) as u64)
+            .set_line(line_number_at(csv_bytes, shape.data_start))
+            .set_record(1);
+        reader.seek(data_position).map_err(csv_parser_error)?;
 
         let mut record = csv::StringRecord::new();
         let mut rows = Vec::new();
         let mut decoded_bytes = 0_usize;
         let mut row_index = 0_usize;
-        while reader
-            .read_record(&mut record)
-            .map_err(CsvIngestError::Csv)?
-        {
+        while reader.read_record(&mut record).map_err(csv_parser_error)? {
             if rows.len() == limits.max_rows {
                 return Err(CsvIngestError::RowLimitExceeded {
                     limit: limits.max_rows,
@@ -556,13 +620,14 @@ struct CsvShape {
     data_rows: usize,
     data_cells: usize,
     max_data_fields: usize,
-    max_data_record_bytes: usize,
+    max_data_decoded_bytes: usize,
 }
 
 fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
     let mut shape = CsvShape::default();
     let mut saw_header = false;
     let mut fields = 1_usize;
+    let mut decoded_record_bytes = 0_usize;
     let mut record_start = 0_usize;
     let mut index = 0_usize;
     let mut record_started = false;
@@ -573,55 +638,69 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
         if in_quotes {
             if byte == b'"' {
                 if bytes.get(index + 1) == Some(&b'"') {
+                    decoded_record_bytes = decoded_record_bytes.checked_add(1)?;
                     index += 2;
                     continue;
                 }
                 in_quotes = false;
+                at_field_start = false;
+                index += 1;
+                continue;
             }
-        } else {
-            match byte {
-                b'"' if at_field_start => {
-                    in_quotes = true;
-                    record_started = true;
+            decoded_record_bytes = decoded_record_bytes.checked_add(1)?;
+            at_field_start = false;
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' if at_field_start => {
+                in_quotes = true;
+                record_started = true;
+                at_field_start = false;
+                index += 1;
+            }
+            b',' => {
+                fields = fields.checked_add(1)?;
+                record_started = true;
+                at_field_start = true;
+                index += 1;
+            }
+            b'\r' | b'\n' => {
+                let terminator_bytes =
+                    usize::from(byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) + 1;
+                if record_started {
+                    finish_shape_record(
+                        &mut shape,
+                        &mut saw_header,
+                        fields,
+                        decoded_record_bytes,
+                        record_start,
+                        index,
+                        index.checked_add(terminator_bytes)?,
+                    )?;
                 }
-                b',' => {
-                    fields = fields.checked_add(1)?;
-                    record_started = true;
-                    at_field_start = true;
-                    index += 1;
-                    continue;
-                }
-                b'\r' | b'\n' => {
-                    let terminator_bytes =
-                        usize::from(byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')) + 1;
-                    if record_started {
-                        finish_shape_record(
-                            &mut shape,
-                            &mut saw_header,
-                            fields,
-                            record_start,
-                            index,
-                            index.checked_add(terminator_bytes)?,
-                        )?;
-                    }
-                    fields = 1;
-                    record_started = false;
-                    at_field_start = true;
-                    index = index.checked_add(terminator_bytes)?;
-                    record_start = index;
-                    continue;
-                }
-                _ => record_started = true,
+                fields = 1;
+                decoded_record_bytes = 0;
+                record_started = false;
+                at_field_start = true;
+                index = index.checked_add(terminator_bytes)?;
+                record_start = index;
+            }
+            _ => {
+                decoded_record_bytes = decoded_record_bytes.checked_add(1)?;
+                record_started = true;
+                at_field_start = false;
+                index += 1;
             }
         }
-        at_field_start = false;
-        index += 1;
     }
     if record_started {
         finish_shape_record(
             &mut shape,
             &mut saw_header,
             fields,
+            decoded_record_bytes,
             record_start,
             bytes.len(),
             bytes.len(),
@@ -634,11 +713,11 @@ fn finish_shape_record(
     shape: &mut CsvShape,
     saw_header: &mut bool,
     fields: usize,
+    decoded_record_bytes: usize,
     record_start: usize,
     record_end: usize,
     data_start: usize,
 ) -> Option<()> {
-    let record_bytes = record_end.checked_sub(record_start)?;
     if !*saw_header {
         shape.header_fields = fields;
         shape.header_start = record_start;
@@ -649,7 +728,7 @@ fn finish_shape_record(
         shape.data_rows = shape.data_rows.checked_add(1)?;
         shape.data_cells = shape.data_cells.checked_add(fields)?;
         shape.max_data_fields = shape.max_data_fields.max(fields);
-        shape.max_data_record_bytes = shape.max_data_record_bytes.max(record_bytes);
+        shape.max_data_decoded_bytes = shape.max_data_decoded_bytes.max(decoded_record_bytes);
     }
     Some(())
 }
@@ -726,11 +805,104 @@ fn csv_field_equals(raw: &[u8], expected: &[u8]) -> bool {
     false
 }
 
+fn header_utf8_error(header: &[u8]) -> Option<(usize, usize)> {
+    if header.is_empty() {
+        return None;
+    }
+
+    let mut column = 0_usize;
+    let mut field_start = 0_usize;
+    let mut index = 0_usize;
+    let mut at_field_start = true;
+    let mut in_quotes = false;
+    while index <= header.len() {
+        let at_end = index == header.len();
+        if at_end || (!in_quotes && header[index] == b',') {
+            if let Some(valid_up_to) = csv_field_utf8_error(&header[field_start..index]) {
+                return Some((column, valid_up_to));
+            }
+            column += 1;
+            field_start = index.saturating_add(1);
+            at_field_start = true;
+            index += 1;
+            continue;
+        }
+
+        let byte = header[index];
+        if in_quotes {
+            if byte == b'"' {
+                if header.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                    continue;
+                }
+                in_quotes = false;
+            }
+        } else if byte == b'"' && at_field_start {
+            in_quotes = true;
+        }
+        at_field_start = false;
+        index += 1;
+    }
+    None
+}
+
+fn csv_field_utf8_error(raw: &[u8]) -> Option<usize> {
+    if raw.first() != Some(&b'"') {
+        return str::from_utf8(raw).err().map(|error| error.valid_up_to());
+    }
+
+    let mut decoded_bytes = 0_usize;
+    let mut segment_start = 1_usize;
+    let mut index = 1_usize;
+    while index < raw.len() {
+        if raw[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let segment = &raw[segment_start..index];
+        if let Err(error) = str::from_utf8(segment) {
+            return Some(decoded_bytes + error.valid_up_to());
+        }
+        decoded_bytes += segment.len();
+        if raw.get(index + 1) == Some(&b'"') {
+            decoded_bytes += 1;
+            index += 2;
+            segment_start = index;
+            continue;
+        }
+        return None;
+    }
+    str::from_utf8(&raw[segment_start..])
+        .err()
+        .map(|error| decoded_bytes + error.valid_up_to())
+}
+
+fn line_number_at(bytes: &[u8], offset: usize) -> u64 {
+    let mut line = 1_u64;
+    let mut index = 0_usize;
+    while index < offset {
+        if bytes[index] == b'\r' {
+            line = line.saturating_add(1);
+            if bytes.get(index + 1) == Some(&b'\n') {
+                index += 1;
+            }
+        } else if bytes[index] == b'\n' {
+            line = line.saturating_add(1);
+        }
+        index += 1;
+    }
+    line
+}
+
+fn csv_parser_error(error: csv::Error) -> CsvIngestError {
+    CsvIngestError::Csv(CsvInputError::Parser(error))
+}
+
 fn parser_working_bytes(shape: CsvShape, limit: usize) -> Result<usize, CsvIngestError> {
     if shape.data_rows == 0 {
         return Ok(0);
     }
-    let payload_capacity = geometric_csv_capacity(shape.max_data_record_bytes).ok_or(
+    let payload_capacity = geometric_csv_capacity(shape.max_data_decoded_bytes).ok_or(
         CsvIngestError::DecodedLimitExceeded {
             limit,
             required: usize::MAX,
@@ -764,19 +936,6 @@ fn geometric_csv_capacity(required: usize) -> Option<usize> {
     } else {
         required.max(4).checked_next_power_of_two()
     }
-}
-
-fn invalid_utf8_csv_error() -> csv::Error {
-    // `csv::Error` has no public constructor. Header bytes were already
-    // validated allocation-free, so parse a fixed one-byte fixture solely to
-    // return the crate's documented UTF-8 error kind without copying input.
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_reader(&b"\xff\n"[..]);
-    let mut record = csv::StringRecord::new();
-    reader
-        .read_record(&mut record)
-        .expect_err("the fixed invalid UTF-8 record must be rejected")
 }
 
 fn ensure_decoded_limit(
