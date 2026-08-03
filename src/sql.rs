@@ -27,13 +27,15 @@ pub struct InsertStatement {
     pub rows: Vec<Vec<Value>>,
 }
 
-/// The columns requested by a `SELECT` statement.
+/// The output requested by a `SELECT` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectProjection {
     /// Expand every column in the table at planning time.
     All,
     /// Return the named columns in the specified order.
     Columns(Vec<String>),
+    /// Count every input row, optionally naming the result field.
+    CountAll { alias: Option<String> },
 }
 
 /// A comparison relationship supported by a `WHERE` predicate.
@@ -55,12 +57,28 @@ pub struct ComparisonPredicate {
     pub value: Value,
 }
 
+/// The direction applied to one `ORDER BY` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDirection {
+    Ascending,
+    Descending,
+}
+
+/// One column and direction from an `ORDER BY` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderByClause {
+    pub column: String,
+    pub direction: OrderDirection,
+}
+
 /// The syntax tree produced for a bounded `SELECT` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub projections: SelectProjection,
     pub table: String,
     pub predicate: Option<ComparisonPredicate>,
+    pub order_by: Option<OrderByClause>,
+    pub limit: Option<usize>,
 }
 
 /// Resource limits applied before and during parsing.
@@ -218,6 +236,13 @@ pub enum ParseErrorKind {
     InvalidComparisonOperator {
         operator: String,
     },
+    ExpectedLimit,
+    InvalidLimit {
+        literal: String,
+    },
+    LimitOutOfRange {
+        literal: String,
+    },
     ExpectedValue,
     InvalidLiteral {
         literal: String,
@@ -275,7 +300,9 @@ impl fmt::Display for ParseErrorKind {
             Self::TooManyValues { limit } => {
                 write!(formatter, "row value count exceeds limit of {limit}")
             }
-            Self::ExpectedProjection => formatter.write_str("expected a column projection or '*'"),
+            Self::ExpectedProjection => {
+                formatter.write_str("expected a column projection, '*', or COUNT(*)")
+            }
             Self::TooManyProjections { limit } => {
                 write!(formatter, "projection count exceeds limit of {limit}")
             }
@@ -284,6 +311,19 @@ impl fmt::Display for ParseErrorKind {
             }
             Self::InvalidComparisonOperator { operator } => {
                 write!(formatter, "invalid comparison operator {operator:?}")
+            }
+            Self::ExpectedLimit => formatter.write_str("expected a nonnegative integer limit"),
+            Self::InvalidLimit { literal } => {
+                write!(
+                    formatter,
+                    "invalid limit {literal:?}; expected a nonnegative integer"
+                )
+            }
+            Self::LimitOutOfRange { literal } => {
+                write!(
+                    formatter,
+                    "limit {literal:?} is outside the supported range"
+                )
             }
             Self::ExpectedValue => formatter.write_str("expected a literal value"),
             Self::InvalidLiteral { literal } => {
@@ -394,11 +434,13 @@ pub fn parse_select(input: &str) -> Result<SelectStatement, ParseError> {
 
 /// Parses one bounded `SELECT` statement.
 ///
-/// Projections are either `*` or a non-empty list of unquoted column names.
-/// The statement reads one table and may contain one `WHERE` comparison between
-/// a column and an `Int64`, `Float64`, `Bool`, or `String` literal. Aliases,
-/// expressions, aggregates, compound predicates, and result modifiers are
-/// outside this intentionally narrow syntax boundary.
+/// Projections are `*`, a non-empty list of unquoted column names, or the single
+/// aggregate `COUNT(*)` with an optional `AS` alias. The statement reads one
+/// table and may contain one `WHERE` comparison between a column and an
+/// `Int64`, `Float64`, `Bool`, or `String` literal. That may be followed by one
+/// `ORDER BY column [ASC|DESC]` clause and a nonnegative integer `LIMIT`. Other
+/// aliases, expressions, aggregates, compound predicates, and result modifiers
+/// are outside this intentionally narrow syntax boundary.
 pub fn parse_select_with_limits(
     input: &str,
     limits: SelectParseLimits,
@@ -542,11 +584,41 @@ impl<'a> Parser<'a> {
             None
         };
 
+        self.skip_whitespace();
+        let order_by = if self.peek_token_is("ORDER") {
+            self.parse_keyword("ORDER")?;
+            self.parse_keyword("BY")?;
+            let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            let direction = if self.peek_token_is("ASC") {
+                self.parse_keyword("ASC")?;
+                OrderDirection::Ascending
+            } else if self.peek_token_is("DESC") {
+                self.parse_keyword("DESC")?;
+                OrderDirection::Descending
+            } else {
+                OrderDirection::Ascending
+            };
+            Some(OrderByClause { column, direction })
+        } else {
+            None
+        };
+
+        self.skip_whitespace();
+        let limit = if self.peek_token_is("LIMIT") {
+            self.parse_keyword("LIMIT")?;
+            Some(self.parse_limit()?)
+        } else {
+            None
+        };
+
         self.finish_statement()?;
         Ok(SelectStatement {
             projections,
             table,
             predicate,
+            order_by,
+            limit,
         })
     }
 
@@ -578,9 +650,15 @@ impl<'a> Parser<'a> {
             }
 
             let (column, _) = self.parse_identifier(IdentifierContext::Column)?;
+            self.skip_whitespace();
+            if columns.is_empty()
+                && column.eq_ignore_ascii_case("COUNT")
+                && self.peek() == Some(b'(')
+            {
+                return self.parse_count_all();
+            }
             columns.push(column);
 
-            self.skip_whitespace();
             if self.peek() != Some(b',') {
                 break;
             }
@@ -588,6 +666,21 @@ impl<'a> Parser<'a> {
         }
 
         Ok(SelectProjection::Columns(columns))
+    }
+
+    fn parse_count_all(&mut self) -> Result<SelectProjection, ParseError> {
+        self.position += 1;
+        self.expect_byte(b'*', "'*'")?;
+        self.expect_byte(b')', "')'")?;
+
+        let alias = if self.peek_token_is("AS") {
+            self.parse_keyword("AS")?;
+            Some(self.parse_identifier(IdentifierContext::Column)?.0)
+        } else {
+            None
+        };
+
+        Ok(SelectProjection::CountAll { alias })
     }
 
     fn parse_comparison(
@@ -667,6 +760,33 @@ impl<'a> Parser<'a> {
                 },
             }),
         }
+    }
+
+    fn parse_limit(&mut self) -> Result<usize, ParseError> {
+        self.skip_whitespace();
+        let start = self.position;
+        let literal = self.take_token();
+        if literal.is_empty() {
+            return Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::ExpectedLimit,
+            });
+        }
+        if !literal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseError {
+                position: start,
+                kind: ParseErrorKind::InvalidLimit {
+                    literal: literal.to_owned(),
+                },
+            });
+        }
+
+        literal.parse().map_err(|_| ParseError {
+            position: start,
+            kind: ParseErrorKind::LimitOutOfRange {
+                literal: literal.to_owned(),
+            },
+        })
     }
 
     fn parse_row(&mut self, limits: InsertParseLimits) -> Result<Vec<Value>, ParseError> {

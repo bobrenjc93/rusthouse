@@ -107,6 +107,82 @@ fn filters_rows_and_reports_empty_results() {
 }
 
 #[test]
+fn counts_all_filtered_and_empty_tables_as_one_int64_row() {
+    let catalog = readings_catalog();
+
+    let all = catalog
+        .execute_select("SELECT COUNT(*) FROM readings")
+        .unwrap();
+    assert_eq!(
+        all.fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [("count()", DataType::Int64)]
+    );
+    assert_eq!(all.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(all.row_indices().collect::<Vec<_>>(), [0]);
+    assert_eq!(all.len(), 1);
+    assert!(!all.is_empty());
+
+    let filtered = catalog
+        .execute_select("SELECT COUNT(*) AS active_count FROM readings WHERE active = true")
+        .unwrap();
+    assert_eq!(
+        filtered
+            .fields()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<Vec<_>>(),
+        [("active_count", DataType::Int64)]
+    );
+    assert_eq!(filtered.scalar_value(), Some(&Value::Int64(2)));
+
+    let no_matches = catalog
+        .execute_select("SELECT COUNT(*) FROM readings WHERE value > 100.0")
+        .unwrap();
+    assert_eq!(no_matches.scalar_value(), Some(&Value::Int64(0)));
+    assert_eq!(no_matches.len(), 1);
+
+    let mut empty_catalog = Catalog::new();
+    empty_catalog
+        .execute_create("CREATE TABLE empty (id Int64)")
+        .unwrap();
+    let empty = empty_catalog
+        .execute_select("SELECT COUNT(*) AS rows FROM empty")
+        .unwrap();
+    assert_eq!(empty.scalar_value(), Some(&Value::Int64(0)));
+    assert_eq!(empty.len(), 1);
+    assert!(!empty.is_empty());
+}
+
+#[test]
+fn applies_order_validation_and_limit_to_count_results() {
+    let catalog = readings_catalog();
+
+    let count = catalog
+        .execute_select("SELECT COUNT(*) FROM readings ORDER BY value DESC LIMIT 1")
+        .unwrap();
+    assert_eq!(count.scalar_value(), Some(&Value::Int64(3)));
+    assert_eq!(count.row_indices().collect::<Vec<_>>(), [0]);
+
+    let suppressed = catalog
+        .execute_select("SELECT COUNT(*) AS matches FROM readings ORDER BY value LIMIT 0")
+        .unwrap();
+    assert_eq!(suppressed.fields().next().unwrap().name(), "matches");
+    assert_eq!(suppressed.scalar_value(), None);
+    assert!(suppressed.is_empty());
+    assert_eq!(suppressed.row_indices().next(), None);
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT COUNT(*) FROM readings ORDER BY missing")
+            .unwrap_err(),
+        CatalogError::OrderFieldNotFound {
+            name: "missing".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn executes_an_already_parsed_statement() {
     let catalog = readings_catalog();
     let statement = SelectStatement {
@@ -117,6 +193,8 @@ fn executes_an_already_parsed_statement() {
             operator: ComparisonOperator::GreaterThanOrEqual,
             value: Value::Int64(2),
         }),
+        order_by: None,
+        limit: None,
     };
 
     let result = catalog.select(statement).unwrap();
@@ -129,6 +207,147 @@ fn executes_an_already_parsed_statement() {
         ["label"]
     );
     assert_eq!(result.selected_rows().rev().collect::<Vec<_>>(), [2, 1]);
+}
+
+#[test]
+fn orders_all_physical_types_and_preserves_source_order_for_ties() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create(
+            "CREATE TABLE sortable (id Int64, integer Int64, float Float64, boolean Bool, text String)",
+        )
+        .unwrap();
+    catalog
+        .execute_insert(
+            "INSERT INTO sortable VALUES \
+             (0, 2, 1.5, true, 'bee'), \
+             (1, -1, -2.0, false, 'cat'), \
+             (2, 2, 1.5, false, 'ant')",
+        )
+        .unwrap();
+
+    let cases: [(&str, &[usize], &[usize]); 4] = [
+        ("integer", &[1, 0, 2], &[0, 2, 1]),
+        ("float", &[1, 0, 2], &[0, 2, 1]),
+        ("boolean", &[1, 2, 0], &[0, 1, 2]),
+        ("text", &[2, 0, 1], &[1, 0, 2]),
+    ];
+
+    for (column, ascending, descending) in cases {
+        let asc = catalog
+            .execute_select(&format!("SELECT id FROM sortable ORDER BY {column}"))
+            .unwrap();
+        assert_eq!(
+            asc.row_indices().collect::<Vec<_>>(),
+            ascending,
+            "ascending {column}"
+        );
+
+        let desc = catalog
+            .execute_select(&format!("SELECT id FROM sortable ORDER BY {column} DESC"))
+            .unwrap();
+        assert_eq!(
+            desc.row_indices().collect::<Vec<_>>(),
+            descending,
+            "descending {column}"
+        );
+        assert_eq!(desc.len(), 3);
+    }
+}
+
+#[test]
+fn float_order_is_total_and_deterministic() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE floats (id Int64, value Float64)")
+        .unwrap();
+    catalog
+        .table_mut("floats")
+        .unwrap()
+        .insert_batch([
+            vec![Value::Int64(0), Value::Float64(f64::NAN)],
+            vec![Value::Int64(1), Value::Float64(0.0)],
+            vec![Value::Int64(2), Value::Float64(-0.0)],
+            vec![Value::Int64(3), Value::Float64(f64::INFINITY)],
+            vec![Value::Int64(4), Value::Float64(f64::NEG_INFINITY)],
+            vec![Value::Int64(5), Value::Float64(f64::NAN)],
+        ])
+        .unwrap();
+
+    let ascending = catalog
+        .execute_select("SELECT id FROM floats ORDER BY value ASC")
+        .unwrap();
+    assert_eq!(
+        ascending.row_indices().collect::<Vec<_>>(),
+        [4, 2, 1, 3, 0, 5]
+    );
+
+    let descending = catalog
+        .execute_select("SELECT id FROM floats ORDER BY value DESC")
+        .unwrap();
+    assert_eq!(
+        descending.row_indices().collect::<Vec<_>>(),
+        [0, 5, 3, 1, 2, 4]
+    );
+}
+
+#[test]
+fn filters_before_ordering_and_limits_after_ordering() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select(
+            "SELECT label FROM readings WHERE active = true ORDER BY value DESC LIMIT 1",
+        )
+        .unwrap();
+
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [2]);
+    assert_eq!(result.len(), 1);
+    assert!(!result.is_empty());
+
+    let zero = catalog
+        .execute_select("SELECT label FROM readings ORDER BY sequence DESC LIMIT 0")
+        .unwrap();
+    assert!(zero.is_empty());
+    assert_eq!(zero.row_indices().next(), None);
+
+    let oversized = catalog
+        .execute_select("SELECT label FROM readings ORDER BY sequence DESC LIMIT 100")
+        .unwrap();
+    assert_eq!(oversized.row_indices().collect::<Vec<_>>(), [2, 1, 0]);
+}
+
+#[test]
+fn orders_empty_tables_and_reports_missing_order_fields() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE empty (id Int64)")
+        .unwrap();
+
+    let empty = catalog
+        .execute_select("SELECT * FROM empty ORDER BY id DESC LIMIT 10")
+        .unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(empty.row_indices().next(), None);
+
+    assert_eq!(
+        catalog
+            .execute_select("SELECT id FROM empty ORDER BY missing")
+            .unwrap_err(),
+        CatalogError::OrderFieldNotFound {
+            name: "missing".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn limits_unordered_results_after_filtering() {
+    let catalog = readings_catalog();
+    let result = catalog
+        .execute_select("SELECT label FROM readings WHERE sequence > 1 LIMIT 1")
+        .unwrap();
+
+    assert_eq!(result.row_indices().collect::<Vec<_>>(), [1]);
+    assert_eq!(result.len(), 1);
 }
 
 #[test]

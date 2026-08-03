@@ -181,6 +181,35 @@ fn select_results_stream_projected_columns_and_selected_rows() {
         )
         .as_bytes()
     );
+
+    let ordered = catalog
+        .execute_select("SELECT label, id FROM events ORDER BY score DESC LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        render_select(&ordered),
+        concat!(
+            "\"label\",\"id\"\n",
+            "\"a \"\"quoted\"\" value\",3\n",
+            "\"second\",2\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn count_limit_zero_writes_only_the_aggregate_header() {
+    let mut catalog = Catalog::new();
+    catalog
+        .execute_create("CREATE TABLE events (id Int64)")
+        .unwrap();
+    catalog
+        .execute_insert("INSERT INTO events VALUES (1), (2)")
+        .unwrap();
+
+    let result = catalog
+        .execute_select("SELECT COUNT(*) AS rows FROM events LIMIT 0")
+        .unwrap();
+    assert_eq!(render_select(&result), b"\"rows\"\n");
 }
 
 #[test]

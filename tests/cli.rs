@@ -174,6 +174,37 @@ fn writes_only_projected_headers_for_empty_results() {
 }
 
 #[test]
+fn writes_count_rows_for_all_filtered_and_empty_tables() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (id Int64, active Bool)\n\
+          INSERT INTO events VALUES (1, true), (2, false), (3, true)\n\
+          CREATE TABLE empty (id Int64)\n\
+          SELECT COUNT(*) FROM events\n\
+          SELECT COUNT(*) AS active_count FROM events WHERE active = true\n\
+          SELECT COUNT(*) AS no_matches FROM events WHERE id > 10\n\
+          SELECT COUNT(*) AS empty_count FROM empty\n",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "\"count()\"\n",
+            "3\n",
+            "\"active_count\"\n",
+            "2\n",
+            "\"no_matches\"\n",
+            "0\n",
+            "\"empty_count\"\n",
+            "0\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
 fn escapes_select_strings_as_csv() {
     let output = run(
         &["--format", "csv"],
