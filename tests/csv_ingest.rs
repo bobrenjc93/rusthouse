@@ -162,6 +162,59 @@ fn row_limit_accepts_exact_boundary_and_rolls_back_on_excess() {
 }
 
 #[test]
+fn header_only_import_succeeds_with_zero_row_and_decoded_limits() {
+    let csv = b"id\n";
+    let mut table = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
+
+    assert_eq!(
+        table
+            .insert_csv_with_limits(
+                csv.as_slice(),
+                CsvIngestLimits::new(csv.len(), 0).with_max_decoded_bytes(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(table.is_empty());
+}
+
+#[test]
+fn decoded_limit_accounts_for_large_parser_record_buffers() {
+    const FIELD_BYTES: usize = 256 * 1024;
+
+    let value = "x".repeat(FIELD_BYTES);
+    let csv = format!("text\n{value}\n");
+    let mut limited = Table::new(vec![Field::new("text", DataType::String)]).unwrap();
+    let error = limited
+        .insert_csv_with_limits(
+            csv.as_bytes(),
+            CsvIngestLimits::new(csv.len(), 1).with_max_decoded_bytes(FIELD_BYTES * 2),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CsvIngestError::DecodedLimitExceeded { limit, required }
+            if limit == FIELD_BYTES * 2 && required > limit
+    ));
+    assert!(limited.is_empty());
+
+    let mut accepted = Table::new(vec![Field::new("text", DataType::String)]).unwrap();
+    assert_eq!(
+        accepted
+            .insert_csv_with_limits(
+                csv.as_bytes(),
+                CsvIngestLimits::new(csv.len(), 1).with_max_decoded_bytes(FIELD_BYTES * 4),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        accepted.string_column("text").unwrap()[0].len(),
+        FIELD_BYTES
+    );
+}
+
+#[test]
 fn decoded_memory_limit_bounds_wide_empty_string_rows_at_exact_boundary() {
     const FIELD_COUNT: usize = 256;
 
@@ -171,8 +224,12 @@ fn decoded_memory_limit_bounds_wide_empty_string_rows_at_exact_boundary() {
     let header = fields.iter().map(Field::name).collect::<Vec<_>>().join(",");
     let empty_row = ",".repeat(FIELD_COUNT - 1);
     let csv = format!("{header}\n{empty_row}\n{empty_row}\n");
-    let decoded_bytes =
+    let staged_bytes =
         2 * (std::mem::size_of::<Vec<Value>>() + FIELD_COUNT * std::mem::size_of::<Value>());
+    let parser_bytes =
+        8 * 1024 + 2 * (empty_row.len() + FIELD_COUNT * std::mem::size_of::<usize>());
+    let commit_bytes = 2 * std::mem::size_of::<Vec<Value>>();
+    let decoded_bytes = (staged_bytes + parser_bytes).max(staged_bytes + commit_bytes);
 
     let exact_limits = CsvIngestLimits::new(csv.len(), 2).with_max_decoded_bytes(decoded_bytes);
     let mut exact = Table::new(fields.clone()).unwrap();

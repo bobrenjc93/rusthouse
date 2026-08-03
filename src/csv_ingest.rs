@@ -21,6 +21,9 @@ pub const DEFAULT_CSV_ROWS: usize = 1_000_000;
 pub const DEFAULT_CSV_DECODED_BYTES: usize = 64 * 1024 * 1024;
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+// `read_record` keeps the reader's scratch record and the caller-owned
+// `StringRecord` live together while a row is converted.
+const PARSER_RECORD_COPIES: usize = 2;
 
 /// Resource limits for one CSV import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,8 +50,9 @@ impl CsvIngestLimits {
 
     /// Sets the maximum memory requested for decoded row staging.
     ///
-    /// The accounting includes outer row-vector capacity, every [`Value`]
-    /// slot, and the capacity of owned string values. It deliberately excludes
+    /// The accounting includes parser record buffers, outer row-vector
+    /// capacity, every [`Value`] slot, owned string capacity, and the temporary
+    /// row collection used by [`Table::insert_batch`]. It deliberately excludes
     /// the independently bounded raw input buffer and final table columns.
     #[must_use]
     pub const fn with_max_decoded_bytes(mut self, max_decoded_bytes: usize) -> Self {
@@ -297,13 +301,6 @@ impl Table {
             });
         }
 
-        let header_guard_bytes = fixed_value_bytes
-            .checked_add(mem::size_of::<Vec<Value>>())
-            .ok_or(CsvIngestError::DecodedLimitExceeded {
-                limit: limits.max_decoded_bytes,
-                required: usize::MAX,
-            })?;
-        ensure_decoded_limit(0, header_guard_bytes, limits.max_decoded_bytes)?;
         let minimum_data_bytes = shape
             .data_cells
             .checked_mul(mem::size_of::<Value>())
@@ -317,30 +314,56 @@ impl Table {
                 limit: limits.max_decoded_bytes,
                 required: usize::MAX,
             })?;
-        ensure_decoded_limit(0, minimum_data_bytes, limits.max_decoded_bytes)?;
+        let parser_working_bytes = parser_working_bytes(shape, limits.max_decoded_bytes)?;
+        let commit_collection_bytes = shape
+            .data_rows
+            .checked_mul(mem::size_of::<Vec<Value>>())
+            .ok_or(CsvIngestError::DecodedLimitExceeded {
+                limit: limits.max_decoded_bytes,
+                required: usize::MAX,
+            })?;
+        ensure_decoded_limit(
+            minimum_data_bytes,
+            parser_working_bytes,
+            limits.max_decoded_bytes,
+        )?;
+        ensure_decoded_limit(
+            minimum_data_bytes,
+            commit_collection_bytes,
+            limits.max_decoded_bytes,
+        )?;
 
         let mut reader = csv::ReaderBuilder::new()
-            .has_headers(true)
+            .has_headers(false)
             .flexible(true)
+            .buffer_capacity(READ_BUFFER_BYTES)
             .from_reader(bytes.as_slice());
 
-        let header = reader.headers().map_err(CsvIngestError::Csv)?;
-        let first_mismatch = header
+        let mut record = csv::StringRecord::new();
+        let has_header = reader
+            .read_record(&mut record)
+            .map_err(CsvIngestError::Csv)?;
+        debug_assert!(has_header, "shape scan found a header record");
+        let first_mismatch = record
             .iter()
             .zip(self.fields())
             .position(|(actual, expected)| actual != expected.name());
-        if header.len() != self.fields().len() || first_mismatch.is_some() {
+        if record.len() != self.fields().len() || first_mismatch.is_some() {
             return Err(CsvIngestError::HeaderMismatch {
                 expected_fields: self.fields().len(),
-                actual_fields: header.len(),
+                actual_fields: record.len(),
                 first_mismatch,
             });
         }
+        record = csv::StringRecord::new();
 
         let mut rows = Vec::new();
         let mut decoded_bytes = 0_usize;
-        for (row_index, record) in reader.records().enumerate() {
-            let record = record.map_err(CsvIngestError::Csv)?;
+        let mut row_index = 0_usize;
+        while reader
+            .read_record(&mut record)
+            .map_err(CsvIngestError::Csv)?
+        {
             if rows.len() == limits.max_rows {
                 return Err(CsvIngestError::RowLimitExceeded {
                     limit: limits.max_rows,
@@ -376,12 +399,13 @@ impl Table {
                 })?;
             ensure_decoded_limit(
                 decoded_bytes,
-                requested_row_bytes.checked_add(planned_outer_bytes).ok_or(
-                    CsvIngestError::DecodedLimitExceeded {
+                parser_working_bytes
+                    .checked_add(requested_row_bytes)
+                    .and_then(|bytes| bytes.checked_add(planned_outer_bytes))
+                    .ok_or(CsvIngestError::DecodedLimitExceeded {
                         limit: limits.max_decoded_bytes,
                         required: usize::MAX,
-                    },
-                )?,
+                    })?,
                 limits.max_decoded_bytes,
             )?;
 
@@ -415,6 +439,16 @@ impl Table {
                     required: usize::MAX,
                 },
             )?;
+            ensure_decoded_limit(
+                decoded_bytes,
+                parser_working_bytes.checked_add(base_row_bytes).ok_or(
+                    CsvIngestError::DecodedLimitExceeded {
+                        limit: limits.max_decoded_bytes,
+                        required: usize::MAX,
+                    },
+                )?,
+                limits.max_decoded_bytes,
+            )?;
 
             let mut actual_string_bytes = 0_usize;
             for (column, (raw, field)) in record.iter().zip(self.fields()).enumerate() {
@@ -428,12 +462,13 @@ impl Table {
                         })?;
                     ensure_decoded_limit(
                         decoded_bytes,
-                        base_row_bytes.checked_add(actual_string_bytes).ok_or(
-                            CsvIngestError::DecodedLimitExceeded {
+                        parser_working_bytes
+                            .checked_add(base_row_bytes)
+                            .and_then(|bytes| bytes.checked_add(actual_string_bytes))
+                            .ok_or(CsvIngestError::DecodedLimitExceeded {
                                 limit: limits.max_decoded_bytes,
                                 required: usize::MAX,
-                            },
-                        )?,
+                            })?,
                         limits.max_decoded_bytes,
                     )?;
                 }
@@ -451,8 +486,23 @@ impl Table {
                 limits.max_decoded_bytes,
             )?;
             rows.push(row);
+            row_index += 1;
+            record.clear();
         }
 
+        drop(record);
+        drop(reader);
+        let commit_collection_bytes = rows.len().checked_mul(mem::size_of::<Vec<Value>>()).ok_or(
+            CsvIngestError::DecodedLimitExceeded {
+                limit: limits.max_decoded_bytes,
+                required: usize::MAX,
+            },
+        )?;
+        ensure_decoded_limit(
+            decoded_bytes,
+            commit_collection_bytes,
+            limits.max_decoded_bytes,
+        )?;
         self.insert_batch(rows).map_err(CsvIngestError::Table)
     }
 }
@@ -508,6 +558,8 @@ struct CsvShape {
     header_fields: usize,
     data_rows: usize,
     data_cells: usize,
+    max_data_fields: usize,
+    max_data_record_bytes: usize,
 }
 
 fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
@@ -515,6 +567,7 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
     let mut shape = CsvShape::default();
     let mut saw_header = false;
     let mut fields = 1_usize;
+    let mut record_bytes = 0_usize;
     let mut index = 0_usize;
     let mut record_started = false;
     let mut at_field_start = true;
@@ -524,6 +577,7 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
         if in_quotes {
             if byte == b'"' {
                 if bytes.get(index + 1) == Some(&b'"') {
+                    record_bytes = record_bytes.checked_add(2)?;
                     index += 2;
                     continue;
                 }
@@ -537,6 +591,7 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
                 }
                 b',' => {
                     fields = fields.checked_add(1)?;
+                    record_bytes = record_bytes.checked_add(1)?;
                     record_started = true;
                     at_field_start = true;
                     index += 1;
@@ -544,9 +599,10 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
                 }
                 b'\r' | b'\n' => {
                     if record_started {
-                        finish_shape_record(&mut shape, &mut saw_header, fields)?;
+                        finish_shape_record(&mut shape, &mut saw_header, fields, record_bytes)?;
                     }
                     fields = 1;
+                    record_bytes = 0;
                     record_started = false;
                     at_field_start = true;
                     if byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
@@ -558,24 +614,59 @@ fn scan_csv_shape(bytes: &[u8]) -> Option<CsvShape> {
                 _ => record_started = true,
             }
         }
+        record_bytes = record_bytes.checked_add(1)?;
         at_field_start = false;
         index += 1;
     }
     if record_started {
-        finish_shape_record(&mut shape, &mut saw_header, fields)?;
+        finish_shape_record(&mut shape, &mut saw_header, fields, record_bytes)?;
     }
     Some(shape)
 }
 
-fn finish_shape_record(shape: &mut CsvShape, saw_header: &mut bool, fields: usize) -> Option<()> {
+fn finish_shape_record(
+    shape: &mut CsvShape,
+    saw_header: &mut bool,
+    fields: usize,
+    record_bytes: usize,
+) -> Option<()> {
     if !*saw_header {
         shape.header_fields = fields;
         *saw_header = true;
     } else {
         shape.data_rows = shape.data_rows.checked_add(1)?;
         shape.data_cells = shape.data_cells.checked_add(fields)?;
+        shape.max_data_fields = shape.max_data_fields.max(fields);
+        shape.max_data_record_bytes = shape.max_data_record_bytes.max(record_bytes);
     }
     Some(())
+}
+
+fn parser_working_bytes(shape: CsvShape, limit: usize) -> Result<usize, CsvIngestError> {
+    if shape.data_rows == 0 {
+        return Ok(0);
+    }
+    let field_indexes = shape
+        .max_data_fields
+        .checked_mul(mem::size_of::<usize>())
+        .ok_or(CsvIngestError::DecodedLimitExceeded {
+            limit,
+            required: usize::MAX,
+        })?;
+    let one_record = shape
+        .max_data_record_bytes
+        .checked_add(field_indexes)
+        .ok_or(CsvIngestError::DecodedLimitExceeded {
+            limit,
+            required: usize::MAX,
+        })?;
+    one_record
+        .checked_mul(PARSER_RECORD_COPIES)
+        .and_then(|bytes| bytes.checked_add(READ_BUFFER_BYTES))
+        .ok_or(CsvIngestError::DecodedLimitExceeded {
+            limit,
+            required: usize::MAX,
+        })
 }
 
 fn ensure_decoded_limit(

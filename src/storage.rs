@@ -434,17 +434,29 @@ impl Table {
         I: IntoIterator<Item = Vec<Value>>,
     {
         let remaining = self.row_limit - self.row_count;
+        let mut rows = rows.into_iter();
         let mut batch = Vec::new();
-        for row in rows {
+        let (minimum, maximum) = rows.size_hint();
+        if maximum == Some(minimum) {
+            let reserved = minimum.min(remaining);
+            batch
+                .try_reserve_exact(reserved)
+                .map_err(|_| TableError::AllocationFailed {
+                    additional_rows: reserved,
+                })?;
+        }
+        for row in &mut rows {
             if batch.len() == remaining {
                 return Err(TableError::RowLimitExceeded {
                     limit: self.row_limit,
                     current: self.row_count,
                 });
             }
-            batch
-                .try_reserve(1)
-                .map_err(|_| TableError::AllocationFailed { additional_rows: 1 })?;
+            if batch.len() == batch.capacity() {
+                batch
+                    .try_reserve(1)
+                    .map_err(|_| TableError::AllocationFailed { additional_rows: 1 })?;
+            }
             batch.push(row);
         }
 
