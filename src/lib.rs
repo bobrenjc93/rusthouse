@@ -1,6 +1,7 @@
 //! RustHouse is an experimental, compact analytical database.
 
 pub mod aggregate;
+pub mod csv;
 pub mod grouping;
 pub mod order;
 pub mod parser;
@@ -10,6 +11,7 @@ pub mod snapshot;
 pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, RowSelection, aggregate_nullable_i64,
 };
+pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
