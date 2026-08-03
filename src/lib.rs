@@ -32,6 +32,7 @@ pub use scan::{
 };
 pub use snapshot::{
     NullableI64PayloadCodec, NullableI64PayloadError, SnapshotCodec, SnapshotError,
+    SnapshotFileError,
 };
 mod storage;
 
