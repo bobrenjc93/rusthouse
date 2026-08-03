@@ -1,3 +1,4 @@
+use crate::Value;
 use std::fmt;
 
 /// Maximum number of statements accepted in one SQL batch.
@@ -7,37 +8,17 @@ pub const MAX_BATCH_TOKENS: usize = 16_384;
 /// Maximum number of literal projections accepted in one `SELECT`.
 pub const MAX_SELECT_PROJECTIONS: usize = 1024;
 
-/// A scalar value produced by a literal projection.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ScalarValue {
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-    String(String),
-}
-
-impl ScalarValue {
-    pub fn to_output_string(&self) -> String {
-        match self {
-            Self::Integer(value) => value.to_string(),
-            Self::Float(value) => value.to_string(),
-            Self::Boolean(value) => value.to_string(),
-            Self::String(value) => value.clone(),
-        }
-    }
-}
-
 /// A named value in a query result.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Column {
+pub struct ResultColumn {
     pub name: String,
-    pub value: ScalarValue,
+    pub value: Value,
 }
 
 /// The single-row result of a literal `SELECT` statement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryResult {
-    pub columns: Vec<Column>,
+    pub columns: Vec<ResultColumn>,
 }
 
 /// The category of a SQL error.
@@ -528,7 +509,7 @@ impl Parser {
         Ok(QueryResult { columns })
     }
 
-    fn parse_select_item(&mut self) -> Result<Column, SqlError> {
+    fn parse_select_item(&mut self) -> Result<ResultColumn, SqlError> {
         let (value, default_name) = self.parse_literal()?;
         let name = if self.current_word_is("AS") {
             self.advance();
@@ -545,10 +526,10 @@ impl Parser {
             }
         };
 
-        Ok(Column { name, value })
+        Ok(ResultColumn { name, value })
     }
 
-    fn parse_literal(&mut self) -> Result<(ScalarValue, String), SqlError> {
+    fn parse_literal(&mut self) -> Result<(Value, String), SqlError> {
         let sign = match self.current().kind {
             TokenKind::Plus => {
                 self.advance();
@@ -576,7 +557,7 @@ impl Parser {
                             format!("float literal `{literal}` is outside the finite range"),
                         ));
                     }
-                    Ok((ScalarValue::Float(value), literal))
+                    Ok((Value::Float64(value), literal))
                 } else {
                     let value = literal.parse::<i64>().map_err(|_| {
                         SqlError::syntax(
@@ -584,13 +565,13 @@ impl Parser {
                             format!("integer literal `{literal}` is outside the Int64 range"),
                         )
                     })?;
-                    Ok((ScalarValue::Integer(value), literal))
+                    Ok((Value::Int64(value), literal))
                 }
             }
             TokenKind::String(value) if sign.is_empty() => {
                 self.advance();
                 let default_name = string_literal_name(&value);
-                Ok((ScalarValue::String(value), default_name))
+                Ok((Value::String(value), default_name))
             }
             TokenKind::Word(word)
                 if sign.is_empty()
@@ -599,7 +580,7 @@ impl Parser {
             {
                 self.advance();
                 let value = word.eq_ignore_ascii_case("TRUE");
-                Ok((ScalarValue::Boolean(value), value.to_string()))
+                Ok((Value::Bool(value), value.to_string()))
             }
             TokenKind::Failure(kind) => Err(SqlError::from_kind(token.offset, kind)),
             TokenKind::End | TokenKind::Semicolon | TokenKind::Comma => Err(SqlError::syntax(
@@ -719,21 +700,21 @@ mod tests {
         assert_eq!(
             results[0].columns,
             vec![
-                Column {
+                ResultColumn {
                     name: "integer_value".to_owned(),
-                    value: ScalarValue::Integer(-42),
+                    value: Value::Int64(-42),
                 },
-                Column {
+                ResultColumn {
                     name: "float_value".to_owned(),
-                    value: ScalarValue::Float(125.0),
+                    value: Value::Float64(125.0),
                 },
-                Column {
+                ResultColumn {
                     name: "enabled".to_owned(),
-                    value: ScalarValue::Boolean(false),
+                    value: Value::Bool(false),
                 },
-                Column {
+                ResultColumn {
                     name: "display text".to_owned(),
-                    value: ScalarValue::String("it's SQL".to_owned()),
+                    value: Value::String("it's SQL".to_owned()),
                 },
             ]
         );
@@ -788,7 +769,7 @@ mod tests {
         assert_eq!(results[0].columns[0].name, "'it''s'");
         assert_eq!(
             results[0].columns[0].value,
-            ScalarValue::String("it's".to_owned())
+            Value::String("it's".to_owned())
         );
     }
 

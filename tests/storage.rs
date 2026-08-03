@@ -1,4 +1,6 @@
-use rusthouse::{ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value, ValueRef};
+use rusthouse::{
+    Column, ColumnSchema, DataType, InsertError, Schema, SchemaError, Table, Value, ValueRef,
+};
 
 fn analytics_schema() -> Schema {
     Schema::new(vec![
@@ -54,6 +56,7 @@ fn inserts_and_accesses_multiple_typed_rows() {
     assert_eq!(table.value(0, 3), Some(ValueRef::String("north")));
     assert_eq!(table.value(2, 0), None);
     assert_eq!(table.value(0, 4), None);
+    assert!(matches!(table.columns()[0], Column::Int64(_)));
 }
 
 #[test]

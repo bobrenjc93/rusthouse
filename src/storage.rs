@@ -143,6 +143,17 @@ impl Value {
     }
 }
 
+impl fmt::Display for Value {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int64(value) => value.fmt(formatter),
+            Self::Float64(value) => value.fmt(formatter),
+            Self::Bool(value) => value.fmt(formatter),
+            Self::String(value) => formatter.write_str(value),
+        }
+    }
+}
+
 impl From<i64> for Value {
     fn from(value: i64) -> Self {
         Self::Int64(value)

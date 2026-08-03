@@ -36,7 +36,7 @@ fn write_csv<W: Write>(result: &QueryResult, writer: &mut W) -> io::Result<()> {
     let values: Vec<String> = result
         .columns
         .iter()
-        .map(|column| column.value.to_output_string())
+        .map(|column| column.value.to_string())
         .collect();
     write_csv_row(values.iter().map(String::as_str), writer)
 }
@@ -79,7 +79,7 @@ fn write_table<W: Write>(result: &QueryResult, writer: &mut W) -> io::Result<()>
     let values: Vec<String> = result
         .columns
         .iter()
-        .map(|column| escape_table_field(&column.value.to_output_string()))
+        .map(|column| escape_table_field(&column.value.to_string()))
         .collect();
     let widths: Vec<usize> = names
         .iter()
@@ -138,14 +138,14 @@ fn display_width(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Column, ScalarValue};
+    use crate::{ResultColumn, Value};
 
     #[test]
     fn csv_quotes_delimiters_quotes_and_line_breaks() {
         let results = vec![QueryResult {
-            columns: vec![Column {
+            columns: vec![ResultColumn {
                 name: "message,text".to_owned(),
-                value: ScalarValue::String("say \"hello\"\nagain".to_owned()),
+                value: Value::String("say \"hello\"\nagain".to_owned()),
             }],
         }];
         let mut output = Vec::new();
@@ -161,9 +161,9 @@ mod tests {
     #[test]
     fn table_escapes_control_characters_in_names_and_values() {
         let results = vec![QueryResult {
-            columns: vec![Column {
+            columns: vec![ResultColumn {
                 name: "line\nname".to_owned(),
-                value: ScalarValue::String("first\nsecond".to_owned()),
+                value: Value::String("first\nsecond".to_owned()),
             }],
         }];
         let mut output = Vec::new();
@@ -180,13 +180,13 @@ mod tests {
     fn table_aligns_wide_and_combining_characters() {
         let results = vec![QueryResult {
             columns: vec![
-                Column {
+                ResultColumn {
                     name: "表".to_owned(),
-                    value: ScalarValue::String("x".to_owned()),
+                    value: Value::String("x".to_owned()),
                 },
-                Column {
+                ResultColumn {
                     name: "e\u{301}".to_owned(),
-                    value: ScalarValue::String("xx".to_owned()),
+                    value: Value::String("xx".to_owned()),
                 },
             ],
         }];
