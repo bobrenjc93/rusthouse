@@ -737,14 +737,9 @@ impl Catalog {
                 let selection = scan_predicate_groups(table, predicate_groups, &name)?;
 
                 let (selection, ordered_rows, row_end, row_count) = match order {
-                    Some((column_index, direction)) => {
-                        let rows = ordered_row_indices(
-                            table,
-                            column_index,
-                            direction,
-                            selection.as_ref(),
-                            limit,
-                        )?;
+                    Some(order_keys) => {
+                        let rows =
+                            ordered_row_indices(table, &order_keys, selection.as_ref(), limit)?;
                         let row_count = rows.len();
                         (None, Some(rows), 0, row_count)
                     }
@@ -816,7 +811,7 @@ fn execute_aggregates<'a>(
     table: &'a Table,
     table_name: &str,
     predicate_groups: Vec<Vec<ComparisonPredicate>>,
-    order_by: Option<OrderByClause>,
+    order_by: Option<Vec<OrderByClause>>,
     limit: Option<usize>,
     aggregate_result_byte_limit: usize,
     aggregates: impl ExactSizeIterator<Item = AggregateProjection>,
@@ -1072,37 +1067,38 @@ fn limited_row_bounds(
 
 fn resolve_order(
     table: &Table,
-    order_by: OrderByClause,
-) -> Result<(usize, OrderDirection), CatalogError> {
-    table
-        .fields()
-        .iter()
-        .position(|field| field.name() == order_by.column)
-        .map(|index| (index, order_by.direction))
-        .ok_or(CatalogError::OrderFieldNotFound {
-            name: order_by.column,
+    order_by: Vec<OrderByClause>,
+) -> Result<Vec<(usize, OrderDirection)>, CatalogError> {
+    order_by
+        .into_iter()
+        .map(|order_key| {
+            table
+                .fields()
+                .iter()
+                .position(|field| field.name() == order_key.column)
+                .map(|index| (index, order_key.direction))
+                .ok_or(CatalogError::OrderFieldNotFound {
+                    name: order_key.column,
+                })
         })
+        .collect()
 }
 
 fn ordered_row_indices(
     table: &Table,
-    column_index: usize,
-    direction: OrderDirection,
+    order_keys: &[(usize, OrderDirection)],
     selection: Option<&RowSelection>,
     limit: Option<usize>,
 ) -> Result<Vec<usize>, CatalogError> {
     match limit {
-        Some(limit) => {
-            bounded_ordered_row_indices(table, column_index, direction, selection, limit)
-        }
-        None => fully_ordered_row_indices(table, column_index, direction, selection),
+        Some(limit) => bounded_ordered_row_indices(table, order_keys, selection, limit),
+        None => fully_ordered_row_indices(table, order_keys, selection),
     }
 }
 
 fn fully_ordered_row_indices(
     table: &Table,
-    column_index: usize,
-    direction: OrderDirection,
+    order_keys: &[(usize, OrderDirection)],
     selection: Option<&RowSelection>,
 ) -> Result<Vec<usize>, CatalogError> {
     let row_count = selection.map_or(table.len(), RowSelection::selected_count);
@@ -1112,15 +1108,14 @@ fn fully_ordered_row_indices(
         None => rows.extend(0..table.len()),
     }
 
-    let order = RowOrder::new(&table.columns()[column_index], direction);
+    let order = RowOrder::new(table, order_keys);
     rows.sort_unstable_by(|left, right| order.compare(*left, *right));
     Ok(rows)
 }
 
 fn bounded_ordered_row_indices(
     table: &Table,
-    column_index: usize,
-    direction: OrderDirection,
+    order_keys: &[(usize, OrderDirection)],
     selection: Option<&RowSelection>,
     limit: usize,
 ) -> Result<Vec<usize>, CatalogError> {
@@ -1131,7 +1126,7 @@ fn bounded_ordered_row_indices(
     let row_count = selection.map_or(table.len(), RowSelection::selected_count);
     let retained_count = row_count.min(limit);
     let mut rows = try_order_row_buffer(retained_count)?;
-    let order = RowOrder::new(&table.columns()[column_index], direction);
+    let order = RowOrder::new(table, order_keys);
 
     match selection {
         Some(selection) => {
@@ -1159,22 +1154,28 @@ fn try_order_row_buffer(row_count: usize) -> Result<Vec<usize>, CatalogError> {
 
 #[derive(Clone, Copy)]
 struct RowOrder<'a> {
-    column: &'a Column,
-    direction: OrderDirection,
+    table: &'a Table,
+    order_keys: &'a [(usize, OrderDirection)],
 }
 
 impl<'a> RowOrder<'a> {
-    const fn new(column: &'a Column, direction: OrderDirection) -> Self {
-        Self { column, direction }
+    const fn new(table: &'a Table, order_keys: &'a [(usize, OrderDirection)]) -> Self {
+        Self { table, order_keys }
     }
 
     fn compare(self, left: usize, right: usize) -> Ordering {
-        let value_order = compare_column_rows(self.column, left, right);
-        let directed_order = match self.direction {
-            OrderDirection::Ascending => value_order,
-            OrderDirection::Descending => value_order.reverse(),
-        };
-        directed_order.then_with(|| left.cmp(&right))
+        self.order_keys
+            .iter()
+            .map(|(column_index, direction)| {
+                let value_order =
+                    compare_column_rows(&self.table.columns()[*column_index], left, right);
+                match direction {
+                    OrderDirection::Ascending => value_order,
+                    OrderDirection::Descending => value_order.reverse(),
+                }
+            })
+            .find(|order| *order != Ordering::Equal)
+            .unwrap_or_else(|| left.cmp(&right))
     }
 }
 
@@ -1303,15 +1304,14 @@ mod ordered_row_tests {
         table
             .insert_batch((0..4).map(|id| vec![Value::Int64(id)]))
             .unwrap();
+        let order_keys = [(0, OrderDirection::Ascending)];
 
-        let zero =
-            bounded_ordered_row_indices(&table, 0, OrderDirection::Ascending, None, 0).unwrap();
+        let zero = bounded_ordered_row_indices(&table, &order_keys, None, 0).unwrap();
         assert!(zero.is_empty());
         assert_eq!(zero.capacity(), 0);
 
         let empty = Table::new(vec![Field::new("id", DataType::Int64)]).unwrap();
-        let empty_rows =
-            bounded_ordered_row_indices(&empty, 0, OrderDirection::Ascending, None, 25).unwrap();
+        let empty_rows = bounded_ordered_row_indices(&empty, &order_keys, None, 25).unwrap();
         assert!(empty_rows.is_empty());
         assert_eq!(empty_rows.capacity(), 0);
     }

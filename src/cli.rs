@@ -307,6 +307,7 @@ fn is_catalog_limit(error: &CatalogError) -> bool {
                 | ParseErrorKind::TooManyProjections { .. }
                 | ParseErrorKind::TooManyPredicates { .. }
                 | ParseErrorKind::TooManyPredicateGroups { .. }
+                | ParseErrorKind::TooManyOrderKeys { .. }
                 | ParseErrorKind::StringTooLong { .. }
         ),
         CatalogError::TableInsertion {

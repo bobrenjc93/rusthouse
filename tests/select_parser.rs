@@ -72,10 +72,10 @@ fn parses_count_all_with_an_optional_alias_and_predicate() {
         parse_select("SELECT COUNT(*) FROM events ORDER BY active DESC LIMIT 0").unwrap();
     assert_eq!(
         modified.order_by,
-        Some(OrderByClause {
+        Some(vec![OrderByClause {
             column: "active".to_owned(),
             direction: OrderDirection::Descending,
-        })
+        }])
     );
     assert_eq!(modified.limit, Some(0));
 }
@@ -152,14 +152,14 @@ fn parses_wildcard_adjacent_to_select_and_from_keywords() {
 }
 
 #[test]
-fn parses_single_column_ordering_and_limit_in_clause_order() {
+fn parses_ordering_lists_with_independent_directions_and_limit_in_clause_order() {
     let ascending = parse_select("SELECT id FROM events ORDER BY score").unwrap();
     assert_eq!(
         ascending.order_by,
-        Some(OrderByClause {
+        Some(vec![OrderByClause {
             column: "score".to_owned(),
             direction: OrderDirection::Ascending,
-        })
+        }])
     );
     assert_eq!(ascending.limit, None);
 
@@ -168,18 +168,32 @@ fn parses_single_column_ordering_and_limit_in_clause_order() {
             .unwrap();
     assert_eq!(
         descending.order_by,
-        Some(OrderByClause {
+        Some(vec![OrderByClause {
             column: "score".to_owned(),
             direction: OrderDirection::Descending,
-        })
+        }])
     );
     assert_eq!(descending.predicate_groups.len(), 1);
     assert_eq!(descending.limit, Some(5));
 
-    let explicit = parse_select("SELECT * FROM events ORDER BY score ASC LIMIT 0").unwrap();
+    let explicit =
+        parse_select("SELECT * FROM events ORDER BY score ASC, active DESC, id LIMIT 0").unwrap();
     assert_eq!(
-        explicit.order_by.unwrap().direction,
-        OrderDirection::Ascending
+        explicit.order_by,
+        Some(vec![
+            OrderByClause {
+                column: "score".to_owned(),
+                direction: OrderDirection::Ascending,
+            },
+            OrderByClause {
+                column: "active".to_owned(),
+                direction: OrderDirection::Descending,
+            },
+            OrderByClause {
+                column: "id".to_owned(),
+                direction: OrderDirection::Ascending,
+            },
+        ])
     );
     assert_eq!(explicit.limit, Some(0));
 }
@@ -192,9 +206,8 @@ fn parses_limit_without_ordering() {
 }
 
 #[test]
-fn rejects_multiple_order_keys_expressions_and_misordered_clauses() {
+fn rejects_order_expressions_and_misordered_clauses() {
     let cases = [
-        ("SELECT * FROM events ORDER BY score, id", ","),
         ("SELECT * FROM events ORDER BY score + 1", "+"),
         ("SELECT * FROM events ORDER BY lower(score)", "("),
         (
@@ -433,6 +446,26 @@ fn enforces_projection_limit_at_the_next_projection() {
         .unwrap_err();
     assert_eq!(error.position, aggregates.find("AVG").unwrap());
     assert_eq!(error.kind, ParseErrorKind::TooManyProjections { limit: 2 });
+}
+
+#[test]
+fn enforces_order_key_limit_at_the_exact_boundary() {
+    let input = "SELECT id FROM events ORDER BY active DESC, score ASC";
+    let exact = SelectParseLimits::new(input.len(), 1).with_max_order_keys(2);
+    assert!(parse_select_with_limits(input, exact).is_ok());
+
+    let error = parse_select_with_limits(input, exact.with_max_order_keys(1)).unwrap_err();
+    assert_eq!(error.position, input.find("score").unwrap());
+    assert_eq!(error.kind, ParseErrorKind::TooManyOrderKeys { limit: 1 });
+
+    let one = "SELECT id FROM events ORDER BY active";
+    let error = parse_select_with_limits(
+        one,
+        SelectParseLimits::new(one.len(), 1).with_max_order_keys(0),
+    )
+    .unwrap_err();
+    assert_eq!(error.position, one.find("active").unwrap());
+    assert_eq!(error.kind, ParseErrorKind::TooManyOrderKeys { limit: 0 });
 }
 
 #[test]
