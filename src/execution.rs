@@ -5,8 +5,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ComparisonOperator, InsertError, InsertStatement, Int64Table, OrderError, OrderLimits,
-    ScanError, ScanLimits, SelectStatement, order_nullable_i64, scan_nullable_i64,
+    ComparisonOperator, DistinctError, DistinctLimits, InsertError, InsertStatement, Int64Table,
+    OrderError, OrderLimits, ScanError, ScanLimits, SelectDistinctStatement, SelectStatement,
+    distinct_nullable_i64, order_nullable_i64, scan_nullable_i64,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -85,6 +86,44 @@ impl From<ScanError> for SelectExecutionError {
 impl From<OrderError> for SelectExecutionError {
     fn from(error: OrderError) -> Self {
         Self::Order(error)
+    }
+}
+
+/// An error produced while executing a parsed [`SelectDistinctStatement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectDistinctExecutionError {
+    /// The statement names a table other than the one supplied for execution.
+    UnknownTable { name: String },
+    /// The statement names a column other than the table's only column.
+    UnknownColumn { name: String },
+    /// The bounded distinct operator rejected the input or result size.
+    Distinct(DistinctError),
+}
+
+impl fmt::Display for SelectDistinctExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
+            Self::Distinct(error) => {
+                write!(formatter, "could not compute distinct values: {error}")
+            }
+        }
+    }
+}
+
+impl Error for SelectDistinctExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Distinct(error) => Some(error),
+            Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
+        }
+    }
+}
+
+impl From<DistinctError> for SelectDistinctExecutionError {
+    fn from(error: DistinctError) -> Self {
+        Self::Distinct(error)
     }
 }
 
@@ -282,4 +321,31 @@ pub fn execute_select_with_order_limits<'table>(
         .collect();
 
     Ok(Cow::Owned(selected))
+}
+
+/// Executes one parsed `SELECT DISTINCT` with explicit resource bounds.
+///
+/// Names are compared exactly, including ASCII case. On valid identifiers,
+/// execution delegates to [`distinct_nullable_i64`], preserving its
+/// deterministic `NULL`-first ascending output and its separate input-row and
+/// distinct-value limits.
+pub fn execute_select_distinct(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &SelectDistinctStatement,
+    limits: DistinctLimits,
+) -> Result<Vec<Option<i64>>, SelectDistinctExecutionError> {
+    if statement.table_name().as_str() != expected_table_name {
+        return Err(SelectDistinctExecutionError::UnknownTable {
+            name: statement.table_name().as_str().to_owned(),
+        });
+    }
+
+    if statement.column_name().as_str() != table.schema().column().name() {
+        return Err(SelectDistinctExecutionError::UnknownColumn {
+            name: statement.column_name().as_str().to_owned(),
+        });
+    }
+
+    distinct_nullable_i64(table.values(), limits).map_err(Into::into)
 }

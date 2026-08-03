@@ -204,6 +204,25 @@ impl SelectStatement {
     }
 }
 
+/// The typed syntax tree for a one-column `SELECT DISTINCT` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectDistinctStatement {
+    column_name: Identifier,
+    table_name: Identifier,
+}
+
+impl SelectDistinctStatement {
+    /// Returns the projected column name.
+    pub fn column_name(&self) -> &Identifier {
+        &self.column_name
+    }
+
+    /// Returns the source table name.
+    pub fn table_name(&self) -> &Identifier {
+        &self.table_name
+    }
+}
+
 /// An error produced while parsing a bounded SQL statement.
 ///
 /// Offsets and sizes are byte-based, matching Rust string indexing.
@@ -394,6 +413,43 @@ pub fn parse_select(input: &str, limits: ParseLimits) -> Result<SelectStatement,
     validate_statement_length(input, limits)?;
 
     Parser::new(input, limits.max_identifier_bytes).parse_select()
+}
+
+/// Parses one `SELECT DISTINCT` statement containing one column and one table.
+///
+/// Keywords are ASCII case-insensitive. The column and table identifiers
+/// follow the same rules and bounds as [`parse_create_table`]. The complete
+/// accepted grammar is:
+///
+/// ```text
+/// SELECT DISTINCT identifier FROM identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, including whitespace
+/// before or after the optional semicolon. Statement limits and all reported
+/// offsets are measured in bytes.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{ParseLimits, parse_select_distinct};
+///
+/// let statement = parse_select_distinct(
+///     "SELECT DISTINCT event_id FROM events;",
+///     ParseLimits::default(),
+/// )?;
+///
+/// assert_eq!(statement.column_name().as_str(), "event_id");
+/// assert_eq!(statement.table_name().as_str(), "events");
+/// # Ok::<(), rusthouse::ParseError>(())
+/// ```
+pub fn parse_select_distinct(
+    input: &str,
+    limits: ParseLimits,
+) -> Result<SelectDistinctStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_select_distinct()
 }
 
 fn validate_statement_length(input: &str, limits: ParseLimits) -> Result<(), ParseError> {
@@ -596,6 +652,38 @@ impl<'input> Parser<'input> {
             predicate,
             order_by,
             limit,
+        })
+    }
+
+    fn parse_select_distinct(mut self) -> Result<SelectDistinctStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        self.expect_keyword("DISTINCT")?;
+        self.require_whitespace("whitespace after DISTINCT")?;
+        if self.keyword_at_position("FROM") && !self.keyword_follows_current_word("FROM") {
+            return Err(self.unexpected("identifier"));
+        }
+        let column_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let table_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(SelectDistinctStatement {
+            column_name,
+            table_name,
         })
     }
 

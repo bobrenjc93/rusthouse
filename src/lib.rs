@@ -19,8 +19,9 @@ pub use catalog::{Catalog, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
-    InsertExecutionError, SelectExecutionError, execute_insert, execute_select,
-    execute_select_with_limits, execute_select_with_order_limits,
+    InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError, execute_insert,
+    execute_select, execute_select_distinct, execute_select_with_limits,
+    execute_select_with_order_limits,
 };
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
@@ -29,8 +30,8 @@ pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64}
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
     ColumnDefinition, CreateTableStatement, EqualityPredicate, Identifier, InsertStatement,
-    OrderByClause, ParseError, ParseLimits, SelectStatement, parse_create_table, parse_insert,
-    parse_select,
+    OrderByClause, ParseError, ParseLimits, SelectDistinctStatement, SelectStatement,
+    parse_create_table, parse_insert, parse_select, parse_select_distinct,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,
