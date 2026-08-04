@@ -233,26 +233,28 @@ impl Database {
     }
 
     fn execute_show_tables(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
-        let names = self.catalog.table_names();
+        let table_count = self.catalog.table_count();
         let columns = vec![ResultColumn {
             name: "name".to_owned(),
             data_type: DataType::String,
         }];
-        let mut bytes = validate_result_shape(
-            names.len(),
+        let fixed_bytes = validate_result_shape(
+            table_count,
             1,
             &columns,
             query_result_limits,
             SHOW_TABLES_RESULT_RESOURCES,
         )?;
-        for name in &names {
-            bytes = bytes.saturating_add(name.len());
-            enforce_resource_limit(
-                SHOW_TABLES_RESULT_RESOURCES.bytes,
-                bytes,
-                query_result_limits.max_bytes,
-            )?;
-        }
+        let table_name_bytes = self.catalog.table_name_bytes();
+        let bytes = fixed_bytes.saturating_add(table_name_bytes);
+        enforce_resource_limit(
+            SHOW_TABLES_RESULT_RESOURCES.bytes,
+            bytes,
+            query_result_limits.max_bytes,
+        )?;
+
+        let names = self.catalog.table_names();
+        debug_assert_eq!(names.len(), table_count);
 
         Ok(QueryResult {
             columns,
@@ -1653,7 +1655,27 @@ mod tests {
     }
 
     #[test]
-    fn show_tables_obeys_query_and_retained_result_limits() {
+    fn show_tables_accepts_exact_custom_row_and_value_limits() {
+        let mut database = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 2,
+            max_values: 2,
+            ..QueryResultLimits::default()
+        });
+        database
+            .execute("CREATE TABLE beta (id Int64); CREATE TABLE Alpha (id Int64);")
+            .expect("setup");
+
+        assert_eq!(
+            query(&mut database, "SHOW TABLES").rows,
+            [
+                vec![Value::String("Alpha".to_owned())],
+                vec![Value::String("beta".to_owned())],
+            ]
+        );
+    }
+
+    #[test]
+    fn show_tables_rejects_exceeded_custom_row_and_value_limits() {
         let cases = [
             (
                 QueryResultLimits {
@@ -1670,15 +1692,6 @@ mod tests {
                 },
                 "SHOW TABLES result values",
             ),
-            (
-                QueryResultLimits {
-                    max_rows: 2,
-                    max_values: 2,
-                    max_bytes: 0,
-                    ..QueryResultLimits::default()
-                },
-                "SHOW TABLES result bytes",
-            ),
         ];
 
         for (limits, resource) in cases {
@@ -1689,27 +1702,76 @@ mod tests {
             let error = database
                 .execute("SHOW TABLES")
                 .expect_err("SHOW TABLES exceeds its configured result limit");
-            if resource == "SHOW TABLES result bytes" {
-                assert!(matches!(
-                    error,
-                    Error::ResourceLimitExceeded {
-                        resource: "SHOW TABLES result bytes",
-                        actual,
-                        max: 0,
-                    } if actual > 0
-                ));
-            } else {
-                assert_eq!(
-                    error,
-                    Error::ResourceLimitExceeded {
-                        resource,
-                        actual: 2,
-                        max: 1,
-                    }
-                );
-            }
+            assert_eq!(
+                error,
+                Error::ResourceLimitExceeded {
+                    resource,
+                    actual: 2,
+                    max: 1,
+                }
+            );
         }
+    }
 
+    #[test]
+    fn show_tables_accepts_exact_and_rejects_exceeded_name_payload_byte_limit() {
+        let table_count = 2;
+        let columns = [ResultColumn {
+            name: "name".to_owned(),
+            data_type: DataType::String,
+        }];
+        let fixed_bytes = validate_result_shape(
+            table_count,
+            1,
+            &columns,
+            QueryResultLimits::default(),
+            SHOW_TABLES_RESULT_RESOURCES,
+        )
+        .expect("fixed result shape fits default limits");
+        let name_bytes = "Alpha".len() + "beta".len();
+        let exact_bytes = fixed_bytes + name_bytes;
+        let mut exact_database = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: table_count,
+            max_values: table_count,
+            max_bytes: exact_bytes,
+            ..QueryResultLimits::default()
+        });
+        exact_database
+            .execute("CREATE TABLE beta (id Int64); CREATE TABLE Alpha (id Int64);")
+            .expect("setup");
+        assert_eq!(
+            query(&mut exact_database, "SHOW TABLES").rows,
+            [
+                vec![Value::String("Alpha".to_owned())],
+                vec![Value::String("beta".to_owned())],
+            ]
+        );
+
+        let max_bytes = exact_bytes - 1;
+        let mut database = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: table_count,
+            max_values: table_count,
+            max_bytes,
+            ..QueryResultLimits::default()
+        });
+        database
+            .execute("CREATE TABLE Alpha (id Int64); CREATE TABLE beta (id Int64);")
+            .expect("setup");
+
+        assert_eq!(
+            database
+                .execute("SHOW TABLES")
+                .expect_err("name payload exceeds the byte limit"),
+            Error::ResourceLimitExceeded {
+                resource: "SHOW TABLES result bytes",
+                actual: exact_bytes,
+                max: max_bytes,
+            }
+        );
+    }
+
+    #[test]
+    fn show_tables_obeys_retained_result_limits() {
         let mut database = Database::new();
         database
             .execute("CREATE TABLE Alpha (id Int64)")
