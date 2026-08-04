@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
 use crate::execution::{
     InnerJoinExecutionError, InsertExecutionError, SelectDistinctExecutionError,
@@ -18,11 +19,12 @@ use crate::execution::{
 };
 use crate::{
     AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
-    InnerJoinStatement, InsertStatement, Int64Table, JoinLimits, OrderLimits, ParseError,
-    ParseLimits, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema,
-    SelectDistinctStatement, SelectStatement, ingest_csv_with_names, parse_create_table,
-    parse_inner_join, parse_insert, parse_scalar_count, parse_scalar_min, parse_scalar_sum,
-    parse_select, parse_select_distinct,
+    InnerJoinStatement, InsertStatement, Int64Table, Int64TableFileRestoreError, JoinLimits,
+    NullableI64PayloadCodec, OrderLimits, ParseError, ParseLimits, ScalarCountStatement,
+    ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement,
+    SelectStatement, SnapshotCodec, ingest_csv_with_names, parse_create_table, parse_inner_join,
+    parse_insert, parse_scalar_count, parse_scalar_min, parse_scalar_sum, parse_select,
+    parse_select_distinct, restore_int64_table_from_file as restore_table_from_file,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -136,6 +138,47 @@ impl From<CsvIngestError> for CatalogCsvIngestError {
     }
 }
 
+/// An error produced while restoring a snapshot file into a [`Catalog`].
+#[derive(Debug)]
+pub enum CatalogSnapshotRestoreError {
+    /// A table with the exact requested name is already registered.
+    TableAlreadyExists { name: String },
+    /// Registering the restored table would exceed the configured table bound.
+    TableLimitExceeded { tables: usize, max_tables: usize },
+    /// The bounded snapshot-file restore failed.
+    Snapshot(Int64TableFileRestoreError),
+}
+
+impl fmt::Display for CatalogSnapshotRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TableAlreadyExists { name } => {
+                write!(formatter, "table '{name}' already exists")
+            }
+            Self::TableLimitExceeded { tables, max_tables } => write!(
+                formatter,
+                "catalog would contain {tables} tables, exceeding the limit of {max_tables}"
+            ),
+            Self::Snapshot(error) => write!(formatter, "could not restore snapshot: {error}"),
+        }
+    }
+}
+
+impl Error for CatalogSnapshotRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::TableAlreadyExists { .. } | Self::TableLimitExceeded { .. } => None,
+        }
+    }
+}
+
+impl From<Int64TableFileRestoreError> for CatalogSnapshotRestoreError {
+    fn from(error: Int64TableFileRestoreError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// A bounded in-memory catalog of named, one-column `Int64` tables.
 ///
 /// Names use the exact spelling retained by the parser. Failed creates and
@@ -235,6 +278,45 @@ impl Catalog {
         let schema = Schema::int64(column.name().as_str(), column.is_nullable());
         let table = Int64Table::new(schema, self.limits.max_rows_per_table);
         self.tables.insert(name.to_owned(), table);
+        Ok(())
+    }
+
+    /// Restores and registers one caller-named `Int64` table from a snapshot file.
+    ///
+    /// The catalog's row cap is applied to the restored table. The table is
+    /// registered only after the bounded file, envelope, payload, schema, row
+    /// cap, exact name, and table-count checks have all succeeded. Every error
+    /// leaves the catalog unchanged.
+    pub fn restore_int64_table_from_file(
+        &mut self,
+        table_name: &str,
+        path: impl AsRef<Path>,
+        schema: Schema,
+        snapshot_codec: SnapshotCodec,
+        payload_codec: NullableI64PayloadCodec,
+    ) -> Result<(), CatalogSnapshotRestoreError> {
+        if self.tables.contains_key(table_name) {
+            return Err(CatalogSnapshotRestoreError::TableAlreadyExists {
+                name: table_name.to_owned(),
+            });
+        }
+
+        if self.tables.len() >= self.limits.max_tables {
+            return Err(CatalogSnapshotRestoreError::TableLimitExceeded {
+                tables: self.tables.len().saturating_add(1),
+                max_tables: self.limits.max_tables,
+            });
+        }
+
+        let table = restore_table_from_file(
+            path,
+            schema,
+            self.limits.max_rows_per_table,
+            snapshot_codec,
+            payload_codec,
+        )?;
+
+        self.tables.insert(table_name.to_owned(), table);
         Ok(())
     }
 

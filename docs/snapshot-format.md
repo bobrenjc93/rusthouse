@@ -96,3 +96,9 @@ limit, and reads no more than that bound. Open, non-regular-file, read,
 oversized-file, and restoration failures remain distinct. After the bounded
 read it delegates to `restore_int64_table`, retaining the same all-or-nothing
 validation behavior.
+
+`Catalog::restore_int64_table_from_file` applies the catalog's per-table row
+cap and registers the restored table under a caller-supplied exact name only
+after the complete file and table validation succeeds. Duplicate-name and
+table-count failures are reported separately from the nested filesystem and
+snapshot errors. Every failure leaves all catalog entries unchanged.

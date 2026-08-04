@@ -20,7 +20,9 @@ pub use aggregate::{
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
 pub use batch::{SharedDatabase, SharedDatabaseError};
-pub use catalog::{Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits};
+pub use catalog::{
+    Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CatalogSnapshotRestoreError,
+};
 pub use cli::{
     DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_ROWS_PER_TABLE, DEFAULT_MAX_SESSION_STATEMENTS,
     DEFAULT_MAX_SESSION_TABLES, SessionError, SessionLimits, run_session,
