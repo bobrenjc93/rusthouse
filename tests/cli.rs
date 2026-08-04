@@ -271,6 +271,28 @@ fn prints_each_select_result_in_statement_order() {
 }
 
 #[test]
+fn legacy_cli_executes_nullable_inner_join_in_deterministic_cross_product_order() {
+    let output = run(
+        &[],
+        b"CREATE TABLE left_rows (left_key Int64)\n\
+          CREATE TABLE right_rows (right_key Int64)\n\
+          INSERT INTO left_rows VALUES (7)\n\
+          INSERT INTO left_rows VALUES (NULL)\n\
+          INSERT INTO left_rows VALUES (7)\n\
+          INSERT INTO left_rows VALUES (8)\n\
+          INSERT INTO right_rows VALUES (7)\n\
+          INSERT INTO right_rows VALUES (7)\n\
+          INSERT INTO right_rows VALUES (NULL)\n\
+          INSERT INTO right_rows VALUES (8)\n\
+          SELECT left_key FROM left_rows INNER JOIN right_rows ON left_key = right_key;\n",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"[7, 7, 7, 7, 8]\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn help_prints_usage_without_reading_a_session() {
     for argument in ["--help", "-h"] {
         let output = run_allowing_stdin_close(&[argument], b"not SQL\n");

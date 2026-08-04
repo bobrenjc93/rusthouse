@@ -6,7 +6,8 @@ use std::error::Error;
 use std::fmt;
 
 use crate::execution::{
-    InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError,
+    InnerJoinExecutionError, InsertExecutionError, SelectDistinctExecutionError,
+    SelectExecutionError, execute_inner_join as execute_inner_join_statement,
     execute_insert as execute_insert_statement,
     execute_scalar_count as execute_scalar_count_statement,
     execute_scalar_count_with_limits as execute_scalar_count_statement_with_limits,
@@ -17,10 +18,11 @@ use crate::execution::{
 };
 use crate::{
     AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
-    InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits, ScalarCountStatement,
-    ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement,
-    SelectStatement, ingest_csv_with_names, parse_create_table, parse_insert, parse_scalar_count,
-    parse_scalar_min, parse_scalar_sum, parse_select, parse_select_distinct,
+    InnerJoinStatement, InsertStatement, Int64Table, JoinLimits, OrderLimits, ParseError,
+    ParseLimits, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema,
+    SelectDistinctStatement, SelectStatement, ingest_csv_with_names, parse_create_table,
+    parse_inner_join, parse_insert, parse_scalar_count, parse_scalar_min, parse_scalar_sum,
+    parse_select, parse_select_distinct,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -57,6 +59,8 @@ pub enum CatalogError {
     Select(SelectExecutionError),
     /// A parsed `SELECT DISTINCT` could not be executed.
     SelectDistinct(SelectDistinctExecutionError),
+    /// A parsed narrow `INNER JOIN` could not be executed.
+    InnerJoin(InnerJoinExecutionError),
 }
 
 impl fmt::Display for CatalogError {
@@ -75,6 +79,7 @@ impl fmt::Display for CatalogError {
             Self::SelectDistinct(error) => {
                 write!(formatter, "could not execute SELECT DISTINCT: {error}")
             }
+            Self::InnerJoin(error) => write!(formatter, "could not execute INNER JOIN: {error}"),
         }
     }
 }
@@ -86,6 +91,7 @@ impl Error for CatalogError {
             Self::Insert(error) => Some(error),
             Self::Select(error) => Some(error),
             Self::SelectDistinct(error) => Some(error),
+            Self::InnerJoin(error) => Some(error),
             Self::TableAlreadyExists { .. } | Self::TableLimitExceeded { .. } => None,
         }
     }
@@ -497,6 +503,47 @@ impl Catalog {
             ),
         )
         .map_err(CatalogError::Select)
+    }
+
+    /// Parses and executes the narrow inner equi-join with explicit bounds.
+    pub fn execute_inner_join(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        join_limits: JoinLimits,
+    ) -> Result<Vec<Option<i64>>, CatalogError> {
+        let statement = parse_inner_join(input, parse_limits)?;
+        self.inner_join(&statement, join_limits)
+    }
+
+    /// Executes a parsed narrow inner equi-join with explicit bounds.
+    pub fn inner_join(
+        &self,
+        statement: &InnerJoinStatement,
+        limits: JoinLimits,
+    ) -> Result<Vec<Option<i64>>, CatalogError> {
+        let left_name = statement.left_table_name().as_str();
+        let left_table = self.tables.get(left_name).ok_or_else(|| {
+            CatalogError::InnerJoin(InnerJoinExecutionError::UnknownTable {
+                name: left_name.to_owned(),
+            })
+        })?;
+        let right_name = statement.right_table_name().as_str();
+        let right_table = self.tables.get(right_name).ok_or_else(|| {
+            CatalogError::InnerJoin(InnerJoinExecutionError::UnknownTable {
+                name: right_name.to_owned(),
+            })
+        })?;
+
+        execute_inner_join_statement(
+            left_name,
+            left_table,
+            right_name,
+            right_table,
+            statement,
+            limits,
+        )
+        .map_err(CatalogError::InnerJoin)
     }
 
     /// Parses and executes a `SELECT DISTINCT` with explicit resource bounds.
