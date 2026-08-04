@@ -45,12 +45,26 @@ pub enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
+    /// A deliberately narrow, two-table Cartesian product.
+    CrossJoin(CrossJoin),
     /// Exactly two `SELECT` operands combined without duplicate elimination.
     UnionAll {
         left: Select,
         right: Select,
     },
     ShowTables,
+}
+
+/// `SELECT * FROM <left> CROSS JOIN <right> [LIMIT n]`.
+///
+/// Keeping this separate from [`Select`] makes projections, predicates,
+/// aliases, and additional joins unrepresentable for this intentionally small
+/// join form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossJoin {
+    pub left_table: String,
+    pub right_table: String,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -500,6 +514,9 @@ impl<'a> Parser<'a> {
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
         let left = self.parse_select()?;
+        if self.eat_keyword("CROSS") {
+            return self.parse_cross_join(left);
+        }
         if !self.eat_keyword("UNION") {
             return Ok(Statement::Select(left));
         }
@@ -513,6 +530,49 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::UnionAll { left, right })
+    }
+
+    fn parse_cross_join(&mut self, left: Select) -> Result<Statement> {
+        const SHAPE: &str =
+            "CROSS JOIN supports exactly SELECT * FROM <left> CROSS JOIN <right> [LIMIT n]";
+
+        let is_wildcard_only = matches!(left.items.as_slice(), [SelectItem::Wildcard]);
+        if left.distinct
+            || !is_wildcard_only
+            || left.predicate.is_some()
+            || !left.group_by.is_empty()
+            || left.having.is_some()
+            || !left.order_by.is_empty()
+            || left.limit.is_some()
+        {
+            return self.error(SHAPE);
+        }
+
+        self.expect_keyword("JOIN")?;
+        let right_table = self.expect_identifier("right table name after CROSS JOIN")?;
+        let limit = if self.eat_keyword("LIMIT") {
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a non-negative integer after LIMIT".to_owned(),
+            })?;
+            Some(number.parse::<usize>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid LIMIT '{number}'"),
+            })?)
+        } else {
+            None
+        };
+
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::CrossJoin(CrossJoin {
+            left_table: left.table,
+            right_table,
+            limit,
+        }))
     }
 
     fn parse_show(&mut self) -> Result<Statement> {

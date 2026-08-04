@@ -135,7 +135,7 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
-    /// Parses and executes exactly one `SELECT` or `SHOW TABLES` under a read lock.
+    /// Parses and executes exactly one read-only query under a read lock.
     ///
     /// The returned result owns all of its columns and values. `CREATE TABLE`,
     /// `INSERT`, empty input, and multi-statement input are rejected before the
@@ -178,9 +178,10 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
     }
     let statement = statements.pop().expect("the statement count is one");
     match statement {
-        statement @ (Statement::Select(_) | Statement::UnionAll { .. } | Statement::ShowTables) => {
-            Ok(statement)
-        }
+        statement @ (Statement::Select(_)
+        | Statement::CrossJoin(_)
+        | Statement::UnionAll { .. }
+        | Statement::ShowTables) => Ok(statement),
         Statement::CreateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "CREATE TABLE",
         }),

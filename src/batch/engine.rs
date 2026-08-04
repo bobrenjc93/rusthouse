@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::batch::catalog::Catalog;
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Having, Operand, OrderBy,
-    Predicate, Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having, Operand,
+    OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -276,6 +276,7 @@ impl Database {
                 })
             }
             statement @ (Statement::Select(_)
+            | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
             | Statement::ShowTables) => self
                 .execute_query_statement_with_limits(statement, query_result_limits)
@@ -290,6 +291,9 @@ impl Database {
     ) -> Result<QueryResult> {
         match statement {
             Statement::Select(select) => self.execute_select(select, query_result_limits),
+            Statement::CrossJoin(cross_join) => {
+                self.execute_cross_join(cross_join, query_result_limits)
+            }
             Statement::UnionAll { left, right } => {
                 self.execute_union_all(left, right, query_result_limits)
             }
@@ -450,6 +454,43 @@ impl Database {
 
         left_result.rows.append(&mut right_result.rows);
         Ok(left_result)
+    }
+
+    fn execute_cross_join(
+        &self,
+        cross_join: CrossJoin,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        let left = self.catalog.table(&cross_join.left_table)?;
+        let right = self.catalog.table(&cross_join.right_table)?;
+        let columns = left
+            .schema()
+            .iter()
+            .chain(right.schema())
+            .map(|field| ResultColumn {
+                name: field.name.clone(),
+                data_type: field.data_type,
+            })
+            .collect::<Vec<_>>();
+        let row_count =
+            limited_cartesian_row_count(left.row_count(), right.row_count(), cross_join.limit)?;
+        validate_cross_join_result_limits(left, right, row_count, &columns, query_result_limits)?;
+
+        let column_count = columns.len();
+        let mut rows = Vec::with_capacity(row_count);
+        'left_rows: for left_row in 0..left.row_count() {
+            for right_row in 0..right.row_count() {
+                if rows.len() == row_count {
+                    break 'left_rows;
+                }
+                let mut row = Vec::with_capacity(column_count);
+                row.extend(left.columns().iter().map(|column| column.value(left_row)));
+                row.extend(right.columns().iter().map(|column| column.value(right_row)));
+                rows.push(row);
+            }
+        }
+
+        Ok(QueryResult { columns, rows })
     }
 }
 
@@ -910,6 +951,85 @@ fn execute_projection(
                 .collect()
         })
         .collect()
+}
+
+fn limited_cartesian_row_count(
+    left_rows: usize,
+    right_rows: usize,
+    limit: Option<usize>,
+) -> Result<usize> {
+    match limit {
+        Some(limit) => Ok(left_rows
+            .checked_mul(right_rows)
+            .map_or(limit, |rows| rows.min(limit))),
+        None => left_rows
+            .checked_mul(right_rows)
+            .ok_or_else(|| Error::NumericOverflow("CROSS JOIN row count".to_owned())),
+    }
+}
+
+fn validate_cross_join_result_limits(
+    left: &Table,
+    right: &Table,
+    row_count: usize,
+    columns: &[ResultColumn],
+    limits: QueryResultLimits,
+) -> Result<()> {
+    let mut bytes = validate_result_shape(
+        row_count,
+        columns.len(),
+        columns,
+        limits,
+        SELECT_RESULT_RESOURCES,
+    )?;
+    bytes = bytes.saturating_add(cross_join_string_bytes(left, right, row_count));
+    enforce_resource_limit(SELECT_RESULT_RESOURCES.bytes, bytes, limits.max_bytes)
+}
+
+/// Counts cloned string payload bytes in the LIMIT-truncated left-major
+/// product without constructing row or value vectors.
+fn cross_join_string_bytes(left: &Table, right: &Table, row_count: usize) -> usize {
+    if row_count == 0 {
+        return 0;
+    }
+
+    let right_rows = right.row_count();
+    debug_assert!(right_rows > 0);
+    let complete_left_rows = row_count / right_rows;
+    let partial_right_rows = row_count % right_rows;
+    let mut bytes = 0_usize;
+
+    for left_row in 0..complete_left_rows {
+        bytes = bytes.saturating_add(string_bytes_at(left, left_row).saturating_mul(right_rows));
+    }
+    if partial_right_rows > 0 {
+        bytes = bytes.saturating_add(
+            string_bytes_at(left, complete_left_rows).saturating_mul(partial_right_rows),
+        );
+    }
+
+    if complete_left_rows > 0 {
+        let right_product_bytes = (0..right_rows)
+            .map(|right_row| string_bytes_at(right, right_row))
+            .fold(0_usize, usize::saturating_add)
+            .saturating_mul(complete_left_rows);
+        bytes = bytes.saturating_add(right_product_bytes);
+    }
+    for right_row in 0..partial_right_rows {
+        bytes = bytes.saturating_add(string_bytes_at(right, right_row));
+    }
+    bytes
+}
+
+fn string_bytes_at(table: &Table, row: usize) -> usize {
+    table
+        .columns()
+        .iter()
+        .map(|column| match column.value_ref(row) {
+            ValueRef::String(value) => value.len(),
+            ValueRef::Null(_) | ValueRef::Int64(_) | ValueRef::Float64(_) | ValueRef::Bool(_) => 0,
+        })
+        .fold(0_usize, usize::saturating_add)
 }
 
 fn validate_projection_result_limits(
