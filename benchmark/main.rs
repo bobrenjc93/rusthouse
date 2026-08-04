@@ -652,16 +652,33 @@ fn stable_median(
             "timer resolution was insufficient for {engine_metric}, '{profile} / {workload}' at {row_count} rows with seed {seed}"
         ));
     }
-    let minimum = samples.iter().copied().fold(f64::INFINITY, f64::min);
-    let maximum = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if maximum / minimum > MAX_SAMPLE_SPREAD {
+    let required = samples.len() / 2 + 1;
+    let stable = stable_sample_count(samples, MAX_SAMPLE_SPREAD);
+    if stable < required {
+        let minimum = samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let maximum = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         return Err(format!(
-            "unstable timing for {engine_metric}, '{profile} / {workload}' at {row_count} rows with seed {seed}: max/min spread {:.2} exceeds {:.2}",
+            "unstable timing for {engine_metric}, '{profile} / {workload}' at {row_count} rows with seed {seed}: only {stable}/{} samples form a max/min spread <= {:.2}; all-sample spread {:.2}",
+            samples.len(),
+            MAX_SAMPLE_SPREAD,
             maximum / minimum,
-            MAX_SAMPLE_SPREAD
         ));
     }
     Ok(value)
+}
+
+fn stable_sample_count(samples: &[f64], maximum_spread: f64) -> usize {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mut best = 0;
+    let mut start = 0;
+    for end in 0..sorted.len() {
+        while sorted[end] / sorted[start] > maximum_spread {
+            start += 1;
+        }
+        best = best.max(end - start + 1);
+    }
+    best
 }
 
 fn details_json(
@@ -687,7 +704,7 @@ fn details_json(
     let mut output = String::new();
     write!(
         output,
-        "{{\"schema_version\":3,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
+        "{{\"schema_version\":4,\"score\":{:.6},\"primary_score\":{:.6},\"end_to_end_score\":{:.6},\"primary_saturated_cases\":{},\"end_to_end_saturated_cases\":{},\"mode\":{},\"seed\":{},\"warmups\":{},\"primary_samples\":{},\"end_to_end_samples\":{},\"row_counts\":[",
         primary_score.score,
         primary_score.score,
         end_to_end_score.score,
@@ -722,7 +739,7 @@ fn details_json(
     }
     write!(
         output,
-        "],\"aggregation\":{{\"space\":\"log\",\"ratio_floor\":0.01,\"ratio_cap\":1.0,\"hierarchy\":[\"workload\",\"scale\",\"family\",\"seed\",\"profile\"],\"complete_matrix_required\":true}},\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_total_profile_seed_budget\",\"sustained_query_budget\":{},\"case_query_amplification_min\":{},\"case_query_amplification_max\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"max_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
+        "],\"aggregation\":{{\"space\":\"log\",\"ratio_floor\":0.01,\"ratio_cap\":1.0,\"hierarchy\":[\"workload\",\"scale\",\"family\",\"seed\",\"profile\"],\"complete_matrix_required\":true}},\"timing_method\":{{\"name\":\"in_process_query_amplification\",\"calibration\":\"fixed_total_profile_seed_budget\",\"sustained_query_budget\":{},\"case_query_amplification_min\":{},\"case_query_amplification_max\":{},\"startup_subtraction\":false,\"correctness_runs_separate\":true,\"stability_gate\":\"strict_majority_window\",\"max_majority_sample_spread\":{MAX_SAMPLE_SPREAD:.1}}},\"correctness_checks\":{correctness_checks},\"rusthouse_path\":{},\"clickhouse_path\":{},\"clickhouse_version\":{},\"clickhouse_sha256\":{},\"limitations\":[{},{}],\"cases\":[",
         settings.sustained_query_budget,
         minimum_amplification,
         maximum_amplification,
@@ -911,12 +928,20 @@ mod tests {
     }
 
     #[test]
-    fn unstable_samples_are_rejected() {
-        let error = stable_median(&[1.0, 1.1, 20.0], "engine", "profile", 42, "workload", 10)
-            .expect_err("large spread must fail");
+    fn one_outlier_does_not_invalidate_a_stable_median() {
+        let value = stable_median(&[1.0, 1.1, 20.0], "engine", "profile", 42, "workload", 10)
+            .expect("a strict majority is stable");
+        assert_eq!(value, 1.1);
+    }
+
+    #[test]
+    fn samples_without_a_stable_majority_are_rejected() {
+        let error = stable_median(&[1.0, 20.0, 400.0], "engine", "profile", 42, "workload", 10)
+            .expect_err("no strict majority fits the stability window");
         assert!(error.contains("unstable timing"));
         assert!(error.contains("profile / workload"));
         assert!(error.contains("seed 42"));
+        assert!(error.contains("only 1/3 samples"));
     }
 
     #[test]
