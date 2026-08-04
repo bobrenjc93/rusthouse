@@ -618,6 +618,22 @@
         "eval_c88a7f3d": 35,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:416",
+      "recordedAt": "2026-08-04T22:05:29.860Z",
+      "label": "PR #416",
+      "kind": "leaf",
+      "prNumber": 416,
+      "title": "Support two-way UNION ALL queries",
+      "scores": {
+        "eval_9fbdfec0": 70,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 35,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
