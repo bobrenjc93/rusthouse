@@ -50,8 +50,8 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
-    /// Whether this is the deliberately narrow one-column `SELECT DISTINCT`
-    /// form.
+    /// Whether this is the deliberately narrow physical-column
+    /// `SELECT DISTINCT` form.
     pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub table: String,
@@ -681,10 +681,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_distinct_select(&mut self) -> Result<Select> {
-        const SHAPE: &str = "SELECT DISTINCT supports exactly one unaliased column followed by FROM <table> and an optional LIMIT";
+        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table> and an optional LIMIT";
 
-        self.reserve_ast_list_item()?;
-        let column = self.expect_identifier("column after DISTINCT")?;
+        let mut items = Vec::new();
+        loop {
+            self.reserve_ast_list_item()?;
+            let name = self.expect_identifier("column after DISTINCT")?;
+            items.push(SelectItem::Column { name, alias: None });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
         if !self.eat_keyword("FROM") {
             return self.error(SHAPE);
         }
@@ -710,10 +717,7 @@ impl<'a> Parser<'a> {
 
         Ok(Select {
             distinct: true,
-            items: vec![SelectItem::Column {
-                name: column,
-                alias: None,
-            }],
+            items,
             table,
             predicate: None,
             group_by: Vec::new(),
