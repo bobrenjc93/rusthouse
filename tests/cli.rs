@@ -64,6 +64,24 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn csv_batch_emits_one_left_named_union_all_result() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE first (id Int64, label String);
+          CREATE TABLE second (id Int64, label String);
+          INSERT INTO first VALUES (1, 'first');
+          INSERT INTO second VALUES (2, 'second'), (3, 'third');
+          SELECT id AS event_id, label AS description FROM first
+          UNION ALL
+          SELECT id AS ignored, label AS also_ignored FROM second WHERE id < 3;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"event_id,description\n1,first\n2,second\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_emits_show_tables_metadata_in_stable_display_order() {
     let output = run(
         &["--format", "csv"],

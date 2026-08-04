@@ -45,6 +45,11 @@ pub enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
+    /// Exactly two `SELECT` operands combined without duplicate elimination.
+    UnionAll {
+        left: Select,
+        right: Select,
+    },
     ShowTables,
 }
 
@@ -485,12 +490,29 @@ impl<'a> Parser<'a> {
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
-            self.parse_select().map(Statement::Select)
+            self.parse_select_statement()
         } else if self.eat_keyword("SHOW") {
             self.parse_show()
         } else {
             self.error("expected CREATE, INSERT, SELECT, or SHOW")
         }
+    }
+
+    fn parse_select_statement(&mut self) -> Result<Statement> {
+        let left = self.parse_select()?;
+        if !self.eat_keyword("UNION") {
+            return Ok(Statement::Select(left));
+        }
+
+        self.expect_keyword("ALL")?;
+        self.expect_keyword("SELECT")?;
+        let right = self.parse_select()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self
+                .error("UNION ALL supports exactly two SELECT operands and no outer clauses");
+        }
+
+        Ok(Statement::UnionAll { left, right })
     }
 
     fn parse_show(&mut self) -> Result<Statement> {
@@ -723,7 +745,8 @@ impl<'a> Parser<'a> {
             None
         };
 
-        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+        if !self.at_keyword("UNION") && !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End)
+        {
             return self.error(SHAPE);
         }
 

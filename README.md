@@ -32,6 +32,12 @@ String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
+Two existing `SELECT` queries can be combined with `UNION ALL`. Their rows are
+concatenated left-first, the left query supplies the result column names, and
+both operands must return the same number and sequence of column types. Each
+operand applies its own clauses; nested unions and union-level outer clauses
+are not supported. The combined result remains subject to the normal query
+result limits before its row vector is grown.
 `SELECT DISTINCT column [, ...] FROM table [LIMIT n]` supports tuples of
 physical columns of any supported types and returns unique tuples in
 deterministic first-seen order. Distinct tuples are collected under the

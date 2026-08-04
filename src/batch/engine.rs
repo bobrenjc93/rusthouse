@@ -275,7 +275,9 @@ impl Database {
                     affected_rows,
                 })
             }
-            statement @ (Statement::Select(_) | Statement::ShowTables) => self
+            statement @ (Statement::Select(_)
+            | Statement::UnionAll { .. }
+            | Statement::ShowTables) => self
                 .execute_query_statement_with_limits(statement, query_result_limits)
                 .map(StatementResult::Query),
         }
@@ -288,6 +290,9 @@ impl Database {
     ) -> Result<QueryResult> {
         match statement {
             Statement::Select(select) => self.execute_select(select, query_result_limits),
+            Statement::UnionAll { left, right } => {
+                self.execute_union_all(left, right, query_result_limits)
+            }
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
             Statement::CreateTable { .. } | Statement::Insert { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT or SHOW TABLES".to_owned(),
@@ -414,6 +419,65 @@ impl Database {
             rows,
         })
     }
+
+    fn execute_union_all(
+        &self,
+        left: Select,
+        right: Select,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        let mut left_result = self.execute_select(left, query_result_limits)?;
+        let mut right_result = self.execute_select(right, query_result_limits)?;
+        validate_union_schema(&left_result.columns, &right_result.columns)?;
+        validate_union_result_limits(&left_result, &right_result, query_result_limits)?;
+
+        left_result.rows.append(&mut right_result.rows);
+        Ok(left_result)
+    }
+}
+
+fn validate_union_schema(left: &[ResultColumn], right: &[ResultColumn]) -> Result<()> {
+    if left.len() != right.len() {
+        return Err(Error::UnionColumnCountMismatch {
+            left: left.len(),
+            right: right.len(),
+        });
+    }
+
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        if left.data_type != right.data_type {
+            return Err(Error::TypeMismatch {
+                context: format!("UNION ALL column {}", index + 1),
+                expected: left.data_type.to_string(),
+                actual: right.data_type.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_union_result_limits(
+    left: &QueryResult,
+    right: &QueryResult,
+    limits: QueryResultLimits,
+) -> Result<()> {
+    let row_count = left.rows.len().saturating_add(right.rows.len());
+    let mut bytes = validate_result_shape(
+        row_count,
+        left.columns.len(),
+        &left.columns,
+        limits,
+        SELECT_RESULT_RESOURCES,
+    )?;
+    for row in left.rows.iter().chain(&right.rows) {
+        for value in row {
+            if let Value::String(value) = value {
+                bytes = bytes.saturating_add(value.len());
+                enforce_resource_limit(SELECT_RESULT_RESOURCES.bytes, bytes, limits.max_bytes)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_distinct_shape(select: &Select) -> Result<()> {

@@ -178,7 +178,9 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
     }
     let statement = statements.pop().expect("the statement count is one");
     match statement {
-        statement @ (Statement::Select(_) | Statement::ShowTables) => Ok(statement),
+        statement @ (Statement::Select(_) | Statement::UnionAll { .. } | Statement::ShowTables) => {
+            Ok(statement)
+        }
         Statement::CreateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "CREATE TABLE",
         }),

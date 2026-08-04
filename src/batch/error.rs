@@ -28,6 +28,10 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    UnionColumnCountMismatch {
+        left: usize,
+        right: usize,
+    },
     InvalidQuery(String),
     NumericOverflow(String),
     StatementLimitExceeded {
@@ -81,6 +85,10 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "type mismatch for {context}: expected {expected}, found {actual}"
+            ),
+            Self::UnionColumnCountMismatch { left, right } => write!(
+                f,
+                "UNION ALL column count mismatch: left operand has {left}, right operand has {right}"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
