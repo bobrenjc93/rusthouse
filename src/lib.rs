@@ -2,6 +2,7 @@
 
 pub mod aggregate;
 pub mod catalog;
+pub mod cli;
 pub mod csv;
 pub mod distinct;
 pub mod execution;
@@ -18,6 +19,10 @@ pub use aggregate::{
     aggregate_nullable_i64, count_nullable_i64,
 };
 pub use catalog::{Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits};
+pub use cli::{
+    DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_ROWS_PER_TABLE, DEFAULT_MAX_SESSION_STATEMENTS,
+    DEFAULT_MAX_SESSION_TABLES, SessionError, SessionLimits, run_session,
+};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{

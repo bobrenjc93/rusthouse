@@ -39,6 +39,17 @@ comparison and nullness scans. `SELECT DISTINCT column FROM table` uses
 explicit input-row and distinct-value limits and returns deterministic
 `NULL`-first, ascending values.
 
+## Command-line session
+
+Running `rusthouse` reads one `CREATE TABLE`, `INSERT INTO`, or projection
+`SELECT` from each nonempty standard-input line. One bounded in-memory catalog
+is retained until EOF. Successful `CREATE` and `INSERT` statements are silent;
+each `SELECT` prints a stable row list such as `[7, NULL, -2]`. Any malformed or
+failed statement is reported on standard error and terminates the process with
+a nonzero status. The default session allows 65,536 input bytes, 1,024
+statements, 64 tables, and 1,024 rows per table. Run `rusthouse --help` for the
+concise command reference.
+
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an
 `Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE`, `INSERT`, and CSV
 ingestion with a write lock, allow `SELECT` operations through read locks, and
