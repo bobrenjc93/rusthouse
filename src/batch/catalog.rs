@@ -43,6 +43,15 @@ impl Catalog {
         self.tables.len()
     }
 
+    /// Returns the combined byte length of all display names without allocating.
+    #[must_use]
+    pub fn table_name_bytes(&self) -> usize {
+        self.tables
+            .values()
+            .map(|table| table.name().len())
+            .fold(0_usize, usize::saturating_add)
+    }
+
     /// Returns display names in deterministic, case-insensitive order.
     #[must_use]
     pub fn table_names(&self) -> Vec<&str> {
@@ -81,6 +90,7 @@ mod tests {
     fn table_names_are_sorted_without_changing_display_case() {
         let mut catalog = Catalog::new();
         assert_eq!(catalog.table_count(), 0);
+        assert_eq!(catalog.table_name_bytes(), 0);
 
         for name in ["zebra", "Alpha", "beta"] {
             catalog
@@ -95,6 +105,7 @@ mod tests {
         }
 
         assert_eq!(catalog.table_count(), 3);
+        assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
     }
 }
