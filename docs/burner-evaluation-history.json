@@ -378,6 +378,22 @@
         "eval_c88a7f3d": 40,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "base:963d8c78e7590b907113a391ee34af0f846e1b39",
+      "commit": "963d8c78e7590b907113a391ee34af0f846e1b39",
+      "recordedAt": "2026-08-04T04:37:04.099Z",
+      "label": "base 963d8c7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_9fbdfec0": 50,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 0,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 30,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
