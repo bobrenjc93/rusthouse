@@ -20,6 +20,12 @@ pub const DEFAULT_MAX_QUERY_RESULT_VALUES: usize = 250_000;
 pub const DEFAULT_MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum groups retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_GROUPS: usize = 100_000;
+/// Maximum grouped-key scalar cells retained while evaluating one grouped `SELECT`.
+pub const DEFAULT_MAX_QUERY_GROUP_KEY_CELLS: usize = 500_000;
+/// Maximum estimated grouped-key value-reference bytes retained by one grouped `SELECT`.
+pub const DEFAULT_MAX_QUERY_GROUP_KEY_BYTES: usize = 32 * 1024 * 1024;
+/// Estimated bytes charged for each scalar cell retained in a grouped key.
+pub const ESTIMATED_GROUP_KEY_CELL_BYTES: usize = std::mem::size_of::<ValueRef<'static>>();
 /// Maximum aggregate state cells retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
@@ -32,6 +38,8 @@ pub struct QueryResultLimits {
     pub max_values: usize,
     pub max_bytes: usize,
     pub max_groups: usize,
+    pub max_group_key_cells: usize,
+    pub max_group_key_bytes: usize,
     pub max_aggregate_state_cells: usize,
     pub max_aggregate_state_bytes: usize,
 }
@@ -43,6 +51,8 @@ impl Default for QueryResultLimits {
             max_values: DEFAULT_MAX_QUERY_RESULT_VALUES,
             max_bytes: DEFAULT_MAX_QUERY_RESULT_BYTES,
             max_groups: DEFAULT_MAX_QUERY_GROUPS,
+            max_group_key_cells: DEFAULT_MAX_QUERY_GROUP_KEY_CELLS,
+            max_group_key_bytes: DEFAULT_MAX_QUERY_GROUP_KEY_BYTES,
             max_aggregate_state_cells: DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS,
             max_aggregate_state_bytes: DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES,
         }
@@ -905,8 +915,27 @@ fn execute_grouped<'a>(
         limits.max_aggregate_state_bytes,
     )?;
 
-    let mut groups = GroupIndex::new(group_columns.len(), planned_group_count);
+    let key_cells_per_group = group_columns.len();
+    let key_bytes_per_group = key_cells_per_group.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES);
+    if !group_columns.is_empty() && !matching_rows.is_empty() {
+        enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
+        enforce_resource_limit(
+            "SELECT group key cells",
+            key_cells_per_group,
+            limits.max_group_key_cells,
+        )?;
+        enforce_resource_limit(
+            "SELECT group key bytes",
+            key_bytes_per_group,
+            limits.max_group_key_bytes,
+        )?;
+    }
+
+    let mut groups = GroupIndex::new(group_columns.len());
     let mut group_count = usize::from(group_columns.is_empty());
+    let mut group_key_cells = 0_usize;
+    let mut group_key_bytes = 0_usize;
+    let mut multiple_key_probe = Vec::new();
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
@@ -919,18 +948,36 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
-        if inserted {
+        let existing_group = groups.find(table, group_columns, *row, &mut multiple_key_probe);
+        let (group, inserted) = if let Some(group) = existing_group {
+            (group, false)
+        } else {
+            let next_group_count = group_count.saturating_add(1);
+            enforce_resource_limit("SELECT groups", next_group_count, limits.max_groups)?;
+            let next_key_cells = group_key_cells.saturating_add(key_cells_per_group);
             enforce_resource_limit(
-                "SELECT groups",
-                group_count.saturating_add(1),
-                limits.max_groups,
+                "SELECT group key cells",
+                next_key_cells,
+                limits.max_group_key_cells,
             )?;
-            group_count += 1;
+            let next_key_bytes = group_key_bytes.saturating_add(key_bytes_per_group);
+            enforce_resource_limit(
+                "SELECT group key bytes",
+                next_key_bytes,
+                limits.max_group_key_bytes,
+            )?;
+
+            let group = group_count;
+            groups.insert(table, group_columns, *row, group, &multiple_key_probe);
+            group_count = next_group_count;
+            group_key_cells = next_key_cells;
+            group_key_bytes = next_key_bytes;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 states.push(AggregateState::new(spec));
             }
-        }
+            (group, true)
+        };
+        debug_assert!(!inserted || group + 1 == group_count);
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
             states[group].update(
@@ -965,48 +1012,73 @@ enum GroupIndex<'a> {
 }
 
 impl<'a> GroupIndex<'a> {
-    fn new(column_count: usize, row_count: usize) -> Self {
-        let initial_capacity = row_count.min(1_024);
+    fn new(column_count: usize) -> Self {
         match column_count {
             0 => Self::Global,
-            1 => Self::One(HashMap::with_capacity(initial_capacity)),
-            _ => Self::Multiple(HashMap::with_capacity(initial_capacity)),
+            1 => Self::One(HashMap::new()),
+            _ => Self::Multiple(HashMap::new()),
         }
     }
 
-    fn find_or_insert(
-        &mut self,
+    fn find(
+        &self,
         table: &'a Table,
         columns: &[usize],
         row: usize,
-        next_group: usize,
-    ) -> (usize, bool) {
+        multiple_key_probe: &mut Vec<ValueRef<'a>>,
+    ) -> Option<usize> {
         match self {
-            Self::Global => (0, false),
+            Self::Global => Some(0),
             Self::One(groups) => {
                 let key = table.columns()[columns[0]].value_ref(row);
-                if let Some(group) = groups.get(&key) {
-                    (*group, false)
-                } else {
-                    groups.insert(key, next_group);
-                    (next_group, true)
-                }
+                groups.get(&key).copied()
             }
             Self::Multiple(groups) if columns.len() == 2 => {
                 let key = [
                     table.columns()[columns[0]].value_ref(row),
                     table.columns()[columns[1]].value_ref(row),
                 ];
-                find_or_insert_group(groups, &key, next_group)
+                groups.get(key.as_slice()).copied()
             }
             Self::Multiple(groups) => {
-                let key = columns
-                    .iter()
-                    .map(|column| table.columns()[*column].value_ref(row))
-                    .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
+                multiple_key_probe.clear();
+                multiple_key_probe.extend(
+                    columns
+                        .iter()
+                        .map(|column| table.columns()[*column].value_ref(row)),
+                );
+                groups.get(multiple_key_probe.as_slice()).copied()
             }
         }
+    }
+
+    fn insert(
+        &mut self,
+        table: &'a Table,
+        columns: &[usize],
+        row: usize,
+        group: usize,
+        multiple_key_probe: &[ValueRef<'a>],
+    ) {
+        let previous = match self {
+            Self::Global => unreachable!("global aggregation has no grouped key to insert"),
+            Self::One(groups) => {
+                let key = table.columns()[columns[0]].value_ref(row);
+                groups.insert(key, group)
+            }
+            Self::Multiple(groups) if columns.len() == 2 => {
+                let key = [
+                    table.columns()[columns[0]].value_ref(row),
+                    table.columns()[columns[1]].value_ref(row),
+                ];
+                groups.insert(key.into(), group)
+            }
+            Self::Multiple(groups) => {
+                debug_assert_eq!(multiple_key_probe.len(), columns.len());
+                groups.insert(multiple_key_probe.into(), group)
+            }
+        };
+        debug_assert!(previous.is_none(), "new group keys must be unique");
     }
 
     fn into_keys(self, group_count: usize) -> Vec<GroupKey<'a>> {
@@ -1033,19 +1105,6 @@ impl<'a> GroupIndex<'a> {
             .into_iter()
             .map(|key| key.expect("every group index has a key"))
             .collect()
-    }
-}
-
-fn find_or_insert_group<'a>(
-    groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
-    key: &[ValueRef<'a>],
-    next_group: usize,
-) -> (usize, bool) {
-    if let Some(group) = groups.get(key) {
-        (*group, false)
-    } else {
-        groups.insert(key.into(), next_group);
-        (next_group, true)
     }
 }
 

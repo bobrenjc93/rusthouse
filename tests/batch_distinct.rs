@@ -1,5 +1,6 @@
 use rusthouse::batch::engine::{
-    Database, QueryResult, QueryResultLimits, ResultColumn, StatementResult,
+    Database, ESTIMATED_GROUP_KEY_CELL_BYTES, QueryResult, QueryResultLimits, ResultColumn,
+    StatementResult,
 };
 use rusthouse::batch::error::Error;
 use rusthouse::batch::run_csv_batch;
@@ -436,6 +437,65 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
             resource: "SELECT result values",
             actual: 4,
             max: 3,
+        }
+    );
+}
+
+#[test]
+fn enforces_group_key_cell_and_byte_caps_before_limit() {
+    let setup = "CREATE TABLE samples (value Int64, label String, active Bool); \
+        INSERT INTO samples VALUES \
+        (1, 'a', true), (2, 'b', false), (1, 'a', true), (3, 'c', true);";
+    let key_cells = 9;
+    let key_bytes = key_cells * ESTIMATED_GROUP_KEY_CELL_BYTES;
+    let exact_limits = QueryResultLimits {
+        max_groups: 3,
+        max_group_key_cells: key_cells,
+        max_group_key_bytes: key_bytes,
+        ..QueryResultLimits::default()
+    };
+
+    let mut exact = Database::with_query_result_limits(exact_limits);
+    exact.execute(setup).expect("setup");
+    assert!(
+        query(
+            &mut exact,
+            "SELECT DISTINCT value, label, active FROM samples LIMIT 0"
+        )
+        .rows
+        .is_empty(),
+        "exact group-key limits allow the query even though LIMIT hides every group"
+    );
+
+    let mut cell_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_group_key_cells: key_cells - 1,
+        ..exact_limits
+    });
+    cell_limited.execute(setup).expect("setup");
+    assert_eq!(
+        cell_limited
+            .execute("SELECT DISTINCT value, label, active FROM samples LIMIT 0")
+            .expect_err("the third tuple exceeds the group-key cell limit"),
+        Error::ResourceLimitExceeded {
+            resource: "SELECT group key cells",
+            actual: key_cells,
+            max: key_cells - 1,
+        }
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_group_key_bytes: key_bytes - 1,
+        ..exact_limits
+    });
+    byte_limited.execute(setup).expect("setup");
+    assert_eq!(
+        byte_limited
+            .execute("SELECT DISTINCT value, label, active FROM samples LIMIT 0")
+            .expect_err("the third tuple exceeds the group-key byte limit"),
+        Error::ResourceLimitExceeded {
+            resource: "SELECT group key bytes",
+            actual: key_bytes,
+            max: key_bytes - 1,
         }
     );
 }
