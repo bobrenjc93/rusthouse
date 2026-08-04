@@ -15,9 +15,10 @@ fn query(database: &mut Database, sql: &str) -> QueryResult {
 }
 
 #[test]
-fn parses_only_the_bounded_one_column_distinct_shape() {
+fn parses_only_the_bounded_physical_column_distinct_shape() {
     for sql in [
         "SELECT DISTINCT value FROM samples",
+        "SELECT DISTINCT value, other FROM samples",
         "select distinct Value from Samples limit 0;",
     ] {
         let statements = parse(sql).expect("valid DISTINCT query");
@@ -25,16 +26,20 @@ fn parses_only_the_bounded_one_column_distinct_shape() {
             panic!("expected SELECT");
         };
         assert!(select.distinct);
-        assert!(matches!(
-            select.items.as_slice(),
-            [SelectItem::Column { alias: None, .. }]
-        ));
+        assert!(!select.items.is_empty());
+        assert!(
+            select
+                .items
+                .iter()
+                .all(|item| matches!(item, SelectItem::Column { alias: None, .. }))
+        );
     }
 
     for sql in [
         "SELECT DISTINCT * FROM samples",
-        "SELECT DISTINCT value, other FROM samples",
         "SELECT DISTINCT value AS renamed FROM samples",
+        "SELECT DISTINCT value, other AS renamed FROM samples",
+        "SELECT DISTINCT value + 1 FROM samples",
         "SELECT DISTINCT CAST(value AS Float64) FROM samples",
         "SELECT DISTINCT COUNT(value) FROM samples",
         "SELECT DISTINCT value FROM samples WHERE value = 1",
@@ -50,26 +55,50 @@ fn parses_only_the_bounded_one_column_distinct_shape() {
     }
 
     parse_with_limits(
-        "SELECT DISTINCT value FROM samples",
+        "SELECT DISTINCT value, other FROM samples",
         BatchSqlLimits {
-            max_ast_list_items: 1,
+            max_ast_list_items: 2,
             ..BatchSqlLimits::default()
         },
     )
-    .expect("one DISTINCT projection fits the AST limit");
+    .expect("two DISTINCT projections fit the AST limit");
     assert_eq!(
         parse_with_limits(
-            "SELECT DISTINCT value FROM samples",
+            "SELECT DISTINCT value, other FROM samples",
             BatchSqlLimits {
-                max_ast_list_items: 0,
+                max_ast_list_items: 1,
                 ..BatchSqlLimits::default()
             },
         ),
         Err(Error::ResourceLimitExceeded {
             resource: "SQL AST list items",
-            actual: 1,
-            max: 0,
+            actual: 2,
+            max: 1,
         })
+    );
+}
+
+#[test]
+fn rejects_duplicate_and_unknown_tuple_columns_with_typed_errors() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (value Int64, label String)")
+        .expect("setup");
+
+    assert_eq!(
+        database
+            .execute("SELECT DISTINCT value, VALUE FROM samples")
+            .expect_err("duplicate physical columns are invalid"),
+        Error::InvalidQuery("SELECT DISTINCT column 'VALUE' is listed more than once".to_owned())
+    );
+    assert_eq!(
+        database
+            .execute("SELECT DISTINCT value, missing FROM samples")
+            .expect_err("unknown tuple columns are invalid"),
+        Error::ColumnNotFound {
+            table: "samples".to_owned(),
+            column: "missing".to_owned(),
+        }
     );
 }
 
@@ -218,16 +247,82 @@ fn deduplicates_all_physical_types_in_first_seen_order() {
 }
 
 #[test]
+fn deduplicates_mixed_type_tuples_in_first_seen_order_before_limit() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (i Int64, f Float64, b Bool, s String); \
+             INSERT INTO samples VALUES \
+             (2, 2.5, true, 'beta'), \
+             (1, -1.0, false, 'alpha'), \
+             (2, 2.5, true, 'beta'), \
+             (2, 2.5, false, 'beta'), \
+             (1, -1.0, false, 'alpha'), \
+             (2, 2.5, true, 'other');",
+        )
+        .expect("setup");
+
+    let result = query(
+        &mut database,
+        "SELECT DISTINCT s, i, f, b FROM samples LIMIT 3",
+    );
+    assert_eq!(
+        result.columns,
+        [
+            ResultColumn {
+                name: "s".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "i".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "f".to_owned(),
+                data_type: DataType::Float64,
+            },
+            ResultColumn {
+                name: "b".to_owned(),
+                data_type: DataType::Bool,
+            },
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        [
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Int64(2),
+                Value::Float64(2.5),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::String("alpha".to_owned()),
+                Value::Int64(1),
+                Value::Float64(-1.0),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::String("beta".to_owned()),
+                Value::Int64(2),
+                Value::Float64(2.5),
+                Value::Bool(false),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn handles_empty_input_and_zero_exact_and_exceeded_limits() {
     let mut empty = Database::with_query_result_limits(QueryResultLimits {
         max_groups: 0,
         ..QueryResultLimits::default()
     });
     empty
-        .execute("CREATE TABLE samples (value Int64)")
+        .execute("CREATE TABLE samples (value Int64, label String)")
         .expect("setup");
     assert!(
-        query(&mut empty, "SELECT DISTINCT value FROM samples")
+        query(&mut empty, "SELECT DISTINCT value, label FROM samples")
             .rows
             .is_empty()
     );
@@ -265,8 +360,8 @@ fn handles_empty_input_and_zero_exact_and_exceeded_limits() {
 
 #[test]
 fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
-    let setup = "CREATE TABLE samples (value Int64); \
-        INSERT INTO samples VALUES (1), (2), (1), (3);";
+    let setup = "CREATE TABLE samples (value Int64, label String); \
+        INSERT INTO samples VALUES (1, 'a'), (2, 'b'), (1, 'a'), (3, 'c');";
     let mut group_limited = Database::with_query_result_limits(QueryResultLimits {
         max_rows: usize::MAX,
         max_values: usize::MAX,
@@ -277,7 +372,7 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
     group_limited.execute(setup).expect("setup");
     assert_eq!(
         group_limited
-            .execute("SELECT DISTINCT value FROM samples LIMIT 0")
+            .execute("SELECT DISTINCT value, label FROM samples LIMIT 0")
             .expect_err("LIMIT cannot bypass DISTINCT working-state limits"),
         Error::ResourceLimitExceeded {
             resource: "SELECT groups",
@@ -287,8 +382,8 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
     );
 
     let mut result_limited = Database::with_query_result_limits(QueryResultLimits {
-        max_rows: 2,
-        max_values: 2,
+        max_rows: 3,
+        max_values: 4,
         max_bytes: usize::MAX,
         max_groups: 3,
         ..QueryResultLimits::default()
@@ -297,31 +392,38 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
     assert_eq!(
         query(
             &mut result_limited,
-            "SELECT DISTINCT value FROM samples LIMIT 2"
+            "SELECT DISTINCT value, label FROM samples LIMIT 2"
         )
         .rows,
-        [vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        [
+            vec![Value::Int64(1), Value::String("a".to_owned())],
+            vec![Value::Int64(2), Value::String("b".to_owned())]
+        ]
     );
     assert_eq!(
         result_limited
-            .execute("SELECT DISTINCT value FROM samples")
+            .execute("SELECT DISTINCT value, label FROM samples")
             .expect_err("three output rows exceed the result cap"),
         Error::ResourceLimitExceeded {
-            resource: "SELECT result rows",
-            actual: 3,
-            max: 2,
+            resource: "SELECT result values",
+            actual: 6,
+            max: 4,
         }
     );
 }
 
 #[test]
 fn csv_batch_emits_distinct_strings_with_escaping() {
-    let input = b"CREATE TABLE labels (label String); \
-        INSERT INTO labels VALUES ('beta'), ('comma,value'), ('beta'), ('alpha'); \
-        SELECT DISTINCT label FROM labels LIMIT 3;";
+    let input = b"CREATE TABLE labels (label String, rank Int64); \
+        INSERT INTO labels VALUES \
+        ('beta', 2), ('comma,value', 1), ('beta', 2), ('beta', 3), ('alpha', 4); \
+        SELECT DISTINCT label, rank FROM labels LIMIT 4;";
     let mut output = Vec::new();
 
     run_csv_batch(&input[..], &mut output).expect("CSV batch succeeds");
 
-    assert_eq!(output, b"label\nbeta\n\"comma,value\"\nalpha\n");
+    assert_eq!(
+        output,
+        b"label,rank\nbeta,2\n\"comma,value\",1\nbeta,3\nalpha,4\n"
+    );
 }
