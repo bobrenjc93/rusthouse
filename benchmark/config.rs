@@ -27,7 +27,7 @@ impl Mode {
                 row_counts: vec![1_000, 10_000, 50_000],
                 warmups: 2,
                 samples: 7,
-                sustained_query_budget: 256,
+                sustained_query_budget: 512,
                 end_to_end_samples: 3,
             },
         }
@@ -206,9 +206,10 @@ mod tests {
             assert!(settings.row_counts.len() >= 2);
             assert!(settings.warmups >= 1);
             assert!(settings.samples >= 3);
-            assert_eq!(settings.sustained_query_budget, 256);
             assert!(settings.end_to_end_samples >= 3);
         }
+        assert_eq!(Mode::Quick.settings().sustained_query_budget, 256);
+        assert_eq!(Mode::Default.settings().sustained_query_budget, 512);
     }
 
     #[test]
