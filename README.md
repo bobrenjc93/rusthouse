@@ -30,6 +30,10 @@ projected `COUNT(*)` alias in `HAVING`. String literals escape a quote by
 doubling it, so semicolons and line breaks inside literals do not split a batch.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
+`SELECT DISTINCT column FROM table [LIMIT n]` supports each physical column
+type and returns unique values in deterministic first-seen order. Distinct
+values are collected under the grouped-query cap before `LIMIT` is applied,
+and the limited output remains subject to the normal result caps.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 

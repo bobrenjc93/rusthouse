@@ -50,6 +50,9 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// Whether this is the deliberately narrow one-column `SELECT DISTINCT`
+    /// form.
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub table: String,
     pub predicate: Option<Predicate>,
@@ -556,6 +559,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        if self.eat_keyword("DISTINCT") {
+            return self.parse_distinct_select();
+        }
+
         let mut items = Vec::new();
         loop {
             self.reserve_ast_list_item()?;
@@ -642,12 +649,64 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Select {
+            distinct: false,
             items,
             table,
             predicate,
             group_by,
             having,
             order_by,
+            limit,
+        })
+    }
+
+    fn parse_distinct_select(&mut self) -> Result<Select> {
+        const SHAPE: &str = "SELECT DISTINCT supports exactly one unaliased column followed by FROM <table> and an optional LIMIT";
+
+        self.reserve_ast_list_item()?;
+        if !matches!(self.peek(), TokenKind::Identifier(value) if !value.eq_ignore_ascii_case("FROM"))
+        {
+            return self.error(SHAPE);
+        }
+        let column = self.expect_identifier("column after DISTINCT")?;
+        if !self.eat_keyword("FROM") {
+            return self.error(SHAPE);
+        }
+        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("LIMIT"))
+        {
+            return self.error(SHAPE);
+        }
+        let table = self.expect_identifier("table name after FROM")?;
+
+        let limit = if self.eat_keyword("LIMIT") {
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a non-negative integer after LIMIT".to_owned(),
+            })?;
+            Some(number.parse::<usize>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid LIMIT '{number}'"),
+            })?)
+        } else {
+            None
+        };
+
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Select {
+            distinct: true,
+            items: vec![SelectItem::Column {
+                name: column,
+                alias: None,
+            }],
+            table,
+            predicate: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
             limit,
         })
     }
