@@ -5,6 +5,9 @@ use crate::batch::value::{DataType, Value};
 const MAX_PREDICATE_DEPTH: usize = 64;
 const MAX_PREDICATE_NODES: usize = 256;
 
+/// Maximum number of executable statements in one parsed batch.
+pub const DEFAULT_MAX_BATCH_STATEMENTS: usize = 4_096;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
@@ -116,8 +119,13 @@ pub struct OrderBy {
 
 /// Parse one or more semicolon-separated SQL statements.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
-    let tokens = Lexer::new(input).tokenize()?;
-    Parser::new(tokens).parse_script()
+    parse_with_statement_limit(input, DEFAULT_MAX_BATCH_STATEMENTS)
+}
+
+/// Parses a batch with an explicit executable-statement limit.
+pub fn parse_with_statement_limit(input: &str, max_statements: usize) -> Result<Vec<Statement>> {
+    let tokens = Lexer::new(input, max_statements).tokenize()?;
+    Parser::new(tokens, max_statements).parse_script()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,11 +157,20 @@ enum TokenKind {
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
+    completed_statements: usize,
+    statement_has_tokens: bool,
+    max_statements: usize,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+    fn new(input: &'a str, max_statements: usize) -> Self {
+        Self {
+            input,
+            position: 0,
+            completed_statements: 0,
+            statement_has_tokens: false,
+            max_statements,
+        }
     }
 
     fn tokenize(mut self) -> Result<Vec<Token>> {
@@ -238,6 +255,20 @@ impl<'a> Lexer<'a> {
                     return self.error(position, format!("unexpected character '{character}'"));
                 }
             };
+            if kind == TokenKind::Semicolon {
+                if self.statement_has_tokens {
+                    self.completed_statements = self.completed_statements.saturating_add(1);
+                    if self.completed_statements > self.max_statements {
+                        return Err(Error::StatementLimitExceeded {
+                            statements: self.completed_statements,
+                            max_statements: self.max_statements,
+                        });
+                    }
+                    self.statement_has_tokens = false;
+                }
+            } else {
+                self.statement_has_tokens = true;
+            }
             tokens.push(Token { kind, position });
         }
     }
@@ -343,15 +374,17 @@ struct Parser {
     current: usize,
     predicate_depth: usize,
     predicate_nodes: usize,
+    max_statements: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, max_statements: usize) -> Self {
         Self {
             tokens,
             current: 0,
             predicate_depth: 0,
             predicate_nodes: 0,
+            max_statements,
         }
     }
 
@@ -359,6 +392,12 @@ impl Parser {
         let mut statements = Vec::new();
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
+            if statements.len() >= self.max_statements {
+                return Err(Error::StatementLimitExceeded {
+                    statements: statements.len().saturating_add(1),
+                    max_statements: self.max_statements,
+                });
+            }
             statements.push(self.parse_statement()?);
             if !self.eat(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
                 return self.error("expected ';' between statements");
@@ -788,6 +827,29 @@ mod tests {
     fn reports_syntax_position() {
         let error = parse("SELECT id FROM things WHERE id ! 2").expect_err("bad operator");
         assert!(matches!(error, Error::Sql { position: 31, .. }));
+    }
+
+    #[test]
+    fn enforces_statement_limit_without_counting_semicolons_in_strings() {
+        let statements = parse_with_statement_limit(
+            "SELECT note FROM t WHERE note = 'one;two'; SELECT note FROM t",
+            2,
+        )
+        .expect("two statements fit the limit");
+        assert_eq!(statements.len(), 2);
+
+        let error = parse_with_statement_limit(
+            "SELECT note FROM t; SELECT note FROM t; SELECT note FROM t;",
+            2,
+        )
+        .expect_err("third statement exceeds the limit");
+        assert_eq!(
+            error,
+            Error::StatementLimitExceeded {
+                statements: 3,
+                max_statements: 2,
+            }
+        );
     }
 
     #[test]

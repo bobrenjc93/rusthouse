@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::io;
 
 use crate::batch::engine::QueryResult;
 use crate::batch::value::Value;
@@ -117,32 +118,50 @@ fn escape_table_text(value: &str) -> String {
 }
 
 fn render_csv(result: &QueryResult) -> String {
-    let mut output = String::new();
-    write_csv_row(
-        &mut output,
-        result.columns.iter().map(|column| column.name.as_str()),
-    );
-    for row in &result.rows {
-        let values = row.iter().map(Value::as_display_string).collect::<Vec<_>>();
-        write_csv_row(&mut output, values.iter().map(String::as_str));
-    }
-    output
+    let mut output = Vec::new();
+    write_csv(&mut output, result).expect("writing CSV to a Vec cannot fail");
+    String::from_utf8(output).expect("CSV rendering preserves UTF-8")
 }
 
-fn write_csv_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>) {
-    for (index, value) in values.enumerate() {
+/// Streams one CSVWithNames result without retaining a formatted output copy.
+pub fn write_csv(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
+    for (index, column) in result.columns.iter().enumerate() {
         if index > 0 {
-            output.push(',');
+            output.write_all(b",")?;
         }
-        if value.contains([',', '"', '\n', '\r']) {
-            output.push('"');
-            output.push_str(&value.replace('"', "\"\""));
-            output.push('"');
-        } else {
-            output.push_str(value);
-        }
+        write_csv_field(output, &column.name)?;
     }
-    output.push('\n');
+    output.write_all(b"\n")?;
+
+    for row in &result.rows {
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                output.write_all(b",")?;
+            }
+            match value {
+                Value::String(value) => write_csv_field(output, value)?,
+                Value::Null(_) => output.write_all(b"NULL")?,
+                value => write_csv_field(output, &value.as_display_string())?,
+            }
+        }
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_csv_field(output: &mut impl io::Write, value: &str) -> io::Result<()> {
+    if !value.contains([',', '"', '\n', '\r']) {
+        return output.write_all(value.as_bytes());
+    }
+
+    output.write_all(b"\"")?;
+    for (index, segment) in value.split('"').enumerate() {
+        if index > 0 {
+            output.write_all(b"\"\"")?;
+        }
+        output.write_all(segment.as_bytes())?;
+    }
+    output.write_all(b"\"")
 }
 
 /// Render one result set with explicit column metadata and positional rows.
@@ -180,6 +199,7 @@ fn render_json(result: &QueryResult) -> String {
 
 fn write_json_value(output: &mut String, value: &Value) {
     match value {
+        Value::Null(_) => output.push_str("null"),
         Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
         Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
         Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
@@ -245,6 +265,24 @@ mod tests {
         assert_eq!(
             render(&result(), OutputFormat::Json),
             r#"{"columns":[{"name":"id","type":"Int64"},{"name":"note","type":"String"}],"rows":[[1,"quote: \", comma"]]}"#
+        );
+    }
+
+    #[test]
+    fn renders_typed_nulls_in_csv_table_and_json_formats() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "total".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            rows: vec![vec![Value::Null(DataType::Int64)]],
+        };
+
+        assert_eq!(render(&result, OutputFormat::Csv), "total\nNULL\n");
+        assert!(render(&result, OutputFormat::Table).contains("| NULL  |"));
+        assert_eq!(
+            render(&result, OutputFormat::Json),
+            r#"{"columns":[{"name":"total","type":"Int64"}],"rows":[[null]]}"#
         );
     }
 

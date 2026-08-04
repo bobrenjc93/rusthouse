@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use engine::{Database, StatementResult};
-use format::{OutputFormat, render};
+use format::write_csv;
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
@@ -91,13 +91,14 @@ pub fn run_csv_batch_with_limit(
     }
 
     let sql = String::from_utf8(bytes).map_err(BatchError::InvalidUtf8)?;
+    let statements = sql::parse(&sql).map_err(BatchError::Sql)?;
     let mut database = Database::new();
-    let results = database.execute(&sql).map_err(BatchError::Sql)?;
-    for result in results {
+    for statement in statements {
+        let result = database
+            .execute_statement(statement)
+            .map_err(BatchError::Sql)?;
         if let StatementResult::Query(query) = result {
-            output
-                .write_all(render(&query, OutputFormat::Csv).as_bytes())
-                .map_err(BatchError::Write)?;
+            write_csv(&mut output, &query).map_err(BatchError::Write)?;
         }
     }
     Ok(())
@@ -106,6 +107,27 @@ pub fn run_csv_batch_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailAfterBytes {
+        remaining: usize,
+        written: usize,
+    }
+
+    impl Write for FailAfterBytes {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("intentional writer stop"));
+            }
+            let written = self.remaining.min(buffer.len());
+            self.remaining -= written;
+            self.written += written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn setup_is_silent_and_each_select_has_its_own_header() {
@@ -135,5 +157,26 @@ mod tests {
                 max_bytes: 5
             }
         ));
+    }
+
+    #[test]
+    fn streams_large_repeated_results_before_executing_later_statements() {
+        let large_value = "x".repeat(1024 * 1024);
+        let mut sql =
+            format!("CREATE TABLE notes (s String); INSERT INTO notes VALUES ('{large_value}');");
+        for _ in 0..256 {
+            sql.push_str("SELECT s FROM notes;");
+        }
+        sql.push_str("SELECT missing FROM notes;");
+        let mut output = FailAfterBytes {
+            remaining: 128,
+            written: 0,
+        };
+
+        let error = run_csv_batch(sql.as_bytes(), &mut output)
+            .expect_err("writer stops during the first large result");
+
+        assert!(matches!(error, BatchError::Write(_)));
+        assert_eq!(output.written, 128);
     }
 }

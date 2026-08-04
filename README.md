@@ -27,6 +27,8 @@ multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. String literals escape a quote by doubling it, so
 semicolons and line breaks inside literals do not split a batch.
+Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
+`MAX`, and `AVG` are typed `NULL` values.
 
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
@@ -51,10 +53,12 @@ explicit input-row and distinct-value limits and returns deterministic
 ## Command-line session
 
 `rusthouse --format csv` reads one complete SQL batch from standard input
-through EOF, with an explicit 64 MiB input limit. Every statement shares one
-in-memory catalog. Successful `CREATE` and `INSERT` statements are silent, and
-each `SELECT` emits a CSVWithNames-compatible header followed by typed rows;
-commas, quotes, and newlines in strings are CSV-escaped.
+through EOF, with explicit limits of 64 MiB and 4,096 statements. Every
+statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
+statements are silent, and each `SELECT` is executed and emitted before the
+next statement, using a CSVWithNames-compatible header followed by typed rows;
+commas, quotes, and newlines in strings are CSV-escaped. The collecting library
+API separately caps retained query results at an estimated 64 MiB.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

@@ -10,6 +10,9 @@ use crate::batch::sql::{
 use crate::batch::storage::{Column, Table};
 use crate::batch::value::{DataType, Value, ValueRef};
 
+/// Maximum estimated heap retained by the collecting [`Database::execute`] API.
+pub const DEFAULT_MAX_RETAINED_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
@@ -54,13 +57,37 @@ impl Database {
     /// nothing. Once parsing succeeds, statements execute in order and earlier
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
-        sql::parse(sql)?
-            .into_iter()
-            .map(|statement| self.execute_statement(statement))
-            .collect()
+        self.execute_with_result_limit(sql, DEFAULT_MAX_RETAINED_RESULT_BYTES)
     }
 
-    fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+    /// Executes a batch while bounding results retained for the caller.
+    pub fn execute_with_result_limit(
+        &mut self,
+        sql: &str,
+        max_result_bytes: usize,
+    ) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        let mut retained_bytes = 0_usize;
+        for statement in statements {
+            let result = self.execute_statement(statement)?;
+            retained_bytes = retained_bytes.saturating_add(result.estimated_retained_bytes());
+            if retained_bytes > max_result_bytes {
+                return Err(Error::ResultLimitExceeded {
+                    bytes: retained_bytes,
+                    max_bytes: max_result_bytes,
+                });
+            }
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Executes one already-parsed statement.
+    ///
+    /// Callers that stream results should parse the complete batch first, then
+    /// invoke this method in order and release each result before continuing.
+    pub fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog.create_table(name, columns)?;
@@ -132,6 +159,41 @@ impl Database {
             columns: result_columns,
             rows,
         })
+    }
+}
+
+impl StatementResult {
+    fn estimated_retained_bytes(&self) -> usize {
+        let Self::Query(result) = self else {
+            return 0;
+        };
+
+        let mut bytes = result
+            .columns
+            .len()
+            .saturating_mul(std::mem::size_of::<ResultColumn>())
+            .saturating_add(
+                result
+                    .columns
+                    .iter()
+                    .map(|column| column.name.len())
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                result
+                    .rows
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Vec<Value>>()),
+            );
+        for row in &result.rows {
+            bytes = bytes.saturating_add(row.len().saturating_mul(std::mem::size_of::<Value>()));
+            for value in row {
+                if let Value::String(value) = value {
+                    bytes = bytes.saturating_add(value.len());
+                }
+            }
+        }
+        bytes
     }
 }
 
@@ -356,10 +418,11 @@ fn execute_grouped<'a>(
     let keys = groups.into_keys(group_count);
     let aggregates = aggregate_states
         .into_iter()
-        .map(|states| {
+        .zip(aggregate_specs)
+        .map(|(states, spec)| {
             states
                 .into_iter()
-                .map(AggregateState::finish)
+                .map(|state| state.finish(spec))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
@@ -524,26 +587,80 @@ impl GroupedData<'_> {
 #[derive(Debug)]
 enum AggregateState {
     Count(i64),
-    SumInt(i64),
-    SumFloat(f64),
+    SumInt { sum: i128, count: u64 },
+    SumFloat { sum: ScaledFloatSum, count: u64 },
     Min(Option<Value>),
     Max(Option<Value>),
     AvgInt { sum: i128, count: u64 },
-    AvgFloat { sum: f64, count: u64 },
+    AvgFloat { sum: ScaledFloatSum, count: u64 },
+}
+
+#[derive(Debug, Default)]
+struct ScaledFloatSum {
+    scale: f64,
+    normalized_sum: f64,
+    correction: f64,
+}
+
+impl ScaledFloatSum {
+    fn add(&mut self, value: f64) {
+        let magnitude = value.abs();
+        if magnitude > self.scale {
+            if self.scale != 0.0 {
+                let ratio = self.scale / magnitude;
+                self.normalized_sum *= ratio;
+                self.correction *= ratio;
+            }
+            self.scale = magnitude;
+        }
+        if self.scale == 0.0 {
+            return;
+        }
+
+        let normalized = value / self.scale;
+        let next = self.normalized_sum + normalized;
+        if self.normalized_sum.abs() >= normalized.abs() {
+            self.correction += (self.normalized_sum - next) + normalized;
+        } else {
+            self.correction += (normalized - next) + self.normalized_sum;
+        }
+        self.normalized_sum = next;
+    }
+
+    fn normalized_total(&self) -> f64 {
+        self.normalized_sum + self.correction
+    }
+
+    fn total(&self) -> f64 {
+        self.normalized_total() * self.scale
+    }
+
+    fn mean(&self, count: u64) -> f64 {
+        let normalized = (self.normalized_total() / count as f64).clamp(-1.0, 1.0);
+        normalized * self.scale
+    }
 }
 
 impl AggregateState {
     fn new(spec: &AggregateSpec) -> Self {
         match spec.function {
             AggregateFunction::Count => Self::Count(0),
-            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => Self::SumInt(0),
-            AggregateFunction::Sum => Self::SumFloat(0.0),
+            AggregateFunction::Sum if spec.input_type == Some(DataType::Int64) => {
+                Self::SumInt { sum: 0, count: 0 }
+            }
+            AggregateFunction::Sum => Self::SumFloat {
+                sum: ScaledFloatSum::default(),
+                count: 0,
+            },
             AggregateFunction::Min => Self::Min(None),
             AggregateFunction::Max => Self::Max(None),
             AggregateFunction::Avg if spec.input_type == Some(DataType::Int64) => {
                 Self::AvgInt { sum: 0, count: 0 }
             }
-            AggregateFunction::Avg => Self::AvgFloat { sum: 0.0, count: 0 },
+            AggregateFunction::Avg => Self::AvgFloat {
+                sum: ScaledFloatSum::default(),
+                count: 0,
+            },
         }
     }
 
@@ -554,25 +671,28 @@ impl AggregateState {
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("COUNT".to_owned()))?;
             }
-            Self::SumInt(sum) => {
+            Self::SumInt { sum, count } => {
                 let Column::Int64(values) = &table.columns()[spec.argument.expect("SUM argument")]
                 else {
                     unreachable!("SUM input type is resolved")
                 };
                 *sum = sum
-                    .checked_add(values[row])
-                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64)".to_owned()))?;
+                    .checked_add(i128::from(values[row]))
+                    .ok_or_else(|| Error::NumericOverflow("SUM(Int64) exact sum".to_owned()))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
             }
-            Self::SumFloat(sum) => {
+            Self::SumFloat { sum, count } => {
                 let Column::Float64(values) =
                     &table.columns()[spec.argument.expect("SUM argument")]
                 else {
                     unreachable!("SUM input type is resolved")
                 };
-                *sum += values[row];
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("SUM(Float64)".to_owned()));
-                }
+                sum.add(values[row]);
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::NumericOverflow("SUM count".to_owned()))?;
             }
             Self::Min(current) => {
                 let column = &table.columns()[spec.argument.expect("MIN argument")];
@@ -612,36 +732,40 @@ impl AggregateState {
                 else {
                     unreachable!("AVG input type is resolved")
                 };
-                *sum += values[row];
+                sum.add(values[row]);
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| Error::NumericOverflow("AVG count".to_owned()))?;
-                if !sum.is_finite() {
-                    return Err(Error::NumericOverflow("AVG(Float64) sum".to_owned()));
-                }
             }
         }
         Ok(())
     }
 
-    fn finish(self) -> Result<Value> {
+    fn finish(self, spec: &AggregateSpec) -> Result<Value> {
         match self {
-            Self::Count(value) | Self::SumInt(value) => Ok(Value::Int64(value)),
-            Self::SumFloat(value) => Ok(Value::Float64(value)),
+            Self::Count(value) => Ok(Value::Int64(value)),
+            Self::SumInt { count: 0, .. } => Ok(Value::Null(DataType::Int64)),
+            Self::SumInt { sum, .. } => i64::try_from(sum)
+                .map(Value::Int64)
+                .map_err(|_| Error::NumericOverflow("SUM(Int64)".to_owned())),
+            Self::SumFloat { count: 0, .. } => Ok(Value::Null(DataType::Float64)),
+            Self::SumFloat { sum, .. } => {
+                let value = sum.total();
+                if value.is_finite() {
+                    Ok(Value::Float64(value))
+                } else {
+                    Err(Error::NumericOverflow("SUM(Float64)".to_owned()))
+                }
+            }
             Self::Min(Some(value)) | Self::Max(Some(value)) => Ok(value),
             Self::AvgInt { sum, count } if count > 0 => {
                 Ok(Value::Float64(sum as f64 / count as f64))
             }
-            Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum / count as f64)),
-            Self::Min(None) => Err(Error::InvalidQuery(
-                "MIN is undefined for an empty input".to_owned(),
+            Self::AvgFloat { sum, count } if count > 0 => Ok(Value::Float64(sum.mean(count))),
+            Self::Min(None) | Self::Max(None) => Ok(Value::Null(
+                spec.input_type.expect("MIN and MAX have column arguments"),
             )),
-            Self::Max(None) => Err(Error::InvalidQuery(
-                "MAX is undefined for an empty input".to_owned(),
-            )),
-            Self::AvgInt { .. } | Self::AvgFloat { .. } => Err(Error::InvalidQuery(
-                "AVG is undefined for an empty input".to_owned(),
-            )),
+            Self::AvgInt { .. } | Self::AvgFloat { .. } => Ok(Value::Null(DataType::Float64)),
         }
     }
 }
@@ -945,5 +1069,103 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn int64_sum_uses_the_final_exact_sum_independent_of_row_order() {
+        for values in [
+            "(9223372036854775807), (1), (-1)",
+            "(9223372036854775807), (-1), (1)",
+        ] {
+            let mut database = Database::new();
+            database
+                .execute(&format!(
+                    "CREATE TABLE numbers (n Int64); INSERT INTO numbers VALUES {values};"
+                ))
+                .expect("setup");
+
+            assert_eq!(
+                query(&mut database, "SELECT SUM(n) AS total FROM numbers").rows,
+                vec![vec![Value::Int64(i64::MAX)]]
+            );
+        }
+    }
+
+    #[test]
+    fn float64_average_scales_finite_boundary_values_without_overflow() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE numbers (n Float64); \
+                 INSERT INTO numbers VALUES \
+                 (1.7976931348623157e308), (1.7976931348623157e308);",
+            )
+            .expect("setup");
+
+        assert_eq!(
+            query(&mut database, "SELECT AVG(n) AS mean FROM numbers").rows,
+            vec![vec![Value::Float64(f64::MAX)]]
+        );
+
+        let mut cancelling = Database::new();
+        cancelling
+            .execute(
+                "CREATE TABLE numbers (n Float64); \
+                 INSERT INTO numbers VALUES \
+                 (1.7976931348623157e308), (-1.7976931348623157e308);",
+            )
+            .expect("setup");
+        assert_eq!(
+            query(&mut cancelling, "SELECT AVG(n) AS mean FROM numbers").rows,
+            vec![vec![Value::Float64(0.0)]]
+        );
+    }
+
+    #[test]
+    fn empty_global_aggregates_return_one_row_with_typed_nulls() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE samples (i Int64, f Float64, b Bool, s String);")
+            .expect("create");
+        let aggregate_sql = "SELECT COUNT(*) AS rows, SUM(i) AS int_sum, \
+            SUM(f) AS float_sum, MIN(s) AS first, MAX(b) AS last, AVG(f) AS mean \
+            FROM samples";
+        let expected = vec![vec![
+            Value::Int64(0),
+            Value::Null(DataType::Int64),
+            Value::Null(DataType::Float64),
+            Value::Null(DataType::String),
+            Value::Null(DataType::Bool),
+            Value::Null(DataType::Float64),
+        ]];
+
+        assert_eq!(query(&mut database, aggregate_sql).rows, expected);
+
+        database
+            .execute("INSERT INTO samples VALUES (1, 2.0, true, 'present')")
+            .expect("insert");
+        assert_eq!(
+            query(&mut database, &format!("{aggregate_sql} WHERE i < 0")).rows,
+            expected
+        );
+    }
+
+    #[test]
+    fn collecting_api_enforces_retained_result_limit() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE notes (s String); INSERT INTO notes VALUES ('abcdefghij');")
+            .expect("setup");
+
+        let error = database
+            .execute_with_result_limit("SELECT s FROM notes", 1)
+            .expect_err("result exceeds explicit retained byte limit");
+        assert!(matches!(
+            error,
+            Error::ResultLimitExceeded {
+                bytes,
+                max_bytes: 1
+            } if bytes > 1
+        ));
     }
 }

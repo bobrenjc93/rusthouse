@@ -56,6 +56,28 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn csv_batch_emits_typed_nulls_for_empty_aggregate_inputs() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE samples (id Int64, score Float64, label String);
+          SELECT COUNT(*) AS rows, SUM(id) AS total, MIN(label) AS first,
+                 MAX(score) AS high, AVG(score) AS mean FROM samples;
+          INSERT INTO samples VALUES (1, 2.5, 'present');
+          SELECT COUNT(*) AS rows, SUM(id) AS total, MIN(label) AS first,
+                 MAX(score) AS high, AVG(score) AS mean
+          FROM samples WHERE id < 0;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"rows,total,first,high,mean\n0,NULL,NULL,NULL,NULL\n\
+          rows,total,first,high,mean\n0,NULL,NULL,NULL,NULL\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn fixed_harness_style_write_completes_without_early_exit_or_broken_pipe() {
     const ROWS: usize = 4_096;
     let mut sql = String::from(

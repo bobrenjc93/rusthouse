@@ -169,6 +169,13 @@ impl Table {
         }
 
         for (field, value) in self.schema.iter().zip(row) {
+            if matches!(value, Value::Null(_)) {
+                return Err(Error::TypeMismatch {
+                    context: format!("column '{}.{}'", self.name, field.name),
+                    expected: field.data_type.to_string(),
+                    actual: "NULL".to_owned(),
+                });
+            }
             if field.data_type != value.data_type() {
                 return Err(Error::TypeMismatch {
                     context: format!("column '{}.{}'", self.name, field.name),

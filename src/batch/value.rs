@@ -3,7 +3,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 /// The four physical column types supported by RustHouse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DataType {
     Int64,
     Float64,
@@ -37,6 +37,8 @@ impl fmt::Display for DataType {
 /// A scalar value read from or written to a typed column.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// A typed SQL `NULL` produced by an expression or aggregate result.
+    Null(DataType),
     Int64(i64),
     Float64(f64),
     Bool(bool),
@@ -46,6 +48,7 @@ pub enum Value {
 /// A non-owning scalar used while scanning immutable column storage.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ValueRef<'a> {
+    Null(DataType),
     Int64(i64),
     Float64(f64),
     Bool(bool),
@@ -56,6 +59,7 @@ impl Value {
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
+            Self::Null(data_type) => *data_type,
             Self::Int64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
@@ -66,6 +70,7 @@ impl Value {
     #[must_use]
     pub fn as_display_string(&self) -> String {
         match self {
+            Self::Null(_) => "NULL".to_owned(),
             Self::Int64(value) => value.to_string(),
             Self::Float64(value) => format_float(*value),
             Self::Bool(value) => value.to_string(),
@@ -75,6 +80,7 @@ impl Value {
 
     pub(crate) fn as_ref(&self) -> ValueRef<'_> {
         match self {
+            Self::Null(data_type) => ValueRef::Null(*data_type),
             Self::Int64(value) => ValueRef::Int64(*value),
             Self::Float64(value) => ValueRef::Float64(*value),
             Self::Bool(value) => ValueRef::Bool(*value),
@@ -91,6 +97,7 @@ impl Value {
 impl ValueRef<'_> {
     pub(crate) fn to_owned(self) -> Value {
         match self {
+            Self::Null(data_type) => Value::Null(data_type),
             Self::Int64(value) => Value::Int64(value),
             Self::Float64(value) => Value::Float64(value),
             Self::Bool(value) => Value::Bool(value),
@@ -100,6 +107,7 @@ impl ValueRef<'_> {
 
     pub(crate) fn sql_cmp(self, other: Self) -> Option<Ordering> {
         match (self, other) {
+            (Self::Null(_), _) | (_, Self::Null(_)) => None,
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(&right)),
             (Self::Float64(left), Self::Float64(right)) => left.partial_cmp(&right),
             (Self::Int64(left), Self::Float64(right)) => int_float_cmp(left, right),
@@ -114,10 +122,11 @@ impl ValueRef<'_> {
 
     fn variant_index(&self) -> u8 {
         match self {
-            Self::Int64(_) => 0,
-            Self::Float64(_) => 1,
-            Self::Bool(_) => 2,
-            Self::String(_) => 3,
+            Self::Null(_) => 0,
+            Self::Int64(_) => 1,
+            Self::Float64(_) => 2,
+            Self::Bool(_) => 3,
+            Self::String(_) => 4,
         }
     }
 }
@@ -206,6 +215,7 @@ impl PartialOrd for ValueRef<'_> {
 impl Ord for ValueRef<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
+            (Self::Null(left), Self::Null(right)) => left.cmp(right),
             (Self::Int64(left), Self::Int64(right)) => left.cmp(right),
             (Self::Float64(left), Self::Float64(right)) => float_cmp(*left, *right),
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
@@ -225,6 +235,7 @@ impl Hash for ValueRef<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.variant_index().hash(state);
         match self {
+            Self::Null(data_type) => data_type.hash(state),
             Self::Int64(value) => value.hash(state),
             Self::Float64(value) => canonical_float_bits(*value).hash(state),
             Self::Bool(value) => value.hash(state),

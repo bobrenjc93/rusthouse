@@ -30,6 +30,14 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    StatementLimitExceeded {
+        statements: usize,
+        max_statements: usize,
+    },
+    ResultLimitExceeded {
+        bytes: usize,
+        max_bytes: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,6 +81,17 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::StatementLimitExceeded {
+                statements,
+                max_statements,
+            } => write!(
+                f,
+                "SQL batch has at least {statements} statements, exceeding the limit of {max_statements}"
+            ),
+            Self::ResultLimitExceeded { bytes, max_bytes } => write!(
+                f,
+                "retained query results require at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
         }
     }
 }
