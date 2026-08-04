@@ -151,6 +151,14 @@ impl Database {
         max_result_bytes: usize,
     ) -> Result<Vec<StatementResult>> {
         let statements = sql::parse(sql)?;
+        self.execute_statements_with_result_limit(statements, max_result_bytes)
+    }
+
+    pub(crate) fn execute_statements_with_result_limit(
+        &mut self,
+        statements: Vec<Statement>,
+        max_result_bytes: usize,
+    ) -> Result<Vec<StatementResult>> {
         let mut results = Vec::with_capacity(statements.len());
         let mut retained_bytes = 0_usize;
         for statement in statements {
