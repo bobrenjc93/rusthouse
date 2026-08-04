@@ -65,6 +65,11 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    Cast {
+        name: String,
+        target_type: DataType,
+        alias: Option<String>,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
@@ -656,6 +661,32 @@ impl<'a> Parser<'a> {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
+            if name.eq_ignore_ascii_case("CAST") {
+                let name = self.expect_identifier("Int64 column in CAST")?;
+                self.expect_keyword("AS")?;
+                let type_position = self.position();
+                let type_name = self.expect_identifier("Float64 target type in CAST")?;
+                let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+                    position: type_position,
+                    message: format!("unknown CAST target type '{type_name}'; expected Float64"),
+                })?;
+                if target_type != DataType::Float64 {
+                    return Err(Error::Sql {
+                        position: type_position,
+                        message: format!(
+                            "unsupported CAST target type '{type_name}'; expected Float64"
+                        ),
+                    });
+                }
+                self.expect(&TokenKind::RightParen, "')' after CAST expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Cast {
+                    name,
+                    target_type,
+                    alias,
+                });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),

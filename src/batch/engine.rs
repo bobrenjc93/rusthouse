@@ -313,6 +313,9 @@ enum ResolvedItem {
         source: usize,
         group_position: Option<usize>,
     },
+    CastInt64ToFloat64 {
+        source: usize,
+    },
     Aggregate {
         state: usize,
     },
@@ -423,6 +426,39 @@ fn resolve_select_items(
                         .clone()
                         .unwrap_or_else(|| table.schema()[source].name.clone()),
                     data_type: table.schema()[source].data_type,
+                });
+            }
+            SelectItem::Cast {
+                name,
+                target_type,
+                alias,
+            } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Int64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("CAST argument '{name}'"),
+                        expected: DataType::Int64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if *target_type != DataType::Float64 {
+                    return Err(Error::InvalidQuery(
+                        "only CAST(Int64 AS Float64) is supported".to_owned(),
+                    ));
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "CAST projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::CastInt64ToFloat64 { source });
+                result_columns.push(ResultColumn {
+                    name: alias.clone().unwrap_or_else(|| {
+                        format!("CAST({} AS Float64)", table.schema()[source].name)
+                    }),
+                    data_type: DataType::Float64,
                 });
             }
             SelectItem::Aggregate {
@@ -555,6 +591,9 @@ fn execute_projection(
                 .iter()
                 .map(|item| match item {
                     ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                    ResolvedItem::CastInt64ToFloat64 { source } => {
+                        Value::Float64(int64_at(table, *source, *row) as f64)
+                    }
                     ResolvedItem::Aggregate { .. } => {
                         unreachable!("projection does not contain aggregates")
                     }
@@ -574,12 +613,18 @@ fn validate_projection_result_limits(
     let mut bytes = validate_result_shape(rows.len(), items.len(), columns, limits)?;
     for row in rows {
         for item in items {
-            let ResolvedItem::Column { source, .. } = item else {
-                unreachable!("ungrouped projections cannot contain aggregates")
+            let source = match item {
+                ResolvedItem::Column { source, .. } => Some(*source),
+                ResolvedItem::CastInt64ToFloat64 { .. } => None,
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                }
             };
-            if let ValueRef::String(value) = table.columns()[*source].value_ref(*row) {
-                bytes = bytes.saturating_add(value.len());
-                enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+            if let Some(source) = source {
+                if let ValueRef::String(value) = table.columns()[source].value_ref(*row) {
+                    bytes = bytes.saturating_add(value.len());
+                    enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+                }
             }
         }
     }
@@ -608,6 +653,9 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
+                ResolvedItem::CastInt64ToFloat64 { .. } => {
+                    unreachable!("CAST projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::Aggregate { state } => match &data.aggregates[*state][*group] {
                     Value::String(value) => value.len(),
                     _ => 0,
@@ -887,6 +935,9 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped columns are validated"),
+                        ResolvedItem::CastInt64ToFloat64 { .. } => {
+                            unreachable!("CAST projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::Aggregate { state } => {
                             self.aggregates[*state][*group].clone()
                         }
@@ -1183,10 +1234,17 @@ fn order_source_rows(
 
     sort_and_limit(rows, limit, |left, right| {
         for order in ordering {
-            let ResolvedItem::Column { source, .. } = items[order.output] else {
-                unreachable!("ungrouped projections cannot contain aggregates")
+            let comparison = match items[order.output] {
+                ResolvedItem::Column { source, .. } => table.columns()[source].cmp_at(left, right),
+                ResolvedItem::CastInt64ToFloat64 { source } => {
+                    let left = ValueRef::Float64(int64_at(table, source, left) as f64);
+                    let right = ValueRef::Float64(int64_at(table, source, right) as f64);
+                    left.cmp(&right)
+                }
+                ResolvedItem::Aggregate { .. } => {
+                    unreachable!("ungrouped projections cannot contain aggregates")
+                }
             };
-            let comparison = table.columns()[source].cmp_at(left, right);
             if comparison != Ordering::Equal {
                 return if order.descending {
                     comparison.reverse()
@@ -1219,6 +1277,9 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
+                ResolvedItem::CastInt64ToFloat64 { .. } => {
+                    unreachable!("CAST projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::Aggregate { state } => {
                     data.aggregates[state][left].cmp(&data.aggregates[state][right])
                 }
@@ -1233,6 +1294,13 @@ fn order_grouped_rows(
         }
         data.keys[left].cmp(&data.keys[right])
     });
+}
+
+fn int64_at(table: &Table, source: usize, row: usize) -> i64 {
+    let Column::Int64(values) = &table.columns()[source] else {
+        unreachable!("CAST input type is resolved")
+    };
+    values[row]
 }
 
 fn sort_and_limit(
