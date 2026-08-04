@@ -86,9 +86,10 @@ JSON-escaped.
 A query result is checked before cloning against limits of 10,000 rows, 250,000
 values, and an estimated 16 MiB. Grouped queries additionally allow 100,000
 groups and bound grouped keys to 500,000 cells and an estimated 32 MiB. Their
-aggregate working state has separate 500,000-cell and estimated 32 MiB limits,
-including cloned string extrema. The collecting library API separately caps
-all retained query results at an estimated 64 MiB.
+grouped-key accounting includes the reusable lookup probe for tuples wider
+than two columns. Aggregate working state has separate 500,000-cell and
+estimated 32 MiB limits, including cloned string extrema. The collecting
+library API separately caps all retained query results at an estimated 64 MiB.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

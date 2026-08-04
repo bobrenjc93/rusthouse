@@ -326,15 +326,20 @@ fn rejects_unknown_and_duplicate_tuple_columns_with_typed_errors() {
 fn handles_empty_input_and_zero_exact_and_exceeded_limits() {
     let mut empty = Database::with_query_result_limits(QueryResultLimits {
         max_groups: 0,
+        max_group_key_cells: 0,
+        max_group_key_bytes: 0,
         ..QueryResultLimits::default()
     });
     empty
-        .execute("CREATE TABLE samples (value Int64, label String)")
+        .execute("CREATE TABLE samples (value Int64, label String, active Bool)")
         .expect("setup");
     assert!(
-        query(&mut empty, "SELECT DISTINCT value, label FROM samples")
-            .rows
-            .is_empty()
+        query(
+            &mut empty,
+            "SELECT DISTINCT value, label, active FROM samples"
+        )
+        .rows
+        .is_empty()
     );
 
     let mut database = Database::new();
@@ -446,7 +451,9 @@ fn enforces_group_key_cell_and_byte_caps_before_limit() {
     let setup = "CREATE TABLE samples (value Int64, label String, active Bool); \
         INSERT INTO samples VALUES \
         (1, 'a', true), (2, 'b', false), (1, 'a', true), (3, 'c', true);";
-    let key_cells = 9;
+    let stored_key_cells = 9;
+    let probe_key_cells = 3;
+    let key_cells = stored_key_cells + probe_key_cells;
     let key_bytes = key_cells * ESTIMATED_GROUP_KEY_CELL_BYTES;
     let exact_limits = QueryResultLimits {
         max_groups: 3,

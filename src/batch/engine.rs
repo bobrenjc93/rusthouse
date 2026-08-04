@@ -917,25 +917,33 @@ fn execute_grouped<'a>(
 
     let key_cells_per_group = group_columns.len();
     let key_bytes_per_group = key_cells_per_group.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES);
+    let probe_key_cells = if group_columns.len() > 2 && !matching_rows.is_empty() {
+        key_cells_per_group
+    } else {
+        0
+    };
+    let probe_key_bytes = probe_key_cells.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES);
     if !group_columns.is_empty() && !matching_rows.is_empty() {
         enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
+        let first_group_key_cells = probe_key_cells.saturating_add(key_cells_per_group);
         enforce_resource_limit(
             "SELECT group key cells",
-            key_cells_per_group,
+            first_group_key_cells,
             limits.max_group_key_cells,
         )?;
+        let first_group_key_bytes = probe_key_bytes.saturating_add(key_bytes_per_group);
         enforce_resource_limit(
             "SELECT group key bytes",
-            key_bytes_per_group,
+            first_group_key_bytes,
             limits.max_group_key_bytes,
         )?;
     }
 
     let mut groups = GroupIndex::new(group_columns.len());
     let mut group_count = usize::from(group_columns.is_empty());
-    let mut group_key_cells = 0_usize;
-    let mut group_key_bytes = 0_usize;
-    let mut multiple_key_probe = Vec::new();
+    let mut group_key_cells = probe_key_cells;
+    let mut group_key_bytes = probe_key_bytes;
+    let mut multiple_key_probe = Vec::with_capacity(probe_key_cells);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
