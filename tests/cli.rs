@@ -1,18 +1,109 @@
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use rusthouse::{DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_STATEMENTS};
 
 fn run(args: &[&str], input: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthouse"))
+    let mut child = spawn(args);
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn spawn(args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
-    child.wait_with_output().unwrap()
+        .unwrap()
+}
+
+#[test]
+fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE metrics (
+              id Int64,
+              score Float64,
+              enabled Bool,
+              label String
+          );
+          INSERT INTO metrics VALUES
+              (1, 1.5, true, 'semi;colon'),
+              (2, 2.5, false, 'comma,value'),
+              (3, 4.0, true, 'quote''d');
+          SELECT id, score, enabled, label FROM metrics ORDER BY id;
+          SELECT COUNT(*) AS row_count,
+                 SUM(id) AS id_sum,
+                 MIN(score) AS score_min,
+                 MAX(score) AS score_max,
+                 AVG(score) AS score_avg
+          FROM metrics;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"id,score,enabled,label\n\
+          1,1.5,true,semi;colon\n\
+          2,2.5,false,\"comma,value\"\n\
+          3,4.0,true,quote'd\n\
+          row_count,id_sum,score_min,score_max,score_avg\n\
+          3,6,1.5,4.0,2.6666666666666665\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn fixed_harness_style_write_completes_without_early_exit_or_broken_pipe() {
+    const ROWS: usize = 4_096;
+    let mut sql = String::from(
+        "CREATE TABLE parity_data (id Int64, score Float64, flag Bool, label String);\n\
+         INSERT INTO parity_data VALUES ",
+    );
+    for row in 0..ROWS {
+        if row != 0 {
+            sql.push(',');
+        }
+        let flag = row % 2 == 0;
+        sql.push_str(&format!("({row},{}.5,{flag},'row_{row:05}')", row % 100));
+    }
+    sql.push_str(
+        ";\nSELECT COUNT(*) AS row_count, SUM(id) AS total, MIN(score) AS low, \
+         MAX(score) AS high, AVG(score) AS mean FROM parity_data;\n\
+         SELECT COUNT(*) AS row_count FROM parity_data;\n",
+    );
+    assert!(
+        sql.len() > 64 * 1024,
+        "input must exceed a typical pipe buffer"
+    );
+
+    let mut child = spawn(&["--format", "csv"]);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(sql.as_bytes())
+        .expect("the process must keep stdin open for the complete batch");
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("row_count,total,low,high,mean\n4096,8386560,"));
+    assert!(stdout.ends_with("row_count\n4096\n"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn csv_is_the_only_accepted_format_argument() {
+    for args in [
+        &["--format", "json"][..],
+        &["--format", "CSV"][..],
+        &["--format", "csv", "extra"][..],
+    ] {
+        let output = run(args, b"");
+        assert!(!output.status.success(), "{args:?}");
+    }
 }
 
 #[test]
