@@ -1,13 +1,14 @@
 //! Versioned, bounded snapshot envelopes and nullable `Int64` row payloads.
 //!
 //! This module does not serialize a catalog. It can create and sync a new
-//! envelope file without replacing an existing destination. See
-//! `docs/snapshot-format.md` for the stable binary layouts.
+//! envelope file without replacing an existing destination, then reopen one
+//! bounded `Int64` table from that file. See `docs/snapshot-format.md` for the
+//! stable binary layouts.
 
 use std::error::Error;
 use std::fmt;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::storage::{InsertError, Int64Table, Schema};
@@ -250,6 +251,55 @@ impl From<NullableI64PayloadError> for Int64TableRestoreError {
 impl From<InsertError> for Int64TableRestoreError {
     fn from(error: InsertError) -> Self {
         Self::Table(error)
+    }
+}
+
+/// An error produced while restoring an [`Int64Table`] from a snapshot file.
+#[derive(Debug)]
+pub enum Int64TableFileRestoreError {
+    /// The snapshot path could not be opened for reading.
+    Open(io::Error),
+    /// The snapshot path does not identify a regular file.
+    NotRegularFile,
+    /// The opened snapshot file could not be inspected or read completely.
+    Read(io::Error),
+    /// The file is larger than the envelope header plus the payload limit.
+    FileTooLarge { file_len: u64, max_file_len: usize },
+    /// The bounded file contents could not be restored as an `Int64` table.
+    Restore(Int64TableRestoreError),
+}
+
+impl fmt::Display for Int64TableFileRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "could not open snapshot file: {error}"),
+            Self::NotRegularFile => write!(formatter, "snapshot path is not a regular file"),
+            Self::Read(error) => write!(formatter, "could not read snapshot file: {error}"),
+            Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => write!(
+                formatter,
+                "snapshot file has {file_len} bytes, exceeding the limit of {max_file_len}"
+            ),
+            Self::Restore(error) => write!(formatter, "could not restore snapshot file: {error}"),
+        }
+    }
+}
+
+impl Error for Int64TableFileRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(error) | Self::Read(error) => Some(error),
+            Self::NotRegularFile | Self::FileTooLarge { .. } => None,
+            Self::Restore(error) => Some(error),
+        }
+    }
+}
+
+impl From<Int64TableRestoreError> for Int64TableFileRestoreError {
+    fn from(error: Int64TableRestoreError) -> Self {
+        Self::Restore(error)
     }
 }
 
@@ -618,6 +668,94 @@ pub fn restore_int64_table(
     Ok(table)
 }
 
+/// Opens a bounded snapshot file and restores one `Int64` table from it.
+///
+/// At most the envelope header plus `snapshot_codec`'s configured payload
+/// limit is read. The path must identify a regular file, preventing streams
+/// and devices from blocking or hiding trailing input behind an unreliable
+/// metadata length. A larger file is rejected before its contents are read.
+/// The bounded bytes are passed to [`restore_int64_table`], so all envelope,
+/// payload, schema, and row-cap validation finishes before a table is returned.
+pub fn restore_int64_table_from_file(
+    path: impl AsRef<Path>,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) -> Result<Int64Table, Int64TableFileRestoreError> {
+    let path = path.as_ref();
+    let mut file = open_regular_snapshot_file(path)?;
+    let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
+    let file_len = bounded_file_len(&file, max_file_len)?;
+    let capacity = usize::try_from(file_len).unwrap_or(max_file_len);
+    let mut envelope = Vec::with_capacity(capacity);
+    Read::take(&mut file, u64::try_from(max_file_len).unwrap_or(u64::MAX))
+        .read_to_end(&mut envelope)
+        .map_err(Int64TableFileRestoreError::Read)?;
+
+    // Check the opened file again in case it grew after the first size check.
+    bounded_file_len(&file, max_file_len)?;
+
+    restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
+        .map_err(Int64TableFileRestoreError::Restore)
+}
+
+fn open_regular_snapshot_file(path: &Path) -> Result<File, Int64TableFileRestoreError> {
+    require_regular_snapshot_path(path)?;
+    open_regular_snapshot_path(path)
+}
+
+fn require_regular_snapshot_path(path: &Path) -> Result<(), Int64TableFileRestoreError> {
+    let metadata = fs::metadata(path).map_err(Int64TableFileRestoreError::Open)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    Ok(())
+}
+
+fn open_regular_snapshot_path(path: &Path) -> Result<File, Int64TableFileRestoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A pathname that becomes a FIFO between the metadata check and open
+        // must not block this process. This flag has no effect on regular files.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(Int64TableFileRestoreError::Open)?;
+    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    Ok(file)
+}
+
+fn bounded_file_len(file: &File, max_file_len: usize) -> Result<u64, Int64TableFileRestoreError> {
+    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    let file_len = metadata.len();
+    let max_file_len_u64 = u64::try_from(max_file_len).unwrap_or(u64::MAX);
+    if file_len > max_file_len_u64 {
+        return Err(Int64TableFileRestoreError::FileTooLarge {
+            file_len,
+            max_file_len,
+        });
+    }
+
+    Ok(file_len)
+}
+
 fn validate_nullable_i64_rows(
     payload: &[u8],
     row_count: usize,
@@ -687,5 +825,58 @@ mod tests {
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_checked_file_with_a_fifo_cannot_block_open() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-unit-tests");
+        fs::create_dir_all(&base).unwrap();
+        let directory = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let path = directory.join("race.snapshot");
+        fs::write(&path, b"checked regular file").unwrap();
+
+        require_regular_snapshot_path(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let fifo_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_path` is a valid, NUL-terminated pathname that lives
+        // through the call, and the mode contains only permission bits.
+        let result = unsafe { libc::mkfifo(fifo_path.as_ptr(), libc::S_IRUSR | libc::S_IWUSR) };
+        assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
+
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            sender
+                .send(open_regular_snapshot_path(&worker_path).map(drop))
+                .unwrap();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening the replacement FIFO must not block");
+        worker.join().unwrap();
+
+        assert!(matches!(
+            result,
+            Err(Int64TableFileRestoreError::NotRegularFile)
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

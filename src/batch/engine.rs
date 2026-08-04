@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::batch::catalog::Catalog;
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, Operand, OrderBy, Predicate,
-    Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, Having, Operand, OrderBy,
+    Predicate, Select, SelectItem, Statement,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -218,6 +218,11 @@ impl Database {
         let group_columns = resolve_group_columns(table, &select.group_by)?;
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
+        let having = select
+            .having
+            .as_ref()
+            .map(|having| resolve_having(&result_columns, &items, &aggregate_specs, having))
+            .transpose()?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
@@ -230,6 +235,9 @@ impl Database {
                 query_result_limits,
             )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
+            if let Some(having) = having {
+                selected_groups.retain(|group| having.evaluate(&grouped, *group));
+            }
             order_grouped_rows(
                 &mut selected_groups,
                 &grouped,
@@ -315,6 +323,30 @@ struct AggregateSpec {
     function: AggregateFunction,
     argument: Option<usize>,
     input_type: Option<DataType>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedHaving {
+    state: usize,
+    operator: ComparisonOperator,
+    value: i64,
+}
+
+impl ResolvedHaving {
+    fn evaluate(self, data: &GroupedData<'_>, group: usize) -> bool {
+        let Value::Int64(count) = data.aggregates[self.state][group] else {
+            unreachable!("HAVING is restricted to COUNT(*)")
+        };
+        let comparison = count.cmp(&self.value);
+        match self.operator {
+            ComparisonOperator::Equal => comparison == Ordering::Equal,
+            ComparisonOperator::NotEqual => comparison != Ordering::Equal,
+            ComparisonOperator::Less => comparison == Ordering::Less,
+            ComparisonOperator::LessOrEqual => comparison != Ordering::Greater,
+            ComparisonOperator::Greater => comparison == Ordering::Greater,
+            ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
+        }
+    }
 }
 
 fn resolve_group_columns(table: &Table, names: &[String]) -> Result<Vec<usize>> {
@@ -436,6 +468,55 @@ fn resolve_select_items(
     }
 
     Ok((items, result_columns, aggregate_specs))
+}
+
+fn resolve_having(
+    columns: &[ResultColumn],
+    items: &[ResolvedItem],
+    aggregate_specs: &[AggregateSpec],
+    requested: &Having,
+) -> Result<ResolvedHaving> {
+    let matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name.eq_ignore_ascii_case(&requested.alias))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let output = match matches.as_slice() {
+        [output] => *output,
+        [] => {
+            return Err(Error::InvalidQuery(format!(
+                "HAVING alias '{}' is not in the SELECT output",
+                requested.alias
+            )));
+        }
+        _ => {
+            return Err(Error::InvalidQuery(format!(
+                "HAVING alias '{}' is ambiguous",
+                requested.alias
+            )));
+        }
+    };
+
+    let ResolvedItem::Aggregate { state } = items[output] else {
+        return Err(Error::InvalidQuery(format!(
+            "HAVING alias '{}' must reference a projected COUNT(*)",
+            requested.alias
+        )));
+    };
+    let spec = &aggregate_specs[state];
+    if spec.function != AggregateFunction::Count || spec.argument.is_some() {
+        return Err(Error::InvalidQuery(format!(
+            "HAVING alias '{}' must reference a projected COUNT(*)",
+            requested.alias
+        )));
+    }
+
+    Ok(ResolvedHaving {
+        state,
+        operator: requested.operator,
+        value: requested.value,
+    })
 }
 
 fn validate_aggregate(function: AggregateFunction, input_type: Option<DataType>) -> Result<()> {
@@ -1328,6 +1409,198 @@ mod tests {
                     Value::Float64(4.0),
                 ],
             ]
+        );
+    }
+
+    #[test]
+    fn having_count_alias_supports_every_comparison_operator() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String); \
+                 INSERT INTO events VALUES \
+                 ('a'), ('a'), ('a'), ('b'), ('b'), ('c');",
+            )
+            .expect("setup");
+
+        let cases = [
+            ("=", &["b"][..]),
+            ("!=", &["a", "c"][..]),
+            ("<>", &["a", "c"][..]),
+            ("<", &["c"][..]),
+            ("<=", &["b", "c"][..]),
+            (">", &["a"][..]),
+            (">=", &["a", "b"][..]),
+        ];
+        for (operator, expected_kinds) in cases {
+            let result = query(
+                &mut database,
+                &format!(
+                    "SELECT kind, COUNT(*) AS Occurrences FROM events \
+                     GROUP BY kind HAVING occurrences {operator} 2 ORDER BY kind"
+                ),
+            );
+            let actual_kinds = result
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::String(value) => value.as_str(),
+                    _ => panic!("kind is a string"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_kinds, expected_kinds, "operator {operator}");
+        }
+    }
+
+    #[test]
+    fn having_filters_before_ordering_and_limiting() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String); \
+                 INSERT INTO events VALUES \
+                 ('a'), ('a'), ('a'), ('b'), ('b'), ('c');",
+            )
+            .expect("setup");
+
+        let result = query(
+            &mut database,
+            "SELECT kind, COUNT(*) AS n FROM events \
+             GROUP BY kind HAVING n > 1 ORDER BY n ASC LIMIT 1",
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::String("b".to_owned()), Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn having_rejects_unknown_ambiguous_and_non_count_star_aliases() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String, amount Int64); \
+                 INSERT INTO events VALUES ('a', 1), ('a', 2);",
+            )
+            .expect("setup");
+
+        let cases = [
+            (
+                "SELECT kind, COUNT(*) AS n FROM events GROUP BY kind HAVING missing > 0",
+                "HAVING alias 'missing' is not in the SELECT output",
+            ),
+            (
+                "SELECT kind AS n, COUNT(*) AS n FROM events GROUP BY kind HAVING n > 0",
+                "HAVING alias 'n' is ambiguous",
+            ),
+            (
+                "SELECT kind, SUM(amount) AS total FROM events GROUP BY kind HAVING total > 0",
+                "HAVING alias 'total' must reference a projected COUNT(*)",
+            ),
+            (
+                "SELECT kind, COUNT(amount) AS n FROM events GROUP BY kind HAVING n > 0",
+                "HAVING alias 'n' must reference a projected COUNT(*)",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            assert_eq!(
+                database.execute(sql).expect_err("invalid HAVING alias"),
+                Error::InvalidQuery(expected.to_owned()),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn having_handles_empty_global_and_grouped_inputs() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE events (kind String);")
+            .expect("setup");
+
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS n FROM events HAVING n = 0"
+            )
+            .rows,
+            vec![vec![Value::Int64(0)]]
+        );
+        assert!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS n FROM events HAVING n > 0"
+            )
+            .rows
+            .is_empty()
+        );
+        assert!(
+            query(
+                &mut database,
+                "SELECT kind, COUNT(*) AS n FROM events \
+                 GROUP BY kind HAVING n = 0"
+            )
+            .rows
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn having_preserves_group_working_limits_and_reduces_result_limits() {
+        let setup = "CREATE TABLE events (kind String); \
+            INSERT INTO events VALUES ('a'), ('a'), ('a'), ('b'), ('b'), ('c');";
+        let sql = "SELECT kind, COUNT(*) AS n FROM events \
+            GROUP BY kind HAVING n > 100";
+
+        let mut group_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_groups: 2,
+            ..QueryResultLimits::default()
+        });
+        group_limited.execute(setup).expect("setup");
+        assert_eq!(
+            group_limited
+                .execute(sql)
+                .expect_err("HAVING cannot hide excess working groups"),
+            Error::ResourceLimitExceeded {
+                resource: "SELECT groups",
+                actual: 3,
+                max: 2,
+            }
+        );
+
+        let mut state_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_groups: 3,
+            max_aggregate_state_cells: 2,
+            ..QueryResultLimits::default()
+        });
+        state_limited.execute(setup).expect("setup");
+        assert_eq!(
+            state_limited
+                .execute(sql)
+                .expect_err("HAVING cannot hide excess aggregate state"),
+            Error::ResourceLimitExceeded {
+                resource: "SELECT aggregate state cells",
+                actual: 3,
+                max: 2,
+            }
+        );
+
+        let mut result_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 1,
+            max_values: 2,
+            max_bytes: usize::MAX,
+            ..QueryResultLimits::default()
+        });
+        result_limited.execute(setup).expect("setup");
+        assert_eq!(
+            query(
+                &mut result_limited,
+                "SELECT kind, COUNT(*) AS n FROM events \
+                 GROUP BY kind HAVING n > 2"
+            )
+            .rows,
+            vec![vec![Value::String("a".to_owned()), Value::Int64(3)]]
         );
     }
 

@@ -64,6 +64,27 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn csv_batch_filters_grouped_rows_with_a_count_alias() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (kind String, active Bool);
+          INSERT INTO events VALUES
+              ('a', true), ('a', true), ('a', false),
+              ('b', true), ('b', false), ('c', true), ('c', true);
+          SELECT kind, COUNT(*) AS Occurrences FROM events
+          WHERE active = true
+          GROUP BY kind
+          HAVING occurrences >= 2
+          ORDER BY occurrences DESC, kind DESC
+          LIMIT 1;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"kind,Occurrences\nc,2\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_emits_typed_nulls_for_empty_aggregate_inputs() {
     let output = run(
         &["--format", "csv"],

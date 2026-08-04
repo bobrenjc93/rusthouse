@@ -380,18 +380,34 @@
       }
     },
     {
-      "key": "base:963d8c78e7590b907113a391ee34af0f846e1b39",
-      "commit": "963d8c78e7590b907113a391ee34af0f846e1b39",
-      "recordedAt": "2026-08-04T04:37:04.099Z",
-      "label": "base 963d8c7",
+      "key": "base:9fc9981d1e77e294d680c2e7c49aaaa172881857",
+      "commit": "9fc9981d1e77e294d680c2e7c49aaaa172881857",
+      "recordedAt": "2026-08-04T06:34:11.312Z",
+      "label": "base 9fc9981",
       "kind": "baseline",
       "title": "main",
       "scores": {
-        "eval_9fbdfec0": 50,
-        "eval_29146f21": 90,
-        "eval_d43b14a4": 0,
+        "eval_9fbdfec0": 55,
+        "eval_29146f21": 85,
+        "eval_d43b14a4": 99,
         "eval_63df825b": 85,
-        "eval_c88a7f3d": 30,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 90
+      }
+    },
+    {
+      "key": "pr:398",
+      "recordedAt": "2026-08-04T06:34:11.312Z",
+      "label": "PR #398",
+      "kind": "composite",
+      "prNumber": 398,
+      "title": "YOLO generation 17: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 60,
+        "eval_29146f21": 85,
+        "eval_d43b14a4": 99,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 25,
         "eval_d04acec3": 90
       }
     }
