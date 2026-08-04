@@ -32,6 +32,39 @@ fn executes_a_catalog_lifecycle_and_formats_nullable_rows() {
 }
 
 #[test]
+fn executes_checked_addition_projections() {
+    let output = run(
+        &[],
+        b"CREATE TABLE readings (value Int64)\n\
+          INSERT INTO readings VALUES (2)\n\
+          INSERT INTO readings VALUES (NULL)\n\
+          INSERT INTO readings VALUES (4)\n\
+          SELECT value + 3 FROM readings\n",
+    );
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"[5, NULL, 7]\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn reports_checked_addition_overflow() {
+    let output = run(
+        &[],
+        b"CREATE TABLE readings (value Int64 NOT NULL)\n\
+          INSERT INTO readings VALUES (9223372036854775807)\n\
+          SELECT value + 1 FROM readings\n",
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"error: line 3: could not execute SELECT: adding 1 to 9223372036854775807 in the SELECT projection overflows Int64\n"
+    );
+}
+
+#[test]
 fn prints_each_select_result_in_statement_order() {
     let output = run(
         &[],
