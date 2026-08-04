@@ -141,7 +141,7 @@ pub fn run_session(
     let mut catalog = Catalog::new(catalog_limits);
     let parse_limits = ParseLimits::default();
     let read_limit = limits.max_input_bytes.saturating_add(1);
-    let mut input = BufReader::new(input).take(read_limit as u64);
+    let mut input = BufReader::new(input.take(read_limit as u64));
     let mut input_bytes = 0_usize;
     let mut statements = 0_usize;
     let mut line_number = 0_usize;
@@ -257,6 +257,30 @@ fn write_rows(output: &mut impl Write, rows: &[Option<i64>]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    struct CountingReader<'a> {
+        bytes: &'a [u8],
+        position: usize,
+    }
+
+    impl<'a> CountingReader<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, position: 0 }
+        }
+
+        fn remaining(&self) -> &'a [u8] {
+            &self.bytes[self.position..]
+        }
+    }
+
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let bytes_read = buffer.len().min(self.remaining().len());
+            buffer[..bytes_read].copy_from_slice(&self.remaining()[..bytes_read]);
+            self.position += bytes_read;
+            Ok(bytes_read)
+        }
+    }
+
     #[test]
     fn custom_session_limits_are_enforced_without_process_state() {
         let limits = SessionLimits::new(128, 2, 1, 1);
@@ -271,6 +295,24 @@ mod tests {
                 max_statements: 2,
             }
         ));
+    }
+
+    #[test]
+    fn buffering_does_not_consume_past_the_input_detection_bound() {
+        let mut input = CountingReader::new(b"0123456789");
+        let limits = SessionLimits::new(0, 0, 0, 0);
+
+        let error = run_session(&mut input, Vec::new(), limits).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::InputLimitExceeded {
+                bytes: 1,
+                max_bytes: 0,
+            }
+        ));
+        assert_eq!(input.position, 1);
+        assert_eq!(input.remaining(), b"123456789");
     }
 
     #[test]
