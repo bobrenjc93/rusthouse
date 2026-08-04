@@ -74,6 +74,82 @@ fn parses_only_the_bounded_one_column_distinct_shape() {
 }
 
 #[test]
+fn preserves_keyword_like_schema_identifiers_contextually() {
+    let parser_cases = [
+        ("SELECT DISTINCT v FROM limit", true),
+        ("SELECT DISTINCT from FROM t", true),
+        ("SELECT DISTINCT limit FROM t", true),
+        ("SELECT DISTINCT distinct FROM t", true),
+        ("SELECT distinct FROM t", false),
+    ];
+    for (sql, expected_distinct) in parser_cases {
+        let statements = parse(sql).expect("keyword-like identifier is contextual");
+        let Statement::Select(select) = &statements[0] else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.distinct, expected_distinct, "{sql:?}");
+    }
+
+    parse_with_limits(
+        "SELECT distinct FROM t",
+        BatchSqlLimits {
+            max_ast_list_items: 1,
+            ..BatchSqlLimits::default()
+        },
+    )
+    .expect("a failed DISTINCT attempt must restore the AST allocation count");
+    assert_eq!(
+        parse_with_limits(
+            "SELECT distinct, other FROM t",
+            BatchSqlLimits {
+                max_ast_list_items: 1,
+                ..BatchSqlLimits::default()
+            },
+        ),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SQL AST list items",
+            actual: 2,
+            max: 1,
+        })
+    );
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE limit (v Int64); \
+             INSERT INTO limit VALUES (2), (1), (2); \
+             CREATE TABLE t (from String, distinct Int64, limit Bool); \
+             INSERT INTO t VALUES \
+             ('beta', 7, true), ('alpha', 7, false), ('beta', 9, true);",
+        )
+        .expect("keyword-like schema setup");
+
+    assert_eq!(
+        query(&mut database, "SELECT DISTINCT v FROM limit").rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        query(&mut database, "SELECT DISTINCT from FROM t").rows,
+        [
+            vec![Value::String("beta".to_owned())],
+            vec![Value::String("alpha".to_owned())]
+        ]
+    );
+    assert_eq!(
+        query(&mut database, "SELECT DISTINCT limit FROM t").rows,
+        [vec![Value::Bool(true)], vec![Value::Bool(false)]]
+    );
+    assert_eq!(
+        query(&mut database, "SELECT distinct FROM t").rows,
+        [
+            vec![Value::Int64(7)],
+            vec![Value::Int64(7)],
+            vec![Value::Int64(9)]
+        ]
+    );
+}
+
+#[test]
 fn deduplicates_all_physical_types_in_first_seen_order() {
     let mut database = Database::new();
     database

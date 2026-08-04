@@ -208,6 +208,7 @@ enum TokenKind {
     End,
 }
 
+#[derive(Clone, Copy)]
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
@@ -559,10 +560,32 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        if self.eat_keyword("DISTINCT") {
-            return self.parse_distinct_select();
+        if self.at_keyword("DISTINCT") {
+            let lexer = self.lexer;
+            let current = self.current.clone();
+            let ast_list_items = self.ast_list_items;
+
+            self.advance();
+            match self.parse_distinct_select() {
+                Ok(select) => return Ok(select),
+                Err(distinct_error) => {
+                    self.lexer = lexer;
+                    self.current = current;
+                    self.ast_list_items = ast_list_items;
+
+                    return match self.parse_regular_select() {
+                        Ok(select) => Ok(select),
+                        Err(error @ Error::ResourceLimitExceeded { .. }) => Err(error),
+                        Err(_) => Err(distinct_error),
+                    };
+                }
+            }
         }
 
+        self.parse_regular_select()
+    }
+
+    fn parse_regular_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
             self.reserve_ast_list_item()?;
@@ -664,16 +687,8 @@ impl<'a> Parser<'a> {
         const SHAPE: &str = "SELECT DISTINCT supports exactly one unaliased column followed by FROM <table> and an optional LIMIT";
 
         self.reserve_ast_list_item()?;
-        if !matches!(self.peek(), TokenKind::Identifier(value) if !value.eq_ignore_ascii_case("FROM"))
-        {
-            return self.error(SHAPE);
-        }
         let column = self.expect_identifier("column after DISTINCT")?;
         if !self.eat_keyword("FROM") {
-            return self.error(SHAPE);
-        }
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case("LIMIT"))
-        {
             return self.error(SHAPE);
         }
         let table = self.expect_identifier("table name after FROM")?;
@@ -929,13 +944,16 @@ impl<'a> Parser<'a> {
     }
 
     fn eat_keyword(&mut self, expected: &str) -> bool {
-        if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
-        {
+        if self.at_keyword(expected) {
             self.advance();
             true
         } else {
             false
         }
+    }
+
+    fn at_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
