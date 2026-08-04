@@ -15,10 +15,11 @@ use crate::execution::{
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    AggregateLimits, CreateTableStatement, DistinctLimits, InsertStatement, Int64Table,
-    OrderLimits, ParseError, ParseLimits, ScalarCountStatement, ScalarSumStatement, ScanLimits,
-    Schema, SelectDistinctStatement, SelectStatement, parse_create_table, parse_insert,
-    parse_scalar_count, parse_scalar_sum, parse_select, parse_select_distinct,
+    AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
+    InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits, ScalarCountStatement,
+    ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement, SelectStatement,
+    ingest_csv_with_names, parse_create_table, parse_insert, parse_scalar_count, parse_scalar_sum,
+    parse_select, parse_select_distinct,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -92,6 +93,39 @@ impl Error for CatalogError {
 impl From<ParseError> for CatalogError {
     fn from(error: ParseError) -> Self {
         Self::Parse(error)
+    }
+}
+
+/// An error produced while ingesting CSV through a [`Catalog`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCsvIngestError {
+    /// No table has the exact requested name.
+    UnknownTable { name: String },
+    /// The named table rejected the CSV input.
+    Csv(CsvIngestError),
+}
+
+impl fmt::Display for CatalogCsvIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::Csv(error) => write!(formatter, "could not ingest CSV: {error}"),
+        }
+    }
+}
+
+impl Error for CatalogCsvIngestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Csv(error) => Some(error),
+            Self::UnknownTable { .. } => None,
+        }
+    }
+}
+
+impl From<CsvIngestError> for CatalogCsvIngestError {
+    fn from(error: CsvIngestError) -> Self {
+        Self::Csv(error)
     }
 }
 
@@ -217,6 +251,23 @@ impl Catalog {
         })?;
 
         execute_insert_statement(name, table, statement).map_err(CatalogError::Insert)
+    }
+
+    /// Atomically ingests bounded `CSVWithNames` bytes into an exactly named table.
+    pub fn ingest_csv_with_names(
+        &mut self,
+        table_name: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, CatalogCsvIngestError> {
+        let table =
+            self.tables
+                .get_mut(table_name)
+                .ok_or_else(|| CatalogCsvIngestError::UnknownTable {
+                    name: table_name.to_owned(),
+                })?;
+
+        ingest_csv_with_names(table, input, limits).map_err(Into::into)
     }
 
     /// Parses and executes one scalar `COUNT` with explicit resource bounds.

@@ -17,7 +17,7 @@ pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
     aggregate_nullable_i64, count_nullable_i64,
 };
-pub use catalog::{Catalog, CatalogError, CatalogLimits};
+pub use catalog::{Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{

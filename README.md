@@ -62,6 +62,8 @@ filesystem replacement. The exact layouts are documented in
 schema column, and each LF- or CRLF-delimited record must be an unquoted decimal
 `Int64` or `NULL`. Callers supply byte and row limits; format, limit,
 nullability, or table-cap failures leave the table unchanged.
+`Catalog::ingest_csv_with_names` exposes the same transactional ingestion by
+exact table name without requiring direct access to catalog-owned tables.
 
 ## Development model
 
