@@ -1,6 +1,7 @@
 //! RustHouse is an experimental, compact analytical database.
 
 pub mod aggregate;
+pub mod batch;
 pub mod catalog;
 pub mod cli;
 pub mod csv;

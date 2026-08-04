@@ -21,6 +21,15 @@ The early implementation should favor Rust's standard library and a small depend
 
 ## SQL execution
 
+The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
+multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
+multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
+`COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
+`ORDER BY`, and `LIMIT`. String literals escape a quote by doubling it, so
+semicolons and line breaks inside literals do not split a batch.
+Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
+`MAX`, and `AVG` are typed `NULL` values.
+
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
@@ -43,14 +52,35 @@ explicit input-row and distinct-value limits and returns deterministic
 
 ## Command-line session
 
-Running `rusthouse` reads one `CREATE TABLE`, `INSERT INTO`, or projection
-`SELECT` from each nonempty standard-input line. One bounded in-memory catalog
-is retained until EOF. Successful `CREATE` and `INSERT` statements are silent;
-each `SELECT` prints a stable row list such as `[7, NULL, -2]`. Any malformed or
-failed statement is reported on standard error and terminates the process with
-a nonzero status. The default session allows 65,536 input bytes, 1,024
-statements, 64 tables, and 1,024 rows per table. Run `rusthouse --help` for the
-concise command reference.
+`rusthouse --format csv` reads one complete SQL batch from standard input
+through EOF, with explicit limits of 64 MiB and 4,096 statements. Parsing is
+lazy and bounds all `INSERT` ASTs in a batch to 100,000 rows and 1,000,000
+scalar values. A separate cumulative 100,000-item limit covers `CREATE`
+columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so compact input cannot
+expand into an unbounded retained token or AST graph.
+Every statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
+statements are silent, and each `SELECT` is executed and emitted before the
+next statement, using a CSVWithNames-compatible header followed by typed rows;
+commas, quotes, and newlines in strings are CSV-escaped. A query result is
+checked before cloning against limits of 10,000 rows, 250,000 values, and an
+estimated 16 MiB. Grouped queries additionally allow 100,000 groups and bound
+aggregate working state to 500,000 cells and an estimated 32 MiB, including
+cloned string extrema. The collecting library API separately caps all retained
+query results at an estimated 64 MiB.
+
+Running `rusthouse` without options retains the legacy line-oriented `Int64`
+session. It reads one statement from each nonempty input line and prints a row
+list such as `[7, NULL, -2]` for each projection. That session allows 65,536
+input bytes, 1,024 statements, 64 tables, and 1,024 rows per table. In either
+mode, malformed or failed SQL is reported on standard error and exits nonzero.
+
+```bash
+printf '%s\n' \
+  "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);" \
+  "INSERT INTO metrics VALUES (1, 2.5, true, 'alpha'), (2, 4.0, false, 'beta');" \
+  "SELECT COUNT(*) AS rows, AVG(score) AS mean FROM metrics;" |
+  cargo run -- --format csv
+```
 
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an
 `Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE`, `INSERT`, and CSV
