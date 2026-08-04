@@ -64,9 +64,10 @@ impl StdError for BatchError {
 
 /// Reads one bounded SQL batch to EOF and emits CSVWithNames for every query.
 ///
-/// `CREATE TABLE` and `INSERT` statements are silent. All statements share one
-/// in-memory catalog, and the SQL parser handles semicolons inside string
-/// literals rather than splitting on raw bytes.
+/// `CREATE TABLE` and `INSERT` statements are silent. `SELECT` and `SHOW TABLES`
+/// produce query results. All statements share one in-memory catalog, and the
+/// SQL parser handles semicolons inside string literals rather than splitting
+/// on raw bytes.
 pub fn run_csv_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
     run_csv_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
 }

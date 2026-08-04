@@ -36,6 +36,14 @@ impl Catalog {
             .get_mut(&normalize(name))
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
+
+    /// Returns display names in deterministic, case-insensitive order.
+    #[must_use]
+    pub fn table_names(&self) -> Vec<&str> {
+        let mut tables = self.tables.iter().collect::<Vec<_>>();
+        tables.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        tables.into_iter().map(|(_, table)| table.name()).collect()
+    }
 }
 
 fn normalize(identifier: &str) -> String {
@@ -61,5 +69,23 @@ mod tests {
             .expect("create table");
 
         assert_eq!(catalog.table("EVENTS").expect("lookup").name(), "Events");
+    }
+
+    #[test]
+    fn table_names_are_sorted_without_changing_display_case() {
+        let mut catalog = Catalog::new();
+        for name in ["zebra", "Alpha", "beta"] {
+            catalog
+                .create_table(
+                    name.to_owned(),
+                    vec![ColumnDef {
+                        name: "id".to_owned(),
+                        data_type: DataType::Int64,
+                    }],
+                )
+                .expect("create table");
+        }
+
+        assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
     }
 }

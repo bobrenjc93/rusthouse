@@ -64,6 +64,22 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn csv_batch_emits_show_tables_metadata_in_stable_display_order() {
+    let output = run(
+        &["--format", "csv"],
+        b"SHOW TABLES;
+          CREATE TABLE zebra (id Int64);
+          CREATE TABLE Alpha (id Int64);
+          CREATE TABLE beta (id Int64);
+          SHOW TABLES;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"name\nname\nAlpha\nbeta\nzebra\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_filters_grouped_rows_with_a_count_alias() {
     let output = run(
         &["--format", "csv"],
