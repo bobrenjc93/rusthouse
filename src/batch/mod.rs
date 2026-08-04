@@ -1,4 +1,4 @@
-//! Bounded, semicolon-delimited SQL batch execution for the CLI CSV protocol.
+//! Bounded, semicolon-delimited SQL batch execution for CLI export formats.
 
 pub mod catalog;
 pub mod engine;
@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use engine::{Database, StatementResult};
-use format::write_csv;
+use format::{OutputFormat, render, write_csv};
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
@@ -21,7 +21,7 @@ use format::write_csv;
 /// while keeping allocation and parser work bounded by an explicit byte cap.
 pub const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-/// A failure while reading, executing, or rendering a CSV SQL batch.
+/// A failure while reading, executing, or rendering a SQL batch.
 #[derive(Debug)]
 pub enum BatchError {
     /// Reading the complete input batch failed.
@@ -34,6 +34,8 @@ pub enum BatchError {
     Sql(error::Error),
     /// Writing CSV output failed.
     Write(io::Error),
+    /// Writing newline-delimited JSON output failed.
+    WriteJson(io::Error),
 }
 
 impl fmt::Display for BatchError {
@@ -47,6 +49,7 @@ impl fmt::Display for BatchError {
             Self::InvalidUtf8(error) => write!(formatter, "SQL input is not valid UTF-8: {error}"),
             Self::Sql(error) => error.fmt(formatter),
             Self::Write(error) => write!(formatter, "could not write CSV to stdout: {error}"),
+            Self::WriteJson(error) => write!(formatter, "could not write JSON to stdout: {error}"),
         }
     }
 }
@@ -54,7 +57,7 @@ impl fmt::Display for BatchError {
 impl StdError for BatchError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Read(error) | Self::Write(error) => Some(error),
+            Self::Read(error) | Self::Write(error) | Self::WriteJson(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
             Self::InputLimitExceeded { .. } => None,
@@ -69,14 +72,53 @@ impl StdError for BatchError {
 /// SQL parser handles semicolons inside string literals rather than splitting
 /// on raw bytes.
 pub fn run_csv_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
-    run_csv_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
+    run_batch_with_limit(
+        input,
+        output,
+        DEFAULT_MAX_BATCH_BYTES,
+        BatchOutputFormat::Csv,
+    )
 }
 
 /// Executes the CSV batch protocol with an explicit input byte limit.
 pub fn run_csv_batch_with_limit(
     input: impl Read,
+    output: impl Write,
+    max_input_bytes: usize,
+) -> Result<(), BatchError> {
+    run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Csv)
+}
+
+/// Reads one bounded SQL batch to EOF and emits one JSON object per query.
+///
+/// `CREATE TABLE` and `INSERT` statements are silent. Each `SELECT` or
+/// `SHOW TABLES` result is rendered on one line with column metadata and
+/// positional rows.
+pub fn run_json_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
+    run_json_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
+}
+
+/// Executes the newline-delimited JSON batch protocol with an explicit input
+/// byte limit.
+pub fn run_json_batch_with_limit(
+    input: impl Read,
+    output: impl Write,
+    max_input_bytes: usize,
+) -> Result<(), BatchError> {
+    run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Json)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BatchOutputFormat {
+    Csv,
+    Json,
+}
+
+fn run_batch_with_limit(
+    input: impl Read,
     mut output: impl Write,
     max_input_bytes: usize,
+    output_format: BatchOutputFormat,
 ) -> Result<(), BatchError> {
     let read_limit = max_input_bytes.saturating_add(1);
     let mut bytes = Vec::new();
@@ -99,7 +141,18 @@ pub fn run_csv_batch_with_limit(
             .execute_statement(statement)
             .map_err(BatchError::Sql)?;
         if let StatementResult::Query(query) = result {
-            write_csv(&mut output, &query).map_err(BatchError::Write)?;
+            match output_format {
+                BatchOutputFormat::Csv => {
+                    write_csv(&mut output, &query).map_err(BatchError::Write)?;
+                }
+                BatchOutputFormat::Json => {
+                    let rendered = render(&query, OutputFormat::Json);
+                    output
+                        .write_all(rendered.as_bytes())
+                        .map_err(BatchError::WriteJson)?;
+                    output.write_all(b"\n").map_err(BatchError::WriteJson)?;
+                }
+            }
         }
     }
     Ok(())
