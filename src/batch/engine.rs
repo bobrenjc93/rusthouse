@@ -20,6 +20,10 @@ pub const DEFAULT_MAX_QUERY_RESULT_VALUES: usize = 250_000;
 pub const DEFAULT_MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum groups retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_GROUPS: usize = 100_000;
+/// Maximum scalar cells retained in grouped-query keys.
+pub const DEFAULT_MAX_QUERY_GROUP_KEY_CELLS: usize = 1_000_000;
+/// Maximum estimated bytes retained by grouped-query keys.
+pub const DEFAULT_MAX_QUERY_GROUP_KEY_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum aggregate state cells retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
@@ -32,6 +36,8 @@ pub struct QueryResultLimits {
     pub max_values: usize,
     pub max_bytes: usize,
     pub max_groups: usize,
+    pub max_group_key_cells: usize,
+    pub max_group_key_bytes: usize,
     pub max_aggregate_state_cells: usize,
     pub max_aggregate_state_bytes: usize,
 }
@@ -43,6 +49,8 @@ impl Default for QueryResultLimits {
             max_values: DEFAULT_MAX_QUERY_RESULT_VALUES,
             max_bytes: DEFAULT_MAX_QUERY_RESULT_BYTES,
             max_groups: DEFAULT_MAX_QUERY_GROUPS,
+            max_group_key_cells: DEFAULT_MAX_QUERY_GROUP_KEY_CELLS,
+            max_group_key_bytes: DEFAULT_MAX_QUERY_GROUP_KEY_BYTES,
             max_aggregate_state_cells: DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS,
             max_aggregate_state_bytes: DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES,
         }
@@ -873,6 +881,48 @@ fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> 
     }
 }
 
+fn estimated_group_key_bytes_per_group(column_count: usize) -> usize {
+    if column_count == 0 {
+        return 0;
+    }
+
+    let stored_key_bytes = if column_count == 1 {
+        std::mem::size_of::<ValueRef<'static>>()
+    } else {
+        std::mem::size_of::<Box<[ValueRef<'static>]>>()
+    };
+    let boxed_cell_bytes = if column_count == 1 {
+        0
+    } else {
+        column_count.saturating_mul(std::mem::size_of::<ValueRef<'static>>())
+    };
+    stored_key_bytes
+        .saturating_add(std::mem::size_of::<usize>())
+        .saturating_add(boxed_cell_bytes)
+}
+
+fn validate_group_key_limits(
+    column_count: usize,
+    group_count: usize,
+    limits: QueryResultLimits,
+) -> Result<()> {
+    let cells = column_count.saturating_mul(group_count);
+    enforce_resource_limit("SELECT group key cells", cells, limits.max_group_key_cells)?;
+    let bytes = estimated_group_key_bytes_per_group(column_count).saturating_mul(group_count);
+    enforce_resource_limit("SELECT group key bytes", bytes, limits.max_group_key_bytes)
+}
+
+fn max_groups_within_key_limits(column_count: usize, limits: QueryResultLimits) -> usize {
+    if column_count == 0 {
+        return usize::MAX;
+    }
+
+    let cell_limited = limits.max_group_key_cells / column_count;
+    let bytes_per_group = estimated_group_key_bytes_per_group(column_count);
+    let byte_limited = limits.max_group_key_bytes / bytes_per_group;
+    cell_limited.min(byte_limited)
+}
+
 fn execute_grouped<'a>(
     table: &'a Table,
     matching_rows: &[usize],
@@ -884,7 +934,10 @@ fn execute_grouped<'a>(
         enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
         1
     } else {
-        matching_rows.len().min(limits.max_groups)
+        matching_rows
+            .len()
+            .min(limits.max_groups)
+            .min(max_groups_within_key_limits(group_columns.len(), limits))
     };
     let planned_state_cells = planned_group_count.saturating_mul(aggregate_specs.len());
     enforce_resource_limit(
@@ -919,13 +972,9 @@ fn execute_grouped<'a>(
         .collect::<Vec<_>>();
 
     for row in matching_rows {
-        let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
+        let (group, inserted) =
+            groups.find_or_insert(table, group_columns, *row, group_count, limits)?;
         if inserted {
-            enforce_resource_limit(
-                "SELECT groups",
-                group_count.saturating_add(1),
-                limits.max_groups,
-            )?;
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 states.push(AggregateState::new(spec));
@@ -980,16 +1029,23 @@ impl<'a> GroupIndex<'a> {
         columns: &[usize],
         row: usize,
         next_group: usize,
-    ) -> (usize, bool) {
+        limits: QueryResultLimits,
+    ) -> Result<(usize, bool)> {
+        if next_group == 0 {
+            enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
+        }
+        validate_group_key_limits(columns.len(), 1, limits)?;
+
         match self {
-            Self::Global => (0, false),
+            Self::Global => Ok((0, false)),
             Self::One(groups) => {
                 let key = table.columns()[columns[0]].value_ref(row);
                 if let Some(group) = groups.get(&key) {
-                    (*group, false)
+                    Ok((*group, false))
                 } else {
+                    validate_new_group(columns.len(), next_group, limits)?;
                     groups.insert(key, next_group);
-                    (next_group, true)
+                    Ok((next_group, true))
                 }
             }
             Self::Multiple(groups) if columns.len() == 2 => {
@@ -997,14 +1053,26 @@ impl<'a> GroupIndex<'a> {
                     table.columns()[columns[0]].value_ref(row),
                     table.columns()[columns[1]].value_ref(row),
                 ];
-                find_or_insert_group(groups, &key, next_group)
+                if let Some(group) = groups.get(key.as_slice()) {
+                    Ok((*group, false))
+                } else {
+                    validate_new_group(columns.len(), next_group, limits)?;
+                    groups.insert(key.into(), next_group);
+                    Ok((next_group, true))
+                }
             }
             Self::Multiple(groups) => {
                 let key = columns
                     .iter()
                     .map(|column| table.columns()[*column].value_ref(row))
                     .collect::<Vec<_>>();
-                find_or_insert_group(groups, &key, next_group)
+                if let Some(group) = groups.get(key.as_slice()) {
+                    Ok((*group, false))
+                } else {
+                    validate_new_group(columns.len(), next_group, limits)?;
+                    groups.insert(key.into_boxed_slice(), next_group);
+                    Ok((next_group, true))
+                }
             }
         }
     }
@@ -1036,17 +1104,14 @@ impl<'a> GroupIndex<'a> {
     }
 }
 
-fn find_or_insert_group<'a>(
-    groups: &mut HashMap<Box<[ValueRef<'a>]>, usize>,
-    key: &[ValueRef<'a>],
+fn validate_new_group(
+    column_count: usize,
     next_group: usize,
-) -> (usize, bool) {
-    if let Some(group) = groups.get(key) {
-        (*group, false)
-    } else {
-        groups.insert(key.into(), next_group);
-        (next_group, true)
-    }
+    limits: QueryResultLimits,
+) -> Result<()> {
+    let group_count = next_group.saturating_add(1);
+    enforce_resource_limit("SELECT groups", group_count, limits.max_groups)?;
+    validate_group_key_limits(column_count, group_count, limits)
 }
 
 #[derive(Debug)]

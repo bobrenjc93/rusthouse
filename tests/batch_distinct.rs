@@ -413,6 +413,86 @@ fn enforces_group_cap_before_limit_and_result_cap_after_limit() {
 }
 
 #[test]
+fn enforces_exact_and_exceeded_tuple_key_cell_and_byte_caps_before_limit() {
+    let setup = "CREATE TABLE samples (value Int64, label String, enabled Bool); \
+        INSERT INTO samples VALUES \
+        (1, 'a', true), (2, 'b', false), (1, 'a', true), (3, 'c', true);";
+    let sql = "SELECT DISTINCT value, label, enabled FROM samples LIMIT 0";
+    let database_with_limits = |limits| {
+        let mut database = Database::with_query_result_limits(limits);
+        database.execute(setup).expect("setup");
+        database
+    };
+
+    let exact_cells = 3 * 3;
+    let cell_limits = QueryResultLimits {
+        max_groups: 3,
+        max_group_key_cells: exact_cells,
+        max_group_key_bytes: usize::MAX,
+        ..QueryResultLimits::default()
+    };
+    let mut exact_cell_database = database_with_limits(cell_limits);
+    assert!(query(&mut exact_cell_database, sql).rows.is_empty());
+
+    let mut cell_limited = database_with_limits(QueryResultLimits {
+        max_group_key_cells: exact_cells - 1,
+        ..cell_limits
+    });
+    assert_eq!(
+        cell_limited
+            .execute(sql)
+            .expect_err("the third tuple exceeds the key-cell cap"),
+        Error::ResourceLimitExceeded {
+            resource: "SELECT group key cells",
+            actual: exact_cells,
+            max: exact_cells - 1,
+        }
+    );
+
+    let mut byte_probe = database_with_limits(QueryResultLimits {
+        max_groups: 3,
+        max_group_key_cells: exact_cells,
+        max_group_key_bytes: 0,
+        ..QueryResultLimits::default()
+    });
+    let bytes_per_group = match byte_probe
+        .execute(sql)
+        .expect_err("the first tuple exceeds a zero-byte key cap")
+    {
+        Error::ResourceLimitExceeded {
+            resource: "SELECT group key bytes",
+            actual,
+            max: 0,
+        } => actual,
+        error => panic!("unexpected error: {error:?}"),
+    };
+    let exact_bytes = bytes_per_group * 3;
+    let byte_limits = QueryResultLimits {
+        max_groups: 3,
+        max_group_key_cells: exact_cells,
+        max_group_key_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    };
+    let mut exact_byte_database = database_with_limits(byte_limits);
+    assert!(query(&mut exact_byte_database, sql).rows.is_empty());
+
+    let mut byte_limited = database_with_limits(QueryResultLimits {
+        max_group_key_bytes: exact_bytes - 1,
+        ..byte_limits
+    });
+    assert_eq!(
+        byte_limited
+            .execute(sql)
+            .expect_err("the third tuple exceeds the key-byte cap"),
+        Error::ResourceLimitExceeded {
+            resource: "SELECT group key bytes",
+            actual: exact_bytes,
+            max: exact_bytes - 1,
+        }
+    );
+}
+
+#[test]
 fn csv_batch_emits_distinct_strings_with_escaping() {
     let input = b"CREATE TABLE labels (label String, rank Int64); \
         INSERT INTO labels VALUES \
