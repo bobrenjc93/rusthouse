@@ -11,6 +11,8 @@ pub const DEFAULT_MAX_BATCH_STATEMENTS: usize = 4_096;
 pub const DEFAULT_MAX_INSERT_ROWS: usize = 100_000;
 /// Maximum `INSERT` scalar values stored across one parsed batch.
 pub const DEFAULT_MAX_INSERT_VALUES: usize = 1_000_000;
+/// Maximum items stored in variable-length schema and query lists across a batch.
+pub const DEFAULT_MAX_AST_LIST_ITEMS: usize = 100_000;
 
 /// Allocation limits applied while constructing a SQL batch AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +20,7 @@ pub struct BatchSqlLimits {
     pub max_statements: usize,
     pub max_insert_rows: usize,
     pub max_insert_values: usize,
+    pub max_ast_list_items: usize,
 }
 
 impl Default for BatchSqlLimits {
@@ -26,6 +29,7 @@ impl Default for BatchSqlLimits {
             max_statements: DEFAULT_MAX_BATCH_STATEMENTS,
             max_insert_rows: DEFAULT_MAX_INSERT_ROWS,
             max_insert_values: DEFAULT_MAX_INSERT_VALUES,
+            max_ast_list_items: DEFAULT_MAX_AST_LIST_ITEMS,
         }
     }
 }
@@ -382,6 +386,7 @@ struct Parser<'a> {
     predicate_nodes: usize,
     insert_rows: usize,
     insert_values: usize,
+    ast_list_items: usize,
     limits: BatchSqlLimits,
 }
 
@@ -396,6 +401,7 @@ impl<'a> Parser<'a> {
             predicate_nodes: 0,
             insert_rows: 0,
             insert_values: 0,
+            ast_list_items: 0,
             limits,
         }
     }
@@ -456,6 +462,7 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LeftParen, "'(' after table name")?;
         let mut columns = Vec::new();
         loop {
+            self.reserve_ast_list_item()?;
             let column_name = self.expect_identifier("column name")?;
             if is_reserved_column_name(&column_name) {
                 return Err(Error::ReservedIdentifier {
@@ -527,6 +534,7 @@ impl<'a> Parser<'a> {
     fn parse_select(&mut self) -> Result<Select> {
         let mut items = Vec::new();
         loop {
+            self.reserve_ast_list_item()?;
             items.push(self.parse_select_item()?);
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -547,6 +555,7 @@ impl<'a> Parser<'a> {
         if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
             loop {
+                self.reserve_ast_list_item()?;
                 group_by.push(self.expect_identifier("GROUP BY column")?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
@@ -558,6 +567,7 @@ impl<'a> Parser<'a> {
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             loop {
+                self.reserve_ast_list_item()?;
                 let name = self.expect_identifier("ORDER BY output column or alias")?;
                 let descending = if self.eat_keyword("DESC") {
                     true
@@ -594,6 +604,18 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
         })
+    }
+
+    fn reserve_ast_list_item(&mut self) -> Result<()> {
+        if self.ast_list_items >= self.limits.max_ast_list_items {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "SQL AST list items",
+                actual: self.ast_list_items.saturating_add(1),
+                max: self.limits.max_ast_list_items,
+            });
+        }
+        self.ast_list_items += 1;
+        Ok(())
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
@@ -911,6 +933,7 @@ mod tests {
             max_statements: 2,
             max_insert_rows: 2,
             max_insert_values: 3,
+            max_ast_list_items: 10,
         };
         let statements = parse_with_limits("INSERT INTO t VALUES (true), (false)", limits)
             .expect("rows and values at or below limits succeed");
@@ -942,6 +965,34 @@ mod tests {
                 resource: "INSERT values",
                 actual: 4,
                 max: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn enforces_cumulative_ast_list_item_limit_at_the_boundary() {
+        let sql = "CREATE TABLE t (a Int64, b Int64); \
+            SELECT a, b FROM t GROUP BY a, b ORDER BY a, b";
+        let exact_limits = BatchSqlLimits {
+            max_ast_list_items: 8,
+            ..BatchSqlLimits::default()
+        };
+        parse_with_limits(sql, exact_limits).expect("eight list items fit the limit");
+
+        let error = parse_with_limits(
+            sql,
+            BatchSqlLimits {
+                max_ast_list_items: 7,
+                ..exact_limits
+            },
+        )
+        .expect_err("eighth list item exceeds the cumulative limit");
+        assert_eq!(
+            error,
+            Error::ResourceLimitExceeded {
+                resource: "SQL AST list items",
+                actual: 8,
+                max: 7,
             }
         );
     }

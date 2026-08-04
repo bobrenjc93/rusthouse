@@ -20,14 +20,20 @@ pub const DEFAULT_MAX_QUERY_RESULT_VALUES: usize = 250_000;
 pub const DEFAULT_MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum groups retained while evaluating one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_GROUPS: usize = 100_000;
+/// Maximum aggregate state cells retained while evaluating one grouped `SELECT`.
+pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
+/// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
+pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Resource limits applied before a query result is cloned into owned rows.
+/// Resource limits for query-result materialization and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
     pub max_rows: usize,
     pub max_values: usize,
     pub max_bytes: usize,
     pub max_groups: usize,
+    pub max_aggregate_state_cells: usize,
+    pub max_aggregate_state_bytes: usize,
 }
 
 impl Default for QueryResultLimits {
@@ -37,6 +43,8 @@ impl Default for QueryResultLimits {
             max_values: DEFAULT_MAX_QUERY_RESULT_VALUES,
             max_bytes: DEFAULT_MAX_QUERY_RESULT_BYTES,
             max_groups: DEFAULT_MAX_QUERY_GROUPS,
+            max_aggregate_state_cells: DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS,
+            max_aggregate_state_bytes: DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES,
         }
     }
 }
@@ -576,16 +584,37 @@ fn execute_grouped<'a>(
     aggregate_specs: &[AggregateSpec],
     limits: QueryResultLimits,
 ) -> Result<GroupedData<'a>> {
-    if group_columns.is_empty() {
+    let planned_group_count = if group_columns.is_empty() {
         enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
-    }
-    let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
+        1
+    } else {
+        matching_rows.len().min(limits.max_groups)
+    };
+    let planned_state_cells = planned_group_count.saturating_mul(aggregate_specs.len());
+    enforce_resource_limit(
+        "SELECT aggregate state cells",
+        planned_state_cells,
+        limits.max_aggregate_state_cells,
+    )?;
+    let mut aggregate_state_bytes = planned_state_cells
+        .saturating_mul(std::mem::size_of::<AggregateState>())
+        .saturating_add(
+            aggregate_specs
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec<AggregateState>>()),
+        );
+    enforce_resource_limit(
+        "SELECT aggregate state bytes",
+        aggregate_state_bytes,
+        limits.max_aggregate_state_bytes,
+    )?;
+
+    let mut groups = GroupIndex::new(group_columns.len(), planned_group_count);
     let mut group_count = usize::from(group_columns.is_empty());
-    let initial_capacity = matching_rows.len().min(1_024);
     let mut aggregate_states = aggregate_specs
         .iter()
         .map(|spec| {
-            let mut states = Vec::with_capacity(initial_capacity);
+            let mut states = Vec::with_capacity(planned_group_count);
             if group_columns.is_empty() {
                 states.push(AggregateState::new(spec));
             }
@@ -608,7 +637,13 @@ fn execute_grouped<'a>(
         }
         for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
             debug_assert_eq!(states.len(), group_count);
-            states[group].update(spec, table, *row)?;
+            states[group].update(
+                spec,
+                table,
+                *row,
+                &mut aggregate_state_bytes,
+                limits.max_aggregate_state_bytes,
+            )?;
         }
     }
 
@@ -861,7 +896,14 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, spec: &AggregateSpec, table: &Table, row: usize) -> Result<()> {
+    fn update(
+        &mut self,
+        spec: &AggregateSpec,
+        table: &Table,
+        row: usize,
+        aggregate_state_bytes: &mut usize,
+        max_aggregate_state_bytes: usize,
+    ) -> Result<()> {
         match self {
             Self::Count(count) => {
                 *count = count
@@ -898,7 +940,12 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate < existing.as_ref())
                 {
-                    *current = Some(candidate.to_owned());
+                    replace_extreme(
+                        current,
+                        candidate,
+                        aggregate_state_bytes,
+                        max_aggregate_state_bytes,
+                    )?;
                 }
             }
             Self::Max(current) => {
@@ -908,7 +955,12 @@ impl AggregateState {
                     .as_ref()
                     .is_none_or(|existing| candidate > existing.as_ref())
                 {
-                    *current = Some(candidate.to_owned());
+                    replace_extreme(
+                        current,
+                        candidate,
+                        aggregate_state_bytes,
+                        max_aggregate_state_bytes,
+                    )?;
                 }
             }
             Self::AvgInt { sum, count } => {
@@ -965,6 +1017,36 @@ impl AggregateState {
             Self::AvgInt { .. } | Self::AvgFloat { .. } => Ok(Value::Null(DataType::Float64)),
         }
     }
+}
+
+fn replace_extreme(
+    current: &mut Option<Value>,
+    candidate: ValueRef<'_>,
+    aggregate_state_bytes: &mut usize,
+    max_aggregate_state_bytes: usize,
+) -> Result<()> {
+    let previous_string_bytes = current
+        .as_ref()
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let candidate_string_bytes = match candidate {
+        ValueRef::String(value) => value.len(),
+        _ => 0,
+    };
+    let next_bytes = aggregate_state_bytes
+        .saturating_sub(previous_string_bytes)
+        .saturating_add(candidate_string_bytes);
+    enforce_resource_limit(
+        "SELECT aggregate state bytes",
+        next_bytes,
+        max_aggregate_state_bytes,
+    )?;
+    *current = Some(candidate.to_owned());
+    *aggregate_state_bytes = next_bytes;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1348,6 +1430,89 @@ mod tests {
     }
 
     #[test]
+    fn grouped_aggregate_state_cell_limit_applies_before_limit() {
+        let setup = "CREATE TABLE samples (g Int64, value Int64); \
+            INSERT INTO samples VALUES (1, 10), (2, 20);";
+        let sql = "SELECT g, MIN(value), MAX(value) FROM samples GROUP BY g LIMIT 1";
+
+        let exact_limits = QueryResultLimits {
+            max_aggregate_state_cells: 4,
+            max_aggregate_state_bytes: usize::MAX,
+            ..QueryResultLimits::default()
+        };
+        let mut exact = Database::with_query_result_limits(exact_limits);
+        exact.execute(setup).expect("setup");
+        assert_eq!(query(&mut exact, sql).rows.len(), 1);
+
+        let mut limited = Database::with_query_result_limits(QueryResultLimits {
+            max_aggregate_state_cells: 3,
+            ..exact_limits
+        });
+        limited.execute(setup).expect("setup");
+        assert_eq!(
+            limited
+                .execute(sql)
+                .expect_err("four working cells exceed the limit"),
+            Error::ResourceLimitExceeded {
+                resource: "SELECT aggregate state cells",
+                actual: 4,
+                max: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn grouped_aggregate_state_byte_limit_includes_string_extrema() {
+        let setup = "CREATE TABLE samples (g Int64, value String); \
+            INSERT INTO samples VALUES (1, 'abcd'), (2, 'wxyz');";
+        let sql = "SELECT g, MIN(value), MAX(value) FROM samples GROUP BY g LIMIT 1";
+        let fixed_bytes = 4 * std::mem::size_of::<AggregateState>()
+            + 2 * std::mem::size_of::<Vec<AggregateState>>();
+
+        let mut preallocation_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_aggregate_state_cells: 4,
+            max_aggregate_state_bytes: fixed_bytes - 1,
+            ..QueryResultLimits::default()
+        });
+        preallocation_limited.execute(setup).expect("setup");
+        assert_eq!(
+            preallocation_limited
+                .execute(sql)
+                .expect_err("fixed working state exceeds the byte limit"),
+            Error::ResourceLimitExceeded {
+                resource: "SELECT aggregate state bytes",
+                actual: fixed_bytes,
+                max: fixed_bytes - 1,
+            }
+        );
+
+        let exact_limits = QueryResultLimits {
+            max_aggregate_state_cells: 4,
+            max_aggregate_state_bytes: fixed_bytes + 16,
+            ..QueryResultLimits::default()
+        };
+        let mut exact = Database::with_query_result_limits(exact_limits);
+        exact.execute(setup).expect("setup");
+        assert_eq!(query(&mut exact, sql).rows.len(), 1);
+
+        let mut string_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_aggregate_state_bytes: fixed_bytes + 15,
+            ..exact_limits
+        });
+        string_limited.execute(setup).expect("setup");
+        assert_eq!(
+            string_limited
+                .execute(sql)
+                .expect_err("cloned extrema strings exceed the byte limit"),
+            Error::ResourceLimitExceeded {
+                resource: "SELECT aggregate state bytes",
+                actual: fixed_bytes + 16,
+                max: fixed_bytes + 15,
+            }
+        );
+    }
+
+    #[test]
     fn collecting_api_enforces_retained_result_limit() {
         let mut database = Database::new();
         database
@@ -1373,6 +1538,7 @@ mod tests {
             max_values: 4,
             max_bytes: usize::MAX,
             max_groups: 10,
+            ..QueryResultLimits::default()
         };
         let mut database = Database::with_query_result_limits(limits);
         database
@@ -1431,6 +1597,7 @@ mod tests {
             max_values: 1,
             max_bytes: 100,
             max_groups: 1,
+            ..QueryResultLimits::default()
         });
         database
             .execute(&format!(
