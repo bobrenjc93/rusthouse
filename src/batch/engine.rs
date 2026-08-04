@@ -338,6 +338,15 @@ impl Database {
         select: Select,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
+        self.execute_select_with_prefix(select, query_result_limits, None)
+    }
+
+    fn execute_select_with_prefix(
+        &self,
+        select: Select,
+        query_result_limits: QueryResultLimits,
+        result_prefix: Option<SelectResultPrefix<'_>>,
+    ) -> Result<QueryResult> {
         validate_distinct_shape(&select)?;
         let table = self.catalog.table(&select.table)?;
         let predicate = select
@@ -345,15 +354,6 @@ impl Database {
             .as_ref()
             .map(|predicate| compile_predicate(table, predicate))
             .transpose()?;
-
-        let mut matching_rows = (0..table.row_count())
-            .filter(|row| {
-                predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.evaluate(table, *row))
-            })
-            .collect::<Vec<_>>();
-
         let group_columns = if select.distinct {
             resolve_distinct_columns(table, &select.items)?
         } else {
@@ -367,6 +367,19 @@ impl Database {
             .map(|having| resolve_having(&result_columns, &items, &aggregate_specs, having))
             .transpose()?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
+        if let Some(prefix) = result_prefix {
+            // Reject a UNION schema mismatch before scanning or materializing
+            // any rows from its right operand.
+            validate_union_schema(prefix.columns, &result_columns)?;
+        }
+
+        let mut matching_rows = (0..table.row_count())
+            .filter(|row| {
+                predicate
+                    .as_ref()
+                    .is_none_or(|predicate| predicate.evaluate(table, *row))
+            })
+            .collect::<Vec<_>>();
 
         let grouped = select.distinct || !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -400,6 +413,7 @@ impl Database {
                 &items,
                 &result_columns,
                 query_result_limits,
+                result_prefix,
             )?;
             grouped.project(&selected_groups, &items)
         } else {
@@ -410,6 +424,7 @@ impl Database {
                 &items,
                 &result_columns,
                 query_result_limits,
+                result_prefix,
             )?;
             execute_projection(table, &matching_rows, &items)?
         };
@@ -427,12 +442,41 @@ impl Database {
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
         let mut left_result = self.execute_select(left, query_result_limits)?;
-        let mut right_result = self.execute_select(right, query_result_limits)?;
-        validate_union_schema(&left_result.columns, &right_result.columns)?;
-        validate_union_result_limits(&left_result, &right_result, query_result_limits)?;
+        let mut right_result = self.execute_select_with_prefix(
+            right,
+            query_result_limits,
+            Some(SelectResultPrefix::from_result(&left_result)),
+        )?;
 
         left_result.rows.append(&mut right_result.rows);
         Ok(left_result)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectResultPrefix<'a> {
+    // The final UNION result retains the left schema, not the right aliases.
+    columns: &'a [ResultColumn],
+    row_count: usize,
+    string_bytes: usize,
+}
+
+impl<'a> SelectResultPrefix<'a> {
+    fn from_result(result: &'a QueryResult) -> Self {
+        let string_bytes = result
+            .rows
+            .iter()
+            .flatten()
+            .map(|value| match value {
+                Value::String(value) => value.len(),
+                Value::Null(_) | Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => 0,
+            })
+            .fold(0_usize, usize::saturating_add);
+        Self {
+            columns: &result.columns,
+            row_count: result.rows.len(),
+            string_bytes,
+        }
     }
 }
 
@@ -451,30 +495,6 @@ fn validate_union_schema(left: &[ResultColumn], right: &[ResultColumn]) -> Resul
                 expected: left.data_type.to_string(),
                 actual: right.data_type.to_string(),
             });
-        }
-    }
-    Ok(())
-}
-
-fn validate_union_result_limits(
-    left: &QueryResult,
-    right: &QueryResult,
-    limits: QueryResultLimits,
-) -> Result<()> {
-    let row_count = left.rows.len().saturating_add(right.rows.len());
-    let mut bytes = validate_result_shape(
-        row_count,
-        left.columns.len(),
-        &left.columns,
-        limits,
-        SELECT_RESULT_RESOURCES,
-    )?;
-    for row in left.rows.iter().chain(&right.rows) {
-        for value in row {
-            if let Value::String(value) = value {
-                bytes = bytes.saturating_add(value.len());
-                enforce_resource_limit(SELECT_RESULT_RESOURCES.bytes, bytes, limits.max_bytes)?;
-            }
         }
     }
     Ok(())
@@ -898,14 +918,10 @@ fn validate_projection_result_limits(
     items: &[ResolvedItem],
     columns: &[ResultColumn],
     limits: QueryResultLimits,
+    result_prefix: Option<SelectResultPrefix<'_>>,
 ) -> Result<()> {
-    let mut bytes = validate_result_shape(
-        rows.len(),
-        items.len(),
-        columns,
-        limits,
-        SELECT_RESULT_RESOURCES,
-    )?;
+    let mut bytes =
+        validate_select_result_shape(rows.len(), items.len(), columns, limits, result_prefix)?;
     for row in rows {
         for item in items {
             let source = match item {
@@ -932,14 +948,10 @@ fn validate_grouped_result_limits(
     items: &[ResolvedItem],
     columns: &[ResultColumn],
     limits: QueryResultLimits,
+    result_prefix: Option<SelectResultPrefix<'_>>,
 ) -> Result<()> {
-    let mut bytes = validate_result_shape(
-        groups.len(),
-        items.len(),
-        columns,
-        limits,
-        SELECT_RESULT_RESOURCES,
-    )?;
+    let mut bytes =
+        validate_select_result_shape(groups.len(), items.len(), columns, limits, result_prefix)?;
     for group in groups {
         for item in items {
             let string_len = match item {
@@ -970,6 +982,29 @@ fn validate_grouped_result_limits(
         }
     }
     Ok(())
+}
+
+fn validate_select_result_shape(
+    row_count: usize,
+    column_count: usize,
+    columns: &[ResultColumn],
+    limits: QueryResultLimits,
+    result_prefix: Option<SelectResultPrefix<'_>>,
+) -> Result<usize> {
+    let combined_row_count = result_prefix.map_or(row_count, |prefix| {
+        prefix.row_count.saturating_add(row_count)
+    });
+    let output_columns = result_prefix.map_or(columns, |prefix| prefix.columns);
+    let bytes = validate_result_shape(
+        combined_row_count,
+        column_count,
+        output_columns,
+        limits,
+        SELECT_RESULT_RESOURCES,
+    )?
+    .saturating_add(result_prefix.map_or(0, |prefix| prefix.string_bytes));
+    enforce_resource_limit(SELECT_RESULT_RESOURCES.bytes, bytes, limits.max_bytes)?;
+    Ok(bytes)
 }
 
 fn validate_result_shape(

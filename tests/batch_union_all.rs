@@ -238,6 +238,40 @@ fn enforces_combined_row_value_and_byte_limits_at_the_boundary() {
 }
 
 #[test]
+fn byte_limit_charges_only_the_returned_left_schema() {
+    let left_alias = "x";
+    let exact_bytes = std::mem::size_of::<ResultColumn>() + left_alias.len();
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 0,
+        max_values: 0,
+        max_bytes: exact_bytes,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE empty_left (n Int64); \
+             CREATE TABLE empty_right (n Int64);",
+        )
+        .expect("setup succeeds");
+
+    let result = query(
+        &mut database,
+        "SELECT n AS x FROM empty_left \
+         UNION ALL \
+         SELECT n AS this_discarded_alias_is_much_longer FROM empty_right",
+    );
+
+    assert_eq!(
+        result.columns,
+        [ResultColumn {
+            name: left_alias.to_owned(),
+            data_type: DataType::Int64,
+        }]
+    );
+    assert!(result.rows.is_empty());
+}
+
+#[test]
 fn shared_database_accepts_union_all_as_one_read_only_query() {
     let database = SharedDatabase::default();
     database
