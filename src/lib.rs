@@ -35,8 +35,8 @@ pub use parser::{
     ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
     InsertStatement, NullnessPredicate, OrderByClause, ParseError, ParseLimits,
     ScalarCountArgument, ScalarCountStatement, ScalarSumStatement, SelectDistinctStatement,
-    SelectPredicate, SelectStatement, parse_create_table, parse_insert, parse_scalar_count,
-    parse_scalar_sum, parse_select, parse_select_distinct,
+    SelectPredicate, SelectProjection, SelectStatement, parse_create_table, parse_insert,
+    parse_scalar_count, parse_scalar_sum, parse_select, parse_select_distinct,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,

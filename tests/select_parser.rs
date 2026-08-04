@@ -432,10 +432,7 @@ fn rejects_malformed_projections_with_byte_offsets() {
         ),
         (
             "SELECT a + b FROM t",
-            ParseError::UnexpectedInput {
-                offset: 9,
-                expected: "FROM",
-            },
+            ParseError::InvalidInt64 { offset: 11 },
         ),
         (
             "SELECT a AS b FROM t",
