@@ -314,6 +314,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 100
       }
+    },
+    {
+      "key": "pr:388",
+      "recordedAt": "2026-08-04T01:10:21.259Z",
+      "label": "PR #388",
+      "kind": "leaf",
+      "prNumber": 388,
+      "title": "Restore an Int64Table from a snapshot envelope",
+      "scores": {
+        "eval_9fbdfec0": 45,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 0,
+        "eval_63df825b": 90,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 100
+      }
     }
   ]
 }
