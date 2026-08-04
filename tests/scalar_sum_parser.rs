@@ -1,4 +1,4 @@
-use rusthouse::{ParseError, ParseLimits, parse_scalar_sum};
+use rusthouse::{ComparisonOperator, ParseError, ParseLimits, parse_scalar_sum};
 
 #[test]
 fn parses_column_sums_with_an_optional_semicolon() {
@@ -21,6 +21,53 @@ fn parses_column_sums_with_an_optional_semicolon() {
             "{input:?}"
         );
         assert_eq!(statement.table_name().as_str(), expected_table, "{input:?}");
+        assert_eq!(statement.predicate(), None, "{input:?}");
+    }
+}
+
+#[test]
+fn parses_every_comparison_operator() {
+    let cases = [
+        ("=", ComparisonOperator::Eq),
+        ("!=", ComparisonOperator::Ne),
+        ("<>", ComparisonOperator::Ne),
+        ("<", ComparisonOperator::Lt),
+        ("<=", ComparisonOperator::Le),
+        (">", ComparisonOperator::Gt),
+        (">=", ComparisonOperator::Ge),
+    ];
+
+    for (sql_operator, expected_operator) in cases {
+        let input = format!("SELECT SUM(c) FROM t WHERE c {sql_operator} 7;");
+        let statement = parse_scalar_sum(&input, ParseLimits::default()).unwrap();
+        let predicate = statement.predicate().unwrap();
+
+        assert_eq!(predicate.column_name().as_str(), "c", "{input:?}");
+        assert_eq!(predicate.operator(), expected_operator, "{input:?}");
+        assert_eq!(predicate.value(), 7, "{input:?}");
+    }
+}
+
+#[test]
+fn parses_comparison_whitespace_casing_and_int64_bounds() {
+    let cases = [
+        (
+            " select sum ( value ) from readings where value<=-9223372036854775808 ",
+            ComparisonOperator::Le,
+            i64::MIN,
+        ),
+        (
+            "SELECT SUM(value) FROM readings WhErE value > +9223372036854775807 ; ",
+            ComparisonOperator::Gt,
+            i64::MAX,
+        ),
+    ];
+
+    for (input, expected_operator, expected_value) in cases {
+        let statement = parse_scalar_sum(input, ParseLimits::default()).unwrap();
+        let predicate = statement.predicate().unwrap();
+        assert_eq!(predicate.operator(), expected_operator, "{input:?}");
+        assert_eq!(predicate.value(), expected_value, "{input:?}");
     }
 }
 
@@ -42,6 +89,7 @@ fn applies_statement_and_identifier_byte_bounds() {
     for (input, identifier) in [
         ("SELECT SUM(column123) FROM t", "column123"),
         ("SELECT SUM(c) FROM table1234", "table1234"),
+        ("SELECT SUM(c) FROM t WHERE predicate = 1", "predicate"),
     ] {
         assert_eq!(
             parse_scalar_sum(input, ParseLimits::new(input.len(), 8)),
@@ -64,7 +112,9 @@ fn rejects_unsupported_aggregate_shapes_and_extra_clauses() {
         "SELECT SUM(c, d) FROM t",
         "SELECT COUNT(c) FROM t",
         "SELECT SUM(c) AS total FROM t",
-        "SELECT SUM(c) FROM t WHERE c = 1",
+        "SELECT SUM(c) FROM t WHERE c IS NULL",
+        "SELECT SUM(c) FROM t WHERE c = NULL",
+        "SELECT SUM(c) FROM t WHERE c === 1",
         "SELECT SUM(c) FROM t GROUP BY c",
         "SELECT SUM(c) FROM t LIMIT 1",
         "SELECT SUM(c) FROM t;;",

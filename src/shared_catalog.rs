@@ -190,6 +190,19 @@ impl SharedCatalog {
             .map_err(Into::into)
     }
 
+    /// Executes a scalar `SUM` under a read lock with explicit scan and aggregate bounds.
+    pub fn execute_scalar_sum_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, SharedCatalogError> {
+        self.read()?
+            .execute_scalar_sum_with_limits(input, parse_limits, scan_limits, aggregate_limits)
+            .map_err(Into::into)
+    }
+
     /// Executes `SELECT DISTINCT` under a read lock with explicit resource bounds.
     pub fn execute_select_distinct(
         &self,

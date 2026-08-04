@@ -22,8 +22,9 @@ pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
     InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError, execute_insert,
-    execute_scalar_count, execute_scalar_count_with_limits, execute_scalar_sum, execute_select,
-    execute_select_distinct, execute_select_with_limits, execute_select_with_order_limits,
+    execute_scalar_count, execute_scalar_count_with_limits, execute_scalar_sum,
+    execute_scalar_sum_with_limits, execute_select, execute_select_distinct,
+    execute_select_with_limits, execute_select_with_order_limits,
 };
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,

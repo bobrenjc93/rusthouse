@@ -3,7 +3,7 @@ use std::thread;
 
 use rusthouse::{
     AggregateLimits, Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError,
-    ParseLimits, SharedCatalog, SharedCatalogError,
+    ParseLimits, ScanLimits, SharedCatalog, SharedCatalogError,
 };
 
 fn shared_catalog(max_rows_per_table: usize) -> SharedCatalog {
@@ -95,6 +95,15 @@ fn shared_reads_expose_nullness_predicates_and_scalar_sum() {
             AggregateLimits::new(4, 4),
         ),
         Ok(Some(5))
+    );
+    assert_eq!(
+        catalog.execute_scalar_sum_with_limits(
+            "SELECT SUM(value) FROM readings WHERE value > 0",
+            ParseLimits::default(),
+            ScanLimits::new(4, 1),
+            AggregateLimits::new(4, 1),
+        ),
+        Ok(Some(7))
     );
 }
 

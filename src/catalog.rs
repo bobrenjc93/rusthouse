@@ -10,7 +10,7 @@ use crate::execution::{
     execute_insert as execute_insert_statement,
     execute_scalar_count as execute_scalar_count_statement,
     execute_scalar_count_with_limits as execute_scalar_count_statement_with_limits,
-    execute_scalar_sum as execute_scalar_sum_statement,
+    execute_scalar_sum_with_limits as execute_scalar_sum_statement_with_limits,
     execute_select_distinct as execute_select_distinct_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
@@ -289,15 +289,51 @@ impl Catalog {
         parse_limits: ParseLimits,
         aggregate_limits: AggregateLimits,
     ) -> Result<Option<i64>, CatalogError> {
+        self.execute_scalar_sum_with_limits(
+            input,
+            parse_limits,
+            ScanLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+            aggregate_limits,
+        )
+    }
+
+    /// Parses and executes one scalar `SUM` with explicit scan and aggregate bounds.
+    pub fn execute_scalar_sum_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
         let statement = parse_scalar_sum(input, parse_limits)?;
-        self.scalar_sum(&statement, aggregate_limits)
+        self.scalar_sum_with_limits(&statement, scan_limits, aggregate_limits)
     }
 
     /// Executes a parsed scalar `SUM` against its exactly named table.
     pub fn scalar_sum(
         &self,
         statement: &ScalarSumStatement,
-        limits: AggregateLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
+        self.scalar_sum_with_limits(
+            statement,
+            ScanLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+            aggregate_limits,
+        )
+    }
+
+    /// Executes a parsed scalar `SUM` with explicit scan and aggregate bounds.
+    pub fn scalar_sum_with_limits(
+        &self,
+        statement: &ScalarSumStatement,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
     ) -> Result<Option<i64>, CatalogError> {
         let name = statement.table_name().as_str();
         let table = self.tables.get(name).ok_or_else(|| {
@@ -306,7 +342,14 @@ impl Catalog {
             })
         })?;
 
-        execute_scalar_sum_statement(name, table, statement, limits).map_err(CatalogError::Select)
+        execute_scalar_sum_statement_with_limits(
+            name,
+            table,
+            statement,
+            scan_limits,
+            aggregate_limits,
+        )
+        .map_err(CatalogError::Select)
     }
 
     /// Parses and executes one bounded projection `SELECT` statement.
