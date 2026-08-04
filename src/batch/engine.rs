@@ -203,6 +203,40 @@ impl Database {
         Ok(results)
     }
 
+    /// Executes one already-parsed `SELECT` or `SHOW TABLES` without mutable access.
+    pub(crate) fn execute_query_statement_with_result_limit(
+        &self,
+        statement: Statement,
+        max_result_bytes: usize,
+    ) -> Result<QueryResult> {
+        let tightened_result_limit = max_result_bytes < self.query_result_limits.max_bytes;
+        let query_limits = QueryResultLimits {
+            max_bytes: self.query_result_limits.max_bytes.min(max_result_bytes),
+            ..self.query_result_limits
+        };
+        let result = self
+            .execute_query_statement_with_limits(statement, query_limits)
+            .map_err(|error| match error {
+                Error::ResourceLimitExceeded {
+                    resource: "SELECT result bytes" | "SHOW TABLES result bytes",
+                    actual,
+                    ..
+                } if tightened_result_limit => Error::ResultLimitExceeded {
+                    bytes: actual,
+                    max_bytes: max_result_bytes,
+                },
+                error => error,
+            })?;
+        let retained_bytes = result.estimated_retained_bytes();
+        if retained_bytes > max_result_bytes {
+            return Err(Error::ResultLimitExceeded {
+                bytes: retained_bytes,
+                max_bytes: max_result_bytes,
+            });
+        }
+        Ok(result)
+    }
+
     /// Executes one already-parsed statement.
     ///
     /// Callers that stream results should parse the complete batch first, then
@@ -241,12 +275,23 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self
-                .execute_select(select, query_result_limits)
+            statement @ (Statement::Select(_) | Statement::ShowTables) => self
+                .execute_query_statement_with_limits(statement, query_result_limits)
                 .map(StatementResult::Query),
-            Statement::ShowTables => self
-                .execute_show_tables(query_result_limits)
-                .map(StatementResult::Query),
+        }
+    }
+
+    fn execute_query_statement_with_limits(
+        &self,
+        statement: Statement,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        match statement {
+            Statement::Select(select) => self.execute_select(select, query_result_limits),
+            Statement::ShowTables => self.execute_show_tables(query_result_limits),
+            Statement::CreateTable { .. } | Statement::Insert { .. } => Err(Error::InvalidQuery(
+                "read-only execution accepts only SELECT or SHOW TABLES".to_owned(),
+            )),
         }
     }
 
@@ -413,30 +458,24 @@ fn resolve_distinct_columns(table: &Table, items: &[SelectItem]) -> Result<Vec<u
     Ok(columns)
 }
 
-impl StatementResult {
+impl QueryResult {
     fn estimated_retained_bytes(&self) -> usize {
-        let Self::Query(result) = self else {
-            return 0;
-        };
-
-        let mut bytes = result
+        let mut bytes = self
             .columns
             .len()
             .saturating_mul(std::mem::size_of::<ResultColumn>())
             .saturating_add(
-                result
-                    .columns
+                self.columns
                     .iter()
                     .map(|column| column.name.len())
                     .fold(0_usize, usize::saturating_add),
             )
             .saturating_add(
-                result
-                    .rows
+                self.rows
                     .len()
                     .saturating_mul(std::mem::size_of::<Vec<Value>>()),
             );
-        for row in &result.rows {
+        for row in &self.rows {
             bytes = bytes.saturating_add(row.len().saturating_mul(std::mem::size_of::<Value>()));
             for value in row {
                 if let Value::String(value) = value {
@@ -445,6 +484,15 @@ impl StatementResult {
             }
         }
         bytes
+    }
+}
+
+impl StatementResult {
+    fn estimated_retained_bytes(&self) -> usize {
+        match self {
+            Self::Command { .. } => 0,
+            Self::Query(result) => result.estimated_retained_bytes(),
+        }
     }
 }
 

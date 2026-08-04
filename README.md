@@ -113,6 +113,13 @@ ingestion with a write lock, allow `SELECT` operations through read locks, and
 return owned projection rows. Existing catalog failures remain typed, and lock
 poisoning is reported separately.
 
+`SharedDatabase` provides the same synchronization for the typed batch SQL
+engine. Its `query` method accepts exactly one `SELECT` or `SHOW TABLES`, takes
+a shared read lock, and returns an owned, resource-bounded result, so cloned
+handles can run analytical reads concurrently. Mutating batches passed to
+`execute` retain one write lock for the entire batch and cannot interleave.
+Read-only API misuse and lock poisoning are reported as distinct typed errors.
+
 ## Snapshot envelope
 
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit
