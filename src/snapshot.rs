@@ -10,6 +10,8 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::storage::{InsertError, Int64Table, Schema};
+
 /// Magic bytes at the start of every RustHouse snapshot envelope.
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"RHOUSESN";
 
@@ -199,6 +201,57 @@ impl fmt::Display for NullableI64PayloadError {
 }
 
 impl Error for NullableI64PayloadError {}
+
+/// An error produced while restoring an [`Int64Table`] from an envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64TableRestoreError {
+    /// The snapshot envelope could not be decoded.
+    Envelope(SnapshotError),
+    /// The envelope payload was not a valid nullable `Int64` row payload.
+    Payload(NullableI64PayloadError),
+    /// The decoded rows violated the requested schema or table row cap.
+    Table(InsertError),
+}
+
+impl fmt::Display for Int64TableRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Envelope(error) => {
+                write!(formatter, "could not decode snapshot envelope: {error}")
+            }
+            Self::Payload(error) => write!(formatter, "could not decode table payload: {error}"),
+            Self::Table(error) => write!(formatter, "could not restore table rows: {error}"),
+        }
+    }
+}
+
+impl Error for Int64TableRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Envelope(error) => Some(error),
+            Self::Payload(error) => Some(error),
+            Self::Table(error) => Some(error),
+        }
+    }
+}
+
+impl From<SnapshotError> for Int64TableRestoreError {
+    fn from(error: SnapshotError) -> Self {
+        Self::Envelope(error)
+    }
+}
+
+impl From<NullableI64PayloadError> for Int64TableRestoreError {
+    fn from(error: NullableI64PayloadError) -> Self {
+        Self::Payload(error)
+    }
+}
+
+impl From<InsertError> for Int64TableRestoreError {
+    fn from(error: InsertError) -> Self {
+        Self::Table(error)
+    }
+}
 
 /// Encodes and decodes bounded nullable `Int64` row payloads.
 ///
@@ -517,6 +570,52 @@ impl SnapshotCodec {
 
         Ok(payload)
     }
+}
+
+/// Restores one bounded `Int64` table from a snapshot envelope.
+///
+/// The supplied codecs retain independent envelope-byte, payload-byte, and
+/// payload-row bounds. The payload is fully decoded before a new table is
+/// created, then all rows are appended in one atomic batch. Envelope, payload,
+/// schema nullability, and table row-cap failures therefore remain typed, and
+/// no partially populated table is returned.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{
+///     NullableI64PayloadCodec, Schema, SnapshotCodec, restore_int64_table,
+/// };
+///
+/// let rows = [Some(-7), None, Some(i64::MAX)];
+/// let payload_codec = NullableI64PayloadCodec::new(3, 27);
+/// let snapshot_codec = SnapshotCodec::new(27);
+/// let payload = payload_codec.encode(&rows)?;
+/// let envelope = snapshot_codec.encode(&payload)?;
+///
+/// let table = restore_int64_table(
+///     &envelope,
+///     Schema::int64("reading", true),
+///     3,
+///     snapshot_codec,
+///     payload_codec,
+/// )?;
+///
+/// assert_eq!(table.values(), rows);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn restore_int64_table(
+    envelope: &[u8],
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) -> Result<Int64Table, Int64TableRestoreError> {
+    let payload = snapshot_codec.decode(envelope)?;
+    let rows = payload_codec.decode(payload)?;
+    let mut table = Int64Table::new(schema, row_cap);
+    table.append_batch(&rows)?;
+    Ok(table)
 }
 
 fn validate_nullable_i64_rows(

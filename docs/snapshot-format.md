@@ -76,3 +76,12 @@ checked during encoding before allocation. Decoding checks the input byte
 length and declared row count before allocation, validates every tag and value,
 rejects truncation and trailing data, and only then allocates the decoded row
 vector. The payload-byte limit includes the row-count field, tags, and values.
+
+## Restoring one Int64 table
+
+`restore_int64_table` composes a caller-configured `SnapshotCodec` and
+`NullableI64PayloadCodec` with a caller-supplied schema and table row cap. It
+decodes the complete envelope and payload before atomically appending the rows
+to a new table. Envelope, payload, schema nullability, and row-cap failures are
+reported as distinct typed error variants; a failure never returns a partially
+populated table.
