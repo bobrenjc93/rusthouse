@@ -684,12 +684,7 @@ pub fn restore_int64_table_from_file(
     payload_codec: NullableI64PayloadCodec,
 ) -> Result<Int64Table, Int64TableFileRestoreError> {
     let path = path.as_ref();
-    let path_metadata = fs::metadata(path).map_err(Int64TableFileRestoreError::Open)?;
-    if !path_metadata.is_file() {
-        return Err(Int64TableFileRestoreError::NotRegularFile);
-    }
-
-    let mut file = File::open(path).map_err(Int64TableFileRestoreError::Open)?;
+    let mut file = open_regular_snapshot_file(path)?;
     let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
     let file_len = bounded_file_len(&file, max_file_len)?;
     let capacity = usize::try_from(file_len).unwrap_or(max_file_len);
@@ -703,6 +698,44 @@ pub fn restore_int64_table_from_file(
 
     restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
         .map_err(Int64TableFileRestoreError::Restore)
+}
+
+fn open_regular_snapshot_file(path: &Path) -> Result<File, Int64TableFileRestoreError> {
+    require_regular_snapshot_path(path)?;
+    open_regular_snapshot_path(path)
+}
+
+fn require_regular_snapshot_path(path: &Path) -> Result<(), Int64TableFileRestoreError> {
+    let metadata = fs::metadata(path).map_err(Int64TableFileRestoreError::Open)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    Ok(())
+}
+
+fn open_regular_snapshot_path(path: &Path) -> Result<File, Int64TableFileRestoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A pathname that becomes a FIFO between the metadata check and open
+        // must not block this process. This flag has no effect on regular files.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(Int64TableFileRestoreError::Open)?;
+    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    Ok(file)
 }
 
 fn bounded_file_len(file: &File, max_file_len: usize) -> Result<u64, Int64TableFileRestoreError> {
@@ -792,5 +825,58 @@ mod tests {
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_checked_file_with_a_fifo_cannot_block_open() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-unit-tests");
+        fs::create_dir_all(&base).unwrap();
+        let directory = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let path = directory.join("race.snapshot");
+        fs::write(&path, b"checked regular file").unwrap();
+
+        require_regular_snapshot_path(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let fifo_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_path` is a valid, NUL-terminated pathname that lives
+        // through the call, and the mode contains only permission bits.
+        let result = unsafe { libc::mkfifo(fifo_path.as_ptr(), libc::S_IRUSR | libc::S_IWUSR) };
+        assert_eq!(result, 0, "mkfifo failed: {}", io::Error::last_os_error());
+
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            sender
+                .send(open_regular_snapshot_path(&worker_path).map(drop))
+                .unwrap();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening the replacement FIFO must not block");
+        worker.join().unwrap();
+
+        assert!(matches!(
+            result,
+            Err(Int64TableFileRestoreError::NotRegularFile)
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

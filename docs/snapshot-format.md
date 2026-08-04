@@ -88,9 +88,11 @@ populated table.
 
 `restore_int64_table_from_file` provides the bounded filesystem entry point.
 It requires a regular file so FIFOs and devices cannot block or hide trailing
-input behind stream metadata. It opens an existing snapshot without modifying
-it, rejects files larger than the 22-byte header plus the configured envelope
-payload limit, and reads no more than that bound. Open, non-regular-file, read,
+input behind stream metadata. Unix opens use nonblocking semantics before the
+opened descriptor is validated, so replacing a checked path with a FIFO cannot
+block the open. It opens an existing snapshot without modifying it, rejects
+files larger than the 22-byte header plus the configured envelope payload
+limit, and reads no more than that bound. Open, non-regular-file, read,
 oversized-file, and restoration failures remain distinct. After the bounded
 read it delegates to `restore_int64_table`, retaining the same all-or-nothing
 validation behavior.

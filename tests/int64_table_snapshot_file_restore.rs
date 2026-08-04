@@ -190,15 +190,24 @@ fn rejects_a_directory_as_a_non_regular_file() {
 #[cfg(unix)]
 #[test]
 fn rejects_a_fifo_with_a_maximum_envelope_and_trailing_data() {
+    use std::ffi::CString;
     use std::io::Write as _;
-    use std::process::Command;
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::mpsc;
     use std::thread;
 
     let directory = TestDirectory::new();
     let path = directory.join("stream.snapshot");
-    let status = Command::new("mkfifo").arg(&path).status().unwrap();
-    assert!(status.success());
+    let fifo_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo_path` is a valid, NUL-terminated pathname that lives
+    // through the call, and the mode contains only permission bits.
+    let result = unsafe { libc::mkfifo(fifo_path.as_ptr(), libc::S_IRUSR | libc::S_IWUSR) };
+    assert_eq!(
+        result,
+        0,
+        "mkfifo failed: {}",
+        std::io::Error::last_os_error()
+    );
 
     let payload_codec = NullableI64PayloadCodec::new(0, 8);
     let payload = payload_codec.encode(&[]).unwrap();
