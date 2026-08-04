@@ -1,13 +1,14 @@
 //! Versioned, bounded snapshot envelopes and nullable `Int64` row payloads.
 //!
 //! This module does not serialize a catalog. It can create and sync a new
-//! envelope file without replacing an existing destination. See
-//! `docs/snapshot-format.md` for the stable binary layouts.
+//! envelope file without replacing an existing destination, then reopen one
+//! bounded `Int64` table from that file. See `docs/snapshot-format.md` for the
+//! stable binary layouts.
 
 use std::error::Error;
 use std::fmt;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::storage::{InsertError, Int64Table, Schema};
@@ -250,6 +251,52 @@ impl From<NullableI64PayloadError> for Int64TableRestoreError {
 impl From<InsertError> for Int64TableRestoreError {
     fn from(error: InsertError) -> Self {
         Self::Table(error)
+    }
+}
+
+/// An error produced while restoring an [`Int64Table`] from a snapshot file.
+#[derive(Debug)]
+pub enum Int64TableFileRestoreError {
+    /// The snapshot path could not be opened for reading.
+    Open(io::Error),
+    /// The opened snapshot file could not be inspected or read completely.
+    Read(io::Error),
+    /// The file is larger than the envelope header plus the payload limit.
+    FileTooLarge { file_len: u64, max_file_len: usize },
+    /// The bounded file contents could not be restored as an `Int64` table.
+    Restore(Int64TableRestoreError),
+}
+
+impl fmt::Display for Int64TableFileRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "could not open snapshot file: {error}"),
+            Self::Read(error) => write!(formatter, "could not read snapshot file: {error}"),
+            Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => write!(
+                formatter,
+                "snapshot file has {file_len} bytes, exceeding the limit of {max_file_len}"
+            ),
+            Self::Restore(error) => write!(formatter, "could not restore snapshot file: {error}"),
+        }
+    }
+}
+
+impl Error for Int64TableFileRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(error) | Self::Read(error) => Some(error),
+            Self::FileTooLarge { .. } => None,
+            Self::Restore(error) => Some(error),
+        }
+    }
+}
+
+impl From<Int64TableRestoreError> for Int64TableFileRestoreError {
+    fn from(error: Int64TableRestoreError) -> Self {
+        Self::Restore(error)
     }
 }
 
@@ -616,6 +663,52 @@ pub fn restore_int64_table(
     let mut table = Int64Table::new(schema, row_cap);
     table.append_batch(&rows)?;
     Ok(table)
+}
+
+/// Opens a bounded snapshot file and restores one `Int64` table from it.
+///
+/// At most the envelope header plus `snapshot_codec`'s configured payload
+/// limit is read. A larger regular file is rejected before its contents are
+/// read. The bounded bytes are passed to [`restore_int64_table`], so all
+/// envelope, payload, schema, and row-cap validation finishes before a table
+/// is returned.
+pub fn restore_int64_table_from_file(
+    path: impl AsRef<Path>,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) -> Result<Int64Table, Int64TableFileRestoreError> {
+    let mut file = File::open(path).map_err(Int64TableFileRestoreError::Open)?;
+    let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
+    let file_len = bounded_file_len(&file, max_file_len)?;
+    let capacity = usize::try_from(file_len).unwrap_or(max_file_len);
+    let mut envelope = Vec::with_capacity(capacity);
+    Read::take(&mut file, u64::try_from(max_file_len).unwrap_or(u64::MAX))
+        .read_to_end(&mut envelope)
+        .map_err(Int64TableFileRestoreError::Read)?;
+
+    // Check the opened file again in case it grew after the first size check.
+    bounded_file_len(&file, max_file_len)?;
+
+    restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
+        .map_err(Int64TableFileRestoreError::Restore)
+}
+
+fn bounded_file_len(file: &File, max_file_len: usize) -> Result<u64, Int64TableFileRestoreError> {
+    let file_len = file
+        .metadata()
+        .map_err(Int64TableFileRestoreError::Read)?
+        .len();
+    let max_file_len_u64 = u64::try_from(max_file_len).unwrap_or(u64::MAX);
+    if file_len > max_file_len_u64 {
+        return Err(Int64TableFileRestoreError::FileTooLarge {
+            file_len,
+            max_file_len,
+        });
+    }
+
+    Ok(file_len)
 }
 
 fn validate_nullable_i64_rows(

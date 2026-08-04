@@ -93,9 +93,12 @@ poisoning is reported separately.
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit
 magic value, format version, declared length, and CRC-32 checksum.
 `NullableI64PayloadCodec` provides the first deterministic storage payload: a
-bounded row count and tagged nullable `Int64` values. These define the current
-persistence corruption boundary without yet choosing catalog serialization or
-filesystem replacement. The exact layouts are documented in
+bounded row count and tagged nullable `Int64` values.
+`restore_int64_table_from_file` reopens one of these files with a hard envelope
+read bound and restores a table only after the envelope, payload, schema, and
+row cap have all been validated. These define the current persistence
+corruption boundary without yet choosing catalog serialization or filesystem
+replacement. The exact layouts are documented in
 [docs/snapshot-format.md](docs/snapshot-format.md).
 
 ## CSV ingestion

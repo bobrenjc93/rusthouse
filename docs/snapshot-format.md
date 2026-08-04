@@ -85,3 +85,10 @@ decodes the complete envelope and payload before atomically appending the rows
 to a new table. Envelope, payload, schema nullability, and row-cap failures are
 reported as distinct typed error variants; a failure never returns a partially
 populated table.
+
+`restore_int64_table_from_file` provides the bounded filesystem entry point.
+It opens an existing snapshot without modifying it, rejects regular files
+larger than the 22-byte header plus the configured envelope payload limit, and
+reads no more than that bound. Open, read, oversized-file, and restoration
+failures remain distinct. After the bounded read it delegates to
+`restore_int64_table`, retaining the same all-or-nothing validation behavior.
