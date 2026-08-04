@@ -53,6 +53,7 @@ pub struct Select {
     pub table: String,
     pub predicate: Option<Predicate>,
     pub group_by: Vec<String>,
+    pub having: Option<Having>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
 }
@@ -135,6 +136,13 @@ pub enum ComparisonOperator {
     LessOrEqual,
     Greater,
     GreaterOrEqual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Having {
+    pub alias: String,
+    pub operator: ComparisonOperator,
+    pub value: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,6 +571,27 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let having = if self.eat_keyword("HAVING") {
+            let alias = self.expect_identifier("COUNT(*) alias after HAVING")?;
+            let operator = self.parse_comparison_operator()?;
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a non-negative Int64 after HAVING comparison".to_owned(),
+            })?;
+            let value = number.parse::<i64>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid non-negative Int64 '{number}' in HAVING comparison"),
+            })?;
+            Some(Having {
+                alias,
+                operator,
+                value,
+            })
+        } else {
+            None
+        };
+
         let mut order_by = Vec::new();
         if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
@@ -601,6 +630,7 @@ impl<'a> Parser<'a> {
             table,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -692,6 +722,17 @@ impl<'a> Parser<'a> {
         }
 
         let left = self.parse_operand()?;
+        let operator = self.parse_comparison_operator()?;
+        let right = self.parse_operand()?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Comparison {
+            left,
+            operator,
+            right,
+        })
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator> {
         let operator = match self.peek() {
             TokenKind::Equal => ComparisonOperator::Equal,
             TokenKind::NotEqual => ComparisonOperator::NotEqual,
@@ -702,13 +743,7 @@ impl<'a> Parser<'a> {
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
         self.advance();
-        let right = self.parse_operand()?;
-        self.record_predicate_node()?;
-        Ok(Predicate::Comparison {
-            left,
-            operator,
-            right,
-        })
+        Ok(operator)
     }
 
     fn record_predicate_node(&mut self) -> Result<()> {
@@ -871,20 +906,69 @@ mod tests {
     #[test]
     fn parses_complete_select_shape() {
         let statements = parse(
-            "SELECT region, SUM(amount) AS total FROM sales \
+            "SELECT region, COUNT(*) AS rows, SUM(amount) AS total FROM sales \
              WHERE active = true AND amount >= 2.5 \
-             GROUP BY region ORDER BY total DESC LIMIT 3;",
+             GROUP BY region HAVING rows >= 2 ORDER BY total DESC LIMIT 3;",
         )
         .expect("valid SQL");
 
         let Statement::Select(select) = &statements[0] else {
             panic!("expected select");
         };
-        assert_eq!(select.items.len(), 2);
+        assert_eq!(select.items.len(), 3);
         assert_eq!(select.group_by, ["region"]);
+        assert_eq!(
+            select.having,
+            Some(Having {
+                alias: "rows".to_owned(),
+                operator: ComparisonOperator::GreaterOrEqual,
+                value: 2,
+            })
+        );
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_every_having_comparison_operator_and_int64_maximum() {
+        let cases = [
+            ("=", ComparisonOperator::Equal),
+            ("!=", ComparisonOperator::NotEqual),
+            ("<>", ComparisonOperator::NotEqual),
+            ("<", ComparisonOperator::Less),
+            ("<=", ComparisonOperator::LessOrEqual),
+            (">", ComparisonOperator::Greater),
+            (">=", ComparisonOperator::GreaterOrEqual),
+        ];
+
+        for (sql_operator, expected) in cases {
+            let sql = format!(
+                "SELECT COUNT(*) AS n FROM events HAVING n {sql_operator} {}",
+                i64::MAX
+            );
+            let statements = parse(&sql).expect("valid HAVING comparison");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            let having = select.having.as_ref().expect("HAVING is parsed");
+            assert_eq!(having.operator, expected, "{sql_operator}");
+            assert_eq!(having.value, i64::MAX, "{sql_operator}");
+        }
+    }
+
+    #[test]
+    fn having_requires_a_nonnegative_int64_in_clause_order() {
+        for sql in [
+            "SELECT COUNT(*) AS n FROM events HAVING n = -1",
+            "SELECT COUNT(*) AS n FROM events HAVING n = 1.5",
+            "SELECT COUNT(*) AS n FROM events HAVING n = 9223372036854775808",
+            "SELECT COUNT(*) AS n FROM events HAVING n = many",
+            "SELECT COUNT(*) AS n FROM events HAVING n = 1 GROUP BY kind",
+            "SELECT COUNT(*) AS n FROM events ORDER BY n HAVING n = 1",
+        ] {
+            assert!(parse(sql).is_err(), "{sql:?} must be rejected");
+        }
     }
 
     #[test]
