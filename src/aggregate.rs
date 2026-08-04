@@ -172,6 +172,42 @@ pub fn count_nullable_i64(
     })
 }
 
+/// Computes `MIN(column)` for nullable `i64` values.
+///
+/// `None` values represent SQL `NULL` and do not participate in the minimum.
+/// The result is `None` when the input or selection has no non-`NULL` values.
+/// Bounds and explicit selections have the same validation semantics as
+/// [`aggregate_nullable_i64`].
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{AggregateLimits, RowSelection, min_nullable_i64};
+///
+/// let values = [Some(4), None, Some(-2), Some(-2)];
+/// let result = min_nullable_i64(
+///     &values,
+///     RowSelection::All,
+///     AggregateLimits::new(values.len(), values.len()),
+/// )?;
+///
+/// assert_eq!(result, Some(-2));
+/// # Ok::<(), rusthouse::AggregateError>(())
+/// ```
+pub fn min_nullable_i64(
+    values: &[Option<i64>],
+    selection: RowSelection<'_>,
+    limits: AggregateLimits,
+) -> Result<Option<i64>, AggregateError> {
+    validate_aggregate_input(values.len(), selection, limits)?;
+
+    let minimum = match selection {
+        RowSelection::All => values.iter().copied().flatten().min(),
+        RowSelection::Indices(indices) => indices.iter().filter_map(|&index| values[index]).min(),
+    };
+    Ok(minimum)
+}
+
 /// Computes `COUNT(*)`, `COUNT(column)`, and `SUM(column)` for nullable `i64`
 /// values.
 ///

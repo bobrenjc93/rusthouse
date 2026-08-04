@@ -29,7 +29,9 @@ subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `WHERE column IS NOT NULL`. Both forms accept an optional nonnegative `LIMIT`.
 Scalar `SELECT COUNT(*)`, `SELECT COUNT(column)`, and `SELECT SUM(column)`
 support the same comparison filters with explicit scan and aggregate row
-bounds while preserving SQL `NULL` semantics.
+bounds while preserving SQL `NULL` semantics. `SELECT MIN(column) FROM table`
+provides the bounded unfiltered minimum and returns `NULL` for empty or
+all-`NULL` input.
 The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a
@@ -38,6 +40,17 @@ filtered projections return matching values in source order through bounded
 comparison and nullness scans. `SELECT DISTINCT column FROM table` uses
 explicit input-row and distinct-value limits and returns deterministic
 `NULL`-first, ascending values.
+
+## Command-line session
+
+Running `rusthouse` reads one `CREATE TABLE`, `INSERT INTO`, or projection
+`SELECT` from each nonempty standard-input line. One bounded in-memory catalog
+is retained until EOF. Successful `CREATE` and `INSERT` statements are silent;
+each `SELECT` prints a stable row list such as `[7, NULL, -2]`. Any malformed or
+failed statement is reported on standard error and terminates the process with
+a nonzero status. The default session allows 65,536 input bytes, 1,024
+statements, 64 tables, and 1,024 rows per table. Run `rusthouse --help` for the
+concise command reference.
 
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an
 `Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE`, `INSERT`, and CSV

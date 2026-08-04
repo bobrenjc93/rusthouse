@@ -10,6 +10,7 @@ use crate::execution::{
     execute_insert as execute_insert_statement,
     execute_scalar_count as execute_scalar_count_statement,
     execute_scalar_count_with_limits as execute_scalar_count_statement_with_limits,
+    execute_scalar_min as execute_scalar_min_statement,
     execute_scalar_sum_with_limits as execute_scalar_sum_statement_with_limits,
     execute_select_distinct as execute_select_distinct_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
@@ -17,9 +18,9 @@ use crate::execution::{
 use crate::{
     AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
     InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits, ScalarCountStatement,
-    ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement, SelectStatement,
-    ingest_csv_with_names, parse_create_table, parse_insert, parse_scalar_count, parse_scalar_sum,
-    parse_select, parse_select_distinct,
+    ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement,
+    SelectStatement, ingest_csv_with_names, parse_create_table, parse_insert, parse_scalar_count,
+    parse_scalar_min, parse_scalar_sum, parse_select, parse_select_distinct,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -401,6 +402,34 @@ impl Catalog {
             aggregate_limits,
         )
         .map_err(CatalogError::Select)
+    }
+
+    /// Parses and executes one scalar `MIN` with explicit resource bounds.
+    pub fn execute_scalar_min(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
+        let statement = parse_scalar_min(input, parse_limits)?;
+        self.scalar_min(&statement, aggregate_limits)
+    }
+
+    /// Executes a parsed scalar `MIN` against its exactly named table.
+    pub fn scalar_min(
+        &self,
+        statement: &ScalarMinStatement,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Select(SelectExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_scalar_min_statement(name, table, statement, aggregate_limits)
+            .map_err(CatalogError::Select)
     }
 
     /// Parses and executes one bounded projection `SELECT` statement.
