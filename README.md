@@ -29,7 +29,9 @@ subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `WHERE column IS NOT NULL`. Both forms accept an optional nonnegative `LIMIT`.
 Scalar `SELECT COUNT(*)`, `SELECT COUNT(column)`, and `SELECT SUM(column)`
 support the same comparison filters with explicit scan and aggregate row
-bounds while preserving SQL `NULL` semantics.
+bounds while preserving SQL `NULL` semantics. `SELECT MIN(column) FROM table`
+provides the bounded unfiltered minimum and returns `NULL` for empty or
+all-`NULL` input.
 The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a

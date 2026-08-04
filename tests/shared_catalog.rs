@@ -69,7 +69,7 @@ fn readers_observe_consistent_owned_snapshots() {
 }
 
 #[test]
-fn shared_reads_expose_nullness_predicates_and_scalar_sum() {
+fn shared_reads_expose_nullness_predicates_and_scalar_aggregates() {
     let catalog = shared_catalog(4);
     for value in ["NULL", "7", "-2", "NULL"] {
         catalog
@@ -105,6 +105,14 @@ fn shared_reads_expose_nullness_predicates_and_scalar_sum() {
             AggregateLimits::new(4, 1),
         ),
         Ok(Some(7))
+    );
+    assert_eq!(
+        catalog.execute_scalar_min(
+            "SELECT MIN(value) FROM readings",
+            ParseLimits::default(),
+            AggregateLimits::new(4, 4),
+        ),
+        Ok(Some(-2))
     );
 }
 

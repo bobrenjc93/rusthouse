@@ -226,6 +226,18 @@ impl SharedCatalog {
             .map_err(Into::into)
     }
 
+    /// Executes a scalar `MIN` under a read lock with explicit aggregate bounds.
+    pub fn execute_scalar_min(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, SharedCatalogError> {
+        self.read()?
+            .execute_scalar_min(input, parse_limits, aggregate_limits)
+            .map_err(Into::into)
+    }
+
     /// Executes `SELECT DISTINCT` under a read lock with explicit resource bounds.
     pub fn execute_select_distinct(
         &self,
