@@ -2,8 +2,9 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 
 use rusthouse::{
-    AggregateLimits, Catalog, CatalogError, CatalogLimits, InsertError, InsertExecutionError,
-    ParseLimits, ScanLimits, SharedCatalog, SharedCatalogError,
+    AggregateLimits, Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CsvIngestError,
+    CsvIngestLimits, InsertError, InsertExecutionError, ParseLimits, ScanLimits, SharedCatalog,
+    SharedCatalogError,
 };
 
 fn shared_catalog(max_rows_per_table: usize) -> SharedCatalog {
@@ -104,6 +105,39 @@ fn shared_reads_expose_nullness_predicates_and_scalar_sum() {
             AggregateLimits::new(4, 1),
         ),
         Ok(Some(7))
+    );
+}
+
+#[test]
+fn shared_csv_ingest_uses_the_catalog_write_boundary() {
+    let catalog = shared_catalog(3);
+    let writer = catalog.clone();
+
+    assert_eq!(
+        writer.ingest_csv_with_names("readings", b"value\n7\nNULL\n", CsvIngestLimits::new(32, 2),),
+        Ok(2)
+    );
+    assert_eq!(
+        catalog
+            .execute_select("SELECT value FROM readings", ParseLimits::default())
+            .unwrap(),
+        vec![Some(7), None]
+    );
+
+    assert_eq!(
+        writer.ingest_csv_with_names("readings", b"other\n1\n", CsvIngestLimits::new(32, 1),),
+        Err(SharedCatalogError::CsvIngest(CatalogCsvIngestError::Csv(
+            CsvIngestError::HeaderMismatch {
+                line: 1,
+                expected: "value".to_owned(),
+            }
+        )))
+    );
+    assert_eq!(
+        catalog
+            .execute_select("SELECT value FROM readings", ParseLimits::default())
+            .unwrap(),
+        vec![Some(7), None]
     );
 }
 
