@@ -215,10 +215,41 @@ impl OrderByClause {
     }
 }
 
+/// A scalar expression supported in a one-column `SELECT` projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectProjection {
+    /// Return the named column without transforming its values.
+    Column(Identifier),
+    /// Add a constant `Int64` to each non-`NULL` value in the named column.
+    Int64Addition {
+        /// The source column.
+        column_name: Identifier,
+        /// The constant right-hand operand.
+        addend: i64,
+    },
+}
+
+impl SelectProjection {
+    /// Returns the source column used by the projection.
+    pub const fn column_name(&self) -> &Identifier {
+        match self {
+            Self::Column(column_name) | Self::Int64Addition { column_name, .. } => column_name,
+        }
+    }
+
+    /// Returns the constant right-hand operand for an `Int64` addition.
+    pub const fn int64_addend(&self) -> Option<i64> {
+        match self {
+            Self::Column(_) => None,
+            Self::Int64Addition { addend, .. } => Some(*addend),
+        }
+    }
+}
+
 /// The typed syntax tree for a one-column `SELECT` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStatement {
-    column_name: Identifier,
+    projection: SelectProjection,
     table_name: Identifier,
     predicate: Option<SelectPredicate>,
     order_by: Option<OrderByClause>,
@@ -226,9 +257,14 @@ pub struct SelectStatement {
 }
 
 impl SelectStatement {
+    /// Returns the expression evaluated for each selected source row.
+    pub const fn projection(&self) -> &SelectProjection {
+        &self.projection
+    }
+
     /// Returns the projected column name.
-    pub fn column_name(&self) -> &Identifier {
-        &self.column_name
+    pub const fn column_name(&self) -> &Identifier {
+        self.projection.column_name()
     }
 
     /// Returns the source table name.
@@ -515,14 +551,14 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
     Parser::new(input, limits.max_identifier_bytes).parse_insert()
 }
 
-/// Parses one `SELECT` statement containing one column and one table.
+/// Parses one `SELECT` statement containing one projection and one table.
 ///
 /// Keywords are ASCII case-insensitive. The column and table identifiers
 /// follow the same rules and bounds as [`parse_create_table`]. The complete
 /// accepted grammar is:
 ///
 /// ```text
-/// SELECT identifier FROM identifier
+/// SELECT identifier [+ Int64] FROM identifier
 ///     [WHERE identifier ((= | != | <> | < | <= | > | >=) Int64
 ///                       | IS [NOT] NULL)]
 ///     [ORDER BY identifier (ASC | DESC) NULLS (FIRST | LAST)]
@@ -532,10 +568,10 @@ pub fn parse_insert(input: &str, limits: ParseLimits) -> Result<InsertStatement,
 /// Leading and trailing ASCII whitespace is accepted, including whitespace
 /// around the comparison operator and before or after the optional clauses and
 /// semicolon. `ORDER BY`, when present, requires an explicit direction, `NULL`
-/// placement, and following `LIMIT`. Comparison values are signed decimal
-/// `Int64` values. Nullness predicates use SQL's `IS NULL` or `IS NOT NULL`
-/// form. `LIMIT` accepts zero and must fit in `usize`. Statement limits and all
-/// reported offsets are measured in bytes.
+/// placement, and following `LIMIT`. Addition and comparison values are signed
+/// decimal `Int64` values. Nullness predicates use SQL's `IS NULL` or `IS NOT
+/// NULL` form. `LIMIT` accepts zero and must fit in `usize`. Statement limits
+/// and all reported offsets are measured in bytes.
 ///
 /// # Examples
 ///
@@ -784,10 +820,27 @@ impl<'input> Parser<'input> {
         self.skip_whitespace();
         self.expect_keyword("SELECT")?;
         self.require_whitespace("whitespace after SELECT")?;
-        if self.keyword_at_position("FROM") && !self.keyword_follows_current_word("FROM") {
+        if self.keyword_at_position("FROM")
+            && !self.keyword_follows_current_word("FROM")
+            && !self.byte_follows_current_word(b'+')
+        {
             return Err(self.unexpected("identifier"));
         }
         let column_name = self.parse_identifier()?;
+        let column_end = self.position;
+        self.skip_whitespace();
+        let projection = if self.peek() == Some(b'+') {
+            self.position += 1;
+            self.skip_whitespace();
+            let addend = self.parse_projection_int64()?;
+            SelectProjection::Int64Addition {
+                column_name,
+                addend,
+            }
+        } else {
+            self.position = column_end;
+            SelectProjection::Column(column_name)
+        };
         self.require_whitespace("whitespace before FROM")?;
         self.expect_keyword("FROM")?;
         self.require_whitespace("whitespace after FROM")?;
@@ -893,7 +946,7 @@ impl<'input> Parser<'input> {
         }
 
         Ok(SelectStatement {
-            column_name,
+            projection,
             table_name,
             predicate,
             order_by,
@@ -1103,6 +1156,32 @@ impl<'input> Parser<'input> {
             .map_err(|_| ParseError::Int64Overflow { offset: start })
     }
 
+    fn parse_projection_int64(&mut self) -> Result<i64, ParseError> {
+        let start = self.position;
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            self.position += 1;
+        }
+        let digits_start = self.position;
+        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            self.position += 1;
+        }
+
+        if self.position == digits_start {
+            return Err(ParseError::InvalidInt64 { offset: start });
+        }
+
+        let end = self.position;
+        if self.peek().is_some_and(|byte| !byte.is_ascii_whitespace()) {
+            return Err(ParseError::InvalidInt64 {
+                offset: self.position,
+            });
+        }
+
+        self.input[start..end]
+            .parse()
+            .map_err(|_| ParseError::Int64Overflow { offset: start })
+    }
+
     fn parse_limit(&mut self) -> Result<usize, ParseError> {
         let start = self.position;
         while self
@@ -1243,6 +1322,23 @@ impl<'input> Parser<'input> {
 
         self.word_end(next_start)
             .is_some_and(|next_end| self.input[next_start..next_end].eq_ignore_ascii_case(keyword))
+    }
+
+    fn byte_follows_current_word(&self, expected: u8) -> bool {
+        let Some(current_end) = self.word_end(self.position) else {
+            return false;
+        };
+
+        let mut next_start = current_end;
+        while self
+            .bytes
+            .get(next_start)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            next_start += 1;
+        }
+
+        self.bytes.get(next_start) == Some(&expected)
     }
 
     fn word_end(&self, start: usize) -> Option<usize> {

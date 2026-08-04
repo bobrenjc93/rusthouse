@@ -7,9 +7,9 @@ use std::fmt;
 use crate::{
     AggregateError, AggregateLimits, DistinctError, DistinctLimits, InsertError, InsertStatement,
     Int64Table, OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScalarSumStatement,
-    ScanError, ScanLimits, SelectDistinctStatement, SelectPredicate, SelectStatement,
-    aggregate_nullable_i64, count_nullable_i64, distinct_nullable_i64, order_nullable_i64,
-    scan_nullable_i64, scan_nullable_i64_nullness,
+    ScanError, ScanLimits, SelectDistinctStatement, SelectPredicate, SelectProjection,
+    SelectStatement, aggregate_nullable_i64, count_nullable_i64, distinct_nullable_i64,
+    order_nullable_i64, scan_nullable_i64, scan_nullable_i64_nullness,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -58,6 +58,8 @@ pub enum SelectExecutionError {
     Order(OrderError),
     /// The bounded aggregate operation rejected the input or selection size.
     Aggregate(AggregateError),
+    /// Adding the projection's constant to a selected value overflowed `Int64`.
+    Int64AdditionOverflow { value: i64, addend: i64 },
 }
 
 impl fmt::Display for SelectExecutionError {
@@ -68,6 +70,10 @@ impl fmt::Display for SelectExecutionError {
             Self::Scan(error) => write!(formatter, "could not scan rows: {error}"),
             Self::Order(error) => write!(formatter, "could not order rows: {error}"),
             Self::Aggregate(error) => write!(formatter, "could not aggregate rows: {error}"),
+            Self::Int64AdditionOverflow { value, addend } => write!(
+                formatter,
+                "adding {addend} to {value} in the SELECT projection overflows Int64"
+            ),
         }
     }
 }
@@ -78,7 +84,9 @@ impl Error for SelectExecutionError {
             Self::Scan(error) => Some(error),
             Self::Order(error) => Some(error),
             Self::Aggregate(error) => Some(error),
-            Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
+            Self::UnknownTable { .. }
+            | Self::UnknownColumn { .. }
+            | Self::Int64AdditionOverflow { .. } => None,
         }
     }
 }
@@ -380,9 +388,10 @@ pub fn execute_scalar_sum_with_limits(
 ///
 /// `expected_table_name` and the table's column name are compared exactly
 /// with the identifiers retained by the parser, including ASCII case. An
-/// unfiltered, unordered result borrows the table's existing column storage.
-/// A `WHERE` predicate uses its corresponding bounded scan, while
-/// `ORDER BY ... LIMIT` uses the bounded top-k operator and owns the ordered values. Use
+/// unfiltered, unordered plain-column result borrows the table's existing
+/// column storage. Scalar expressions own their projected values. A `WHERE`
+/// predicate uses its corresponding bounded scan, while `ORDER BY ... LIMIT`
+/// uses the bounded top-k operator and owns the ordered values. Use
 /// [`execute_select_with_order_limits`] for explicit bounds on both operators.
 ///
 /// # Examples
@@ -443,8 +452,9 @@ pub fn execute_select_with_limits<'table>(
 /// Executes one parsed `SELECT` with explicit scan and top-k order bounds.
 ///
 /// Ordered projections are materialized in the source-index order returned by
-/// [`order_nullable_i64`]. Unordered projections retain the borrowing behavior
-/// of [`execute_select_with_limits`].
+/// [`order_nullable_i64`]. Unordered plain-column projections retain the
+/// borrowing behavior of [`execute_select_with_limits`]; scalar expressions
+/// are evaluated after row selection and own their output.
 pub fn execute_select_with_order_limits<'table>(
     expected_table_name: &str,
     table: &'table Int64Table,
@@ -506,11 +516,14 @@ pub fn execute_select_with_order_limits<'table>(
             .map(|row_index| order_input[row_index])
             .collect();
 
-        return Ok(Cow::Owned(selected));
+        return project_selected_values(Cow::Owned(selected), statement.projection());
     }
 
     let Some(predicate) = statement.where_predicate() else {
-        return Ok(Cow::Borrowed(&values[..limit.min(values.len())]));
+        return project_selected_values(
+            Cow::Borrowed(&values[..limit.min(values.len())]),
+            statement.projection(),
+        );
     };
 
     let matching_rows = scan_select_predicate(values, predicate, scan_limits)?;
@@ -520,7 +533,32 @@ pub fn execute_select_with_order_limits<'table>(
         .map(|row_index| values[row_index])
         .collect();
 
-    Ok(Cow::Owned(selected))
+    project_selected_values(Cow::Owned(selected), statement.projection())
+}
+
+fn project_selected_values<'table>(
+    selected: Cow<'table, [Option<i64>]>,
+    projection: &SelectProjection,
+) -> Result<Cow<'table, [Option<i64>]>, SelectExecutionError> {
+    let SelectProjection::Int64Addition { addend, .. } = projection else {
+        return Ok(selected);
+    };
+
+    let projected = selected
+        .iter()
+        .copied()
+        .map(|value| match value {
+            None => Ok(None),
+            Some(value) => value.checked_add(*addend).map(Some).ok_or(
+                SelectExecutionError::Int64AdditionOverflow {
+                    value,
+                    addend: *addend,
+                },
+            ),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Cow::Owned(projected))
 }
 
 fn scan_select_predicate(
