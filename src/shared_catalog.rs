@@ -5,7 +5,8 @@ use std::fmt;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
-    AggregateLimits, Catalog, CatalogError, CatalogLimits, DistinctLimits, ParseLimits, ScanLimits,
+    AggregateLimits, Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CsvIngestLimits,
+    DistinctLimits, ParseLimits, ScanLimits,
 };
 
 /// An error produced while accessing a [`SharedCatalog`].
@@ -13,6 +14,8 @@ use crate::{
 pub enum SharedCatalogError {
     /// The catalog rejected the parsed or executed statement.
     Catalog(CatalogError),
+    /// The catalog rejected a CSV ingestion request.
+    CsvIngest(CatalogCsvIngestError),
     /// A thread panicked while it held the catalog's write lock.
     LockPoisoned,
 }
@@ -21,6 +24,7 @@ impl fmt::Display for SharedCatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Catalog(error) => write!(formatter, "catalog operation failed: {error}"),
+            Self::CsvIngest(error) => write!(formatter, "catalog CSV ingestion failed: {error}"),
             Self::LockPoisoned => write!(formatter, "shared catalog lock is poisoned"),
         }
     }
@@ -30,6 +34,7 @@ impl Error for SharedCatalogError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Catalog(error) => Some(error),
+            Self::CsvIngest(error) => Some(error),
             Self::LockPoisoned => None,
         }
     }
@@ -41,9 +46,15 @@ impl From<CatalogError> for SharedCatalogError {
     }
 }
 
+impl From<CatalogCsvIngestError> for SharedCatalogError {
+    fn from(error: CatalogCsvIngestError) -> Self {
+        Self::CsvIngest(error)
+    }
+}
+
 /// A clonable, synchronized handle to an in-memory [`Catalog`].
 ///
-/// CREATE and INSERT operations take an exclusive write lock. SELECT
+/// CREATE, INSERT, and CSV ingestion operations take an exclusive write lock. SELECT
 /// operations take a shared read lock, and projection results are copied into
 /// owned vectors before the lock is released.
 ///
@@ -125,6 +136,18 @@ impl SharedCatalog {
             .map_err(Into::into)
     }
 
+    /// Atomically ingests bounded `CSVWithNames` bytes under a write lock.
+    pub fn ingest_csv_with_names(
+        &self,
+        table_name: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, SharedCatalogError> {
+        self.write()?
+            .ingest_csv_with_names(table_name, input, limits)
+            .map_err(Into::into)
+    }
+
     /// Parses and executes one projection `SELECT` under a read lock.
     ///
     /// The returned rows own their storage and remain valid after other handles
@@ -165,6 +188,19 @@ impl SharedCatalog {
             .map_err(Into::into)
     }
 
+    /// Executes a scalar `COUNT` under a read lock with explicit scan and aggregate bounds.
+    pub fn execute_scalar_count_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<u64, SharedCatalogError> {
+        self.read()?
+            .execute_scalar_count_with_limits(input, parse_limits, scan_limits, aggregate_limits)
+            .map_err(Into::into)
+    }
+
     /// Executes a scalar `SUM` under a read lock with explicit aggregate bounds.
     pub fn execute_scalar_sum(
         &self,
@@ -174,6 +210,19 @@ impl SharedCatalog {
     ) -> Result<Option<i64>, SharedCatalogError> {
         self.read()?
             .execute_scalar_sum(input, parse_limits, aggregate_limits)
+            .map_err(Into::into)
+    }
+
+    /// Executes a scalar `SUM` under a read lock with explicit scan and aggregate bounds.
+    pub fn execute_scalar_sum_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, SharedCatalogError> {
+        self.read()?
+            .execute_scalar_sum_with_limits(input, parse_limits, scan_limits, aggregate_limits)
             .map_err(Into::into)
     }
 

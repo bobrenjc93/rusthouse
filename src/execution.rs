@@ -178,13 +178,12 @@ pub fn execute_insert(
     table.append(statement.value()).map_err(Into::into)
 }
 
-/// Executes one parsed scalar `COUNT` with explicit resource bounds.
+/// Executes one parsed scalar `COUNT` with explicit aggregate bounds.
 ///
 /// The expected table name and optional column name are compared exactly with
-/// the identifiers retained by the parser, including ASCII case. On a match,
-/// execution delegates to [`count_nullable_i64`]: `COUNT(*)` includes all
-/// rows, while `COUNT(column)` excludes `NULL`. Both aggregate row caps are
-/// supplied explicitly by the caller.
+/// the identifiers retained by the parser, including ASCII case. Predicate
+/// scans use bounds sized to the table. Use [`execute_scalar_count_with_limits`]
+/// to supply explicit scan bounds as well.
 ///
 /// # Examples
 ///
@@ -216,6 +215,29 @@ pub fn execute_scalar_count(
     statement: &ScalarCountStatement,
     limits: AggregateLimits,
 ) -> Result<u64, SelectExecutionError> {
+    let rows = table.values().len();
+    execute_scalar_count_with_limits(
+        expected_table_name,
+        table,
+        statement,
+        ScanLimits::new(rows, rows),
+        limits,
+    )
+}
+
+/// Executes one parsed scalar `COUNT` with explicit scan and aggregate bounds.
+///
+/// A `WHERE` comparison first delegates to [`scan_nullable_i64`], which
+/// excludes `NULL` according to SQL comparison semantics. The returned source
+/// rows are then passed to [`count_nullable_i64`] as an explicit selection.
+/// Unfiltered counts aggregate all rows without consuming scan bounds.
+pub fn execute_scalar_count_with_limits(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &ScalarCountStatement,
+    scan_limits: ScanLimits,
+    aggregate_limits: AggregateLimits,
+) -> Result<u64, SelectExecutionError> {
     if statement.table_name().as_str() != expected_table_name {
         return Err(SelectExecutionError::UnknownTable {
             name: statement.table_name().as_str().to_owned(),
@@ -230,7 +252,29 @@ pub fn execute_scalar_count(
         }
     }
 
-    let counts = count_nullable_i64(table.values(), RowSelection::All, limits)?;
+    if let Some(predicate) = statement.predicate() {
+        if predicate.column_name().as_str() != table.schema().column().name() {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: predicate.column_name().as_str().to_owned(),
+            });
+        }
+    }
+
+    let matching_rows = statement
+        .predicate()
+        .map(|predicate| {
+            scan_nullable_i64(
+                table.values(),
+                predicate.operator(),
+                predicate.value(),
+                scan_limits,
+            )
+        })
+        .transpose()?;
+    let selection = matching_rows
+        .as_deref()
+        .map_or(RowSelection::All, RowSelection::Indices);
+    let counts = count_nullable_i64(table.values(), selection, aggregate_limits)?;
     Ok(if statement.column_name().is_some() {
         counts.count_column()
     } else {
@@ -274,7 +318,29 @@ pub fn execute_scalar_sum(
     expected_table_name: &str,
     table: &Int64Table,
     statement: &ScalarSumStatement,
-    limits: AggregateLimits,
+    aggregate_limits: AggregateLimits,
+) -> Result<Option<i64>, SelectExecutionError> {
+    let rows = table.values().len();
+    execute_scalar_sum_with_limits(
+        expected_table_name,
+        table,
+        statement,
+        ScanLimits::new(rows, rows),
+        aggregate_limits,
+    )
+}
+
+/// Executes one parsed scalar `SUM` with explicit scan and aggregate bounds.
+///
+/// A comparison predicate is evaluated by [`scan_nullable_i64`] before the
+/// aggregate receives the matching source-row indices. Unfiltered statements
+/// do not scan and aggregate every row directly.
+pub fn execute_scalar_sum_with_limits(
+    expected_table_name: &str,
+    table: &Int64Table,
+    statement: &ScalarSumStatement,
+    scan_limits: ScanLimits,
+    aggregate_limits: AggregateLimits,
 ) -> Result<Option<i64>, SelectExecutionError> {
     if statement.table_name().as_str() != expected_table_name {
         return Err(SelectExecutionError::UnknownTable {
@@ -288,7 +354,25 @@ pub fn execute_scalar_sum(
         });
     }
 
-    let aggregates = aggregate_nullable_i64(table.values(), RowSelection::All, limits)?;
+    if let Some(predicate) = statement.predicate() {
+        if predicate.column_name().as_str() != table.schema().column().name() {
+            return Err(SelectExecutionError::UnknownColumn {
+                name: predicate.column_name().as_str().to_owned(),
+            });
+        }
+    }
+
+    let values = table.values();
+    let matching_rows = statement
+        .predicate()
+        .map(|predicate| {
+            scan_nullable_i64(values, predicate.operator(), predicate.value(), scan_limits)
+        })
+        .transpose()?;
+    let selection = matching_rows
+        .as_deref()
+        .map_or(RowSelection::All, RowSelection::Indices);
+    let aggregates = aggregate_nullable_i64(values, selection, aggregate_limits)?;
     Ok(aggregates.sum())
 }
 

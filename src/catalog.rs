@@ -9,15 +9,17 @@ use crate::execution::{
     InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError,
     execute_insert as execute_insert_statement,
     execute_scalar_count as execute_scalar_count_statement,
-    execute_scalar_sum as execute_scalar_sum_statement,
+    execute_scalar_count_with_limits as execute_scalar_count_statement_with_limits,
+    execute_scalar_sum_with_limits as execute_scalar_sum_statement_with_limits,
     execute_select_distinct as execute_select_distinct_statement,
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    AggregateLimits, CreateTableStatement, DistinctLimits, InsertStatement, Int64Table,
-    OrderLimits, ParseError, ParseLimits, ScalarCountStatement, ScalarSumStatement, ScanLimits,
-    Schema, SelectDistinctStatement, SelectStatement, parse_create_table, parse_insert,
-    parse_scalar_count, parse_scalar_sum, parse_select, parse_select_distinct,
+    AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
+    InsertStatement, Int64Table, OrderLimits, ParseError, ParseLimits, ScalarCountStatement,
+    ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement, SelectStatement,
+    ingest_csv_with_names, parse_create_table, parse_insert, parse_scalar_count, parse_scalar_sum,
+    parse_select, parse_select_distinct,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -91,6 +93,39 @@ impl Error for CatalogError {
 impl From<ParseError> for CatalogError {
     fn from(error: ParseError) -> Self {
         Self::Parse(error)
+    }
+}
+
+/// An error produced while ingesting CSV through a [`Catalog`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCsvIngestError {
+    /// No table has the exact requested name.
+    UnknownTable { name: String },
+    /// The named table rejected the CSV input.
+    Csv(CsvIngestError),
+}
+
+impl fmt::Display for CatalogCsvIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::Csv(error) => write!(formatter, "could not ingest CSV: {error}"),
+        }
+    }
+}
+
+impl Error for CatalogCsvIngestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Csv(error) => Some(error),
+            Self::UnknownTable { .. } => None,
+        }
+    }
+}
+
+impl From<CsvIngestError> for CatalogCsvIngestError {
+    fn from(error: CsvIngestError) -> Self {
+        Self::Csv(error)
     }
 }
 
@@ -218,6 +253,23 @@ impl Catalog {
         execute_insert_statement(name, table, statement).map_err(CatalogError::Insert)
     }
 
+    /// Atomically ingests bounded `CSVWithNames` bytes into an exactly named table.
+    pub fn ingest_csv_with_names(
+        &mut self,
+        table_name: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, CatalogCsvIngestError> {
+        let table =
+            self.tables
+                .get_mut(table_name)
+                .ok_or_else(|| CatalogCsvIngestError::UnknownTable {
+                    name: table_name.to_owned(),
+                })?;
+
+        ingest_csv_with_names(table, input, limits).map_err(Into::into)
+    }
+
     /// Parses and executes one scalar `COUNT` with explicit resource bounds.
     pub fn execute_scalar_count(
         &self,
@@ -227,6 +279,18 @@ impl Catalog {
     ) -> Result<u64, CatalogError> {
         let statement = parse_scalar_count(input, parse_limits)?;
         self.scalar_count(&statement, aggregate_limits)
+    }
+
+    /// Parses and executes one scalar `COUNT` with explicit scan and aggregate bounds.
+    pub fn execute_scalar_count_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<u64, CatalogError> {
+        let statement = parse_scalar_count(input, parse_limits)?;
+        self.scalar_count_with_limits(&statement, scan_limits, aggregate_limits)
     }
 
     /// Executes a parsed scalar `COUNT` against its exactly named table.
@@ -245,6 +309,30 @@ impl Catalog {
         execute_scalar_count_statement(name, table, statement, limits).map_err(CatalogError::Select)
     }
 
+    /// Executes a parsed scalar `COUNT` with explicit scan and aggregate bounds.
+    pub fn scalar_count_with_limits(
+        &self,
+        statement: &ScalarCountStatement,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<u64, CatalogError> {
+        let name = statement.table_name().as_str();
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Select(SelectExecutionError::UnknownTable {
+                name: name.to_owned(),
+            })
+        })?;
+
+        execute_scalar_count_statement_with_limits(
+            name,
+            table,
+            statement,
+            scan_limits,
+            aggregate_limits,
+        )
+        .map_err(CatalogError::Select)
+    }
+
     /// Parses and executes one scalar `SUM` with explicit resource bounds.
     pub fn execute_scalar_sum(
         &self,
@@ -252,15 +340,51 @@ impl Catalog {
         parse_limits: ParseLimits,
         aggregate_limits: AggregateLimits,
     ) -> Result<Option<i64>, CatalogError> {
+        self.execute_scalar_sum_with_limits(
+            input,
+            parse_limits,
+            ScanLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+            aggregate_limits,
+        )
+    }
+
+    /// Parses and executes one scalar `SUM` with explicit scan and aggregate bounds.
+    pub fn execute_scalar_sum_with_limits(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
         let statement = parse_scalar_sum(input, parse_limits)?;
-        self.scalar_sum(&statement, aggregate_limits)
+        self.scalar_sum_with_limits(&statement, scan_limits, aggregate_limits)
     }
 
     /// Executes a parsed scalar `SUM` against its exactly named table.
     pub fn scalar_sum(
         &self,
         statement: &ScalarSumStatement,
-        limits: AggregateLimits,
+        aggregate_limits: AggregateLimits,
+    ) -> Result<Option<i64>, CatalogError> {
+        self.scalar_sum_with_limits(
+            statement,
+            ScanLimits::new(
+                self.limits.max_rows_per_table,
+                self.limits.max_rows_per_table,
+            ),
+            aggregate_limits,
+        )
+    }
+
+    /// Executes a parsed scalar `SUM` with explicit scan and aggregate bounds.
+    pub fn scalar_sum_with_limits(
+        &self,
+        statement: &ScalarSumStatement,
+        scan_limits: ScanLimits,
+        aggregate_limits: AggregateLimits,
     ) -> Result<Option<i64>, CatalogError> {
         let name = statement.table_name().as_str();
         let table = self.tables.get(name).ok_or_else(|| {
@@ -269,7 +393,14 @@ impl Catalog {
             })
         })?;
 
-        execute_scalar_sum_statement(name, table, statement, limits).map_err(CatalogError::Select)
+        execute_scalar_sum_statement_with_limits(
+            name,
+            table,
+            statement,
+            scan_limits,
+            aggregate_limits,
+        )
+        .map_err(CatalogError::Select)
     }
 
     /// Parses and executes one bounded projection `SELECT` statement.

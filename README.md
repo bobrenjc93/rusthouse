@@ -27,8 +27,9 @@ subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `Int64` predicates through `WHERE column operator literal`, where `operator` is
 `=`, `!=`, `<>`, `<`, `<=`, `>`, or `>=`, as well as `WHERE column IS NULL` and
 `WHERE column IS NOT NULL`. Both forms accept an optional nonnegative `LIMIT`.
-Scalar `SELECT COUNT(*)`, `SELECT COUNT(column)`, and `SELECT SUM(column)` use
-explicit aggregate row bounds and preserve SQL `NULL` semantics.
+Scalar `SELECT COUNT(*)`, `SELECT COUNT(column)`, and `SELECT SUM(column)`
+support the same comparison filters with explicit scan and aggregate row
+bounds while preserving SQL `NULL` semantics.
 The explicit
 `ORDER BY column ASC|DESC NULLS FIRST|LAST LIMIT n` form uses a bounded top-k
 operator and materializes rows in stable order. Plain projections borrow a
@@ -39,10 +40,10 @@ explicit input-row and distinct-value limits and returns deterministic
 `NULL`-first, ascending values.
 
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an
-`Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE` and `INSERT` with a
-write lock, allow `SELECT` operations through read locks, and return owned
-projection rows. Existing catalog failures remain typed, and lock poisoning is
-reported separately.
+`Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE`, `INSERT`, and CSV
+ingestion with a write lock, allow `SELECT` operations through read locks, and
+return owned projection rows. Existing catalog failures remain typed, and lock
+poisoning is reported separately.
 
 ## Snapshot envelope
 
@@ -61,6 +62,9 @@ filesystem replacement. The exact layouts are documented in
 schema column, and each LF- or CRLF-delimited record must be an unquoted decimal
 `Int64` or `NULL`. Callers supply byte and row limits; format, limit,
 nullability, or table-cap failures leave the table unchanged.
+`Catalog::ingest_csv_with_names` exposes the same transactional ingestion by
+exact table name without requiring direct access to catalog-owned tables;
+`SharedCatalog::ingest_csv_with_names` provides the synchronized equivalent.
 
 ## Development model
 
