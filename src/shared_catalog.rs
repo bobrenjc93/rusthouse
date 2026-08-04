@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
     AggregateLimits, Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CsvIngestLimits,
-    DistinctLimits, ParseLimits, ScanLimits,
+    DistinctLimits, JoinLimits, ParseLimits, ScanLimits,
 };
 
 /// An error produced while accessing a [`SharedCatalog`].
@@ -173,6 +173,21 @@ impl SharedCatalog {
         self.read()?
             .execute_select_with_limits(input, parse_limits, scan_limits)
             .map(|rows| rows.into_owned())
+            .map_err(Into::into)
+    }
+
+    /// Executes the narrow inner equi-join under a read lock with explicit bounds.
+    ///
+    /// The returned rows own their storage and remain valid after the lock is
+    /// released and other handles mutate either source table.
+    pub fn execute_inner_join(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        join_limits: JoinLimits,
+    ) -> Result<Vec<Option<i64>>, SharedCatalogError> {
+        self.read()?
+            .execute_inner_join(input, parse_limits, join_limits)
             .map_err(Into::into)
     }
 

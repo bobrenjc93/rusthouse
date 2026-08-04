@@ -538,6 +538,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:410",
+      "recordedAt": "2026-08-04T14:07:39.302Z",
+      "label": "PR #410",
+      "kind": "composite",
+      "prNumber": 410,
+      "title": "YOLO generation 19: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 65,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 30,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

@@ -4,9 +4,12 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod format;
+pub mod shared_database;
 pub mod sql;
 pub mod storage;
 pub mod value;
+
+pub use shared_database::{SharedDatabase, SharedDatabaseError};
 
 use std::error::Error as StdError;
 use std::fmt;

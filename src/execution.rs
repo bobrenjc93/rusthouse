@@ -5,11 +5,12 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    AggregateError, AggregateLimits, DistinctError, DistinctLimits, InsertError, InsertStatement,
-    Int64Table, OrderError, OrderLimits, RowSelection, ScalarCountStatement, ScalarMinStatement,
-    ScalarSumStatement, ScanError, ScanLimits, SelectDistinctStatement, SelectPredicate,
-    SelectStatement, aggregate_nullable_i64, count_nullable_i64, distinct_nullable_i64,
-    min_nullable_i64, order_nullable_i64, scan_nullable_i64, scan_nullable_i64_nullness,
+    AggregateError, AggregateLimits, DistinctError, DistinctLimits, InnerJoinStatement,
+    InsertError, InsertStatement, Int64Table, JoinError, JoinLimits, OrderError, OrderLimits,
+    RowSelection, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement, ScanError,
+    ScanLimits, SelectDistinctStatement, SelectPredicate, SelectStatement, aggregate_nullable_i64,
+    count_nullable_i64, distinct_nullable_i64, inner_equi_join_nullable_i64, min_nullable_i64,
+    order_nullable_i64, scan_nullable_i64, scan_nullable_i64_nullness,
 };
 
 /// An error produced while executing a parsed [`InsertStatement`].
@@ -137,6 +138,92 @@ impl From<DistinctError> for SelectDistinctExecutionError {
     fn from(error: DistinctError) -> Self {
         Self::Distinct(error)
     }
+}
+
+/// An error produced while executing a parsed [`InnerJoinStatement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InnerJoinExecutionError {
+    /// The statement names a table other than either table supplied for execution.
+    UnknownTable { name: String },
+    /// The statement names a column other than the relevant table's only column.
+    UnknownColumn { name: String },
+    /// The bounded join operator rejected an input or output size.
+    Join(JoinError),
+}
+
+impl fmt::Display for InnerJoinExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
+            Self::Join(error) => write!(formatter, "could not join rows: {error}"),
+        }
+    }
+}
+
+impl Error for InnerJoinExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Join(error) => Some(error),
+            Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
+        }
+    }
+}
+
+impl From<JoinError> for InnerJoinExecutionError {
+    fn from(error: JoinError) -> Self {
+        Self::Join(error)
+    }
+}
+
+/// Executes the narrow inner equi-join against two named one-column tables.
+///
+/// All identifiers are compared exactly, including ASCII case. On successful
+/// resolution, [`inner_equi_join_nullable_i64`] supplies duplicate
+/// cross-products, SQL `NULL` non-matching semantics, deterministic left-major
+/// order, and explicit input/output bounds. The returned values are projected
+/// from the left table in that match order.
+pub fn execute_inner_join(
+    expected_left_table_name: &str,
+    left_table: &Int64Table,
+    expected_right_table_name: &str,
+    right_table: &Int64Table,
+    statement: &InnerJoinStatement,
+    limits: JoinLimits,
+) -> Result<Vec<Option<i64>>, InnerJoinExecutionError> {
+    if statement.left_table_name().as_str() != expected_left_table_name {
+        return Err(InnerJoinExecutionError::UnknownTable {
+            name: statement.left_table_name().as_str().to_owned(),
+        });
+    }
+    if statement.right_table_name().as_str() != expected_right_table_name {
+        return Err(InnerJoinExecutionError::UnknownTable {
+            name: statement.right_table_name().as_str().to_owned(),
+        });
+    }
+
+    let left_column = left_table.schema().column().name();
+    for column_name in [
+        statement.projected_column_name(),
+        statement.left_column_name(),
+    ] {
+        if column_name.as_str() != left_column {
+            return Err(InnerJoinExecutionError::UnknownColumn {
+                name: column_name.as_str().to_owned(),
+            });
+        }
+    }
+    if statement.right_column_name().as_str() != right_table.schema().column().name() {
+        return Err(InnerJoinExecutionError::UnknownColumn {
+            name: statement.right_column_name().as_str().to_owned(),
+        });
+    }
+
+    let matches = inner_equi_join_nullable_i64(left_table.values(), right_table.values(), limits)?;
+    Ok(matches
+        .into_iter()
+        .map(|pair| left_table.values()[pair.left_row()])
+        .collect())
 }
 
 /// Executes one parsed `INSERT` against one explicitly named table.
