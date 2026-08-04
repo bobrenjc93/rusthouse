@@ -1,6 +1,7 @@
 use rusthouse::{
     AggregateError, AggregateLimits, Catalog, CatalogError, CatalogLimits, Int64Table, ParseLimits,
-    Schema, SelectExecutionError, execute_scalar_count, parse_scalar_count,
+    ScanError, ScanLimits, Schema, SelectExecutionError, execute_scalar_count,
+    execute_scalar_count_with_limits, parse_scalar_count,
 };
 
 fn table(values: &[Option<i64>]) -> Int64Table {
@@ -45,6 +46,53 @@ fn populated_input_distinguishes_rows_from_non_null_values() {
 }
 
 #[test]
+fn filters_both_count_forms_with_every_comparison_operator_and_sql_null_semantics() {
+    let table = table(&[
+        None,
+        Some(i64::MIN),
+        Some(-2),
+        Some(0),
+        Some(2),
+        Some(i64::MAX),
+        None,
+    ]);
+    let cases = [
+        ("=", 1),
+        ("!=", 4),
+        ("<>", 4),
+        ("<", 2),
+        ("<=", 3),
+        (">", 2),
+        (">=", 3),
+    ];
+
+    for argument in ["*", "value"] {
+        for (operator, expected) in cases {
+            let input = format!("SELECT COUNT({argument}) FROM readings WHERE value {operator} 0;");
+            assert_eq!(execute(&input, &table), expected, "{input:?}");
+        }
+    }
+}
+
+#[test]
+fn filtered_counts_return_zero_when_no_rows_match() {
+    let table = table(&[None, Some(i64::MIN), Some(i64::MAX), None]);
+
+    for argument in ["*", "value"] {
+        assert_eq!(
+            execute(
+                &format!(
+                    "SELECT COUNT({argument}) FROM readings WHERE value > {}",
+                    i64::MAX
+                ),
+                &table,
+            ),
+            0
+        );
+    }
+}
+
+#[test]
 fn counts_values_even_when_their_sum_would_overflow() {
     for values in [[Some(i64::MAX), Some(1)], [Some(i64::MIN), Some(-1)]] {
         let table = table(&values);
@@ -70,6 +118,12 @@ fn validates_table_and_column_identifiers_before_aggregation() {
                 name: "other".to_owned(),
             },
         ),
+        (
+            "SELECT COUNT(*) FROM readings WHERE other = 1",
+            SelectExecutionError::UnknownColumn {
+                name: "other".to_owned(),
+            },
+        ),
     ];
 
     for (input, expected) in cases {
@@ -78,6 +132,91 @@ fn validates_table_and_column_identifiers_before_aggregation() {
             execute_scalar_count("readings", &table, &statement, AggregateLimits::new(0, 0),),
             Err(expected),
             "{input:?}"
+        );
+    }
+}
+
+#[test]
+fn filtered_counts_preserve_scan_and_aggregate_limits() {
+    let table = table(&[Some(1), None, Some(1), Some(2), Some(3)]);
+
+    for argument in ["*", "value"] {
+        let statement = parse_scalar_count(
+            &format!("SELECT COUNT({argument}) FROM readings WHERE value >= 1"),
+            ParseLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            execute_scalar_count_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(5, 4),
+                AggregateLimits::new(5, 4),
+            ),
+            Ok(4),
+            "exact bounds for COUNT({argument})"
+        );
+        assert_eq!(
+            execute_scalar_count_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(4, 4),
+                AggregateLimits::new(5, 4),
+            ),
+            Err(SelectExecutionError::Scan(ScanError::InputLimitExceeded {
+                rows: 5,
+                max_rows: 4,
+            })),
+            "scan input bound for COUNT({argument})"
+        );
+        assert_eq!(
+            execute_scalar_count_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(5, 3),
+                AggregateLimits::new(5, 4),
+            ),
+            Err(SelectExecutionError::Scan(ScanError::ResultLimitExceeded {
+                rows: 4,
+                max_rows: 3,
+            })),
+            "scan result bound for COUNT({argument})"
+        );
+        assert_eq!(
+            execute_scalar_count_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(5, 4),
+                AggregateLimits::new(4, 4),
+            ),
+            Err(SelectExecutionError::Aggregate(
+                AggregateError::InputLimitExceeded {
+                    rows: 5,
+                    max_rows: 4,
+                }
+            )),
+            "aggregate input bound for COUNT({argument})"
+        );
+        assert_eq!(
+            execute_scalar_count_with_limits(
+                "readings",
+                &table,
+                &statement,
+                ScanLimits::new(5, 4),
+                AggregateLimits::new(5, 3),
+            ),
+            Err(SelectExecutionError::Aggregate(
+                AggregateError::SelectionLimitExceeded {
+                    rows: 4,
+                    max_rows: 3,
+                }
+            )),
+            "aggregate selection bound for COUNT({argument})"
         );
     }
 }
@@ -155,5 +294,14 @@ fn catalog_parses_and_executes_both_count_forms_with_supplied_limits() {
                 max_rows: 2,
             }
         )))
+    );
+    assert_eq!(
+        catalog.execute_scalar_count_with_limits(
+            "SELECT COUNT(*) FROM readings WHERE value >= 0",
+            parse_limits,
+            ScanLimits::new(3, 1),
+            AggregateLimits::new(3, 1),
+        ),
+        Ok(1)
     );
 }
