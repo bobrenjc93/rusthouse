@@ -268,6 +268,7 @@ impl Database {
         select: Select,
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
+        validate_distinct_shape(&select)?;
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -283,7 +284,14 @@ impl Database {
             })
             .collect::<Vec<_>>();
 
-        let group_columns = resolve_group_columns(table, &select.group_by)?;
+        let group_columns = if select.distinct {
+            let SelectItem::Column { name, alias: None } = &select.items[0] else {
+                unreachable!("the DISTINCT shape is validated")
+            };
+            vec![table.column_index(name)?]
+        } else {
+            resolve_group_columns(table, &select.group_by)?
+        };
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
         let having = select
@@ -293,7 +301,7 @@ impl Database {
             .transpose()?;
         let ordering = resolve_ordering(&result_columns, &select.order_by)?;
 
-        let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
+        let grouped = select.distinct || !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
             let grouped = execute_grouped(
                 table,
@@ -306,13 +314,19 @@ impl Database {
             if let Some(having) = having {
                 selected_groups.retain(|group| having.evaluate(&grouped, *group));
             }
-            order_grouped_rows(
-                &mut selected_groups,
-                &grouped,
-                &items,
-                &ordering,
-                select.limit,
-            );
+            if select.distinct {
+                if let Some(limit) = select.limit {
+                    selected_groups.truncate(limit);
+                }
+            } else {
+                order_grouped_rows(
+                    &mut selected_groups,
+                    &grouped,
+                    &items,
+                    &ordering,
+                    select.limit,
+                );
+            }
             validate_grouped_result_limits(
                 &grouped,
                 &selected_groups,
@@ -338,6 +352,30 @@ impl Database {
             rows,
         })
     }
+}
+
+fn validate_distinct_shape(select: &Select) -> Result<()> {
+    if !select.distinct {
+        return Ok(());
+    }
+
+    let one_unaliased_column = matches!(
+        select.items.as_slice(),
+        [SelectItem::Column { alias: None, .. }]
+    );
+    if !one_unaliased_column
+        || select.predicate.is_some()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || !select.order_by.is_empty()
+    {
+        return Err(Error::InvalidQuery(
+            "SELECT DISTINCT supports exactly one unaliased column and an optional LIMIT"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 impl StatementResult {
