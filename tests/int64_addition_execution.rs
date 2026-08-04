@@ -44,6 +44,20 @@ fn reports_typed_positive_and_negative_overflow() {
 }
 
 #[test]
+fn executes_addition_on_a_column_named_from() {
+    let mut table = Int64Table::new(Schema::int64("FROM", true), 2);
+    table.append_batch(&[Some(4), None]).unwrap();
+    let statement = parse_select("SELECT FROM + 3 FROM readings", ParseLimits::default()).unwrap();
+
+    assert_eq!(
+        execute_select("readings", &table, &statement)
+            .unwrap()
+            .as_ref(),
+        &[Some(7), None]
+    );
+}
+
+#[test]
 fn evaluates_only_rows_selected_by_zero_and_exact_limits() {
     let table = table(&[Some(4), None, Some(i64::MAX)]);
 

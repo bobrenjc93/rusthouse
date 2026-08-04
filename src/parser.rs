@@ -820,7 +820,10 @@ impl<'input> Parser<'input> {
         self.skip_whitespace();
         self.expect_keyword("SELECT")?;
         self.require_whitespace("whitespace after SELECT")?;
-        if self.keyword_at_position("FROM") && !self.keyword_follows_current_word("FROM") {
+        if self.keyword_at_position("FROM")
+            && !self.keyword_follows_current_word("FROM")
+            && !self.byte_follows_current_word(b'+')
+        {
             return Err(self.unexpected("identifier"));
         }
         let column_name = self.parse_identifier()?;
@@ -1319,6 +1322,23 @@ impl<'input> Parser<'input> {
 
         self.word_end(next_start)
             .is_some_and(|next_end| self.input[next_start..next_end].eq_ignore_ascii_case(keyword))
+    }
+
+    fn byte_follows_current_word(&self, expected: u8) -> bool {
+        let Some(current_end) = self.word_end(self.position) else {
+            return false;
+        };
+
+        let mut next_start = current_end;
+        while self
+            .bytes
+            .get(next_start)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            next_start += 1;
+        }
+
+        self.bytes.get(next_start) == Some(&expected)
     }
 
     fn word_end(&self, start: usize) -> Option<usize> {

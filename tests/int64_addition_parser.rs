@@ -41,6 +41,17 @@ fn bounds_the_addition_column_identifier() {
 }
 
 #[test]
+fn parses_addition_on_a_column_named_from() {
+    for input in ["SELECT FROM + 1 FROM t", "SELECT FROM+1 FROM t;"] {
+        let statement = parse_select(input, ParseLimits::default()).unwrap();
+
+        assert_eq!(statement.column_name().as_str(), "FROM", "{input:?}");
+        assert_eq!(statement.projection().int64_addend(), Some(1), "{input:?}");
+        assert_eq!(statement.table_name().as_str(), "t", "{input:?}");
+    }
+}
+
+#[test]
 fn rejects_malformed_and_overflowing_addition_literals_with_offsets() {
     for input in [
         "SELECT c + FROM t",
