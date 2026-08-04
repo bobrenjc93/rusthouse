@@ -9,6 +9,14 @@ fn run(args: &[&str], input: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_allowing_stdin_close(args: &[&str], input: &[u8]) -> Output {
+    let mut child = spawn(args);
+    if let Err(error) = child.stdin.take().unwrap().write_all(input) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    child.wait_with_output().unwrap()
+}
+
 fn spawn(args: &[&str]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_rusthouse"))
         .args(args)
@@ -187,7 +195,7 @@ fn prints_each_select_result_in_statement_order() {
 #[test]
 fn help_prints_usage_without_reading_a_session() {
     for argument in ["--help", "-h"] {
-        let output = run(&[argument], b"not SQL\n");
+        let output = run_allowing_stdin_close(&[argument], b"not SQL\n");
 
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
