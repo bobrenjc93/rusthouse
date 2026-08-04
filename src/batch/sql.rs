@@ -74,6 +74,10 @@ pub enum SelectItem {
         target_type: DataType,
         alias: Option<String>,
     },
+    Length {
+        name: String,
+        alias: Option<String>,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
@@ -779,6 +783,13 @@ impl<'a> Parser<'a> {
                     target_type,
                     alias,
                 });
+            }
+
+            if name.eq_ignore_ascii_case("LENGTH") {
+                let name = self.expect_identifier("String column in LENGTH")?;
+                self.expect(&TokenKind::RightParen, "')' after LENGTH expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Length { name, alias });
             }
 
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {

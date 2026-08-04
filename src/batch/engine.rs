@@ -61,8 +61,8 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST` projections support converting an `Int64` column to `Float64` in an
-/// ungrouped query. An optional `AS` alias controls the result column name.
+/// `CAST` and `LENGTH` provide bounded scalar projections in ungrouped
+/// queries. An optional `AS` alias controls each result column name.
 ///
 /// # Examples
 ///
@@ -406,7 +406,7 @@ impl Database {
                 &result_columns,
                 query_result_limits,
             )?;
-            execute_projection(table, &matching_rows, &items)
+            execute_projection(table, &matching_rows, &items)?
         };
 
         Ok(QueryResult {
@@ -503,6 +503,9 @@ enum ResolvedItem {
         group_position: Option<usize>,
     },
     CastInt64ToFloat64 {
+        source: usize,
+    },
+    StringLength {
         source: usize,
     },
     Aggregate {
@@ -652,6 +655,30 @@ fn resolve_select_items(
                     data_type: DataType::Float64,
                 });
             }
+            SelectItem::Length { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::String {
+                    return Err(Error::TypeMismatch {
+                        context: format!("LENGTH argument '{name}'"),
+                        expected: DataType::String.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "LENGTH projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::StringLength { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("LENGTH({})", table.schema()[source].name)),
+                    data_type: DataType::Int64,
+                });
+            }
             SelectItem::Aggregate {
                 function,
                 argument,
@@ -776,20 +803,25 @@ fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
     items: &[ResolvedItem],
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>> {
     matching_rows
         .iter()
         .map(|row| {
             items
                 .iter()
-                .map(|item| match item {
-                    ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
-                    ResolvedItem::CastInt64ToFloat64 { source } => {
-                        Value::Float64(int64_at(table, *source, *row) as f64)
-                    }
-                    ResolvedItem::Aggregate { .. } => {
-                        unreachable!("projection does not contain aggregates")
-                    }
+                .map(|item| {
+                    Ok(match item {
+                        ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                        ResolvedItem::CastInt64ToFloat64 { source } => {
+                            Value::Float64(int64_at(table, *source, *row) as f64)
+                        }
+                        ResolvedItem::StringLength { source } => Value::Int64(
+                            string_length_to_i64(string_at(table, *source, *row).len())?,
+                        ),
+                        ResolvedItem::Aggregate { .. } => {
+                            unreachable!("projection does not contain aggregates")
+                        }
+                    })
                 })
                 .collect()
         })
@@ -814,7 +846,7 @@ fn validate_projection_result_limits(
         for item in items {
             let source = match item {
                 ResolvedItem::Column { source, .. } => Some(*source),
-                ResolvedItem::CastInt64ToFloat64 { .. } => None,
+                ResolvedItem::CastInt64ToFloat64 { .. } | ResolvedItem::StringLength { .. } => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
                 }
@@ -860,6 +892,9 @@ fn validate_grouped_result_limits(
                 } => unreachable!("grouped columns are validated"),
                 ResolvedItem::CastInt64ToFloat64 { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::StringLength { .. } => {
+                    unreachable!("LENGTH projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Aggregate { state } => match &data.aggregates[*state][*group] {
                     Value::String(value) => value.len(),
@@ -1220,6 +1255,9 @@ impl GroupedData<'_> {
                         ResolvedItem::CastInt64ToFloat64 { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::StringLength { .. } => {
+                            unreachable!("LENGTH projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::Aggregate { state } => {
                             self.aggregates[*state][*group].clone()
                         }
@@ -1523,6 +1561,9 @@ fn order_source_rows(
                     let right = ValueRef::Float64(int64_at(table, source, right) as f64);
                     left.cmp(&right)
                 }
+                ResolvedItem::StringLength { source } => string_at(table, source, left)
+                    .len()
+                    .cmp(&string_at(table, source, right).len()),
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
                 }
@@ -1562,6 +1603,9 @@ fn order_grouped_rows(
                 ResolvedItem::CastInt64ToFloat64 { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
+                ResolvedItem::StringLength { .. } => {
+                    unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::Aggregate { state } => {
                     data.aggregates[state][left].cmp(&data.aggregates[state][right])
                 }
@@ -1583,6 +1627,17 @@ fn int64_at(table: &Table, source: usize, row: usize) -> i64 {
         unreachable!("CAST input type is resolved")
     };
     values[row]
+}
+
+fn string_at(table: &Table, source: usize, row: usize) -> &str {
+    let Column::String(values) = &table.columns()[source] else {
+        unreachable!("LENGTH input type is resolved")
+    };
+    &values[row]
+}
+
+fn string_length_to_i64(length: usize) -> Result<i64> {
+    i64::try_from(length).map_err(|_| Error::NumericOverflow("LENGTH(String)".to_owned()))
 }
 
 fn sort_and_limit(
@@ -1726,6 +1781,16 @@ mod tests {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
         }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn string_length_reports_int64_overflow() {
+        let overflow = usize::try_from(i64::MAX).unwrap() + 1;
+        assert_eq!(
+            string_length_to_i64(overflow),
+            Err(Error::NumericOverflow("LENGTH(String)".to_owned()))
+        );
     }
 
     #[test]
