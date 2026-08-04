@@ -44,8 +44,8 @@ pub use scan::{
 };
 pub use shared_catalog::{SharedCatalog, SharedCatalogError};
 pub use snapshot::{
-    NullableI64PayloadCodec, NullableI64PayloadError, SnapshotCodec, SnapshotError,
-    SnapshotFileError,
+    Int64TableRestoreError, NullableI64PayloadCodec, NullableI64PayloadError, SnapshotCodec,
+    SnapshotError, SnapshotFileError, restore_int64_table,
 };
 mod storage;
 
