@@ -165,6 +165,14 @@ pub fn parse(input: &str) -> Result<Vec<Statement>> {
     parse_with_limits(input, BatchSqlLimits::default())
 }
 
+/// Parses a batch while allowing no executable statements.
+///
+/// This lets one-statement APIs report their own typed statement-count error
+/// without changing the general batch parser's empty-input syntax error.
+pub(crate) fn parse_allow_empty(input: &str) -> Result<Vec<Statement>> {
+    Parser::new(input, BatchSqlLimits::default()).parse_script(true)
+}
+
 /// Parses a batch with an explicit executable-statement limit.
 pub fn parse_with_statement_limit(input: &str, max_statements: usize) -> Result<Vec<Statement>> {
     parse_with_limits(
@@ -178,7 +186,7 @@ pub fn parse_with_statement_limit(input: &str, max_statements: usize) -> Result<
 
 /// Parses a batch lazily with explicit AST allocation limits.
 pub fn parse_with_limits(input: &str, limits: BatchSqlLimits) -> Result<Vec<Statement>> {
-    Parser::new(input, limits).parse_script()
+    Parser::new(input, limits).parse_script(false)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -445,7 +453,7 @@ impl<'a> Parser<'a> {
         std::mem::replace(&mut self.current, next).kind
     }
 
-    fn parse_script(mut self) -> Result<Vec<Statement>> {
+    fn parse_script(mut self, allow_empty: bool) -> Result<Vec<Statement>> {
         let mut statements = Vec::new();
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
@@ -461,7 +469,7 @@ impl<'a> Parser<'a> {
             }
             while self.eat(&TokenKind::Semicolon) {}
         }
-        if statements.is_empty() {
+        if statements.is_empty() && !allow_empty {
             return self.error("expected a SQL statement");
         }
         Ok(statements)
