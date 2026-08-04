@@ -15,14 +15,14 @@ pub mod snapshot;
 
 pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
-    aggregate_nullable_i64, count_nullable_i64,
+    aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
 pub use catalog::{Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits};
 pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
     InsertExecutionError, SelectDistinctExecutionError, SelectExecutionError, execute_insert,
-    execute_scalar_count, execute_scalar_count_with_limits, execute_scalar_sum,
+    execute_scalar_count, execute_scalar_count_with_limits, execute_scalar_min, execute_scalar_sum,
     execute_scalar_sum_with_limits, execute_select, execute_select_distinct,
     execute_select_with_limits, execute_select_with_order_limits,
 };
@@ -34,9 +34,9 @@ pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullab
 pub use parser::{
     ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
     InsertStatement, NullnessPredicate, OrderByClause, ParseError, ParseLimits,
-    ScalarCountArgument, ScalarCountStatement, ScalarSumStatement, SelectDistinctStatement,
-    SelectPredicate, SelectStatement, parse_create_table, parse_insert, parse_scalar_count,
-    parse_scalar_sum, parse_select, parse_select_distinct,
+    ScalarCountArgument, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement,
+    SelectDistinctStatement, SelectPredicate, SelectStatement, parse_create_table, parse_insert,
+    parse_scalar_count, parse_scalar_min, parse_scalar_sum, parse_select, parse_select_distinct,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,
