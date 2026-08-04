@@ -16,7 +16,7 @@ fn query(database: &mut Database, sql: &str) -> QueryResult {
 fn parses_length_as_a_bounded_select_item_with_an_optional_alias() {
     let statements = parse(
         "SELECT LENGTH(label), length(label) AS bytes FROM samples \
-         WHERE label != 'skip' ORDER BY bytes DESC LIMIT 2",
+         WHERE label != 'skip' ORDER BY length(label) DESC LIMIT 2",
     )
     .expect("valid LENGTH projections");
     let Statement::Select(select) = &statements[0] else {
@@ -37,7 +37,7 @@ fn parses_length_as_a_bounded_select_item_with_an_optional_alias() {
         ]
     );
     assert!(select.predicate.is_some());
-    assert_eq!(select.order_by[0].name, "bytes");
+    assert_eq!(select.order_by[0].name, "LENGTH(label)");
     assert!(select.order_by[0].descending);
     assert_eq!(select.limit, Some(2));
 
@@ -70,13 +70,13 @@ fn projects_utf8_byte_lengths_through_where_ordering_and_limit() {
 
     let ordered = query(
         &mut database,
-        "SELECT LENGTH(label) AS bytes FROM samples \
-         WHERE keep = true ORDER BY bytes DESC LIMIT 2",
+        "SELECT LENGTH(label) FROM samples \
+         WHERE keep = true ORDER BY LENGTH(label) DESC LIMIT 2",
     );
     assert_eq!(
         ordered.columns,
         [ResultColumn {
-            name: "bytes".to_owned(),
+            name: "LENGTH(label)".to_owned(),
             data_type: DataType::Int64,
         }]
     );
@@ -148,6 +148,9 @@ fn rejects_malformed_length_syntax() {
         "SELECT LENGTH(label FROM samples",
         "SELECT LENGTH(label) bytes FROM samples",
         "SELECT LENGTH(LENGTH(label)) FROM samples",
+        "SELECT LENGTH(label) FROM samples ORDER BY LENGTH()",
+        "SELECT LENGTH(label) FROM samples ORDER BY LENGTH(*)",
+        "SELECT LENGTH(label) FROM samples ORDER BY LENGTH(label",
     ] {
         assert!(parse(sql).is_err(), "{sql:?} must be rejected");
     }

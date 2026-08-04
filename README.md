@@ -50,9 +50,10 @@ ungrouped queries: they cannot be combined with aggregate projections or
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
 `LENGTH(<column>)`. `WHERE` filters source rows before evaluation, and the
-result or its alias can be used with `ORDER BY` and `LIMIT`. Non-`String`
-arguments and byte lengths outside the `Int64` range are reported as typed
-errors.
+unaliased expression can be ordered with `ORDER BY LENGTH(<column>)`; aliased
+projections can be ordered by their alias. Both forms support `LIMIT`.
+Non-`String` arguments and byte lengths outside the `Int64` range are reported
+as typed errors.
 
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
