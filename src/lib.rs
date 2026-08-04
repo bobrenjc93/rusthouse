@@ -19,6 +19,7 @@ pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
+pub use batch::{SharedDatabase, SharedDatabaseError};
 pub use catalog::{Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits};
 pub use cli::{
     DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_ROWS_PER_TABLE, DEFAULT_MAX_SESSION_STATEMENTS,
