@@ -570,6 +570,22 @@
         "eval_c88a7f3d": 30,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:413",
+      "recordedAt": "2026-08-04T15:36:19.745Z",
+      "label": "PR #413",
+      "kind": "leaf",
+      "prNumber": 413,
+      "title": "Extend typed batch DISTINCT to column tuples",
+      "scores": {
+        "eval_9fbdfec0": 65,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 30,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
