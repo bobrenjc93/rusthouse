@@ -87,8 +87,10 @@ reported as distinct typed error variants; a failure never returns a partially
 populated table.
 
 `restore_int64_table_from_file` provides the bounded filesystem entry point.
-It opens an existing snapshot without modifying it, rejects regular files
-larger than the 22-byte header plus the configured envelope payload limit, and
-reads no more than that bound. Open, read, oversized-file, and restoration
-failures remain distinct. After the bounded read it delegates to
-`restore_int64_table`, retaining the same all-or-nothing validation behavior.
+It requires a regular file so FIFOs and devices cannot block or hide trailing
+input behind stream metadata. It opens an existing snapshot without modifying
+it, rejects files larger than the 22-byte header plus the configured envelope
+payload limit, and reads no more than that bound. Open, non-regular-file, read,
+oversized-file, and restoration failures remain distinct. After the bounded
+read it delegates to `restore_int64_table`, retaining the same all-or-nothing
+validation behavior.

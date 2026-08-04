@@ -7,7 +7,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -259,6 +259,8 @@ impl From<InsertError> for Int64TableRestoreError {
 pub enum Int64TableFileRestoreError {
     /// The snapshot path could not be opened for reading.
     Open(io::Error),
+    /// The snapshot path does not identify a regular file.
+    NotRegularFile,
     /// The opened snapshot file could not be inspected or read completely.
     Read(io::Error),
     /// The file is larger than the envelope header plus the payload limit.
@@ -271,6 +273,7 @@ impl fmt::Display for Int64TableFileRestoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Open(error) => write!(formatter, "could not open snapshot file: {error}"),
+            Self::NotRegularFile => write!(formatter, "snapshot path is not a regular file"),
             Self::Read(error) => write!(formatter, "could not read snapshot file: {error}"),
             Self::FileTooLarge {
                 file_len,
@@ -288,7 +291,7 @@ impl Error for Int64TableFileRestoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Open(error) | Self::Read(error) => Some(error),
-            Self::FileTooLarge { .. } => None,
+            Self::NotRegularFile | Self::FileTooLarge { .. } => None,
             Self::Restore(error) => Some(error),
         }
     }
@@ -668,10 +671,11 @@ pub fn restore_int64_table(
 /// Opens a bounded snapshot file and restores one `Int64` table from it.
 ///
 /// At most the envelope header plus `snapshot_codec`'s configured payload
-/// limit is read. A larger regular file is rejected before its contents are
-/// read. The bounded bytes are passed to [`restore_int64_table`], so all
-/// envelope, payload, schema, and row-cap validation finishes before a table
-/// is returned.
+/// limit is read. The path must identify a regular file, preventing streams
+/// and devices from blocking or hiding trailing input behind an unreliable
+/// metadata length. A larger file is rejected before its contents are read.
+/// The bounded bytes are passed to [`restore_int64_table`], so all envelope,
+/// payload, schema, and row-cap validation finishes before a table is returned.
 pub fn restore_int64_table_from_file(
     path: impl AsRef<Path>,
     schema: Schema,
@@ -679,6 +683,12 @@ pub fn restore_int64_table_from_file(
     snapshot_codec: SnapshotCodec,
     payload_codec: NullableI64PayloadCodec,
 ) -> Result<Int64Table, Int64TableFileRestoreError> {
+    let path = path.as_ref();
+    let path_metadata = fs::metadata(path).map_err(Int64TableFileRestoreError::Open)?;
+    if !path_metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
     let mut file = File::open(path).map_err(Int64TableFileRestoreError::Open)?;
     let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
     let file_len = bounded_file_len(&file, max_file_len)?;
@@ -696,10 +706,12 @@ pub fn restore_int64_table_from_file(
 }
 
 fn bounded_file_len(file: &File, max_file_len: usize) -> Result<u64, Int64TableFileRestoreError> {
-    let file_len = file
-        .metadata()
-        .map_err(Int64TableFileRestoreError::Read)?
-        .len();
+    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    let file_len = metadata.len();
     let max_file_len_u64 = u64::try_from(max_file_len).unwrap_or(u64::MAX);
     if file_len > max_file_len_u64 {
         return Err(Int64TableFileRestoreError::FileTooLarge {

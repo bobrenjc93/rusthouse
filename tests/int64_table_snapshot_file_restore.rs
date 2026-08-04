@@ -172,9 +172,8 @@ fn rejects_a_file_larger_than_the_header_and_payload_limit() {
     ));
 }
 
-#[cfg(unix)]
 #[test]
-fn reports_failures_after_open_as_read_errors() {
+fn rejects_a_directory_as_a_non_regular_file() {
     let directory = TestDirectory::new();
     let error = restore_int64_table_from_file(
         &directory.0,
@@ -185,5 +184,58 @@ fn reports_failures_after_open_as_read_errors() {
     )
     .unwrap_err();
 
-    assert!(matches!(error, Int64TableFileRestoreError::Read(_)));
+    assert!(matches!(error, Int64TableFileRestoreError::NotRegularFile));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_fifo_with_a_maximum_envelope_and_trailing_data() {
+    use std::io::Write as _;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let directory = TestDirectory::new();
+    let path = directory.join("stream.snapshot");
+    let status = Command::new("mkfifo").arg(&path).status().unwrap();
+    assert!(status.success());
+
+    let payload_codec = NullableI64PayloadCodec::new(0, 8);
+    let payload = payload_codec.encode(&[]).unwrap();
+    let snapshot_codec = SnapshotCodec::new(payload.len());
+    let mut bytes = snapshot_codec.encode(&payload).unwrap();
+    assert_eq!(bytes.len(), SNAPSHOT_HEADER_LEN + payload.len());
+    bytes.push(0xaa);
+
+    // Opening both FIFO ends keeps this hermetic writer from blocking while
+    // the restore call rejects the non-regular path before opening it.
+    let writer_path = path.clone();
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    let (done_sender, done_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let mut fifo = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(writer_path)
+            .unwrap();
+        fifo.write_all(&bytes).unwrap();
+        ready_sender.send(()).unwrap();
+        done_receiver.recv().unwrap();
+    });
+    ready_receiver.recv().unwrap();
+
+    let result = restore_int64_table_from_file(
+        path,
+        Schema::int64("reading", true),
+        0,
+        snapshot_codec,
+        payload_codec,
+    );
+
+    done_sender.send(()).unwrap();
+    writer.join().unwrap();
+    assert!(matches!(
+        result,
+        Err(Int64TableFileRestoreError::NotRegularFile)
+    ));
 }
