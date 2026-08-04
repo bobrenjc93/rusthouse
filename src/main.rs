@@ -8,7 +8,8 @@ Usage: rusthouse [OPTIONS]
 
 With no options, reads the legacy line-oriented Int64 session from stdin.
 With --format csv, reads one semicolon-delimited SQL batch through EOF and
-prints CSVWithNames output for each SELECT. CREATE and INSERT remain silent.
+prints CSVWithNames output for each SELECT or SHOW TABLES query. CREATE and
+INSERT remain silent.
 
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table

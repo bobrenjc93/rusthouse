@@ -130,7 +130,7 @@ impl Database {
                 .execute_statement_with_limits(statement, query_limits)
                 .map_err(|error| match error {
                     Error::ResourceLimitExceeded {
-                        resource: "SELECT result bytes",
+                        resource: "SELECT result bytes" | "SHOW TABLES result bytes",
                         actual,
                         ..
                     } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -192,7 +192,41 @@ impl Database {
             Statement::Select(select) => self
                 .execute_select(select, query_result_limits)
                 .map(StatementResult::Query),
+            Statement::ShowTables => self
+                .execute_show_tables(query_result_limits)
+                .map(StatementResult::Query),
         }
+    }
+
+    fn execute_show_tables(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
+        let names = self.catalog.table_names();
+        let columns = vec![ResultColumn {
+            name: "name".to_owned(),
+            data_type: DataType::String,
+        }];
+        let mut bytes = validate_result_shape(
+            names.len(),
+            1,
+            &columns,
+            query_result_limits,
+            SHOW_TABLES_RESULT_RESOURCES,
+        )?;
+        for name in &names {
+            bytes = bytes.saturating_add(name.len());
+            enforce_resource_limit(
+                SHOW_TABLES_RESULT_RESOURCES.bytes,
+                bytes,
+                query_result_limits.max_bytes,
+            )?;
+        }
+
+        Ok(QueryResult {
+            columns,
+            rows: names
+                .into_iter()
+                .map(|name| vec![Value::String(name.to_owned())])
+                .collect(),
+        })
     }
 
     fn execute_select(
@@ -610,7 +644,13 @@ fn validate_projection_result_limits(
     columns: &[ResultColumn],
     limits: QueryResultLimits,
 ) -> Result<()> {
-    let mut bytes = validate_result_shape(rows.len(), items.len(), columns, limits)?;
+    let mut bytes = validate_result_shape(
+        rows.len(),
+        items.len(),
+        columns,
+        limits,
+        SELECT_RESULT_RESOURCES,
+    )?;
     for row in rows {
         for item in items {
             let source = match item {
@@ -638,7 +678,13 @@ fn validate_grouped_result_limits(
     columns: &[ResultColumn],
     limits: QueryResultLimits,
 ) -> Result<()> {
-    let mut bytes = validate_result_shape(groups.len(), items.len(), columns, limits)?;
+    let mut bytes = validate_result_shape(
+        groups.len(),
+        items.len(),
+        columns,
+        limits,
+        SELECT_RESULT_RESOURCES,
+    )?;
     for group in groups {
         for item in items {
             let string_len = match item {
@@ -673,10 +719,11 @@ fn validate_result_shape(
     column_count: usize,
     columns: &[ResultColumn],
     limits: QueryResultLimits,
+    resources: QueryResultResources,
 ) -> Result<usize> {
-    enforce_resource_limit("SELECT result rows", row_count, limits.max_rows)?;
+    enforce_resource_limit(resources.rows, row_count, limits.max_rows)?;
     let value_count = row_count.saturating_mul(column_count);
-    enforce_resource_limit("SELECT result values", value_count, limits.max_values)?;
+    enforce_resource_limit(resources.values, value_count, limits.max_values)?;
 
     let column_bytes = columns
         .len()
@@ -690,9 +737,28 @@ fn validate_result_shape(
     let bytes = column_bytes
         .saturating_add(row_count.saturating_mul(std::mem::size_of::<Vec<Value>>()))
         .saturating_add(value_count.saturating_mul(std::mem::size_of::<Value>()));
-    enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+    enforce_resource_limit(resources.bytes, bytes, limits.max_bytes)?;
     Ok(bytes)
 }
+
+#[derive(Debug, Clone, Copy)]
+struct QueryResultResources {
+    rows: &'static str,
+    values: &'static str,
+    bytes: &'static str,
+}
+
+const SELECT_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "SELECT result rows",
+    values: "SELECT result values",
+    bytes: "SELECT result bytes",
+};
+
+const SHOW_TABLES_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "SHOW TABLES result rows",
+    values: "SHOW TABLES result values",
+    bytes: "SHOW TABLES result bytes",
+};
 
 fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> Result<()> {
     if actual > max {
@@ -1478,6 +1544,107 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn show_tables_returns_typed_empty_and_case_preserving_sorted_results() {
+        let mut database = Database::new();
+        let empty = query(&mut database, "SHOW TABLES");
+        assert_eq!(
+            empty.columns,
+            [ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            }]
+        );
+        assert!(empty.rows.is_empty());
+
+        database
+            .execute(
+                "CREATE TABLE zebra (id Int64); \
+                 CREATE TABLE Alpha (id Int64); \
+                 CREATE TABLE beta (id Int64);",
+            )
+            .expect("setup");
+        assert_eq!(
+            query(&mut database, "show tables;").rows,
+            [
+                vec![Value::String("Alpha".to_owned())],
+                vec![Value::String("beta".to_owned())],
+                vec![Value::String("zebra".to_owned())],
+            ]
+        );
+    }
+
+    #[test]
+    fn show_tables_obeys_query_and_retained_result_limits() {
+        let cases = [
+            (
+                QueryResultLimits {
+                    max_rows: 1,
+                    ..QueryResultLimits::default()
+                },
+                "SHOW TABLES result rows",
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 2,
+                    max_values: 1,
+                    ..QueryResultLimits::default()
+                },
+                "SHOW TABLES result values",
+            ),
+            (
+                QueryResultLimits {
+                    max_rows: 2,
+                    max_values: 2,
+                    max_bytes: 0,
+                    ..QueryResultLimits::default()
+                },
+                "SHOW TABLES result bytes",
+            ),
+        ];
+
+        for (limits, resource) in cases {
+            let mut database = Database::with_query_result_limits(limits);
+            database
+                .execute("CREATE TABLE Alpha (id Int64); CREATE TABLE beta (id Int64);")
+                .expect("setup");
+            let error = database
+                .execute("SHOW TABLES")
+                .expect_err("SHOW TABLES exceeds its configured result limit");
+            if resource == "SHOW TABLES result bytes" {
+                assert!(matches!(
+                    error,
+                    Error::ResourceLimitExceeded {
+                        resource: "SHOW TABLES result bytes",
+                        actual,
+                        max: 0,
+                    } if actual > 0
+                ));
+            } else {
+                assert_eq!(
+                    error,
+                    Error::ResourceLimitExceeded {
+                        resource,
+                        actual: 2,
+                        max: 1,
+                    }
+                );
+            }
+        }
+
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE Alpha (id Int64)")
+            .expect("setup");
+        assert!(matches!(
+            database.execute_with_result_limit("SHOW TABLES", 1),
+            Err(Error::ResultLimitExceeded {
+                bytes,
+                max_bytes: 1,
+            }) if bytes > 1
+        ));
     }
 
     #[test]

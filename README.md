@@ -28,6 +28,8 @@ multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a
 projected `COUNT(*)` alias in `HAVING`. String literals escape a quote by
 doubling it, so semicolons and line breaks inside literals do not split a batch.
+`SHOW TABLES` returns the catalog's display names in deterministic,
+case-insensitive order as one `String` column.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
@@ -60,11 +62,11 @@ scalar values. A separate cumulative 100,000-item limit covers `CREATE`
 columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so compact input cannot
 expand into an unbounded retained token or AST graph.
 Every statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
-statements are silent, and each `SELECT` is executed and emitted before the
-next statement, using a CSVWithNames-compatible header followed by typed rows;
-commas, quotes, and newlines in strings are CSV-escaped. A query result is
-checked before cloning against limits of 10,000 rows, 250,000 values, and an
-estimated 16 MiB. Grouped queries additionally allow 100,000 groups and bound
+statements are silent, and each `SELECT` or `SHOW TABLES` query is executed and
+emitted before the next statement, using a CSVWithNames-compatible header
+followed by typed rows; commas, quotes, and newlines in strings are CSV-escaped.
+A query result is checked before cloning against limits of 10,000 rows, 250,000
+values, and an estimated 16 MiB. Grouped queries additionally allow 100,000 groups and bound
 aggregate working state to 500,000 cells and an estimated 32 MiB, including
 cloned string extrema. The collecting library API separately caps all retained
 query results at an estimated 64 MiB.

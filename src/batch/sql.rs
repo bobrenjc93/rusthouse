@@ -45,6 +45,7 @@ pub enum Statement {
         rows: Vec<Vec<Value>>,
     },
     Select(Select),
+    ShowTables,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -464,9 +465,19 @@ impl<'a> Parser<'a> {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
             self.parse_select().map(Statement::Select)
+        } else if self.eat_keyword("SHOW") {
+            self.parse_show()
         } else {
-            self.error("expected CREATE, INSERT, or SELECT")
+            self.error("expected CREATE, INSERT, SELECT, or SHOW")
         }
+    }
+
+    fn parse_show(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLES")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after SHOW TABLES");
+        }
+        Ok(Statement::ShowTables)
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -959,6 +970,35 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_bounded_show_tables_with_an_optional_semicolon() {
+        for sql in ["SHOW TABLES", "show tables;"] {
+            assert_eq!(
+                parse(sql).expect("valid SHOW TABLES"),
+                [Statement::ShowTables]
+            );
+        }
+
+        assert_eq!(
+            parse_with_statement_limit("SHOW TABLES", 0).expect_err("statement limit applies"),
+            Error::StatementLimitExceeded {
+                statements: 1,
+                max_statements: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn show_tables_rejects_trailing_input_with_a_typed_sql_error() {
+        assert_eq!(
+            parse("SHOW TABLES extra").expect_err("trailing input is not a SHOW clause"),
+            Error::Sql {
+                position: 12,
+                message: "unexpected trailing input after SHOW TABLES".to_owned(),
+            }
+        );
     }
 
     #[test]
