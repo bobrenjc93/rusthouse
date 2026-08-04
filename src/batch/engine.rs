@@ -295,10 +295,7 @@ impl Database {
             .collect::<Vec<_>>();
 
         let group_columns = if select.distinct {
-            let SelectItem::Column { name, alias: None } = &select.items[0] else {
-                unreachable!("the DISTINCT shape is validated")
-            };
-            vec![table.column_index(name)?]
+            resolve_distinct_columns(table, &select.items)?
         } else {
             resolve_group_columns(table, &select.group_by)?
         };
@@ -369,23 +366,41 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
         return Ok(());
     }
 
-    let one_unaliased_column = matches!(
-        select.items.as_slice(),
-        [SelectItem::Column { alias: None, .. }]
-    );
-    if !one_unaliased_column
+    let unaliased_columns = !select.items.is_empty()
+        && select
+            .items
+            .iter()
+            .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
+    if !unaliased_columns
         || select.predicate.is_some()
         || !select.group_by.is_empty()
         || select.having.is_some()
         || !select.order_by.is_empty()
     {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports exactly one unaliased column and an optional LIMIT"
+            "SELECT DISTINCT supports one or more unaliased columns and an optional LIMIT"
                 .to_owned(),
         ));
     }
 
     Ok(())
+}
+
+fn resolve_distinct_columns(table: &Table, items: &[SelectItem]) -> Result<Vec<usize>> {
+    let mut columns = Vec::with_capacity(items.len());
+    for item in items {
+        let SelectItem::Column { name, alias: None } = item else {
+            unreachable!("the DISTINCT shape is validated")
+        };
+        let column = table.column_index(name)?;
+        if columns.contains(&column) {
+            return Err(Error::InvalidQuery(format!(
+                "DISTINCT column '{name}' is listed more than once"
+            )));
+        }
+        columns.push(column);
+    }
+    Ok(columns)
 }
 
 impl StatementResult {
