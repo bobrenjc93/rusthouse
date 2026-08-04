@@ -442,6 +442,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:401",
+      "recordedAt": "2026-08-04T08:53:15.962Z",
+      "label": "PR #401",
+      "kind": "leaf",
+      "prNumber": 401,
+      "title": "Document CAST with an executable batch API example",
+      "scores": {
+        "eval_9fbdfec0": 60,
+        "eval_29146f21": 85,
+        "eval_d43b14a4": 99,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

@@ -50,6 +50,40 @@ impl Default for QueryResultLimits {
 }
 
 /// A reusable in-memory SQL database.
+///
+/// `CAST` projections support converting an `Int64` column to `Float64` in an
+/// ungrouped query. An optional `AS` alias controls the result column name.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::batch::engine::{Database, ResultColumn, StatementResult};
+/// use rusthouse::batch::value::{DataType, Value};
+///
+/// let mut database = Database::new();
+/// let results = database.execute(
+///     "CREATE TABLE readings (value Int64); \
+///      INSERT INTO readings VALUES (7), (-2); \
+///      SELECT CAST(value AS Float64) AS value_f64 \
+///      FROM readings ORDER BY value_f64;",
+/// )?;
+///
+/// let StatementResult::Query(query) = &results[2] else {
+///     panic!("the SELECT must produce a query result");
+/// };
+/// assert_eq!(
+///     query.columns,
+///     vec![ResultColumn {
+///         name: "value_f64".to_owned(),
+///         data_type: DataType::Float64,
+///     }],
+/// );
+/// assert_eq!(
+///     query.rows,
+///     vec![vec![Value::Float64(-2.0)], vec![Value::Float64(7.0)]],
+/// );
+/// # Ok::<(), rusthouse::batch::error::Error>(())
+/// ```
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
