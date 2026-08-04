@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use engine::{Database, StatementResult};
-use format::{OutputFormat, render, write_csv};
+use format::{write_csv, write_json};
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
@@ -146,10 +146,7 @@ fn run_batch_with_limit(
                     write_csv(&mut output, &query).map_err(BatchError::Write)?;
                 }
                 BatchOutputFormat::Json => {
-                    let rendered = render(&query, OutputFormat::Json);
-                    output
-                        .write_all(rendered.as_bytes())
-                        .map_err(BatchError::WriteJson)?;
+                    write_json(&mut output, &query).map_err(BatchError::WriteJson)?;
                     output.write_all(b"\n").map_err(BatchError::WriteJson)?;
                 }
             }
@@ -197,6 +194,45 @@ mod tests {
             output,
             b"n,note\n1,semi;colon\n2,\"comma,value\"\nrows,total\n2,3\n"
         );
+    }
+
+    #[test]
+    fn json_batch_streams_multiple_results_on_separate_lines() {
+        let input = b"CREATE TABLE t (n Int64);\n\
+            INSERT INTO t VALUES (2), (1);\n\
+            SELECT n FROM t ORDER BY n;\n\
+            SELECT COUNT(*) AS rows FROM t;\n";
+        let mut output = Vec::new();
+
+        run_json_batch(&input[..], &mut output).expect("batch succeeds");
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"{"columns":[{"name":"n","type":"Int64"}],"rows":[[1],[2]]}"#,
+                "\n",
+                r#"{"columns":[{"name":"rows","type":"Int64"}],"rows":[[2]]}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn json_batch_preserves_typed_short_writer_failures() {
+        let mut output = FailAfterBytes {
+            remaining: 32,
+            written: 0,
+        };
+
+        let error = run_json_batch(&b"SHOW TABLES;"[..], &mut output)
+            .expect_err("writer stops during the JSON result");
+
+        let BatchError::WriteJson(source) = error else {
+            panic!("expected a typed JSON write error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert_eq!(output.written, 32);
     }
 
     #[test]

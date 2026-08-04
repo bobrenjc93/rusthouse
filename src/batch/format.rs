@@ -164,67 +164,85 @@ fn write_csv_field(output: &mut impl io::Write, value: &str) -> io::Result<()> {
     output.write_all(b"\"")
 }
 
-/// Render one result set with explicit column metadata and positional rows.
-///
-/// Positional rows preserve every value even when output column names repeat.
 fn render_json(result: &QueryResult) -> String {
-    let mut output = String::from("{\"columns\":[");
-    for (index, column) in result.columns.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str("{\"name\":");
-        write_json_string(&mut output, &column.name);
-        output.push_str(",\"type\":");
-        write_json_string(&mut output, &column.data_type.to_string());
-        output.push('}');
-    }
-    output.push_str("],\"rows\":[");
-    for (row_index, row) in result.rows.iter().enumerate() {
-        if row_index > 0 {
-            output.push(',');
-        }
-        output.push('[');
-        for (column_index, value) in row.iter().enumerate() {
-            if column_index > 0 {
-                output.push(',');
-            }
-            write_json_value(&mut output, value);
-        }
-        output.push(']');
-    }
-    output.push_str("]}");
-    output
+    let mut output = Vec::new();
+    write_json(&mut output, result).expect("writing JSON to a Vec cannot fail");
+    String::from_utf8(output).expect("JSON rendering preserves UTF-8")
 }
 
-fn write_json_value(output: &mut String, value: &Value) {
+/// Streams one JSON result with explicit column metadata and positional rows.
+///
+/// Positional rows preserve every value even when output column names repeat.
+pub fn write_json(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
+    output.write_all(b"{\"columns\":[")?;
+    for (index, column) in result.columns.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b",")?;
+        }
+        output.write_all(b"{\"name\":")?;
+        write_json_string(output, &column.name)?;
+        output.write_all(b",\"type\":")?;
+        write_json_string(output, &column.data_type.to_string())?;
+        output.write_all(b"}")?;
+    }
+    output.write_all(b"],\"rows\":[")?;
+    for (row_index, row) in result.rows.iter().enumerate() {
+        if row_index > 0 {
+            output.write_all(b",")?;
+        }
+        output.write_all(b"[")?;
+        for (column_index, value) in row.iter().enumerate() {
+            if column_index > 0 {
+                output.write_all(b",")?;
+            }
+            write_json_value(output, value)?;
+        }
+        output.write_all(b"]")?;
+    }
+    output.write_all(b"]}")
+}
+
+fn write_json_value(output: &mut impl io::Write, value: &Value) -> io::Result<()> {
     match value {
-        Value::Null(_) => output.push_str("null"),
-        Value::Int64(value) => write!(output, "{value}").expect("writing to String cannot fail"),
-        Value::Float64(value) => output.push_str(&Value::Float64(*value).as_display_string()),
-        Value::Bool(value) => write!(output, "{value}").expect("writing to String cannot fail"),
+        Value::Null(_) => output.write_all(b"null"),
+        Value::Int64(value) => write!(output, "{value}"),
+        Value::Float64(value) => {
+            output.write_all(Value::Float64(*value).as_display_string().as_bytes())
+        }
+        Value::Bool(value) => write!(output, "{value}"),
         Value::String(value) => write_json_string(output, value),
     }
 }
 
-fn write_json_string(output: &mut String, value: &str) {
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\u{08}' => output.push_str("\\b"),
-            '\u{0c}' => output.push_str("\\f"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            value if value.is_control() => {
-                write!(output, "\\u{:04x}", value as u32).expect("writing to String cannot fail");
+fn write_json_string(output: &mut impl io::Write, value: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
+    let mut unescaped_start = 0;
+    for (index, character) in value.char_indices() {
+        let escaped = match character {
+            '"' => Some(r#"\""#),
+            '\\' => Some(r"\\"),
+            '\u{08}' => Some(r"\b"),
+            '\u{0c}' => Some(r"\f"),
+            '\n' => Some(r"\n"),
+            '\r' => Some(r"\r"),
+            '\t' => Some(r"\t"),
+            character if character.is_control() => {
+                output.write_all(value[unescaped_start..index].as_bytes())?;
+                write!(output, "\\u{:04x}", character as u32)?;
+                unescaped_start = index + character.len_utf8();
+                continue;
             }
-            value => output.push(value),
+            _ => None,
+        };
+
+        if let Some(escaped) = escaped {
+            output.write_all(value[unescaped_start..index].as_bytes())?;
+            output.write_all(escaped.as_bytes())?;
+            unescaped_start = index + character.len_utf8();
         }
     }
-    output.push('"');
+    output.write_all(value[unescaped_start..].as_bytes())?;
+    output.write_all(b"\"")
 }
 
 #[cfg(test)]
@@ -269,6 +287,48 @@ mod tests {
     }
 
     #[test]
+    fn streams_all_json_value_types_and_escaping() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "null".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "integer".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "float".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ResultColumn {
+                    name: "boolean".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ResultColumn {
+                    name: "text\"\n".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: vec![vec![
+                Value::Null(DataType::String),
+                Value::Int64(i64::MIN),
+                Value::Float64(2.0),
+                Value::Bool(false),
+                Value::String("\"\\\u{08}\u{0c}\n\r\t\u{01}雪".to_owned()),
+            ]],
+        };
+        let expected = r#"{"columns":[{"name":"null","type":"String"},{"name":"integer","type":"Int64"},{"name":"float","type":"Float64"},{"name":"boolean","type":"Bool"},{"name":"text\"\n","type":"String"}],"rows":[[null,-9223372036854775808,2.0,false,"\"\\\b\f\n\r\t\u0001雪"]]}"#;
+        let mut output = Vec::new();
+
+        write_json(&mut output, &result).expect("Vec accepts streamed JSON");
+
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(render(&result, OutputFormat::Json), expected);
+    }
+
+    #[test]
     fn renders_typed_nulls_in_csv_table_and_json_formats() {
         let result = QueryResult {
             columns: vec![ResultColumn {
@@ -301,11 +361,13 @@ mod tests {
             ],
             rows: vec![vec![Value::Int64(1), Value::String("x".to_owned())]],
         };
+        let expected = r#"{"columns":[{"name":"id","type":"Int64"},{"name":"id","type":"String"}],"rows":[[1,"x"]]}"#;
+        let mut output = Vec::new();
 
-        assert_eq!(
-            render(&result, OutputFormat::Json),
-            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"id","type":"String"}],"rows":[[1,"x"]]}"#
-        );
+        write_json(&mut output, &result).expect("Vec accepts streamed JSON");
+
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(render(&result, OutputFormat::Json), expected);
     }
 
     #[test]
