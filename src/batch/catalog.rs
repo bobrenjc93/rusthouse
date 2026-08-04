@@ -37,6 +37,12 @@ impl Catalog {
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
     }
 
+    /// Returns the number of registered tables without allocating.
+    #[must_use]
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+
     /// Returns display names in deterministic, case-insensitive order.
     #[must_use]
     pub fn table_names(&self) -> Vec<&str> {
@@ -74,6 +80,8 @@ mod tests {
     #[test]
     fn table_names_are_sorted_without_changing_display_case() {
         let mut catalog = Catalog::new();
+        assert_eq!(catalog.table_count(), 0);
+
         for name in ["zebra", "Alpha", "beta"] {
             catalog
                 .create_table(
@@ -86,6 +94,7 @@ mod tests {
                 .expect("create table");
         }
 
+        assert_eq!(catalog.table_count(), 3);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
     }
 }
