@@ -443,10 +443,12 @@ struct ResolvedHaving {
 
 impl ResolvedHaving {
     fn evaluate(self, data: &GroupedData<'_>, group: usize) -> bool {
-        let Value::Int64(count) = data.aggregates[self.state][group] else {
-            unreachable!("HAVING is restricted to COUNT(*)")
+        let value = match data.aggregates[self.state][group].as_ref() {
+            ValueRef::Int64(value) => value,
+            ValueRef::Null(DataType::Int64) => return false,
+            _ => unreachable!("HAVING is restricted to COUNT(*) and SUM(Int64)"),
         };
-        let comparison = count.cmp(&self.value);
+        let comparison = value.cmp(&self.value);
         match self.operator {
             ComparisonOperator::Equal => comparison == Ordering::Equal,
             ComparisonOperator::NotEqual => comparison != Ordering::Equal,
@@ -642,14 +644,16 @@ fn resolve_having(
 
     let ResolvedItem::Aggregate { state } = items[output] else {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected COUNT(*)",
+            "HAVING alias '{}' must reference a projected COUNT(*) or SUM(Int64)",
             requested.alias
         )));
     };
     let spec = &aggregate_specs[state];
-    if spec.function != AggregateFunction::Count || spec.argument.is_some() {
+    let supported = (spec.function == AggregateFunction::Count && spec.argument.is_none())
+        || (spec.function == AggregateFunction::Sum && spec.input_type == Some(DataType::Int64));
+    if !supported {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected COUNT(*)",
+            "HAVING alias '{}' must reference a projected COUNT(*) or SUM(Int64)",
             requested.alias
         )));
     }
@@ -1760,6 +1764,48 @@ mod tests {
     }
 
     #[test]
+    fn having_sum_int64_alias_supports_signed_sums_and_every_comparison_operator() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String, amount Int64); \
+                 INSERT INTO events VALUES \
+                 ('negative', -5), ('negative', 1), \
+                 ('zero', -2), ('zero', 2), \
+                 ('positive', 2), ('positive', 5);",
+            )
+            .expect("setup");
+
+        let cases = [
+            ("=", "-4", &["negative"][..]),
+            ("!=", "0", &["negative", "positive"][..]),
+            ("<>", "0", &["negative", "positive"][..]),
+            ("<", "0", &["negative"][..]),
+            ("<=", "0", &["negative", "zero"][..]),
+            (">", "-4", &["positive", "zero"][..]),
+            (">=", "+7", &["positive"][..]),
+        ];
+        for (operator, threshold, expected_kinds) in cases {
+            let result = query(
+                &mut database,
+                &format!(
+                    "SELECT kind, COUNT(*) AS n, SUM(amount) AS Total FROM events \
+                     GROUP BY kind HAVING total {operator} {threshold} ORDER BY kind"
+                ),
+            );
+            let actual_kinds = result
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::String(value) => value.as_str(),
+                    _ => panic!("kind is a string"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_kinds, expected_kinds, "operator {operator}");
+        }
+    }
+
+    #[test]
     fn having_filters_before_ordering_and_limiting() {
         let mut database = Database::new();
         database
@@ -1782,12 +1828,12 @@ mod tests {
     }
 
     #[test]
-    fn having_rejects_unknown_ambiguous_and_non_count_star_aliases() {
+    fn having_rejects_unknown_ambiguous_and_unsupported_aliases() {
         let mut database = Database::new();
         database
             .execute(
-                "CREATE TABLE events (kind String, amount Int64); \
-                 INSERT INTO events VALUES ('a', 1), ('a', 2);",
+                "CREATE TABLE events (kind String, amount Int64, score Float64); \
+                 INSERT INTO events VALUES ('a', 1, 1.5), ('a', 2, 2.5);",
             )
             .expect("setup");
 
@@ -1797,16 +1843,25 @@ mod tests {
                 "HAVING alias 'missing' is not in the SELECT output",
             ),
             (
-                "SELECT kind AS n, COUNT(*) AS n FROM events GROUP BY kind HAVING n > 0",
-                "HAVING alias 'n' is ambiguous",
+                "SELECT kind, SUM(amount) AS total, COUNT(*) AS total FROM events \
+                 GROUP BY kind HAVING total > 0",
+                "HAVING alias 'total' is ambiguous",
             ),
             (
-                "SELECT kind, SUM(amount) AS total FROM events GROUP BY kind HAVING total > 0",
-                "HAVING alias 'total' must reference a projected COUNT(*)",
+                "SELECT kind AS total, COUNT(*) AS n FROM events GROUP BY kind HAVING total > 0",
+                "HAVING alias 'total' must reference a projected COUNT(*) or SUM(Int64)",
             ),
             (
                 "SELECT kind, COUNT(amount) AS n FROM events GROUP BY kind HAVING n > 0",
-                "HAVING alias 'n' must reference a projected COUNT(*)",
+                "HAVING alias 'n' must reference a projected COUNT(*) or SUM(Int64)",
+            ),
+            (
+                "SELECT kind, SUM(score) AS total FROM events GROUP BY kind HAVING total > 0",
+                "HAVING alias 'total' must reference a projected COUNT(*) or SUM(Int64)",
+            ),
+            (
+                "SELECT kind, MIN(amount) AS low FROM events GROUP BY kind HAVING low > 0",
+                "HAVING alias 'low' must reference a projected COUNT(*) or SUM(Int64)",
             ),
         ];
 
@@ -1823,7 +1878,7 @@ mod tests {
     fn having_handles_empty_global_and_grouped_inputs() {
         let mut database = Database::new();
         database
-            .execute("CREATE TABLE events (kind String);")
+            .execute("CREATE TABLE events (kind String, amount Int64);")
             .expect("setup");
 
         assert_eq!(
@@ -1851,6 +1906,22 @@ mod tests {
             .rows
             .is_empty()
         );
+
+        assert_eq!(
+            query(&mut database, "SELECT SUM(amount) AS total FROM events").rows,
+            vec![vec![Value::Null(DataType::Int64)]]
+        );
+        for operator in ["=", "!=", "<>", "<", "<=", ">", ">="] {
+            assert!(
+                query(
+                    &mut database,
+                    &format!("SELECT SUM(amount) AS total FROM events HAVING total {operator} 0")
+                )
+                .rows
+                .is_empty(),
+                "NULL SUM must make {operator} predicate false"
+            );
+        }
     }
 
     #[test]

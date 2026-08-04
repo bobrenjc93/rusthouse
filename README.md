@@ -26,8 +26,10 @@ multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a
-projected `COUNT(*)` alias in `HAVING`. String literals escape a quote by
-doubling it, so semicolons and line breaks inside literals do not split a batch.
+unique projected `COUNT(*)` or `SUM(Int64)` alias to a signed `Int64` threshold
+in `HAVING`. An empty `SUM` is `NULL` and does not satisfy a `HAVING` predicate.
+String literals escape a quote by doubling it, so semicolons and line breaks
+inside literals do not split a batch.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `SELECT DISTINCT column FROM table [LIMIT n]` supports each physical column
