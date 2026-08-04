@@ -3,8 +3,8 @@ use std::thread;
 
 use rusthouse::{
     AggregateLimits, Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CsvIngestError,
-    CsvIngestLimits, InsertError, InsertExecutionError, ParseLimits, ScanLimits, SharedCatalog,
-    SharedCatalogError,
+    CsvIngestLimits, InnerJoinExecutionError, InsertError, InsertExecutionError, JoinError,
+    JoinLimits, ParseLimits, ScanLimits, SharedCatalog, SharedCatalogError,
 };
 
 fn shared_catalog(max_rows_per_table: usize) -> SharedCatalog {
@@ -114,6 +114,46 @@ fn shared_reads_expose_nullness_predicates_and_scalar_aggregates() {
         ),
         Ok(Some(-2))
     );
+}
+
+#[test]
+fn shared_inner_join_returns_owned_rows_and_preserves_typed_errors() {
+    let catalog = SharedCatalog::with_limits(CatalogLimits::new(2, 3));
+    let parse_limits = ParseLimits::default();
+    catalog
+        .execute_create("CREATE TABLE left_rows (left_key Int64)", parse_limits)
+        .unwrap();
+    catalog
+        .execute_create("CREATE TABLE right_rows (right_key Int64)", parse_limits)
+        .unwrap();
+    for sql in [
+        "INSERT INTO left_rows VALUES (7)",
+        "INSERT INTO left_rows VALUES (NULL)",
+        "INSERT INTO right_rows VALUES (7)",
+        "INSERT INTO right_rows VALUES (7)",
+    ] {
+        catalog.execute_insert(sql, parse_limits).unwrap();
+    }
+
+    let sql = "SELECT left_key FROM left_rows INNER JOIN right_rows ON left_key = right_key";
+    let rows = catalog
+        .execute_inner_join(sql, parse_limits, JoinLimits::new(2, 2))
+        .unwrap();
+    assert_eq!(rows, vec![Some(7), Some(7)]);
+    assert_eq!(
+        catalog.execute_inner_join(sql, parse_limits, JoinLimits::new(2, 1)),
+        Err(SharedCatalogError::Catalog(CatalogError::InnerJoin(
+            InnerJoinExecutionError::Join(JoinError::OutputLimitExceeded {
+                pairs: 2,
+                max_pairs: 1,
+            })
+        )))
+    );
+
+    catalog
+        .execute_insert("INSERT INTO left_rows VALUES (7)", parse_limits)
+        .unwrap();
+    assert_eq!(rows, vec![Some(7), Some(7)]);
 }
 
 #[test]
@@ -252,6 +292,14 @@ fn poisoned_lock_is_reported_as_a_typed_error() {
     );
     assert_eq!(
         catalog.execute_select("SELECT value FROM readings", ParseLimits::default()),
+        Err(SharedCatalogError::LockPoisoned)
+    );
+    assert_eq!(
+        catalog.execute_inner_join(
+            "SELECT value FROM readings INNER JOIN other ON value = value",
+            ParseLimits::default(),
+            JoinLimits::new(0, 0),
+        ),
         Err(SharedCatalogError::LockPoisoned)
     );
 }
