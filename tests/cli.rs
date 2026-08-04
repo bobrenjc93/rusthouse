@@ -123,6 +123,46 @@ fn csv_batch_emits_typed_nulls_for_empty_aggregate_inputs() {
 }
 
 #[test]
+fn json_batch_emits_escaped_typed_results_null_aggregates_and_show_tables() {
+    let output = run(
+        &["--format", "json"],
+        br#"CREATE TABLE metrics (
+              id Int64,
+              score Float64,
+              enabled Bool,
+              label String
+          );
+          INSERT INTO metrics VALUES
+              (1, 1.5, true, 'quote" and slash\
+line	tab'),
+              (2, 2.5, false, 'plain');
+          SELECT id, score, enabled, label FROM metrics ORDER BY id;
+          SELECT COUNT(*) AS row_count,
+                 SUM(id) AS id_sum,
+                 MIN(label) AS label_min,
+                 MAX(score) AS score_max,
+                 AVG(score) AS score_avg
+          FROM metrics WHERE id < 0;
+          SHOW TABLES;"#,
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        concat!(
+            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"score","type":"Float64"},{"name":"enabled","type":"Bool"},{"name":"label","type":"String"}],"rows":[[1,1.5,true,"quote\" and slash\\\nline\ttab"],[2,2.5,false,"plain"]]}"#,
+            "\n",
+            r#"{"columns":[{"name":"row_count","type":"Int64"},{"name":"id_sum","type":"Int64"},{"name":"label_min","type":"String"},{"name":"score_max","type":"Float64"},{"name":"score_avg","type":"Float64"}],"rows":[[0,null,null,null,null]]}"#,
+            "\n",
+            r#"{"columns":[{"name":"name","type":"String"}],"rows":[["metrics"]]}"#,
+            "\n"
+        )
+        .as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn fixed_harness_style_write_completes_without_early_exit_or_broken_pipe() {
     const ROWS: usize = 4_096;
     let mut sql = String::from(
@@ -185,11 +225,12 @@ fn csv_batch_rejects_repeated_oversized_projections_before_materialization() {
 }
 
 #[test]
-fn csv_is_the_only_accepted_format_argument() {
+fn only_exact_supported_format_arguments_are_accepted() {
     for args in [
-        &["--format", "json"][..],
         &["--format", "CSV"][..],
+        &["--format", "JSON"][..],
         &["--format", "csv", "extra"][..],
+        &["--format", "json", "extra"][..],
     ] {
         let output = run(args, b"");
         assert!(!output.status.success(), "{args:?}");
@@ -237,6 +278,7 @@ fn help_prints_usage_without_reading_a_session() {
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("Usage: rusthouse [OPTIONS]"));
+        assert!(stdout.contains("--format json"));
         assert!(stdout.contains("65536 input bytes, 1024 statements, 64 tables"));
         assert!(output.stderr.is_empty());
     }
