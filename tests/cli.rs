@@ -117,6 +117,29 @@ fn fixed_harness_style_write_completes_without_early_exit_or_broken_pipe() {
 }
 
 #[test]
+fn csv_batch_rejects_repeated_oversized_projections_before_materialization() {
+    let mut sql = String::from("CREATE TABLE many_rows (flag Bool); INSERT INTO many_rows VALUES ");
+    for row in 0..20_000 {
+        if row != 0 {
+            sql.push(',');
+        }
+        sql.push_str("(true)");
+    }
+    sql.push(';');
+    for _ in 0..200 {
+        sql.push_str("SELECT flag FROM many_rows;");
+    }
+
+    let output = run(&["--format", "csv"], sql.as_bytes());
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("SELECT result rows requires at least 20000"));
+    assert!(stderr.contains("exceeding the limit of 10000"));
+}
+
+#[test]
 fn csv_is_the_only_accepted_format_argument() {
     for args in [
         &["--format", "json"][..],

@@ -7,6 +7,28 @@ const MAX_PREDICATE_NODES: usize = 256;
 
 /// Maximum number of executable statements in one parsed batch.
 pub const DEFAULT_MAX_BATCH_STATEMENTS: usize = 4_096;
+/// Maximum `INSERT` rows stored across one parsed batch.
+pub const DEFAULT_MAX_INSERT_ROWS: usize = 100_000;
+/// Maximum `INSERT` scalar values stored across one parsed batch.
+pub const DEFAULT_MAX_INSERT_VALUES: usize = 1_000_000;
+
+/// Allocation limits applied while constructing a SQL batch AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchSqlLimits {
+    pub max_statements: usize,
+    pub max_insert_rows: usize,
+    pub max_insert_values: usize,
+}
+
+impl Default for BatchSqlLimits {
+    fn default() -> Self {
+        Self {
+            max_statements: DEFAULT_MAX_BATCH_STATEMENTS,
+            max_insert_rows: DEFAULT_MAX_INSERT_ROWS,
+            max_insert_values: DEFAULT_MAX_INSERT_VALUES,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -119,13 +141,23 @@ pub struct OrderBy {
 
 /// Parse one or more semicolon-separated SQL statements.
 pub fn parse(input: &str) -> Result<Vec<Statement>> {
-    parse_with_statement_limit(input, DEFAULT_MAX_BATCH_STATEMENTS)
+    parse_with_limits(input, BatchSqlLimits::default())
 }
 
 /// Parses a batch with an explicit executable-statement limit.
 pub fn parse_with_statement_limit(input: &str, max_statements: usize) -> Result<Vec<Statement>> {
-    let tokens = Lexer::new(input, max_statements).tokenize()?;
-    Parser::new(tokens, max_statements).parse_script()
+    parse_with_limits(
+        input,
+        BatchSqlLimits {
+            max_statements,
+            ..BatchSqlLimits::default()
+        },
+    )
+}
+
+/// Parses a batch lazily with explicit AST allocation limits.
+pub fn parse_with_limits(input: &str, limits: BatchSqlLimits) -> Result<Vec<Statement>> {
+    Parser::new(input, limits).parse_script()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,126 +183,100 @@ enum TokenKind {
     LessOrEqual,
     Greater,
     GreaterOrEqual,
+    Invalid(Error),
     End,
 }
 
 struct Lexer<'a> {
     input: &'a str,
     position: usize,
-    completed_statements: usize,
-    statement_has_tokens: bool,
-    max_statements: usize,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str, max_statements: usize) -> Self {
-        Self {
-            input,
-            position: 0,
-            completed_statements: 0,
-            statement_has_tokens: false,
-            max_statements,
-        }
+    fn new(input: &'a str) -> Self {
+        Self { input, position: 0 }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>> {
-        let mut tokens = Vec::new();
-        loop {
-            self.skip_ignored();
-            let position = self.position;
-            let Some(character) = self.current() else {
-                tokens.push(Token {
-                    kind: TokenKind::End,
-                    position,
-                });
-                return Ok(tokens);
-            };
+    fn next_token(&mut self) -> Result<Token> {
+        self.skip_ignored();
+        let position = self.position;
+        let Some(character) = self.current() else {
+            return Ok(Token {
+                kind: TokenKind::End,
+                position,
+            });
+        };
 
-            let kind = match character {
-                ',' => {
-                    self.advance();
-                    TokenKind::Comma
-                }
-                '(' => {
-                    self.advance();
-                    TokenKind::LeftParen
-                }
-                ')' => {
-                    self.advance();
-                    TokenKind::RightParen
-                }
-                ';' => {
-                    self.advance();
-                    TokenKind::Semicolon
-                }
-                '*' => {
-                    self.advance();
-                    TokenKind::Star
-                }
-                '-' => {
-                    self.advance();
-                    TokenKind::Minus
-                }
-                '=' => {
-                    self.advance();
-                    TokenKind::Equal
-                }
-                '!' => {
-                    self.advance();
-                    if self.current() != Some('=') {
-                        return self.error(position, "expected '=' after '!'");
-                    }
-                    self.advance();
-                    TokenKind::NotEqual
-                }
-                '<' => {
-                    self.advance();
-                    match self.current() {
-                        Some('=') => {
-                            self.advance();
-                            TokenKind::LessOrEqual
-                        }
-                        Some('>') => {
-                            self.advance();
-                            TokenKind::NotEqual
-                        }
-                        _ => TokenKind::Less,
-                    }
-                }
-                '>' => {
-                    self.advance();
-                    if self.current() == Some('=') {
-                        self.advance();
-                        TokenKind::GreaterOrEqual
-                    } else {
-                        TokenKind::Greater
-                    }
-                }
-                '\'' => TokenKind::String(self.scan_string(position)?),
-                value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()),
-                value if value.is_ascii_alphabetic() || value == '_' => {
-                    TokenKind::Identifier(self.scan_identifier())
-                }
-                _ => {
-                    return self.error(position, format!("unexpected character '{character}'"));
-                }
-            };
-            if kind == TokenKind::Semicolon {
-                if self.statement_has_tokens {
-                    self.completed_statements = self.completed_statements.saturating_add(1);
-                    if self.completed_statements > self.max_statements {
-                        return Err(Error::StatementLimitExceeded {
-                            statements: self.completed_statements,
-                            max_statements: self.max_statements,
-                        });
-                    }
-                    self.statement_has_tokens = false;
-                }
-            } else {
-                self.statement_has_tokens = true;
+        let kind = match character {
+            ',' => {
+                self.advance();
+                TokenKind::Comma
             }
-            tokens.push(Token { kind, position });
-        }
+            '(' => {
+                self.advance();
+                TokenKind::LeftParen
+            }
+            ')' => {
+                self.advance();
+                TokenKind::RightParen
+            }
+            ';' => {
+                self.advance();
+                TokenKind::Semicolon
+            }
+            '*' => {
+                self.advance();
+                TokenKind::Star
+            }
+            '-' => {
+                self.advance();
+                TokenKind::Minus
+            }
+            '=' => {
+                self.advance();
+                TokenKind::Equal
+            }
+            '!' => {
+                self.advance();
+                if self.current() != Some('=') {
+                    return self.error(position, "expected '=' after '!'");
+                }
+                self.advance();
+                TokenKind::NotEqual
+            }
+            '<' => {
+                self.advance();
+                match self.current() {
+                    Some('=') => {
+                        self.advance();
+                        TokenKind::LessOrEqual
+                    }
+                    Some('>') => {
+                        self.advance();
+                        TokenKind::NotEqual
+                    }
+                    _ => TokenKind::Less,
+                }
+            }
+            '>' => {
+                self.advance();
+                if self.current() == Some('=') {
+                    self.advance();
+                    TokenKind::GreaterOrEqual
+                } else {
+                    TokenKind::Greater
+                }
+            }
+            '\'' => TokenKind::String(self.scan_string(position)?),
+            value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()),
+            value if value.is_ascii_alphabetic() || value == '_' => {
+                TokenKind::Identifier(self.scan_identifier())
+            }
+            _ => {
+                return self.error(position, format!("unexpected character '{character}'"));
+            }
+        };
+        Ok(Token { kind, position })
     }
 
     fn current(&self) -> Option<char> {
@@ -369,33 +375,55 @@ impl<'a> Lexer<'a> {
     }
 }
 
-struct Parser {
-    tokens: Vec<Token>,
-    current: usize,
+struct Parser<'a> {
+    lexer: Lexer<'a>,
+    current: Token,
     predicate_depth: usize,
     predicate_nodes: usize,
-    max_statements: usize,
+    insert_rows: usize,
+    insert_values: usize,
+    limits: BatchSqlLimits,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>, max_statements: usize) -> Self {
+impl<'a> Parser<'a> {
+    fn new(input: &'a str, limits: BatchSqlLimits) -> Self {
+        let mut lexer = Lexer::new(input);
+        let current = Self::next_or_invalid(&mut lexer);
         Self {
-            tokens,
-            current: 0,
+            lexer,
+            current,
             predicate_depth: 0,
             predicate_nodes: 0,
-            max_statements,
+            insert_rows: 0,
+            insert_values: 0,
+            limits,
         }
+    }
+
+    fn next_or_invalid(lexer: &mut Lexer<'a>) -> Token {
+        lexer.next_token().unwrap_or_else(|error| Token {
+            kind: TokenKind::Invalid(error),
+            position: lexer.position,
+        })
+    }
+
+    fn advance(&mut self) {
+        self.current = Self::next_or_invalid(&mut self.lexer);
+    }
+
+    fn take_kind(&mut self) -> TokenKind {
+        let next = Self::next_or_invalid(&mut self.lexer);
+        std::mem::replace(&mut self.current, next).kind
     }
 
     fn parse_script(mut self) -> Result<Vec<Statement>> {
         let mut statements = Vec::new();
         while self.eat(&TokenKind::Semicolon) {}
         while !self.at(&TokenKind::End) {
-            if statements.len() >= self.max_statements {
+            if statements.len() >= self.limits.max_statements {
                 return Err(Error::StatementLimitExceeded {
                     statements: statements.len().saturating_add(1),
-                    max_statements: self.max_statements,
+                    max_statements: self.limits.max_statements,
                 });
             }
             statements.push(self.parse_statement()?);
@@ -461,11 +489,26 @@ impl Parser {
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
+            if self.insert_rows >= self.limits.max_insert_rows {
+                return Err(Error::ResourceLimitExceeded {
+                    resource: "INSERT rows",
+                    actual: self.insert_rows.saturating_add(1),
+                    max: self.limits.max_insert_rows,
+                });
+            }
             self.expect(&TokenKind::LeftParen, "'(' before row values")?;
             let mut row = Vec::new();
             if !self.at(&TokenKind::RightParen) {
                 loop {
+                    if self.insert_values >= self.limits.max_insert_values {
+                        return Err(Error::ResourceLimitExceeded {
+                            resource: "INSERT values",
+                            actual: self.insert_values.saturating_add(1),
+                            max: self.limits.max_insert_values,
+                        });
+                    }
                     row.push(self.parse_literal()?);
+                    self.insert_values += 1;
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -473,6 +516,7 @@ impl Parser {
             }
             self.expect(&TokenKind::RightParen, "')' after row values")?;
             rows.push(row);
+            self.insert_rows += 1;
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -635,7 +679,7 @@ impl Parser {
             TokenKind::GreaterOrEqual => ComparisonOperator::GreaterOrEqual,
             _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
         };
-        self.current += 1;
+        self.advance();
         let right = self.parse_operand()?;
         self.record_predicate_node()?;
         Ok(Predicate::Comparison {
@@ -673,8 +717,10 @@ impl Parser {
     }
 
     fn parse_literal(&mut self) -> Result<Value> {
-        if let TokenKind::String(value) = self.peek().clone() {
-            self.current += 1;
+        if matches!(self.peek(), TokenKind::String(_)) {
+            let TokenKind::String(value) = self.take_kind() else {
+                unreachable!("matched string token")
+            };
             return Ok(Value::String(value));
         }
 
@@ -727,7 +773,7 @@ impl Parser {
     fn eat_keyword(&mut self, expected: &str) -> bool {
         if matches!(self.peek(), TokenKind::Identifier(value) if value.eq_ignore_ascii_case(expected))
         {
-            self.current += 1;
+            self.advance();
             true
         } else {
             false
@@ -735,8 +781,10 @@ impl Parser {
     }
 
     fn expect_identifier(&mut self, description: &str) -> Result<String> {
-        if let TokenKind::Identifier(value) = self.peek().clone() {
-            self.current += 1;
+        if matches!(self.peek(), TokenKind::Identifier(_)) {
+            let TokenKind::Identifier(value) = self.take_kind() else {
+                unreachable!("matched identifier token")
+            };
             Ok(value)
         } else {
             self.error(format!("expected {description}"))
@@ -744,8 +792,10 @@ impl Parser {
     }
 
     fn take_number(&mut self) -> Option<String> {
-        if let TokenKind::Number(value) = self.peek().clone() {
-            self.current += 1;
+        if matches!(self.peek(), TokenKind::Number(_)) {
+            let TokenKind::Number(value) = self.take_kind() else {
+                unreachable!("matched number token")
+            };
             Some(value)
         } else {
             None
@@ -762,7 +812,7 @@ impl Parser {
 
     fn eat(&mut self, expected: &TokenKind) -> bool {
         if self.at(expected) {
-            self.current += 1;
+            self.advance();
             true
         } else {
             false
@@ -774,14 +824,17 @@ impl Parser {
     }
 
     fn peek(&self) -> &TokenKind {
-        &self.tokens[self.current].kind
+        &self.current.kind
     }
 
     fn position(&self) -> usize {
-        self.tokens[self.current].position
+        self.current.position
     }
 
     fn error<T>(&self, message: impl Into<String>) -> Result<T> {
+        if let TokenKind::Invalid(error) = self.peek() {
+            return Err(error.clone());
+        }
         Err(Error::Sql {
             position: self.position(),
             message: message.into(),
@@ -848,6 +901,68 @@ mod tests {
             Error::StatementLimitExceeded {
                 statements: 3,
                 max_statements: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn enforces_insert_row_and_value_allocation_limits_at_boundaries() {
+        let limits = BatchSqlLimits {
+            max_statements: 2,
+            max_insert_rows: 2,
+            max_insert_values: 3,
+        };
+        let statements = parse_with_limits("INSERT INTO t VALUES (true), (false)", limits)
+            .expect("rows and values at or below limits succeed");
+        assert_eq!(statements.len(), 1);
+
+        let row_error = parse_with_limits("INSERT INTO t VALUES (true), (false), (true)", limits)
+            .expect_err("third row exceeds the row limit");
+        assert_eq!(
+            row_error,
+            Error::ResourceLimitExceeded {
+                resource: "INSERT rows",
+                actual: 3,
+                max: 2,
+            }
+        );
+
+        let cumulative_error = parse_with_limits(
+            "INSERT INTO t VALUES (true); INSERT INTO t VALUES (false), (true)",
+            limits,
+        )
+        .expect_err("row limit applies across INSERT statements");
+        assert_eq!(cumulative_error, row_error);
+
+        let value_error = parse_with_limits("INSERT INTO t VALUES (1, 2), (3, 4)", limits)
+            .expect_err("fourth value exceeds the value limit");
+        assert_eq!(
+            value_error,
+            Error::ResourceLimitExceeded {
+                resource: "INSERT values",
+                actual: 4,
+                max: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn default_row_limit_stops_large_bool_insert_while_parsing_lazily() {
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        for row in 0..=DEFAULT_MAX_INSERT_ROWS {
+            if row != 0 {
+                sql.push(',');
+            }
+            sql.push_str("(true)");
+        }
+
+        let error = parse(&sql).expect_err("row above default limit is rejected");
+        assert_eq!(
+            error,
+            Error::ResourceLimitExceeded {
+                resource: "INSERT rows",
+                actual: DEFAULT_MAX_INSERT_ROWS + 1,
+                max: DEFAULT_MAX_INSERT_ROWS,
             }
         );
     }

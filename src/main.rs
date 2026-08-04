@@ -13,6 +13,8 @@ prints CSVWithNames output for each SELECT. CREATE and INSERT remain silent.
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table
   csv batch: 67108864 input bytes, 4096 statements
+  csv INSERT ASTs/batch: 100000 rows, 1000000 values
+  csv SELECT: 10000 rows, 250000 values, 16777216 estimated result bytes
 
 Options:
   --format csv  Emit CSVWithNames-compatible query results

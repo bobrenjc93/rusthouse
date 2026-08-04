@@ -12,11 +12,40 @@ use crate::batch::value::{DataType, Value, ValueRef};
 
 /// Maximum estimated heap retained by the collecting [`Database::execute`] API.
 pub const DEFAULT_MAX_RETAINED_RESULT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum rows materialized by one `SELECT`.
+pub const DEFAULT_MAX_QUERY_RESULT_ROWS: usize = 10_000;
+/// Maximum scalar cells materialized by one `SELECT`.
+pub const DEFAULT_MAX_QUERY_RESULT_VALUES: usize = 250_000;
+/// Maximum estimated heap materialized by one `SELECT`.
+pub const DEFAULT_MAX_QUERY_RESULT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum groups retained while evaluating one grouped `SELECT`.
+pub const DEFAULT_MAX_QUERY_GROUPS: usize = 100_000;
+
+/// Resource limits applied before a query result is cloned into owned rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryResultLimits {
+    pub max_rows: usize,
+    pub max_values: usize,
+    pub max_bytes: usize,
+    pub max_groups: usize,
+}
+
+impl Default for QueryResultLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_MAX_QUERY_RESULT_ROWS,
+            max_values: DEFAULT_MAX_QUERY_RESULT_VALUES,
+            max_bytes: DEFAULT_MAX_QUERY_RESULT_BYTES,
+            max_groups: DEFAULT_MAX_QUERY_GROUPS,
+        }
+    }
+}
 
 /// A reusable in-memory SQL database.
 #[derive(Debug, Default)]
 pub struct Database {
     catalog: Catalog,
+    query_result_limits: QueryResultLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +75,22 @@ impl Database {
         Self::default()
     }
 
+    /// Creates an empty database with explicit per-query materialization limits.
+    pub fn with_query_result_limits(query_result_limits: QueryResultLimits) -> Self {
+        Self {
+            catalog: Catalog::new(),
+            query_result_limits,
+        }
+    }
+
     #[must_use]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    #[must_use]
+    pub const fn query_result_limits(&self) -> QueryResultLimits {
+        self.query_result_limits
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -70,7 +112,25 @@ impl Database {
         let mut results = Vec::with_capacity(statements.len());
         let mut retained_bytes = 0_usize;
         for statement in statements {
-            let result = self.execute_statement(statement)?;
+            let remaining_bytes = max_result_bytes.saturating_sub(retained_bytes);
+            let tightened_result_limit = remaining_bytes < self.query_result_limits.max_bytes;
+            let query_limits = QueryResultLimits {
+                max_bytes: self.query_result_limits.max_bytes.min(remaining_bytes),
+                ..self.query_result_limits
+            };
+            let result = self
+                .execute_statement_with_limits(statement, query_limits)
+                .map_err(|error| match error {
+                    Error::ResourceLimitExceeded {
+                        resource: "SELECT result bytes",
+                        actual,
+                        ..
+                    } if tightened_result_limit => Error::ResultLimitExceeded {
+                        bytes: retained_bytes.saturating_add(actual),
+                        max_bytes: max_result_bytes,
+                    },
+                    error => error,
+                })?;
             retained_bytes = retained_bytes.saturating_add(result.estimated_retained_bytes());
             if retained_bytes > max_result_bytes {
                 return Err(Error::ResultLimitExceeded {
@@ -88,6 +148,14 @@ impl Database {
     /// Callers that stream results should parse the complete batch first, then
     /// invoke this method in order and release each result before continuing.
     pub fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult> {
+        self.execute_statement_with_limits(statement, self.query_result_limits)
+    }
+
+    fn execute_statement_with_limits(
+        &mut self,
+        statement: Statement,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog.create_table(name, columns)?;
@@ -113,11 +181,17 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Select(select) => self.execute_select(select).map(StatementResult::Query),
+            Statement::Select(select) => self
+                .execute_select(select, query_result_limits)
+                .map(StatementResult::Query),
         }
     }
 
-    fn execute_select(&self, select: Select) -> Result<QueryResult> {
+    fn execute_select(
+        &self,
+        select: Select,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -140,7 +214,13 @@ impl Database {
 
         let grouped = !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
-            let grouped = execute_grouped(table, &matching_rows, &group_columns, &aggregate_specs)?;
+            let grouped = execute_grouped(
+                table,
+                &matching_rows,
+                &group_columns,
+                &aggregate_specs,
+                query_result_limits,
+            )?;
             let mut selected_groups = (0..grouped.len()).collect::<Vec<_>>();
             order_grouped_rows(
                 &mut selected_groups,
@@ -149,9 +229,23 @@ impl Database {
                 &ordering,
                 select.limit,
             );
+            validate_grouped_result_limits(
+                &grouped,
+                &selected_groups,
+                &items,
+                &result_columns,
+                query_result_limits,
+            )?;
             grouped.project(&selected_groups, &items)
         } else {
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            validate_projection_result_limits(
+                table,
+                &matching_rows,
+                &items,
+                &result_columns,
+                query_result_limits,
+            )?;
             execute_projection(table, &matching_rows, &items)
         };
 
@@ -381,12 +475,110 @@ fn execute_projection(
         .collect()
 }
 
+fn validate_projection_result_limits(
+    table: &Table,
+    rows: &[usize],
+    items: &[ResolvedItem],
+    columns: &[ResultColumn],
+    limits: QueryResultLimits,
+) -> Result<()> {
+    let mut bytes = validate_result_shape(rows.len(), items.len(), columns, limits)?;
+    for row in rows {
+        for item in items {
+            let ResolvedItem::Column { source, .. } = item else {
+                unreachable!("ungrouped projections cannot contain aggregates")
+            };
+            if let ValueRef::String(value) = table.columns()[*source].value_ref(*row) {
+                bytes = bytes.saturating_add(value.len());
+                enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_grouped_result_limits(
+    data: &GroupedData<'_>,
+    groups: &[usize],
+    items: &[ResolvedItem],
+    columns: &[ResultColumn],
+    limits: QueryResultLimits,
+) -> Result<()> {
+    let mut bytes = validate_result_shape(groups.len(), items.len(), columns, limits)?;
+    for group in groups {
+        for item in items {
+            let string_len = match item {
+                ResolvedItem::Column {
+                    group_position: Some(position),
+                    ..
+                } => match data.keys[*group].value(*position) {
+                    ValueRef::String(value) => value.len(),
+                    _ => 0,
+                },
+                ResolvedItem::Column {
+                    group_position: None,
+                    ..
+                } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Aggregate { state } => match &data.aggregates[*state][*group] {
+                    Value::String(value) => value.len(),
+                    _ => 0,
+                },
+            };
+            bytes = bytes.saturating_add(string_len);
+            enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_result_shape(
+    row_count: usize,
+    column_count: usize,
+    columns: &[ResultColumn],
+    limits: QueryResultLimits,
+) -> Result<usize> {
+    enforce_resource_limit("SELECT result rows", row_count, limits.max_rows)?;
+    let value_count = row_count.saturating_mul(column_count);
+    enforce_resource_limit("SELECT result values", value_count, limits.max_values)?;
+
+    let column_bytes = columns
+        .len()
+        .saturating_mul(std::mem::size_of::<ResultColumn>())
+        .saturating_add(
+            columns
+                .iter()
+                .map(|column| column.name.len())
+                .fold(0_usize, usize::saturating_add),
+        );
+    let bytes = column_bytes
+        .saturating_add(row_count.saturating_mul(std::mem::size_of::<Vec<Value>>()))
+        .saturating_add(value_count.saturating_mul(std::mem::size_of::<Value>()));
+    enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
+    Ok(bytes)
+}
+
+fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> Result<()> {
+    if actual > max {
+        Err(Error::ResourceLimitExceeded {
+            resource,
+            actual,
+            max,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn execute_grouped<'a>(
     table: &'a Table,
     matching_rows: &[usize],
     group_columns: &[usize],
     aggregate_specs: &[AggregateSpec],
+    limits: QueryResultLimits,
 ) -> Result<GroupedData<'a>> {
+    if group_columns.is_empty() {
+        enforce_resource_limit("SELECT groups", 1, limits.max_groups)?;
+    }
     let mut groups = GroupIndex::new(group_columns.len(), matching_rows.len());
     let mut group_count = usize::from(group_columns.is_empty());
     let initial_capacity = matching_rows.len().min(1_024);
@@ -404,6 +596,11 @@ fn execute_grouped<'a>(
     for row in matching_rows {
         let (group, inserted) = groups.find_or_insert(table, group_columns, *row, group_count);
         if inserted {
+            enforce_resource_limit(
+                "SELECT groups",
+                group_count.saturating_add(1),
+                limits.max_groups,
+            )?;
             group_count += 1;
             for (states, spec) in aggregate_states.iter_mut().zip(aggregate_specs) {
                 states.push(AggregateState::new(spec));
@@ -1166,6 +1363,92 @@ mod tests {
                 bytes,
                 max_bytes: 1
             } if bytes > 1
+        ));
+    }
+
+    #[test]
+    fn select_materialization_limits_apply_before_owned_projection_rows() {
+        let limits = QueryResultLimits {
+            max_rows: 2,
+            max_values: 4,
+            max_bytes: usize::MAX,
+            max_groups: 10,
+        };
+        let mut database = Database::with_query_result_limits(limits);
+        database
+            .execute(
+                "CREATE TABLE entries (id Int64, label String); \
+                 INSERT INTO entries VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            )
+            .expect("setup");
+
+        assert_eq!(
+            query(&mut database, "SELECT id, label FROM entries LIMIT 2")
+                .rows
+                .len(),
+            2
+        );
+        let error = database
+            .execute("SELECT id FROM entries")
+            .expect_err("third projected row exceeds the row limit");
+        assert_eq!(
+            error,
+            Error::ResourceLimitExceeded {
+                resource: "SELECT result rows",
+                actual: 3,
+                max: 2,
+            }
+        );
+
+        let mut value_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 3,
+            max_values: 5,
+            ..limits
+        });
+        value_limited
+            .execute(
+                "CREATE TABLE entries (id Int64, label String); \
+                 INSERT INTO entries VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            )
+            .expect("setup");
+        let error = value_limited
+            .execute("SELECT id, label FROM entries")
+            .expect_err("six projected values exceed the value limit");
+        assert_eq!(
+            error,
+            Error::ResourceLimitExceeded {
+                resource: "SELECT result values",
+                actual: 6,
+                max: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn select_byte_limit_counts_string_payload_before_cloning() {
+        let mut database = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 1,
+            max_values: 1,
+            max_bytes: 100,
+            max_groups: 1,
+        });
+        database
+            .execute(&format!(
+                "CREATE TABLE entries (label String); INSERT INTO entries VALUES ('{}');",
+                "x".repeat(128)
+            ))
+            .expect("setup");
+
+        let error = database
+            .execute("SELECT label FROM entries")
+            .expect_err("string payload exceeds byte limit");
+        assert!(matches!(
+            error,
+            Error::ResourceLimitExceeded {
+                resource: "SELECT result bytes",
+                actual,
+                max: 100,
+            } if actual > 100
         ));
     }
 }

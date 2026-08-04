@@ -38,6 +38,11 @@ pub enum Error {
         bytes: usize,
         max_bytes: usize,
     },
+    ResourceLimitExceeded {
+        resource: &'static str,
+        actual: usize,
+        max: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -91,6 +96,14 @@ impl fmt::Display for Error {
             Self::ResultLimitExceeded { bytes, max_bytes } => write!(
                 f,
                 "retained query results require at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
+            Self::ResourceLimitExceeded {
+                resource,
+                actual,
+                max,
+            } => write!(
+                f,
+                "{resource} requires at least {actual}, exceeding the limit of {max}"
             ),
         }
     }
