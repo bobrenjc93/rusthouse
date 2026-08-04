@@ -74,6 +74,10 @@ pub enum SelectItem {
         target_type: DataType,
         alias: Option<String>,
     },
+    Length {
+        name: String,
+        alias: Option<String>,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
@@ -648,7 +652,7 @@ impl<'a> Parser<'a> {
             self.expect_keyword("BY")?;
             loop {
                 self.reserve_ast_list_item()?;
-                let name = self.expect_identifier("ORDER BY output column or alias")?;
+                let name = self.parse_order_by_name()?;
                 let descending = if self.eat_keyword("DESC") {
                     true
                 } else {
@@ -781,6 +785,13 @@ impl<'a> Parser<'a> {
                 });
             }
 
+            if name.eq_ignore_ascii_case("LENGTH") {
+                let name = self.expect_identifier("String column in LENGTH")?;
+                self.expect(&TokenKind::RightParen, "')' after LENGTH expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Length { name, alias });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -800,6 +811,20 @@ impl<'a> Parser<'a> {
         } else {
             let alias = self.parse_alias()?;
             Ok(SelectItem::Column { name, alias })
+        }
+    }
+
+    fn parse_order_by_name(&mut self) -> Result<String> {
+        let name = self.expect_identifier("ORDER BY output column, expression, or alias")?;
+        if name.eq_ignore_ascii_case("LENGTH") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("String column in ORDER BY LENGTH")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY LENGTH expression",
+            )?;
+            Ok(format!("LENGTH({argument})"))
+        } else {
+            Ok(name)
         }
     }
 

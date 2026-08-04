@@ -46,6 +46,14 @@ Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 named `CAST(<column> AS Float64)`. `CAST` projections are currently limited to
 ungrouped queries: they cannot be combined with aggregate projections or
 `GROUP BY`.
+`LENGTH(string_column)` is another ungrouped scalar projection and returns the
+string's UTF-8 byte length as `Int64` without allocating a transformed string.
+It accepts an optional `AS alias`; otherwise, the result column is named
+`LENGTH(<column>)`. `WHERE` filters source rows before evaluation, and the
+unaliased expression can be ordered with `ORDER BY LENGTH(<column>)`; aliased
+projections can be ordered by their alias. Both forms support `LIMIT`.
+Non-`String` arguments and byte lengths outside the `Int64` range are reported
+as typed errors.
 
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
