@@ -33,6 +33,13 @@ case-insensitive order as one `String` column.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
+`SELECT` projections support `CAST(int64_column AS Float64)` for converting an
+`Int64` column to `Float64`. Add an explicit alias with
+`CAST(int64_column AS Float64) AS alias`; without one, the result column is
+named `CAST(<column> AS Float64)`. `CAST` projections are currently limited to
+ungrouped queries: they cannot be combined with aggregate projections or
+`GROUP BY`.
+
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
