@@ -3,6 +3,9 @@ use std::collections::HashSet;
 use crate::batch::error::{Error, Result};
 use crate::batch::value::{DataType, Value, ValueRef};
 
+/// Default maximum number of rows retained by one typed batch table.
+pub const DEFAULT_MAX_ROWS_PER_TABLE: usize = 1_000_000;
+
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -104,10 +107,17 @@ pub struct Table {
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
     row_count: usize,
+    row_cap: usize,
 }
 
 impl Table {
+    /// Creates an empty table with the finite default row cap.
     pub fn new(name: String, schema: Vec<ColumnDef>) -> Result<Self> {
+        Self::with_row_cap(name, schema, DEFAULT_MAX_ROWS_PER_TABLE)
+    }
+
+    /// Creates an empty table with an explicit maximum retained row count.
+    pub fn with_row_cap(name: String, schema: Vec<ColumnDef>, row_cap: usize) -> Result<Self> {
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
                 "a table must contain at least one column".to_owned(),
@@ -134,6 +144,7 @@ impl Table {
             schema,
             columns,
             row_count: 0,
+            row_cap,
         })
     }
 
@@ -155,6 +166,12 @@ impl Table {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    /// Returns the maximum number of rows this table can retain.
+    #[must_use]
+    pub fn row_cap(&self) -> usize {
+        self.row_cap
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
@@ -203,14 +220,42 @@ impl Table {
         Ok(())
     }
 
-    /// Validates the complete row before appending one value to each column.
+    /// Validates the row cap and complete row before appending to any column.
     pub fn insert_row(&mut self, row: Vec<Value>) -> Result<()> {
+        self.validate_row_capacity(1)?;
         self.validate_row(&row)?;
+        self.append_validated_row(row);
+        Ok(())
+    }
+
+    /// Atomically validates and appends a complete batch of rows.
+    pub fn insert_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<()> {
+        self.validate_row_capacity(rows.len())?;
+        for row in &rows {
+            self.validate_row(row)?;
+        }
+        for row in rows {
+            self.append_validated_row(row);
+        }
+        Ok(())
+    }
+
+    fn validate_row_capacity(&self, incoming_rows: usize) -> Result<()> {
+        if incoming_rows > self.row_cap.saturating_sub(self.row_count) {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: self.row_count.saturating_add(incoming_rows),
+                max: self.row_cap,
+            });
+        }
+        Ok(())
+    }
+
+    fn append_validated_row(&mut self, row: Vec<Value>) {
         for (column, value) in self.columns.iter_mut().zip(row) {
             column.push(value);
         }
         self.row_count += 1;
-        Ok(())
     }
 
     /// Removes every row while retaining the table name, schema, and physical columns.
@@ -266,5 +311,32 @@ mod tests {
         assert!(matches!(error, Error::TypeMismatch { .. }));
         assert_eq!(table.row_count(), 0);
         assert!(table.columns().iter().all(Column::is_empty));
+    }
+
+    #[test]
+    fn rejected_row_batch_does_not_mutate_at_the_row_cap() {
+        let mut table = Table::with_row_cap(
+            "events".to_owned(),
+            vec![ColumnDef {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            2,
+        )
+        .expect("valid schema");
+        table
+            .insert_row(vec![Value::Int64(1)])
+            .expect("first row fits");
+
+        assert_eq!(
+            table.insert_rows(vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]),
+            Err(Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 3,
+                max: 2,
+            })
+        );
+        assert_eq!(table.row_count(), 1);
+        assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[1]));
     }
 }

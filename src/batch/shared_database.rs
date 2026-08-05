@@ -105,6 +105,12 @@ impl SharedDatabase {
         Self::new(Database::with_query_result_limits(query_result_limits))
     }
 
+    /// Creates an empty shared database with an explicit per-table row cap.
+    #[must_use]
+    pub fn with_max_rows_per_table(max_rows_per_table: usize) -> Self {
+        Self::new(Database::with_max_rows_per_table(max_rows_per_table))
+    }
+
     /// Wraps an existing synchronized database allocation.
     ///
     /// Poisoning of the supplied lock is reported by every operation as
@@ -117,6 +123,11 @@ impl SharedDatabase {
     /// Returns the per-query result limits configured on the database.
     pub fn query_result_limits(&self) -> Result<QueryResultLimits, SharedDatabaseError> {
         Ok(self.read()?.query_result_limits())
+    }
+
+    /// Returns the maximum number of rows retained by each created table.
+    pub fn max_rows_per_table(&self) -> Result<usize, SharedDatabaseError> {
+        Ok(self.read()?.max_rows_per_table())
     }
 
     /// Parses and executes a complete SQL batch under one database lock.

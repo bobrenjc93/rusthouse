@@ -11,6 +11,8 @@ use crate::batch::sql::{
 use crate::batch::storage::{Column, Table};
 use crate::batch::value::{DataType, Value, ValueRef};
 
+pub use crate::batch::storage::DEFAULT_MAX_ROWS_PER_TABLE;
+
 /// Maximum estimated heap retained by the collecting [`Database::execute`] API.
 pub const DEFAULT_MAX_RETAINED_RESULT_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum rows materialized by one `SELECT`.
@@ -122,10 +124,21 @@ impl Default for QueryResultLimits {
 /// );
 /// # Ok::<(), rusthouse::batch::error::Error>(())
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     catalog: Catalog,
     query_result_limits: QueryResultLimits,
+    max_rows_per_table: usize,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            catalog: Catalog::new(),
+            query_result_limits: QueryResultLimits::default(),
+            max_rows_per_table: DEFAULT_MAX_ROWS_PER_TABLE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +173,15 @@ impl Database {
         Self {
             catalog: Catalog::new(),
             query_result_limits,
+            max_rows_per_table: DEFAULT_MAX_ROWS_PER_TABLE,
+        }
+    }
+
+    /// Creates an empty database with an explicit row cap for each created table.
+    pub fn with_max_rows_per_table(max_rows_per_table: usize) -> Self {
+        Self {
+            max_rows_per_table,
+            ..Self::default()
         }
     }
 
@@ -171,6 +193,12 @@ impl Database {
     #[must_use]
     pub const fn query_result_limits(&self) -> QueryResultLimits {
         self.query_result_limits
+    }
+
+    /// Returns the maximum number of rows retained by each created table.
+    #[must_use]
+    pub const fn max_rows_per_table(&self) -> usize {
+        self.max_rows_per_table
     }
 
     /// Execute one or more semicolon-separated statements in order.
@@ -286,7 +314,8 @@ impl Database {
     ) -> Result<StatementResult> {
         match statement {
             Statement::CreateTable { name, columns } => {
-                self.catalog.create_table(name, columns)?;
+                self.catalog
+                    .create_table_with_row_cap(name, columns, self.max_rows_per_table)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
@@ -308,16 +337,8 @@ impl Database {
             }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
-                {
-                    let target = self.catalog.table(&table)?;
-                    for row in &rows {
-                        target.validate_row(row)?;
-                    }
-                }
                 let target = self.catalog.table_mut(&table)?;
-                for row in rows {
-                    target.insert_row(row)?;
-                }
+                target.insert_rows(rows)?;
                 Ok(StatementResult::Command {
                     tag: "INSERT",
                     affected_rows,
