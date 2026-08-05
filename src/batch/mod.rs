@@ -1,6 +1,7 @@
 //! Bounded, semicolon-delimited SQL batch execution for CLI export formats.
 
 pub mod catalog;
+pub mod csv;
 pub mod engine;
 pub mod error;
 pub mod format;
