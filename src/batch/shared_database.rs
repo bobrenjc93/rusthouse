@@ -33,7 +33,7 @@ impl fmt::Display for SharedDatabaseError {
             ),
             Self::ReadOnlyStatementRequired { statement } => write!(
                 formatter,
-                "read-only query accepts only SELECT or SHOW TABLES; found {statement}"
+                "read-only query accepts only SELECT, SHOW TABLES, or DESCRIBE TABLE; found {statement}"
             ),
             Self::LockPoisoned => write!(formatter, "shared database lock is poisoned"),
         }
@@ -62,7 +62,8 @@ impl From<Error> for SharedDatabaseError {
 /// Each SQL batch is completely parsed before the database lock is acquired.
 /// [`Self::execute`] retains one write lock while every statement executes, so
 /// statements from concurrent mutating batches cannot interleave. [`Self::query`]
-/// executes one `SELECT` or `SHOW TABLES` under a shared read lock. Results own
+/// executes one `SELECT`, `SHOW TABLES`, or `DESCRIBE TABLE` under a shared read
+/// lock. Results own
 /// their columns and values and remain valid after the lock is released.
 ///
 /// A batch is not a rollback transaction: once parsing succeeds, earlier
@@ -181,7 +182,8 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         statement @ (Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
-        | Statement::ShowTables) => Ok(statement),
+        | Statement::ShowTables
+        | Statement::DescribeTable { .. }) => Ok(statement),
         Statement::CreateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "CREATE TABLE",
         }),

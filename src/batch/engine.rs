@@ -183,7 +183,10 @@ impl Database {
                 .execute_statement_with_limits(statement, query_limits)
                 .map_err(|error| match error {
                     Error::ResourceLimitExceeded {
-                        resource: "SELECT result bytes" | "SHOW TABLES result bytes",
+                        resource:
+                            "SELECT result bytes"
+                            | "SHOW TABLES result bytes"
+                            | "DESCRIBE TABLE result bytes",
                         actual,
                         ..
                     } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -204,7 +207,7 @@ impl Database {
         Ok(results)
     }
 
-    /// Executes one already-parsed `SELECT` or `SHOW TABLES` without mutable access.
+    /// Executes one already-parsed read-only query without mutable access.
     pub(crate) fn execute_query_statement_with_result_limit(
         &self,
         statement: Statement,
@@ -219,7 +222,10 @@ impl Database {
             .execute_query_statement_with_limits(statement, query_limits)
             .map_err(|error| match error {
                 Error::ResourceLimitExceeded {
-                    resource: "SELECT result bytes" | "SHOW TABLES result bytes",
+                    resource:
+                        "SELECT result bytes"
+                        | "SHOW TABLES result bytes"
+                        | "DESCRIBE TABLE result bytes",
                     actual,
                     ..
                 } if tightened_result_limit => Error::ResultLimitExceeded {
@@ -286,7 +292,8 @@ impl Database {
             statement @ (Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
-            | Statement::ShowTables) => self
+            | Statement::ShowTables
+            | Statement::DescribeTable { .. }) => self
                 .execute_query_statement_with_limits(statement, query_result_limits)
                 .map(StatementResult::Query),
         }
@@ -306,10 +313,14 @@ impl Database {
                 self.execute_union_all(left, right, query_result_limits)
             }
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
+            Statement::DescribeTable { name } => {
+                self.execute_describe_table(&name, query_result_limits)
+            }
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT or SHOW TABLES".to_owned(),
+                "read-only execution accepts only SELECT, SHOW TABLES, or DESCRIBE TABLE"
+                    .to_owned(),
             )),
         }
     }
@@ -345,6 +356,65 @@ impl Database {
                 .map(|name| vec![Value::String(name.to_owned())])
                 .collect(),
         })
+    }
+
+    fn execute_describe_table(
+        &self,
+        name: &str,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_COUNT: usize = 2;
+        const RESULT_COLUMN_NAME_BYTES: usize = "name".len() + "type".len();
+
+        let table = self.catalog.table(name)?;
+        let row_count = table.schema().len();
+        let fixed_bytes = validate_result_shape_parts(
+            row_count,
+            RESULT_COLUMN_COUNT,
+            RESULT_COLUMN_COUNT,
+            RESULT_COLUMN_NAME_BYTES,
+            query_result_limits,
+            DESCRIBE_TABLE_RESULT_RESOURCES,
+        )?;
+        let value_bytes = table
+            .schema()
+            .iter()
+            .map(|field| {
+                field
+                    .name
+                    .len()
+                    .saturating_add(field.data_type.as_str().len())
+            })
+            .fold(0_usize, usize::saturating_add);
+        let bytes = fixed_bytes.saturating_add(value_bytes);
+        enforce_resource_limit(
+            DESCRIBE_TABLE_RESULT_RESOURCES.bytes,
+            bytes,
+            query_result_limits.max_bytes,
+        )?;
+
+        let columns = vec![
+            ResultColumn {
+                name: "name".to_owned(),
+                data_type: DataType::String,
+            },
+            ResultColumn {
+                name: "type".to_owned(),
+                data_type: DataType::String,
+            },
+        ];
+        let rows = table
+            .schema()
+            .iter()
+            .map(|field| {
+                vec![
+                    Value::String(field.name.clone()),
+                    Value::String(field.data_type.as_str().to_owned()),
+                ]
+            })
+            .collect();
+
+        Ok(QueryResult { columns, rows })
     }
 
     fn execute_select(
@@ -1336,19 +1406,35 @@ fn validate_result_shape(
     limits: QueryResultLimits,
     resources: QueryResultResources,
 ) -> Result<usize> {
+    let column_name_bytes = columns
+        .iter()
+        .map(|column| column.name.len())
+        .fold(0_usize, usize::saturating_add);
+    validate_result_shape_parts(
+        row_count,
+        column_count,
+        columns.len(),
+        column_name_bytes,
+        limits,
+        resources,
+    )
+}
+
+fn validate_result_shape_parts(
+    row_count: usize,
+    values_per_row: usize,
+    result_column_count: usize,
+    result_column_name_bytes: usize,
+    limits: QueryResultLimits,
+    resources: QueryResultResources,
+) -> Result<usize> {
     enforce_resource_limit(resources.rows, row_count, limits.max_rows)?;
-    let value_count = row_count.saturating_mul(column_count);
+    let value_count = row_count.saturating_mul(values_per_row);
     enforce_resource_limit(resources.values, value_count, limits.max_values)?;
 
-    let column_bytes = columns
-        .len()
+    let column_bytes = result_column_count
         .saturating_mul(std::mem::size_of::<ResultColumn>())
-        .saturating_add(
-            columns
-                .iter()
-                .map(|column| column.name.len())
-                .fold(0_usize, usize::saturating_add),
-        );
+        .saturating_add(result_column_name_bytes);
     let bytes = column_bytes
         .saturating_add(row_count.saturating_mul(std::mem::size_of::<Vec<Value>>()))
         .saturating_add(value_count.saturating_mul(std::mem::size_of::<Value>()));
@@ -1373,6 +1459,12 @@ const SHOW_TABLES_RESULT_RESOURCES: QueryResultResources = QueryResultResources 
     rows: "SHOW TABLES result rows",
     values: "SHOW TABLES result values",
     bytes: "SHOW TABLES result bytes",
+};
+
+const DESCRIBE_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "DESCRIBE TABLE result rows",
+    values: "DESCRIBE TABLE result values",
+    bytes: "DESCRIBE TABLE result bytes",
 };
 
 fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> Result<()> {

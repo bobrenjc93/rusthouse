@@ -56,6 +56,9 @@ pub enum Statement {
         right: Select,
     },
     ShowTables,
+    DescribeTable {
+        name: String,
+    },
 }
 
 /// `SELECT * FROM <left> CROSS JOIN <right> [LIMIT n]`.
@@ -556,8 +559,10 @@ impl<'a> Parser<'a> {
             self.parse_select_statement()
         } else if self.eat_keyword("SHOW") {
             self.parse_show()
+        } else if self.eat_keyword("DESCRIBE") {
+            self.parse_describe()
         } else {
-            self.error("expected CREATE, DROP, INSERT, SELECT, or SHOW")
+            self.error("expected CREATE, DROP, INSERT, SELECT, SHOW, or DESCRIBE")
         }
     }
 
@@ -630,6 +635,15 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after SHOW TABLES");
         }
         Ok(Statement::ShowTables)
+    }
+
+    fn parse_describe(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after DESCRIBE TABLE <name>");
+        }
+        Ok(Statement::DescribeTable { name })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {

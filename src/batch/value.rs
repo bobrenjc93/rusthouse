@@ -21,16 +21,22 @@ impl DataType {
             _ => None,
         }
     }
-}
 
-impl fmt::Display for DataType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+    /// Returns the canonical SQL spelling used in schema metadata.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
             Self::Int64 => "Int64",
             Self::Float64 => "Float64",
             Self::Bool => "Bool",
             Self::String => "String",
-        })
+        }
+    }
+}
+
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
