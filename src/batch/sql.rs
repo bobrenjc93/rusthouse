@@ -104,8 +104,10 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
-    /// The deliberately minimal `ROW_NUMBER() OVER ()` window projection.
+    /// A deliberately minimal unpartitioned `ROW_NUMBER` window projection.
     RowNumber {
+        /// An optional, single, explicitly directed `Int64` source column.
+        order_by: Option<OrderBy>,
         alias: Option<String>,
     },
     Aggregate {
@@ -907,28 +909,46 @@ impl<'a> Parser<'a> {
                 )?;
                 self.expect_keyword("OVER")?;
                 self.expect(&TokenKind::LeftParen, "'(' after OVER")?;
-                self.expect(
-                    &TokenKind::RightParen,
-                    "')' after the empty ROW_NUMBER window",
-                )?;
+                let order_by = if self.eat(&TokenKind::RightParen) {
+                    None
+                } else {
+                    self.expect_keyword("ORDER")?;
+                    self.expect_keyword("BY")?;
+                    let name = self.expect_identifier("Int64 column in ROW_NUMBER ORDER BY")?;
+                    let descending = if self.eat_keyword("ASC") {
+                        false
+                    } else if self.eat_keyword("DESC") {
+                        true
+                    } else {
+                        return self
+                            .error("expected ASC or DESC after the ROW_NUMBER ORDER BY column");
+                    };
+                    self.expect(
+                        &TokenKind::RightParen,
+                        "')' after the ROW_NUMBER window ordering",
+                    )?;
+                    Some(OrderBy { name, descending })
+                };
                 let alias = self.parse_alias()?;
-                return Ok(SelectItem::RowNumber { alias });
+                return Ok(SelectItem::RowNumber { order_by, alias });
             }
 
             if name.eq_ignore_ascii_case("CAST") {
-                let name = self.expect_identifier("Int64 column in CAST")?;
+                let name = self.expect_identifier("column in CAST")?;
                 self.expect_keyword("AS")?;
                 let type_position = self.position();
-                let type_name = self.expect_identifier("Float64 target type in CAST")?;
+                let type_name = self.expect_identifier("target type in CAST")?;
                 let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                     position: type_position,
-                    message: format!("unknown CAST target type '{type_name}'; expected Float64"),
+                    message: format!(
+                        "unknown CAST target type '{type_name}'; expected Int64 or Float64"
+                    ),
                 })?;
-                if target_type != DataType::Float64 {
+                if !matches!(target_type, DataType::Int64 | DataType::Float64) {
                     return Err(Error::Sql {
                         position: type_position,
                         message: format!(
-                            "unsupported CAST target type '{type_name}'; expected Float64"
+                            "unsupported CAST target type '{type_name}'; expected Int64 or Float64"
                         ),
                     });
                 }
