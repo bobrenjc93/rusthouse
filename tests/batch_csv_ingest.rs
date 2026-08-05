@@ -1,6 +1,7 @@
 use rusthouse::batch::csv::{CsvIngestError, CsvIngestLimits};
-use rusthouse::batch::engine::{Database, QueryResult, StatementResult};
+use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
+use rusthouse::batch::format::write_csv;
 use rusthouse::batch::value::{DataType, Value};
 
 const HEADER: &str = "id,score,active,label";
@@ -108,8 +109,38 @@ fn decodes_single_line_quoted_strings_among_typed_fields() {
 }
 
 #[test]
+fn preserves_multiline_strings_and_mixed_record_endings() {
+    let input = concat!(
+        "id,score,active,label\r\n",
+        "1,1.0,true,\"alpha\nbeta\"\n",
+        "2,2.0,false,\"gamma\r\ndelta \"\"quoted\"\"\"\r\n",
+        "3,3.0,true,plain",
+    )
+    .as_bytes();
+    let mut database = database(3);
+
+    assert_eq!(
+        database
+            .ingest_csv_with_names("metrics", input, CsvIngestLimits::new(input.len(), 3, 12),)
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        query(&mut database, "SELECT id, label FROM metrics ORDER BY id;").rows,
+        [
+            vec![Value::Int64(1), Value::String("alpha\nbeta".to_owned())],
+            vec![
+                Value::Int64(2),
+                Value::String("gamma\r\ndelta \"quoted\"".to_owned()),
+            ],
+            vec![Value::Int64(3), Value::String("plain".to_owned())],
+        ]
+    );
+}
+
+#[test]
 fn quoted_string_can_precede_more_typed_fields() {
-    let input = b"id,label,active\n1,\"left,right\",true\n2,\"\",false\n";
+    let input = b"id,label,active\n1,\"left,\nright\",true\n2,\"\",false\n";
     let mut database = Database::with_max_rows_per_table(2);
     database
         .execute("CREATE TABLE messages (id Int64, label String, active Bool);")
@@ -130,7 +161,7 @@ fn quoted_string_can_precede_more_typed_fields() {
         [
             vec![
                 Value::Int64(1),
-                Value::String("left,right".to_owned()),
+                Value::String("left,\nright".to_owned()),
                 Value::Bool(true),
             ],
             vec![
@@ -139,6 +170,67 @@ fn quoted_string_can_precede_more_typed_fields() {
                 Value::Bool(false),
             ],
         ]
+    );
+}
+
+#[test]
+fn csv_export_with_multiline_strings_round_trips_at_exact_limits() {
+    let expected_rows = vec![
+        vec![
+            Value::Int64(1),
+            Value::Float64(2.5),
+            Value::Bool(true),
+            Value::String("first\nline, with a \"quote\"".to_owned()),
+        ],
+        vec![
+            Value::Int64(2),
+            Value::Float64(-3.25),
+            Value::Bool(false),
+            Value::String("windows\r\nline".to_owned()),
+        ],
+    ];
+    let exported = QueryResult {
+        columns: vec![
+            ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "score".to_owned(),
+                data_type: DataType::Float64,
+            },
+            ResultColumn {
+                name: "active".to_owned(),
+                data_type: DataType::Bool,
+            },
+            ResultColumn {
+                name: "label".to_owned(),
+                data_type: DataType::String,
+            },
+        ],
+        rows: expected_rows.clone(),
+    };
+    let mut csv = Vec::new();
+    write_csv(&mut csv, &exported).unwrap();
+
+    let mut database = database(2);
+    assert_eq!(
+        database
+            .ingest_csv_with_names(
+                "metrics",
+                &csv,
+                CsvIngestLimits::new(csv.len(), expected_rows.len(), 8),
+            )
+            .unwrap(),
+        expected_rows.len()
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, score, active, label FROM metrics ORDER BY id;",
+        )
+        .rows,
+        expected_rows
     );
 }
 
@@ -342,27 +434,31 @@ fn malformed_rows_and_typed_values_roll_back_prior_parsed_records() {
 }
 
 #[test]
-fn embedded_record_break_and_late_malformed_quote_preserve_existing_rows() {
-    let input = concat!(
+fn malformed_records_after_valid_multiline_rows_preserve_existing_rows() {
+    let prefix = concat!(
         "id,score,active,label\n",
-        "1,1.0,true,\"valid,quoted\"\n",
-        "2,2.0,false,\"two\n",
-        "lines\"\n",
-    )
-    .as_bytes();
-    let mut database = database(4);
-    database
-        .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
-        .unwrap();
+        "1,1.0,true,\"valid\nmultiline\"\n",
+        "2,2.0,false,ok\r\n",
+    );
+    for suffix in [
+        "3,3.0,true,\"unterminated\n",
+        "3,3.0,true,\"closed\nafter newline\"junk\n",
+    ] {
+        let input = format!("{prefix}{suffix}").into_bytes();
+        let mut database = database(4);
+        database
+            .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
+            .unwrap();
 
-    assert_eq!(
-        database.ingest_csv_with_names("metrics", input, generous_limits(input)),
-        Err(CsvIngestError::MalformedQuoting { line: 3, column: 4 })
-    );
-    assert_eq!(
-        query(&mut database, "SELECT id, label FROM metrics;").rows,
-        [vec![Value::Int64(9), Value::String("existing".to_owned()),]]
-    );
+        assert_eq!(
+            database.ingest_csv_with_names("metrics", &input, generous_limits(&input)),
+            Err(CsvIngestError::MalformedQuoting { line: 5, column: 4 })
+        );
+        assert_eq!(
+            query(&mut database, "SELECT id, label FROM metrics;").rows,
+            [vec![Value::Int64(9), Value::String("existing".to_owned()),]]
+        );
+    }
 }
 
 #[test]
@@ -410,6 +506,12 @@ fn validates_utf8_line_endings_header_and_table_before_mutation() {
     let bare_cr = b"id,score,active,label\n1,1.0,true,one\r";
     assert_eq!(
         database.ingest_csv_with_names("metrics", bare_cr, generous_limits(bare_cr)),
+        Err(CsvIngestError::InvalidLineEnding { line: 2 })
+    );
+
+    let quoted_bare_cr = b"id,score,active,label\n1,1.0,true,\"one\rtwo\"\n";
+    assert_eq!(
+        database.ingest_csv_with_names("metrics", quoted_bare_cr, generous_limits(quoted_bare_cr),),
         Err(CsvIngestError::InvalidLineEnding { line: 2 })
     );
 
