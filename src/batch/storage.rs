@@ -13,6 +13,31 @@ pub struct ColumnDef {
     pub data_type: DataType,
 }
 
+pub(crate) fn is_sql_identifier_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
+}
+
+pub(crate) fn is_sql_identifier_continue(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+fn is_valid_sql_identifier(identifier: &str) -> bool {
+    let mut characters = identifier.chars();
+    characters.next().is_some_and(is_sql_identifier_start)
+        && characters.all(is_sql_identifier_continue)
+}
+
+fn validate_sql_identifier(identifier: &str, context: &str) -> Result<()> {
+    if is_valid_sql_identifier(identifier) {
+        Ok(())
+    } else {
+        Err(Error::InvalidIdentifier {
+            identifier: identifier.to_owned(),
+            context: context.to_owned(),
+        })
+    }
+}
+
 pub(crate) fn is_reserved_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE")
 }
@@ -118,6 +143,7 @@ impl Table {
 
     /// Creates an empty table with an explicit maximum retained row count.
     pub fn with_row_cap(name: String, schema: Vec<ColumnDef>, row_cap: usize) -> Result<Self> {
+        validate_sql_identifier(&name, "table name")?;
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
                 "a table must contain at least one column".to_owned(),
@@ -125,6 +151,7 @@ impl Table {
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
+            validate_sql_identifier(&field.name, "column name")?;
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
                     identifier: field.name.clone(),

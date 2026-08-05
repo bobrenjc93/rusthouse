@@ -14,6 +14,10 @@ pub enum Error {
         identifier: String,
         context: String,
     },
+    InvalidIdentifier {
+        identifier: String,
+        context: String,
+    },
     ColumnNotFound {
         table: String,
         column: String,
@@ -69,6 +73,13 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "{context} {identifier:?} is reserved; TRUE and FALSE are Boolean literals"
+            ),
+            Self::InvalidIdentifier {
+                identifier,
+                context,
+            } => write!(
+                f,
+                "{context} {identifier:?} is not a valid SQL identifier; expected [A-Za-z_][A-Za-z0-9_]*"
             ),
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column '{column}' does not exist in table '{table}'")

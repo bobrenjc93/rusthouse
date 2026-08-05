@@ -1,5 +1,7 @@
 use crate::batch::error::{Error, Result};
-use crate::batch::storage::{ColumnDef, is_reserved_column_name};
+use crate::batch::storage::{
+    ColumnDef, is_reserved_column_name, is_sql_identifier_continue, is_sql_identifier_start,
+};
 use crate::batch::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
@@ -61,6 +63,9 @@ pub enum Statement {
         right: Select,
     },
     ShowTables,
+    ShowCreateTable {
+        name: String,
+    },
     DescribeTable {
         name: String,
     },
@@ -392,7 +397,7 @@ impl<'a> Lexer<'a> {
             }
             '\'' => TokenKind::String(self.scan_string(position)?),
             value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()),
-            value if value.is_ascii_alphabetic() || value == '_' => {
+            value if is_sql_identifier_start(value) => {
                 TokenKind::Identifier(self.scan_identifier())
             }
             _ => {
@@ -429,10 +434,7 @@ impl<'a> Lexer<'a> {
 
     fn scan_identifier(&mut self) -> String {
         let start = self.position;
-        while self
-            .current()
-            .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_')
-        {
+        while self.current().is_some_and(is_sql_identifier_continue) {
             self.advance();
         }
         self.input[start..self.position].to_owned()
@@ -676,6 +678,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_show(&mut self) -> Result<Statement> {
+        if self.eat_keyword("CREATE") {
+            self.expect_keyword("TABLE")?;
+            let name = self.expect_identifier("table name")?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after SHOW CREATE TABLE <name>");
+            }
+            return Ok(Statement::ShowCreateTable { name });
+        }
+
         self.expect_keyword("TABLES")?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after SHOW TABLES");
