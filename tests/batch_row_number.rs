@@ -164,6 +164,79 @@ fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit()
 }
 
 #[test]
+fn ordered_row_number_limits_match_a_full_stable_ordering() {
+    let source_rows = [
+        (-2, -100),
+        (10, 2),
+        (20, 1),
+        (30, 2),
+        (40, 1),
+        (50, 3),
+        (-1, 100),
+        (60, 3),
+        (70, 1),
+        (80, 2),
+        (90, 3),
+    ];
+    let values = source_rows
+        .iter()
+        .map(|(id, rank_key)| format!("({id}, {rank_key})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut database = Database::new();
+    database
+        .execute(&format!(
+            "CREATE TABLE events (id Int64, rank_key Int64); \
+             INSERT INTO events VALUES {values};"
+        ))
+        .expect("fixture succeeds");
+
+    let matching_row_count = source_rows.iter().filter(|(id, _)| *id >= 0).count();
+    let limits = [0, 2, matching_row_count, matching_row_count + 5];
+
+    for (direction, descending) in [("ASC", false), ("DESC", true)] {
+        let mut full_stable_order = source_rows
+            .iter()
+            .filter(|(id, _)| *id >= 0)
+            .collect::<Vec<_>>();
+        full_stable_order.sort_by(|left, right| {
+            let comparison = left.1.cmp(&right.1);
+            if descending {
+                comparison.reverse()
+            } else {
+                comparison
+            }
+        });
+        let full_result = full_stable_order
+            .iter()
+            .enumerate()
+            .map(|(index, (id, rank_key))| {
+                vec![
+                    Value::Int64(*id),
+                    Value::Int64(*rank_key),
+                    Value::Int64(i64::try_from(index + 1).unwrap()),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        for limit in limits {
+            let results = database
+                .execute(&format!(
+                    "SELECT id, rank_key, \
+                            ROW_NUMBER() OVER (ORDER BY rank_key {direction}) AS n \
+                     FROM events WHERE id >= 0 LIMIT {limit}"
+                ))
+                .expect("limited ordered ROW_NUMBER succeeds");
+            assert_eq!(
+                query(&results[0]).rows,
+                full_result[..limit.min(full_result.len())],
+                "{direction} LIMIT {limit}"
+            );
+        }
+    }
+}
+
+#[test]
 fn ordered_row_number_limits_rows_before_checked_cast_projection() {
     let mut database = Database::new();
     database

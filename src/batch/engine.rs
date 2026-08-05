@@ -466,14 +466,14 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
-        if let Some(ordering) = window_ordering {
-            order_window_rows(&mut matching_rows, table, ordering);
-        }
         if items
             .iter()
             .any(|item| matches!(item, ResolvedItem::RowNumber))
         {
             validate_row_number_count(matching_rows.len())?;
+        }
+        if let Some(ordering) = window_ordering {
+            order_window_rows(&mut matching_rows, table, ordering, select.limit);
         }
 
         let grouped = select.distinct || !group_columns.is_empty() || !aggregate_specs.is_empty();
@@ -746,16 +746,21 @@ fn same_window_order(left: Option<&OrderBy>, right: Option<&OrderBy>) -> bool {
     }
 }
 
-fn order_window_rows(rows: &mut [usize], table: &Table, ordering: ResolvedWindowOrder) {
-    rows.sort_unstable_by(|left, right| {
+fn order_window_rows(
+    rows: &mut Vec<usize>,
+    table: &Table,
+    ordering: ResolvedWindowOrder,
+    limit: Option<usize>,
+) {
+    sort_and_limit(rows, limit, |left, right| {
         let comparison =
-            int64_at(table, ordering.source, *left).cmp(&int64_at(table, ordering.source, *right));
+            int64_at(table, ordering.source, left).cmp(&int64_at(table, ordering.source, right));
         let comparison = if ordering.descending {
             comparison.reverse()
         } else {
             comparison
         };
-        comparison.then_with(|| left.cmp(right))
+        comparison.then_with(|| left.cmp(&right))
     });
 }
 
