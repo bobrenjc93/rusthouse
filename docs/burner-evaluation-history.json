@@ -762,6 +762,22 @@
         "eval_c88a7f3d": 35,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:434",
+      "recordedAt": "2026-08-05T10:28:41.394Z",
+      "label": "PR #434",
+      "kind": "leaf",
+      "prNumber": 434,
+      "title": "Add a bounded nullable Int64 left-outer join operator",
+      "scores": {
+        "eval_9fbdfec0": 75,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 35,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
