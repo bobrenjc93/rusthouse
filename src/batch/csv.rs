@@ -1,9 +1,9 @@
-//! Bounded ingestion for an unquoted, typed `CSVWithNames` subset.
+//! Bounded ingestion for a typed `CSVWithNames` subset.
 //!
-//! This intentionally is not a general CSV implementation. Double quotes are
-//! rejected, so fields cannot contain commas, CR, or LF. In particular, a
-//! `String` field is copied exactly as written between delimiters and cannot
-//! use CSV quoting or escaping.
+//! Data fields with the `String` schema type may be double-quoted. Commas in a
+//! quoted string are data, and a double quote is decoded from `""`. This is
+//! intentionally not a general streaming CSV implementation: headers and
+//! non-`String` fields must be unquoted, and records cannot contain CR or LF.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -88,8 +88,10 @@ pub enum CsvIngestError {
         expected: usize,
         actual: usize,
     },
-    /// A double quote was found; quoted and escaped fields are unsupported.
+    /// Quoting was used in a header or for a non-`String` data field.
     QuotingNotSupported { line: usize, column: usize },
+    /// A quote was unclosed or used outside the quoted-field grammar.
+    MalformedQuoting { line: usize, column: usize },
     /// A field cannot be parsed as its schema type.
     InvalidValue {
         line: usize,
@@ -152,7 +154,11 @@ impl fmt::Display for CsvIngestError {
             ),
             Self::QuotingNotSupported { line, column } => write!(
                 formatter,
-                "CSV field at line {line}, column {column} uses unsupported quoting"
+                "CSV field at line {line}, column {column} uses quoting where only an unquoted field is supported"
+            ),
+            Self::MalformedQuoting { line, column } => write!(
+                formatter,
+                "CSV field at line {line}, column {column} has malformed quoting"
             ),
             Self::InvalidValue {
                 line,
@@ -217,7 +223,7 @@ pub(crate) fn parse_rows(
             });
         }
 
-        let actual_columns = field_count(record);
+        let actual_columns = scan_record(record, line, |_, _, _| Ok(()))?;
         let next_value_count = value_count.saturating_add(actual_columns);
         if next_value_count > limits.max_values {
             return Err(CsvIngestError::ValueLimitExceeded {
@@ -235,11 +241,18 @@ pub(crate) fn parse_rows(
         }
 
         let mut row = Vec::with_capacity(expected_columns);
-        for (column, (field, definition)) in record.split(',').zip(table.schema()).enumerate() {
-            let column = column + 1;
-            reject_quoting(field, line, column)?;
-            row.push(parse_value(field, definition.data_type, line, column)?);
-        }
+        scan_record(record, line, |column, field, quoted| {
+            let data_type = table.schema()[column - 1].data_type;
+            if quoted {
+                if data_type != DataType::String {
+                    return Err(CsvIngestError::QuotingNotSupported { line, column });
+                }
+                row.push(Value::String(field.replace("\"\"", "\"")));
+            } else {
+                row.push(parse_value(field, data_type, line, column)?);
+            }
+            Ok(())
+        })?;
         value_count = next_value_count;
         rows.push(row);
     }
@@ -299,6 +312,66 @@ fn reject_quoting(field: &str, line: usize, column: usize) -> Result<(), CsvInge
         return Err(CsvIngestError::QuotingNotSupported { line, column });
     }
     Ok(())
+}
+
+/// Visits the syntactically valid fields in one physical data record.
+///
+/// Quoted field contents exclude the surrounding quotes but retain doubled
+/// quotes so the caller can decode them only after limits and arity are known.
+fn scan_record(
+    record: &str,
+    line: usize,
+    mut visit: impl FnMut(usize, &str, bool) -> Result<(), CsvIngestError>,
+) -> Result<usize, CsvIngestError> {
+    let bytes = record.as_bytes();
+    let mut field_start = 0_usize;
+    let mut column = 0_usize;
+
+    loop {
+        column = column.saturating_add(1);
+        if bytes.get(field_start) == Some(&b'"') {
+            let contents_start = field_start + 1;
+            let mut cursor = contents_start;
+            loop {
+                match bytes.get(cursor) {
+                    Some(b'"') if bytes.get(cursor + 1) == Some(&b'"') => {
+                        cursor += 2;
+                    }
+                    Some(b'"') => {
+                        let delimiter = cursor + 1;
+                        if delimiter < bytes.len() && bytes[delimiter] != b',' {
+                            return Err(CsvIngestError::MalformedQuoting { line, column });
+                        }
+                        visit(column, &record[contents_start..cursor], true)?;
+                        if delimiter == bytes.len() {
+                            return Ok(column);
+                        }
+                        field_start = delimiter + 1;
+                        break;
+                    }
+                    Some(_) => cursor += 1,
+                    None => {
+                        return Err(CsvIngestError::MalformedQuoting { line, column });
+                    }
+                }
+            }
+        } else {
+            let field_end = record[field_start..]
+                .as_bytes()
+                .iter()
+                .position(|byte| *byte == b',')
+                .map_or(bytes.len(), |offset| field_start + offset);
+            let field = &record[field_start..field_end];
+            if field.contains('"') {
+                return Err(CsvIngestError::MalformedQuoting { line, column });
+            }
+            visit(column, field, false)?;
+            if field_end == bytes.len() {
+                return Ok(column);
+            }
+            field_start = field_end + 1;
+        }
+    }
 }
 
 fn parse_value(
