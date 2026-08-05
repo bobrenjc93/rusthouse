@@ -7,9 +7,10 @@ const HELP: &str = "RustHouse bounded SQL query session
 Usage: rusthouse [OPTIONS]
 
 With no options, reads the legacy line-oriented Int64 session from stdin.
-With --format csv or --format json, reads one semicolon-delimited SQL batch
-through EOF and prints one result for each SELECT, SHOW TABLES, or DESCRIBE
-TABLE query. CREATE, DROP, and INSERT remain silent.
+With --format table, --format csv, or --format json, reads one
+semicolon-delimited SQL batch through EOF and prints one result for each
+SELECT, SHOW TABLES, or DESCRIBE TABLE query. CREATE, DROP, and INSERT remain
+silent.
 
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table
@@ -20,6 +21,7 @@ Limits:
   batch grouped SELECT: 100000 groups, 500000 aggregate cells, 33554432 state bytes
 
 Options:
+  --format table Emit human-readable query result tables
   --format csv   Emit CSVWithNames-compatible query results
   --format json  Emit newline-delimited JSON query results
   -h, --help     Print help
@@ -39,6 +41,14 @@ fn main() -> ExitCode {
                 stdout.lock(),
                 rusthouse::SessionLimits::default(),
             ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(&error),
+            }
+        }
+        Ok(Action::TableBatch) => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            match rusthouse::batch::run_table_batch(stdin.lock(), stdout.lock()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(&error),
             }
@@ -69,6 +79,7 @@ fn main() -> ExitCode {
 enum Action {
     Help,
     Run,
+    TableBatch,
     CsvBatch,
     JsonBatch,
 }
@@ -79,6 +90,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, OsStri
         (None, None, None) => Ok(Action::Run),
         (Some(argument), None, None) if argument == "--help" || argument == "-h" => {
             Ok(Action::Help)
+        }
+        (Some(format), Some(value), None) if format == "--format" && value == "table" => {
+            Ok(Action::TableBatch)
         }
         (Some(format), Some(value), None) if format == "--format" && value == "csv" => {
             Ok(Action::CsvBatch)

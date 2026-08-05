@@ -107,20 +107,23 @@ explicit input-row and distinct-value limits and returns deterministic
 
 ## Command-line session
 
-`rusthouse --format csv` and `rusthouse --format json` read one complete SQL
-batch from standard input through EOF, with explicit limits of 64 MiB and 4,096
-statements. Parsing is lazy and bounds all `INSERT` ASTs in a batch to 100,000
+`rusthouse --format table`, `rusthouse --format csv`, and
+`rusthouse --format json` read one complete SQL batch from standard input
+through EOF, with explicit limits of 64 MiB and 4,096 statements. Parsing is
+lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Every statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
 statements are silent, and each `SELECT`, `SHOW TABLES`, or `DESCRIBE TABLE`
-query is executed and emitted before the next statement. CSV output uses a CSVWithNames-compatible
-header followed by typed rows; commas, quotes, and newlines in strings are
-CSV-escaped. JSON output is newline-delimited, with one compact object per
-query containing typed column metadata and positional rows. Numbers and
-booleans use native JSON values, SQL `NULL` becomes `null`, and strings are
-JSON-escaped.
+query is executed and emitted before the next statement. Table output uses
+bordered, human-readable columns, escapes control characters, renders SQL
+`NULL` as `NULL`, and separates multiple query results with a blank line. CSV
+output uses a CSVWithNames-compatible header followed by typed rows; commas,
+quotes, and newlines in strings are CSV-escaped. JSON output is
+newline-delimited, with one compact object per query containing typed column
+metadata and positional rows. Numbers and booleans use native JSON values, SQL
+`NULL` becomes `null`, and strings are JSON-escaped.
 A query result is checked before cloning against limits of 10,000 rows, 250,000
 values, and an estimated 16 MiB. Grouped queries additionally allow 100,000
 groups and bound grouped keys to 500,000 cells and an estimated 32 MiB. Their
@@ -144,6 +147,7 @@ printf '%s\n' \
 ```
 
 Use `--format csv` instead to emit the same query results as CSVWithNames.
+Use `--format table` for bordered output intended for direct terminal reading.
 
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an
 `Arc<RwLock<Catalog>>`. Cloned handles serialize `CREATE`, `INSERT`, and CSV

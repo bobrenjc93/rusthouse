@@ -16,7 +16,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use engine::{Database, StatementResult};
-use format::{write_csv, write_json};
+use format::{OutputFormat, render, write_csv, write_json};
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
@@ -35,6 +35,8 @@ pub enum BatchError {
     InvalidUtf8(std::string::FromUtf8Error),
     /// Parsing or executing a statement failed.
     Sql(error::Error),
+    /// Writing human-readable table output failed.
+    WriteTable(io::Error),
     /// Writing CSV output failed.
     Write(io::Error),
     /// Writing newline-delimited JSON output failed.
@@ -51,6 +53,9 @@ impl fmt::Display for BatchError {
             ),
             Self::InvalidUtf8(error) => write!(formatter, "SQL input is not valid UTF-8: {error}"),
             Self::Sql(error) => error.fmt(formatter),
+            Self::WriteTable(error) => {
+                write!(formatter, "could not write table to stdout: {error}")
+            }
             Self::Write(error) => write!(formatter, "could not write CSV to stdout: {error}"),
             Self::WriteJson(error) => write!(formatter, "could not write JSON to stdout: {error}"),
         }
@@ -60,12 +65,35 @@ impl fmt::Display for BatchError {
 impl StdError for BatchError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Read(error) | Self::Write(error) | Self::WriteJson(error) => Some(error),
+            Self::Read(error)
+            | Self::WriteTable(error)
+            | Self::Write(error)
+            | Self::WriteJson(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
             Self::InputLimitExceeded { .. } => None,
         }
     }
+}
+
+/// Reads one bounded SQL batch to EOF and emits human-readable result tables.
+///
+/// `CREATE TABLE`, `DROP TABLE`, and `INSERT` statements are silent. Each
+/// `SELECT`, `SHOW TABLES`, or `DESCRIBE TABLE` result is rendered with the
+/// existing table formatter. Results remain in statement order and are
+/// separated by one blank line.
+pub fn run_table_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
+    run_table_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
+}
+
+/// Executes the human-readable table batch protocol with an explicit input
+/// byte limit.
+pub fn run_table_batch_with_limit(
+    input: impl Read,
+    output: impl Write,
+    max_input_bytes: usize,
+) -> Result<(), BatchError> {
+    run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Table)
 }
 
 /// Reads one bounded SQL batch to EOF and emits CSVWithNames for every query.
@@ -113,6 +141,7 @@ pub fn run_json_batch_with_limit(
 
 #[derive(Debug, Clone, Copy)]
 enum BatchOutputFormat {
+    Table,
     Csv,
     Json,
 }
@@ -139,12 +168,24 @@ fn run_batch_with_limit(
     let sql = String::from_utf8(bytes).map_err(BatchError::InvalidUtf8)?;
     let statements = sql::parse(&sql).map_err(BatchError::Sql)?;
     let mut database = Database::new();
+    let mut emitted_table = false;
     for statement in statements {
         let result = database
             .execute_statement(statement)
             .map_err(BatchError::Sql)?;
         if let StatementResult::Query(query) = result {
             match output_format {
+                BatchOutputFormat::Table => {
+                    if emitted_table {
+                        output.write_all(b"\n").map_err(BatchError::WriteTable)?;
+                    }
+                    let rendered = render(&query, OutputFormat::Table);
+                    output
+                        .write_all(rendered.as_bytes())
+                        .map_err(BatchError::WriteTable)?;
+                    output.write_all(b"\n").map_err(BatchError::WriteTable)?;
+                    emitted_table = true;
+                }
                 BatchOutputFormat::Csv => {
                     write_csv(&mut output, &query).map_err(BatchError::Write)?;
                 }
@@ -236,6 +277,23 @@ mod tests {
         };
         assert_eq!(source.kind(), io::ErrorKind::Other);
         assert_eq!(output.written, 32);
+    }
+
+    #[test]
+    fn table_batch_preserves_typed_short_writer_failures() {
+        let mut output = FailAfterBytes {
+            remaining: 12,
+            written: 0,
+        };
+
+        let error = run_table_batch(&b"SHOW TABLES;"[..], &mut output)
+            .expect_err("writer stops during the table result");
+
+        let BatchError::WriteTable(source) = error else {
+            panic!("expected a typed table write error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert_eq!(output.written, 12);
     }
 
     #[test]
