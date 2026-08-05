@@ -1021,14 +1021,12 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
             .iter()
             .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
     if !unaliased_columns
-        || select.predicate.is_some()
         || !select.group_by.is_empty()
         || select.having.is_some()
         || !select.order_by.is_empty()
     {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports one or more unaliased columns and an optional LIMIT"
-                .to_owned(),
+            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, and an optional LIMIT".to_owned(),
         ));
     }
 
