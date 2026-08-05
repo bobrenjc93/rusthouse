@@ -25,6 +25,14 @@ impl Catalog {
         Ok(())
     }
 
+    /// Removes one table using the catalog's case-insensitive name resolution.
+    pub fn drop_table(&mut self, name: &str) -> Result<()> {
+        self.tables
+            .remove(&normalize(name))
+            .map(|_| ())
+            .ok_or_else(|| Error::TableNotFound(name.to_owned()))
+    }
+
     pub fn table(&self, name: &str) -> Result<&Table> {
         self.tables
             .get(&normalize(name))
@@ -107,5 +115,31 @@ mod tests {
         assert_eq!(catalog.table_count(), 3);
         assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
+    }
+
+    #[test]
+    fn dropping_is_case_insensitive_and_a_missing_table_preserves_the_catalog() {
+        let mut catalog = Catalog::new();
+        for name in ["Events", "readings"] {
+            catalog
+                .create_table(
+                    name.to_owned(),
+                    vec![ColumnDef {
+                        name: "id".to_owned(),
+                        data_type: DataType::Int64,
+                    }],
+                )
+                .expect("create table");
+        }
+
+        catalog.drop_table("EVENTS").expect("case-insensitive drop");
+        assert_eq!(catalog.table_names(), ["readings"]);
+
+        assert_eq!(
+            catalog.drop_table("missing"),
+            Err(Error::TableNotFound("missing".to_owned()))
+        );
+        assert_eq!(catalog.table_names(), ["readings"]);
+        assert!(catalog.table("readings").is_ok());
     }
 }
