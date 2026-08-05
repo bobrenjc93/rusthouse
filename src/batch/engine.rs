@@ -259,6 +259,13 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::DropTable { name } => {
+                self.catalog.drop_table(&name)?;
+                Ok(StatementResult::Command {
+                    tag: "DROP TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
                 {
@@ -299,7 +306,9 @@ impl Database {
                 self.execute_union_all(left, right, query_result_limits)
             }
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
-            Statement::CreateTable { .. } | Statement::Insert { .. } => Err(Error::InvalidQuery(
+            Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            | Statement::Insert { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT or SHOW TABLES".to_owned(),
             )),
         }

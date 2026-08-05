@@ -55,9 +55,10 @@ pub use scan::{
 };
 pub use shared_catalog::{SharedCatalog, SharedCatalogError};
 pub use snapshot::{
+    Int64TableFileRecovery, Int64TableFileRecoveryError, Int64TableFileRecoverySource,
     Int64TableFileRestoreError, Int64TableRestoreError, NullableI64PayloadCodec,
     NullableI64PayloadError, SnapshotCodec, SnapshotError, SnapshotFileError, restore_int64_table,
-    restore_int64_table_from_file,
+    restore_int64_table_from_file, restore_int64_table_from_file_with_backup,
 };
 mod storage;
 
