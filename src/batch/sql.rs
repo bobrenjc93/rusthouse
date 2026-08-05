@@ -1,5 +1,7 @@
 use crate::batch::error::{Error, Result};
-use crate::batch::storage::{ColumnDef, is_reserved_column_name};
+use crate::batch::storage::{
+    ColumnDef, is_reserved_column_name, is_sql_identifier_continue, is_sql_identifier_start,
+};
 use crate::batch::value::{DataType, Value};
 
 const MAX_PREDICATE_DEPTH: usize = 64;
@@ -395,7 +397,7 @@ impl<'a> Lexer<'a> {
             }
             '\'' => TokenKind::String(self.scan_string(position)?),
             value if value.is_ascii_digit() => TokenKind::Number(self.scan_number()),
-            value if value.is_ascii_alphabetic() || value == '_' => {
+            value if is_sql_identifier_start(value) => {
                 TokenKind::Identifier(self.scan_identifier())
             }
             _ => {
@@ -432,10 +434,7 @@ impl<'a> Lexer<'a> {
 
     fn scan_identifier(&mut self) -> String {
         let start = self.position;
-        while self
-            .current()
-            .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_')
-        {
+        while self.current().is_some_and(is_sql_identifier_continue) {
             self.advance();
         }
         self.input[start..self.position].to_owned()

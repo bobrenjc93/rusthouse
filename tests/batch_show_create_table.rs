@@ -6,6 +6,7 @@ use rusthouse::batch::engine::{
 };
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{Statement, parse};
+use rusthouse::batch::storage::ColumnDef;
 use rusthouse::batch::value::{DataType, Value};
 
 const CREATE: &str =
@@ -161,4 +162,82 @@ fn shared_database_reads_show_create_table_under_a_read_lock() {
             .rows,
         [vec![Value::String(DDL.to_owned())]]
     );
+}
+
+#[test]
+fn direct_ast_create_validates_identifiers_and_round_trips_show_create_sql() {
+    let statement = Statement::CreateTable {
+        name: "Manual_Table1".to_owned(),
+        columns: vec![
+            ColumnDef {
+                name: "EventID".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ColumnDef {
+                name: "score_2".to_owned(),
+                data_type: DataType::Float64,
+            },
+            ColumnDef {
+                name: "Active".to_owned(),
+                data_type: DataType::Bool,
+            },
+            ColumnDef {
+                name: "Label".to_owned(),
+                data_type: DataType::String,
+            },
+        ],
+    };
+    let mut database = Database::new();
+    assert_eq!(
+        database.execute_statement(statement.clone()),
+        Ok(StatementResult::Command {
+            tag: "CREATE TABLE",
+            affected_rows: 0,
+        })
+    );
+
+    let result = query(&mut database, "SHOW CREATE TABLE manual_table1");
+    let [row] = result.rows.as_slice() else {
+        panic!("SHOW CREATE TABLE must return one row");
+    };
+    let [Value::String(ddl)] = row.as_slice() else {
+        panic!("SHOW CREATE TABLE must return one String");
+    };
+    assert_eq!(parse(ddl), Ok(vec![statement]));
+
+    let mut round_tripped = Database::new();
+    round_tripped.execute(ddl).expect("shown DDL is executable");
+    assert_eq!(
+        query(&mut round_tripped, "SHOW CREATE TABLE MANUAL_TABLE1"),
+        result
+    );
+
+    for (name, column, expected) in [
+        (
+            "bad name",
+            "id",
+            Error::InvalidIdentifier {
+                identifier: "bad name".to_owned(),
+                context: "table name".to_owned(),
+            },
+        ),
+        (
+            "valid_name",
+            "id)",
+            Error::InvalidIdentifier {
+                identifier: "id)".to_owned(),
+                context: "column name".to_owned(),
+            },
+        ),
+    ] {
+        let invalid = Statement::CreateTable {
+            name: name.to_owned(),
+            columns: vec![ColumnDef {
+                name: column.to_owned(),
+                data_type: DataType::Int64,
+            }],
+        };
+        assert_eq!(database.execute_statement(invalid), Err(expected));
+    }
+    assert_eq!(database.catalog().table_count(), 1);
 }
