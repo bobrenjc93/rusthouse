@@ -4,7 +4,7 @@ use crate::batch::storage::{
 };
 use crate::batch::value::{DataType, Value};
 
-pub(crate) const MAX_PREDICATE_DEPTH: usize = 64;
+const MAX_PREDICATE_DEPTH: usize = 64;
 pub(crate) const MAX_PREDICATE_NODES: usize = 256;
 
 /// Maximum number of executable statements in one parsed batch.

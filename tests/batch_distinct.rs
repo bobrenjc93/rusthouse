@@ -476,8 +476,30 @@ fn direct_ast_distinct_rejects_incomparable_predicate_literals_without_panicking
 }
 
 #[test]
-fn direct_ast_distinct_enforces_predicate_complexity_limits() {
-    const MAX_DEPTH: usize = 64;
+fn flat_predicates_parse_and_execute_at_the_node_limit() {
+    const MAX_NODES: usize = 256;
+    let comparisons = (MAX_NODES + 1) / 2;
+    let predicate = vec!["value = 1"; comparisons].join(" AND ");
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (value Int64); INSERT INTO samples VALUES (1), (2);")
+        .expect("setup");
+
+    for projection in ["value", "DISTINCT value"] {
+        let sql = format!("SELECT {projection} FROM samples WHERE {predicate}");
+        assert_eq!(query(&mut database, &sql).rows, [vec![Value::Int64(1)]]);
+    }
+
+    let oversized = vec!["value = 1"; comparisons + 1].join(" AND ");
+    assert!(matches!(
+        parse(&format!("SELECT value FROM samples WHERE {oversized}")),
+        Err(Error::Sql { message, .. })
+            if message.contains("predicate is too complex; maximum 256 expression nodes")
+    ));
+}
+
+#[test]
+fn direct_ast_distinct_enforces_predicate_node_limit() {
     const MAX_NODES: usize = 256;
 
     fn comparison() -> Predicate {
@@ -488,26 +510,10 @@ fn direct_ast_distinct_enforces_predicate_complexity_limits() {
         }
     }
 
-    fn nested_conjunction(depth: usize) -> Predicate {
-        (0..depth).fold(comparison(), |left, _| {
+    fn conjunction(comparisons: usize) -> Predicate {
+        (1..comparisons).fold(comparison(), |left, _| {
             Predicate::And(Box::new(left), Box::new(comparison()))
         })
-    }
-
-    fn balanced_conjunction(leaves: usize) -> Predicate {
-        let mut predicates = (0..leaves).map(|_| comparison()).collect::<Vec<_>>();
-        while predicates.len() > 1 {
-            let mut next = Vec::with_capacity(predicates.len().div_ceil(2));
-            let mut current = predicates.into_iter();
-            while let Some(left) = current.next() {
-                next.push(match current.next() {
-                    Some(right) => Predicate::And(Box::new(left), Box::new(right)),
-                    None => left,
-                });
-            }
-            predicates = next;
-        }
-        predicates.pop().expect("at least one predicate leaf")
     }
 
     fn statement(predicate: Predicate) -> Statement {
@@ -531,25 +537,13 @@ fn direct_ast_distinct_enforces_predicate_complexity_limits() {
         .execute("CREATE TABLE samples (value Int64); INSERT INTO samples VALUES (1);")
         .expect("setup");
 
-    database
-        .execute_statement(statement(nested_conjunction(MAX_DEPTH)))
-        .expect("the exact predicate depth limit is accepted");
-    assert_eq!(
-        database.execute_statement(statement(nested_conjunction(MAX_DEPTH + 1))),
-        Err(Error::ResourceLimitExceeded {
-            resource: "WHERE predicate depth",
-            actual: MAX_DEPTH + 1,
-            max: MAX_DEPTH,
-        })
-    );
-
     // A full binary predicate with 128 leaves has 255 total nodes. The next
     // leaf raises the total to 257, the first representable count above 256.
     database
-        .execute_statement(statement(balanced_conjunction((MAX_NODES + 1) / 2)))
+        .execute_statement(statement(conjunction((MAX_NODES + 1) / 2)))
         .expect("the largest predicate below the node limit is accepted");
     assert_eq!(
-        database.execute_statement(statement(balanced_conjunction((MAX_NODES + 3) / 2))),
+        database.execute_statement(statement(conjunction((MAX_NODES + 3) / 2))),
         Err(Error::ResourceLimitExceeded {
             resource: "WHERE predicate nodes",
             actual: MAX_NODES + 1,

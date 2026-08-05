@@ -2671,17 +2671,13 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
 }
 
 fn validate_predicate_complexity(predicate: &Predicate) -> Result<()> {
-    let mut pending = vec![(predicate, 0_usize)];
+    // Parentheses are not represented in the AST, and flat AND/OR lists are
+    // left-associated. The parser's parenthesis-depth limit therefore cannot
+    // be reapplied to structural AST depth. Its node limit still places a
+    // strict bound on both compiled state and recursive compilation depth.
+    let mut pending = vec![predicate];
     let mut nodes = 0_usize;
-    while let Some((predicate, depth)) = pending.pop() {
-        if depth > sql::MAX_PREDICATE_DEPTH {
-            return Err(Error::ResourceLimitExceeded {
-                resource: "WHERE predicate depth",
-                actual: depth,
-                max: sql::MAX_PREDICATE_DEPTH,
-            });
-        }
-
+    while let Some(predicate) = pending.pop() {
         nodes = nodes.saturating_add(1);
         if nodes > sql::MAX_PREDICATE_NODES {
             return Err(Error::ResourceLimitExceeded {
@@ -2694,16 +2690,15 @@ fn validate_predicate_complexity(predicate: &Predicate) -> Result<()> {
         match predicate {
             Predicate::Comparison { .. } => {}
             Predicate::And(left, right) | Predicate::Or(left, right) => {
-                let child_depth = depth.saturating_add(1);
-                pending.push((right, child_depth));
-                pending.push((left, child_depth));
+                pending.push(right);
+                pending.push(left);
             }
         }
     }
     Ok(())
 }
 
-/// Compiles a predicate only after its depth and node count have been bounded.
+/// Compiles a predicate only after its node count has been bounded.
 fn compile_bounded_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
