@@ -64,6 +64,87 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn table_batch_emits_all_types_empty_and_null_results_in_statement_order() {
+    let output = run(
+        &["--format", "table"],
+        b"SHOW TABLES;
+          CREATE TABLE metrics (id Int64, score Float64, enabled Bool, label String);
+          INSERT INTO metrics VALUES (7, 1.5, true, 'alpha');
+          SELECT id, score, enabled, label FROM metrics;
+          SELECT id, score, enabled, label FROM metrics WHERE id < 0;
+          SELECT SUM(id) AS i, MIN(score) AS f, MIN(enabled) AS b, MIN(label) AS s
+          FROM metrics WHERE id < 0;
+          SHOW TABLES;
+          DESCRIBE TABLE metrics;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!(
+            "+------+\n",
+            "| name |\n",
+            "+------+\n",
+            "+------+\n",
+            "\n",
+            "+----+-------+---------+-------+\n",
+            "| id | score | enabled | label |\n",
+            "+----+-------+---------+-------+\n",
+            "| 7  | 1.5   | true    | alpha |\n",
+            "+----+-------+---------+-------+\n",
+            "\n",
+            "+----+-------+---------+-------+\n",
+            "| id | score | enabled | label |\n",
+            "+----+-------+---------+-------+\n",
+            "+----+-------+---------+-------+\n",
+            "\n",
+            "+------+------+------+------+\n",
+            "| i    | f    | b    | s    |\n",
+            "+------+------+------+------+\n",
+            "| NULL | NULL | NULL | NULL |\n",
+            "+------+------+------+------+\n",
+            "\n",
+            "+---------+\n",
+            "| name    |\n",
+            "+---------+\n",
+            "| metrics |\n",
+            "+---------+\n",
+            "\n",
+            "+---------+---------+\n",
+            "| name    | type    |\n",
+            "+---------+---------+\n",
+            "| id      | Int64   |\n",
+            "| score   | Float64 |\n",
+            "| enabled | Bool    |\n",
+            "| label   | String  |\n",
+            "+---------+---------+\n",
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn table_batch_rejects_wide_cell_padding_without_partial_output() {
+    const ROWS: usize = 10_000;
+    let wide_value = "x".repeat(10_000);
+    let mut sql =
+        format!("CREATE TABLE padded (value String); INSERT INTO padded VALUES ('{wide_value}')");
+    for _ in 1..ROWS {
+        sql.push_str(",('')");
+    }
+    sql.push_str("; SELECT value FROM padded;");
+
+    let output = run(&["--format", "table"], sql.as_bytes());
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: table output requires at least 100090020 bytes, exceeding the limit of 16777216 bytes\n"
+    );
+}
+
+#[test]
 fn csv_batch_emits_one_left_named_union_all_result() {
     let output = run(
         &["--format", "csv"],
@@ -147,7 +228,7 @@ fn batch_formats_emit_describe_table_metadata() {
 
 #[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
-    for format in ["csv", "json"] {
+    for format in ["table", "csv", "json"] {
         let output = run(
             &["--format", format],
             b"CREATE TABLE temporary (id Int64); DROP TABLE TEMPORARY;",
@@ -157,6 +238,53 @@ fn batch_cli_keeps_drop_table_command_output_silent() {
         assert!(output.stdout.is_empty(), "{format}");
         assert!(output.stderr.is_empty(), "{format}");
     }
+}
+
+#[test]
+fn batch_cli_keeps_truncate_table_command_output_silent() {
+    for format in ["table", "csv", "json"] {
+        let output = run(
+            &["--format", format],
+            b"CREATE TABLE temporary (id Int64); \
+              INSERT INTO temporary VALUES (1), (2); \
+              TRUNCATE TABLE TEMPORARY;",
+        );
+
+        assert!(output.status.success(), "{format}: {:?}", output.stderr);
+        assert!(output.stdout.is_empty(), "{format}");
+        assert!(output.stderr.is_empty(), "{format}");
+    }
+}
+
+#[test]
+fn table_batch_observes_truncate_between_query_results() {
+    let output = run(
+        &["--format", "table"],
+        b"CREATE TABLE events (id Int64); \
+          INSERT INTO events VALUES (1), (2); \
+          SELECT COUNT(*) AS rows FROM events; \
+          TRUNCATE TABLE events; \
+          SELECT COUNT(*) AS rows FROM events;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!(
+            "+------+\n",
+            "| rows |\n",
+            "+------+\n",
+            "| 2    |\n",
+            "+------+\n",
+            "\n",
+            "+------+\n",
+            "| rows |\n",
+            "+------+\n",
+            "| 0    |\n",
+            "+------+\n",
+        )
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -307,8 +435,10 @@ fn csv_batch_rejects_repeated_oversized_projections_before_materialization() {
 #[test]
 fn only_exact_supported_format_arguments_are_accepted() {
     for args in [
+        &["--format", "TABLE"][..],
         &["--format", "CSV"][..],
         &["--format", "JSON"][..],
+        &["--format", "table", "extra"][..],
         &["--format", "csv", "extra"][..],
         &["--format", "json", "extra"][..],
     ] {
@@ -380,6 +510,7 @@ fn help_prints_usage_without_reading_a_session() {
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("Usage: rusthouse [OPTIONS]"));
+        assert!(stdout.contains("--format table"));
         assert!(stdout.contains("--format json"));
         assert!(stdout.contains("65536 input bytes, 1024 statements, 64 tables"));
         assert!(output.stderr.is_empty());

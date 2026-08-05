@@ -272,6 +272,13 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::TruncateTable { name } => {
+                let affected_rows = self.catalog.table_mut(&name)?.truncate();
+                Ok(StatementResult::Command {
+                    tag: "TRUNCATE TABLE",
+                    affected_rows,
+                })
+            }
             Statement::Insert { table, rows } => {
                 let affected_rows = rows.len();
                 {
@@ -318,6 +325,7 @@ impl Database {
             }
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
+            | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, or DESCRIBE TABLE"
                     .to_owned(),
