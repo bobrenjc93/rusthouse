@@ -66,6 +66,11 @@ unaliased expression can be ordered with `ORDER BY LENGTH(<column>)`; aliased
 projections can be ordered by their alias. Both forms support `LIMIT`.
 Non-`String` arguments and byte lengths outside the `Int64` range are reported
 as typed errors.
+`ABS(int64_column)` is an ungrouped scalar projection that returns a checked
+`Int64` absolute value. It supports an optional `AS alias`, ordering by the
+unaliased expression or alias, `WHERE`, and `LIMIT`. Filtering and limiting
+select rows before output evaluation, so an excluded `i64::MIN` does not fail
+the query; a selected `i64::MIN` reports a typed numeric-overflow error.
 
 `ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
 non-`DISTINCT` projection and accepts an optional `AS alias`. Rows are numbered

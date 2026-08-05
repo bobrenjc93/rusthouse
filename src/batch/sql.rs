@@ -97,6 +97,10 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    Abs {
+        name: String,
+        alias: Option<String>,
+    },
     /// The deliberately minimal `ROW_NUMBER() OVER ()` window projection.
     RowNumber {
         alias: Option<String>,
@@ -930,6 +934,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::Length { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("ABS") {
+                let name = self.expect_identifier("Int64 column in ABS")?;
+                self.expect(&TokenKind::RightParen, "')' after ABS expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Abs { name, alias });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -961,6 +972,10 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY LENGTH expression",
             )?;
             Ok(format!("LENGTH({argument})"))
+        } else if name.eq_ignore_ascii_case("ABS") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("Int64 column in ORDER BY ABS")?;
+            self.expect(&TokenKind::RightParen, "')' after ORDER BY ABS expression")?;
+            Ok(format!("ABS({argument})"))
         } else {
             Ok(name)
         }

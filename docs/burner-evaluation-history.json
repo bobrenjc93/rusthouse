@@ -666,6 +666,22 @@
         "eval_c88a7f3d": 35,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:419",
+      "recordedAt": "2026-08-05T05:07:44.916Z",
+      "label": "PR #419",
+      "kind": "leaf",
+      "prNumber": 419,
+      "title": "Add checked ABS for Int64 projections",
+      "scores": {
+        "eval_9fbdfec0": 75,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 35,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
