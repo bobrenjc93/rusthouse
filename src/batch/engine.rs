@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::batch::catalog::Catalog;
+use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
@@ -199,6 +200,53 @@ impl Database {
     #[must_use]
     pub const fn max_rows_per_table(&self) -> usize {
         self.max_rows_per_table
+    }
+
+    /// Atomically appends a bounded, typed, unquoted `CSVWithNames` input.
+    ///
+    /// The header must exactly match the target table's column names in schema
+    /// order. Data fields are parsed using their `Int64`, finite `Float64`,
+    /// `Bool`, or `String` schema types. Only LF and CRLF records are accepted.
+    /// Double quotes are rejected: this deliberately small subset cannot ingest
+    /// strings containing commas, CR, or LF because it does not implement CSV
+    /// quoting or escaping.
+    ///
+    /// The complete input, header, every row and value, configured limits, and
+    /// remaining table capacity are validated before any physical column is
+    /// changed. Every error therefore leaves the target table unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::csv::CsvIngestLimits;
+    /// use rusthouse::batch::engine::Database;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute(
+    ///     "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);",
+    /// )?;
+    /// let input = b"id,score,active,label\n1,2.5,true,alpha\n";
+    /// let rows = database.ingest_csv_with_names(
+    ///     "metrics",
+    ///     input,
+    ///     CsvIngestLimits::new(input.len(), 1, 4),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_csv_with_names(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> std::result::Result<usize, CsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            csv::parse_rows(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.catalog.table_mut(table)?.insert_rows(rows)?;
+        Ok(affected_rows)
     }
 
     /// Execute one or more semicolon-separated statements in order.
