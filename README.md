@@ -30,6 +30,17 @@ unique projected `COUNT(*)` or `SUM(Int64)` alias to a signed `Int64` threshold
 in `HAVING`. An empty `SUM` is `NULL` and does not satisfy a `HAVING` predicate.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
+
+Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
+column with one row. `Int64` literals are optionally signed base-10 integers,
+such as `-7`; `Float64` literals are optionally signed, finite decimal or
+scientific forms containing a decimal point or exponent, such as `+2.5` or
+`6.25e1`; and `Bool` literals are case-insensitive `TRUE` or `FALSE`. `String`
+literals are single-quoted and escape a quote by doubling it, as in
+`SELECT 'it''s ready' AS message`. This form accepts exactly one literal
+expression and an optional `AS` alias: expression lists, `NULL`, operator
+expressions, `FROM`, and other trailing clauses are not supported.
+
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
