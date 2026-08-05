@@ -67,6 +67,13 @@ projections can be ordered by their alias. Both forms support `LIMIT`.
 Non-`String` arguments and byte lengths outside the `Int64` range are reported
 as typed errors.
 
+`ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
+non-`DISTINCT` projection and accepts an optional `AS alias`. Rows are numbered
+in stable source order after `WHERE` filtering and before `LIMIT`. This minimal
+window form deliberately rejects arguments, a nonempty `OVER` specification,
+aggregate projections, `GROUP BY`, `HAVING`, and `ORDER BY`; its output is
+covered by the normal result row, value, and byte caps.
+
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
 `SELECT` projections across multiple named tables. `SELECT` supports nullable
