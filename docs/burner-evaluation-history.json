@@ -858,6 +858,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:445",
+      "recordedAt": "2026-08-05T17:21:50.497Z",
+      "label": "PR #445",
+      "kind": "leaf",
+      "prNumber": 445,
+      "title": "Bound retained rows in typed batch tables",
+      "scores": {
+        "eval_9fbdfec0": 80,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
