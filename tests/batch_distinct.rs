@@ -4,7 +4,10 @@ use rusthouse::batch::engine::{
 };
 use rusthouse::batch::error::Error;
 use rusthouse::batch::run_csv_batch;
-use rusthouse::batch::sql::{BatchSqlLimits, SelectItem, Statement, parse, parse_with_limits};
+use rusthouse::batch::sql::{
+    BatchSqlLimits, ComparisonOperator, Operand, Predicate, Select, SelectItem, Statement, parse,
+    parse_with_limits,
+};
 use rusthouse::batch::value::{DataType, Value};
 
 fn query(database: &mut Database, sql: &str) -> QueryResult {
@@ -421,6 +424,55 @@ fn rejects_unknown_and_duplicate_tuple_columns_with_typed_errors() {
             column: "missing".to_owned(),
         }
     );
+}
+
+#[test]
+fn direct_ast_distinct_rejects_incomparable_predicate_literals_without_panicking() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (value Float64); \
+             INSERT INTO samples VALUES (1.0);",
+        )
+        .expect("setup");
+    let statement = |literal| {
+        Statement::Select(Select {
+            distinct: true,
+            items: vec![SelectItem::Column {
+                name: "value".to_owned(),
+                alias: None,
+            }],
+            table: "samples".to_owned(),
+            predicate: Some(Predicate::Comparison {
+                left: Operand::Column("value".to_owned()),
+                operator: ComparisonOperator::Equal,
+                right: Operand::Literal(literal),
+            }),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+        })
+    };
+
+    assert_eq!(
+        database.execute_statement(statement(Value::Null(DataType::Float64))),
+        Err(Error::InvalidQuery(
+            "WHERE comparisons do not support NULL literals".to_owned()
+        ))
+    );
+    for literal in [
+        Value::Float64(f64::NAN),
+        Value::Float64(f64::INFINITY),
+        Value::Float64(f64::NEG_INFINITY),
+    ] {
+        assert_eq!(
+            database.execute_statement(statement(literal)),
+            Err(Error::InvalidQuery(
+                "WHERE comparison Float64 literals must be finite".to_owned()
+            ))
+        );
+    }
 }
 
 #[test]
