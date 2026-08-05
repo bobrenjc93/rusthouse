@@ -195,6 +195,41 @@ fn float64_to_int64_rejects_only_selected_out_of_range_values() {
 }
 
 #[test]
+fn ordering_selects_below_range_casts_independent_of_source_order() {
+    for values in [
+        "(-9223372036854775808.0), (-9223372036854777856.0)",
+        "(-9223372036854777856.0), (-9223372036854775808.0)",
+    ] {
+        let mut database = Database::new();
+        database
+            .execute(&format!(
+                "CREATE TABLE samples (reading Float64); \
+                 INSERT INTO samples VALUES {values};"
+            ))
+            .expect("setup");
+
+        assert_eq!(
+            database.execute(
+                "SELECT CAST(reading AS Int64) AS converted \
+                 FROM samples ORDER BY converted LIMIT 1"
+            ),
+            Err(Error::NumericOverflow("CAST(Float64 AS Int64)".to_owned())),
+            "source values {values}"
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT CAST(reading AS Int64) AS converted \
+                 FROM samples ORDER BY converted DESC LIMIT 1",
+            )
+            .rows,
+            [vec![Value::Int64(i64::MIN)]],
+            "source values {values}"
+        );
+    }
+}
+
+#[test]
 fn projects_negative_values_and_integer_extremes_with_filters_aliases_and_limits() {
     let mut database = Database::new();
     database

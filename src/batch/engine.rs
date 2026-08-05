@@ -1921,9 +1921,11 @@ fn order_source_rows(
                     let right = ValueRef::Float64(int64_at(table, source, right) as f64);
                     left.cmp(&right)
                 }
-                ResolvedItem::CastFloat64ToInt64 { source } => (float64_at(table, source, left)
-                    as i64)
-                    .cmp(&(float64_at(table, source, right) as i64)),
+                ResolvedItem::CastFloat64ToInt64 { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).trunc());
+                    let right = ValueRef::Float64(float64_at(table, source, right).trunc());
+                    left.cmp(&right)
+                }
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
