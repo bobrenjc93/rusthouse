@@ -1021,14 +1021,12 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
             .iter()
             .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
     if !unaliased_columns
-        || select.predicate.is_some()
         || !select.group_by.is_empty()
         || select.having.is_some()
         || !select.order_by.is_empty()
     {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports one or more unaliased columns and an optional LIMIT"
-                .to_owned(),
+            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, and an optional LIMIT".to_owned(),
         ));
     }
 
@@ -2709,7 +2707,22 @@ fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> 
                 data_type: table.schema()[index].data_type,
             })
         }
-        Operand::Literal(value) => Ok(CompiledOperand::Literal(value.clone())),
+        Operand::Literal(value) => {
+            validate_predicate_literal_value(value)?;
+            Ok(CompiledOperand::Literal(value.clone()))
+        }
+    }
+}
+
+fn validate_predicate_literal_value(value: &Value) -> Result<()> {
+    match value {
+        Value::Null(_) => Err(Error::InvalidQuery(
+            "WHERE comparisons do not support NULL literals".to_owned(),
+        )),
+        Value::Float64(value) if !value.is_finite() => Err(Error::InvalidQuery(
+            "WHERE comparison Float64 literals must be finite".to_owned(),
+        )),
+        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) | Value::String(_) => Ok(()),
     }
 }
 

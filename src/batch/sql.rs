@@ -915,7 +915,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_distinct_select(&mut self) -> Result<Select> {
-        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table> and an optional LIMIT";
+        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, and an optional LIMIT";
 
         let mut items = Vec::new();
         loop {
@@ -930,6 +930,14 @@ impl<'a> Parser<'a> {
             return self.error(SHAPE);
         }
         let table = self.expect_identifier("table name after FROM")?;
+
+        let predicate = if self.eat_keyword("WHERE") {
+            self.predicate_depth = 0;
+            self.predicate_nodes = 0;
+            Some(self.parse_or_predicate()?)
+        } else {
+            None
+        };
 
         let limit = if self.eat_keyword("LIMIT") {
             let position = self.position();
@@ -954,7 +962,7 @@ impl<'a> Parser<'a> {
             distinct: true,
             items,
             table,
-            predicate: None,
+            predicate,
             group_by: Vec::new(),
             having: None,
             order_by: Vec::new(),
