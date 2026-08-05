@@ -934,19 +934,21 @@ impl<'a> Parser<'a> {
             }
 
             if name.eq_ignore_ascii_case("CAST") {
-                let name = self.expect_identifier("Int64 column in CAST")?;
+                let name = self.expect_identifier("column in CAST")?;
                 self.expect_keyword("AS")?;
                 let type_position = self.position();
-                let type_name = self.expect_identifier("Float64 target type in CAST")?;
+                let type_name = self.expect_identifier("target type in CAST")?;
                 let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                     position: type_position,
-                    message: format!("unknown CAST target type '{type_name}'; expected Float64"),
+                    message: format!(
+                        "unknown CAST target type '{type_name}'; expected Int64 or Float64"
+                    ),
                 })?;
-                if target_type != DataType::Float64 {
+                if !matches!(target_type, DataType::Int64 | DataType::Float64) {
                     return Err(Error::Sql {
                         position: type_position,
                         message: format!(
-                            "unsupported CAST target type '{type_name}'; expected Float64"
+                            "unsupported CAST target type '{type_name}'; expected Int64 or Float64"
                         ),
                     });
                 }

@@ -753,6 +753,9 @@ enum ResolvedItem {
     CastInt64ToFloat64 {
         source: usize,
     },
+    CastFloat64ToInt64 {
+        source: usize,
+    },
     StringLength {
         source: usize,
     },
@@ -881,17 +884,22 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                if actual != DataType::Int64 {
+                let expected = match target_type {
+                    DataType::Float64 => DataType::Int64,
+                    DataType::Int64 => DataType::Float64,
+                    DataType::Bool | DataType::String => {
+                        return Err(Error::InvalidQuery(
+                            "only CAST(Int64 AS Float64) and CAST(Float64 AS Int64) are supported"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                if actual != expected {
                     return Err(Error::TypeMismatch {
                         context: format!("CAST argument '{name}'"),
-                        expected: DataType::Int64.to_string(),
+                        expected: expected.to_string(),
                         actual: actual.to_string(),
                     });
-                }
-                if *target_type != DataType::Float64 {
-                    return Err(Error::InvalidQuery(
-                        "only CAST(Int64 AS Float64) is supported".to_owned(),
-                    ));
                 }
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
@@ -899,12 +907,16 @@ fn resolve_select_items(
                             .to_owned(),
                     ));
                 }
-                items.push(ResolvedItem::CastInt64ToFloat64 { source });
+                items.push(match target_type {
+                    DataType::Float64 => ResolvedItem::CastInt64ToFloat64 { source },
+                    DataType::Int64 => ResolvedItem::CastFloat64ToInt64 { source },
+                    DataType::Bool | DataType::String => unreachable!("CAST target is validated"),
+                });
                 result_columns.push(ResultColumn {
                     name: alias.clone().unwrap_or_else(|| {
-                        format!("CAST({} AS Float64)", table.schema()[source].name)
+                        format!("CAST({} AS {target_type})", table.schema()[source].name)
                     }),
-                    data_type: DataType::Float64,
+                    data_type: *target_type,
                 });
             }
             SelectItem::Length { name, alias } => {
@@ -1098,6 +1110,9 @@ fn execute_projection(
                         ResolvedItem::CastInt64ToFloat64 { source } => {
                             Value::Float64(int64_at(table, *source, *row) as f64)
                         }
+                        ResolvedItem::CastFloat64ToInt64 { source } => Value::Int64(
+                            checked_float64_to_int64(float64_at(table, *source, *row))?,
+                        ),
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
@@ -1223,6 +1238,7 @@ fn validate_projection_result_limits(
             let source = match item {
                 ResolvedItem::Column { source, .. } => Some(*source),
                 ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::RowNumber => None,
@@ -1265,7 +1281,8 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
-                ResolvedItem::CastInt64ToFloat64 { .. } => {
+                ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::CastFloat64ToInt64 { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
@@ -1656,7 +1673,8 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped columns are validated"),
-                        ResolvedItem::CastInt64ToFloat64 { .. } => {
+                        ResolvedItem::CastInt64ToFloat64 { .. }
+                        | ResolvedItem::CastFloat64ToInt64 { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
                         ResolvedItem::StringLength { .. } => {
@@ -1973,6 +1991,11 @@ fn order_source_rows(
                     let right = ValueRef::Float64(int64_at(table, source, right) as f64);
                     left.cmp(&right)
                 }
+                ResolvedItem::CastFloat64ToInt64 { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).trunc());
+                    let right = ValueRef::Float64(float64_at(table, source, right).trunc());
+                    left.cmp(&right)
+                }
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
@@ -2018,7 +2041,8 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
-                ResolvedItem::CastInt64ToFloat64 { .. } => {
+                ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::CastFloat64ToInt64 { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
@@ -2051,6 +2075,22 @@ fn int64_at(table: &Table, source: usize, row: usize) -> i64 {
         unreachable!("CAST input type is resolved")
     };
     values[row]
+}
+
+fn float64_at(table: &Table, source: usize, row: usize) -> f64 {
+    let Column::Float64(values) = &table.columns()[source] else {
+        unreachable!("CAST input type is resolved")
+    };
+    values[row]
+}
+
+fn checked_float64_to_int64(value: f64) -> Result<i64> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+
+    if !value.is_finite() || value < i64::MIN as f64 || value >= I64_UPPER_EXCLUSIVE {
+        return Err(Error::NumericOverflow("CAST(Float64 AS Int64)".to_owned()));
+    }
+    Ok(value.trunc() as i64)
 }
 
 fn string_at(table: &Table, source: usize, row: usize) -> &str {

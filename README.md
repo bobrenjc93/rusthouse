@@ -52,12 +52,13 @@ subject to the normal result caps.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
-`SELECT` projections support `CAST(int64_column AS Float64)` for converting an
-`Int64` column to `Float64`. Add an explicit alias with
-`CAST(int64_column AS Float64) AS alias`; without one, the result column is
-named `CAST(<column> AS Float64)`. `CAST` projections are currently limited to
-ungrouped queries: they cannot be combined with aggregate projections or
-`GROUP BY`.
+`SELECT` projections support `CAST(int64_column AS Float64)` and
+`CAST(float64_column AS Int64)`. Float-to-integer casts truncate finite values
+toward zero and report typed numeric-overflow errors outside the `Int64`
+range. Add an explicit `AS alias`; otherwise, the result column is named
+`CAST(<column> AS <type>)`. `WHERE`, `ORDER BY`, and `LIMIT` select rows before
+checked conversion. `CAST` projections are currently limited to ungrouped
+queries: they cannot be combined with aggregate projections or `GROUP BY`.
 `LENGTH(string_column)` is another ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
