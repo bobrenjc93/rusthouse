@@ -39,7 +39,10 @@ pub use execution::{
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
 };
-pub use join::{JoinError, JoinLimits, JoinRowPair, inner_equi_join_nullable_i64};
+pub use join::{
+    JoinError, JoinLimits, JoinRowPair, LeftOuterJoinRowPair, inner_equi_join_nullable_i64,
+    left_outer_equi_join_nullable_i64,
+};
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
     ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
