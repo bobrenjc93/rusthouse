@@ -61,13 +61,16 @@ pub use scan::{
     scan_nullable_i64_nullness,
 };
 pub use shared_catalog::{SharedCatalog, SharedCatalogError};
-#[cfg(unix)]
-pub use snapshot::SnapshotReplaceError;
 pub use snapshot::{
     Int64TableFileRecovery, Int64TableFileRecoveryError, Int64TableFileRecoverySource,
     Int64TableFileRestoreError, Int64TableRestoreError, NullableI64PayloadCodec,
     NullableI64PayloadError, SnapshotCodec, SnapshotError, SnapshotFileError, restore_int64_table,
     restore_int64_table_from_file, restore_int64_table_from_file_with_backup,
+};
+#[cfg(unix)]
+pub use snapshot::{
+    Int64TableFileRepairError, SnapshotReplaceError,
+    restore_and_repair_int64_table_from_file_with_backup,
 };
 mod storage;
 
