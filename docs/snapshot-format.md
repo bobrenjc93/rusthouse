@@ -2,8 +2,7 @@
 
 RustHouse snapshots use a versioned binary envelope. The envelope provides a
 corruption and resource boundary. The first defined payload serializes nullable
-`Int64` rows; catalog serialization and atomic file replacement remain outside
-this format.
+`Int64` rows; catalog serialization remains outside this format.
 
 ## Version 1 layout
 
@@ -45,8 +44,21 @@ writes the complete envelope, and synchronizes the file contents and metadata.
 An existing destination is never replaced or truncated. Encoding, creation,
 writing, and synchronization failures are reported as distinct typed errors.
 
-This create-only operation does not use temporary files, replace paths, or
-synchronize the parent directory.
+## Atomically replacing an envelope file
+
+`SnapshotCodec::replace_file` applies the same payload bound before accessing
+the filesystem. It opens the destination's parent directory, exclusively
+creates a sibling temporary file, writes and synchronizes the complete
+envelope, renames the temporary file over the destination, and synchronizes
+the parent directory. The temporary-name search is bounded.
+
+Encoding, parent-directory opening, temporary creation, writing, temporary
+file synchronization, rename, cleanup, and directory synchronization failures
+are distinct typed errors. Failures before a successful rename attempt to
+remove the temporary file and leave an existing destination unchanged. A
+directory-sync failure is different: the destination has already been
+replaced and is visible, but the rename's durability after a system crash is
+uncertain.
 
 ## Nullable Int64 row payload
 

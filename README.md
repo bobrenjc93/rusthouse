@@ -177,10 +177,14 @@ read bound and restores a table only after the envelope, payload, schema, and
 row cap have all been validated. An explicit-backup helper tries that same
 bounded restore against a caller-supplied backup only when the primary fails,
 and preserves both typed failures if neither file is valid.
+`SnapshotCodec::replace_file` atomically creates or replaces an envelope through
+an exclusively created, synchronized sibling temporary file, then synchronizes
+the parent directory. Typed stage errors clean up failures before the rename
+and separately report post-rename directory-sync uncertainty.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
-without yet choosing catalog serialization or filesystem replacement. The
+without yet choosing catalog serialization. The
 exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.md).
 
 ## CSV ingestion

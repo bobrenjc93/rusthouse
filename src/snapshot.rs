@@ -1,15 +1,16 @@
 //! Versioned, bounded snapshot envelopes and nullable `Int64` row payloads.
 //!
 //! This module does not serialize a catalog. It can create and sync a new
-//! envelope file without replacing an existing destination, then reopen one
-//! bounded `Int64` table from that file. See `docs/snapshot-format.md` for the
-//! stable binary layouts.
+//! envelope file, atomically replace an envelope through a sibling temporary
+//! file, then reopen one bounded `Int64` table from that file. See
+//! `docs/snapshot-format.md` for the stable binary layouts.
 
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{InsertError, Int64Table, Schema};
 
@@ -28,6 +29,9 @@ pub const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len()
 const VERSION_OFFSET: usize = SNAPSHOT_MAGIC.len();
 const LENGTH_OFFSET: usize = VERSION_OFFSET + std::mem::size_of::<u16>();
 const CHECKSUM_OFFSET: usize = LENGTH_OFFSET + std::mem::size_of::<u64>();
+
+const TEMPORARY_CREATE_ATTEMPTS: usize = 128;
+static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 /// Number of bytes in the nullable `Int64` payload row-count field.
 pub const NULLABLE_I64_PAYLOAD_HEADER_LEN: usize = std::mem::size_of::<u64>();
@@ -134,6 +138,114 @@ impl Error for SnapshotFileError {
         match self {
             Self::Encode(error) => Some(error),
             Self::Create(error) | Self::Write(error) | Self::Sync(error) => Some(error),
+        }
+    }
+}
+
+/// An error produced while atomically replacing a snapshot envelope file.
+#[derive(Debug)]
+pub enum SnapshotReplaceError {
+    /// The payload could not be encoded before filesystem access began.
+    Encode(SnapshotError),
+    /// The destination has no final path component to replace.
+    InvalidDestination,
+    /// The destination's parent directory could not be opened for syncing.
+    OpenDirectory(io::Error),
+    /// A sibling temporary file could not be exclusively created.
+    CreateTemporary(io::Error),
+    /// The complete encoded envelope could not be written to the temporary file.
+    WriteTemporary(io::Error),
+    /// The temporary file could not be synchronized before the rename.
+    SyncTemporary(io::Error),
+    /// The synchronized temporary file could not be renamed over the destination.
+    Rename(io::Error),
+    /// A temporary file could not be removed after an earlier failure.
+    CleanupTemporary {
+        /// The failure encountered while removing the temporary file.
+        source: io::Error,
+        /// The operation failure that triggered cleanup.
+        operation: Box<SnapshotReplaceError>,
+    },
+    /// The parent directory could not be synchronized after a successful rename.
+    ///
+    /// The destination has already been replaced when this variant is returned,
+    /// but the rename's durability after a system crash is uncertain.
+    SyncDirectory(io::Error),
+}
+
+impl SnapshotReplaceError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// A `true` result means the new envelope is visible at the destination,
+    /// while its durability after a system crash remains uncertain.
+    pub const fn destination_was_replaced(&self) -> bool {
+        matches!(self, Self::SyncDirectory(_))
+    }
+
+    /// Returns the operation error that preceded a temporary-file cleanup failure.
+    pub fn operation_error(&self) -> Option<&Self> {
+        match self {
+            Self::CleanupTemporary { operation, .. } => Some(operation),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SnapshotReplaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode(error) => write!(formatter, "could not encode snapshot: {error}"),
+            Self::InvalidDestination => {
+                write!(formatter, "snapshot destination has no file name")
+            }
+            Self::OpenDirectory(error) => {
+                write!(
+                    formatter,
+                    "could not open snapshot parent directory: {error}"
+                )
+            }
+            Self::CreateTemporary(error) => {
+                write!(
+                    formatter,
+                    "could not create temporary snapshot file: {error}"
+                )
+            }
+            Self::WriteTemporary(error) => {
+                write!(
+                    formatter,
+                    "could not write temporary snapshot file: {error}"
+                )
+            }
+            Self::SyncTemporary(error) => {
+                write!(formatter, "could not sync temporary snapshot file: {error}")
+            }
+            Self::Rename(error) => {
+                write!(formatter, "could not replace snapshot file: {error}")
+            }
+            Self::CleanupTemporary { source, operation } => write!(
+                formatter,
+                "could not clean up temporary snapshot file after {operation}: {source}"
+            ),
+            Self::SyncDirectory(error) => write!(
+                formatter,
+                "snapshot was replaced, but its parent directory could not be synced: {error}"
+            ),
+        }
+    }
+}
+
+impl Error for SnapshotReplaceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::InvalidDestination => None,
+            Self::OpenDirectory(error)
+            | Self::CreateTemporary(error)
+            | Self::WriteTemporary(error)
+            | Self::SyncTemporary(error)
+            | Self::Rename(error)
+            | Self::SyncDirectory(error) => Some(error),
+            Self::CleanupTemporary { source, .. } => Some(source),
         }
     }
 }
@@ -639,6 +751,53 @@ impl SnapshotCodec {
         file.sync_all().map_err(SnapshotFileError::Sync)
     }
 
+    /// Atomically creates or replaces a snapshot envelope file.
+    ///
+    /// The payload is bounded and encoded before filesystem access. The
+    /// envelope is written to an exclusively created sibling temporary file,
+    /// which is synchronized and then renamed over `path`. Finally, the
+    /// destination's parent directory is synchronized so the rename is durable.
+    ///
+    /// Failures before the rename attempt to remove the temporary file and
+    /// leave an existing destination unchanged. A
+    /// [`SnapshotReplaceError::SyncDirectory`] failure occurs after the rename:
+    /// the new destination is visible, but its durability after a system crash
+    /// is uncertain.
+    pub fn replace_file(
+        self,
+        path: impl AsRef<Path>,
+        payload: &[u8],
+    ) -> Result<(), SnapshotReplaceError> {
+        let envelope = self.encode(payload).map_err(SnapshotReplaceError::Encode)?;
+        let path = path.as_ref();
+        if path.file_name().is_none() {
+            return Err(SnapshotReplaceError::InvalidDestination);
+        }
+
+        let parent = normalized_parent(path);
+        let directory = File::open(parent).map_err(SnapshotReplaceError::OpenDirectory)?;
+        let (mut file, temporary) = create_temporary_snapshot(parent)?;
+
+        if let Err(error) = file.write_all(&envelope) {
+            drop(file);
+            return Err(temporary.cleanup(SnapshotReplaceError::WriteTemporary(error)));
+        }
+        if let Err(error) = file.sync_all() {
+            drop(file);
+            return Err(temporary.cleanup(SnapshotReplaceError::SyncTemporary(error)));
+        }
+        drop(file);
+
+        if let Err(error) = fs::rename(temporary.path(), path) {
+            return Err(temporary.cleanup(SnapshotReplaceError::Rename(error)));
+        }
+        temporary.persist();
+
+        directory
+            .sync_all()
+            .map_err(SnapshotReplaceError::SyncDirectory)
+    }
+
     /// Validates an envelope and returns its borrowed payload.
     pub fn decode(self, envelope: &[u8]) -> Result<&[u8], SnapshotError> {
         if envelope.len() < SNAPSHOT_HEADER_LEN {
@@ -705,6 +864,75 @@ impl SnapshotCodec {
         }
 
         Ok(payload)
+    }
+}
+
+fn normalized_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn create_temporary_snapshot(
+    parent: &Path,
+) -> Result<(File, TemporarySnapshot), SnapshotReplaceError> {
+    for _ in 0..TEMPORARY_CREATE_ATTEMPTS {
+        let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".rusthouse-snapshot-{}-{sequence}.tmp", std::process::id());
+        let path = parent.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((file, TemporarySnapshot::new(path))),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(SnapshotReplaceError::CreateTemporary(error)),
+        }
+    }
+
+    Err(SnapshotReplaceError::CreateTemporary(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not find an unused temporary snapshot name",
+    )))
+}
+
+struct TemporarySnapshot {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TemporarySnapshot {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            remove_on_drop: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(mut self, operation: SnapshotReplaceError) -> SnapshotReplaceError {
+        self.remove_on_drop = false;
+        match fs::remove_file(&self.path) {
+            Ok(()) => operation,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => operation,
+            Err(source) => SnapshotReplaceError::CleanupTemporary {
+                source,
+                operation: Box::new(operation),
+            },
+        }
+    }
+
+    fn persist(mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for TemporarySnapshot {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
