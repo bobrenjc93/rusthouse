@@ -151,6 +151,11 @@ grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
 estimated 32 MiB limits, including cloned string extrema. The collecting
 library API separately caps all retained query results at an estimated 64 MiB.
+Typed batch tables also retain at most 1,000,000 rows each by default.
+`Database::with_max_rows_per_table` and the matching `SharedDatabase`
+constructor configure this per-table cap; an oversized `INSERT` is rejected
+atomically before any of its rows are appended, and `TRUNCATE TABLE` restores
+the table's full capacity.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::batch::error::{Error, Result};
-use crate::batch::storage::{ColumnDef, Table};
+use crate::batch::storage::{ColumnDef, DEFAULT_MAX_ROWS_PER_TABLE, Table};
 
 /// An in-memory collection of named tables.
 #[derive(Debug, Default)]
@@ -16,11 +16,21 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, name: String, schema: Vec<ColumnDef>) -> Result<()> {
+        self.create_table_with_row_cap(name, schema, DEFAULT_MAX_ROWS_PER_TABLE)
+    }
+
+    /// Creates a table with an explicit maximum retained row count.
+    pub fn create_table_with_row_cap(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        row_cap: usize,
+    ) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
             return Err(Error::TableAlreadyExists(name));
         }
-        let table = Table::new(name, schema)?;
+        let table = Table::with_row_cap(name, schema, row_cap)?;
         self.tables.insert(key, table);
         Ok(())
     }
