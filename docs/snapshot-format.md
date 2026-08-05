@@ -46,11 +46,15 @@ writing, and synchronization failures are reported as distinct typed errors.
 
 ## Atomically replacing an envelope file
 
-`SnapshotCodec::replace_file` applies the same payload bound before accessing
-the filesystem. It opens the destination's parent directory, exclusively
-creates a sibling temporary file, writes and synchronizes the complete
-envelope, renames the temporary file over the destination, and synchronizes
-the parent directory. The temporary-name search is bounded.
+On Unix, `SnapshotCodec::replace_file` applies the same payload bound before
+accessing the filesystem. It opens the destination's parent directory,
+exclusively creates a sibling temporary file, writes and synchronizes the
+complete envelope, renames the temporary file over the destination, and
+synchronizes the parent directory. Creation, rename, cleanup, and sync stay
+relative to the one opened directory descriptor, so renaming or rebinding the
+parent path cannot redirect later stages or strand the temporary file. The
+temporary-name search is bounded. The API is not exposed on Windows because
+the required directory-handle opening and flush semantics are not implemented.
 
 Encoding, parent-directory opening, temporary creation, writing, temporary
 file synchronization, rename, cleanup, and directory synchronization failures
