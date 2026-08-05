@@ -61,9 +61,9 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST`, `LENGTH`, and the minimal `ROW_NUMBER() OVER ()` window form provide
-/// bounded projections in ungrouped queries. An optional `AS` alias controls
-/// each result column name.
+/// `CAST`, `LENGTH`, `ABS`, and the minimal `ROW_NUMBER() OVER ()` window form
+/// provide bounded projections in ungrouped queries. An optional `AS` alias
+/// controls each result column name.
 ///
 /// # Examples
 ///
@@ -677,6 +677,9 @@ enum ResolvedItem {
     StringLength {
         source: usize,
     },
+    Int64Abs {
+        source: usize,
+    },
     RowNumber,
     Aggregate {
         state: usize,
@@ -849,6 +852,29 @@ fn resolve_select_items(
                     data_type: DataType::Int64,
                 });
             }
+            SelectItem::Abs { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Int64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("ABS argument '{name}'"),
+                        expected: DataType::Int64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "ABS projections are only supported in ungrouped SELECT queries".to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::Int64Abs { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("ABS({})", table.schema()[source].name)),
+                    data_type: DataType::Int64,
+                });
+            }
             SelectItem::RowNumber { alias } => {
                 items.push(ResolvedItem::RowNumber);
                 result_columns.push(ResultColumn {
@@ -996,6 +1022,9 @@ fn execute_projection(
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
+                        ResolvedItem::Int64Abs { source } => {
+                            Value::Int64(checked_int64_abs(int64_at(table, *source, *row))?)
+                        }
                         ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("projection does not contain aggregates")
@@ -1116,6 +1145,7 @@ fn validate_projection_result_limits(
                 ResolvedItem::Column { source, .. } => Some(*source),
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::StringLength { .. }
+                | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::RowNumber => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
@@ -1161,6 +1191,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Int64Abs { .. } => {
+                    unreachable!("ABS projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
@@ -1550,6 +1583,9 @@ impl GroupedData<'_> {
                         ResolvedItem::StringLength { .. } => {
                             unreachable!("LENGTH projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::Int64Abs { .. } => {
+                            unreachable!("ABS projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::RowNumber => {
                             unreachable!(
                                 "ROW_NUMBER projections are restricted to ungrouped queries"
@@ -1861,6 +1897,9 @@ fn order_source_rows(
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
+                ResolvedItem::Int64Abs { source } => int64_at(table, source, left)
+                    .unsigned_abs()
+                    .cmp(&int64_at(table, source, right).unsigned_abs()),
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections cannot be ordered")
                 }
@@ -1906,6 +1945,9 @@ fn order_grouped_rows(
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
                 }
+                ResolvedItem::Int64Abs { .. } => {
+                    unreachable!("ABS projections are restricted to ungrouped queries")
+                }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
                 }
@@ -1941,6 +1983,12 @@ fn string_at(table: &Table, source: usize, row: usize) -> &str {
 
 fn string_length_to_i64(length: usize) -> Result<i64> {
     i64::try_from(length).map_err(|_| Error::NumericOverflow("LENGTH(String)".to_owned()))
+}
+
+fn checked_int64_abs(value: i64) -> Result<i64> {
+    value
+        .checked_abs()
+        .ok_or_else(|| Error::NumericOverflow("ABS(Int64)".to_owned()))
 }
 
 fn sort_and_limit(
