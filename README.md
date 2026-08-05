@@ -205,6 +205,8 @@ using the same transactional parser, so every failure leaves existing rows
 unchanged.
 `Catalog::ingest_csv_with_names` exposes the same transactional ingestion by
 exact table name without requiring direct access to catalog-owned tables;
+`Catalog::ingest_csv_with_names_from_reader` resolves the exact table before
+consuming the bounded reader and preserves the reader importer's typed errors.
 `SharedCatalog::ingest_csv_with_names` provides the synchronized equivalent.
 
 ## Development model
