@@ -118,10 +118,12 @@ Every statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
 statements are silent, and each `SELECT`, `SHOW TABLES`, or `DESCRIBE TABLE`
 query is executed and emitted before the next statement. Table output uses
 bordered, human-readable columns, escapes control characters, renders SQL
-`NULL` as `NULL`, and separates multiple query results with a blank line. CSV
-output uses a CSVWithNames-compatible header followed by typed rows; commas,
-quotes, and newlines in strings are CSV-escaped. JSON output is
-newline-delimited, with one compact object per query containing typed column
+`NULL` as `NULL`, and separates multiple query results with a blank line. Each
+padded table is size-checked against a 16 MiB formatted-output limit before
+being streamed, so a wide cell cannot amplify many short rows into unbounded
+memory or output. CSV output uses a CSVWithNames-compatible header followed by
+typed rows; commas, quotes, and newlines in strings are CSV-escaped. JSON output
+is newline-delimited, with one compact object per query containing typed column
 metadata and positional rows. Numbers and booleans use native JSON values, SQL
 `NULL` becomes `null`, and strings are JSON-escaped.
 A query result is checked before cloning against limits of 10,000 rows, 250,000

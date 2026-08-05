@@ -1,5 +1,6 @@
-use std::fmt::Write;
-use std::io;
+use std::borrow::Cow;
+use std::error::Error as StdError;
+use std::{fmt, io};
 
 use crate::batch::engine::QueryResult;
 use crate::batch::value::Value;
@@ -33,88 +34,291 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
 }
 
 fn render_table(result: &QueryResult) -> String {
-    let rendered_columns = result
-        .columns
-        .iter()
-        .map(|column| escape_table_text(&column.name))
-        .collect::<Vec<_>>();
-    let rendered_rows = result
-        .rows
-        .iter()
-        .map(|row| row.iter().map(table_value).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let widths = rendered_columns
-        .iter()
-        .enumerate()
-        .map(|(column, name)| {
-            rendered_rows
-                .iter()
-                .map(|row| row[column].chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(name.chars().count())
-        })
-        .collect::<Vec<_>>();
-
-    let border = table_border(&widths);
-    let mut output = String::new();
-    output.push_str(&border);
-    output.push('\n');
-    table_row(
-        &mut output,
-        rendered_columns.iter().map(String::as_str),
-        &widths,
-    );
-    output.push_str(&border);
-    output.push('\n');
-    for row in &rendered_rows {
-        table_row(&mut output, row.iter().map(String::as_str), &widths);
-    }
-    output.push_str(&border);
-    output
+    let mut output = Vec::new();
+    write_table(&mut output, result, usize::MAX)
+        .expect("rendering an in-memory query result to a Vec cannot fail");
+    String::from_utf8(output).expect("table rendering preserves UTF-8")
 }
 
-fn table_border(widths: &[usize]) -> String {
-    let mut border = String::new();
-    border.push('+');
-    for width in widths {
-        border.push_str(&"-".repeat(*width + 2));
-        border.push('+');
-    }
-    border
+/// A typed failure while sizing or streaming a human-readable table.
+#[derive(Debug)]
+pub enum TableWriteError {
+    /// Table borders or cell padding would exceed the formatted-output bound.
+    OutputLimitExceeded { bytes: usize, max_bytes: usize },
+    /// Writing the already size-checked table failed.
+    Write(io::Error),
 }
 
-fn table_row<'a>(output: &mut String, values: impl Iterator<Item = &'a str>, widths: &[usize]) {
-    output.push('|');
-    for (value, width) in values.zip(widths) {
-        output.push(' ');
-        output.push_str(value);
-        output.push_str(&" ".repeat(width.saturating_sub(value.chars().count()) + 1));
-        output.push('|');
-    }
-    output.push('\n');
-}
-
-fn table_value(value: &Value) -> String {
-    escape_table_text(&value.as_display_string())
-}
-
-fn escape_table_text(value: &str) -> String {
-    let mut output = String::new();
-    for character in value.chars() {
-        match character {
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            value if value.is_control() => {
-                write!(output, "\\u{{{:04x}}}", value as u32)
-                    .expect("writing to String cannot fail");
-            }
-            value => output.push(value),
+impl fmt::Display for TableWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "table output requires at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
+            Self::Write(error) => write!(formatter, "could not write table output: {error}"),
         }
     }
-    output
+}
+
+impl StdError for TableWriteError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            Self::OutputLimitExceeded { .. } => None,
+        }
+    }
+}
+
+/// Streams one human-readable result table after checking its exact byte size.
+///
+/// The bound includes borders and alignment padding. Sizing completes before
+/// the first byte is written, so a rejected table never produces partial
+/// output. Cell contents are revisited while streaming but are never retained
+/// as a second formatted copy of the query result.
+pub fn write_table(
+    output: &mut impl io::Write,
+    result: &QueryResult,
+    max_output_bytes: usize,
+) -> Result<(), TableWriteError> {
+    write_table_with_affixes(output, result, max_output_bytes, b"", b"")
+}
+
+pub(crate) fn write_table_with_affixes(
+    output: &mut impl io::Write,
+    result: &QueryResult,
+    max_output_bytes: usize,
+    prefix: &[u8],
+    suffix: &[u8],
+) -> Result<(), TableWriteError> {
+    let layout = TableLayout::new(result, prefix.len(), suffix.len(), max_output_bytes)?;
+
+    output.write_all(prefix).map_err(TableWriteError::Write)?;
+    write_table_border(output, &layout.widths).map_err(TableWriteError::Write)?;
+    output.write_all(b"\n").map_err(TableWriteError::Write)?;
+    write_table_header(output, result, &layout.widths).map_err(TableWriteError::Write)?;
+    write_table_border(output, &layout.widths).map_err(TableWriteError::Write)?;
+    output.write_all(b"\n").map_err(TableWriteError::Write)?;
+    for row in &result.rows {
+        write_table_values(output, row, &layout.widths).map_err(TableWriteError::Write)?;
+    }
+    write_table_border(output, &layout.widths).map_err(TableWriteError::Write)?;
+    output.write_all(suffix).map_err(TableWriteError::Write)
+}
+
+struct TableLayout {
+    widths: Vec<usize>,
+}
+
+impl TableLayout {
+    fn new(
+        result: &QueryResult,
+        prefix_bytes: usize,
+        suffix_bytes: usize,
+        max_output_bytes: usize,
+    ) -> Result<Self, TableWriteError> {
+        let Some(widths) = table_widths(result) else {
+            return Err(output_limit_overflow(max_output_bytes));
+        };
+        let Some(table_bytes) = table_rendered_bytes(result, &widths) else {
+            return Err(output_limit_overflow(max_output_bytes));
+        };
+        let Some(output_bytes) = prefix_bytes
+            .checked_add(table_bytes)
+            .and_then(|bytes| bytes.checked_add(suffix_bytes))
+        else {
+            return Err(output_limit_overflow(max_output_bytes));
+        };
+        if output_bytes > max_output_bytes {
+            return Err(TableWriteError::OutputLimitExceeded {
+                bytes: output_bytes,
+                max_bytes: max_output_bytes,
+            });
+        }
+        Ok(Self { widths })
+    }
+}
+
+fn output_limit_overflow(max_output_bytes: usize) -> TableWriteError {
+    TableWriteError::OutputLimitExceeded {
+        bytes: max_output_bytes.saturating_add(1),
+        max_bytes: max_output_bytes,
+    }
+}
+
+fn table_widths(result: &QueryResult) -> Option<Vec<usize>> {
+    let mut widths = result
+        .columns
+        .iter()
+        .map(|column| table_text_metrics(&column.name).map(|metrics| metrics.characters))
+        .collect::<Option<Vec<_>>>()?;
+    for row in &result.rows {
+        for (column, width) in widths.iter_mut().enumerate() {
+            let value = table_value_text(&row[column]);
+            let metrics = table_text_metrics(&value)?;
+            *width = (*width).max(metrics.characters);
+        }
+    }
+    Some(widths)
+}
+
+fn table_rendered_bytes(result: &QueryResult, widths: &[usize]) -> Option<usize> {
+    let border_bytes = widths.iter().try_fold(1_usize, |bytes, width| {
+        bytes.checked_add(width.checked_add(3)?)
+    })?;
+    let header_bytes = table_row_bytes(
+        result.columns.iter().map(|column| column.name.as_str()),
+        widths,
+    )?;
+    let mut bytes = border_bytes
+        .checked_add(1)?
+        .checked_add(header_bytes)?
+        .checked_add(border_bytes)?
+        .checked_add(1)?;
+    for row in &result.rows {
+        bytes = bytes.checked_add(table_row_bytes(row.iter().map(table_value_text), widths)?)?;
+    }
+    bytes.checked_add(border_bytes)
+}
+
+fn table_row_bytes<T>(values: impl Iterator<Item = T>, widths: &[usize]) -> Option<usize>
+where
+    T: AsRef<str>,
+{
+    values
+        .zip(widths)
+        .try_fold(1_usize, |bytes, (value, width)| {
+            let metrics = table_text_metrics(value.as_ref())?;
+            let padding = width.checked_sub(metrics.characters)?.checked_add(1)?;
+            bytes
+                .checked_add(1)?
+                .checked_add(metrics.bytes)?
+                .checked_add(padding)?
+                .checked_add(1)
+        })?
+        .checked_add(1)
+}
+
+#[derive(Clone, Copy)]
+struct TableTextMetrics {
+    characters: usize,
+    bytes: usize,
+}
+
+fn table_text_metrics(value: &str) -> Option<TableTextMetrics> {
+    let mut metrics = TableTextMetrics {
+        characters: 0,
+        bytes: 0,
+    };
+    for character in value.chars() {
+        let (characters, bytes) = match character {
+            '\\' | '\n' | '\r' | '\t' => (2, 2),
+            value if value.is_control() => {
+                let significant_hex_digits =
+                    (u32::BITS - (value as u32).leading_zeros()).div_ceil(4) as usize;
+                let escaped_bytes = significant_hex_digits.max(4).checked_add(4)?;
+                (escaped_bytes, escaped_bytes)
+            }
+            value => (1, value.len_utf8()),
+        };
+        metrics.characters = metrics.characters.checked_add(characters)?;
+        metrics.bytes = metrics.bytes.checked_add(bytes)?;
+    }
+    Some(metrics)
+}
+
+fn table_value_text(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::Null(_) => Cow::Borrowed("NULL"),
+        Value::Bool(true) => Cow::Borrowed("true"),
+        Value::Bool(false) => Cow::Borrowed("false"),
+        Value::String(value) => Cow::Borrowed(value),
+        Value::Int64(_) | Value::Float64(_) => Cow::Owned(value.as_display_string()),
+    }
+}
+
+const TABLE_DASHES: [u8; 1024] = [b'-'; 1024];
+const TABLE_SPACES: [u8; 1024] = [b' '; 1024];
+
+fn write_table_border(output: &mut impl io::Write, widths: &[usize]) -> io::Result<()> {
+    output.write_all(b"+")?;
+    for width in widths {
+        write_repeated(output, &TABLE_DASHES, width + 2)?;
+        output.write_all(b"+")?;
+    }
+    Ok(())
+}
+
+fn write_table_header(
+    output: &mut impl io::Write,
+    result: &QueryResult,
+    widths: &[usize],
+) -> io::Result<()> {
+    output.write_all(b"|")?;
+    for (column, width) in result.columns.iter().zip(widths) {
+        write_table_cell(output, &column.name, *width)?;
+    }
+    output.write_all(b"\n")
+}
+
+fn write_table_values(
+    output: &mut impl io::Write,
+    row: &[Value],
+    widths: &[usize],
+) -> io::Result<()> {
+    output.write_all(b"|")?;
+    for (value, width) in row.iter().zip(widths) {
+        write_table_cell(output, &table_value_text(value), *width)?;
+    }
+    output.write_all(b"\n")
+}
+
+fn write_table_cell(output: &mut impl io::Write, value: &str, width: usize) -> io::Result<()> {
+    let metrics = table_text_metrics(value).expect("validated table text metrics cannot overflow");
+    output.write_all(b" ")?;
+    write_escaped_table_text(output, value)?;
+    write_repeated(
+        output,
+        &TABLE_SPACES,
+        width
+            .checked_sub(metrics.characters)
+            .and_then(|padding| padding.checked_add(1))
+            .expect("validated table padding cannot overflow"),
+    )?;
+    output.write_all(b"|")
+}
+
+fn write_repeated(output: &mut impl io::Write, chunk: &[u8], mut count: usize) -> io::Result<()> {
+    while count >= chunk.len() {
+        output.write_all(chunk)?;
+        count -= chunk.len();
+    }
+    output.write_all(&chunk[..count])
+}
+
+fn write_escaped_table_text(output: &mut impl io::Write, value: &str) -> io::Result<()> {
+    let mut unescaped_start = 0;
+    for (index, character) in value.char_indices() {
+        let escaped = match character {
+            '\\' => Some("\\\\"),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            character if character.is_control() => {
+                output.write_all(value[unescaped_start..index].as_bytes())?;
+                write!(output, "\\u{{{:04x}}}", character as u32)?;
+                unescaped_start = index + character.len_utf8();
+                continue;
+            }
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            output.write_all(value[unescaped_start..index].as_bytes())?;
+            output.write_all(escaped.as_bytes())?;
+            unescaped_start = index + character.len_utf8();
+        }
+    }
+    output.write_all(value[unescaped_start..].as_bytes())
 }
 
 fn render_csv(result: &QueryResult) -> String {
@@ -375,6 +579,29 @@ mod tests {
         let rendered = render(&result(), OutputFormat::Table);
         assert!(rendered.contains("| id | note"));
         assert!(rendered.contains("| 1  | quote: \", comma"));
+    }
+
+    #[test]
+    fn streams_a_table_at_the_exact_formatted_byte_limit() {
+        let mut result = result();
+        result.rows[0][1] = Value::String("snow: 雪\nslash: \\\u{1b}".to_owned());
+        let expected = render(&result, OutputFormat::Table);
+        let mut exact_output = Vec::new();
+
+        write_table(&mut exact_output, &result, expected.len())
+            .expect("the exact formatted byte limit is accepted");
+
+        assert_eq!(exact_output, expected.as_bytes());
+
+        let mut rejected_output = Vec::new();
+        let error = write_table(&mut rejected_output, &result, expected.len() - 1)
+            .expect_err("one byte below the formatted size is rejected");
+        assert!(matches!(
+            error,
+            TableWriteError::OutputLimitExceeded { bytes, max_bytes }
+                if bytes == expected.len() && max_bytes == expected.len() - 1
+        ));
+        assert!(rejected_output.is_empty());
     }
 
     #[test]

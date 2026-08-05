@@ -15,14 +15,17 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use engine::{Database, StatementResult};
-use format::{OutputFormat, render, write_csv, write_json};
+use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, Database, StatementResult};
+use format::{TableWriteError, write_csv, write_json, write_table_with_affixes};
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
 /// This accommodates the fixed quick and default comparison harness datasets
 /// while keeping allocation and parser work bounded by an explicit byte cap.
 pub const DEFAULT_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum bytes emitted for one formatted table result, including separators.
+pub const DEFAULT_MAX_TABLE_OUTPUT_BYTES: usize = DEFAULT_MAX_QUERY_RESULT_BYTES;
 
 /// A failure while reading, executing, or rendering a SQL batch.
 #[derive(Debug)]
@@ -35,6 +38,8 @@ pub enum BatchError {
     InvalidUtf8(std::string::FromUtf8Error),
     /// Parsing or executing a statement failed.
     Sql(error::Error),
+    /// A padded table result crossed the formatted-output byte limit.
+    TableOutputLimitExceeded { bytes: usize, max_bytes: usize },
     /// Writing human-readable table output failed.
     WriteTable(io::Error),
     /// Writing CSV output failed.
@@ -53,6 +58,10 @@ impl fmt::Display for BatchError {
             ),
             Self::InvalidUtf8(error) => write!(formatter, "SQL input is not valid UTF-8: {error}"),
             Self::Sql(error) => error.fmt(formatter),
+            Self::TableOutputLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "table output requires at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
             Self::WriteTable(error) => {
                 write!(formatter, "could not write table to stdout: {error}")
             }
@@ -71,7 +80,7 @@ impl StdError for BatchError {
             | Self::WriteJson(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
-            Self::InputLimitExceeded { .. } => None,
+            Self::InputLimitExceeded { .. } | Self::TableOutputLimitExceeded { .. } => None,
         }
     }
 }
@@ -176,14 +185,15 @@ fn run_batch_with_limit(
         if let StatementResult::Query(query) = result {
             match output_format {
                 BatchOutputFormat::Table => {
-                    if emitted_table {
-                        output.write_all(b"\n").map_err(BatchError::WriteTable)?;
-                    }
-                    let rendered = render(&query, OutputFormat::Table);
-                    output
-                        .write_all(rendered.as_bytes())
-                        .map_err(BatchError::WriteTable)?;
-                    output.write_all(b"\n").map_err(BatchError::WriteTable)?;
+                    let prefix: &[u8] = if emitted_table { b"\n" } else { b"" };
+                    write_table_with_affixes(
+                        &mut output,
+                        &query,
+                        DEFAULT_MAX_TABLE_OUTPUT_BYTES,
+                        prefix,
+                        b"\n",
+                    )
+                    .map_err(batch_table_error)?;
                     emitted_table = true;
                 }
                 BatchOutputFormat::Csv => {
@@ -197,6 +207,15 @@ fn run_batch_with_limit(
         }
     }
     Ok(())
+}
+
+fn batch_table_error(error: TableWriteError) -> BatchError {
+    match error {
+        TableWriteError::OutputLimitExceeded { bytes, max_bytes } => {
+            BatchError::TableOutputLimitExceeded { bytes, max_bytes }
+        }
+        TableWriteError::Write(error) => BatchError::WriteTable(error),
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +313,30 @@ mod tests {
         };
         assert_eq!(source.kind(), io::ErrorKind::Other);
         assert_eq!(output.written, 12);
+    }
+
+    #[test]
+    fn table_batch_rejects_wide_cell_padding_before_writing() {
+        const ROWS: usize = 10_000;
+        let wide_value = "x".repeat(10_000);
+        let mut sql = format!(
+            "CREATE TABLE padded (value String); INSERT INTO padded VALUES ('{wide_value}')"
+        );
+        for _ in 1..ROWS {
+            sql.push_str(",('')");
+        }
+        sql.push_str("; SELECT value FROM padded;");
+        let mut output = Vec::new();
+
+        let error = run_table_batch(sql.as_bytes(), &mut output)
+            .expect_err("alignment padding crosses the table output limit");
+
+        let BatchError::TableOutputLimitExceeded { bytes, max_bytes } = error else {
+            panic!("expected a typed table output limit error");
+        };
+        assert!(bytes > 100_000_000, "adversarial output was {bytes} bytes");
+        assert_eq!(max_bytes, DEFAULT_MAX_TABLE_OUTPUT_BYTES);
+        assert!(output.is_empty());
     }
 
     #[test]

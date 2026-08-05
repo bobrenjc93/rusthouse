@@ -124,6 +124,27 @@ fn table_batch_emits_all_types_empty_and_null_results_in_statement_order() {
 }
 
 #[test]
+fn table_batch_rejects_wide_cell_padding_without_partial_output() {
+    const ROWS: usize = 10_000;
+    let wide_value = "x".repeat(10_000);
+    let mut sql =
+        format!("CREATE TABLE padded (value String); INSERT INTO padded VALUES ('{wide_value}')");
+    for _ in 1..ROWS {
+        sql.push_str(",('')");
+    }
+    sql.push_str("; SELECT value FROM padded;");
+
+    let output = run(&["--format", "table"], sql.as_bytes());
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: table output requires at least 100090020 bytes, exceeding the limit of 16777216 bytes\n"
+    );
+}
+
+#[test]
 fn csv_batch_emits_one_left_named_union_all_result() {
     let output = run(
         &["--format", "csv"],
