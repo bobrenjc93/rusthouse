@@ -120,6 +120,20 @@ fn csv_batch_emits_show_tables_metadata_in_stable_display_order() {
 }
 
 #[test]
+fn batch_cli_keeps_drop_table_command_output_silent() {
+    for format in ["csv", "json"] {
+        let output = run(
+            &["--format", format],
+            b"CREATE TABLE temporary (id Int64); DROP TABLE TEMPORARY;",
+        );
+
+        assert!(output.status.success(), "{format}: {:?}", output.stderr);
+        assert!(output.stdout.is_empty(), "{format}");
+        assert!(output.stderr.is_empty(), "{format}");
+    }
+}
+
+#[test]
 fn csv_batch_filters_grouped_rows_with_a_count_alias() {
     let output = run(
         &["--format", "csv"],

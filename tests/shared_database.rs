@@ -239,6 +239,12 @@ fn sql_errors_are_preserved_and_poisoning_is_typed() {
             statement: "INSERT",
         })
     );
+    assert_eq!(
+        database.query("DROP TABLE blocked;"),
+        Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "DROP TABLE",
+        })
+    );
 
     let inner = Arc::new(RwLock::new(Database::new()));
     let poisoned = SharedDatabase::from_arc(Arc::clone(&inner));
@@ -260,4 +266,47 @@ fn sql_errors_are_preserved_and_poisoning_is_typed() {
         poisoned.query_result_limits(),
         Err(SharedDatabaseError::LockPoisoned)
     );
+}
+
+#[test]
+fn drop_table_is_a_shared_database_mutation() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE retained (id Int64); \
+             CREATE TABLE Victim (id Int64); \
+             INSERT INTO Victim VALUES (7);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.query("DROP TABLE victim;"),
+        Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "DROP TABLE",
+        })
+    );
+    assert_eq!(
+        database
+            .query("SELECT id FROM victim;")
+            .expect("read-only rejection did not drop the table")
+            .rows,
+        [vec![Value::Int64(7)]]
+    );
+
+    assert_eq!(
+        database
+            .execute("DROP TABLE vIcTiM;")
+            .expect("execute accepts the mutation"),
+        [StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }]
+    );
+    assert_eq!(
+        database.query("SELECT id FROM Victim;"),
+        Err(SharedDatabaseError::Sql(Error::TableNotFound(
+            "Victim".to_owned()
+        )))
+    );
+    assert!(database.query("SELECT id FROM retained;").is_ok());
 }
