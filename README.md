@@ -186,7 +186,23 @@ engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, or
 resource-bounded result, so cloned
 handles can run analytical reads concurrently. Mutating batches passed to
 `execute` retain one write lock for the entire batch and cannot interleave.
+For transactional ingestion, `Database::execute_insert_batch` and the matching
+`SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
+statement and cumulative per-table row cap, then commit in statement order.
+Any validation or resource failure leaves all tables unchanged; the shared
+form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
+
+The typed engine's `Database::ingest_csv_with_names` API atomically appends a
+bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
+header must exactly match every schema column in order and case. Data fields
+parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
+types, and callers provide complete-input byte, row, and total-value limits.
+Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
+CRLF records are accepted. This is deliberately an unquoted subset: double
+quotes are rejected, and a `String` cannot contain a comma, CR, or LF because
+CSV quoting and escaping are not implemented. Any input, schema, value, limit,
+or remaining-capacity failure leaves the table unchanged.
 
 ## Snapshot envelope
 

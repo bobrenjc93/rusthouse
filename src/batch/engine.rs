@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::batch::catalog::Catalog;
+use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
@@ -201,6 +202,53 @@ impl Database {
         self.max_rows_per_table
     }
 
+    /// Atomically appends a bounded, typed, unquoted `CSVWithNames` input.
+    ///
+    /// The header must exactly match the target table's column names in schema
+    /// order. Data fields are parsed using their `Int64`, finite `Float64`,
+    /// `Bool`, or `String` schema types. Only LF and CRLF records are accepted.
+    /// Double quotes are rejected: this deliberately small subset cannot ingest
+    /// strings containing commas, CR, or LF because it does not implement CSV
+    /// quoting or escaping.
+    ///
+    /// The complete input, header, every row and value, configured limits, and
+    /// remaining table capacity are validated before any physical column is
+    /// changed. Every error therefore leaves the target table unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::csv::CsvIngestLimits;
+    /// use rusthouse::batch::engine::Database;
+    ///
+    /// let mut database = Database::new();
+    /// database.execute(
+    ///     "CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);",
+    /// )?;
+    /// let input = b"id,score,active,label\n1,2.5,true,alpha\n";
+    /// let rows = database.ingest_csv_with_names(
+    ///     "metrics",
+    ///     input,
+    ///     CsvIngestLimits::new(input.len(), 1, 4),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn ingest_csv_with_names(
+        &mut self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> std::result::Result<usize, CsvIngestError> {
+        let rows = {
+            let target = self.catalog.table(table)?;
+            csv::parse_rows(target, input.as_ref(), limits)?
+        };
+        let affected_rows = rows.len();
+        self.catalog.table_mut(table)?.insert_rows(rows)?;
+        Ok(affected_rows)
+    }
+
     /// Execute one or more semicolon-separated statements in order.
     ///
     /// The complete batch is parsed before execution, so a syntax error applies
@@ -208,6 +256,17 @@ impl Database {
     /// statements remain applied if a later execution error occurs.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
         self.execute_with_result_limit(sql, DEFAULT_MAX_RETAINED_RESULT_BYTES)
+    }
+
+    /// Atomically executes a nonempty SQL batch containing only `INSERT` statements.
+    ///
+    /// Every target table, row shape, value type, finite floating-point value,
+    /// and cumulative per-table row count is validated before any row is
+    /// appended. A failure therefore leaves every table unchanged. Successful
+    /// statements are committed and reported in input order.
+    pub fn execute_insert_batch(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        self.execute_insert_statements(statements)
     }
 
     /// Executes a batch while bounding results retained for the caller.
@@ -258,6 +317,52 @@ impl Database {
                 });
             }
             results.push(result);
+        }
+        Ok(results)
+    }
+
+    pub(crate) fn execute_insert_statements(
+        &mut self,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<StatementResult>> {
+        for statement in &statements {
+            if !matches!(statement, Statement::Insert { .. }) {
+                return Err(Error::InsertOnlyStatementRequired {
+                    statement: statement_name(statement),
+                });
+            }
+        }
+
+        let mut incoming_rows_by_table = HashMap::<String, usize>::new();
+        for statement in &statements {
+            let Statement::Insert { table, rows } = statement else {
+                unreachable!("non-INSERT statements were rejected")
+            };
+            let target = self.catalog.table(table)?;
+            let cumulative_rows = incoming_rows_by_table
+                .entry(table.to_ascii_lowercase())
+                .or_default();
+            *cumulative_rows = cumulative_rows.saturating_add(rows.len());
+            target.validate_row_capacity(*cumulative_rows)?;
+            for row in rows {
+                target.validate_row(row)?;
+            }
+        }
+
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let Statement::Insert { table, rows } = statement else {
+                unreachable!("non-INSERT statements were rejected")
+            };
+            let affected_rows = rows.len();
+            self.catalog
+                .table_mut(&table)
+                .expect("preflight resolved every INSERT target")
+                .append_validated_rows(rows);
+            results.push(StatementResult::Command {
+                tag: "INSERT",
+                affected_rows,
+            });
         }
         Ok(results)
     }
@@ -679,6 +784,21 @@ impl Database {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+}
+
+fn statement_name(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::CreateTable { .. } => "CREATE TABLE",
+        Statement::DropTable { .. } => "DROP TABLE",
+        Statement::TruncateTable { .. } => "TRUNCATE TABLE",
+        Statement::Insert { .. } => "INSERT",
+        Statement::LiteralSelect(_)
+        | Statement::Select(_)
+        | Statement::CrossJoin(_)
+        | Statement::UnionAll { .. } => "SELECT",
+        Statement::ShowTables => "SHOW TABLES",
+        Statement::DescribeTable { .. } => "DESCRIBE TABLE",
     }
 }
 
@@ -2528,6 +2648,33 @@ mod tests {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
         }
+    }
+
+    #[test]
+    fn insert_batch_preflight_rejects_non_finite_ast_values_without_mutation() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE events (id Int64); CREATE TABLE samples (value Float64);")
+            .expect("setup");
+        let statements = vec![
+            Statement::Insert {
+                table: "events".to_owned(),
+                rows: vec![vec![Value::Int64(1)]],
+            },
+            Statement::Insert {
+                table: "samples".to_owned(),
+                rows: vec![vec![Value::Float64(f64::INFINITY)]],
+            },
+        ];
+
+        assert_eq!(
+            database.execute_insert_statements(statements),
+            Err(Error::InvalidQuery(
+                "column 'samples.value' cannot store a non-finite Float64".to_owned()
+            ))
+        );
+        assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
+        assert_eq!(database.catalog().table("samples").unwrap().row_count(), 0);
     }
 
     #[test]
