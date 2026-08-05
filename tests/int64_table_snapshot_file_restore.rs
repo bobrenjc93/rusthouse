@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusthouse::snapshot::SNAPSHOT_HEADER_LEN;
 use rusthouse::{
+    InsertError, Int64TableFileRecoveryError, Int64TableFileRecoverySource,
     Int64TableFileRestoreError, Int64TableRestoreError, NullableI64PayloadCodec, Schema,
     SnapshotCodec, SnapshotError, restore_int64_table_from_file,
+    restore_int64_table_from_file_with_backup,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +40,17 @@ impl Drop for TestDirectory {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+fn write_snapshot(
+    path: &Path,
+    rows: &[Option<i64>],
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) {
+    let payload = payload_codec.encode(rows).unwrap();
+    let envelope = snapshot_codec.encode(&payload).unwrap();
+    fs::write(path, envelope).unwrap();
 }
 
 #[test]
@@ -185,6 +198,246 @@ fn rejects_a_directory_as_a_non_regular_file() {
     .unwrap_err();
 
     assert!(matches!(error, Int64TableFileRestoreError::NotRegularFile));
+}
+
+#[test]
+fn valid_primary_takes_precedence_over_a_valid_backup() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let backup_path = directory.join("backup.snapshot");
+    let snapshot_codec = SnapshotCodec::new(17);
+    let payload_codec = NullableI64PayloadCodec::new(1, 17);
+    write_snapshot(&primary_path, &[Some(11)], snapshot_codec, payload_codec);
+    write_snapshot(&backup_path, &[Some(22)], snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_from_file_with_backup(
+        primary_path,
+        backup_path,
+        Schema::int64("reading", false),
+        1,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    assert_eq!(recovered.source(), Int64TableFileRecoverySource::Primary);
+    assert_eq!(recovered.table().values(), &[Some(11)]);
+}
+
+#[test]
+fn missing_primary_recovers_from_the_explicit_backup() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("backup.snapshot");
+    let snapshot_codec = SnapshotCodec::new(17);
+    let payload_codec = NullableI64PayloadCodec::new(1, 17);
+    write_snapshot(&backup_path, &[Some(22)], snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_from_file_with_backup(
+        directory.join("missing-primary.snapshot"),
+        backup_path,
+        Schema::int64("reading", false),
+        1,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    let (table, source) = recovered.into_parts();
+    assert_eq!(source, Int64TableFileRecoverySource::Backup);
+    assert_eq!(table.values(), &[Some(22)]);
+}
+
+#[test]
+fn corrupt_primary_recovers_from_the_explicit_backup() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let backup_path = directory.join("backup.snapshot");
+    let snapshot_codec = SnapshotCodec::new(17);
+    let payload_codec = NullableI64PayloadCodec::new(1, 17);
+    write_snapshot(&primary_path, &[Some(11)], snapshot_codec, payload_codec);
+    let mut primary = fs::read(&primary_path).unwrap();
+    *primary.last_mut().unwrap() ^= 1;
+    fs::write(&primary_path, primary).unwrap();
+    write_snapshot(&backup_path, &[Some(22)], snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_from_file_with_backup(
+        primary_path,
+        backup_path,
+        Schema::int64("reading", false),
+        1,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    assert_eq!(recovered.source(), Int64TableFileRecoverySource::Backup);
+    assert_eq!(recovered.into_table().values(), &[Some(22)]);
+}
+
+#[test]
+fn truncated_primary_recovers_from_the_explicit_backup() {
+    let directory = TestDirectory::new();
+    let primary_path = directory.join("primary.snapshot");
+    let backup_path = directory.join("backup.snapshot");
+    let snapshot_codec = SnapshotCodec::new(17);
+    let payload_codec = NullableI64PayloadCodec::new(1, 17);
+    write_snapshot(&primary_path, &[Some(11)], snapshot_codec, payload_codec);
+    let mut primary = fs::read(&primary_path).unwrap();
+    primary.pop();
+    fs::write(&primary_path, primary).unwrap();
+    write_snapshot(&backup_path, &[Some(22)], snapshot_codec, payload_codec);
+
+    let recovered = restore_int64_table_from_file_with_backup(
+        primary_path,
+        backup_path,
+        Schema::int64("reading", false),
+        1,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap();
+
+    assert_eq!(recovered.source(), Int64TableFileRecoverySource::Backup);
+    assert_eq!(recovered.table().values(), &[Some(22)]);
+}
+
+#[test]
+fn dual_failure_preserves_both_typed_file_errors() {
+    let directory = TestDirectory::new();
+    let backup_path = directory.join("corrupt-backup.snapshot");
+    let snapshot_codec = SnapshotCodec::new(17);
+    let payload_codec = NullableI64PayloadCodec::new(1, 17);
+    write_snapshot(&backup_path, &[Some(22)], snapshot_codec, payload_codec);
+    let mut backup = fs::read(&backup_path).unwrap();
+    *backup.last_mut().unwrap() ^= 1;
+    fs::write(&backup_path, backup).unwrap();
+
+    let error = restore_int64_table_from_file_with_backup(
+        directory.join("missing-primary.snapshot"),
+        backup_path,
+        Schema::int64("reading", false),
+        1,
+        snapshot_codec,
+        payload_codec,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error.primary_error(),
+        Int64TableFileRestoreError::Open(source) if source.kind() == ErrorKind::NotFound
+    ));
+    assert!(matches!(
+        error.backup_error(),
+        Int64TableFileRestoreError::Restore(Int64TableRestoreError::Envelope(
+            SnapshotError::ChecksumMismatch { .. }
+        ))
+    ));
+    let (primary, backup) = error.into_errors();
+    assert!(matches!(primary, Int64TableFileRestoreError::Open(_)));
+    assert!(matches!(
+        backup,
+        Int64TableFileRestoreError::Restore(Int64TableRestoreError::Envelope(
+            SnapshotError::ChecksumMismatch { .. }
+        ))
+    ));
+}
+
+#[test]
+fn backup_recovery_preserves_schema_row_and_file_limits() {
+    let directory = TestDirectory::new();
+
+    let nullable_backup = directory.join("nullable-backup.snapshot");
+    let one_row_snapshot_codec = SnapshotCodec::new(17);
+    let one_row_payload_codec = NullableI64PayloadCodec::new(1, 17);
+    write_snapshot(
+        &nullable_backup,
+        &[None],
+        one_row_snapshot_codec,
+        one_row_payload_codec,
+    );
+    let schema_error = restore_int64_table_from_file_with_backup(
+        directory.join("missing-schema-primary.snapshot"),
+        nullable_backup,
+        Schema::int64("reading", false),
+        1,
+        one_row_snapshot_codec,
+        one_row_payload_codec,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        schema_error,
+        Int64TableFileRecoveryError::BothFailed {
+            backup: Int64TableFileRestoreError::Restore(Int64TableRestoreError::Table(
+                InsertError::NullNotAllowed { ref column }
+            )),
+            ..
+        } if column == "reading"
+    ));
+
+    let rows_backup = directory.join("rows-backup.snapshot");
+    let two_row_snapshot_codec = SnapshotCodec::new(26);
+    let two_row_payload_codec = NullableI64PayloadCodec::new(2, 26);
+    write_snapshot(
+        &rows_backup,
+        &[Some(1), Some(2)],
+        two_row_snapshot_codec,
+        two_row_payload_codec,
+    );
+    let row_error = restore_int64_table_from_file_with_backup(
+        directory.join("missing-rows-primary.snapshot"),
+        rows_backup,
+        Schema::int64("reading", false),
+        1,
+        two_row_snapshot_codec,
+        two_row_payload_codec,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        row_error,
+        Int64TableFileRecoveryError::BothFailed {
+            backup: Int64TableFileRestoreError::Restore(Int64TableRestoreError::Table(
+                InsertError::RowCapExceeded {
+                    row_cap: 1,
+                    current_rows: 0,
+                    incoming_rows: 2,
+                }
+            )),
+            ..
+        }
+    ));
+
+    let oversized_backup = directory.join("oversized-backup.snapshot");
+    let empty_snapshot_codec = SnapshotCodec::new(8);
+    let empty_payload_codec = NullableI64PayloadCodec::new(0, 8);
+    write_snapshot(
+        &oversized_backup,
+        &[],
+        empty_snapshot_codec,
+        empty_payload_codec,
+    );
+    let mut oversized = fs::read(&oversized_backup).unwrap();
+    oversized.push(0xaa);
+    fs::write(&oversized_backup, oversized).unwrap();
+    let file_error = restore_int64_table_from_file_with_backup(
+        directory.join("missing-file-primary.snapshot"),
+        oversized_backup,
+        Schema::int64("reading", true),
+        0,
+        empty_snapshot_codec,
+        empty_payload_codec,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        file_error,
+        Int64TableFileRecoveryError::BothFailed {
+            backup: Int64TableFileRestoreError::FileTooLarge {
+                file_len,
+                max_file_len,
+            },
+            ..
+        } if file_len == (SNAPSHOT_HEADER_LEN + 9) as u64
+            && max_file_len == SNAPSHOT_HEADER_LEN + 8
+    ));
 }
 
 #[cfg(unix)]

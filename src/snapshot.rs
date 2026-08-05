@@ -303,6 +303,92 @@ impl From<Int64TableRestoreError> for Int64TableFileRestoreError {
     }
 }
 
+/// Identifies the snapshot file that produced a recovered table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Int64TableFileRecoverySource {
+    /// The caller-supplied primary snapshot was valid.
+    Primary,
+    /// The primary failed validation and the caller-supplied backup was valid.
+    Backup,
+}
+
+/// A table recovered from either a primary or explicit backup snapshot file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int64TableFileRecovery {
+    table: Int64Table,
+    source: Int64TableFileRecoverySource,
+}
+
+impl Int64TableFileRecovery {
+    /// Returns the completely validated recovered table.
+    pub fn table(&self) -> &Int64Table {
+        &self.table
+    }
+
+    /// Returns which caller-supplied snapshot file produced the table.
+    pub const fn source(&self) -> Int64TableFileRecoverySource {
+        self.source
+    }
+
+    /// Consumes the recovery result and returns its table.
+    pub fn into_table(self) -> Int64Table {
+        self.table
+    }
+
+    /// Consumes the recovery result and returns its table and source.
+    pub fn into_parts(self) -> (Int64Table, Int64TableFileRecoverySource) {
+        (self.table, self.source)
+    }
+}
+
+/// An error produced when both primary and backup snapshot restoration fail.
+#[derive(Debug)]
+pub enum Int64TableFileRecoveryError {
+    /// Both bounded file restoration attempts failed.
+    BothFailed {
+        /// The typed failure from the primary snapshot.
+        primary: Int64TableFileRestoreError,
+        /// The typed failure from the backup snapshot.
+        backup: Int64TableFileRestoreError,
+    },
+}
+
+impl Int64TableFileRecoveryError {
+    /// Returns the typed failure from the primary snapshot.
+    pub const fn primary_error(&self) -> &Int64TableFileRestoreError {
+        match self {
+            Self::BothFailed { primary, .. } => primary,
+        }
+    }
+
+    /// Returns the typed failure from the backup snapshot.
+    pub const fn backup_error(&self) -> &Int64TableFileRestoreError {
+        match self {
+            Self::BothFailed { backup, .. } => backup,
+        }
+    }
+
+    /// Consumes this error and returns both typed file restoration failures.
+    pub fn into_errors(self) -> (Int64TableFileRestoreError, Int64TableFileRestoreError) {
+        match self {
+            Self::BothFailed { primary, backup } => (primary, backup),
+        }
+    }
+}
+
+impl fmt::Display for Int64TableFileRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BothFailed { primary, backup } => write!(
+                formatter,
+                "could not restore primary snapshot ({primary}) or backup snapshot ({backup})"
+            ),
+        }
+    }
+}
+
+impl Error for Int64TableFileRecoveryError {}
+
 /// Encodes and decodes bounded nullable `Int64` row payloads.
 ///
 /// The payload can be passed directly to [`SnapshotCodec::encode`]. Decoding
@@ -698,6 +784,51 @@ pub fn restore_int64_table_from_file(
 
     restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
         .map_err(Int64TableFileRestoreError::Restore)
+}
+
+/// Restores one bounded `Int64` table from a primary or explicit backup file.
+///
+/// The primary is attempted first. A valid primary is returned immediately and
+/// the backup is not inspected. If the primary fails for any typed file,
+/// envelope, payload, schema, or row-cap reason, the backup is restored with
+/// the same bounds. A successful result reports which file supplied the table;
+/// if both attempts fail, both typed failures are retained. Neither failure
+/// exposes a partially decoded or populated table.
+pub fn restore_int64_table_from_file_with_backup(
+    primary_path: impl AsRef<Path>,
+    backup_path: impl AsRef<Path>,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) -> Result<Int64TableFileRecovery, Int64TableFileRecoveryError> {
+    match restore_int64_table_from_file(
+        primary_path,
+        schema.clone(),
+        row_cap,
+        snapshot_codec,
+        payload_codec,
+    ) {
+        Ok(table) => Ok(Int64TableFileRecovery {
+            table,
+            source: Int64TableFileRecoverySource::Primary,
+        }),
+        Err(primary) => {
+            match restore_int64_table_from_file(
+                backup_path,
+                schema,
+                row_cap,
+                snapshot_codec,
+                payload_codec,
+            ) {
+                Ok(table) => Ok(Int64TableFileRecovery {
+                    table,
+                    source: Int64TableFileRecoverySource::Backup,
+                }),
+                Err(backup) => Err(Int64TableFileRecoveryError::BothFailed { primary, backup }),
+            }
+        }
+    }
 }
 
 fn open_regular_snapshot_file(path: &Path) -> Result<File, Int64TableFileRestoreError> {
