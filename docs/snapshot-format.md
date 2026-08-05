@@ -53,11 +53,14 @@ complete envelope, renames the temporary file over the destination, and
 synchronizes the parent directory. Creation, rename, cleanup, and sync stay
 relative to the one opened directory descriptor, so renaming or rebinding the
 parent path cannot redirect later stages or strand the temporary file. The
-temporary-name search is bounded, and a candidate equal to the destination is
-skipped so the destination is not exposed before the rename. Destinations
-ending in `/` or `/.` are rejected instead of being normalized to a different
-pathname. The API is not exposed on Windows because the required
-directory-handle opening and flush semantics are not implemented.
+temporary-name search is bounded. Names extend the destination with a unique
+suffix and are compared to the destination by filesystem identity immediately
+after exclusive creation; an alias is removed and retried before any bytes are
+written. This covers case-folding filesystems rather than relying on byte-exact
+name comparison. Destinations ending in `/` or `/.` are rejected instead of
+being normalized to a different pathname. The API is not exposed on Windows
+because the required directory-handle opening and flush semantics are not
+implemented.
 
 Encoding, parent-directory opening, temporary creation, writing, temporary
 file synchronization, rename, cleanup, and directory synchronization failures

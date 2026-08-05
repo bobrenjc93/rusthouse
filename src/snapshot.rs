@@ -774,9 +774,11 @@ impl SnapshotCodec {
     /// All operations after opening the parent are relative to that directory
     /// descriptor, so renaming or rebinding the parent path cannot redirect the
     /// operation or strand the temporary file.
-    /// Temporary candidates equal to the destination name are skipped, so the
-    /// destination is never exposed before the rename. Paths ending in `/` or
-    /// `/.` are rejected rather than normalized to a different destination.
+    /// Temporary names extend the destination with a unique suffix and are
+    /// checked by filesystem identity before writing. Any candidate that the
+    /// filesystem resolves as the destination is removed and retried. Paths
+    /// ending in `/` or `/.` are rejected rather than normalized to a different
+    /// destination.
     ///
     /// Failures before the rename attempt to remove the temporary file and
     /// leave an existing destination unchanged. A
@@ -933,14 +935,44 @@ fn create_temporary_snapshot_with_counter<'a>(
     next_temporary_file: &AtomicU32,
 ) -> Result<(File, TemporarySnapshot<'a>), SnapshotReplaceError> {
     for _ in 0..TEMPORARY_CREATE_ATTEMPTS {
-        let mut name = next_temporary_snapshot_name(next_temporary_file);
-        if name.as_c_str() == destination {
-            name = next_temporary_snapshot_name(next_temporary_file);
-        }
-        match directory.create(&name) {
-            Ok(file) => return Ok((file, TemporarySnapshot::new(directory, name))),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        let suffix = next_temporary_snapshot_suffix(next_temporary_file);
+        let preferred_name = temporary_snapshot_name(destination, &suffix);
+        let created = match directory.create(&preferred_name) {
+            Ok(file) => Ok((file, preferred_name)),
+            Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                if suffix.as_c_str() == destination {
+                    continue;
+                }
+                directory.create(&suffix).map(|file| (file, suffix))
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(SnapshotReplaceError::CreateTemporary(error)),
+        };
+        let (file, name) = match created {
+            Ok(created) => created,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(SnapshotReplaceError::CreateTemporary(error)),
+        };
+        let temporary = TemporarySnapshot::new(directory, name);
+
+        match directory.entry_aliases_file(destination, &file) {
+            Ok(false) => return Ok((file, temporary)),
+            Ok(true) => {
+                drop(file);
+                if let Err(source) = temporary.discard() {
+                    return Err(SnapshotReplaceError::CleanupTemporary {
+                        source,
+                        operation: Box::new(SnapshotReplaceError::CreateTemporary(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "temporary snapshot name aliases the destination",
+                        ))),
+                    });
+                }
+            }
+            Err(error) => {
+                drop(file);
+                return Err(temporary.cleanup(SnapshotReplaceError::CreateTemporary(error)));
+            }
         }
     }
 
@@ -951,10 +983,18 @@ fn create_temporary_snapshot_with_counter<'a>(
 }
 
 #[cfg(unix)]
-fn next_temporary_snapshot_name(next_temporary_file: &AtomicU32) -> CString {
+fn next_temporary_snapshot_suffix(next_temporary_file: &AtomicU32) -> CString {
     let sequence = next_temporary_file.fetch_add(1, Ordering::Relaxed);
     let name = format!(".rusthouse-snapshot-{}-{sequence}.tmp", std::process::id());
     CString::new(name).expect("generated snapshot names never contain NUL bytes")
+}
+
+#[cfg(unix)]
+fn temporary_snapshot_name(destination: &CStr, suffix: &CStr) -> CString {
+    let mut name = Vec::with_capacity(destination.to_bytes().len() + suffix.to_bytes().len());
+    name.extend_from_slice(destination.to_bytes());
+    name.extend_from_slice(suffix.to_bytes());
+    CString::new(name).expect("validated destination and generated suffix contain no NUL bytes")
 }
 
 #[cfg(unix)]
@@ -991,6 +1031,42 @@ impl SnapshotDirectory {
 
         // SAFETY: `openat` returned a new owned descriptor on success.
         Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn entry_aliases_file(&self, name: &CStr, file: &File) -> io::Result<bool> {
+        let mut file_status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `file_status` points to writable storage and `file` remains
+        // open while `fstat` initializes it.
+        let file_result = unsafe { libc::fstat(file.as_raw_fd(), file_status.as_mut_ptr()) };
+        if file_result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut entry_status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `entry_status` points to writable storage, `name` is
+        // NUL-terminated, and the directory descriptor remains open.
+        let entry_result = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                entry_status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if entry_result == -1 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+
+        // SAFETY: both successful calls above completely initialized their
+        // respective `stat` values.
+        let (file_status, entry_status) =
+            unsafe { (file_status.assume_init(), entry_status.assume_init()) };
+        Ok(file_status.st_dev == entry_status.st_dev && file_status.st_ino == entry_status.st_ino)
     }
 
     fn rename(&self, source: &CStr, destination: &CStr) -> io::Result<()> {
@@ -1057,6 +1133,15 @@ impl<'a> TemporarySnapshot<'a> {
                 source,
                 operation: Box::new(operation),
             },
+        }
+    }
+
+    fn discard(mut self) -> io::Result<()> {
+        self.remove_on_drop = false;
+        match self.directory.remove(&self.name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -1326,7 +1411,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn temporary_name_equal_to_destination_is_skipped_before_creation() {
+    fn temporary_name_cannot_alias_destination_under_ascii_case_folding() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -1347,13 +1432,19 @@ mod tests {
         let directory = SnapshotDirectory::open(&root).unwrap();
         let next_temporary_file = AtomicU32::new(0);
         let destination =
-            CString::new(format!(".rusthouse-snapshot-{}-0.tmp", std::process::id())).unwrap();
+            CString::new(format!(".RUSTHOUSE-SNAPSHOT-{}-0.TMP", std::process::id())).unwrap();
 
         let (file, temporary) =
             create_temporary_snapshot_with_counter(&directory, &destination, &next_temporary_file)
                 .unwrap();
 
         assert_ne!(temporary.name(), destination.as_c_str());
+        assert!(
+            !temporary
+                .name()
+                .to_bytes()
+                .eq_ignore_ascii_case(destination.to_bytes())
+        );
         let destination_path = root.join(OsStr::from_bytes(destination.to_bytes()));
         assert!(!destination_path.exists());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
