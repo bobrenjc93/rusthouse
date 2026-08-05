@@ -38,6 +38,12 @@ both operands must return the same number and sequence of column types. Each
 operand applies its own clauses; nested unions and union-level outer clauses
 are not supported. The combined result remains subject to the normal query
 result limits before its row vector is grown.
+`SELECT * FROM left_table CROSS JOIN right_table [LIMIT n]` returns every
+typed column from the left table followed by every column from the right, with
+rows in deterministic left-major order. This deliberately narrow form does
+not accept projections, predicates, aliases, or additional joins. The
+LIMIT-reduced Cartesian row, scalar-value, and estimated byte counts are all
+checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [LIMIT n]` supports tuples of
 physical columns of any supported types and returns unique tuples in
 deterministic first-seen order. Distinct tuples are collected under the

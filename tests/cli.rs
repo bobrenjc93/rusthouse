@@ -82,6 +82,28 @@ fn csv_batch_emits_one_left_named_union_all_result() {
 }
 
 #[test]
+fn csv_batch_emits_typed_cross_join_in_left_major_order() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE left_rows (id Int64, label String);
+          CREATE TABLE right_rows (score Float64, active Bool);
+          INSERT INTO left_rows VALUES (1, 'first'), (2, 'second');
+          INSERT INTO right_rows VALUES (1.5, true), (2.5, false);
+          SELECT * FROM left_rows CROSS JOIN right_rows LIMIT 3;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"id,label,score,active\n\
+          1,first,1.5,true\n\
+          1,first,2.5,false\n\
+          2,second,1.5,true\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_emits_show_tables_metadata_in_stable_display_order() {
     let output = run(
         &["--format", "csv"],
