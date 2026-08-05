@@ -80,10 +80,15 @@ the query; a selected `i64::MIN` reports a typed numeric-overflow error.
 non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
 `ROW_NUMBER() OVER (ORDER BY int64_column ASC|DESC)` filters with `WHERE`, then
 orders equal keys by stable source position and numbers rows before `LIMIT`.
-The empty window retains source order. These minimal window forms deliberately
-reject arguments, partitioning, multiple or implicit-direction window sort
-keys, aggregate projections, `GROUP BY`, `HAVING`, and query-level `ORDER BY`;
-their output is covered by the normal result row, value, and byte caps.
+`ROW_NUMBER() OVER (PARTITION BY int64_column)` instead retains source order
+and assigns an independent counter to each key after filtering and before
+`LIMIT`. Distinct partitions are bounded by the grouped-query group and key
+caps. The empty window retains source order. These minimal window forms
+deliberately reject arguments, multiple partition keys, combined partitioning
+and ordering, multiple or implicit-direction window sort keys, conflicting
+window specifications, aggregate projections, `GROUP BY`, `HAVING`, and
+query-level `ORDER BY`; their output is covered by the normal result row,
+value, and byte caps.
 
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and
