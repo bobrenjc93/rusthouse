@@ -164,6 +164,38 @@ fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit()
 }
 
 #[test]
+fn ordered_row_number_limits_rows_before_checked_cast_projection() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (rank_key Int64, reading Float64); \
+             INSERT INTO samples VALUES (2, 9223372036854775808.0), (1, 7.9);",
+        )
+        .expect("fixture succeeds");
+
+    let results = database
+        .execute(
+            "SELECT CAST(reading AS Int64) AS converted, \
+                    ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS n \
+             FROM samples LIMIT 1",
+        )
+        .expect("window LIMIT excludes the overflowing cast");
+    assert_eq!(
+        query(&results[0]).rows,
+        [vec![Value::Int64(7), Value::Int64(1)]]
+    );
+
+    assert_eq!(
+        database.execute(
+            "SELECT CAST(reading AS Int64), \
+                    ROW_NUMBER() OVER (ORDER BY rank_key DESC) \
+             FROM samples LIMIT 1",
+        ),
+        Err(Error::NumericOverflow("CAST(Float64 AS Int64)".to_owned()))
+    );
+}
+
+#[test]
 fn ordered_row_number_rejects_missing_and_non_int64_columns() {
     let mut database = Database::new();
     database
