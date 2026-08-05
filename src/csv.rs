@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Read};
 
 use crate::{InsertError, Int64Table};
 
@@ -116,6 +117,46 @@ impl Error for CsvIngestError {
     }
 }
 
+/// An error produced while reading and ingesting `CSVWithNames` input.
+#[derive(Debug)]
+pub enum CsvReaderIngestError {
+    /// Reading the complete bounded input failed.
+    Read(io::Error),
+    /// The reader produced more than the configured byte bound.
+    ByteLimitExceeded { bytes: usize, max_bytes: usize },
+    /// The complete bounded input was rejected by the CSV parser or table.
+    Csv(CsvIngestError),
+}
+
+impl fmt::Display for CsvReaderIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "could not read CSV input: {error}"),
+            Self::ByteLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "CSV input has at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
+            Self::Csv(error) => write!(formatter, "could not ingest CSV input: {error}"),
+        }
+    }
+}
+
+impl Error for CsvReaderIngestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Csv(error) => Some(error),
+            Self::ByteLimitExceeded { .. } => None,
+        }
+    }
+}
+
+impl From<CsvIngestError> for CsvReaderIngestError {
+    fn from(error: CsvIngestError) -> Self {
+        Self::Csv(error)
+    }
+}
+
 /// Atomically ingests a bounded, one-column `CSVWithNames` input.
 ///
 /// The first line must exactly equal the table's column name. Each following
@@ -196,6 +237,59 @@ pub fn ingest_csv_with_names(
         .append_batch(&values)
         .map_err(CsvIngestError::TableInsert)?;
     Ok(values.len())
+}
+
+/// Reads and atomically ingests a bounded, one-column `CSVWithNames` input.
+///
+/// The reader is consumed to EOF unless it produces `limits.max_bytes + 1`
+/// bytes, which is the first point at which an oversized input can be
+/// identified. Read failures are reported separately from byte-limit and CSV
+/// validation failures.
+///
+/// No CSV parsing or table mutation occurs until the complete bounded read
+/// succeeds. The buffered input is then passed to [`ingest_csv_with_names`],
+/// preserving its transactional validation and append behavior.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Cursor;
+/// use rusthouse::{
+///     CsvIngestLimits, Int64Table, Schema, ingest_csv_with_names_from_reader,
+/// };
+///
+/// let mut table = Int64Table::new(Schema::int64("reading", false), 2);
+/// let input = Cursor::new(b"reading\n7\n-2\n");
+/// let rows = ingest_csv_with_names_from_reader(
+///     &mut table,
+///     input,
+///     CsvIngestLimits::new(32, 2),
+/// )?;
+///
+/// assert_eq!(rows, 2);
+/// assert_eq!(table.values(), &[Some(7), Some(-2)]);
+/// # Ok::<(), rusthouse::CsvReaderIngestError>(())
+/// ```
+pub fn ingest_csv_with_names_from_reader(
+    table: &mut Int64Table,
+    reader: impl Read,
+    limits: CsvIngestLimits,
+) -> Result<usize, CsvReaderIngestError> {
+    let read_limit = limits.max_bytes.saturating_add(1);
+    let mut input = Vec::new();
+    reader
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut input)
+        .map_err(CsvReaderIngestError::Read)?;
+
+    if input.len() > limits.max_bytes {
+        return Err(CsvReaderIngestError::ByteLimitExceeded {
+            bytes: input.len(),
+            max_bytes: limits.max_bytes,
+        });
+    }
+
+    ingest_csv_with_names(table, input, limits).map_err(Into::into)
 }
 
 fn line_contents(line: &[u8]) -> &[u8] {

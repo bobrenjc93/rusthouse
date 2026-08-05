@@ -27,7 +27,10 @@ pub use cli::{
     DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_ROWS_PER_TABLE, DEFAULT_MAX_SESSION_STATEMENTS,
     DEFAULT_MAX_SESSION_TABLES, SessionError, SessionLimits, run_session,
 };
-pub use csv::{CsvIngestError, CsvIngestLimits, ingest_csv_with_names};
+pub use csv::{
+    CsvIngestError, CsvIngestLimits, CsvReaderIngestError, ingest_csv_with_names,
+    ingest_csv_with_names_from_reader,
+};
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
     InnerJoinExecutionError, InsertExecutionError, SelectDistinctExecutionError,
