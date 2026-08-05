@@ -73,11 +73,13 @@ select rows before output evaluation, so an excluded `i64::MIN` does not fail
 the query; a selected `i64::MIN` reports a typed numeric-overflow error.
 
 `ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
-non-`DISTINCT` projection and accepts an optional `AS alias`. Rows are numbered
-in stable source order after `WHERE` filtering and before `LIMIT`. This minimal
-window form deliberately rejects arguments, a nonempty `OVER` specification,
-aggregate projections, `GROUP BY`, `HAVING`, and `ORDER BY`; its output is
-covered by the normal result row, value, and byte caps.
+non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
+`ROW_NUMBER() OVER (ORDER BY int64_column ASC|DESC)` filters with `WHERE`, then
+orders equal keys by stable source position and numbers rows before `LIMIT`.
+The empty window retains source order. These minimal window forms deliberately
+reject arguments, partitioning, multiple or implicit-direction window sort
+keys, aggregate projections, `GROUP BY`, `HAVING`, and query-level `ORDER BY`;
+their output is covered by the normal result row, value, and byte caps.
 
 RustHouse's bounded in-memory `Catalog` parses and executes a one-column `Int64`
 subset covering `CREATE TABLE`, single-row `INSERT INTO ... VALUES`, and

@@ -95,7 +95,107 @@ fn row_number_handles_empty_filtered_and_limited_inputs() {
 }
 
 #[test]
-fn row_number_rejects_arguments_and_nonempty_window_specifications() {
+fn ordered_row_number_supports_both_directions_stable_ties_filtering_and_limit() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE events (id Int64, rank_key Int64, label String); \
+             INSERT INTO events VALUES \
+                 (1, 2, 'first-two'), (2, 1, 'first-one'), \
+                 (3, 2, 'second-two'), (4, 1, 'second-one'), \
+                 (5, 3, 'three'), (6, 0, 'filtered'); \
+             SELECT id, label, ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS n \
+             FROM events WHERE id <= 5 LIMIT 4; \
+             SELECT id, label, ROW_NUMBER() OVER (ORDER BY rank_key DESC) AS n \
+             FROM events WHERE id <= 5 LIMIT 4;",
+        )
+        .expect("ordered ROW_NUMBER queries succeed");
+
+    assert_eq!(
+        query(&results[2]).rows,
+        vec![
+            vec![
+                Value::Int64(2),
+                Value::String("first-one".to_owned()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::String("second-one".to_owned()),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("first-two".to_owned()),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::String("second-two".to_owned()),
+                Value::Int64(4),
+            ],
+        ]
+    );
+    assert_eq!(
+        query(&results[3]).rows,
+        vec![
+            vec![
+                Value::Int64(5),
+                Value::String("three".to_owned()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::String("first-two".to_owned()),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::String("second-two".to_owned()),
+                Value::Int64(3),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::String("first-one".to_owned()),
+                Value::Int64(4),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn ordered_row_number_rejects_missing_and_non_int64_columns() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (1, 'one');",
+        )
+        .expect("fixture succeeds");
+
+    assert_eq!(
+        database
+            .execute("SELECT ROW_NUMBER() OVER (ORDER BY missing ASC) FROM events")
+            .expect_err("missing ordering column is rejected"),
+        Error::ColumnNotFound {
+            table: "events".to_owned(),
+            column: "missing".to_owned(),
+        }
+    );
+    assert_eq!(
+        database
+            .execute("SELECT ROW_NUMBER() OVER (ORDER BY label DESC) FROM events")
+            .expect_err("non-Int64 ordering column is rejected"),
+        Error::TypeMismatch {
+            context: "ROW_NUMBER ORDER BY column 'label'".to_owned(),
+            expected: "Int64".to_owned(),
+            actual: "String".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn row_number_rejects_arguments_and_unsupported_window_specifications() {
     let malformed = [
         "SELECT ROW_NUMBER(id) OVER () FROM events",
         "SELECT ROW_NUMBER(*) OVER () FROM events",
@@ -103,6 +203,7 @@ fn row_number_rejects_arguments_and_nonempty_window_specifications() {
         "SELECT ROW_NUMBER() FROM events",
         "SELECT ROW_NUMBER() OVER window_name FROM events",
         "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM events",
+        "SELECT ROW_NUMBER() OVER (ORDER BY id ASC, id DESC) FROM events",
         "SELECT ROW_NUMBER() OVER (PARTITION BY id) FROM events",
         "SELECT ROW_NUMBER() OVER () FROM events WINDOW w AS ()",
     ];
@@ -154,7 +255,7 @@ fn row_number_projection_obeys_ast_and_result_materialization_caps() {
         .execute(
             "CREATE TABLE events (id Int64); \
              INSERT INTO events VALUES (1), (2); \
-             SELECT ROW_NUMBER() OVER () FROM events;",
+             SELECT ROW_NUMBER() OVER (ORDER BY id DESC) FROM events;",
         )
         .expect_err("two window rows cross the result row cap");
     assert_eq!(
@@ -174,7 +275,7 @@ fn row_number_projection_obeys_ast_and_result_materialization_caps() {
         .execute(
             "CREATE TABLE events (id Int64); \
              INSERT INTO events VALUES (1), (2); \
-             SELECT id, ROW_NUMBER() OVER () FROM events;",
+             SELECT id, ROW_NUMBER() OVER (ORDER BY id ASC) FROM events;",
         )
         .expect_err("the window projection counts toward result values");
     assert_eq!(
@@ -189,20 +290,20 @@ fn row_number_projection_obeys_ast_and_result_materialization_caps() {
 
 #[test]
 fn row_number_is_rendered_as_typed_csv_and_json() {
-    let input = b"CREATE TABLE events (id Int64); \
-        INSERT INTO events VALUES (7), (9); \
-        SELECT id, ROW_NUMBER() OVER () AS sequence FROM events;";
+    let input = b"CREATE TABLE events (id Int64, rank_key Int64); \
+        INSERT INTO events VALUES (7, 2), (9, 1); \
+        SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS sequence FROM events;";
 
     let mut csv = Vec::new();
     run_csv_batch(&input[..], &mut csv).expect("CSV output succeeds");
-    assert_eq!(csv, b"id,sequence\n7,1\n9,2\n");
+    assert_eq!(csv, b"id,sequence\n9,1\n7,2\n");
 
     let mut json = Vec::new();
     run_json_batch(&input[..], &mut json).expect("JSON output succeeds");
     assert_eq!(
         json,
         concat!(
-            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"sequence","type":"Int64"}],"rows":[[7,1],[9,2]]}"#,
+            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"sequence","type":"Int64"}],"rows":[[9,1],[7,2]]}"#,
             "\n"
         )
         .as_bytes()

@@ -61,7 +61,7 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST`, `LENGTH`, `ABS`, and the minimal `ROW_NUMBER() OVER ()` window form
+/// `CAST`, `LENGTH`, `ABS`, and the minimal unpartitioned `ROW_NUMBER` window forms
 /// provide bounded projections in ungrouped queries. An optional `AS` alias
 /// controls each result column name.
 ///
@@ -376,6 +376,7 @@ impl Database {
         };
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
+        let window_ordering = resolve_row_number_ordering(table, &select.items)?;
         let having = select
             .having
             .as_ref()
@@ -395,6 +396,9 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
+        if let Some(ordering) = window_ordering {
+            order_window_rows(&mut matching_rows, table, ordering);
+        }
         if items
             .iter()
             .any(|item| matches!(item, ResolvedItem::RowNumber))
@@ -617,6 +621,72 @@ fn validate_row_number_shape(select: &Select) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedWindowOrder {
+    source: usize,
+    descending: bool,
+}
+
+fn resolve_row_number_ordering(
+    table: &Table,
+    items: &[SelectItem],
+) -> Result<Option<ResolvedWindowOrder>> {
+    let mut row_number_orders = items.iter().filter_map(|item| match item {
+        SelectItem::RowNumber { order_by, .. } => Some(order_by.as_ref()),
+        _ => None,
+    });
+    let Some(first) = row_number_orders.next() else {
+        return Ok(None);
+    };
+
+    if row_number_orders.any(|order| !same_window_order(first, order)) {
+        return Err(Error::InvalidQuery(
+            "all ROW_NUMBER projections must use the same window ordering".to_owned(),
+        ));
+    }
+
+    let Some(order) = first else {
+        return Ok(None);
+    };
+    let source = table.column_index(&order.name)?;
+    let actual = table.schema()[source].data_type;
+    if actual != DataType::Int64 {
+        return Err(Error::TypeMismatch {
+            context: format!("ROW_NUMBER ORDER BY column '{}'", order.name),
+            expected: DataType::Int64.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+
+    Ok(Some(ResolvedWindowOrder {
+        source,
+        descending: order.descending,
+    }))
+}
+
+fn same_window_order(left: Option<&OrderBy>, right: Option<&OrderBy>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.descending == right.descending && left.name.eq_ignore_ascii_case(&right.name)
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn order_window_rows(rows: &mut [usize], table: &Table, ordering: ResolvedWindowOrder) {
+    rows.sort_unstable_by(|left, right| {
+        let comparison =
+            int64_at(table, ordering.source, *left).cmp(&int64_at(table, ordering.source, *right));
+        let comparison = if ordering.descending {
+            comparison.reverse()
+        } else {
+            comparison
+        };
+        comparison.then_with(|| left.cmp(right))
+    });
 }
 
 fn resolve_distinct_columns(table: &Table, items: &[SelectItem]) -> Result<Vec<usize>> {
@@ -884,7 +954,7 @@ fn resolve_select_items(
                     data_type: DataType::Int64,
                 });
             }
-            SelectItem::RowNumber { alias } => {
+            SelectItem::RowNumber { alias, .. } => {
                 items.push(ResolvedItem::RowNumber);
                 result_columns.push(ResultColumn {
                     name: alias.clone().unwrap_or_else(|| "ROW_NUMBER()".to_owned()),
