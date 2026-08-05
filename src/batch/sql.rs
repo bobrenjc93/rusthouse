@@ -43,6 +43,9 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    TruncateTable {
+        name: String,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -553,6 +556,8 @@ impl<'a> Parser<'a> {
             self.parse_create()
         } else if self.eat_keyword("DROP") {
             self.parse_drop()
+        } else if self.eat_keyword("TRUNCATE") {
+            self.parse_truncate()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
@@ -562,7 +567,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_keyword("DESCRIBE") {
             self.parse_describe()
         } else {
-            self.error("expected CREATE, DROP, INSERT, SELECT, SHOW, or DESCRIBE")
+            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, or DESCRIBE")
         }
     }
 
@@ -687,6 +692,15 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after DROP TABLE");
         }
         Ok(Statement::DropTable { name })
+    }
+
+    fn parse_truncate(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let name = self.expect_identifier("table name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after TRUNCATE TABLE");
+        }
+        Ok(Statement::TruncateTable { name })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {

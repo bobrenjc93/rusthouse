@@ -310,3 +310,45 @@ fn drop_table_is_a_shared_database_mutation() {
     );
     assert!(database.query("SELECT id FROM retained;").is_ok());
 }
+
+#[test]
+fn truncate_table_is_a_shared_database_mutation() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE Events (id Int64); \
+             INSERT INTO Events VALUES (7), (8);",
+        )
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.query("TRUNCATE TABLE events;"),
+        Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "TRUNCATE TABLE",
+        })
+    );
+    assert_eq!(
+        database
+            .query("SELECT COUNT(*) FROM events;")
+            .expect("read-only rejection did not truncate the table")
+            .rows,
+        [vec![Value::Int64(2)]]
+    );
+
+    assert_eq!(
+        database
+            .execute("TRUNCATE TABLE eVeNtS;")
+            .expect("execute accepts the mutation"),
+        [StatementResult::Command {
+            tag: "TRUNCATE TABLE",
+            affected_rows: 2,
+        }]
+    );
+    assert!(
+        database
+            .query("SELECT id FROM Events;")
+            .expect("the schema remains queryable")
+            .rows
+            .is_empty()
+    );
+}

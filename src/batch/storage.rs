@@ -86,6 +86,15 @@ impl Column {
             _ => unreachable!("values are validated before insertion"),
         }
     }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Int64(values) => values.clear(),
+            Self::Float64(values) => values.clear(),
+            Self::Bool(values) => values.clear(),
+            Self::String(values) => values.clear(),
+        }
+    }
 }
 
 /// A table stores one typed vector per schema field.
@@ -202,6 +211,16 @@ impl Table {
         }
         self.row_count += 1;
         Ok(())
+    }
+
+    /// Removes every row while retaining the table name, schema, and physical columns.
+    pub fn truncate(&mut self) -> usize {
+        let removed_rows = self.row_count;
+        for column in &mut self.columns {
+            column.clear();
+        }
+        self.row_count = 0;
+        removed_rows
     }
 }
 
