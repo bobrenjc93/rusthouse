@@ -64,6 +64,40 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn tsv_batch_emits_all_types_nulls_empty_and_multiple_escaped_results() {
+    let output = run(
+        &["--format", "tsv"],
+        b"CREATE TABLE metrics (
+              id Int64,
+              score Float64,
+              enabled Bool,
+              label String
+          );
+          SELECT id, score, enabled, label FROM metrics;
+          INSERT INTO metrics VALUES
+              (1, 1.5, true, 'slash\\tab\tcarriage\rline\nend'),
+              (2, 2.0, false, 'plain');
+          SELECT id, score, enabled, label FROM metrics ORDER BY id;
+          SELECT MIN(label) AS missing FROM metrics WHERE id < 0;
+          SELECT COUNT(*) AS rows FROM metrics;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"id\tscore\tenabled\tlabel\n\
+          id\tscore\tenabled\tlabel\n\
+          1\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nend\n\
+          2\t2.0\tfalse\tplain\n\
+          missing\n\
+          \\N\n\
+          rows\n\
+          2\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn table_batch_emits_all_types_empty_and_null_results_in_statement_order() {
     let output = run(
         &["--format", "table"],
@@ -253,7 +287,7 @@ fn batch_formats_emit_canonical_show_create_table_ddl() {
 
 #[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
-    for format in ["table", "csv", "json"] {
+    for format in ["table", "csv", "tsv", "json"] {
         let output = run(
             &["--format", format],
             b"CREATE TABLE temporary (id Int64); DROP TABLE TEMPORARY;",
@@ -267,7 +301,7 @@ fn batch_cli_keeps_drop_table_command_output_silent() {
 
 #[test]
 fn batch_cli_keeps_truncate_table_command_output_silent() {
-    for format in ["table", "csv", "json"] {
+    for format in ["table", "csv", "tsv", "json"] {
         let output = run(
             &["--format", format],
             b"CREATE TABLE temporary (id Int64); \
@@ -463,9 +497,11 @@ fn only_exact_supported_format_arguments_are_accepted() {
         &["--format", "TABLE"][..],
         &["--format", "CSV"][..],
         &["--format", "JSON"][..],
+        &["--format", "TSV"][..],
         &["--format", "table", "extra"][..],
         &["--format", "csv", "extra"][..],
         &["--format", "json", "extra"][..],
+        &["--format", "tsv", "extra"][..],
     ] {
         let output = run(args, b"");
         assert!(!output.status.success(), "{args:?}");
@@ -575,6 +611,7 @@ fn help_prints_usage_without_reading_a_session() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("Usage: rusthouse [OPTIONS]"));
         assert!(stdout.contains("--format table"));
+        assert!(stdout.contains("--format tsv"));
         assert!(stdout.contains("--format json"));
         assert!(stdout.contains("65536 input bytes, 1024 statements, 64 tables"));
         assert!(output.stderr.is_empty());

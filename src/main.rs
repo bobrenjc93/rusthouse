@@ -7,7 +7,7 @@ const HELP: &str = "RustHouse bounded SQL query session
 Usage: rusthouse [OPTIONS]
 
 With no options, reads the legacy line-oriented Int64 session from stdin.
-With --format table, --format csv, or --format json, reads one
+With --format table, --format csv, --format tsv, or --format json, reads one
 semicolon-delimited SQL batch through EOF and prints one result for each
 SELECT, SHOW TABLES, SHOW CREATE TABLE, or DESCRIBE TABLE query. CREATE, DROP,
 TRUNCATE, and INSERT remain silent.
@@ -24,6 +24,7 @@ Limits:
 Options:
   --format table Emit human-readable query result tables
   --format csv   Emit CSVWithNames-compatible query results
+  --format tsv   Emit TabSeparatedWithNames query results
   --format json  Emit newline-delimited JSON query results
   -h, --help     Print help
 ";
@@ -62,6 +63,14 @@ fn main() -> ExitCode {
                 Err(error) => fail(&error),
             }
         }
+        Ok(Action::TsvBatch) => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            match rusthouse::batch::run_tsv_batch(stdin.lock(), stdout.lock()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(&error),
+            }
+        }
         Ok(Action::JsonBatch) => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -82,6 +91,7 @@ enum Action {
     Run,
     TableBatch,
     CsvBatch,
+    TsvBatch,
     JsonBatch,
 }
 
@@ -97,6 +107,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, OsStri
         }
         (Some(format), Some(value), None) if format == "--format" && value == "csv" => {
             Ok(Action::CsvBatch)
+        }
+        (Some(format), Some(value), None) if format == "--format" && value == "tsv" => {
+            Ok(Action::TsvBatch)
         }
         (Some(format), Some(value), None) if format == "--format" && value == "json" => {
             Ok(Action::JsonBatch)
