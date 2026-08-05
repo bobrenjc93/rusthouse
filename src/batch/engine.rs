@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::batch::catalog::Catalog;
 use crate::batch::error::{Error, Result};
@@ -344,12 +345,17 @@ impl Database {
     ) -> Result<QueryResult> {
         let LiteralSelect { value, alias } = select;
         validate_literal_select_value(&value)?;
-        let columns = vec![ResultColumn {
-            name: alias.unwrap_or_else(|| literal_result_name(&value)),
-            data_type: value.data_type(),
-        }];
-        let mut bytes =
-            validate_result_shape(1, 1, &columns, query_result_limits, SELECT_RESULT_RESOURCES)?;
+        let column_name_bytes = alias
+            .as_ref()
+            .map_or_else(|| literal_result_name_len(&value), String::len);
+        let mut bytes = validate_result_shape_parts(
+            1,
+            1,
+            1,
+            column_name_bytes,
+            query_result_limits,
+            SELECT_RESULT_RESOURCES,
+        )?;
         if let Value::String(value) = &value {
             bytes = bytes.saturating_add(value.len());
             enforce_resource_limit(
@@ -358,6 +364,10 @@ impl Database {
                 query_result_limits.max_bytes,
             )?;
         }
+        let columns = vec![ResultColumn {
+            name: alias.unwrap_or_else(|| literal_result_name(&value)),
+            data_type: value.data_type(),
+        }];
 
         Ok(QueryResult {
             columns,
@@ -625,6 +635,57 @@ impl Database {
     }
 }
 
+fn literal_result_name_len(value: &Value) -> usize {
+    match value {
+        Value::String(value) => sql_string_literal_name_len(value),
+        Value::Int64(value) => {
+            let magnitude = value.unsigned_abs();
+            let digits = if magnitude == 0 {
+                1
+            } else {
+                magnitude.ilog10() as usize + 1
+            };
+            digits + usize::from(value.is_negative())
+        }
+        Value::Float64(value) => float64_result_name_len(*value),
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Null(_) => 4,
+    }
+}
+
+fn sql_string_literal_name_len(value: &str) -> usize {
+    value
+        .len()
+        .saturating_add(value.bytes().filter(|byte| *byte == b'\'').count())
+        .saturating_add(2)
+}
+
+fn float64_result_name_len(value: f64) -> usize {
+    #[derive(Default)]
+    struct Metrics {
+        bytes: usize,
+        has_fraction_or_exponent: bool,
+    }
+
+    impl fmt::Write for Metrics {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.bytes = self.bytes.saturating_add(text.len());
+            self.has_fraction_or_exponent |= text.contains(['.', 'e', 'E']);
+            Ok(())
+        }
+    }
+
+    let mut metrics = Metrics::default();
+    fmt::write(&mut metrics, format_args!("{value}"))
+        .expect("counting formatted Float64 bytes cannot fail");
+    if value.is_finite() && !metrics.has_fraction_or_exponent {
+        metrics.bytes.saturating_add(2)
+    } else {
+        metrics.bytes
+    }
+}
+
 fn validate_literal_select_value(value: &Value) -> Result<()> {
     match value {
         Value::Null(_) => Err(Error::InvalidQuery(
@@ -639,7 +700,18 @@ fn validate_literal_select_value(value: &Value) -> Result<()> {
 
 fn literal_result_name(value: &Value) -> String {
     match value {
-        Value::String(value) => format!("'{}'", value.replace('\'', "''")),
+        Value::String(value) => {
+            let mut name = String::with_capacity(sql_string_literal_name_len(value));
+            name.push('\'');
+            for character in value.chars() {
+                name.push(character);
+                if character == '\'' {
+                    name.push('\'');
+                }
+            }
+            name.push('\'');
+            name
+        }
         Value::Null(_) | Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => {
             value.as_display_string()
         }

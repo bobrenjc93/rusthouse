@@ -168,6 +168,105 @@ fn direct_ast_execution_rejects_null_and_non_finite_literal_values() {
 }
 
 #[test]
+fn direct_ast_unaliased_string_is_preflighted_at_exact_result_limits() {
+    let value = "'escaped payload'".repeat(1_024);
+    let derived_name_bytes = value.len() + value.bytes().filter(|byte| *byte == b'\'').count() + 2;
+    let required_bytes = size_of::<ResultColumn>()
+        + derived_name_bytes
+        + size_of::<Vec<Value>>()
+        + size_of::<Value>()
+        + value.len();
+    let statement = || {
+        Statement::LiteralSelect(LiteralSelect {
+            value: Value::String(value.clone()),
+            alias: None,
+        })
+    };
+
+    let mut row_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_rows: 0,
+        ..QueryResultLimits::default()
+    });
+    assert_eq!(
+        row_limited.execute_statement(statement()),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result rows",
+            actual: 1,
+            max: 0,
+        })
+    );
+
+    let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: required_bytes - 1,
+        ..QueryResultLimits::default()
+    });
+    assert_eq!(
+        byte_limited.execute_statement(statement()),
+        Err(Error::ResourceLimitExceeded {
+            resource: "SELECT result bytes",
+            actual: required_bytes,
+            max: required_bytes - 1,
+        })
+    );
+
+    let mut exact = Database::with_query_result_limits(QueryResultLimits {
+        max_bytes: required_bytes,
+        ..QueryResultLimits::default()
+    });
+    let StatementResult::Query(result) = exact.execute_statement(statement()).unwrap() else {
+        panic!("literal SELECT must return a query result");
+    };
+    assert_eq!(result.columns[0].name.len(), derived_name_bytes);
+    assert_eq!(result.rows, vec![vec![Value::String(value)]]);
+}
+
+#[test]
+fn direct_ast_generated_scalar_names_have_exact_byte_accounting() {
+    for value in [
+        Value::Int64(i64::MIN),
+        Value::Float64(2.0),
+        Value::Float64(f64::MAX),
+        Value::Float64(f64::MIN_POSITIVE),
+        Value::Bool(true),
+    ] {
+        let expected_name = value.as_display_string();
+        let required_bytes = size_of::<ResultColumn>()
+            + expected_name.len()
+            + size_of::<Vec<Value>>()
+            + size_of::<Value>();
+        let statement = || {
+            Statement::LiteralSelect(LiteralSelect {
+                value: value.clone(),
+                alias: None,
+            })
+        };
+
+        let mut byte_limited = Database::with_query_result_limits(QueryResultLimits {
+            max_bytes: required_bytes - 1,
+            ..QueryResultLimits::default()
+        });
+        assert_eq!(
+            byte_limited.execute_statement(statement()),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT result bytes",
+                actual: required_bytes,
+                max: required_bytes - 1,
+            })
+        );
+
+        let mut exact = Database::with_query_result_limits(QueryResultLimits {
+            max_bytes: required_bytes,
+            ..QueryResultLimits::default()
+        });
+        let StatementResult::Query(result) = exact.execute_statement(statement()).unwrap() else {
+            panic!("literal SELECT must return a query result");
+        };
+        assert_eq!(result.columns[0].name, expected_name);
+        assert_eq!(result.rows, vec![vec![value]]);
+    }
+}
+
+#[test]
 fn shared_database_executes_literal_select_under_a_read_lock() {
     let database = SharedDatabase::default();
     let result = database.query("SELECT 'ready' AS status;").unwrap();
