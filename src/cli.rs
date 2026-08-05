@@ -130,9 +130,9 @@ impl Error for SessionError {
 /// Runs one bounded stdin session, retaining a single in-memory catalog.
 ///
 /// Each nonempty physical line must contain one `CREATE TABLE`, `INSERT INTO`,
-/// or projection/narrow inner-join `SELECT`. Successful creates and inserts
-/// produce no output. Each successful select produces one row-list line such
-/// as `[7, NULL, -2]`.
+/// or projection/narrow inner- or left-join `SELECT`. Successful creates and
+/// inserts produce no output. Each successful select produces one row-list
+/// line such as `[7, NULL, -2]`.
 pub fn run_session(
     input: impl Read,
     mut output: impl Write,
@@ -218,14 +218,16 @@ fn execute_line(
             .execute_insert(statement, parse_limits)
             .map_err(|source| SessionError::Statement { line, source })
     } else if keyword.eq_ignore_ascii_case("SELECT") {
-        let rows = if statement
-            .split_ascii_whitespace()
-            .nth(4)
-            .is_some_and(|word| word.eq_ignore_ascii_case("INNER"))
-        {
+        let join_keyword = statement.split_ascii_whitespace().nth(4);
+        let rows = if join_keyword.is_some_and(|word| word.eq_ignore_ascii_case("INNER")) {
             let max_rows = catalog.limits().max_rows_per_table;
             catalog
                 .execute_inner_join(statement, parse_limits, JoinLimits::new(max_rows, max_rows))
+                .map_err(|source| SessionError::Statement { line, source })?
+        } else if join_keyword.is_some_and(|word| word.eq_ignore_ascii_case("LEFT")) {
+            let max_rows = catalog.limits().max_rows_per_table;
+            catalog
+                .execute_left_join(statement, parse_limits, JoinLimits::new(max_rows, max_rows))
                 .map_err(|source| SessionError::Statement { line, source })?
         } else {
             catalog
@@ -269,7 +271,7 @@ fn write_rows(output: &mut impl Write, rows: &[Option<i64>]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InnerJoinExecutionError, JoinError};
+    use crate::{InnerJoinExecutionError, JoinError, LeftJoinExecutionError};
 
     struct CountingReader<'a> {
         bytes: &'a [u8],
@@ -370,6 +372,44 @@ mod tests {
                     JoinError::OutputLimitExceeded {
                         pairs: 3,
                         max_pairs: 2,
+                    }
+                )),
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_left_join_accepts_and_rejects_the_session_output_cap_boundary() {
+        let limits = SessionLimits::new(768, 8, 2, 3);
+        let exact = b"CREATE TABLE l (v Int64)\n\
+            CREATE TABLE r (k Int64)\n\
+            SELECT k FROM l LEFT JOIN r ON v = k\n\
+            INSERT INTO l VALUES (1)\n\
+            INSERT INTO l VALUES (NULL)\n\
+            INSERT INTO r VALUES (1)\n\
+            INSERT INTO r VALUES (1)\n\
+            SELECT k FROM l LEFT JOIN r ON v = k\n";
+        let mut output = Vec::new();
+
+        run_session(&exact[..], &mut output, limits).unwrap();
+        assert_eq!(output, b"[]\n[1, 1, NULL]\n");
+
+        let exceeded = b"CREATE TABLE l (v Int64)\n\
+            CREATE TABLE r (k Int64)\n\
+            INSERT INTO l VALUES (1)\n\
+            INSERT INTO l VALUES (1)\n\
+            INSERT INTO r VALUES (1)\n\
+            INSERT INTO r VALUES (1)\n\
+            SELECT k FROM l LEFT JOIN r ON v = k\n";
+        let error = run_session(&exceeded[..], Vec::new(), limits).unwrap_err();
+        assert!(matches!(
+            error,
+            SessionError::Statement {
+                line: 7,
+                source: CatalogError::LeftJoin(LeftJoinExecutionError::Join(
+                    JoinError::OutputLimitExceeded {
+                        pairs: 4,
+                        max_pairs: 3,
                     }
                 )),
             }

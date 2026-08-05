@@ -308,6 +308,43 @@ impl InnerJoinStatement {
     }
 }
 
+/// The typed syntax tree for the narrow one-column left equi-join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftJoinStatement {
+    projected_column_name: Identifier,
+    left_table_name: Identifier,
+    right_table_name: Identifier,
+    left_column_name: Identifier,
+    right_column_name: Identifier,
+}
+
+impl LeftJoinStatement {
+    /// Returns the column projected from the right table.
+    pub fn projected_column_name(&self) -> &Identifier {
+        &self.projected_column_name
+    }
+
+    /// Returns the left table name.
+    pub fn left_table_name(&self) -> &Identifier {
+        &self.left_table_name
+    }
+
+    /// Returns the right table name.
+    pub fn right_table_name(&self) -> &Identifier {
+        &self.right_table_name
+    }
+
+    /// Returns the left equality-key column.
+    pub fn left_column_name(&self) -> &Identifier {
+        &self.left_column_name
+    }
+
+    /// Returns the right equality-key column.
+    pub fn right_column_name(&self) -> &Identifier {
+        &self.right_column_name
+    }
+}
+
 /// The argument to a scalar `COUNT` aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalarCountArgument {
@@ -635,6 +672,26 @@ pub fn parse_inner_join(
     validate_statement_length(input, limits)?;
 
     Parser::new(input, limits.max_identifier_bytes).parse_inner_join()
+}
+
+/// Parses the narrow legacy left equi-join over two one-column tables.
+///
+/// Keywords are ASCII case-insensitive. All five identifiers follow the same
+/// rules and bounds as [`parse_create_table`]. The complete accepted grammar
+/// is:
+///
+/// ```text
+/// SELECT identifier FROM identifier LEFT JOIN identifier
+///     ON identifier = identifier [;]
+/// ```
+///
+/// Leading and trailing ASCII whitespace is accepted, as is whitespace around
+/// `=` and the optional semicolon. Qualifiers, aliases, additional predicates,
+/// `OUTER`, and other join kinds are intentionally outside this grammar.
+pub fn parse_left_join(input: &str, limits: ParseLimits) -> Result<LeftJoinStatement, ParseError> {
+    validate_statement_length(input, limits)?;
+
+    Parser::new(input, limits.max_identifier_bytes).parse_left_join()
 }
 
 /// Parses one scalar `COUNT(*)` or `COUNT(column)` statement.
@@ -1055,6 +1112,50 @@ impl<'input> Parser<'input> {
         }
 
         Ok(InnerJoinStatement {
+            projected_column_name,
+            left_table_name,
+            right_table_name,
+            left_column_name,
+            right_column_name,
+        })
+    }
+
+    fn parse_left_join(mut self) -> Result<LeftJoinStatement, ParseError> {
+        self.skip_whitespace();
+        self.expect_keyword("SELECT")?;
+        self.require_whitespace("whitespace after SELECT")?;
+        let projected_column_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before FROM")?;
+        self.expect_keyword("FROM")?;
+        self.require_whitespace("whitespace after FROM")?;
+        let left_table_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before LEFT")?;
+        self.expect_keyword("LEFT")?;
+        self.require_whitespace("whitespace after LEFT")?;
+        self.expect_keyword("JOIN")?;
+        self.require_whitespace("whitespace after JOIN")?;
+        let right_table_name = self.parse_identifier()?;
+        self.require_whitespace("whitespace before ON")?;
+        self.expect_keyword("ON")?;
+        self.require_whitespace("whitespace after ON")?;
+        let left_column_name = self.parse_identifier()?;
+        self.skip_whitespace();
+        self.expect_byte(b'=', "'='")?;
+        self.skip_whitespace();
+        let right_column_name = self.parse_identifier()?;
+        self.skip_whitespace();
+
+        if self.peek() == Some(b';') {
+            self.position += 1;
+            self.skip_whitespace();
+        }
+        if self.position != self.bytes.len() {
+            return Err(ParseError::TrailingInput {
+                offset: self.position,
+            });
+        }
+
+        Ok(LeftJoinStatement {
             projected_column_name,
             left_table_name,
             right_table_name,

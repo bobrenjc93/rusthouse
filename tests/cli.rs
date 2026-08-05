@@ -503,6 +503,45 @@ fn legacy_cli_executes_nullable_inner_join_in_deterministic_cross_product_order(
 }
 
 #[test]
+fn legacy_cli_executes_left_join_with_duplicates_nulls_and_empty_inputs() {
+    let output = run(
+        &[],
+        b"CREATE TABLE left_rows (left_key Int64)\n\
+          CREATE TABLE right_rows (right_key Int64)\n\
+          SELECT right_key FROM left_rows LEFT JOIN right_rows ON left_key = right_key;\n\
+          INSERT INTO left_rows VALUES (7)\n\
+          INSERT INTO left_rows VALUES (NULL)\n\
+          INSERT INTO left_rows VALUES (8)\n\
+          INSERT INTO right_rows VALUES (7)\n\
+          INSERT INTO right_rows VALUES (7)\n\
+          INSERT INTO right_rows VALUES (NULL)\n\
+          SELECT right_key FROM left_rows LEFT JOIN right_rows ON left_key = right_key;\n",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"[]\n[7, 7, NULL, NULL]\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn legacy_cli_reports_unknown_left_join_identifiers() {
+    let output = run(
+        &[],
+        b"CREATE TABLE left_rows (left_key Int64)\n\
+          CREATE TABLE right_rows (right_key Int64)\n\
+          SELECT missing FROM left_rows LEFT JOIN right_rows ON left_key = right_key;\n",
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("could not execute LEFT JOIN: unknown column 'missing'")
+    );
+}
+
+#[test]
 fn help_prints_usage_without_reading_a_session() {
     for argument in ["--help", "-h"] {
         let output = run_allowing_stdin_close(&[argument], b"not SQL\n");
