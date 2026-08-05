@@ -12,7 +12,7 @@ The first useful release should support:
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
 - projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
-- a batch/interactive CLI with readable table, CSV, and JSON output;
+- a batch/interactive CLI with readable table, CSV, TSV, and JSON output;
 - durable local snapshots with an explicit, documented file format;
 - an HTTP endpoint for executing SQL;
 - deterministic tests and a small benchmark that demonstrate analytical behavior.
@@ -127,8 +127,8 @@ and output bounds.
 
 ## Command-line session
 
-`rusthouse --format table`, `rusthouse --format csv`, and
-`rusthouse --format json` read one complete SQL batch from standard input
+`rusthouse --format table`, `rusthouse --format csv`, `rusthouse --format tsv`,
+and `rusthouse --format json` read one complete SQL batch from standard input
 through EOF, with explicit limits of 64 MiB and 4,096 statements. Parsing is
 lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
@@ -147,6 +147,10 @@ typed rows; commas, quotes, and newlines in strings are CSV-escaped. JSON output
 is newline-delimited, with one compact object per query containing typed column
 metadata and positional rows. Numbers and booleans use native JSON values, SQL
 `NULL` becomes `null`, and strings are JSON-escaped.
+TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
+an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
+carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
+column names and strings use ClickHouse's backslash escapes.
 A query result is checked before cloning against limits of 10,000 rows, 250,000
 values, and an estimated 16 MiB. Grouped queries additionally allow 100,000
 groups and bound grouped keys to 500,000 cells and an estimated 32 MiB. Their
@@ -175,6 +179,7 @@ printf '%s\n' \
 ```
 
 Use `--format csv` instead to emit the same query results as CSVWithNames.
+Use `--format tsv` for ClickHouse-style TabSeparatedWithNames output.
 Use `--format table` for bordered output intended for direct terminal reading.
 
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an

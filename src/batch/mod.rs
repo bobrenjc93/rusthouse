@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, Database, StatementResult};
-use format::{TableWriteError, write_csv, write_json, write_table_with_affixes};
+use format::{TableWriteError, write_csv, write_json, write_table_with_affixes, write_tsv};
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
@@ -45,6 +45,8 @@ pub enum BatchError {
     WriteTable(io::Error),
     /// Writing CSV output failed.
     Write(io::Error),
+    /// Writing TabSeparatedWithNames output failed.
+    WriteTsv(io::Error),
     /// Writing newline-delimited JSON output failed.
     WriteJson(io::Error),
 }
@@ -67,6 +69,7 @@ impl fmt::Display for BatchError {
                 write!(formatter, "could not write table to stdout: {error}")
             }
             Self::Write(error) => write!(formatter, "could not write CSV to stdout: {error}"),
+            Self::WriteTsv(error) => write!(formatter, "could not write TSV to stdout: {error}"),
             Self::WriteJson(error) => write!(formatter, "could not write JSON to stdout: {error}"),
         }
     }
@@ -78,6 +81,7 @@ impl StdError for BatchError {
             Self::Read(error)
             | Self::WriteTable(error)
             | Self::Write(error)
+            | Self::WriteTsv(error)
             | Self::WriteJson(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
@@ -131,6 +135,25 @@ pub fn run_csv_batch_with_limit(
     run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Csv)
 }
 
+/// Reads one bounded SQL batch to EOF and emits TabSeparatedWithNames for
+/// every query.
+///
+/// `CREATE TABLE`, `DROP TABLE`, `TRUNCATE TABLE`, and `INSERT` statements are
+/// silent. Each query result has its own escaped header followed by typed rows;
+/// SQL `NULL` is emitted as `\N`.
+pub fn run_tsv_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
+    run_tsv_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
+}
+
+/// Executes the TSV batch protocol with an explicit input byte limit.
+pub fn run_tsv_batch_with_limit(
+    input: impl Read,
+    output: impl Write,
+    max_input_bytes: usize,
+) -> Result<(), BatchError> {
+    run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Tsv)
+}
+
 /// Reads one bounded SQL batch to EOF and emits one JSON object per query.
 ///
 /// `CREATE TABLE`, `DROP TABLE`, `TRUNCATE TABLE`, and `INSERT` statements are
@@ -155,6 +178,7 @@ pub fn run_json_batch_with_limit(
 enum BatchOutputFormat {
     Table,
     Csv,
+    Tsv,
     Json,
 }
 
@@ -201,6 +225,9 @@ fn run_batch_with_limit(
                 }
                 BatchOutputFormat::Csv => {
                     write_csv(&mut output, &query).map_err(BatchError::Write)?;
+                }
+                BatchOutputFormat::Tsv => {
+                    write_tsv(&mut output, &query).map_err(BatchError::WriteTsv)?;
                 }
                 BatchOutputFormat::Json => {
                     write_json(&mut output, &query).map_err(BatchError::WriteJson)?;
@@ -285,6 +312,19 @@ mod tests {
     }
 
     #[test]
+    fn tsv_batch_streams_empty_and_multiple_results_with_headers() {
+        let input = b"CREATE TABLE t (n Int64);\n\
+            SELECT n FROM t;\n\
+            INSERT INTO t VALUES (2), (1);\n\
+            SELECT n FROM t ORDER BY n;\n";
+        let mut output = Vec::new();
+
+        run_tsv_batch(&input[..], &mut output).expect("batch succeeds");
+
+        assert_eq!(output, b"n\nn\n1\n2\n");
+    }
+
+    #[test]
     fn json_batch_preserves_typed_short_writer_failures() {
         let mut output = FailAfterBytes {
             remaining: 32,
@@ -299,6 +339,23 @@ mod tests {
         };
         assert_eq!(source.kind(), io::ErrorKind::Other);
         assert_eq!(output.written, 32);
+    }
+
+    #[test]
+    fn tsv_batch_preserves_typed_short_writer_failures() {
+        let mut output = FailAfterBytes {
+            remaining: 6,
+            written: 0,
+        };
+
+        let error = run_tsv_batch(&b"SELECT 'a\tb' AS text;"[..], &mut output)
+            .expect_err("writer stops during an escaped TSV string");
+
+        let BatchError::WriteTsv(source) = error else {
+            panic!("expected a typed TSV write error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert_eq!(output.written, 6);
     }
 
     #[test]
