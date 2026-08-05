@@ -6,10 +6,11 @@ use std::fmt;
 
 use crate::{
     AggregateError, AggregateLimits, DistinctError, DistinctLimits, InnerJoinStatement,
-    InsertError, InsertStatement, Int64Table, JoinError, JoinLimits, OrderError, OrderLimits,
-    RowSelection, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement, ScanError,
-    ScanLimits, SelectDistinctStatement, SelectPredicate, SelectStatement, aggregate_nullable_i64,
-    count_nullable_i64, distinct_nullable_i64, inner_equi_join_nullable_i64, min_nullable_i64,
+    InsertError, InsertStatement, Int64Table, JoinError, JoinLimits, LeftJoinStatement, OrderError,
+    OrderLimits, RowSelection, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement,
+    ScanError, ScanLimits, SelectDistinctStatement, SelectPredicate, SelectStatement,
+    aggregate_nullable_i64, count_nullable_i64, distinct_nullable_i64,
+    inner_equi_join_nullable_i64, left_outer_equi_join_nullable_i64, min_nullable_i64,
     order_nullable_i64, scan_nullable_i64, scan_nullable_i64_nullness,
 };
 
@@ -223,6 +224,97 @@ pub fn execute_inner_join(
     Ok(matches
         .into_iter()
         .map(|pair| left_table.values()[pair.left_row()])
+        .collect())
+}
+
+/// An error produced while executing a parsed [`LeftJoinStatement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftJoinExecutionError {
+    /// The statement names a table other than either table supplied for execution.
+    UnknownTable { name: String },
+    /// The statement names a column other than the relevant table's only column.
+    UnknownColumn { name: String },
+    /// The bounded join operator rejected an input or output size.
+    Join(JoinError),
+}
+
+impl fmt::Display for LeftJoinExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::UnknownColumn { name } => write!(formatter, "unknown column '{name}'"),
+            Self::Join(error) => write!(formatter, "could not join rows: {error}"),
+        }
+    }
+}
+
+impl Error for LeftJoinExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Join(error) => Some(error),
+            Self::UnknownTable { .. } | Self::UnknownColumn { .. } => None,
+        }
+    }
+}
+
+impl From<JoinError> for LeftJoinExecutionError {
+    fn from(error: JoinError) -> Self {
+        Self::Join(error)
+    }
+}
+
+/// Executes the narrow left equi-join against two named one-column tables.
+///
+/// All identifiers are compared exactly, including ASCII case. On successful
+/// resolution, [`left_outer_equi_join_nullable_i64`] supplies duplicate
+/// cross-products, SQL `NULL` non-matching semantics, deterministic left-major
+/// order, and explicit input/output bounds. Values are projected from matched
+/// right rows, with a typed `NULL` for each unmatched left row.
+pub fn execute_left_join(
+    expected_left_table_name: &str,
+    left_table: &Int64Table,
+    expected_right_table_name: &str,
+    right_table: &Int64Table,
+    statement: &LeftJoinStatement,
+    limits: JoinLimits,
+) -> Result<Vec<Option<i64>>, LeftJoinExecutionError> {
+    if statement.left_table_name().as_str() != expected_left_table_name {
+        return Err(LeftJoinExecutionError::UnknownTable {
+            name: statement.left_table_name().as_str().to_owned(),
+        });
+    }
+    if statement.right_table_name().as_str() != expected_right_table_name {
+        return Err(LeftJoinExecutionError::UnknownTable {
+            name: statement.right_table_name().as_str().to_owned(),
+        });
+    }
+
+    let left_column = left_table.schema().column().name();
+    if statement.left_column_name().as_str() != left_column {
+        return Err(LeftJoinExecutionError::UnknownColumn {
+            name: statement.left_column_name().as_str().to_owned(),
+        });
+    }
+    let right_column = right_table.schema().column().name();
+    for column_name in [
+        statement.projected_column_name(),
+        statement.right_column_name(),
+    ] {
+        if column_name.as_str() != right_column {
+            return Err(LeftJoinExecutionError::UnknownColumn {
+                name: column_name.as_str().to_owned(),
+            });
+        }
+    }
+
+    let rows =
+        left_outer_equi_join_nullable_i64(left_table.values(), right_table.values(), limits)?;
+    Ok(rows
+        .into_iter()
+        .map(|pair| {
+            pair.right_row()
+                .and_then(|right_row| right_table.values()[right_row])
+        })
         .collect())
 }
 

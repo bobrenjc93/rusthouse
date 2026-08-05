@@ -191,6 +191,21 @@ impl SharedCatalog {
             .map_err(Into::into)
     }
 
+    /// Executes the narrow left equi-join under a read lock with explicit bounds.
+    ///
+    /// The returned rows own their storage and remain valid after the lock is
+    /// released and other handles mutate either source table.
+    pub fn execute_left_join(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        join_limits: JoinLimits,
+    ) -> Result<Vec<Option<i64>>, SharedCatalogError> {
+        self.read()?
+            .execute_left_join(input, parse_limits, join_limits)
+            .map_err(Into::into)
+    }
+
     /// Executes a scalar `COUNT` under a read lock with explicit aggregate bounds.
     pub fn execute_scalar_count(
         &self,

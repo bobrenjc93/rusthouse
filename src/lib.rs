@@ -21,7 +21,8 @@ pub use aggregate::{
 };
 pub use batch::{SharedDatabase, SharedDatabaseError};
 pub use catalog::{
-    Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CatalogSnapshotRestoreError,
+    Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
+    CatalogSnapshotRestoreError,
 };
 pub use cli::{
     DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_ROWS_PER_TABLE, DEFAULT_MAX_SESSION_STATEMENTS,
@@ -33,10 +34,10 @@ pub use csv::{
 };
 pub use distinct::{DistinctError, DistinctLimits, distinct_nullable_i64};
 pub use execution::{
-    InnerJoinExecutionError, InsertExecutionError, SelectDistinctExecutionError,
-    SelectExecutionError, execute_inner_join, execute_insert, execute_scalar_count,
-    execute_scalar_count_with_limits, execute_scalar_min, execute_scalar_sum,
-    execute_scalar_sum_with_limits, execute_select, execute_select_distinct,
+    InnerJoinExecutionError, InsertExecutionError, LeftJoinExecutionError,
+    SelectDistinctExecutionError, SelectExecutionError, execute_inner_join, execute_insert,
+    execute_left_join, execute_scalar_count, execute_scalar_count_with_limits, execute_scalar_min,
+    execute_scalar_sum, execute_scalar_sum_with_limits, execute_select, execute_select_distinct,
     execute_select_with_limits, execute_select_with_order_limits,
 };
 pub use grouping::{
@@ -49,11 +50,11 @@ pub use join::{
 pub use order::{NullOrder, OrderDirection, OrderError, OrderLimits, order_nullable_i64};
 pub use parser::{
     ColumnDefinition, ComparisonPredicate, CreateTableStatement, EqualityPredicate, Identifier,
-    InnerJoinStatement, InsertStatement, NullnessPredicate, OrderByClause, ParseError, ParseLimits,
-    ScalarCountArgument, ScalarCountStatement, ScalarMinStatement, ScalarSumStatement,
-    SelectDistinctStatement, SelectPredicate, SelectStatement, parse_create_table,
-    parse_inner_join, parse_insert, parse_scalar_count, parse_scalar_min, parse_scalar_sum,
-    parse_select, parse_select_distinct,
+    InnerJoinStatement, InsertStatement, LeftJoinStatement, NullnessPredicate, OrderByClause,
+    ParseError, ParseLimits, ScalarCountArgument, ScalarCountStatement, ScalarMinStatement,
+    ScalarSumStatement, SelectDistinctStatement, SelectPredicate, SelectStatement,
+    parse_create_table, parse_inner_join, parse_insert, parse_left_join, parse_scalar_count,
+    parse_scalar_min, parse_scalar_sum, parse_select, parse_select_distinct,
 };
 pub use scan::{
     ComparisonOperator, NullPredicate, ScanError, ScanLimits, scan_nullable_i64,

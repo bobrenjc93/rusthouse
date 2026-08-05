@@ -4,12 +4,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 
 use crate::execution::{
-    InnerJoinExecutionError, InsertExecutionError, SelectDistinctExecutionError,
-    SelectExecutionError, execute_inner_join as execute_inner_join_statement,
-    execute_insert as execute_insert_statement,
+    InnerJoinExecutionError, InsertExecutionError, LeftJoinExecutionError,
+    SelectDistinctExecutionError, SelectExecutionError,
+    execute_inner_join as execute_inner_join_statement, execute_insert as execute_insert_statement,
+    execute_left_join as execute_left_join_statement,
     execute_scalar_count as execute_scalar_count_statement,
     execute_scalar_count_with_limits as execute_scalar_count_statement_with_limits,
     execute_scalar_min as execute_scalar_min_statement,
@@ -18,12 +20,13 @@ use crate::execution::{
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
-    InnerJoinStatement, InsertStatement, Int64Table, Int64TableFileRestoreError, JoinLimits,
-    NullableI64PayloadCodec, OrderLimits, ParseError, ParseLimits, ScalarCountStatement,
-    ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema, SelectDistinctStatement,
-    SelectStatement, SnapshotCodec, ingest_csv_with_names, parse_create_table, parse_inner_join,
-    parse_insert, parse_scalar_count, parse_scalar_min, parse_scalar_sum, parse_select,
+    AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, CsvReaderIngestError,
+    DistinctLimits, InnerJoinStatement, InsertStatement, Int64Table, Int64TableFileRestoreError,
+    JoinLimits, LeftJoinStatement, NullableI64PayloadCodec, OrderLimits, ParseError, ParseLimits,
+    ScalarCountStatement, ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema,
+    SelectDistinctStatement, SelectStatement, SnapshotCodec, ingest_csv_with_names,
+    ingest_csv_with_names_from_reader, parse_create_table, parse_inner_join, parse_insert,
+    parse_left_join, parse_scalar_count, parse_scalar_min, parse_scalar_sum, parse_select,
     parse_select_distinct, restore_int64_table_from_file as restore_table_from_file,
 };
 
@@ -63,6 +66,8 @@ pub enum CatalogError {
     SelectDistinct(SelectDistinctExecutionError),
     /// A parsed narrow `INNER JOIN` could not be executed.
     InnerJoin(InnerJoinExecutionError),
+    /// A parsed narrow `LEFT JOIN` could not be executed.
+    LeftJoin(LeftJoinExecutionError),
 }
 
 impl fmt::Display for CatalogError {
@@ -82,6 +87,7 @@ impl fmt::Display for CatalogError {
                 write!(formatter, "could not execute SELECT DISTINCT: {error}")
             }
             Self::InnerJoin(error) => write!(formatter, "could not execute INNER JOIN: {error}"),
+            Self::LeftJoin(error) => write!(formatter, "could not execute LEFT JOIN: {error}"),
         }
     }
 }
@@ -94,6 +100,7 @@ impl Error for CatalogError {
             Self::Select(error) => Some(error),
             Self::SelectDistinct(error) => Some(error),
             Self::InnerJoin(error) => Some(error),
+            Self::LeftJoin(error) => Some(error),
             Self::TableAlreadyExists { .. } | Self::TableLimitExceeded { .. } => None,
         }
     }
@@ -135,6 +142,39 @@ impl Error for CatalogCsvIngestError {
 impl From<CsvIngestError> for CatalogCsvIngestError {
     fn from(error: CsvIngestError) -> Self {
         Self::Csv(error)
+    }
+}
+
+/// An error produced while ingesting CSV from a reader through a [`Catalog`].
+#[derive(Debug)]
+pub enum CatalogCsvReaderIngestError {
+    /// No table has the exact requested name.
+    UnknownTable { name: String },
+    /// The named table's bounded reader ingestion failed.
+    Reader(CsvReaderIngestError),
+}
+
+impl fmt::Display for CatalogCsvReaderIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::Reader(error) => write!(formatter, "could not ingest CSV from reader: {error}"),
+        }
+    }
+}
+
+impl Error for CatalogCsvReaderIngestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Reader(error) => Some(error),
+            Self::UnknownTable { .. } => None,
+        }
+    }
+}
+
+impl From<CsvReaderIngestError> for CatalogCsvReaderIngestError {
+    fn from(error: CsvReaderIngestError) -> Self {
+        Self::Reader(error)
     }
 }
 
@@ -357,6 +397,26 @@ impl Catalog {
                 })?;
 
         ingest_csv_with_names(table, input, limits).map_err(Into::into)
+    }
+
+    /// Reads and atomically ingests bounded `CSVWithNames` into an exactly named table.
+    ///
+    /// The table is resolved before the reader is consumed. Once resolved, the
+    /// operation delegates to [`ingest_csv_with_names_from_reader`], preserving
+    /// its bounded read and transactional parsing and append behavior.
+    pub fn ingest_csv_with_names_from_reader(
+        &mut self,
+        table_name: &str,
+        reader: impl Read,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, CatalogCsvReaderIngestError> {
+        let table = self.tables.get_mut(table_name).ok_or_else(|| {
+            CatalogCsvReaderIngestError::UnknownTable {
+                name: table_name.to_owned(),
+            }
+        })?;
+
+        ingest_csv_with_names_from_reader(table, reader, limits).map_err(Into::into)
     }
 
     /// Parses and executes one scalar `COUNT` with explicit resource bounds.
@@ -626,6 +686,47 @@ impl Catalog {
             limits,
         )
         .map_err(CatalogError::InnerJoin)
+    }
+
+    /// Parses and executes the narrow left equi-join with explicit bounds.
+    pub fn execute_left_join(
+        &self,
+        input: &str,
+        parse_limits: ParseLimits,
+        join_limits: JoinLimits,
+    ) -> Result<Vec<Option<i64>>, CatalogError> {
+        let statement = parse_left_join(input, parse_limits)?;
+        self.left_join(&statement, join_limits)
+    }
+
+    /// Executes a parsed narrow left equi-join with explicit bounds.
+    pub fn left_join(
+        &self,
+        statement: &LeftJoinStatement,
+        limits: JoinLimits,
+    ) -> Result<Vec<Option<i64>>, CatalogError> {
+        let left_name = statement.left_table_name().as_str();
+        let left_table = self.tables.get(left_name).ok_or_else(|| {
+            CatalogError::LeftJoin(LeftJoinExecutionError::UnknownTable {
+                name: left_name.to_owned(),
+            })
+        })?;
+        let right_name = statement.right_table_name().as_str();
+        let right_table = self.tables.get(right_name).ok_or_else(|| {
+            CatalogError::LeftJoin(LeftJoinExecutionError::UnknownTable {
+                name: right_name.to_owned(),
+            })
+        })?;
+
+        execute_left_join_statement(
+            left_name,
+            left_table,
+            right_name,
+            right_table,
+            statement,
+            limits,
+        )
+        .map_err(CatalogError::LeftJoin)
     }
 
     /// Parses and executes a `SELECT DISTINCT` with explicit resource bounds.

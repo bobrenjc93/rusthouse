@@ -104,6 +104,12 @@ filtered projections return matching values in source order through bounded
 comparison and nullness scans. `SELECT DISTINCT column FROM table` uses
 explicit input-row and distinct-value limits and returns deterministic
 `NULL`-first, ascending values.
+The same catalog exposes narrow one-column equi-joins. `INNER JOIN` projects
+the left column for matching rows. `SELECT right_column FROM left_table LEFT
+JOIN right_table ON left_column = right_column` projects matching right values
+and a typed `NULL` for each unmatched left row. Both forms preserve duplicate
+cross-products in deterministic left-major order and enforce explicit input
+and output bounds.
 
 ## Command-line session
 
@@ -205,6 +211,8 @@ using the same transactional parser, so every failure leaves existing rows
 unchanged.
 `Catalog::ingest_csv_with_names` exposes the same transactional ingestion by
 exact table name without requiring direct access to catalog-owned tables;
+`Catalog::ingest_csv_with_names_from_reader` resolves the exact table before
+consuming the bounded reader and preserves the reader importer's typed errors.
 `SharedCatalog::ingest_csv_with_names` provides the synchronized equivalent.
 
 ## Development model
