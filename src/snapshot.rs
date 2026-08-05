@@ -159,7 +159,7 @@ impl Error for SnapshotFileError {
 pub enum SnapshotReplaceError {
     /// The payload could not be encoded before filesystem access began.
     Encode(SnapshotError),
-    /// The destination has no normal, unambiguous final path component.
+    /// The destination has no normal, unambiguous, non-reserved final component.
     InvalidDestination,
     /// The destination's parent directory could not be opened for syncing.
     OpenDirectory(io::Error),
@@ -224,7 +224,7 @@ impl fmt::Display for SnapshotReplaceError {
             Self::Encode(error) => write!(formatter, "could not encode snapshot: {error}"),
             Self::InvalidDestination => write!(
                 formatter,
-                "snapshot destination has no normal, unambiguous file name"
+                "snapshot destination has no normal, unambiguous, non-reserved file name"
             ),
             Self::OpenDirectory(error) => {
                 write!(
@@ -901,7 +901,9 @@ impl SnapshotCodec {
     /// checked by filesystem identity before writing. Any candidate that the
     /// filesystem resolves as the destination is removed and retried. Paths
     /// ending in `/` or `/.` are rejected rather than normalized to a different
-    /// destination.
+    /// destination. On targets with the cooperative locking protocol,
+    /// `.rusthouse-snapshot.lock` and its ASCII case variants are reserved for
+    /// that protocol and rejected as destinations.
     ///
     /// Failures before the rename attempt to remove the temporary file and
     /// leave an existing destination unchanged. A
@@ -924,6 +926,22 @@ impl SnapshotCodec {
         payload: &[u8],
         sync_directory: impl FnOnce(&SnapshotDirectory) -> io::Result<()>,
     ) -> Result<(), SnapshotReplaceError> {
+        self.replace_file_with_lock_mode_and_directory_sync(
+            path,
+            payload,
+            SnapshotLockMode::Automatic,
+            sync_directory,
+        )
+    }
+
+    #[cfg(unix)]
+    fn replace_file_with_lock_mode_and_directory_sync(
+        self,
+        path: &Path,
+        payload: &[u8],
+        lock_mode: SnapshotLockMode,
+        sync_directory: impl FnOnce(&SnapshotDirectory) -> io::Result<()>,
+    ) -> Result<(), SnapshotReplaceError> {
         let envelope = self.encode(payload).map_err(SnapshotReplaceError::Encode)?;
         let destination = snapshot_destination_name(path)?;
 
@@ -932,8 +950,10 @@ impl SnapshotCodec {
             SnapshotDirectory::open(parent).map_err(SnapshotReplaceError::OpenDirectory)?;
         #[cfg(not(target_os = "solaris"))]
         let _lock = directory
-            .lock_exclusive()
+            .lock_exclusive_with_mode(lock_mode)
             .map_err(SnapshotReplaceError::LockDirectory)?;
+        #[cfg(target_os = "solaris")]
+        let _ = lock_mode;
         replace_envelope_in_directory_with_sync(&directory, &destination, &envelope, sync_directory)
     }
 
@@ -1114,6 +1134,13 @@ fn snapshot_destination_name(path: &Path) -> Result<CString, SnapshotReplaceErro
         Some(std::path::Component::Normal(name)) => name,
         _ => return Err(SnapshotReplaceError::InvalidDestination),
     };
+    #[cfg(not(target_os = "solaris"))]
+    if name
+        .as_bytes()
+        .eq_ignore_ascii_case(&SNAPSHOT_LOCK_FILE_NAME[..SNAPSHOT_LOCK_FILE_NAME.len() - 1])
+    {
+        return Err(SnapshotReplaceError::InvalidDestination);
+    }
     CString::new(name.as_bytes()).map_err(|_| SnapshotReplaceError::InvalidDestination)
 }
 
@@ -1207,6 +1234,14 @@ struct SnapshotDirectory {
     file: File,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SnapshotLockMode {
+    Automatic,
+    #[cfg(all(test, not(target_os = "solaris")))]
+    ForceFallback,
+}
+
 #[cfg(all(unix, not(target_os = "solaris")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotDestinationState {
@@ -1230,6 +1265,7 @@ struct SnapshotReplacementCondition<'a> {
 struct SnapshotRepairHooks<BeforePublish, SyncDirectory> {
     before_publish: BeforePublish,
     sync_directory: SyncDirectory,
+    lock_mode: SnapshotLockMode,
 }
 
 #[cfg(unix)]
@@ -1245,25 +1281,33 @@ impl SnapshotDirectory {
     }
 
     #[cfg(not(target_os = "solaris"))]
-    fn lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
-        self.lock_with_fallback(libc::LOCK_EX, || {
-            flock_descriptor(&self.file, libc::LOCK_EX)
-        })
+    fn lock_exclusive_with_mode(
+        &self,
+        mode: SnapshotLockMode,
+    ) -> io::Result<SnapshotDirectoryLock<'_>> {
+        self.lock_with_mode(libc::LOCK_EX, mode)
     }
 
     #[cfg(all(test, not(target_os = "solaris")))]
-    fn try_lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
-        let operation = libc::LOCK_EX | libc::LOCK_NB;
-        self.lock_with_fallback(operation, || flock_descriptor(&self.file, operation))
+    fn try_lock_exclusive_with_mode(
+        &self,
+        mode: SnapshotLockMode,
+    ) -> io::Result<SnapshotDirectoryLock<'_>> {
+        self.lock_with_mode(libc::LOCK_EX | libc::LOCK_NB, mode)
     }
 
     #[cfg(not(target_os = "solaris"))]
-    fn lock_with_fallback(
+    fn lock_with_mode(
         &self,
         operation: libc::c_int,
-        lock_directory: impl FnOnce() -> io::Result<()>,
+        mode: SnapshotLockMode,
     ) -> io::Result<SnapshotDirectoryLock<'_>> {
-        match lock_directory() {
+        let directory_lock = match mode {
+            SnapshotLockMode::Automatic => flock_descriptor(&self.file, operation),
+            #[cfg(test)]
+            SnapshotLockMode::ForceFallback => Err(io::Error::from_raw_os_error(libc::EBADF)),
+        };
+        match directory_lock {
             Ok(()) => Ok(SnapshotDirectoryLock::Directory(&self.file)),
             Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
                 let lock_file = self.open_lock_file()?;
@@ -1747,6 +1791,7 @@ pub fn restore_and_repair_int64_table_from_file_with_backup(
         SnapshotRepairHooks {
             before_publish: || {},
             sync_directory: SnapshotDirectory::sync,
+            lock_mode: SnapshotLockMode::Automatic,
         },
     )
 }
@@ -1789,7 +1834,7 @@ fn restore_and_repair_int64_table_from_file_with_backup_using(
             );
         }
     };
-    let _lock = match directory.lock_exclusive() {
+    let _lock = match directory.lock_exclusive_with_mode(hooks.lock_mode) {
         Ok(lock) => lock,
         Err(error) => {
             return restore_after_repair_setup_failure(
@@ -2053,28 +2098,53 @@ mod tests {
         };
         let first_directory = SnapshotDirectory::open(&root).unwrap();
         let second_directory = SnapshotDirectory::open(&root).unwrap();
-        let nfs_directory_error = || Err(io::Error::from_raw_os_error(libc::EBADF));
 
         let first_lock = first_directory
-            .lock_with_fallback(libc::LOCK_EX, nfs_directory_error)
+            .lock_exclusive_with_mode(SnapshotLockMode::ForceFallback)
             .unwrap();
         let lock_path = root.join(".rusthouse-snapshot.lock");
         assert!(lock_path.metadata().unwrap().is_file());
 
-        let operation = libc::LOCK_EX | libc::LOCK_NB;
-        let error = match second_directory.lock_with_fallback(operation, nfs_directory_error) {
-            Err(error) => error,
-            Ok(_) => panic!("a second fallback lock must not bypass the first"),
-        };
+        let error =
+            match second_directory.try_lock_exclusive_with_mode(SnapshotLockMode::ForceFallback) {
+                Err(error) => error,
+                Ok(_) => panic!("a second fallback lock must not bypass the first"),
+            };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        let codec = SnapshotCodec::new(8);
+        for reserved_name in [".rusthouse-snapshot.lock", ".RUSTHOUSE-SNAPSHOT.LOCK"] {
+            let error = codec
+                .replace_file_with_lock_mode_and_directory_sync(
+                    &root.join(reserved_name),
+                    b"blocked",
+                    SnapshotLockMode::ForceFallback,
+                    SnapshotDirectory::sync,
+                )
+                .unwrap_err();
+            assert!(matches!(error, SnapshotReplaceError::InvalidDestination));
+        }
 
         drop(first_lock);
         let second_lock = second_directory
-            .lock_with_fallback(operation, nfs_directory_error)
+            .try_lock_exclusive_with_mode(SnapshotLockMode::ForceFallback)
             .unwrap();
         assert!(lock_path.metadata().unwrap().is_file());
 
         drop(second_lock);
+        let snapshot_path = root.join("snapshot.bin");
+        codec
+            .replace_file_with_lock_mode_and_directory_sync(
+                &snapshot_path,
+                b"payload",
+                SnapshotLockMode::ForceFallback,
+                SnapshotDirectory::sync,
+            )
+            .unwrap();
+        let envelope = fs::read(&snapshot_path).unwrap();
+        assert_eq!(codec.decode(&envelope), Ok(&b"payload"[..]));
+        assert!(lock_path.metadata().unwrap().is_file());
+
         drop(first_directory);
         drop(second_directory);
         fs::remove_dir_all(root).unwrap();
@@ -2270,6 +2340,7 @@ mod tests {
             SnapshotRepairHooks {
                 before_publish: || {},
                 sync_directory: fail_directory_sync,
+                lock_mode: SnapshotLockMode::Automatic,
             },
         )
         .unwrap_err();
@@ -2347,14 +2418,19 @@ mod tests {
         let publisher = thread::spawn(move || {
             publish_receiver.recv().unwrap();
             let directory = SnapshotDirectory::open(&publisher_directory).unwrap();
-            match directory.try_lock_exclusive() {
+            match directory.try_lock_exclusive_with_mode(SnapshotLockMode::ForceFallback) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => panic!("unexpected nonblocking lock failure: {error}"),
                 Ok(_) => panic!("concurrent replacement acquired the repair lock"),
             }
             blocked_sender.send(()).unwrap();
             snapshot_codec
-                .replace_file(publisher_primary, &publisher_payload)
+                .replace_file_with_lock_mode_and_directory_sync(
+                    &publisher_primary,
+                    &publisher_payload,
+                    SnapshotLockMode::ForceFallback,
+                    SnapshotDirectory::sync,
+                )
                 .unwrap();
         });
 
@@ -2373,6 +2449,7 @@ mod tests {
                         .expect("the concurrent primary refresh must reach the held lock");
                 },
                 sync_directory: SnapshotDirectory::sync,
+                lock_mode: SnapshotLockMode::ForceFallback,
             },
         )
         .unwrap();
@@ -2391,7 +2468,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.values(), &[Some(33)]);
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        let snapshot_entries = fs::read_dir(&directory)
+            .unwrap()
+            .filter(|entry| {
+                !entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .as_bytes()
+                    .eq_ignore_ascii_case(
+                        &SNAPSHOT_LOCK_FILE_NAME[..SNAPSHOT_LOCK_FILE_NAME.len() - 1],
+                    )
+            })
+            .count();
+        assert_eq!(snapshot_entries, 2);
+        assert!(directory.join(".rusthouse-snapshot.lock").is_file());
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2446,6 +2537,7 @@ mod tests {
                         .unwrap();
                 },
                 sync_directory: SnapshotDirectory::sync,
+                lock_mode: SnapshotLockMode::Automatic,
             },
         )
         .unwrap();

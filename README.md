@@ -202,7 +202,9 @@ and repair APIs. Linux NFS and other filesystems that return `EBADF` when an
 exclusive lock is requested on a read-only directory descriptor instead use a
 persistent writable `.rusthouse-snapshot.lock` file in that directory. This is
 a cooperative protocol: direct filesystem writes and renames do not take the
-lock, must not modify its lock file, and must not run concurrently.
+lock, must not modify its lock file, and must not run concurrently. The lock
+file name and its ASCII case variants are reserved replacement and repair
+destinations.
 Directory-relative operations remain anchored to the opened parent even if its
 path is renamed or rebound. The repair helper also checks that the initially
 failed primary still matches before publication. Typed stage errors clean up

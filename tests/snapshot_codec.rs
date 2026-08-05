@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -301,6 +303,13 @@ fn atomic_replace_cleans_up_the_temporary_file_when_rename_fails() {
     let entries = fs::read_dir(&directory.0)
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .filter(|entry| {
+            !entry
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .eq_ignore_ascii_case(b".rusthouse-snapshot.lock")
+        })
         .collect::<Vec<_>>();
     assert_eq!(entries, [path]);
 }

@@ -58,6 +58,8 @@ and locks a persistent writable `.rusthouse-snapshot.lock` file in that opened
 directory instead. This guarantee is cooperative: every replacing writer must
 use these APIs. Direct filesystem writes and renames do not participate in the
 advisory lock, must not modify its lock file, and must not run concurrently.
+The lock file name and its ASCII case variants are reserved and rejected as
+replacement and repair destinations on targets using this protocol.
 Creation, rename, cleanup, and sync stay relative to the one opened directory
 descriptor, so renaming or rebinding the parent path cannot redirect later
 stages or strand the temporary file. The temporary-name search is bounded.
@@ -66,7 +68,8 @@ destination by filesystem identity immediately after exclusive creation; an
 alias is removed and retried before any bytes are written. This covers
 case-folding filesystems rather than relying on byte-exact name comparison.
 Destinations ending in `/` or `/.` are rejected instead of being normalized to
-a different pathname. Ordinary replacement is not exposed on Windows. Solaris
+a different pathname. The cooperative lock file name is also rejected as
+described above. Ordinary replacement is not exposed on Windows. Solaris
 supports replacement without the cooperative lock; repair is therefore not
 exposed there.
 
