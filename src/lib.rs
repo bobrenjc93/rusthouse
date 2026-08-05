@@ -61,6 +61,8 @@ pub use scan::{
     scan_nullable_i64_nullness,
 };
 pub use shared_catalog::{SharedCatalog, SharedCatalogError};
+#[cfg(unix)]
+pub use snapshot::SnapshotReplaceError;
 pub use snapshot::{
     Int64TableFileRecovery, Int64TableFileRecoveryError, Int64TableFileRecoverySource,
     Int64TableFileRestoreError, Int64TableRestoreError, NullableI64PayloadCodec,
@@ -69,8 +71,7 @@ pub use snapshot::{
 };
 #[cfg(all(unix, not(target_os = "solaris")))]
 pub use snapshot::{
-    Int64TableFileRepairError, SnapshotReplaceError,
-    restore_and_repair_int64_table_from_file_with_backup,
+    Int64TableFileRepairError, restore_and_repair_int64_table_from_file_with_backup,
 };
 mod storage;
 

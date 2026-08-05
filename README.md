@@ -194,18 +194,18 @@ read bound and restores a table only after the envelope, payload, schema, and
 row cap have all been validated. An explicit-backup helper tries that same
 bounded restore against a caller-supplied backup only when the primary fails,
 and preserves both typed failures if neither file is valid.
-On supported Unix targets other than Solaris, `SnapshotCodec::replace_file`
-atomically creates or replaces an envelope through an exclusively created,
-synchronized sibling temporary file, then synchronizes the parent directory.
-An advisory directory lock serializes calls to RustHouse replacement and
-repair APIs. This is a cooperative protocol: direct filesystem writes and
-renames do not take the lock and must not run concurrently. Directory-relative
-operations remain anchored to the opened parent even if its path is renamed or
-rebound. The repair helper also checks that the initially failed primary still
-matches before publication. Typed stage errors clean up failures before
-publication and separately report post-publication directory-sync uncertainty.
-The APIs are not exposed on Windows or Solaris because RustHouse does not yet
-implement the required locking, directory-handle, and flush semantics there.
+On Unix, `SnapshotCodec::replace_file` atomically creates or replaces an
+envelope through an exclusively created, synchronized sibling temporary file,
+then synchronizes the parent directory. On non-Solaris Unix, an advisory
+directory lock serializes calls to RustHouse replacement and repair APIs. This
+is a cooperative protocol: direct filesystem writes and renames do not take
+the lock and must not run concurrently. Directory-relative operations remain
+anchored to the opened parent even if its path is renamed or rebound. The
+repair helper also checks that the initially failed primary still matches
+before publication. Typed stage errors clean up failures before publication
+and separately report post-publication directory-sync uncertainty. Ordinary
+replacement is not exposed on Windows; repair and its locking protocol are not
+exposed on Windows or Solaris.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary

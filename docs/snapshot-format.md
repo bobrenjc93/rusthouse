@@ -46,13 +46,13 @@ writing, and synchronization failures are reported as distinct typed errors.
 
 ## Atomically replacing an envelope file
 
-On supported Unix targets other than Solaris, `SnapshotCodec::replace_file`
-applies the same payload bound before accessing the filesystem. It opens the
-destination's parent directory, holds an exclusive advisory lock on it,
+On Unix, `SnapshotCodec::replace_file` applies the same payload bound before
+accessing the filesystem. It opens the destination's parent directory,
 exclusively creates a sibling temporary file, writes and synchronizes the
 complete envelope, renames the temporary file over the destination, and
-synchronizes the parent directory. Replacement and repair calls from this
-crate therefore serialize within one directory. This guarantee is cooperative:
+synchronizes the parent directory. On non-Solaris Unix it also holds an
+exclusive advisory lock on the parent, so replacement and repair calls from
+this crate serialize within one directory. This guarantee is cooperative:
 every replacing writer must use these APIs. Direct filesystem writes and
 renames do not participate in the advisory lock and must not run concurrently.
 Creation, rename, cleanup, and sync stay relative to the one opened directory
@@ -63,13 +63,15 @@ destination by filesystem identity immediately after exclusive creation; an
 alias is removed and retried before any bytes are written. This covers
 case-folding filesystems rather than relying on byte-exact name comparison.
 Destinations ending in `/` or `/.` are rejected instead of being normalized to
-a different pathname. The API is not exposed on Windows or Solaris because the
-required locking, directory-handle, and flush semantics are not implemented.
+a different pathname. Ordinary replacement is not exposed on Windows. Solaris
+supports replacement without the cooperative lock; repair is therefore not
+exposed there.
 
-Encoding, parent-directory opening and locking, destination inspection,
-temporary creation, writing, temporary-file synchronization, publication,
-rename, cleanup, and directory synchronization failures are distinct typed
-errors. Conditional repair also reports a changed destination separately.
+Encoding, parent-directory opening and (where supported) locking, destination
+inspection, temporary creation, writing, temporary-file synchronization,
+publication, rename, cleanup, and directory synchronization failures are
+distinct typed errors. Conditional repair also reports a changed destination
+separately.
 Failures before successful publication attempt to remove the temporary file
 and leave an existing destination unchanged. A directory-sync failure is
 different: the destination has already been replaced and is visible, but the
