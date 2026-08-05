@@ -306,6 +306,30 @@ fn atomic_replace_cleans_up_the_temporary_file_when_rename_fails() {
 }
 
 #[test]
+#[cfg(unix)]
+fn atomic_replace_rejects_trailing_slash_and_dot_paths_without_replacing() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let original = b"existing snapshot bytes";
+    fs::write(&path, original).unwrap();
+
+    let mut trailing_slash = path.as_os_str().to_os_string();
+    trailing_slash.push("/");
+    let mut trailing_dot = path.as_os_str().to_os_string();
+    trailing_dot.push("/.");
+
+    for invalid_path in [PathBuf::from(trailing_slash), PathBuf::from(trailing_dot)] {
+        let error = SnapshotCodec::new(8)
+            .replace_file(invalid_path, b"updated")
+            .unwrap_err();
+        assert!(matches!(error, SnapshotReplaceError::InvalidDestination));
+    }
+
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[test]
 fn snapshots_distinct_values_from_a_filtered_sql_projection() {
     let parse_limits = ParseLimits::default();
     let mut catalog = Catalog::new(CatalogLimits::new(1, 4));
