@@ -41,6 +41,8 @@ const CHECKSUM_OFFSET: usize = LENGTH_OFFSET + std::mem::size_of::<u64>();
 const TEMPORARY_CREATE_ATTEMPTS: usize = 128;
 #[cfg(unix)]
 static NEXT_TEMPORARY_FILE: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(unix, not(target_os = "solaris")))]
+const SNAPSHOT_LOCK_FILE_NAME: &[u8] = b".rusthouse-snapshot.lock\0";
 
 /// Number of bytes in the nullable `Int64` payload row-count field.
 pub const NULLABLE_I64_PAYLOAD_HEADER_LEN: usize = std::mem::size_of::<u64>();
@@ -161,7 +163,7 @@ pub enum SnapshotReplaceError {
     InvalidDestination,
     /// The destination's parent directory could not be opened for syncing.
     OpenDirectory(io::Error),
-    /// The destination's parent directory could not be locked for replacement.
+    /// The destination's replacement coordination lock could not be acquired.
     LockDirectory(io::Error),
     /// The destination could not be inspected before a conditional replacement.
     InspectDestination(io::Error),
@@ -233,7 +235,7 @@ impl fmt::Display for SnapshotReplaceError {
             Self::LockDirectory(error) => {
                 write!(
                     formatter,
-                    "could not lock snapshot parent directory: {error}"
+                    "could not acquire snapshot replacement lock: {error}"
                 )
             }
             Self::InspectDestination(error) => {
@@ -880,14 +882,18 @@ impl SnapshotCodec {
     /// envelope is written to an exclusively created sibling temporary file,
     /// which is synchronized and then renamed over `path`. Finally, the
     /// destination's parent directory is synchronized so the rename is durable.
-    /// On non-Solaris Unix targets, an exclusive advisory lock on the opened
-    /// parent serializes replacements and repairs performed by this crate
-    /// within that directory. This concurrency guarantee requires every
-    /// replacing writer to use [`Self::replace_file`] or
+    /// On non-Solaris Unix targets, an exclusive advisory lock associated with
+    /// the opened parent serializes replacements and repairs performed by this
+    /// crate within that directory. If the filesystem rejects an exclusive
+    /// lock on the read-only directory descriptor with `EBADF`, as Linux NFS
+    /// does, RustHouse instead locks a persistent writable
+    /// `.rusthouse-snapshot.lock` file in that directory. This concurrency
+    /// guarantee requires every replacing writer to use [`Self::replace_file`] or
     /// `restore_and_repair_int64_table_from_file_with_backup`. Direct filesystem
-    /// writes and renames do not participate in the advisory lock and must not
-    /// run concurrently with these operations. Solaris supports ordinary atomic
-    /// replacement without that cooperative locking protocol.
+    /// writes and renames do not participate in the advisory lock, must not
+    /// modify its lock file, and must not run concurrently with these operations.
+    /// Solaris supports ordinary atomic replacement without that cooperative
+    /// locking protocol.
     /// All operations after opening the parent are relative to that directory
     /// descriptor, so renaming or rebinding the parent path cannot redirect the
     /// operation or strand the temporary file.
@@ -1240,31 +1246,65 @@ impl SnapshotDirectory {
 
     #[cfg(not(target_os = "solaris"))]
     fn lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
-        loop {
-            // SAFETY: `self.file` remains open for the lifetime of the returned
-            // guard, and `flock` does not take ownership of the descriptor.
-            let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX) };
-            if result == 0 {
-                return Ok(SnapshotDirectoryLock { directory: self });
-            }
-
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+        self.lock_with_fallback(libc::LOCK_EX, || {
+            flock_descriptor(&self.file, libc::LOCK_EX)
+        })
     }
 
     #[cfg(all(test, not(target_os = "solaris")))]
     fn try_lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
-        // SAFETY: `self.file` remains open for the lifetime of the returned
-        // guard, and `flock` does not take ownership of the descriptor.
-        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 {
-            Ok(SnapshotDirectoryLock { directory: self })
-        } else {
-            Err(io::Error::last_os_error())
+        let operation = libc::LOCK_EX | libc::LOCK_NB;
+        self.lock_with_fallback(operation, || flock_descriptor(&self.file, operation))
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    fn lock_with_fallback(
+        &self,
+        operation: libc::c_int,
+        lock_directory: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<SnapshotDirectoryLock<'_>> {
+        match lock_directory() {
+            Ok(()) => Ok(SnapshotDirectoryLock::Directory(&self.file)),
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
+                let lock_file = self.open_lock_file()?;
+                flock_descriptor(&lock_file, operation)?;
+                Ok(SnapshotDirectoryLock::File(lock_file))
+            }
+            Err(error) => Err(error),
         }
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    fn open_lock_file(&self) -> io::Result<File> {
+        let name = CStr::from_bytes_with_nul(SNAPSHOT_LOCK_FILE_NAME)
+            .expect("the snapshot lock file name is NUL-terminated");
+        // SAFETY: `self.file` is an open directory, `name` is NUL-terminated,
+        // and the returned descriptor is checked before ownership is assumed.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                libc::c_uint::from(0o666_u16),
+            )
+        };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot replacement lock is not a regular file",
+            ));
+        }
+        Ok(file)
     }
 
     #[cfg(not(target_os = "solaris"))]
@@ -1429,16 +1469,36 @@ impl SnapshotDirectory {
 }
 
 #[cfg(all(unix, not(target_os = "solaris")))]
-struct SnapshotDirectoryLock<'a> {
-    directory: &'a SnapshotDirectory,
+fn flock_descriptor(file: &File, operation: libc::c_int) -> io::Result<()> {
+    loop {
+        // SAFETY: `file` remains open for this call, and `flock` does not take
+        // ownership of its descriptor.
+        let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if result == 0 {
+            return Ok(());
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "solaris")))]
+enum SnapshotDirectoryLock<'a> {
+    Directory(&'a File),
+    File(File),
 }
 
 #[cfg(all(unix, not(target_os = "solaris")))]
 impl Drop for SnapshotDirectoryLock<'_> {
     fn drop(&mut self) {
-        // SAFETY: the borrowed directory remains open while the guard exists,
-        // and unlocking does not take ownership of its descriptor.
-        let _ = unsafe { libc::flock(self.directory.file.as_raw_fd(), libc::LOCK_UN) };
+        let file = match self {
+            Self::Directory(file) => *file,
+            Self::File(file) => file,
+        };
+        let _ = flock_descriptor(file, libc::LOCK_UN);
     }
 }
 
@@ -1662,9 +1722,9 @@ pub fn restore_int64_table_from_file_with_backup(
 /// remains relative to that directory descriptor. After the backup validates,
 /// its envelope replaces the primary only if the initially observed directory
 /// entry is unchanged. Calls to [`SnapshotCodec::replace_file`] use the same
-/// advisory directory lock, so a cooperative concurrent refresh publishes only
-/// after the repair completes. Direct filesystem writers do not participate in
-/// that protocol and must not modify the primary concurrently. The backup is
+/// advisory replacement lock, so a cooperative concurrent refresh publishes
+/// only after the repair completes. Direct filesystem writers do not participate
+/// in that protocol and must not modify the primary concurrently. The backup is
 /// never modified. Dual restoration failures and replacement-stage failures
 /// remain distinct and retain their typed causes. A destination change observed
 /// before publication is reported as [`SnapshotReplaceError::DestinationChanged`].
@@ -1973,6 +2033,51 @@ mod tests {
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[test]
+    fn directory_lock_falls_back_to_a_writable_file_after_ebadf() {
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-lock-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let first_directory = SnapshotDirectory::open(&root).unwrap();
+        let second_directory = SnapshotDirectory::open(&root).unwrap();
+        let nfs_directory_error = || Err(io::Error::from_raw_os_error(libc::EBADF));
+
+        let first_lock = first_directory
+            .lock_with_fallback(libc::LOCK_EX, nfs_directory_error)
+            .unwrap();
+        let lock_path = root.join(".rusthouse-snapshot.lock");
+        assert!(lock_path.metadata().unwrap().is_file());
+
+        let operation = libc::LOCK_EX | libc::LOCK_NB;
+        let error = match second_directory.lock_with_fallback(operation, nfs_directory_error) {
+            Err(error) => error,
+            Ok(_) => panic!("a second fallback lock must not bypass the first"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(first_lock);
+        let second_lock = second_directory
+            .lock_with_fallback(operation, nfs_directory_error)
+            .unwrap();
+        assert!(lock_path.metadata().unwrap().is_file());
+
+        drop(second_lock);
+        drop(first_directory);
+        drop(second_directory);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

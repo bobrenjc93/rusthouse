@@ -51,10 +51,13 @@ accessing the filesystem. It opens the destination's parent directory,
 exclusively creates a sibling temporary file, writes and synchronizes the
 complete envelope, renames the temporary file over the destination, and
 synchronizes the parent directory. On non-Solaris Unix it also holds an
-exclusive advisory lock on the parent, so replacement and repair calls from
-this crate serialize within one directory. This guarantee is cooperative:
-every replacing writer must use these APIs. Direct filesystem writes and
-renames do not participate in the advisory lock and must not run concurrently.
+exclusive advisory lock associated with the parent, so replacement and repair
+calls from this crate serialize within one directory. If locking the read-only
+directory descriptor returns `EBADF`, as it does on Linux NFS, RustHouse opens
+and locks a persistent writable `.rusthouse-snapshot.lock` file in that opened
+directory instead. This guarantee is cooperative: every replacing writer must
+use these APIs. Direct filesystem writes and renames do not participate in the
+advisory lock, must not modify its lock file, and must not run concurrently.
 Creation, rename, cleanup, and sync stay relative to the one opened directory
 descriptor, so renaming or rebinding the parent path cannot redirect later
 stages or strand the temporary file. The temporary-name search is bounded.
