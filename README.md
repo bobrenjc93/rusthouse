@@ -177,10 +177,18 @@ read bound and restores a table only after the envelope, payload, schema, and
 row cap have all been validated. An explicit-backup helper tries that same
 bounded restore against a caller-supplied backup only when the primary fails,
 and preserves both typed failures if neither file is valid.
+On Unix, `SnapshotCodec::replace_file` atomically creates or replaces an
+envelope through an exclusively created, synchronized sibling temporary file,
+then synchronizes the parent directory. Directory-relative operations remain
+anchored to the opened parent even if its path is renamed or rebound. Typed
+stage errors clean up failures before the rename and separately report
+post-rename directory-sync uncertainty. The API is not exposed on Windows
+because RustHouse does not yet implement the required directory-handle and
+flush semantics there.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
-without yet choosing catalog serialization or filesystem replacement. The
+without yet choosing catalog serialization. The
 exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.md).
 
 ## CSV ingestion

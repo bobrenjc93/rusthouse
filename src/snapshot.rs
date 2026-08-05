@@ -1,15 +1,23 @@
 //! Versioned, bounded snapshot envelopes and nullable `Int64` row payloads.
 //!
 //! This module does not serialize a catalog. It can create and sync a new
-//! envelope file without replacing an existing destination, then reopen one
-//! bounded `Int64` table from that file. See `docs/snapshot-format.md` for the
-//! stable binary layouts.
+//! envelope file, atomically replace an envelope through a sibling temporary
+//! file on Unix, then reopen one bounded `Int64` table from that file. See
+//! `docs/snapshot-format.md` for the stable binary layouts.
 
 use std::error::Error;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::storage::{InsertError, Int64Table, Schema};
 
@@ -28,6 +36,11 @@ pub const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len()
 const VERSION_OFFSET: usize = SNAPSHOT_MAGIC.len();
 const LENGTH_OFFSET: usize = VERSION_OFFSET + std::mem::size_of::<u16>();
 const CHECKSUM_OFFSET: usize = LENGTH_OFFSET + std::mem::size_of::<u64>();
+
+#[cfg(unix)]
+const TEMPORARY_CREATE_ATTEMPTS: usize = 128;
+#[cfg(unix)]
+static NEXT_TEMPORARY_FILE: AtomicU32 = AtomicU32::new(0);
 
 /// Number of bytes in the nullable `Int64` payload row-count field.
 pub const NULLABLE_I64_PAYLOAD_HEADER_LEN: usize = std::mem::size_of::<u64>();
@@ -134,6 +147,119 @@ impl Error for SnapshotFileError {
         match self {
             Self::Encode(error) => Some(error),
             Self::Create(error) | Self::Write(error) | Self::Sync(error) => Some(error),
+        }
+    }
+}
+
+/// An error produced while atomically replacing a snapshot envelope file.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum SnapshotReplaceError {
+    /// The payload could not be encoded before filesystem access began.
+    Encode(SnapshotError),
+    /// The destination has no normal, unambiguous final path component.
+    InvalidDestination,
+    /// The destination's parent directory could not be opened for syncing.
+    OpenDirectory(io::Error),
+    /// A sibling temporary file could not be exclusively created.
+    CreateTemporary(io::Error),
+    /// The complete encoded envelope could not be written to the temporary file.
+    WriteTemporary(io::Error),
+    /// The temporary file could not be synchronized before the rename.
+    SyncTemporary(io::Error),
+    /// The synchronized temporary file could not be renamed over the destination.
+    Rename(io::Error),
+    /// A temporary file could not be removed after an earlier failure.
+    CleanupTemporary {
+        /// The failure encountered while removing the temporary file.
+        source: io::Error,
+        /// The operation failure that triggered cleanup.
+        operation: Box<SnapshotReplaceError>,
+    },
+    /// The parent directory could not be synchronized after a successful rename.
+    ///
+    /// The destination has already been replaced when this variant is returned,
+    /// but the rename's durability after a system crash is uncertain.
+    SyncDirectory(io::Error),
+}
+
+#[cfg(unix)]
+impl SnapshotReplaceError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// A `true` result means the new envelope is visible at the destination,
+    /// while its durability after a system crash remains uncertain.
+    pub const fn destination_was_replaced(&self) -> bool {
+        matches!(self, Self::SyncDirectory(_))
+    }
+
+    /// Returns the operation error that preceded a temporary-file cleanup failure.
+    pub fn operation_error(&self) -> Option<&Self> {
+        match self {
+            Self::CleanupTemporary { operation, .. } => Some(operation),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for SnapshotReplaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode(error) => write!(formatter, "could not encode snapshot: {error}"),
+            Self::InvalidDestination => write!(
+                formatter,
+                "snapshot destination has no normal, unambiguous file name"
+            ),
+            Self::OpenDirectory(error) => {
+                write!(
+                    formatter,
+                    "could not open snapshot parent directory: {error}"
+                )
+            }
+            Self::CreateTemporary(error) => {
+                write!(
+                    formatter,
+                    "could not create temporary snapshot file: {error}"
+                )
+            }
+            Self::WriteTemporary(error) => {
+                write!(
+                    formatter,
+                    "could not write temporary snapshot file: {error}"
+                )
+            }
+            Self::SyncTemporary(error) => {
+                write!(formatter, "could not sync temporary snapshot file: {error}")
+            }
+            Self::Rename(error) => {
+                write!(formatter, "could not replace snapshot file: {error}")
+            }
+            Self::CleanupTemporary { source, operation } => write!(
+                formatter,
+                "could not clean up temporary snapshot file after {operation}: {source}"
+            ),
+            Self::SyncDirectory(error) => write!(
+                formatter,
+                "snapshot was replaced, but its parent directory could not be synced: {error}"
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Error for SnapshotReplaceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::InvalidDestination => None,
+            Self::OpenDirectory(error)
+            | Self::CreateTemporary(error)
+            | Self::WriteTemporary(error)
+            | Self::SyncTemporary(error)
+            | Self::Rename(error)
+            | Self::SyncDirectory(error) => Some(error),
+            Self::CleanupTemporary { source, .. } => Some(source),
         }
     }
 }
@@ -639,6 +765,42 @@ impl SnapshotCodec {
         file.sync_all().map_err(SnapshotFileError::Sync)
     }
 
+    /// Atomically creates or replaces a snapshot envelope file on Unix.
+    ///
+    /// The payload is bounded and encoded before filesystem access. The
+    /// envelope is written to an exclusively created sibling temporary file,
+    /// which is synchronized and then renamed over `path`. Finally, the
+    /// destination's parent directory is synchronized so the rename is durable.
+    /// All operations after opening the parent are relative to that directory
+    /// descriptor, so renaming or rebinding the parent path cannot redirect the
+    /// operation or strand the temporary file.
+    /// Temporary names extend the destination with a unique suffix and are
+    /// checked by filesystem identity before writing. Any candidate that the
+    /// filesystem resolves as the destination is removed and retried. Paths
+    /// ending in `/` or `/.` are rejected rather than normalized to a different
+    /// destination.
+    ///
+    /// Failures before the rename attempt to remove the temporary file and
+    /// leave an existing destination unchanged. A
+    /// [`SnapshotReplaceError::SyncDirectory`] failure occurs after the rename:
+    /// the new destination is visible, but its durability after a system crash
+    /// is uncertain.
+    #[cfg(unix)]
+    pub fn replace_file(
+        self,
+        path: impl AsRef<Path>,
+        payload: &[u8],
+    ) -> Result<(), SnapshotReplaceError> {
+        let envelope = self.encode(payload).map_err(SnapshotReplaceError::Encode)?;
+        let path = path.as_ref();
+        let destination = snapshot_destination_name(path)?;
+
+        let parent = normalized_parent(path);
+        let directory =
+            SnapshotDirectory::open(parent).map_err(SnapshotReplaceError::OpenDirectory)?;
+        replace_envelope_in_directory(&directory, &destination, &envelope)
+    }
+
     /// Validates an envelope and returns its borrowed payload.
     pub fn decode(self, envelope: &[u8]) -> Result<&[u8], SnapshotError> {
         if envelope.len() < SNAPSHOT_HEADER_LEN {
@@ -705,6 +867,295 @@ impl SnapshotCodec {
         }
 
         Ok(payload)
+    }
+}
+
+#[cfg(unix)]
+fn replace_envelope_in_directory(
+    directory: &SnapshotDirectory,
+    destination: &CStr,
+    envelope: &[u8],
+) -> Result<(), SnapshotReplaceError> {
+    let (mut file, temporary) = create_temporary_snapshot(directory, destination)?;
+
+    if let Err(error) = file.write_all(envelope) {
+        drop(file);
+        return Err(temporary.cleanup(SnapshotReplaceError::WriteTemporary(error)));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        return Err(temporary.cleanup(SnapshotReplaceError::SyncTemporary(error)));
+    }
+    drop(file);
+
+    if let Err(error) = directory.rename(temporary.name(), destination) {
+        return Err(temporary.cleanup(SnapshotReplaceError::Rename(error)));
+    }
+    temporary.persist();
+
+    directory
+        .sync()
+        .map_err(SnapshotReplaceError::SyncDirectory)
+}
+
+#[cfg(unix)]
+fn snapshot_destination_name(path: &Path) -> Result<CString, SnapshotReplaceError> {
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.ends_with(b"/") || path_bytes.ends_with(b"/.") {
+        return Err(SnapshotReplaceError::InvalidDestination);
+    }
+
+    let name = match path.components().next_back() {
+        Some(std::path::Component::Normal(name)) => name,
+        _ => return Err(SnapshotReplaceError::InvalidDestination),
+    };
+    CString::new(name.as_bytes()).map_err(|_| SnapshotReplaceError::InvalidDestination)
+}
+
+#[cfg(unix)]
+fn normalized_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+#[cfg(unix)]
+fn create_temporary_snapshot<'a>(
+    directory: &'a SnapshotDirectory,
+    destination: &CStr,
+) -> Result<(File, TemporarySnapshot<'a>), SnapshotReplaceError> {
+    create_temporary_snapshot_with_counter(directory, destination, &NEXT_TEMPORARY_FILE)
+}
+
+#[cfg(unix)]
+fn create_temporary_snapshot_with_counter<'a>(
+    directory: &'a SnapshotDirectory,
+    destination: &CStr,
+    next_temporary_file: &AtomicU32,
+) -> Result<(File, TemporarySnapshot<'a>), SnapshotReplaceError> {
+    for _ in 0..TEMPORARY_CREATE_ATTEMPTS {
+        let suffix = next_temporary_snapshot_suffix(next_temporary_file);
+        let preferred_name = temporary_snapshot_name(destination, &suffix);
+        let created = match directory.create(&preferred_name) {
+            Ok(file) => Ok((file, preferred_name)),
+            Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+                if suffix.as_c_str() == destination {
+                    continue;
+                }
+                directory.create(&suffix).map(|file| (file, suffix))
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(SnapshotReplaceError::CreateTemporary(error)),
+        };
+        let (file, name) = match created {
+            Ok(created) => created,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(SnapshotReplaceError::CreateTemporary(error)),
+        };
+        let temporary = TemporarySnapshot::new(directory, name);
+
+        match directory.entry_aliases_file(destination, &file) {
+            Ok(false) => return Ok((file, temporary)),
+            Ok(true) => {
+                drop(file);
+                if let Err(source) = temporary.discard() {
+                    return Err(SnapshotReplaceError::CleanupTemporary {
+                        source,
+                        operation: Box::new(SnapshotReplaceError::CreateTemporary(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "temporary snapshot name aliases the destination",
+                        ))),
+                    });
+                }
+            }
+            Err(error) => {
+                drop(file);
+                return Err(temporary.cleanup(SnapshotReplaceError::CreateTemporary(error)));
+            }
+        }
+    }
+
+    Err(SnapshotReplaceError::CreateTemporary(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not find an unused temporary snapshot name",
+    )))
+}
+
+#[cfg(unix)]
+fn next_temporary_snapshot_suffix(next_temporary_file: &AtomicU32) -> CString {
+    let sequence = next_temporary_file.fetch_add(1, Ordering::Relaxed);
+    let name = format!(".rusthouse-snapshot-{}-{sequence}.tmp", std::process::id());
+    CString::new(name).expect("generated snapshot names never contain NUL bytes")
+}
+
+#[cfg(unix)]
+fn temporary_snapshot_name(destination: &CStr, suffix: &CStr) -> CString {
+    let mut name = Vec::with_capacity(destination.to_bytes().len() + suffix.to_bytes().len());
+    name.extend_from_slice(destination.to_bytes());
+    name.extend_from_slice(suffix.to_bytes());
+    CString::new(name).expect("validated destination and generated suffix contain no NUL bytes")
+}
+
+#[cfg(unix)]
+struct SnapshotDirectory {
+    file: File,
+}
+
+#[cfg(unix)]
+impl SnapshotDirectory {
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(Self { file })
+    }
+
+    fn create(&self, name: &CStr) -> io::Result<File> {
+        // SAFETY: `self.file` is an open directory, `name` is NUL-terminated,
+        // and the returned descriptor is checked before ownership is assumed.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                libc::c_uint::from(0o666_u16),
+            )
+        };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn entry_aliases_file(&self, name: &CStr, file: &File) -> io::Result<bool> {
+        let mut file_status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `file_status` points to writable storage and `file` remains
+        // open while `fstat` initializes it.
+        let file_result = unsafe { libc::fstat(file.as_raw_fd(), file_status.as_mut_ptr()) };
+        if file_result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut entry_status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `entry_status` points to writable storage, `name` is
+        // NUL-terminated, and the directory descriptor remains open.
+        let entry_result = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                entry_status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if entry_result == -1 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+
+        // SAFETY: both successful calls above completely initialized their
+        // respective `stat` values.
+        let (file_status, entry_status) =
+            unsafe { (file_status.assume_init(), entry_status.assume_init()) };
+        Ok(file_status.st_dev == entry_status.st_dev && file_status.st_ino == entry_status.st_ino)
+    }
+
+    fn rename(&self, source: &CStr, destination: &CStr) -> io::Result<()> {
+        // SAFETY: both names are NUL-terminated and both directory descriptors
+        // remain open for the duration of the call.
+        let result = unsafe {
+            libc::renameat(
+                self.file.as_raw_fd(),
+                source.as_ptr(),
+                self.file.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remove(&self, name: &CStr) -> io::Result<()> {
+        // SAFETY: `name` is NUL-terminated and `self.file` remains open for the
+        // duration of this directory-relative unlink operation.
+        let result = unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+#[cfg(unix)]
+struct TemporarySnapshot<'a> {
+    directory: &'a SnapshotDirectory,
+    name: CString,
+    remove_on_drop: bool,
+}
+
+#[cfg(unix)]
+impl<'a> TemporarySnapshot<'a> {
+    fn new(directory: &'a SnapshotDirectory, name: CString) -> Self {
+        Self {
+            directory,
+            name,
+            remove_on_drop: true,
+        }
+    }
+
+    fn name(&self) -> &CStr {
+        &self.name
+    }
+
+    fn cleanup(mut self, operation: SnapshotReplaceError) -> SnapshotReplaceError {
+        self.remove_on_drop = false;
+        match self.directory.remove(&self.name) {
+            Ok(()) => operation,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => operation,
+            Err(source) => SnapshotReplaceError::CleanupTemporary {
+                source,
+                operation: Box::new(operation),
+            },
+        }
+    }
+
+    fn discard(mut self) -> io::Result<()> {
+        self.remove_on_drop = false;
+        match self.directory.remove(&self.name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn persist(mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TemporarySnapshot<'_> {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = self.directory.remove(&self.name);
+        }
     }
 }
 
@@ -960,15 +1411,106 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn temporary_name_cannot_alias_destination_under_ascii_case_folding() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-name-collision-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let directory = SnapshotDirectory::open(&root).unwrap();
+        let next_temporary_file = AtomicU32::new(0);
+        let destination =
+            CString::new(format!(".RUSTHOUSE-SNAPSHOT-{}-0.TMP", std::process::id())).unwrap();
+
+        let (file, temporary) =
+            create_temporary_snapshot_with_counter(&directory, &destination, &next_temporary_file)
+                .unwrap();
+
+        assert_ne!(temporary.name(), destination.as_c_str());
+        assert!(
+            !temporary
+                .name()
+                .to_bytes()
+                .eq_ignore_ascii_case(destination.to_bytes())
+        );
+        let destination_path = root.join(OsStr::from_bytes(destination.to_bytes()));
+        assert!(!destination_path.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        drop(file);
+        drop(temporary);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        drop(directory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_stays_with_open_directory_when_parent_path_is_rebound() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-rebind-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let parent = root.join("parent");
+        let moved_parent = root.join("moved-parent");
+        fs::create_dir(&parent).unwrap();
+
+        let directory = SnapshotDirectory::open(&parent).unwrap();
+        fs::rename(&parent, &moved_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+
+        let codec = SnapshotCodec::new(8);
+        let envelope = codec.encode(b"payload").unwrap();
+        let destination = CString::new("snapshot.bin").unwrap();
+        replace_envelope_in_directory(&directory, &destination, &envelope).unwrap();
+
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        let entries = fs::read_dir(&moved_parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [moved_parent.join("snapshot.bin")]);
+        let reopened = fs::read(&entries[0]).unwrap();
+        assert_eq!(codec.decode(&reopened), Ok(&b"payload"[..]));
+
+        drop(directory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replacing_a_checked_file_with_a_fifo_cannot_block_open() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
 
-        static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-unit-tests");
         fs::create_dir_all(&base).unwrap();

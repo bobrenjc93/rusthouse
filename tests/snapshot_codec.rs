@@ -3,6 +3,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use rusthouse::SnapshotReplaceError;
 use rusthouse::snapshot::{SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
 use rusthouse::{
     Catalog, CatalogLimits, DistinctLimits, NullableI64PayloadCodec, ParseLimits, SnapshotCodec,
@@ -231,6 +233,100 @@ fn rejects_an_oversized_payload_without_creating_a_file() {
         })
     ));
     assert!(!path.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn atomically_creates_an_envelope_that_reopens() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let codec = SnapshotCodec::new(8);
+
+    codec.replace_file(&path, b"new").unwrap();
+
+    let reopened = fs::read(path).unwrap();
+    assert_eq!(codec.decode(&reopened), Ok(&b"new"[..]));
+}
+
+#[test]
+#[cfg(unix)]
+fn atomically_replaces_an_envelope_that_reopens() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let codec = SnapshotCodec::new(8);
+    codec.create_new_file(&path, b"old").unwrap();
+
+    codec.replace_file(&path, b"updated").unwrap();
+
+    let reopened = fs::read(path).unwrap();
+    assert_eq!(codec.decode(&reopened), Ok(&b"updated"[..]));
+}
+
+#[test]
+#[cfg(unix)]
+fn atomic_replace_preserves_an_existing_file_for_an_oversized_payload() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let original = b"existing snapshot bytes";
+    fs::write(&path, original).unwrap();
+
+    let error = SnapshotCodec::new(2)
+        .replace_file(&path, &[1, 2, 3])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SnapshotReplaceError::Encode(SnapshotError::PayloadTooLarge {
+            payload_len: 3,
+            max_payload_len: 2,
+        })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn atomic_replace_cleans_up_the_temporary_file_when_rename_fails() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    fs::create_dir(&path).unwrap();
+
+    let error = SnapshotCodec::new(8)
+        .replace_file(&path, b"payload")
+        .unwrap_err();
+
+    assert!(matches!(&error, SnapshotReplaceError::Rename(_)));
+    assert!(!error.destination_was_replaced());
+    let entries = fs::read_dir(&directory.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, [path]);
+}
+
+#[test]
+#[cfg(unix)]
+fn atomic_replace_rejects_trailing_slash_and_dot_paths_without_replacing() {
+    let directory = TestDirectory::new();
+    let path = directory.join("snapshot.bin");
+    let original = b"existing snapshot bytes";
+    fs::write(&path, original).unwrap();
+
+    let mut trailing_slash = path.as_os_str().to_os_string();
+    trailing_slash.push("/");
+    let mut trailing_dot = path.as_os_str().to_os_string();
+    trailing_dot.push("/.");
+
+    for invalid_path in [PathBuf::from(trailing_slash), PathBuf::from(trailing_dot)] {
+        let error = SnapshotCodec::new(8)
+            .replace_file(invalid_path, b"updated")
+            .unwrap_err();
+        assert!(matches!(error, SnapshotReplaceError::InvalidDestination));
+    }
+
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
 }
 
 #[test]
