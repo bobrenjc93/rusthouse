@@ -257,6 +257,37 @@ fn batch_cli_keeps_truncate_table_command_output_silent() {
 }
 
 #[test]
+fn table_batch_observes_truncate_between_query_results() {
+    let output = run(
+        &["--format", "table"],
+        b"CREATE TABLE events (id Int64); \
+          INSERT INTO events VALUES (1), (2); \
+          SELECT COUNT(*) AS rows FROM events; \
+          TRUNCATE TABLE events; \
+          SELECT COUNT(*) AS rows FROM events;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        concat!(
+            "+------+\n",
+            "| rows |\n",
+            "+------+\n",
+            "| 2    |\n",
+            "+------+\n",
+            "\n",
+            "+------+\n",
+            "| rows |\n",
+            "+------+\n",
+            "| 0    |\n",
+            "+------+\n",
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_filters_grouped_rows_with_a_count_alias() {
     let output = run(
         &["--format", "csv"],

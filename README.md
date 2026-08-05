@@ -114,9 +114,10 @@ lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
-Every statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
-statements are silent, and each `SELECT`, `SHOW TABLES`, or `DESCRIBE TABLE`
-query is executed and emitted before the next statement. Table output uses
+Every statement shares one in-memory catalog. Successful `CREATE`, `DROP`,
+`TRUNCATE`, and `INSERT` statements are silent, and each `SELECT`, `SHOW
+TABLES`, or `DESCRIBE TABLE` query is executed and emitted before the next
+statement. Table output uses
 bordered, human-readable columns, escapes control characters, renders SQL
 `NULL` as `NULL`, and separates multiple query results with a blank line. Each
 padded table is size-checked against a 16 MiB formatted-output limit before
