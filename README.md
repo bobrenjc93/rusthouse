@@ -190,6 +190,11 @@ exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.m
 schema column, and each LF- or CRLF-delimited record must be an unquoted decimal
 `Int64` or `NULL`. Callers supply byte and row limits; format, limit,
 nullability, or table-cap failures leave the table unchanged.
+`ingest_csv_with_names_from_reader` accepts an `std::io::Read`, consumes at most
+the byte limit plus one detection byte, and reports read failures separately
+from oversized or invalid CSV. It buffers the complete bounded input before
+using the same transactional parser, so every failure leaves existing rows
+unchanged.
 `Catalog::ingest_csv_with_names` exposes the same transactional ingestion by
 exact table name without requiring direct access to catalog-owned tables;
 `SharedCatalog::ingest_csv_with_names` provides the synchronized equivalent.
