@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 use rusthouse::SnapshotReplaceError;
 use rusthouse::snapshot::{SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
 use rusthouse::{
@@ -236,7 +236,7 @@ fn rejects_an_oversized_payload_without_creating_a_file() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn atomically_creates_an_envelope_that_reopens() {
     let directory = TestDirectory::new();
     let path = directory.join("snapshot.bin");
@@ -249,7 +249,7 @@ fn atomically_creates_an_envelope_that_reopens() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn atomically_replaces_an_envelope_that_reopens() {
     let directory = TestDirectory::new();
     let path = directory.join("snapshot.bin");
@@ -263,7 +263,7 @@ fn atomically_replaces_an_envelope_that_reopens() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn atomic_replace_preserves_an_existing_file_for_an_oversized_payload() {
     let directory = TestDirectory::new();
     let path = directory.join("snapshot.bin");
@@ -286,7 +286,7 @@ fn atomic_replace_preserves_an_existing_file_for_an_oversized_payload() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn atomic_replace_cleans_up_the_temporary_file_when_rename_fails() {
     let directory = TestDirectory::new();
     let path = directory.join("snapshot.bin");
@@ -306,7 +306,7 @@ fn atomic_replace_cleans_up_the_temporary_file_when_rename_fails() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn atomic_replace_rejects_trailing_slash_and_dot_paths_without_replacing() {
     let directory = TestDirectory::new();
     let path = directory.join("snapshot.bin");

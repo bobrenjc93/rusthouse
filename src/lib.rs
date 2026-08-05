@@ -67,7 +67,7 @@ pub use snapshot::{
     NullableI64PayloadError, SnapshotCodec, SnapshotError, SnapshotFileError, restore_int64_table,
     restore_int64_table_from_file, restore_int64_table_from_file_with_backup,
 };
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 pub use snapshot::{
     Int64TableFileRepairError, SnapshotReplaceError,
     restore_and_repair_int64_table_from_file_with_backup,

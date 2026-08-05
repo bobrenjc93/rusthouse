@@ -10,7 +10,7 @@ use rusthouse::{
     SnapshotCodec, SnapshotError, restore_int64_table_from_file,
     restore_int64_table_from_file_with_backup,
 };
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 use rusthouse::{
     Int64TableFileRepairError, SnapshotReplaceError,
     restore_and_repair_int64_table_from_file_with_backup,
@@ -306,7 +306,7 @@ fn truncated_primary_recovers_from_the_explicit_backup() {
     assert_eq!(recovered.table().values(), &[Some(22)]);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[test]
 fn valid_primary_skips_the_backup_and_is_not_rewritten_during_repair() {
     let directory = TestDirectory::new();
@@ -333,7 +333,7 @@ fn valid_primary_skips_the_backup_and_is_not_rewritten_during_repair() {
     assert!(!backup_path.exists());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[test]
 fn missing_primary_is_atomically_repaired_from_the_unchanged_backup() {
     let directory = TestDirectory::new();
@@ -369,7 +369,7 @@ fn missing_primary_is_atomically_repaired_from_the_unchanged_backup() {
     assert_eq!(reopened.values(), &[Some(22)]);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[test]
 fn corrupt_primary_is_atomically_repaired_from_the_unchanged_backup() {
     let directory = TestDirectory::new();
@@ -400,7 +400,7 @@ fn corrupt_primary_is_atomically_repaired_from_the_unchanged_backup() {
     assert_eq!(fs::read(&backup_path).unwrap(), backup_before);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[test]
 fn repair_distinguishes_dual_restore_failures_from_replacement_failures() {
     let directory = TestDirectory::new();

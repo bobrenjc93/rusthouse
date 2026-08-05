@@ -2,21 +2,22 @@
 //!
 //! This module does not serialize a catalog. It can create and sync a new
 //! envelope file, atomically replace an envelope through a sibling temporary
-//! file on Unix, then reopen one bounded `Int64` table from that file. See
+//! file on supported Unix targets other than Solaris, then reopen one bounded
+//! `Int64` table from that file. See
 //! `docs/snapshot-format.md` for the stable binary layouts.
 
 use std::error::Error;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::storage::{InsertError, Int64Table, Schema};
@@ -37,9 +38,9 @@ const VERSION_OFFSET: usize = SNAPSHOT_MAGIC.len();
 const LENGTH_OFFSET: usize = VERSION_OFFSET + std::mem::size_of::<u16>();
 const CHECKSUM_OFFSET: usize = LENGTH_OFFSET + std::mem::size_of::<u64>();
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 const TEMPORARY_CREATE_ATTEMPTS: usize = 128;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 static NEXT_TEMPORARY_FILE: AtomicU32 = AtomicU32::new(0);
 
 /// Number of bytes in the nullable `Int64` payload row-count field.
@@ -152,7 +153,7 @@ impl Error for SnapshotFileError {
 }
 
 /// An error produced while atomically replacing a snapshot envelope file.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[derive(Debug)]
 pub enum SnapshotReplaceError {
     /// The payload could not be encoded before filesystem access began.
@@ -193,7 +194,7 @@ pub enum SnapshotReplaceError {
     SyncDirectory(io::Error),
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl SnapshotReplaceError {
     /// Returns whether the destination was replaced before this error occurred.
     ///
@@ -215,7 +216,7 @@ impl SnapshotReplaceError {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl fmt::Display for SnapshotReplaceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -280,7 +281,7 @@ impl fmt::Display for SnapshotReplaceError {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl Error for SnapshotReplaceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -553,7 +554,7 @@ impl fmt::Display for Int64TableFileRecoveryError {
 impl Error for Int64TableFileRecoveryError {}
 
 /// An error produced while restoring and repairing a primary snapshot file.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[derive(Debug)]
 pub enum Int64TableFileRepairError {
     /// Neither the primary nor the backup could be restored within the bounds.
@@ -572,7 +573,7 @@ pub enum Int64TableFileRepairError {
     },
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl Int64TableFileRepairError {
     /// Returns the typed failure from the initial primary restoration.
     pub const fn primary_error(&self) -> &Int64TableFileRestoreError {
@@ -598,7 +599,7 @@ impl Int64TableFileRepairError {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl fmt::Display for Int64TableFileRepairError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -614,7 +615,7 @@ impl fmt::Display for Int64TableFileRepairError {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl Error for Int64TableFileRepairError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -874,14 +875,20 @@ impl SnapshotCodec {
         file.sync_all().map_err(SnapshotFileError::Sync)
     }
 
-    /// Atomically creates or replaces a snapshot envelope file on Unix.
+    /// Atomically creates or replaces a snapshot envelope file on supported
+    /// Unix targets other than Solaris.
     ///
     /// The payload is bounded and encoded before filesystem access. The
     /// envelope is written to an exclusively created sibling temporary file,
     /// which is synchronized and then renamed over `path`. Finally, the
     /// destination's parent directory is synchronized so the rename is durable.
     /// An exclusive advisory lock on the opened parent serializes replacements
-    /// and repairs performed by this crate within that directory.
+    /// and repairs performed by this crate within that directory. This
+    /// concurrency guarantee requires every replacing writer to use
+    /// [`Self::replace_file`] or
+    /// [`restore_and_repair_int64_table_from_file_with_backup`]. Direct
+    /// filesystem writes and renames do not participate in the advisory lock
+    /// and must not run concurrently with these operations.
     /// All operations after opening the parent are relative to that directory
     /// descriptor, so renaming or rebinding the parent path cannot redirect the
     /// operation or strand the temporary file.
@@ -896,7 +903,7 @@ impl SnapshotCodec {
     /// [`SnapshotReplaceError::SyncDirectory`] failure occurs after the rename:
     /// the new destination is visible, but its durability after a system crash
     /// is uncertain.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     pub fn replace_file(
         self,
         path: impl AsRef<Path>,
@@ -905,7 +912,7 @@ impl SnapshotCodec {
         self.replace_file_with_directory_sync(path.as_ref(), payload, SnapshotDirectory::sync)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     fn replace_file_with_directory_sync(
         self,
         path: &Path,
@@ -993,7 +1000,7 @@ impl SnapshotCodec {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn replace_envelope_in_directory_with_sync(
     directory: &SnapshotDirectory,
     destination: &CStr,
@@ -1020,7 +1027,7 @@ fn replace_envelope_in_directory_with_sync(
     sync_directory(directory).map_err(SnapshotReplaceError::SyncDirectory)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn replace_envelope_in_directory_if_unchanged(
     directory: &SnapshotDirectory,
     destination: &CStr,
@@ -1090,7 +1097,7 @@ fn replace_envelope_in_directory_if_unchanged(
     sync_directory(directory).map_err(SnapshotReplaceError::SyncDirectory)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn snapshot_destination_name(path: &Path) -> Result<CString, SnapshotReplaceError> {
     let path_bytes = path.as_os_str().as_bytes();
     if path_bytes.ends_with(b"/") || path_bytes.ends_with(b"/.") {
@@ -1104,7 +1111,7 @@ fn snapshot_destination_name(path: &Path) -> Result<CString, SnapshotReplaceErro
     CString::new(name.as_bytes()).map_err(|_| SnapshotReplaceError::InvalidDestination)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn normalized_parent(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -1112,7 +1119,7 @@ fn normalized_parent(path: &Path) -> &Path {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn create_temporary_snapshot<'a>(
     directory: &'a SnapshotDirectory,
     destination: &CStr,
@@ -1120,7 +1127,7 @@ fn create_temporary_snapshot<'a>(
     create_temporary_snapshot_with_counter(directory, destination, &NEXT_TEMPORARY_FILE)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn create_temporary_snapshot_with_counter<'a>(
     directory: &'a SnapshotDirectory,
     destination: &CStr,
@@ -1174,14 +1181,14 @@ fn create_temporary_snapshot_with_counter<'a>(
     )))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn next_temporary_snapshot_suffix(next_temporary_file: &AtomicU32) -> CString {
     let sequence = next_temporary_file.fetch_add(1, Ordering::Relaxed);
     let name = format!(".rusthouse-snapshot-{}-{sequence}.tmp", std::process::id());
     CString::new(name).expect("generated snapshot names never contain NUL bytes")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn temporary_snapshot_name(destination: &CStr, suffix: &CStr) -> CString {
     let mut name = Vec::with_capacity(destination.to_bytes().len() + suffix.to_bytes().len());
     name.extend_from_slice(destination.to_bytes());
@@ -1189,12 +1196,12 @@ fn temporary_snapshot_name(destination: &CStr, suffix: &CStr) -> CString {
     CString::new(name).expect("validated destination and generated suffix contain no NUL bytes")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 struct SnapshotDirectory {
     file: File,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotDestinationState {
     Missing,
@@ -1206,20 +1213,20 @@ enum SnapshotDestinationState {
     },
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 struct SnapshotReplacementCondition<'a> {
     destination: SnapshotDestinationState,
     envelope: Option<&'a [u8]>,
     codec: SnapshotCodec,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 struct SnapshotRepairHooks<BeforePublish, SyncDirectory> {
     before_publish: BeforePublish,
     sync_directory: SyncDirectory,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl SnapshotDirectory {
     fn open(path: &Path) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1231,6 +1238,7 @@ impl SnapshotDirectory {
         Ok(Self { file })
     }
 
+    #[cfg(not(target_os = "solaris"))]
     fn lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
         loop {
             // SAFETY: `self.file` remains open for the lifetime of the returned
@@ -1244,6 +1252,18 @@ impl SnapshotDirectory {
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
             }
+        }
+    }
+
+    #[cfg(all(test, not(target_os = "solaris")))]
+    fn try_lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
+        // SAFETY: `self.file` remains open for the lifetime of the returned
+        // guard, and `flock` does not take ownership of the descriptor.
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            Ok(SnapshotDirectoryLock { directory: self })
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -1405,12 +1425,12 @@ impl SnapshotDirectory {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 struct SnapshotDirectoryLock<'a> {
     directory: &'a SnapshotDirectory,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl Drop for SnapshotDirectoryLock<'_> {
     fn drop(&mut self) {
         // SAFETY: the borrowed directory remains open while the guard exists,
@@ -1419,14 +1439,14 @@ impl Drop for SnapshotDirectoryLock<'_> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 struct TemporarySnapshot<'a> {
     directory: &'a SnapshotDirectory,
     name: CString,
     remove_on_drop: bool,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl<'a> TemporarySnapshot<'a> {
     fn new(directory: &'a SnapshotDirectory, name: CString) -> Self {
         Self {
@@ -1466,7 +1486,7 @@ impl<'a> TemporarySnapshot<'a> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 impl Drop for TemporarySnapshot<'_> {
     fn drop(&mut self) {
         if self.remove_on_drop {
@@ -1550,7 +1570,7 @@ fn read_bounded_snapshot_file(
     read_bounded_snapshot_from_file(file, snapshot_codec)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn read_bounded_snapshot_file_from_directory(
     directory: &SnapshotDirectory,
     name: &CStr,
@@ -1638,11 +1658,14 @@ pub fn restore_int64_table_from_file_with_backup(
 /// opened and locked before its initial restoration, and all primary access
 /// remains relative to that directory descriptor. After the backup validates,
 /// its envelope replaces the primary only if the initially observed directory
-/// entry is unchanged. The backup is never modified. Dual restoration failures
-/// and replacement-stage failures remain distinct and retain their typed
-/// causes. A concurrent destination refresh is preserved and reported as
-/// [`SnapshotReplaceError::DestinationChanged`].
-#[cfg(unix)]
+/// entry is unchanged. Calls to [`SnapshotCodec::replace_file`] use the same
+/// advisory directory lock, so a cooperative concurrent refresh publishes only
+/// after the repair completes. Direct filesystem writers do not participate in
+/// that protocol and must not modify the primary concurrently. The backup is
+/// never modified. Dual restoration failures and replacement-stage failures
+/// remain distinct and retain their typed causes. A destination change observed
+/// before publication is reported as [`SnapshotReplaceError::DestinationChanged`].
+#[cfg(all(unix, not(target_os = "solaris")))]
 pub fn restore_and_repair_int64_table_from_file_with_backup(
     primary_path: impl AsRef<Path>,
     backup_path: impl AsRef<Path>,
@@ -1665,7 +1688,7 @@ pub fn restore_and_repair_int64_table_from_file_with_backup(
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn restore_and_repair_int64_table_from_file_with_backup_using(
     primary_path: &Path,
     backup_path: &Path,
@@ -1789,7 +1812,7 @@ fn restore_and_repair_int64_table_from_file_with_backup_using(
     })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "solaris")))]
 fn restore_after_repair_setup_failure(
     primary_path: &Path,
     backup_path: &Path,
@@ -1949,7 +1972,7 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     #[test]
     fn temporary_name_cannot_alias_destination_under_ascii_case_folding() {
         use std::ffi::OsStr;
@@ -1996,7 +2019,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     #[test]
     fn atomic_replace_stays_with_open_directory_when_parent_path_is_rebound() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -2099,7 +2122,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     #[test]
     fn repair_reports_directory_sync_failure_after_replacing_the_primary() {
         fn fail_directory_sync(_: &SnapshotDirectory) -> io::Result<()> {
@@ -2172,9 +2195,9 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     #[test]
-    fn repair_does_not_overwrite_a_concurrently_refreshed_primary() {
+    fn repair_serializes_a_concurrent_cooperative_primary_refresh() {
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
@@ -2209,16 +2232,25 @@ mod tests {
         let refreshed_before = snapshot_codec.encode(&refreshed_payload).unwrap();
 
         let (publish_sender, publish_receiver) = mpsc::channel();
-        let (published_sender, published_receiver) = mpsc::channel();
+        let (blocked_sender, blocked_receiver) = mpsc::channel();
+        let publisher_directory = directory.clone();
         let publisher_primary = primary_path.clone();
-        let publisher_refreshed = refreshed_before.clone();
+        let publisher_payload = refreshed_payload.clone();
         let publisher = thread::spawn(move || {
             publish_receiver.recv().unwrap();
-            fs::write(publisher_primary, publisher_refreshed).unwrap();
-            published_sender.send(()).unwrap();
+            let directory = SnapshotDirectory::open(&publisher_directory).unwrap();
+            match directory.try_lock_exclusive() {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("unexpected nonblocking lock failure: {error}"),
+                Ok(_) => panic!("concurrent replacement acquired the repair lock"),
+            }
+            blocked_sender.send(()).unwrap();
+            snapshot_codec
+                .replace_file(publisher_primary, &publisher_payload)
+                .unwrap();
         });
 
-        let error = restore_and_repair_int64_table_from_file_with_backup_using(
+        let recovered = restore_and_repair_int64_table_from_file_with_backup_using(
             &primary_path,
             &backup_path,
             Schema::int64("reading", false),
@@ -2228,26 +2260,18 @@ mod tests {
             SnapshotRepairHooks {
                 before_publish: || {
                     publish_sender.send(()).unwrap();
-                    published_receiver
+                    blocked_receiver
                         .recv_timeout(Duration::from_secs(2))
-                        .expect("the concurrent primary refresh must finish");
+                        .expect("the concurrent primary refresh must reach the held lock");
                 },
                 sync_directory: SnapshotDirectory::sync,
             },
         )
-        .unwrap_err();
+        .unwrap();
         publisher.join().unwrap();
 
-        assert!(matches!(
-            error.primary_error(),
-            Int64TableFileRestoreError::Restore(Int64TableRestoreError::Envelope(
-                SnapshotError::ChecksumMismatch { .. }
-            ))
-        ));
-        assert!(matches!(
-            error.repair_error(),
-            Some(SnapshotReplaceError::DestinationChanged)
-        ));
+        assert_eq!(recovered.source(), Int64TableFileRecoverySource::Backup);
+        assert_eq!(recovered.table().values(), &[Some(22)]);
         assert_eq!(fs::read(&primary_path).unwrap(), refreshed_before);
         assert_eq!(fs::read(&backup_path).unwrap(), backup_before);
         let table = restore_int64_table_from_file(
@@ -2264,7 +2288,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "solaris")))]
     #[test]
     fn repair_stays_with_the_initial_directory_when_its_path_is_rebound() {
         static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);

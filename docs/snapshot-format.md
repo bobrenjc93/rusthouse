@@ -46,22 +46,25 @@ writing, and synchronization failures are reported as distinct typed errors.
 
 ## Atomically replacing an envelope file
 
-On Unix, `SnapshotCodec::replace_file` applies the same payload bound before
-accessing the filesystem. It opens the destination's parent directory,
-holds an exclusive advisory lock on it, exclusively creates a sibling
-temporary file, writes and synchronizes the complete envelope, renames the
-temporary file over the destination, and synchronizes the parent directory.
-Replacement and repair operations from this crate therefore serialize within
-one directory. Creation, rename, cleanup, and sync stay relative to the one
-opened directory descriptor, so renaming or rebinding the parent path cannot
-redirect later stages or strand the temporary file. The temporary-name search
-is bounded. Names extend the destination with a unique suffix and are compared
-to the destination by filesystem identity immediately after exclusive
-creation; an alias is removed and retried before any bytes are written. This
-covers case-folding filesystems rather than relying on byte-exact name
-comparison. Destinations ending in `/` or `/.` are rejected instead of being
-normalized to a different pathname. The API is not exposed on Windows because
-the required directory-handle opening and flush semantics are not implemented.
+On supported Unix targets other than Solaris, `SnapshotCodec::replace_file`
+applies the same payload bound before accessing the filesystem. It opens the
+destination's parent directory, holds an exclusive advisory lock on it,
+exclusively creates a sibling temporary file, writes and synchronizes the
+complete envelope, renames the temporary file over the destination, and
+synchronizes the parent directory. Replacement and repair calls from this
+crate therefore serialize within one directory. This guarantee is cooperative:
+every replacing writer must use these APIs. Direct filesystem writes and
+renames do not participate in the advisory lock and must not run concurrently.
+Creation, rename, cleanup, and sync stay relative to the one opened directory
+descriptor, so renaming or rebinding the parent path cannot redirect later
+stages or strand the temporary file. The temporary-name search is bounded.
+Names extend the destination with a unique suffix and are compared to the
+destination by filesystem identity immediately after exclusive creation; an
+alias is removed and retried before any bytes are written. This covers
+case-folding filesystems rather than relying on byte-exact name comparison.
+Destinations ending in `/` or `/.` are rejected instead of being normalized to
+a different pathname. The API is not exposed on Windows or Solaris because the
+required locking, directory-handle, and flush semantics are not implemented.
 
 Encoding, parent-directory opening and locking, destination inspection,
 temporary creation, writing, temporary-file synchronization, publication,
@@ -136,17 +139,20 @@ Success identifies whether the primary or backup supplied the table. When both
 fail, one recovery error retains both typed file restoration errors and no
 partially restored table is returned.
 
-On Unix, `restore_and_repair_int64_table_from_file_with_backup` adds automatic
-primary repair to that bounded recovery policy. It opens and locks the
-primary's parent before the first restoration attempt, then reads and repairs
-the primary relative to that one directory descriptor. A valid primary still
-returns without inspecting the backup. Otherwise, a valid backup is read once.
-Its validated envelope is published only if the primary directory entry and,
-when bounded bytes were readable, its exact contents still match the failed
-attempt. A concurrent refresh is preserved and reported as
-`SnapshotReplaceError::DestinationChanged`; a concurrently created previously
-missing primary is protected by no-replace publication. The backup is never
-modified. The repair error type distinguishes failures of both bounded
-restoration attempts from failures during atomic primary replacement; a
-directory-sync failure therefore reports that the primary is already visible
-but its crash durability is uncertain.
+On supported Unix targets other than Solaris,
+`restore_and_repair_int64_table_from_file_with_backup` adds automatic primary
+repair to that bounded recovery policy. It opens and locks the primary's parent
+before the first restoration attempt, then reads and repairs the primary
+relative to that one directory descriptor. A valid primary still returns
+without inspecting the backup. Otherwise, a valid backup is read once. Its
+validated envelope is published only if the primary directory entry and, when
+bounded bytes were readable, its exact contents still match the failed attempt.
+That check can report a change completed before publication as
+`SnapshotReplaceError::DestinationChanged`, but it is not an atomic
+compare-and-swap for writers outside the cooperative lock protocol. A
+cooperative `SnapshotCodec::replace_file` call waits for repair to finish; a
+concurrently created previously missing primary is also protected by
+no-replace publication. The backup is never modified. The repair error type
+distinguishes failures of both bounded restoration attempts from failures
+during atomic primary replacement; a directory-sync failure therefore reports
+that the primary is already visible but its crash durability is uncertain.
