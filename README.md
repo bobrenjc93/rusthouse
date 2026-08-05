@@ -196,10 +196,13 @@ bounded restore against a caller-supplied backup only when the primary fails,
 and preserves both typed failures if neither file is valid.
 On Unix, `SnapshotCodec::replace_file` atomically creates or replaces an
 envelope through an exclusively created, synchronized sibling temporary file,
-then synchronizes the parent directory. Directory-relative operations remain
-anchored to the opened parent even if its path is renamed or rebound. Typed
-stage errors clean up failures before the rename and separately report
-post-rename directory-sync uncertainty. The API is not exposed on Windows
+then synchronizes the parent directory. An advisory directory lock serializes
+crate-managed replacements and repairs. Directory-relative operations remain
+anchored to the opened parent even if its path is renamed or rebound. The
+repair helper conditionally publishes a validated backup only while the
+initially failed primary remains unchanged, preserving a concurrent refresh.
+Typed stage errors clean up failures before publication and separately report
+post-publication directory-sync uncertainty. The API is not exposed on Windows
 because RustHouse does not yet implement the required directory-handle and
 flush semantics there.
 `Catalog::restore_int64_table_from_file` registers a validated table under a

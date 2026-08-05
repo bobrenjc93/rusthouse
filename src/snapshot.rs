@@ -161,6 +161,12 @@ pub enum SnapshotReplaceError {
     InvalidDestination,
     /// The destination's parent directory could not be opened for syncing.
     OpenDirectory(io::Error),
+    /// The destination's parent directory could not be locked for replacement.
+    LockDirectory(io::Error),
+    /// The destination could not be inspected before a conditional replacement.
+    InspectDestination(io::Error),
+    /// The destination changed after it was selected for conditional replacement.
+    DestinationChanged,
     /// A sibling temporary file could not be exclusively created.
     CreateTemporary(io::Error),
     /// The complete encoded envelope could not be written to the temporary file.
@@ -169,6 +175,8 @@ pub enum SnapshotReplaceError {
     SyncTemporary(io::Error),
     /// The synchronized temporary file could not be renamed over the destination.
     Rename(io::Error),
+    /// A missing destination could not be published without replacement.
+    Publish(io::Error),
     /// A temporary file could not be removed after an earlier failure.
     CleanupTemporary {
         /// The failure encountered while removing the temporary file.
@@ -176,6 +184,8 @@ pub enum SnapshotReplaceError {
         /// The operation failure that triggered cleanup.
         operation: Box<SnapshotReplaceError>,
     },
+    /// The destination was published, but its sibling temporary link remained.
+    CleanupPublishedTemporary(io::Error),
     /// The parent directory could not be synchronized after a successful rename.
     ///
     /// The destination has already been replaced when this variant is returned,
@@ -190,7 +200,10 @@ impl SnapshotReplaceError {
     /// A `true` result means the new envelope is visible at the destination,
     /// while its durability after a system crash remains uncertain.
     pub const fn destination_was_replaced(&self) -> bool {
-        matches!(self, Self::SyncDirectory(_))
+        matches!(
+            self,
+            Self::CleanupPublishedTemporary(_) | Self::SyncDirectory(_)
+        )
     }
 
     /// Returns the operation error that preceded a temporary-file cleanup failure.
@@ -217,6 +230,19 @@ impl fmt::Display for SnapshotReplaceError {
                     "could not open snapshot parent directory: {error}"
                 )
             }
+            Self::LockDirectory(error) => {
+                write!(
+                    formatter,
+                    "could not lock snapshot parent directory: {error}"
+                )
+            }
+            Self::InspectDestination(error) => {
+                write!(formatter, "could not inspect snapshot destination: {error}")
+            }
+            Self::DestinationChanged => write!(
+                formatter,
+                "snapshot destination changed before conditional replacement"
+            ),
             Self::CreateTemporary(error) => {
                 write!(
                     formatter,
@@ -235,9 +261,16 @@ impl fmt::Display for SnapshotReplaceError {
             Self::Rename(error) => {
                 write!(formatter, "could not replace snapshot file: {error}")
             }
+            Self::Publish(error) => {
+                write!(formatter, "could not publish snapshot file: {error}")
+            }
             Self::CleanupTemporary { source, operation } => write!(
                 formatter,
                 "could not clean up temporary snapshot file after {operation}: {source}"
+            ),
+            Self::CleanupPublishedTemporary(error) => write!(
+                formatter,
+                "snapshot was published, but its temporary link could not be removed: {error}"
             ),
             Self::SyncDirectory(error) => write!(
                 formatter,
@@ -252,12 +285,16 @@ impl Error for SnapshotReplaceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Encode(error) => Some(error),
-            Self::InvalidDestination => None,
+            Self::InvalidDestination | Self::DestinationChanged => None,
             Self::OpenDirectory(error)
+            | Self::LockDirectory(error)
+            | Self::InspectDestination(error)
             | Self::CreateTemporary(error)
             | Self::WriteTemporary(error)
             | Self::SyncTemporary(error)
             | Self::Rename(error)
+            | Self::Publish(error)
+            | Self::CleanupPublishedTemporary(error)
             | Self::SyncDirectory(error) => Some(error),
             Self::CleanupTemporary { source, .. } => Some(source),
         }
@@ -843,6 +880,8 @@ impl SnapshotCodec {
     /// envelope is written to an exclusively created sibling temporary file,
     /// which is synchronized and then renamed over `path`. Finally, the
     /// destination's parent directory is synchronized so the rename is durable.
+    /// An exclusive advisory lock on the opened parent serializes replacements
+    /// and repairs performed by this crate within that directory.
     /// All operations after opening the parent are relative to that directory
     /// descriptor, so renaming or rebinding the parent path cannot redirect the
     /// operation or strand the temporary file.
@@ -879,6 +918,9 @@ impl SnapshotCodec {
         let parent = normalized_parent(path);
         let directory =
             SnapshotDirectory::open(parent).map_err(SnapshotReplaceError::OpenDirectory)?;
+        let _lock = directory
+            .lock_exclusive()
+            .map_err(SnapshotReplaceError::LockDirectory)?;
         replace_envelope_in_directory_with_sync(&directory, &destination, &envelope, sync_directory)
     }
 
@@ -974,6 +1016,76 @@ fn replace_envelope_in_directory_with_sync(
         return Err(temporary.cleanup(SnapshotReplaceError::Rename(error)));
     }
     temporary.persist();
+
+    sync_directory(directory).map_err(SnapshotReplaceError::SyncDirectory)
+}
+
+#[cfg(unix)]
+fn replace_envelope_in_directory_if_unchanged(
+    directory: &SnapshotDirectory,
+    destination: &CStr,
+    condition: SnapshotReplacementCondition<'_>,
+    envelope: &[u8],
+    before_publish: impl FnOnce(),
+    sync_directory: impl FnOnce(&SnapshotDirectory) -> io::Result<()>,
+) -> Result<(), SnapshotReplaceError> {
+    let (mut file, temporary) = create_temporary_snapshot(directory, destination)?;
+
+    if let Err(error) = file.write_all(envelope) {
+        drop(file);
+        return Err(temporary.cleanup(SnapshotReplaceError::WriteTemporary(error)));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        return Err(temporary.cleanup(SnapshotReplaceError::SyncTemporary(error)));
+    }
+    drop(file);
+
+    before_publish();
+    let current = match directory.destination_state(destination) {
+        Ok(current) => current,
+        Err(error) => {
+            return Err(temporary.cleanup(SnapshotReplaceError::InspectDestination(error)));
+        }
+    };
+    if current != condition.destination {
+        return Err(temporary.cleanup(SnapshotReplaceError::DestinationChanged));
+    }
+    if let Some(expected_envelope) = condition.envelope {
+        let contents_unchanged =
+            read_bounded_snapshot_file_from_directory(directory, destination, condition.codec)
+                .is_ok_and(|current_envelope| current_envelope == expected_envelope);
+        if !contents_unchanged {
+            return Err(temporary.cleanup(SnapshotReplaceError::DestinationChanged));
+        }
+    } else if condition.destination != SnapshotDestinationState::Missing
+        && read_bounded_snapshot_file_from_directory(directory, destination, condition.codec)
+            .is_ok()
+    {
+        // The initial entry could not be read as a bounded regular snapshot.
+        // If the same entry now can be read (for example, a dangling symlink's
+        // target was published), it no longer represents the failed attempt.
+        return Err(temporary.cleanup(SnapshotReplaceError::DestinationChanged));
+    }
+
+    if condition.destination == SnapshotDestinationState::Missing {
+        if let Err(error) = directory.link(temporary.name(), destination) {
+            let operation = if error.kind() == io::ErrorKind::AlreadyExists {
+                SnapshotReplaceError::DestinationChanged
+            } else {
+                SnapshotReplaceError::Publish(error)
+            };
+            return Err(temporary.cleanup(operation));
+        }
+        if let Err(error) = temporary.discard() {
+            return Err(SnapshotReplaceError::CleanupPublishedTemporary(error));
+        }
+    } else {
+        if let Err(error) = directory.rename(temporary.name(), destination) {
+            return Err(temporary.cleanup(SnapshotReplaceError::Rename(error)));
+        }
+        temporary.persist();
+    }
 
     sync_directory(directory).map_err(SnapshotReplaceError::SyncDirectory)
 }
@@ -1083,6 +1195,31 @@ struct SnapshotDirectory {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDestinationState {
+    Missing,
+    Present {
+        device: libc::dev_t,
+        inode: libc::ino_t,
+        mode: libc::mode_t,
+        size: libc::off_t,
+    },
+}
+
+#[cfg(unix)]
+struct SnapshotReplacementCondition<'a> {
+    destination: SnapshotDestinationState,
+    envelope: Option<&'a [u8]>,
+    codec: SnapshotCodec,
+}
+
+#[cfg(unix)]
+struct SnapshotRepairHooks<BeforePublish, SyncDirectory> {
+    before_publish: BeforePublish,
+    sync_directory: SyncDirectory,
+}
+
+#[cfg(unix)]
 impl SnapshotDirectory {
     fn open(path: &Path) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1092,6 +1229,72 @@ impl SnapshotDirectory {
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(path)?;
         Ok(Self { file })
+    }
+
+    fn lock_exclusive(&self) -> io::Result<SnapshotDirectoryLock<'_>> {
+        loop {
+            // SAFETY: `self.file` remains open for the lifetime of the returned
+            // guard, and `flock` does not take ownership of the descriptor.
+            let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                return Ok(SnapshotDirectoryLock { directory: self });
+            }
+
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn destination_state(&self, name: &CStr) -> io::Result<SnapshotDestinationState> {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `status` points to writable storage, `name` is
+        // NUL-terminated, and the directory descriptor remains open.
+        let result = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                status.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(SnapshotDestinationState::Missing)
+            } else {
+                Err(error)
+            };
+        }
+
+        // SAFETY: the successful `fstatat` call completely initialized
+        // `status`.
+        let status = unsafe { status.assume_init() };
+        Ok(SnapshotDestinationState::Present {
+            device: status.st_dev,
+            inode: status.st_ino,
+            mode: status.st_mode,
+            size: status.st_size,
+        })
+    }
+
+    fn open_read(&self, name: &CStr) -> io::Result<File> {
+        // SAFETY: `self.file` is an open directory, `name` is NUL-terminated,
+        // and the returned descriptor is checked before ownership is assumed.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `openat` returned a new owned descriptor on success.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 
     fn create(&self, name: &CStr) -> io::Result<File> {
@@ -1167,6 +1370,25 @@ impl SnapshotDirectory {
         }
     }
 
+    fn link(&self, source: &CStr, destination: &CStr) -> io::Result<()> {
+        // SAFETY: both names are NUL-terminated and both directory descriptors
+        // remain open for the duration of this directory-relative hard link.
+        let result = unsafe {
+            libc::linkat(
+                self.file.as_raw_fd(),
+                source.as_ptr(),
+                self.file.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     fn remove(&self, name: &CStr) -> io::Result<()> {
         // SAFETY: `name` is NUL-terminated and `self.file` remains open for the
         // duration of this directory-relative unlink operation.
@@ -1180,6 +1402,20 @@ impl SnapshotDirectory {
 
     fn sync(&self) -> io::Result<()> {
         self.file.sync_all()
+    }
+}
+
+#[cfg(unix)]
+struct SnapshotDirectoryLock<'a> {
+    directory: &'a SnapshotDirectory,
+}
+
+#[cfg(unix)]
+impl Drop for SnapshotDirectoryLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the borrowed directory remains open while the guard exists,
+        // and unlocking does not take ownership of its descriptor.
+        let _ = unsafe { libc::flock(self.directory.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1310,7 +1546,31 @@ fn read_bounded_snapshot_file(
     path: &Path,
     snapshot_codec: SnapshotCodec,
 ) -> Result<Vec<u8>, Int64TableFileRestoreError> {
-    let mut file = open_regular_snapshot_file(path)?;
+    let file = open_regular_snapshot_file(path)?;
+    read_bounded_snapshot_from_file(file, snapshot_codec)
+}
+
+#[cfg(unix)]
+fn read_bounded_snapshot_file_from_directory(
+    directory: &SnapshotDirectory,
+    name: &CStr,
+    snapshot_codec: SnapshotCodec,
+) -> Result<Vec<u8>, Int64TableFileRestoreError> {
+    let file = directory
+        .open_read(name)
+        .map_err(Int64TableFileRestoreError::Open)?;
+    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+    if !metadata.is_file() {
+        return Err(Int64TableFileRestoreError::NotRegularFile);
+    }
+
+    read_bounded_snapshot_from_file(file, snapshot_codec)
+}
+
+fn read_bounded_snapshot_from_file(
+    mut file: File,
+    snapshot_codec: SnapshotCodec,
+) -> Result<Vec<u8>, Int64TableFileRestoreError> {
     let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
     let file_len = bounded_file_len(&file, max_file_len)?;
     let capacity = usize::try_from(file_len).unwrap_or(max_file_len);
@@ -1374,11 +1634,14 @@ pub fn restore_int64_table_from_file_with_backup(
 ///
 /// A valid primary is returned immediately without inspecting the backup. If
 /// primary restoration fails, the backup is read once with the same file,
-/// envelope, payload, schema, and row bounds. After the backup validates, its
-/// already-bounded payload atomically replaces the primary through
-/// [`SnapshotCodec::replace_file`] before the recovered table is returned. The
-/// backup is never modified. Dual restoration failures and replacement-stage
-/// failures remain distinct and retain their typed causes.
+/// envelope, payload, schema, and row bounds. The primary's parent directory is
+/// opened and locked before its initial restoration, and all primary access
+/// remains relative to that directory descriptor. After the backup validates,
+/// its envelope replaces the primary only if the initially observed directory
+/// entry is unchanged. The backup is never modified. Dual restoration failures
+/// and replacement-stage failures remain distinct and retain their typed
+/// causes. A concurrent destination refresh is preserved and reported as
+/// [`SnapshotReplaceError::DestinationChanged`].
 #[cfg(unix)]
 pub fn restore_and_repair_int64_table_from_file_with_backup(
     primary_path: impl AsRef<Path>,
@@ -1395,7 +1658,10 @@ pub fn restore_and_repair_int64_table_from_file_with_backup(
         row_cap,
         snapshot_codec,
         payload_codec,
-        |path, payload| snapshot_codec.replace_file(path, payload),
+        SnapshotRepairHooks {
+            before_publish: || {},
+            sync_directory: SnapshotDirectory::sync,
+        },
     )
 }
 
@@ -1407,25 +1673,74 @@ fn restore_and_repair_int64_table_from_file_with_backup_using(
     row_cap: usize,
     snapshot_codec: SnapshotCodec,
     payload_codec: NullableI64PayloadCodec,
-    replace_primary: impl FnOnce(&Path, &[u8]) -> Result<(), SnapshotReplaceError>,
+    hooks: SnapshotRepairHooks<impl FnOnce(), impl FnOnce(&SnapshotDirectory) -> io::Result<()>>,
 ) -> Result<Int64TableFileRecovery, Int64TableFileRepairError> {
-    let primary = match restore_int64_table_from_file(
-        primary_path,
-        schema.clone(),
-        row_cap,
-        snapshot_codec,
-        payload_codec,
-    ) {
-        Ok(table) => {
-            return Ok(Int64TableFileRecovery {
-                table,
-                source: Int64TableFileRecoverySource::Primary,
-            });
+    let destination = match snapshot_destination_name(primary_path) {
+        Ok(destination) => destination,
+        Err(repair) => {
+            return restore_after_repair_setup_failure(
+                primary_path,
+                backup_path,
+                schema,
+                row_cap,
+                snapshot_codec,
+                payload_codec,
+                repair,
+            );
         }
-        Err(primary) => primary,
+    };
+    let directory = match SnapshotDirectory::open(normalized_parent(primary_path)) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return restore_after_repair_setup_failure(
+                primary_path,
+                backup_path,
+                schema,
+                row_cap,
+                snapshot_codec,
+                payload_codec,
+                SnapshotReplaceError::OpenDirectory(error),
+            );
+        }
+    };
+    let _lock = match directory.lock_exclusive() {
+        Ok(lock) => lock,
+        Err(error) => {
+            return restore_after_repair_setup_failure(
+                primary_path,
+                backup_path,
+                schema,
+                row_cap,
+                snapshot_codec,
+                payload_codec,
+                SnapshotReplaceError::LockDirectory(error),
+            );
+        }
+    };
+    let observed_primary = directory.destination_state(&destination);
+
+    let primary_envelope =
+        read_bounded_snapshot_file_from_directory(&directory, &destination, snapshot_codec);
+    let (primary, observed_primary_envelope) = match primary_envelope {
+        Ok(envelope) => match restore_int64_table(
+            &envelope,
+            schema.clone(),
+            row_cap,
+            snapshot_codec,
+            payload_codec,
+        ) {
+            Ok(table) => {
+                return Ok(Int64TableFileRecovery {
+                    table,
+                    source: Int64TableFileRecoverySource::Primary,
+                });
+            }
+            Err(primary) => (Int64TableFileRestoreError::Restore(primary), Some(envelope)),
+        },
+        Err(primary) => (primary, None),
     };
 
-    let mut backup_envelope = match read_bounded_snapshot_file(backup_path, snapshot_codec) {
+    let backup_envelope = match read_bounded_snapshot_file(backup_path, snapshot_codec) {
         Ok(envelope) => envelope,
         Err(backup) => return Err(Int64TableFileRepairError::BothFailed { primary, backup }),
     };
@@ -1445,16 +1760,66 @@ fn restore_and_repair_int64_table_from_file_with_backup_using(
         }
     };
 
-    // The complete envelope has already validated, so removing its fixed-size
-    // header leaves exactly the bounded payload that supplied `table`.
-    backup_envelope.drain(..SNAPSHOT_HEADER_LEN);
-    replace_primary(primary_path, &backup_envelope)
-        .map_err(|repair| Int64TableFileRepairError::RepairFailed { primary, repair })?;
+    let observed_primary = match observed_primary {
+        Ok(observed_primary) => observed_primary,
+        Err(error) => {
+            return Err(Int64TableFileRepairError::RepairFailed {
+                primary,
+                repair: SnapshotReplaceError::InspectDestination(error),
+            });
+        }
+    };
+    replace_envelope_in_directory_if_unchanged(
+        &directory,
+        &destination,
+        SnapshotReplacementCondition {
+            destination: observed_primary,
+            envelope: observed_primary_envelope.as_deref(),
+            codec: snapshot_codec,
+        },
+        &backup_envelope,
+        hooks.before_publish,
+        hooks.sync_directory,
+    )
+    .map_err(|repair| Int64TableFileRepairError::RepairFailed { primary, repair })?;
 
     Ok(Int64TableFileRecovery {
         table,
         source: Int64TableFileRecoverySource::Backup,
     })
+}
+
+#[cfg(unix)]
+fn restore_after_repair_setup_failure(
+    primary_path: &Path,
+    backup_path: &Path,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+    repair: SnapshotReplaceError,
+) -> Result<Int64TableFileRecovery, Int64TableFileRepairError> {
+    let primary = match restore_int64_table_from_file(
+        primary_path,
+        schema.clone(),
+        row_cap,
+        snapshot_codec,
+        payload_codec,
+    ) {
+        Ok(table) => {
+            return Ok(Int64TableFileRecovery {
+                table,
+                source: Int64TableFileRecoverySource::Primary,
+            });
+        }
+        Err(primary) => primary,
+    };
+
+    match restore_int64_table_from_file(backup_path, schema, row_cap, snapshot_codec, payload_codec)
+    {
+        Ok(_) => Err(Int64TableFileRepairError::RepairFailed { primary, repair }),
+        Err(backup) => Err(Int64TableFileRepairError::BothFailed { primary, backup }),
+    }
 }
 
 fn open_regular_snapshot_file(path: &Path) -> Result<File, Int64TableFileRestoreError> {
@@ -1737,6 +2102,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repair_reports_directory_sync_failure_after_replacing_the_primary() {
+        fn fail_directory_sync(_: &SnapshotDirectory) -> io::Result<()> {
+            Err(io::Error::other("injected directory sync failure"))
+        }
+
         static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
 
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-repair-sync-tests");
@@ -1767,10 +2136,9 @@ mod tests {
             1,
             snapshot_codec,
             payload_codec,
-            |path, payload| {
-                snapshot_codec.replace_file_with_directory_sync(path, payload, |_| {
-                    Err(io::Error::other("injected directory sync failure"))
-                })
+            SnapshotRepairHooks {
+                before_publish: || {},
+                sync_directory: fail_directory_sync,
             },
         )
         .unwrap_err();
@@ -1802,5 +2170,175 @@ mod tests {
         assert_eq!(table.values(), &[Some(22)]);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_does_not_overwrite_a_concurrently_refreshed_primary() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-repair-race-tests");
+        fs::create_dir_all(&base).unwrap();
+        let directory = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let primary_path = directory.join("primary.snapshot");
+        let backup_path = directory.join("backup.snapshot");
+        let snapshot_codec = SnapshotCodec::new(17);
+        let payload_codec = NullableI64PayloadCodec::new(1, 17);
+
+        for (path, value) in [(&primary_path, 11), (&backup_path, 22)] {
+            let payload = payload_codec.encode(&[Some(value)]).unwrap();
+            snapshot_codec.create_new_file(path, &payload).unwrap();
+        }
+        let mut corrupt_primary = fs::read(&primary_path).unwrap();
+        *corrupt_primary.last_mut().unwrap() ^= 1;
+        fs::write(&primary_path, corrupt_primary).unwrap();
+        let backup_before = fs::read(&backup_path).unwrap();
+        let refreshed_payload = payload_codec.encode(&[Some(33)]).unwrap();
+        let refreshed_before = snapshot_codec.encode(&refreshed_payload).unwrap();
+
+        let (publish_sender, publish_receiver) = mpsc::channel();
+        let (published_sender, published_receiver) = mpsc::channel();
+        let publisher_primary = primary_path.clone();
+        let publisher_refreshed = refreshed_before.clone();
+        let publisher = thread::spawn(move || {
+            publish_receiver.recv().unwrap();
+            fs::write(publisher_primary, publisher_refreshed).unwrap();
+            published_sender.send(()).unwrap();
+        });
+
+        let error = restore_and_repair_int64_table_from_file_with_backup_using(
+            &primary_path,
+            &backup_path,
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+            SnapshotRepairHooks {
+                before_publish: || {
+                    publish_sender.send(()).unwrap();
+                    published_receiver
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("the concurrent primary refresh must finish");
+                },
+                sync_directory: SnapshotDirectory::sync,
+            },
+        )
+        .unwrap_err();
+        publisher.join().unwrap();
+
+        assert!(matches!(
+            error.primary_error(),
+            Int64TableFileRestoreError::Restore(Int64TableRestoreError::Envelope(
+                SnapshotError::ChecksumMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            error.repair_error(),
+            Some(SnapshotReplaceError::DestinationChanged)
+        ));
+        assert_eq!(fs::read(&primary_path).unwrap(), refreshed_before);
+        assert_eq!(fs::read(&backup_path).unwrap(), backup_before);
+        let table = restore_int64_table_from_file(
+            &primary_path,
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+        assert_eq!(table.values(), &[Some(33)]);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_stays_with_the_initial_directory_when_its_path_is_rebound() {
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-repair-rebind-tests");
+        fs::create_dir_all(&base).unwrap();
+        let root = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let parent = root.join("parent");
+        let moved_parent = root.join("moved-parent");
+        fs::create_dir(&parent).unwrap();
+        let primary_path = parent.join("primary.snapshot");
+        let backup_path = root.join("backup.snapshot");
+        let snapshot_codec = SnapshotCodec::new(17);
+        let payload_codec = NullableI64PayloadCodec::new(1, 17);
+        for (path, value) in [(&primary_path, 11), (&backup_path, 22)] {
+            let payload = payload_codec.encode(&[Some(value)]).unwrap();
+            snapshot_codec.create_new_file(path, &payload).unwrap();
+        }
+        let mut corrupt_primary = fs::read(&primary_path).unwrap();
+        *corrupt_primary.last_mut().unwrap() ^= 1;
+        fs::write(&primary_path, corrupt_primary).unwrap();
+
+        let rebound_primary = primary_path.clone();
+        let recovered = restore_and_repair_int64_table_from_file_with_backup_using(
+            &primary_path,
+            &backup_path,
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+            SnapshotRepairHooks {
+                before_publish: || {
+                    fs::rename(&parent, &moved_parent).unwrap();
+                    fs::create_dir(&parent).unwrap();
+                    let payload = payload_codec.encode(&[Some(33)]).unwrap();
+                    snapshot_codec
+                        .create_new_file(&rebound_primary, &payload)
+                        .unwrap();
+                },
+                sync_directory: SnapshotDirectory::sync,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recovered.source(), Int64TableFileRecoverySource::Backup);
+        assert_eq!(recovered.table().values(), &[Some(22)]);
+        let rebound = restore_int64_table_from_file(
+            &primary_path,
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+        assert_eq!(rebound.values(), &[Some(33)]);
+        let repaired = restore_int64_table_from_file(
+            moved_parent.join("primary.snapshot"),
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+        assert_eq!(repaired.values(), &[Some(22)]);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
