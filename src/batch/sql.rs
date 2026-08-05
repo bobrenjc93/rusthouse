@@ -166,6 +166,7 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -1074,23 +1075,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and_predicate(&mut self) -> Result<Predicate> {
-        let mut predicate = self.parse_predicate_atom()?;
+        let mut predicate = self.parse_not_predicate()?;
         while self.eat_keyword("AND") {
-            let right = self.parse_predicate_atom()?;
+            let right = self.parse_not_predicate()?;
             self.record_predicate_node()?;
             predicate = Predicate::And(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
     }
 
+    fn parse_not_predicate(&mut self) -> Result<Predicate> {
+        if !self.eat_keyword("NOT") {
+            return self.parse_predicate_atom();
+        }
+
+        self.enter_predicate_nesting()?;
+        let predicate = self.parse_not_predicate();
+        self.predicate_depth -= 1;
+        let predicate = predicate?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Not(Box::new(predicate)))
+    }
+
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
         if self.eat(&TokenKind::LeftParen) {
-            if self.predicate_depth >= MAX_PREDICATE_DEPTH {
-                return self.error(format!(
-                    "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
-                ));
-            }
-            self.predicate_depth += 1;
+            self.enter_predicate_nesting()?;
             let predicate = self.parse_or_predicate();
             self.predicate_depth -= 1;
             let predicate = predicate?;
@@ -1107,6 +1116,16 @@ impl<'a> Parser<'a> {
             operator,
             right,
         })
+    }
+
+    fn enter_predicate_nesting(&mut self) -> Result<()> {
+        if self.predicate_depth >= MAX_PREDICATE_DEPTH {
+            return self.error(format!(
+                "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
+            ));
+        }
+        self.predicate_depth += 1;
+        Ok(())
     }
 
     fn parse_comparison_operator(&mut self) -> Result<ComparisonOperator> {
@@ -1308,6 +1327,132 @@ mod tests {
         assert_eq!(select.order_by[0].name, "total");
         assert!(select.order_by[0].descending);
         assert_eq!(select.limit, Some(3));
+    }
+
+    #[test]
+    fn parses_not_with_boolean_precedence_parentheses_and_repetition() {
+        fn comparison(name: &str, value: Value) -> Predicate {
+            Predicate::Comparison {
+                left: Operand::Column(name.to_owned()),
+                operator: ComparisonOperator::Equal,
+                right: Operand::Literal(value),
+            }
+        }
+
+        let statements = parse(
+            "SELECT id FROM things \
+             WHERE NOT id = 1 AND enabled = true OR name = 'match'; \
+             SELECT id FROM things WHERE NOT (id = 1 AND enabled = true); \
+             SELECT id FROM things WHERE NOT NOT id = 1;",
+        )
+        .expect("valid NOT predicates");
+
+        let Statement::Select(precedence) = &statements[0] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            precedence.predicate,
+            Some(Predicate::Or(
+                Box::new(Predicate::And(
+                    Box::new(Predicate::Not(Box::new(comparison("id", Value::Int64(1),)))),
+                    Box::new(comparison("enabled", Value::Bool(true))),
+                )),
+                Box::new(comparison("name", Value::String("match".to_owned()))),
+            ))
+        );
+
+        let Statement::Select(parenthesized) = &statements[1] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            parenthesized.predicate,
+            Some(Predicate::Not(Box::new(Predicate::And(
+                Box::new(comparison("id", Value::Int64(1))),
+                Box::new(comparison("enabled", Value::Bool(true))),
+            ))))
+        );
+
+        let Statement::Select(repeated) = &statements[2] else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            repeated.predicate,
+            Some(Predicate::Not(Box::new(Predicate::Not(Box::new(
+                comparison("id", Value::Int64(1)),
+            )))))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_not_predicates() {
+        for (sql, expected_message) in [
+            (
+                "SELECT id FROM things WHERE NOT",
+                "expected column or literal",
+            ),
+            (
+                "SELECT id FROM things WHERE NOT NOT",
+                "expected column or literal",
+            ),
+            (
+                "SELECT id FROM things WHERE NOT = id",
+                "expected column or literal",
+            ),
+            (
+                "SELECT id FROM things WHERE NOT ()",
+                "expected column or literal",
+            ),
+            (
+                "SELECT id FROM things WHERE NOT (id = 1",
+                "expected right parenthesis after predicate",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse(sql),
+                    Err(Error::Sql { message, .. }) if message == expected_message
+                ),
+                "{sql:?} must report {expected_message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_obeys_exact_and_exceeded_predicate_depth_and_node_limits() {
+        let exact_depth = format!(
+            "SELECT id FROM things WHERE {}id = 1",
+            "NOT ".repeat(MAX_PREDICATE_DEPTH)
+        );
+        parse(&exact_depth).expect("NOT nesting at the depth limit is valid");
+
+        let exceeded_depth = format!(
+            "SELECT id FROM things WHERE {}id = 1",
+            "NOT ".repeat(MAX_PREDICATE_DEPTH + 1)
+        );
+        assert!(matches!(
+            parse(&exceeded_depth),
+            Err(Error::Sql { message, .. })
+                if message == format!(
+                    "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
+                )
+        ));
+
+        // One NOT plus 128 comparisons and 127 ORs is exactly 256 nodes.
+        let mut exact_nodes = "NOT id = 0".to_owned();
+        for value in 1..128 {
+            exact_nodes.push_str(&format!(" OR id = {value}"));
+        }
+        let exact_nodes = format!("SELECT id FROM things WHERE {exact_nodes}");
+        parse(&exact_nodes).expect("predicate at the expression-node limit is valid");
+
+        let exceeded_nodes = exact_nodes.replacen("WHERE ", "WHERE NOT ", 1);
+        assert!(matches!(
+            parse(&exceeded_nodes),
+            Err(Error::Sql { message, .. })
+                if message == format!(
+                    "predicate is too complex; maximum {MAX_PREDICATE_NODES} expression nodes"
+                )
+        ));
     }
 
     #[test]

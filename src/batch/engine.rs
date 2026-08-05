@@ -2225,6 +2225,7 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -2251,6 +2252,7 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
+            Self::Not(predicate) => !predicate.evaluate(table, row),
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
@@ -2301,6 +2303,9 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
                 right,
             })
         }
+        Predicate::Not(predicate) => Ok(CompiledPredicate::Not(Box::new(compile_predicate(
+            table, predicate,
+        )?))),
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
             Box::new(compile_predicate(table, left)?),
             Box::new(compile_predicate(table, right)?),
@@ -2826,6 +2831,97 @@ mod tests {
             result.rows,
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
+    }
+
+    #[test]
+    fn filters_with_not_precedence_parentheses_and_repetition() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE valueset (id Int64, enabled Bool); \
+                 INSERT INTO valueset VALUES \
+                 (1, false), (2, true), (3, false);",
+            )
+            .expect("setup");
+
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT id FROM valueset \
+                 WHERE NOT id = 1 AND enabled = true OR id = 3",
+            )
+            .rows,
+            vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT id FROM valueset WHERE NOT (id = 1 OR enabled = true)",
+            )
+            .rows,
+            vec![vec![Value::Int64(3)]]
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT id FROM valueset WHERE NOT NOT enabled = true",
+            )
+            .rows,
+            vec![vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn not_evaluates_every_comparison_operator_and_typed_column() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE samples (id Int64, score Float64, enabled Bool, label String); \
+                 INSERT INTO samples VALUES \
+                 (1, 1.25, false, 'ant'), \
+                 (2, 2.5, true, 'bee'), \
+                 (3, 3.75, false, 'cat');",
+            )
+            .expect("setup");
+
+        let operator_cases = [
+            ("=", &[1, 3][..]),
+            ("!=", &[2][..]),
+            ("<>", &[2][..]),
+            ("<", &[2, 3][..]),
+            ("<=", &[3][..]),
+            (">", &[1, 2][..]),
+            (">=", &[1][..]),
+        ];
+        for (operator, expected) in operator_cases {
+            let rows = query(
+                &mut database,
+                &format!("SELECT id FROM samples WHERE NOT id {operator} 2"),
+            )
+            .rows;
+            let expected = expected
+                .iter()
+                .map(|value| vec![Value::Int64(*value)])
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "operator {operator}");
+        }
+
+        for (predicate, expected) in [
+            ("score = 2.5", &[1, 3][..]),
+            ("enabled = true", &[1, 3][..]),
+            ("label = 'bee'", &[1, 3][..]),
+        ] {
+            let rows = query(
+                &mut database,
+                &format!("SELECT id FROM samples WHERE NOT {predicate}"),
+            )
+            .rows;
+            let expected = expected
+                .iter()
+                .map(|value| vec![Value::Int64(*value)])
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "predicate {predicate}");
+        }
     }
 
     #[test]
