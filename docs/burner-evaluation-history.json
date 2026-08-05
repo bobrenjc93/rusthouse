@@ -842,6 +842,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:442",
+      "recordedAt": "2026-08-05T15:29:10.292Z",
+      "label": "PR #442",
+      "kind": "leaf",
+      "prNumber": 442,
+      "title": "Document literal-only SELECT with an executable Database example",
+      "scores": {
+        "eval_9fbdfec0": 80,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
