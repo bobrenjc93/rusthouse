@@ -104,6 +104,12 @@ filtered projections return matching values in source order through bounded
 comparison and nullness scans. `SELECT DISTINCT column FROM table` uses
 explicit input-row and distinct-value limits and returns deterministic
 `NULL`-first, ascending values.
+The same catalog exposes narrow one-column equi-joins. `INNER JOIN` projects
+the left column for matching rows. `SELECT right_column FROM left_table LEFT
+JOIN right_table ON left_column = right_column` projects matching right values
+and a typed `NULL` for each unmatched left row. Both forms preserve duplicate
+cross-products in deterministic left-major order and enforce explicit input
+and output bounds.
 
 ## Command-line session
 

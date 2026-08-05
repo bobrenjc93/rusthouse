@@ -4,7 +4,7 @@ use std::thread;
 use rusthouse::{
     AggregateLimits, Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CsvIngestError,
     CsvIngestLimits, InnerJoinExecutionError, InsertError, InsertExecutionError, JoinError,
-    JoinLimits, ParseLimits, ScanLimits, SharedCatalog, SharedCatalogError,
+    JoinLimits, LeftJoinExecutionError, ParseLimits, ScanLimits, SharedCatalog, SharedCatalogError,
 };
 
 fn shared_catalog(max_rows_per_table: usize) -> SharedCatalog {
@@ -154,6 +154,63 @@ fn shared_inner_join_returns_owned_rows_and_preserves_typed_errors() {
         .execute_insert("INSERT INTO left_rows VALUES (7)", parse_limits)
         .unwrap();
     assert_eq!(rows, vec![Some(7), Some(7)]);
+}
+
+#[test]
+fn shared_left_join_handles_duplicates_nulls_empty_inputs_and_bounds() {
+    let empty = SharedCatalog::with_limits(CatalogLimits::new(2, 3));
+    let parse_limits = ParseLimits::default();
+    empty
+        .execute_create("CREATE TABLE left_rows (left_key Int64)", parse_limits)
+        .unwrap();
+    empty
+        .execute_create("CREATE TABLE right_rows (right_key Int64)", parse_limits)
+        .unwrap();
+    let sql = "SELECT right_key FROM left_rows LEFT JOIN right_rows ON left_key = right_key";
+    assert_eq!(
+        empty.execute_left_join(sql, parse_limits, JoinLimits::new(0, 0)),
+        Ok(vec![])
+    );
+
+    for statement in [
+        "INSERT INTO left_rows VALUES (7)",
+        "INSERT INTO left_rows VALUES (NULL)",
+        "INSERT INTO right_rows VALUES (7)",
+        "INSERT INTO right_rows VALUES (7)",
+    ] {
+        empty.execute_insert(statement, parse_limits).unwrap();
+    }
+
+    let rows = empty
+        .execute_left_join(sql, parse_limits, JoinLimits::new(2, 3))
+        .unwrap();
+    assert_eq!(rows, vec![Some(7), Some(7), None]);
+    assert_eq!(
+        empty.execute_left_join(sql, parse_limits, JoinLimits::new(2, 2)),
+        Err(SharedCatalogError::Catalog(CatalogError::LeftJoin(
+            LeftJoinExecutionError::Join(JoinError::OutputLimitExceeded {
+                pairs: 3,
+                max_pairs: 2,
+            })
+        )))
+    );
+    assert_eq!(
+        empty.execute_left_join(
+            "SELECT missing FROM left_rows LEFT JOIN right_rows ON left_key = right_key",
+            parse_limits,
+            JoinLimits::new(2, 3),
+        ),
+        Err(SharedCatalogError::Catalog(CatalogError::LeftJoin(
+            LeftJoinExecutionError::UnknownColumn {
+                name: "missing".to_owned(),
+            }
+        )))
+    );
+
+    empty
+        .execute_insert("INSERT INTO left_rows VALUES (7)", parse_limits)
+        .unwrap();
+    assert_eq!(rows, vec![Some(7), Some(7), None]);
 }
 
 #[test]
