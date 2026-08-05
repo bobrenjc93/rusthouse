@@ -186,6 +186,11 @@ engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, or
 resource-bounded result, so cloned
 handles can run analytical reads concurrently. Mutating batches passed to
 `execute` retain one write lock for the entire batch and cannot interleave.
+For transactional ingestion, `Database::execute_insert_batch` and the matching
+`SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
+statement and cumulative per-table row cap, then commit in statement order.
+Any validation or resource failure leaves all tables unchanged; the shared
+form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
 ## Snapshot envelope

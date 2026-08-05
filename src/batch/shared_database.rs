@@ -66,8 +66,10 @@ impl From<Error> for SharedDatabaseError {
 /// lock. Results own
 /// their columns and values and remain valid after the lock is released.
 ///
-/// A batch is not a rollback transaction: once parsing succeeds, earlier
-/// statements remain applied if a later statement fails.
+/// A batch passed to [`Self::execute`] is not a rollback transaction: once
+/// parsing succeeds, earlier statements remain applied if a later statement
+/// fails. [`Self::execute_insert_batch`] provides atomic preflight and commit
+/// for the narrower `INSERT`-only case.
 ///
 /// # Examples
 ///
@@ -133,6 +135,21 @@ impl SharedDatabase {
     /// Parses and executes a complete SQL batch under one database lock.
     pub fn execute(&self, input: &str) -> Result<Vec<StatementResult>, SharedDatabaseError> {
         self.execute_with_result_limit(input, DEFAULT_MAX_RETAINED_RESULT_BYTES)
+    }
+
+    /// Atomically executes a nonempty, `INSERT`-only batch under one write lock.
+    ///
+    /// Parsing completes before the lock is acquired. Preflight and ordered
+    /// commit both occur while the same write guard is retained, so neither a
+    /// validation failure nor a concurrent operation can expose a partial batch.
+    pub fn execute_insert_batch(
+        &self,
+        input: &str,
+    ) -> Result<Vec<StatementResult>, SharedDatabaseError> {
+        let statements = sql::parse(input)?;
+        self.write()?
+            .execute_insert_statements(statements)
+            .map_err(Into::into)
     }
 
     /// Executes a batch under one lock while bounding all results retained for the caller.
