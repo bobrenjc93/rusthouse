@@ -241,6 +241,22 @@ fn batch_cli_keeps_drop_table_command_output_silent() {
 }
 
 #[test]
+fn batch_cli_keeps_truncate_table_command_output_silent() {
+    for format in ["table", "csv", "json"] {
+        let output = run(
+            &["--format", format],
+            b"CREATE TABLE temporary (id Int64); \
+              INSERT INTO temporary VALUES (1), (2); \
+              TRUNCATE TABLE TEMPORARY;",
+        );
+
+        assert!(output.status.success(), "{format}: {:?}", output.stderr);
+        assert!(output.stdout.is_empty(), "{format}");
+        assert!(output.stderr.is_empty(), "{format}");
+    }
+}
+
+#[test]
 fn csv_batch_filters_grouped_rows_with_a_count_alias() {
     let output = run(
         &["--format", "csv"],
