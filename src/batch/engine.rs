@@ -1240,7 +1240,7 @@ impl ResolvedHaving {
         let value = match data.aggregates[self.state][group].as_ref() {
             ValueRef::Int64(value) => value,
             ValueRef::Null(DataType::Int64) => return false,
-            _ => unreachable!("HAVING is restricted to COUNT(*) and SUM(Int64)"),
+            _ => unreachable!("HAVING is restricted to Int64 aggregates"),
         };
         let comparison = value.cmp(&self.value);
         match self.operator {
@@ -1501,16 +1501,15 @@ fn resolve_having(
 
     let ResolvedItem::Aggregate { state } = items[output] else {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected COUNT(*) or SUM(Int64)",
+            "HAVING alias '{}' must reference a projected Int64 aggregate",
             requested.alias
         )));
     };
     let spec = &aggregate_specs[state];
-    let supported = (spec.function == AggregateFunction::Count && spec.argument.is_none())
-        || (spec.function == AggregateFunction::Sum && spec.input_type == Some(DataType::Int64));
+    let supported = aggregate_output_type(spec.function, spec.input_type) == DataType::Int64;
     if !supported {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected COUNT(*) or SUM(Int64)",
+            "HAVING alias '{}' must reference a projected Int64 aggregate",
             requested.alias
         )));
     }
@@ -2967,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn having_count_alias_supports_every_comparison_operator() {
+    fn having_count_column_alias_supports_every_comparison_operator() {
         let mut database = Database::new();
         database
             .execute(
@@ -2990,7 +2989,7 @@ mod tests {
             let result = query(
                 &mut database,
                 &format!(
-                    "SELECT kind, COUNT(*) AS Occurrences FROM events \
+                    "SELECT kind, COUNT(kind) AS Occurrences FROM events \
                      GROUP BY kind HAVING occurrences {operator} 2 ORDER BY kind"
                 ),
             );
@@ -3004,6 +3003,73 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual_kinds, expected_kinds, "operator {operator}");
         }
+    }
+
+    #[test]
+    fn having_min_and_max_int64_aliases_support_grouped_and_global_inputs() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String, amount Int64); \
+                 INSERT INTO events VALUES \
+                 ('a', -5), ('a', 2), \
+                 ('b', 0), ('b', 7), ('b', 9), \
+                 ('c', -1);",
+            )
+            .expect("setup");
+
+        let grouped_cases = [
+            ("MIN", "<", "0", &["a", "c"][..]),
+            ("MIN", ">=", "+0", &["b"][..]),
+            ("MAX", "=", "2", &["a"][..]),
+            ("MAX", "!=", "2", &["b", "c"][..]),
+            ("MAX", "<>", "2", &["b", "c"][..]),
+            ("MAX", "<=", "2", &["a", "c"][..]),
+            ("MAX", ">", "2", &["b"][..]),
+        ];
+        for (function, operator, threshold, expected_kinds) in grouped_cases {
+            let result = query(
+                &mut database,
+                &format!(
+                    "SELECT kind, {function}(amount) AS extreme FROM events \
+                     GROUP BY kind HAVING extreme {operator} {threshold} ORDER BY kind"
+                ),
+            );
+            let actual_kinds = result
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::String(value) => value.as_str(),
+                    _ => panic!("kind is a string"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_kinds, expected_kinds, "{function} {operator}");
+        }
+
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(amount) AS n FROM events HAVING n = 6"
+            )
+            .rows,
+            vec![vec![Value::Int64(6)]]
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MIN(amount) AS low FROM events HAVING low = -5"
+            )
+            .rows,
+            vec![vec![Value::Int64(-5)]]
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT MAX(amount) AS high FROM events HAVING high >= +9"
+            )
+            .rows,
+            vec![vec![Value::Int64(9)]]
+        );
     }
 
     #[test]
@@ -3053,20 +3119,20 @@ mod tests {
         let mut database = Database::new();
         database
             .execute(
-                "CREATE TABLE events (kind String); \
+                "CREATE TABLE events (kind String, amount Int64); \
                  INSERT INTO events VALUES \
-                 ('a'), ('a'), ('a'), ('b'), ('b'), ('c');",
+                 ('a', 8), ('a', 9), ('b', 3), ('b', 4), ('c', 1);",
             )
             .expect("setup");
 
         let result = query(
             &mut database,
-            "SELECT kind, COUNT(*) AS n FROM events \
-             GROUP BY kind HAVING n > 1 ORDER BY n ASC LIMIT 1",
+            "SELECT kind, MAX(amount) AS high FROM events \
+             GROUP BY kind HAVING high > 1 ORDER BY high ASC LIMIT 1",
         );
         assert_eq!(
             result.rows,
-            vec![vec![Value::String("b".to_owned()), Value::Int64(2)]]
+            vec![vec![Value::String("b".to_owned()), Value::Int64(4)]]
         );
     }
 
@@ -3086,25 +3152,29 @@ mod tests {
                 "HAVING alias 'missing' is not in the SELECT output",
             ),
             (
-                "SELECT kind, SUM(amount) AS total, COUNT(*) AS total FROM events \
+                "SELECT kind, MIN(amount) AS Total, MAX(amount) AS total FROM events \
                  GROUP BY kind HAVING total > 0",
                 "HAVING alias 'total' is ambiguous",
             ),
             (
                 "SELECT kind AS total, COUNT(*) AS n FROM events GROUP BY kind HAVING total > 0",
-                "HAVING alias 'total' must reference a projected COUNT(*) or SUM(Int64)",
-            ),
-            (
-                "SELECT kind, COUNT(amount) AS n FROM events GROUP BY kind HAVING n > 0",
-                "HAVING alias 'n' must reference a projected COUNT(*) or SUM(Int64)",
+                "HAVING alias 'total' must reference a projected Int64 aggregate",
             ),
             (
                 "SELECT kind, SUM(score) AS total FROM events GROUP BY kind HAVING total > 0",
-                "HAVING alias 'total' must reference a projected COUNT(*) or SUM(Int64)",
+                "HAVING alias 'total' must reference a projected Int64 aggregate",
             ),
             (
-                "SELECT kind, MIN(amount) AS low FROM events GROUP BY kind HAVING low > 0",
-                "HAVING alias 'low' must reference a projected COUNT(*) or SUM(Int64)",
+                "SELECT kind, MIN(score) AS low FROM events GROUP BY kind HAVING low > 0",
+                "HAVING alias 'low' must reference a projected Int64 aggregate",
+            ),
+            (
+                "SELECT kind, MAX(kind) AS high FROM events GROUP BY kind HAVING high > 0",
+                "HAVING alias 'high' must reference a projected Int64 aggregate",
+            ),
+            (
+                "SELECT kind, AVG(amount) AS mean FROM events GROUP BY kind HAVING mean > 0",
+                "HAVING alias 'mean' must reference a projected Int64 aggregate",
             ),
         ];
 
@@ -3127,7 +3197,7 @@ mod tests {
         assert_eq!(
             query(
                 &mut database,
-                "SELECT COUNT(*) AS n FROM events HAVING n = 0"
+                "SELECT COUNT(amount) AS n FROM events HAVING n = 0"
             )
             .rows,
             vec![vec![Value::Int64(0)]]
@@ -3150,20 +3220,30 @@ mod tests {
             .is_empty()
         );
 
-        assert_eq!(
-            query(&mut database, "SELECT SUM(amount) AS total FROM events").rows,
-            vec![vec![Value::Null(DataType::Int64)]]
-        );
-        for operator in ["=", "!=", "<>", "<", "<=", ">", ">="] {
-            assert!(
+        for function in ["SUM", "MIN", "MAX"] {
+            assert_eq!(
                 query(
                     &mut database,
-                    &format!("SELECT SUM(amount) AS total FROM events HAVING total {operator} 0")
+                    &format!("SELECT {function}(amount) AS value FROM events")
                 )
-                .rows
-                .is_empty(),
-                "NULL SUM must make {operator} predicate false"
+                .rows,
+                vec![vec![Value::Null(DataType::Int64)]],
+                "empty {function} is NULL"
             );
+            for operator in ["=", "!=", "<>", "<", "<=", ">", ">="] {
+                assert!(
+                    query(
+                        &mut database,
+                        &format!(
+                            "SELECT {function}(amount) AS value FROM events \
+                             HAVING value {operator} 0"
+                        )
+                    )
+                    .rows
+                    .is_empty(),
+                    "NULL {function} must make {operator} predicate false"
+                );
+            }
         }
     }
 

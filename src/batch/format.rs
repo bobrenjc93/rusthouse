@@ -9,6 +9,7 @@ use crate::batch::value::Value;
 pub enum OutputFormat {
     Table,
     Csv,
+    Tsv,
     Json,
 }
 
@@ -18,6 +19,7 @@ impl OutputFormat {
         match value.to_ascii_lowercase().as_str() {
             "table" => Some(Self::Table),
             "csv" => Some(Self::Csv),
+            "tsv" => Some(Self::Tsv),
             "json" => Some(Self::Json),
             _ => None,
         }
@@ -29,6 +31,7 @@ pub fn render(result: &QueryResult, format: OutputFormat) -> String {
     match format {
         OutputFormat::Table => render_table(result),
         OutputFormat::Csv => render_csv(result),
+        OutputFormat::Tsv => render_tsv(result),
         OutputFormat::Json => render_json(result),
     }
 }
@@ -368,6 +371,65 @@ fn write_csv_field(output: &mut impl io::Write, value: &str) -> io::Result<()> {
     output.write_all(b"\"")
 }
 
+fn render_tsv(result: &QueryResult) -> String {
+    let mut output = Vec::new();
+    write_tsv(&mut output, result).expect("writing TSV to a Vec cannot fail");
+    String::from_utf8(output).expect("TSV rendering preserves UTF-8")
+}
+
+/// Streams one ClickHouse-style `TabSeparatedWithNames` result.
+///
+/// Column names and `String` values use ClickHouse's backslash escapes for
+/// backslashes, tabs, carriage returns, line feeds, NUL, backspace, form feed,
+/// and apostrophes. SQL `NULL` is emitted as `\N`.
+pub fn write_tsv(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
+    for (index, column) in result.columns.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b"\t")?;
+        }
+        write_tsv_escaped(output, &column.name)?;
+    }
+    output.write_all(b"\n")?;
+
+    for row in &result.rows {
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                output.write_all(b"\t")?;
+            }
+            match value {
+                Value::String(value) => write_tsv_escaped(output, value)?,
+                Value::Null(_) => output.write_all(b"\\N")?,
+                value => output.write_all(value.as_display_string().as_bytes())?,
+            }
+        }
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_tsv_escaped(output: &mut impl io::Write, value: &str) -> io::Result<()> {
+    let mut unescaped_start = 0;
+    for (index, character) in value.char_indices() {
+        let escaped = match character {
+            '\\' => Some(r"\\"),
+            '\t' => Some(r"\t"),
+            '\r' => Some(r"\r"),
+            '\n' => Some(r"\n"),
+            '\0' => Some(r"\0"),
+            '\u{08}' => Some(r"\b"),
+            '\u{0c}' => Some(r"\f"),
+            '\'' => Some(r"\'"),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            output.write_all(value[unescaped_start..index].as_bytes())?;
+            output.write_all(escaped.as_bytes())?;
+            unescaped_start = index + character.len_utf8();
+        }
+    }
+    output.write_all(value[unescaped_start..].as_bytes())
+}
+
 fn render_json(result: &QueryResult) -> String {
     let mut output = Vec::new();
     write_json(&mut output, result).expect("writing JSON to a Vec cannot fail");
@@ -480,6 +542,85 @@ mod tests {
             render(&result(), OutputFormat::Csv),
             "id,note\n1,\"quote: \"\", comma\"\n"
         );
+    }
+
+    #[test]
+    fn streams_all_tsv_value_types_nulls_and_escaping() {
+        let result = QueryResult {
+            columns: vec![
+                ResultColumn {
+                    name: "null\\name".to_owned(),
+                    data_type: DataType::String,
+                },
+                ResultColumn {
+                    name: "integer\tname".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                ResultColumn {
+                    name: "float\rname".to_owned(),
+                    data_type: DataType::Float64,
+                },
+                ResultColumn {
+                    name: "boolean\nname".to_owned(),
+                    data_type: DataType::Bool,
+                },
+                ResultColumn {
+                    name: "text".to_owned(),
+                    data_type: DataType::String,
+                },
+            ],
+            rows: vec![vec![
+                Value::Null(DataType::String),
+                Value::Int64(i64::MIN),
+                Value::Float64(2.0),
+                Value::Bool(false),
+                Value::String("slash\\tab\tcarriage\rline\n雪".to_owned()),
+            ]],
+        };
+        let expected = concat!(
+            "null\\\\name\tinteger\\tname\tfloat\\rname\tboolean\\nname\ttext\n",
+            "\\N\t-9223372036854775808\t2.0\tfalse\tslash\\\\tab\\tcarriage\\rline\\n雪\n",
+        );
+        let mut output = Vec::new();
+
+        write_tsv(&mut output, &result).expect("Vec accepts streamed TSV");
+
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(render(&result, OutputFormat::Tsv), expected);
+    }
+
+    #[test]
+    fn tsv_empty_result_still_writes_escaped_header() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "empty\tcolumn".to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_tsv(&mut output, &result).expect("Vec accepts streamed TSV");
+
+        assert_eq!(output, b"empty\\tcolumn\n");
+    }
+
+    #[test]
+    fn tsv_escapes_every_clickhouse_special_character_in_names_and_strings() {
+        let special_characters = "\\\t\r\n\0\u{08}\u{0c}'";
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: special_characters.to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(special_characters.to_owned())]],
+        };
+        let expected = concat!(r"\\\t\r\n\0\b\f\'", "\n", r"\\\t\r\n\0\b\f\'", "\n",);
+        let mut output = Vec::new();
+
+        write_tsv(&mut output, &result).expect("Vec accepts streamed TSV");
+
+        assert_eq!(output, expected.as_bytes());
     }
 
     #[test]
