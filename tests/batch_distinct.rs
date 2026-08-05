@@ -476,6 +476,89 @@ fn direct_ast_distinct_rejects_incomparable_predicate_literals_without_panicking
 }
 
 #[test]
+fn direct_ast_distinct_enforces_predicate_complexity_limits() {
+    const MAX_DEPTH: usize = 64;
+    const MAX_NODES: usize = 256;
+
+    fn comparison() -> Predicate {
+        Predicate::Comparison {
+            left: Operand::Column("value".to_owned()),
+            operator: ComparisonOperator::Equal,
+            right: Operand::Literal(Value::Int64(1)),
+        }
+    }
+
+    fn nested_conjunction(depth: usize) -> Predicate {
+        (0..depth).fold(comparison(), |left, _| {
+            Predicate::And(Box::new(left), Box::new(comparison()))
+        })
+    }
+
+    fn balanced_conjunction(leaves: usize) -> Predicate {
+        let mut predicates = (0..leaves).map(|_| comparison()).collect::<Vec<_>>();
+        while predicates.len() > 1 {
+            let mut next = Vec::with_capacity(predicates.len().div_ceil(2));
+            let mut current = predicates.into_iter();
+            while let Some(left) = current.next() {
+                next.push(match current.next() {
+                    Some(right) => Predicate::And(Box::new(left), Box::new(right)),
+                    None => left,
+                });
+            }
+            predicates = next;
+        }
+        predicates.pop().expect("at least one predicate leaf")
+    }
+
+    fn statement(predicate: Predicate) -> Statement {
+        Statement::Select(Select {
+            distinct: true,
+            items: vec![SelectItem::Column {
+                name: "value".to_owned(),
+                alias: None,
+            }],
+            table: "samples".to_owned(),
+            predicate: Some(predicate),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+        })
+    }
+
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE samples (value Int64); INSERT INTO samples VALUES (1);")
+        .expect("setup");
+
+    database
+        .execute_statement(statement(nested_conjunction(MAX_DEPTH)))
+        .expect("the exact predicate depth limit is accepted");
+    assert_eq!(
+        database.execute_statement(statement(nested_conjunction(MAX_DEPTH + 1))),
+        Err(Error::ResourceLimitExceeded {
+            resource: "WHERE predicate depth",
+            actual: MAX_DEPTH + 1,
+            max: MAX_DEPTH,
+        })
+    );
+
+    // A full binary predicate with 128 leaves has 255 total nodes. The next
+    // leaf raises the total to 257, the first representable count above 256.
+    database
+        .execute_statement(statement(balanced_conjunction((MAX_NODES + 1) / 2)))
+        .expect("the largest predicate below the node limit is accepted");
+    assert_eq!(
+        database.execute_statement(statement(balanced_conjunction((MAX_NODES + 3) / 2))),
+        Err(Error::ResourceLimitExceeded {
+            resource: "WHERE predicate nodes",
+            actual: MAX_NODES + 1,
+            max: MAX_NODES,
+        })
+    );
+}
+
+#[test]
 fn handles_empty_input_and_zero_exact_and_exceeded_limits() {
     let mut empty = Database::with_query_result_limits(QueryResultLimits {
         max_groups: 0,

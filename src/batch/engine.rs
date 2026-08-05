@@ -2666,6 +2666,45 @@ impl CompiledOperand {
 }
 
 fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
+    validate_predicate_complexity(predicate)?;
+    compile_bounded_predicate(table, predicate)
+}
+
+fn validate_predicate_complexity(predicate: &Predicate) -> Result<()> {
+    let mut pending = vec![(predicate, 0_usize)];
+    let mut nodes = 0_usize;
+    while let Some((predicate, depth)) = pending.pop() {
+        if depth > sql::MAX_PREDICATE_DEPTH {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "WHERE predicate depth",
+                actual: depth,
+                max: sql::MAX_PREDICATE_DEPTH,
+            });
+        }
+
+        nodes = nodes.saturating_add(1);
+        if nodes > sql::MAX_PREDICATE_NODES {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "WHERE predicate nodes",
+                actual: nodes,
+                max: sql::MAX_PREDICATE_NODES,
+            });
+        }
+
+        match predicate {
+            Predicate::Comparison { .. } => {}
+            Predicate::And(left, right) | Predicate::Or(left, right) => {
+                let child_depth = depth.saturating_add(1);
+                pending.push((right, child_depth));
+                pending.push((left, child_depth));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compiles a predicate only after its depth and node count have been bounded.
+fn compile_bounded_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPredicate> {
     match predicate {
         Predicate::Comparison {
             left,
@@ -2688,12 +2727,12 @@ fn compile_predicate(table: &Table, predicate: &Predicate) -> Result<CompiledPre
             })
         }
         Predicate::And(left, right) => Ok(CompiledPredicate::And(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_bounded_predicate(table, left)?),
+            Box::new(compile_bounded_predicate(table, right)?),
         )),
         Predicate::Or(left, right) => Ok(CompiledPredicate::Or(
-            Box::new(compile_predicate(table, left)?),
-            Box::new(compile_predicate(table, right)?),
+            Box::new(compile_bounded_predicate(table, left)?),
+            Box::new(compile_bounded_predicate(table, right)?),
         )),
     }
 }
