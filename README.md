@@ -160,12 +160,14 @@ magic value, format version, declared length, and CRC-32 checksum.
 bounded row count and tagged nullable `Int64` values.
 `restore_int64_table_from_file` reopens one of these files with a hard envelope
 read bound and restores a table only after the envelope, payload, schema, and
-row cap have all been validated. `Catalog::restore_int64_table_from_file`
-registers that validated table under a caller-supplied exact name while also
-enforcing the catalog's table-count and per-table row limits. These define the
-current persistence corruption boundary without yet choosing catalog
-serialization or filesystem replacement. The exact layouts are documented in
-[docs/snapshot-format.md](docs/snapshot-format.md).
+row cap have all been validated. An explicit-backup helper tries that same
+bounded restore against a caller-supplied backup only when the primary fails,
+and preserves both typed failures if neither file is valid.
+`Catalog::restore_int64_table_from_file` registers a validated table under a
+caller-supplied exact name while also enforcing the catalog's table-count and
+per-table row limits. These define the current persistence corruption boundary
+without yet choosing catalog serialization or filesystem replacement. The
+exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.md).
 
 ## CSV ingestion
 

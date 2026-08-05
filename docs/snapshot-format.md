@@ -102,3 +102,12 @@ cap and registers the restored table under a caller-supplied exact name only
 after the complete file and table validation succeeds. Duplicate-name and
 table-count failures are reported separately from the nested filesystem and
 snapshot errors. Every failure leaves all catalog entries unchanged.
+
+`restore_int64_table_from_file_with_backup` composes the same bounded file
+restore for a caller-supplied primary and explicit backup path. A valid primary
+takes precedence and the backup is not inspected. Any typed primary failure,
+including a missing, truncated, corrupt, schema-invalid, or over-limit file,
+causes one backup attempt with exactly the same codecs, schema, and row cap.
+Success identifies whether the primary or backup supplied the table. When both
+fail, one recovery error retains both typed file restoration errors and no
+partially restored table is returned.
