@@ -4,7 +4,7 @@ use std::process::{Command, Output, Stdio};
 
 use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{self, BatchSqlLimits, Statement};
+use rusthouse::batch::sql::{self, BatchSqlLimits, LiteralSelect, Statement};
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{SharedDatabase, SharedDatabaseError};
 
@@ -122,6 +122,48 @@ fn database_returns_one_inferred_column_and_row_for_each_literal_type() {
             }]
         );
         assert_eq!(result.rows, vec![vec![value]]);
+    }
+}
+
+#[test]
+fn direct_ast_execution_rejects_null_and_non_finite_literal_values() {
+    let mut database = Database::new();
+    let cases = [
+        (
+            Value::Null(DataType::Int64),
+            None,
+            "literal SELECT does not support NULL",
+        ),
+        (
+            Value::Null(DataType::String),
+            Some("aliased_null"),
+            "literal SELECT does not support NULL",
+        ),
+        (
+            Value::Float64(f64::NAN),
+            None,
+            "literal SELECT Float64 must be finite",
+        ),
+        (
+            Value::Float64(f64::INFINITY),
+            Some("positive_infinity"),
+            "literal SELECT Float64 must be finite",
+        ),
+        (
+            Value::Float64(f64::NEG_INFINITY),
+            None,
+            "literal SELECT Float64 must be finite",
+        ),
+    ];
+
+    for (value, alias, message) in cases {
+        assert_eq!(
+            database.execute_statement(Statement::LiteralSelect(LiteralSelect {
+                value,
+                alias: alias.map(str::to_owned),
+            })),
+            Err(Error::InvalidQuery(message.to_owned()))
+        );
     }
 }
 

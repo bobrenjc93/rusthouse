@@ -343,6 +343,7 @@ impl Database {
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
         let LiteralSelect { value, alias } = select;
+        validate_literal_select_value(&value)?;
         let columns = vec![ResultColumn {
             name: alias.unwrap_or_else(|| literal_result_name(&value)),
             data_type: value.data_type(),
@@ -624,11 +625,24 @@ impl Database {
     }
 }
 
+fn validate_literal_select_value(value: &Value) -> Result<()> {
+    match value {
+        Value::Null(_) => Err(Error::InvalidQuery(
+            "literal SELECT does not support NULL".to_owned(),
+        )),
+        Value::Float64(value) if !value.is_finite() => Err(Error::InvalidQuery(
+            "literal SELECT Float64 must be finite".to_owned(),
+        )),
+        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) | Value::String(_) => Ok(()),
+    }
+}
+
 fn literal_result_name(value: &Value) -> String {
     match value {
         Value::String(value) => format!("'{}'", value.replace('\'', "''")),
-        Value::Null(_) => unreachable!("literal SELECT does not support NULL"),
-        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => value.as_display_string(),
+        Value::Null(_) | Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => {
+            value.as_display_string()
+        }
     }
 }
 
