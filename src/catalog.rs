@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 
 use crate::execution::{
@@ -19,14 +20,14 @@ use crate::execution::{
     execute_select_with_order_limits as execute_select_statement_with_limits,
 };
 use crate::{
-    AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, DistinctLimits,
-    InnerJoinStatement, InsertStatement, Int64Table, Int64TableFileRestoreError, JoinLimits,
-    LeftJoinStatement, NullableI64PayloadCodec, OrderLimits, ParseError, ParseLimits,
+    AggregateLimits, CreateTableStatement, CsvIngestError, CsvIngestLimits, CsvReaderIngestError,
+    DistinctLimits, InnerJoinStatement, InsertStatement, Int64Table, Int64TableFileRestoreError,
+    JoinLimits, LeftJoinStatement, NullableI64PayloadCodec, OrderLimits, ParseError, ParseLimits,
     ScalarCountStatement, ScalarMinStatement, ScalarSumStatement, ScanLimits, Schema,
     SelectDistinctStatement, SelectStatement, SnapshotCodec, ingest_csv_with_names,
-    parse_create_table, parse_inner_join, parse_insert, parse_left_join, parse_scalar_count,
-    parse_scalar_min, parse_scalar_sum, parse_select, parse_select_distinct,
-    restore_int64_table_from_file as restore_table_from_file,
+    ingest_csv_with_names_from_reader, parse_create_table, parse_inner_join, parse_insert,
+    parse_left_join, parse_scalar_count, parse_scalar_min, parse_scalar_sum, parse_select,
+    parse_select_distinct, restore_int64_table_from_file as restore_table_from_file,
 };
 
 /// Resource bounds applied to an in-memory catalog.
@@ -141,6 +142,39 @@ impl Error for CatalogCsvIngestError {
 impl From<CsvIngestError> for CatalogCsvIngestError {
     fn from(error: CsvIngestError) -> Self {
         Self::Csv(error)
+    }
+}
+
+/// An error produced while ingesting CSV from a reader through a [`Catalog`].
+#[derive(Debug)]
+pub enum CatalogCsvReaderIngestError {
+    /// No table has the exact requested name.
+    UnknownTable { name: String },
+    /// The named table's bounded reader ingestion failed.
+    Reader(CsvReaderIngestError),
+}
+
+impl fmt::Display for CatalogCsvReaderIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTable { name } => write!(formatter, "unknown table '{name}'"),
+            Self::Reader(error) => write!(formatter, "could not ingest CSV from reader: {error}"),
+        }
+    }
+}
+
+impl Error for CatalogCsvReaderIngestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Reader(error) => Some(error),
+            Self::UnknownTable { .. } => None,
+        }
+    }
+}
+
+impl From<CsvReaderIngestError> for CatalogCsvReaderIngestError {
+    fn from(error: CsvReaderIngestError) -> Self {
+        Self::Reader(error)
     }
 }
 
@@ -363,6 +397,26 @@ impl Catalog {
                 })?;
 
         ingest_csv_with_names(table, input, limits).map_err(Into::into)
+    }
+
+    /// Reads and atomically ingests bounded `CSVWithNames` into an exactly named table.
+    ///
+    /// The table is resolved before the reader is consumed. Once resolved, the
+    /// operation delegates to [`ingest_csv_with_names_from_reader`], preserving
+    /// its bounded read and transactional parsing and append behavior.
+    pub fn ingest_csv_with_names_from_reader(
+        &mut self,
+        table_name: &str,
+        reader: impl Read,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, CatalogCsvReaderIngestError> {
+        let table = self.tables.get_mut(table_name).ok_or_else(|| {
+            CatalogCsvReaderIngestError::UnknownTable {
+                name: table_name.to_owned(),
+            }
+        })?;
+
+        ingest_csv_with_names_from_reader(table, reader, limits).map_err(Into::into)
     }
 
     /// Parses and executes one scalar `COUNT` with explicit resource bounds.

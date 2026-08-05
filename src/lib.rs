@@ -21,7 +21,8 @@ pub use aggregate::{
 };
 pub use batch::{SharedDatabase, SharedDatabaseError};
 pub use catalog::{
-    Catalog, CatalogCsvIngestError, CatalogError, CatalogLimits, CatalogSnapshotRestoreError,
+    Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
+    CatalogSnapshotRestoreError,
 };
 pub use cli::{
     DEFAULT_MAX_SESSION_BYTES, DEFAULT_MAX_SESSION_ROWS_PER_TABLE, DEFAULT_MAX_SESSION_STATEMENTS,
