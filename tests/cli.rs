@@ -120,6 +120,32 @@ fn csv_batch_emits_show_tables_metadata_in_stable_display_order() {
 }
 
 #[test]
+fn batch_formats_emit_describe_table_metadata() {
+    let sql = b"CREATE TABLE metrics (id Int64, score Float64, active Bool, label String); \
+                DESCRIBE TABLE metrics;";
+
+    let csv = run(&["--format", "csv"], sql);
+    assert!(csv.status.success(), "{:?}", csv.stderr);
+    assert_eq!(
+        csv.stdout,
+        b"name,type\nid,Int64\nscore,Float64\nactive,Bool\nlabel,String\n"
+    );
+    assert!(csv.stderr.is_empty());
+
+    let json = run(&["--format", "json"], sql);
+    assert!(json.status.success(), "{:?}", json.stderr);
+    assert_eq!(
+        json.stdout,
+        concat!(
+            r#"{"columns":[{"name":"name","type":"String"},{"name":"type","type":"String"}],"rows":[["id","Int64"],["score","Float64"],["active","Bool"],["label","String"]]}"#,
+            "\n"
+        )
+        .as_bytes()
+    );
+    assert!(json.stderr.is_empty());
+}
+
+#[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
     for format in ["csv", "json"] {
         let output = run(

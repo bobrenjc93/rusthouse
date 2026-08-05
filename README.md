@@ -32,6 +32,9 @@ String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
+`DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
+and `type` `String` columns. It uses case-insensitive table lookup and applies
+the normal result row, value, and byte limits before allocating result storage.
 Two existing `SELECT` queries can be combined with `UNION ALL`. Their rows are
 concatenated left-first, the left query supplies the result column names, and
 both operands must return the same number and sequence of column types. Each
@@ -111,8 +114,8 @@ rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Every statement shares one in-memory catalog. Successful `CREATE` and `INSERT`
-statements are silent, and each `SELECT` or `SHOW TABLES` query is executed and
-emitted before the next statement. CSV output uses a CSVWithNames-compatible
+statements are silent, and each `SELECT`, `SHOW TABLES`, or `DESCRIBE TABLE`
+query is executed and emitted before the next statement. CSV output uses a CSVWithNames-compatible
 header followed by typed rows; commas, quotes, and newlines in strings are
 CSV-escaped. JSON output is newline-delimited, with one compact object per
 query containing typed column metadata and positional rows. Numbers and
@@ -149,8 +152,9 @@ return owned projection rows. Existing catalog failures remain typed, and lock
 poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
-engine. Its `query` method accepts exactly one `SELECT` or `SHOW TABLES`, takes
-a shared read lock, and returns an owned, resource-bounded result, so cloned
+engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, or
+`DESCRIBE TABLE`, takes a shared read lock, and returns an owned,
+resource-bounded result, so cloned
 handles can run analytical reads concurrently. Mutating batches passed to
 `execute` retain one write lock for the entire batch and cannot interleave.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
