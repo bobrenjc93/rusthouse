@@ -650,6 +650,22 @@
         "eval_c88a7f3d": 35,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:418",
+      "recordedAt": "2026-08-05T04:30:44.788Z",
+      "label": "PR #418",
+      "kind": "leaf",
+      "prNumber": 418,
+      "title": "Add minimal ROW_NUMBER window projection",
+      "scores": {
+        "eval_9fbdfec0": 70,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 35,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }

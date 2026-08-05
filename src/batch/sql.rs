@@ -97,6 +97,10 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    /// The deliberately minimal `ROW_NUMBER() OVER ()` window projection.
+    RowNumber {
+        alias: Option<String>,
+    },
     Aggregate {
         function: AggregateFunction,
         argument: AggregateArgument,
@@ -181,6 +185,40 @@ pub struct Having {
 pub struct OrderBy {
     pub name: String,
     pub descending: bool,
+}
+
+fn validate_row_number_shape(select: &Select, position: usize) -> Result<()> {
+    let has_row_number = select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::RowNumber { .. }));
+    if !has_row_number {
+        return Ok(());
+    }
+
+    let message = if select.distinct {
+        Some("ROW_NUMBER() OVER () is not supported with DISTINCT")
+    } else if !select.group_by.is_empty() || select.having.is_some() {
+        Some("ROW_NUMBER() OVER () is only supported in ungrouped SELECT queries")
+    } else if select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::Aggregate { .. }))
+    {
+        Some("ROW_NUMBER() OVER () cannot be combined with aggregate projections")
+    } else if !select.order_by.is_empty() {
+        Some("ROW_NUMBER() OVER () cannot be combined with ORDER BY")
+    } else {
+        None
+    };
+
+    match message {
+        Some(message) => Err(Error::Sql {
+            position,
+            message: message.to_owned(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Parse one or more semicolon-separated SQL statements.
@@ -762,7 +800,7 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(Select {
+        let select = Select {
             distinct: false,
             items,
             table,
@@ -771,7 +809,9 @@ impl<'a> Parser<'a> {
             having,
             order_by,
             limit,
-        })
+        };
+        validate_row_number_shape(&select, self.position())?;
+        Ok(select)
     }
 
     fn parse_distinct_select(&mut self) -> Result<Select> {
@@ -842,6 +882,21 @@ impl<'a> Parser<'a> {
         let position = self.position();
         let name = self.expect_identifier("column or aggregate function")?;
         if self.eat(&TokenKind::LeftParen) {
+            if name.eq_ignore_ascii_case("ROW_NUMBER") {
+                self.expect(
+                    &TokenKind::RightParen,
+                    "')' after the empty ROW_NUMBER argument list",
+                )?;
+                self.expect_keyword("OVER")?;
+                self.expect(&TokenKind::LeftParen, "'(' after OVER")?;
+                self.expect(
+                    &TokenKind::RightParen,
+                    "')' after the empty ROW_NUMBER window",
+                )?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::RowNumber { alias });
+            }
+
             if name.eq_ignore_ascii_case("CAST") {
                 let name = self.expect_identifier("Int64 column in CAST")?;
                 self.expect_keyword("AS")?;

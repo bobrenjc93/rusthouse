@@ -61,8 +61,9 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST` and `LENGTH` provide bounded scalar projections in ungrouped
-/// queries. An optional `AS` alias controls each result column name.
+/// `CAST`, `LENGTH`, and the minimal `ROW_NUMBER() OVER ()` window form provide
+/// bounded projections in ungrouped queries. An optional `AS` alias controls
+/// each result column name.
 ///
 /// # Examples
 ///
@@ -352,6 +353,7 @@ impl Database {
         result_prefix: Option<SelectResultPrefix<'_>>,
     ) -> Result<QueryResult> {
         validate_distinct_shape(&select)?;
+        validate_row_number_shape(&select)?;
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -384,6 +386,12 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
+        if items
+            .iter()
+            .any(|item| matches!(item, ResolvedItem::RowNumber))
+        {
+            validate_row_number_count(matching_rows.len())?;
+        }
 
         let grouped = select.distinct || !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -566,6 +574,42 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
     Ok(())
 }
 
+fn validate_row_number_shape(select: &Select) -> Result<()> {
+    let has_row_number = select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::RowNumber { .. }));
+    if !has_row_number {
+        return Ok(());
+    }
+
+    if select.distinct {
+        return Err(Error::InvalidQuery(
+            "ROW_NUMBER() OVER () is not supported with DISTINCT".to_owned(),
+        ));
+    }
+    if !select.group_by.is_empty() || select.having.is_some() {
+        return Err(Error::InvalidQuery(
+            "ROW_NUMBER() OVER () is only supported in ungrouped SELECT queries".to_owned(),
+        ));
+    }
+    if select
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::Aggregate { .. }))
+    {
+        return Err(Error::InvalidQuery(
+            "ROW_NUMBER() OVER () cannot be combined with aggregate projections".to_owned(),
+        ));
+    }
+    if !select.order_by.is_empty() {
+        return Err(Error::InvalidQuery(
+            "ROW_NUMBER() OVER () cannot be combined with ORDER BY".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_distinct_columns(table: &Table, items: &[SelectItem]) -> Result<Vec<usize>> {
     let mut columns = Vec::with_capacity(items.len());
     for item in items {
@@ -633,6 +677,7 @@ enum ResolvedItem {
     StringLength {
         source: usize,
     },
+    RowNumber,
     Aggregate {
         state: usize,
     },
@@ -804,6 +849,13 @@ fn resolve_select_items(
                     data_type: DataType::Int64,
                 });
             }
+            SelectItem::RowNumber { alias } => {
+                items.push(ResolvedItem::RowNumber);
+                result_columns.push(ResultColumn {
+                    name: alias.clone().unwrap_or_else(|| "ROW_NUMBER()".to_owned()),
+                    data_type: DataType::Int64,
+                });
+            }
             SelectItem::Aggregate {
                 function,
                 argument,
@@ -931,7 +983,8 @@ fn execute_projection(
 ) -> Result<Vec<Vec<Value>>> {
     matching_rows
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(row_number, row)| {
             items
                 .iter()
                 .map(|item| {
@@ -943,6 +996,7 @@ fn execute_projection(
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
+                        ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("projection does not contain aggregates")
                         }
@@ -951,6 +1005,20 @@ fn execute_projection(
                 .collect()
         })
         .collect()
+}
+
+fn validate_row_number_count(row_count: usize) -> Result<()> {
+    if row_count > 0 {
+        checked_row_number(row_count - 1)?;
+    }
+    Ok(())
+}
+
+fn checked_row_number(zero_based: usize) -> Result<i64> {
+    i64::try_from(zero_based)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| Error::NumericOverflow("ROW_NUMBER result".to_owned()))
 }
 
 fn limited_cartesian_row_count(
@@ -1046,7 +1114,9 @@ fn validate_projection_result_limits(
         for item in items {
             let source = match item {
                 ResolvedItem::Column { source, .. } => Some(*source),
-                ResolvedItem::CastInt64ToFloat64 { .. } | ResolvedItem::StringLength { .. } => None,
+                ResolvedItem::CastInt64ToFloat64 { .. }
+                | ResolvedItem::StringLength { .. }
+                | ResolvedItem::RowNumber => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
                 }
@@ -1091,6 +1161,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::RowNumber => {
+                    unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Aggregate { state } => match &data.aggregates[*state][*group] {
                     Value::String(value) => value.len(),
@@ -1477,6 +1550,11 @@ impl GroupedData<'_> {
                         ResolvedItem::StringLength { .. } => {
                             unreachable!("LENGTH projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::RowNumber => {
+                            unreachable!(
+                                "ROW_NUMBER projections are restricted to ungrouped queries"
+                            )
+                        }
                         ResolvedItem::Aggregate { state } => {
                             self.aggregates[*state][*group].clone()
                         }
@@ -1783,6 +1861,9 @@ fn order_source_rows(
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
+                ResolvedItem::RowNumber => {
+                    unreachable!("ROW_NUMBER projections cannot be ordered")
+                }
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
                 }
@@ -1824,6 +1905,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::StringLength { .. } => {
                     unreachable!("LENGTH projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::RowNumber => {
+                    unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::Aggregate { state } => {
                     data.aggregates[state][left].cmp(&data.aggregates[state][right])
@@ -2752,5 +2836,18 @@ mod tests {
                 max: 100,
             } if actual > 100
         ));
+    }
+
+    #[test]
+    fn row_number_conversion_is_one_based_and_checked() {
+        assert_eq!(checked_row_number(0), Ok(1));
+        assert_eq!(checked_row_number(41), Ok(42));
+
+        if let Ok(max_i64) = usize::try_from(i64::MAX) {
+            assert_eq!(
+                checked_row_number(max_i64),
+                Err(Error::NumericOverflow("ROW_NUMBER result".to_owned()))
+            );
+        }
     }
 }
