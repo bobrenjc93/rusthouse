@@ -149,7 +149,8 @@ metadata and positional rows. Numbers and booleans use native JSON values, SQL
 `NULL` becomes `null`, and strings are JSON-escaped.
 TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
-carriage returns, and line feeds in column names and strings are backslash-escaped.
+carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
+column names and strings use ClickHouse's backslash escapes.
 A query result is checked before cloning against limits of 10,000 rows, 250,000
 values, and an estimated 16 MiB. Grouped queries additionally allow 100,000
 groups and bound grouped keys to 500,000 cells and an estimated 32 MiB. Their

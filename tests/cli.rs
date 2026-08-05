@@ -75,7 +75,7 @@ fn tsv_batch_emits_all_types_nulls_empty_and_multiple_escaped_results() {
           );
           SELECT id, score, enabled, label FROM metrics;
           INSERT INTO metrics VALUES
-              (1, 1.5, true, 'slash\\tab\tcarriage\rline\nend'),
+              (1, 1.5, true, 'slash\\tab\tcarriage\rline\nnul\0back\x08form\x0capostrophe''inside'),
               (2, 2.0, false, 'plain');
           SELECT id, score, enabled, label FROM metrics ORDER BY id;
           SELECT MIN(label) AS missing FROM metrics WHERE id < 0;
@@ -87,7 +87,7 @@ fn tsv_batch_emits_all_types_nulls_empty_and_multiple_escaped_results() {
         output.stdout,
         b"id\tscore\tenabled\tlabel\n\
           id\tscore\tenabled\tlabel\n\
-          1\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nend\n\
+          1\t1.5\ttrue\tslash\\\\tab\\tcarriage\\rline\\nnul\\0back\\bform\\fapostrophe\\'inside\n\
           2\t2.0\tfalse\tplain\n\
           missing\n\
           \\N\n\

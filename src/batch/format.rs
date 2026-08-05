@@ -379,8 +379,9 @@ fn render_tsv(result: &QueryResult) -> String {
 
 /// Streams one ClickHouse-style `TabSeparatedWithNames` result.
 ///
-/// Column names and `String` values escape backslashes, tabs, carriage
-/// returns, and line feeds. SQL `NULL` is emitted as `\N`.
+/// Column names and `String` values use ClickHouse's backslash escapes for
+/// backslashes, tabs, carriage returns, line feeds, NUL, backspace, form feed,
+/// and apostrophes. SQL `NULL` is emitted as `\N`.
 pub fn write_tsv(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
     for (index, column) in result.columns.iter().enumerate() {
         if index > 0 {
@@ -414,6 +415,10 @@ fn write_tsv_escaped(output: &mut impl io::Write, value: &str) -> io::Result<()>
             '\t' => Some(r"\t"),
             '\r' => Some(r"\r"),
             '\n' => Some(r"\n"),
+            '\0' => Some(r"\0"),
+            '\u{08}' => Some(r"\b"),
+            '\u{0c}' => Some(r"\f"),
+            '\'' => Some(r"\'"),
             _ => None,
         };
         if let Some(escaped) = escaped {
@@ -598,6 +603,24 @@ mod tests {
         write_tsv(&mut output, &result).expect("Vec accepts streamed TSV");
 
         assert_eq!(output, b"empty\\tcolumn\n");
+    }
+
+    #[test]
+    fn tsv_escapes_every_clickhouse_special_character_in_names_and_strings() {
+        let special_characters = "\\\t\r\n\0\u{08}\u{0c}'";
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: special_characters.to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(special_characters.to_owned())]],
+        };
+        let expected = concat!(r"\\\t\r\n\0\b\f\'", "\n", r"\\\t\r\n\0\b\f\'", "\n",);
+        let mut output = Vec::new();
+
+        write_tsv(&mut output, &result).expect("Vec accepts streamed TSV");
+
+        assert_eq!(output, expected.as_bytes());
     }
 
     #[test]
