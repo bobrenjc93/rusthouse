@@ -66,6 +66,32 @@ impl Default for QueryResultLimits {
 /// provide bounded projections in ungrouped queries. An optional `AS` alias
 /// controls each result column name.
 ///
+/// A literal-only query returns one inferred, typed column and one row:
+///
+/// ```
+/// use rusthouse::batch::engine::{Database, ResultColumn, StatementResult};
+/// use rusthouse::batch::value::{DataType, Value};
+///
+/// let mut database = Database::new();
+/// let results = database.execute("SELECT 'it''s ready' AS message;")?;
+///
+/// let [StatementResult::Query(query)] = results.as_slice() else {
+///     panic!("the SELECT must produce exactly one query result");
+/// };
+/// assert_eq!(
+///     query.columns,
+///     vec![ResultColumn {
+///         name: "message".to_owned(),
+///         data_type: DataType::String,
+///     }],
+/// );
+/// assert_eq!(
+///     query.rows,
+///     vec![vec![Value::String("it's ready".to_owned())]],
+/// );
+/// # Ok::<(), rusthouse::batch::error::Error>(())
+/// ```
+///
 /// # Examples
 ///
 /// ```
