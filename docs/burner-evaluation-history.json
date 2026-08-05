@@ -794,6 +794,38 @@
         "eval_c88a7f3d": 35,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "base:7f50056e549c0a11514c015c5aacfc754c1ebad9",
+      "commit": "7f50056e549c0a11514c015c5aacfc754c1ebad9",
+      "recordedAt": "2026-08-05T13:04:37.347Z",
+      "label": "base 7f50056",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_9fbdfec0": 80,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 20,
+        "eval_d04acec3": 90
+      }
+    },
+    {
+      "key": "pr:438",
+      "recordedAt": "2026-08-05T13:04:37.347Z",
+      "label": "PR #438",
+      "kind": "leaf",
+      "prNumber": 438,
+      "title": "Atomically replace a snapshot envelope file",
+      "scores": {
+        "eval_9fbdfec0": 80,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 20,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
