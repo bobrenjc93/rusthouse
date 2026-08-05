@@ -890,6 +890,22 @@
         "eval_c88a7f3d": 25,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:449",
+      "recordedAt": "2026-08-05T19:35:50.936Z",
+      "label": "PR #449",
+      "kind": "leaf",
+      "prNumber": 449,
+      "title": "Expose canonical DDL with SHOW CREATE TABLE",
+      "scores": {
+        "eval_9fbdfec0": 85,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 25,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
