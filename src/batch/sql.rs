@@ -50,6 +50,8 @@ pub enum Statement {
         table: String,
         rows: Vec<Vec<Value>>,
     },
+    /// Exactly one typed literal with no `FROM` or other clauses.
+    LiteralSelect(LiteralSelect),
     Select(Select),
     /// A deliberately narrow, two-table Cartesian product.
     CrossJoin(CrossJoin),
@@ -62,6 +64,16 @@ pub enum Statement {
     DescribeTable {
         name: String,
     },
+}
+
+/// `SELECT <literal> [AS <alias>]`.
+///
+/// This deliberately separate syntax tree keeps expression lists, table
+/// sources, and trailing clauses unrepresentable for literal-only queries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiteralSelect {
+    pub value: Value,
+    pub alias: Option<String>,
 }
 
 /// `SELECT * FROM <left> CROSS JOIN <right> [LIMIT n]`.
@@ -572,6 +584,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
+        if self.at_literal_start() {
+            return self.parse_literal_select();
+        }
+
         let left = self.parse_select()?;
         if self.eat_keyword("CROSS") {
             return self.parse_cross_join(left);
@@ -589,6 +605,31 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Statement::UnionAll { left, right })
+    }
+
+    fn parse_literal_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "literal SELECT supports exactly one literal with an optional AS alias and no trailing clauses";
+
+        self.reserve_ast_list_item()?;
+        let value = self.parse_literal()?;
+        let alias = self.parse_alias()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::LiteralSelect(LiteralSelect { value, alias }))
+    }
+
+    fn at_literal_start(&self) -> bool {
+        match self.peek() {
+            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Plus | TokenKind::Minus => {
+                true
+            }
+            TokenKind::Identifier(value) => {
+                value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE")
+            }
+            _ => false,
+        }
     }
 
     fn parse_cross_join(&mut self, left: Select) -> Result<Statement> {
@@ -1149,7 +1190,7 @@ impl<'a> Parser<'a> {
 
     fn parse_operand(&mut self) -> Result<Operand> {
         match self.peek() {
-            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Minus => {
+            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::Plus | TokenKind::Minus => {
                 self.parse_literal().map(Operand::Literal)
             }
             TokenKind::Identifier(value)
@@ -1172,13 +1213,15 @@ impl<'a> Parser<'a> {
             return Ok(Value::String(value));
         }
 
-        let negative = self.eat(&TokenKind::Minus);
+        let sign = if self.eat(&TokenKind::Minus) {
+            Some('-')
+        } else if self.eat(&TokenKind::Plus) {
+            Some('+')
+        } else {
+            None
+        };
         if let Some(number) = self.take_number() {
-            let signed = if negative {
-                format!("-{number}")
-            } else {
-                number
-            };
+            let signed = sign.map_or(number.clone(), |sign| format!("{sign}{number}"));
             if signed.contains(['.', 'e', 'E']) {
                 let value = signed.parse::<f64>().map_err(|_| Error::Sql {
                     position: self.position(),
@@ -1197,8 +1240,8 @@ impl<'a> Parser<'a> {
                     message: format!("invalid Int64 literal '{signed}'"),
                 });
         }
-        if negative {
-            return self.error("expected a number after '-'");
+        if let Some(sign) = sign {
+            return self.error(format!("expected a number after '{sign}'"));
         }
 
         if self.eat_keyword("TRUE") {

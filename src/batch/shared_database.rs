@@ -179,7 +179,8 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
     }
     let statement = statements.pop().expect("the statement count is one");
     match statement {
-        statement @ (Statement::Select(_)
+        statement @ (Statement::LiteralSelect(_)
+        | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
         | Statement::ShowTables
