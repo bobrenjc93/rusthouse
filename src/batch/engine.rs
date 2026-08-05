@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::batch::catalog::Catalog;
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having, Operand,
-    OrderBy, Predicate, Select, SelectItem, Statement,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
+    LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -296,7 +296,8 @@ impl Database {
                     affected_rows,
                 })
             }
-            statement @ (Statement::Select(_)
+            statement @ (Statement::LiteralSelect(_)
+            | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
             | Statement::ShowTables
@@ -312,6 +313,9 @@ impl Database {
         query_result_limits: QueryResultLimits,
     ) -> Result<QueryResult> {
         match statement {
+            Statement::LiteralSelect(select) => {
+                self.execute_literal_select(select, query_result_limits)
+            }
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
                 self.execute_cross_join(cross_join, query_result_limits)
@@ -331,6 +335,33 @@ impl Database {
                     .to_owned(),
             )),
         }
+    }
+
+    fn execute_literal_select(
+        &self,
+        select: LiteralSelect,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        let LiteralSelect { value, alias } = select;
+        let columns = vec![ResultColumn {
+            name: alias.unwrap_or_else(|| literal_result_name(&value)),
+            data_type: value.data_type(),
+        }];
+        let mut bytes =
+            validate_result_shape(1, 1, &columns, query_result_limits, SELECT_RESULT_RESOURCES)?;
+        if let Value::String(value) = &value {
+            bytes = bytes.saturating_add(value.len());
+            enforce_resource_limit(
+                SELECT_RESULT_RESOURCES.bytes,
+                bytes,
+                query_result_limits.max_bytes,
+            )?;
+        }
+
+        Ok(QueryResult {
+            columns,
+            rows: vec![vec![value]],
+        })
     }
 
     fn execute_show_tables(&self, query_result_limits: QueryResultLimits) -> Result<QueryResult> {
@@ -590,6 +621,14 @@ impl Database {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+}
+
+fn literal_result_name(value: &Value) -> String {
+    match value {
+        Value::String(value) => format!("'{}'", value.replace('\'', "''")),
+        Value::Null(_) => unreachable!("literal SELECT does not support NULL"),
+        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => value.as_display_string(),
     }
 }
 
