@@ -26,8 +26,9 @@ multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a
-unique projected `COUNT(*)` or `SUM(Int64)` alias to a signed `Int64` threshold
-in `HAVING`. An empty `SUM` is `NULL` and does not satisfy a `HAVING` predicate.
+unique projected `COUNT(*)`, `COUNT(column)`, `SUM(Int64)`, `MIN(Int64)`, or
+`MAX(Int64)` alias to a signed `Int64` threshold in `HAVING`. Empty `SUM`,
+`MIN`, and `MAX` results are `NULL` and do not satisfy a `HAVING` predicate.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
