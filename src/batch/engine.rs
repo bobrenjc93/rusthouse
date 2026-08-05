@@ -61,9 +61,9 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST`, `LENGTH`, `ABS`, and the minimal unpartitioned `ROW_NUMBER` window forms
-/// provide bounded projections in ungrouped queries. An optional `AS` alias
-/// controls each result column name.
+/// `CAST`, `LENGTH`, `ABS`, and the minimal `ROW_NUMBER` window forms provide
+/// bounded projections in ungrouped queries. An optional `AS` alias controls
+/// each result column name.
 ///
 /// # Examples
 ///
@@ -376,7 +376,7 @@ impl Database {
         };
         let (items, result_columns, aggregate_specs) =
             resolve_select_items(table, &select.items, &group_columns)?;
-        let window_ordering = resolve_row_number_ordering(table, &select.items)?;
+        let row_number_window = resolve_row_number_window(table, &select.items)?;
         let having = select
             .having
             .as_ref()
@@ -396,15 +396,26 @@ impl Database {
                     .is_none_or(|predicate| predicate.evaluate(table, *row))
             })
             .collect::<Vec<_>>();
-        if let Some(ordering) = window_ordering {
-            order_window_rows(&mut matching_rows, table, ordering);
-        }
-        if items
-            .iter()
-            .any(|item| matches!(item, ResolvedItem::RowNumber))
-        {
-            validate_row_number_count(matching_rows.len())?;
-        }
+        let mut row_numbers = match row_number_window {
+            Some(ResolvedRowNumberWindow::Unpartitioned { ordering }) => {
+                if let Some(ordering) = ordering {
+                    order_window_rows(&mut matching_rows, table, ordering);
+                }
+                unpartitioned_row_numbers(
+                    matching_rows.len(),
+                    select.limit,
+                    query_result_limits.max_rows,
+                )?
+            }
+            Some(ResolvedRowNumberWindow::Partitioned { source }) => partitioned_row_numbers(
+                table,
+                &matching_rows,
+                source,
+                select.limit,
+                query_result_limits,
+            )?,
+            None => Vec::new(),
+        };
 
         let grouped = select.distinct || !group_columns.is_empty() || !aggregate_specs.is_empty();
         let rows = if grouped {
@@ -443,6 +454,7 @@ impl Database {
             grouped.project(&selected_groups, &items)
         } else {
             order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            row_numbers.truncate(matching_rows.len());
             validate_projection_result_limits(
                 table,
                 &matching_rows,
@@ -451,7 +463,7 @@ impl Database {
                 query_result_limits,
                 result_prefix,
             )?;
-            execute_projection(table, &matching_rows, &items)?
+            execute_projection(table, &matching_rows, &row_numbers, &items)?
         };
 
         Ok(QueryResult {
@@ -629,51 +641,86 @@ struct ResolvedWindowOrder {
     descending: bool,
 }
 
-fn resolve_row_number_ordering(
+#[derive(Debug, Clone, Copy)]
+enum ResolvedRowNumberWindow {
+    Unpartitioned {
+        ordering: Option<ResolvedWindowOrder>,
+    },
+    Partitioned {
+        source: usize,
+    },
+}
+
+fn resolve_row_number_window(
     table: &Table,
     items: &[SelectItem],
-) -> Result<Option<ResolvedWindowOrder>> {
-    let mut row_number_orders = items.iter().filter_map(|item| match item {
-        SelectItem::RowNumber { order_by, .. } => Some(order_by.as_ref()),
+) -> Result<Option<ResolvedRowNumberWindow>> {
+    let mut windows = items.iter().filter_map(|item| match item {
+        SelectItem::RowNumber {
+            partition_by,
+            order_by,
+            ..
+        } => Some((partition_by.as_deref(), order_by.as_ref())),
         _ => None,
     });
-    let Some(first) = row_number_orders.next() else {
+    let Some(first) = windows.next() else {
         return Ok(None);
     };
 
-    if row_number_orders.any(|order| !same_window_order(first, order)) {
+    if windows.any(|window| !same_row_number_window(first, window)) {
         return Err(Error::InvalidQuery(
-            "all ROW_NUMBER projections must use the same window ordering".to_owned(),
+            "all ROW_NUMBER projections must use the same window specification".to_owned(),
         ));
     }
 
-    let Some(order) = first else {
-        return Ok(None);
-    };
-    let source = table.column_index(&order.name)?;
+    if let Some(partition_by) = first.0 {
+        let source = resolve_row_number_int64_column(table, partition_by, "PARTITION BY")?;
+        return Ok(Some(ResolvedRowNumberWindow::Partitioned { source }));
+    }
+
+    let ordering = first
+        .1
+        .map(|order| {
+            let source = resolve_row_number_int64_column(table, &order.name, "ORDER BY")?;
+            Ok(ResolvedWindowOrder {
+                source,
+                descending: order.descending,
+            })
+        })
+        .transpose()?;
+    Ok(Some(ResolvedRowNumberWindow::Unpartitioned { ordering }))
+}
+
+fn resolve_row_number_int64_column(table: &Table, name: &str, clause: &str) -> Result<usize> {
+    let source = table.column_index(name)?;
     let actual = table.schema()[source].data_type;
     if actual != DataType::Int64 {
         return Err(Error::TypeMismatch {
-            context: format!("ROW_NUMBER ORDER BY column '{}'", order.name),
+            context: format!("ROW_NUMBER {clause} column '{name}'"),
             expected: DataType::Int64.to_string(),
             actual: actual.to_string(),
         });
     }
-
-    Ok(Some(ResolvedWindowOrder {
-        source,
-        descending: order.descending,
-    }))
+    Ok(source)
 }
 
-fn same_window_order(left: Option<&OrderBy>, right: Option<&OrderBy>) -> bool {
-    match (left, right) {
+fn same_row_number_window(
+    left: (Option<&str>, Option<&OrderBy>),
+    right: (Option<&str>, Option<&OrderBy>),
+) -> bool {
+    let same_partition = match (left.0, right.0) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    let same_order = match (left.1, right.1) {
         (None, None) => true,
         (Some(left), Some(right)) => {
             left.descending == right.descending && left.name.eq_ignore_ascii_case(&right.name)
         }
         (None, Some(_)) | (Some(_), None) => false,
-    }
+    };
+    same_partition && same_order
 }
 
 fn order_window_rows(rows: &mut [usize], table: &Table, ordering: ResolvedWindowOrder) {
@@ -1096,6 +1143,7 @@ fn aggregate_output_type(function: AggregateFunction, input_type: Option<DataTyp
 fn execute_projection(
     table: &Table,
     matching_rows: &[usize],
+    row_numbers: &[i64],
     items: &[ResolvedItem],
 ) -> Result<Vec<Vec<Value>>> {
     matching_rows
@@ -1119,7 +1167,7 @@ fn execute_projection(
                         ResolvedItem::Int64Abs { source } => {
                             Value::Int64(checked_int64_abs(int64_at(table, *source, *row))?)
                         }
-                        ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
+                        ResolvedItem::RowNumber => Value::Int64(row_numbers[row_number]),
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("projection does not contain aggregates")
                         }
@@ -1130,11 +1178,61 @@ fn execute_projection(
         .collect()
 }
 
-fn validate_row_number_count(row_count: usize) -> Result<()> {
+fn unpartitioned_row_numbers(
+    row_count: usize,
+    limit: Option<usize>,
+    max_result_rows: usize,
+) -> Result<Vec<i64>> {
     if row_count > 0 {
         checked_row_number(row_count - 1)?;
     }
-    Ok(())
+    let output_count = limit
+        .map_or(row_count, |limit| row_count.min(limit))
+        .min(max_result_rows);
+    (0..output_count).map(checked_row_number).collect()
+}
+
+fn partitioned_row_numbers(
+    table: &Table,
+    matching_rows: &[usize],
+    source: usize,
+    limit: Option<usize>,
+    limits: QueryResultLimits,
+) -> Result<Vec<i64>> {
+    let mut counters = HashMap::<i64, usize>::new();
+    let output_count = limit
+        .map_or(matching_rows.len(), |limit| matching_rows.len().min(limit))
+        .min(limits.max_rows);
+    let mut row_numbers = Vec::with_capacity(output_count);
+    for row in matching_rows {
+        let key = int64_at(table, source, *row);
+        let next_partition_count = counters.len().saturating_add(1);
+        let counter = if let Some(counter) = counters.get_mut(&key) {
+            counter
+        } else {
+            enforce_resource_limit("SELECT groups", next_partition_count, limits.max_groups)?;
+            enforce_resource_limit(
+                "SELECT group key cells",
+                next_partition_count,
+                limits.max_group_key_cells,
+            )?;
+            let key_bytes = next_partition_count.saturating_mul(ESTIMATED_GROUP_KEY_CELL_BYTES);
+            enforce_resource_limit(
+                "SELECT group key bytes",
+                key_bytes,
+                limits.max_group_key_bytes,
+            )?;
+            counters.entry(key).or_insert(0)
+        };
+        let row_number = checked_row_number(*counter)?;
+        if row_numbers.len() < output_count {
+            row_numbers.push(row_number);
+        }
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| Error::NumericOverflow("ROW_NUMBER partition counter".to_owned()))?;
+    }
+    Ok(row_numbers)
 }
 
 fn checked_row_number(zero_based: usize) -> Result<i64> {

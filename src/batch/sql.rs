@@ -104,8 +104,11 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
-    /// A deliberately minimal unpartitioned `ROW_NUMBER` window projection.
+    /// A deliberately minimal `ROW_NUMBER` window projection.
     RowNumber {
+        /// An optional, single `Int64` source column whose partitions retain
+        /// source order. Mutually exclusive with `order_by`.
+        partition_by: Option<String>,
         /// An optional, single, explicitly directed `Int64` source column.
         order_by: Option<OrderBy>,
         alias: Option<String>,
@@ -197,12 +200,22 @@ pub struct OrderBy {
 }
 
 fn validate_row_number_shape(select: &Select, position: usize) -> Result<()> {
-    let has_row_number = select
-        .items
-        .iter()
-        .any(|item| matches!(item, SelectItem::RowNumber { .. }));
-    if !has_row_number {
+    let mut windows = select.items.iter().filter_map(|item| match item {
+        SelectItem::RowNumber {
+            partition_by,
+            order_by,
+            ..
+        } => Some((partition_by.as_deref(), order_by.as_ref())),
+        _ => None,
+    });
+    let Some(first_window) = windows.next() else {
         return Ok(());
+    };
+    if windows.any(|window| !same_row_number_window(first_window, window)) {
+        return Err(Error::Sql {
+            position,
+            message: "all ROW_NUMBER projections must use the same window specification".to_owned(),
+        });
     }
 
     let message = if select.distinct {
@@ -227,6 +240,28 @@ fn validate_row_number_shape(select: &Select, position: usize) -> Result<()> {
             message: message.to_owned(),
         }),
         None => Ok(()),
+    }
+}
+
+fn same_row_number_window(
+    left: (Option<&str>, Option<&OrderBy>),
+    right: (Option<&str>, Option<&OrderBy>),
+) -> bool {
+    let same_partition = match (left.0, right.0) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, Some(_)) | (Some(_), None) => false,
+    };
+    same_partition && same_window_order(left.1, right.1)
+}
+
+fn same_window_order(left: Option<&OrderBy>, right: Option<&OrderBy>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.descending == right.descending && left.name.eq_ignore_ascii_case(&right.name)
+        }
+        (None, Some(_)) | (Some(_), None) => false,
     }
 }
 
@@ -909,8 +944,17 @@ impl<'a> Parser<'a> {
                 )?;
                 self.expect_keyword("OVER")?;
                 self.expect(&TokenKind::LeftParen, "'(' after OVER")?;
-                let order_by = if self.eat(&TokenKind::RightParen) {
-                    None
+                let (partition_by, order_by) = if self.eat(&TokenKind::RightParen) {
+                    (None, None)
+                } else if self.eat_keyword("PARTITION") {
+                    self.expect_keyword("BY")?;
+                    let partition_by =
+                        self.expect_identifier("Int64 column in ROW_NUMBER PARTITION BY")?;
+                    self.expect(
+                        &TokenKind::RightParen,
+                        "')' after the ROW_NUMBER window partition",
+                    )?;
+                    (Some(partition_by), None)
                 } else {
                     self.expect_keyword("ORDER")?;
                     self.expect_keyword("BY")?;
@@ -927,10 +971,14 @@ impl<'a> Parser<'a> {
                         &TokenKind::RightParen,
                         "')' after the ROW_NUMBER window ordering",
                     )?;
-                    Some(OrderBy { name, descending })
+                    (None, Some(OrderBy { name, descending }))
                 };
                 let alias = self.parse_alias()?;
-                return Ok(SelectItem::RowNumber { order_by, alias });
+                return Ok(SelectItem::RowNumber {
+                    partition_by,
+                    order_by,
+                    alias,
+                });
             }
 
             if name.eq_ignore_ascii_case("CAST") {

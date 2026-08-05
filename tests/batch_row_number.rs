@@ -1,4 +1,6 @@
-use rusthouse::batch::engine::{Database, QueryResultLimits, ResultColumn, StatementResult};
+use rusthouse::batch::engine::{
+    Database, ESTIMATED_GROUP_KEY_CELL_BYTES, QueryResultLimits, ResultColumn, StatementResult,
+};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{self, BatchSqlLimits};
 use rusthouse::batch::value::{DataType, Value};
@@ -90,6 +92,32 @@ fn row_number_handles_empty_filtered_and_limited_inputs() {
         vec![
             vec![Value::Int64(3), Value::Int64(1)],
             vec![Value::Int64(1), Value::Int64(2)],
+        ]
+    );
+}
+
+#[test]
+fn partitioned_row_number_counts_interleaved_filtered_rows_before_limit() {
+    let mut database = Database::new();
+    let results = database
+        .execute(
+            "CREATE TABLE events (id Int64, account_id Int64, keep Int64); \
+             INSERT INTO events VALUES \
+                 (10, 1, 0), (11, 1, 1), (20, 2, 1), \
+                 (12, 1, 1), (21, 2, 1), (30, 3, 1); \
+             SELECT id, account_id, \
+                    ROW_NUMBER() OVER (PARTITION BY account_id) AS sequence \
+             FROM events WHERE keep = 1 LIMIT 4;",
+        )
+        .expect("partitioned ROW_NUMBER query succeeds");
+
+    assert_eq!(
+        query(&results[2]).rows,
+        vec![
+            vec![Value::Int64(11), Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(20), Value::Int64(2), Value::Int64(1)],
+            vec![Value::Int64(12), Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(21), Value::Int64(2), Value::Int64(2)],
         ]
     );
 }
@@ -227,6 +255,37 @@ fn ordered_row_number_rejects_missing_and_non_int64_columns() {
 }
 
 #[test]
+fn partitioned_row_number_rejects_missing_and_non_int64_columns() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (1, 'one');",
+        )
+        .expect("fixture succeeds");
+
+    assert_eq!(
+        database
+            .execute("SELECT ROW_NUMBER() OVER (PARTITION BY missing) FROM events")
+            .expect_err("missing partition column is rejected"),
+        Error::ColumnNotFound {
+            table: "events".to_owned(),
+            column: "missing".to_owned(),
+        }
+    );
+    assert_eq!(
+        database
+            .execute("SELECT ROW_NUMBER() OVER (PARTITION BY label) FROM events")
+            .expect_err("non-Int64 partition column is rejected"),
+        Error::TypeMismatch {
+            context: "ROW_NUMBER PARTITION BY column 'label'".to_owned(),
+            expected: "Int64".to_owned(),
+            actual: "String".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn row_number_rejects_arguments_and_unsupported_window_specifications() {
     let malformed = [
         "SELECT ROW_NUMBER(id) OVER () FROM events",
@@ -236,11 +295,29 @@ fn row_number_rejects_arguments_and_unsupported_window_specifications() {
         "SELECT ROW_NUMBER() OVER window_name FROM events",
         "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM events",
         "SELECT ROW_NUMBER() OVER (ORDER BY id ASC, id DESC) FROM events",
-        "SELECT ROW_NUMBER() OVER (PARTITION BY id) FROM events",
+        "SELECT ROW_NUMBER() OVER (PARTITION BY id, other) FROM events",
+        "SELECT ROW_NUMBER() OVER (PARTITION BY id ORDER BY other ASC) FROM events",
+        "SELECT ROW_NUMBER() OVER (PARTITION BY id ASC) FROM events",
         "SELECT ROW_NUMBER() OVER () FROM events WINDOW w AS ()",
     ];
 
     for sql in malformed {
+        assert!(sql::parse(sql).is_err(), "must reject {sql:?}");
+    }
+}
+
+#[test]
+fn row_number_rejects_conflicting_window_specifications() {
+    let conflicting = [
+        "SELECT ROW_NUMBER() OVER (PARTITION BY id), \
+                ROW_NUMBER() OVER (PARTITION BY other) FROM events",
+        "SELECT ROW_NUMBER() OVER (PARTITION BY id), \
+                ROW_NUMBER() OVER () FROM events",
+        "SELECT ROW_NUMBER() OVER (PARTITION BY id), \
+                ROW_NUMBER() OVER (ORDER BY id ASC) FROM events",
+    ];
+
+    for sql in conflicting {
         assert!(sql::parse(sql).is_err(), "must reject {sql:?}");
     }
 }
@@ -321,21 +398,81 @@ fn row_number_projection_obeys_ast_and_result_materialization_caps() {
 }
 
 #[test]
+fn partition_tracking_obeys_group_and_key_caps_before_limit() {
+    let exact_limits = QueryResultLimits {
+        max_groups: 2,
+        max_group_key_cells: 2,
+        max_group_key_bytes: 2 * ESTIMATED_GROUP_KEY_CELL_BYTES,
+        ..QueryResultLimits::default()
+    };
+    let query_with_hidden_partitions = "CREATE TABLE events (account_id Int64); \
+        INSERT INTO events VALUES (1), (1), (2); \
+        SELECT ROW_NUMBER() OVER (PARTITION BY account_id) FROM events LIMIT 0;";
+
+    Database::with_query_result_limits(exact_limits)
+        .execute(query_with_hidden_partitions)
+        .expect("exact partition tracking caps succeed even with LIMIT 0");
+
+    let cases = [
+        (
+            QueryResultLimits {
+                max_groups: 1,
+                ..exact_limits
+            },
+            Error::ResourceLimitExceeded {
+                resource: "SELECT groups",
+                actual: 2,
+                max: 1,
+            },
+        ),
+        (
+            QueryResultLimits {
+                max_group_key_cells: 1,
+                ..exact_limits
+            },
+            Error::ResourceLimitExceeded {
+                resource: "SELECT group key cells",
+                actual: 2,
+                max: 1,
+            },
+        ),
+        (
+            QueryResultLimits {
+                max_group_key_bytes: ESTIMATED_GROUP_KEY_CELL_BYTES,
+                ..exact_limits
+            },
+            Error::ResourceLimitExceeded {
+                resource: "SELECT group key bytes",
+                actual: 2 * ESTIMATED_GROUP_KEY_CELL_BYTES,
+                max: ESTIMATED_GROUP_KEY_CELL_BYTES,
+            },
+        ),
+    ];
+
+    for (limits, expected) in cases {
+        assert_eq!(
+            Database::with_query_result_limits(limits).execute(query_with_hidden_partitions),
+            Err(expected),
+        );
+    }
+}
+
+#[test]
 fn row_number_is_rendered_as_typed_csv_and_json() {
-    let input = b"CREATE TABLE events (id Int64, rank_key Int64); \
-        INSERT INTO events VALUES (7, 2), (9, 1); \
-        SELECT id, ROW_NUMBER() OVER (ORDER BY rank_key ASC) AS sequence FROM events;";
+    let input = b"CREATE TABLE events (id Int64, account_id Int64); \
+        INSERT INTO events VALUES (7, 1), (9, 2), (8, 1); \
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY account_id) AS sequence FROM events;";
 
     let mut csv = Vec::new();
     run_csv_batch(&input[..], &mut csv).expect("CSV output succeeds");
-    assert_eq!(csv, b"id,sequence\n9,1\n7,2\n");
+    assert_eq!(csv, b"id,sequence\n7,1\n9,1\n8,2\n");
 
     let mut json = Vec::new();
     run_json_batch(&input[..], &mut json).expect("JSON output succeeds");
     assert_eq!(
         json,
         concat!(
-            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"sequence","type":"Int64"}],"rows":[[9,1],[7,2]]}"#,
+            r#"{"columns":[{"name":"id","type":"Int64"},{"name":"sequence","type":"Int64"}],"rows":[[7,1],[9,1],[8,2]]}"#,
             "\n"
         )
         .as_bytes()
