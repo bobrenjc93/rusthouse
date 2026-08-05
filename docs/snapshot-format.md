@@ -133,3 +133,13 @@ causes one backup attempt with exactly the same codecs, schema, and row cap.
 Success identifies whether the primary or backup supplied the table. When both
 fail, one recovery error retains both typed file restoration errors and no
 partially restored table is returned.
+
+On Unix, `restore_and_repair_int64_table_from_file_with_backup` adds automatic
+primary repair to that bounded recovery policy. A valid primary still returns
+without inspecting the backup. Otherwise, a valid backup is read once and its
+validated payload is passed to `SnapshotCodec::replace_file`, which atomically
+rewrites and directory-syncs the primary before the recovered table is
+returned. The backup is never modified. Its error type distinguishes failures
+of both bounded restoration attempts from failures during atomic primary
+replacement; a directory-sync failure therefore reports that the primary is
+already visible but its crash durability is uncertain.

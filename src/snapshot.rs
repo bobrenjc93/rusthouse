@@ -515,6 +515,78 @@ impl fmt::Display for Int64TableFileRecoveryError {
 
 impl Error for Int64TableFileRecoveryError {}
 
+/// An error produced while restoring and repairing a primary snapshot file.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum Int64TableFileRepairError {
+    /// Neither the primary nor the backup could be restored within the bounds.
+    BothFailed {
+        /// The typed failure from the primary snapshot.
+        primary: Int64TableFileRestoreError,
+        /// The typed failure from the backup snapshot.
+        backup: Int64TableFileRestoreError,
+    },
+    /// The backup was valid, but atomically replacing the primary failed.
+    RepairFailed {
+        /// The typed failure that caused recovery from the backup.
+        primary: Int64TableFileRestoreError,
+        /// The failure from atomically replacing the primary snapshot.
+        repair: SnapshotReplaceError,
+    },
+}
+
+#[cfg(unix)]
+impl Int64TableFileRepairError {
+    /// Returns the typed failure from the initial primary restoration.
+    pub const fn primary_error(&self) -> &Int64TableFileRestoreError {
+        match self {
+            Self::BothFailed { primary, .. } | Self::RepairFailed { primary, .. } => primary,
+        }
+    }
+
+    /// Returns the backup restoration failure when both files were invalid.
+    pub const fn backup_error(&self) -> Option<&Int64TableFileRestoreError> {
+        match self {
+            Self::BothFailed { backup, .. } => Some(backup),
+            Self::RepairFailed { .. } => None,
+        }
+    }
+
+    /// Returns the atomic replacement failure when backup restoration succeeded.
+    pub const fn repair_error(&self) -> Option<&SnapshotReplaceError> {
+        match self {
+            Self::BothFailed { .. } => None,
+            Self::RepairFailed { repair, .. } => Some(repair),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for Int64TableFileRepairError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BothFailed { primary, backup } => write!(
+                formatter,
+                "could not restore primary snapshot ({primary}) or backup snapshot ({backup})"
+            ),
+            Self::RepairFailed { primary, repair } => write!(
+                formatter,
+                "restored backup after primary snapshot failure ({primary}), but could not repair primary snapshot: {repair}"
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Error for Int64TableFileRepairError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::BothFailed { .. } => None,
+            Self::RepairFailed { repair, .. } => Some(repair),
+        }
+    }
+}
+
 /// Encodes and decodes bounded nullable `Int64` row payloads.
 ///
 /// The payload can be passed directly to [`SnapshotCodec::encode`]. Decoding
@@ -791,14 +863,23 @@ impl SnapshotCodec {
         path: impl AsRef<Path>,
         payload: &[u8],
     ) -> Result<(), SnapshotReplaceError> {
+        self.replace_file_with_directory_sync(path.as_ref(), payload, SnapshotDirectory::sync)
+    }
+
+    #[cfg(unix)]
+    fn replace_file_with_directory_sync(
+        self,
+        path: &Path,
+        payload: &[u8],
+        sync_directory: impl FnOnce(&SnapshotDirectory) -> io::Result<()>,
+    ) -> Result<(), SnapshotReplaceError> {
         let envelope = self.encode(payload).map_err(SnapshotReplaceError::Encode)?;
-        let path = path.as_ref();
         let destination = snapshot_destination_name(path)?;
 
         let parent = normalized_parent(path);
         let directory =
             SnapshotDirectory::open(parent).map_err(SnapshotReplaceError::OpenDirectory)?;
-        replace_envelope_in_directory(&directory, &destination, &envelope)
+        replace_envelope_in_directory_with_sync(&directory, &destination, &envelope, sync_directory)
     }
 
     /// Validates an envelope and returns its borrowed payload.
@@ -871,10 +952,11 @@ impl SnapshotCodec {
 }
 
 #[cfg(unix)]
-fn replace_envelope_in_directory(
+fn replace_envelope_in_directory_with_sync(
     directory: &SnapshotDirectory,
     destination: &CStr,
     envelope: &[u8],
+    sync_directory: impl FnOnce(&SnapshotDirectory) -> io::Result<()>,
 ) -> Result<(), SnapshotReplaceError> {
     let (mut file, temporary) = create_temporary_snapshot(directory, destination)?;
 
@@ -893,9 +975,7 @@ fn replace_envelope_in_directory(
     }
     temporary.persist();
 
-    directory
-        .sync()
-        .map_err(SnapshotReplaceError::SyncDirectory)
+    sync_directory(directory).map_err(SnapshotReplaceError::SyncDirectory)
 }
 
 #[cfg(unix)]
@@ -1220,7 +1300,16 @@ pub fn restore_int64_table_from_file(
     snapshot_codec: SnapshotCodec,
     payload_codec: NullableI64PayloadCodec,
 ) -> Result<Int64Table, Int64TableFileRestoreError> {
-    let path = path.as_ref();
+    let envelope = read_bounded_snapshot_file(path.as_ref(), snapshot_codec)?;
+
+    restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
+        .map_err(Int64TableFileRestoreError::Restore)
+}
+
+fn read_bounded_snapshot_file(
+    path: &Path,
+    snapshot_codec: SnapshotCodec,
+) -> Result<Vec<u8>, Int64TableFileRestoreError> {
     let mut file = open_regular_snapshot_file(path)?;
     let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
     let file_len = bounded_file_len(&file, max_file_len)?;
@@ -1233,8 +1322,7 @@ pub fn restore_int64_table_from_file(
     // Check the opened file again in case it grew after the first size check.
     bounded_file_len(&file, max_file_len)?;
 
-    restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
-        .map_err(Int64TableFileRestoreError::Restore)
+    Ok(envelope)
 }
 
 /// Restores one bounded `Int64` table from a primary or explicit backup file.
@@ -1280,6 +1368,93 @@ pub fn restore_int64_table_from_file_with_backup(
             }
         }
     }
+}
+
+/// Restores a bounded primary snapshot, repairing it from an explicit backup.
+///
+/// A valid primary is returned immediately without inspecting the backup. If
+/// primary restoration fails, the backup is read once with the same file,
+/// envelope, payload, schema, and row bounds. After the backup validates, its
+/// already-bounded payload atomically replaces the primary through
+/// [`SnapshotCodec::replace_file`] before the recovered table is returned. The
+/// backup is never modified. Dual restoration failures and replacement-stage
+/// failures remain distinct and retain their typed causes.
+#[cfg(unix)]
+pub fn restore_and_repair_int64_table_from_file_with_backup(
+    primary_path: impl AsRef<Path>,
+    backup_path: impl AsRef<Path>,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) -> Result<Int64TableFileRecovery, Int64TableFileRepairError> {
+    restore_and_repair_int64_table_from_file_with_backup_using(
+        primary_path.as_ref(),
+        backup_path.as_ref(),
+        schema,
+        row_cap,
+        snapshot_codec,
+        payload_codec,
+        |path, payload| snapshot_codec.replace_file(path, payload),
+    )
+}
+
+#[cfg(unix)]
+fn restore_and_repair_int64_table_from_file_with_backup_using(
+    primary_path: &Path,
+    backup_path: &Path,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+    replace_primary: impl FnOnce(&Path, &[u8]) -> Result<(), SnapshotReplaceError>,
+) -> Result<Int64TableFileRecovery, Int64TableFileRepairError> {
+    let primary = match restore_int64_table_from_file(
+        primary_path,
+        schema.clone(),
+        row_cap,
+        snapshot_codec,
+        payload_codec,
+    ) {
+        Ok(table) => {
+            return Ok(Int64TableFileRecovery {
+                table,
+                source: Int64TableFileRecoverySource::Primary,
+            });
+        }
+        Err(primary) => primary,
+    };
+
+    let mut backup_envelope = match read_bounded_snapshot_file(backup_path, snapshot_codec) {
+        Ok(envelope) => envelope,
+        Err(backup) => return Err(Int64TableFileRepairError::BothFailed { primary, backup }),
+    };
+    let table = match restore_int64_table(
+        &backup_envelope,
+        schema,
+        row_cap,
+        snapshot_codec,
+        payload_codec,
+    ) {
+        Ok(table) => table,
+        Err(backup) => {
+            return Err(Int64TableFileRepairError::BothFailed {
+                primary,
+                backup: Int64TableFileRestoreError::Restore(backup),
+            });
+        }
+    };
+
+    // The complete envelope has already validated, so removing its fixed-size
+    // header leaves exactly the bounded payload that supplied `table`.
+    backup_envelope.drain(..SNAPSHOT_HEADER_LEN);
+    replace_primary(primary_path, &backup_envelope)
+        .map_err(|repair| Int64TableFileRepairError::RepairFailed { primary, repair })?;
+
+    Ok(Int64TableFileRecovery {
+        table,
+        source: Int64TableFileRecoverySource::Backup,
+    })
 }
 
 fn open_regular_snapshot_file(path: &Path) -> Result<File, Int64TableFileRestoreError> {
@@ -1485,7 +1660,13 @@ mod tests {
         let codec = SnapshotCodec::new(8);
         let envelope = codec.encode(b"payload").unwrap();
         let destination = CString::new("snapshot.bin").unwrap();
-        replace_envelope_in_directory(&directory, &destination, &envelope).unwrap();
+        replace_envelope_in_directory_with_sync(
+            &directory,
+            &destination,
+            &envelope,
+            SnapshotDirectory::sync,
+        )
+        .unwrap();
 
         assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
         let entries = fs::read_dir(&moved_parent)
@@ -1550,6 +1731,76 @@ mod tests {
             result,
             Err(Int64TableFileRestoreError::NotRegularFile)
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_reports_directory_sync_failure_after_replacing_the_primary() {
+        static NEXT_TEST_DIRECTORY: AtomicU32 = AtomicU32::new(0);
+
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/snapshot-repair-sync-tests");
+        fs::create_dir_all(&base).unwrap();
+        let directory = loop {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let candidate = base.join(format!("{}-{sequence}", std::process::id()));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        };
+        let primary_path = directory.join("primary.snapshot");
+        let backup_path = directory.join("backup.snapshot");
+        let snapshot_codec = SnapshotCodec::new(17);
+        let payload_codec = NullableI64PayloadCodec::new(1, 17);
+        let payload = payload_codec.encode(&[Some(22)]).unwrap();
+        snapshot_codec
+            .create_new_file(&backup_path, &payload)
+            .unwrap();
+        let backup_before = fs::read(&backup_path).unwrap();
+
+        let error = restore_and_repair_int64_table_from_file_with_backup_using(
+            &primary_path,
+            &backup_path,
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+            |path, payload| {
+                snapshot_codec.replace_file_with_directory_sync(path, payload, |_| {
+                    Err(io::Error::other("injected directory sync failure"))
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error.primary_error(),
+            Int64TableFileRestoreError::Open(source)
+                if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            error.repair_error(),
+            Some(SnapshotReplaceError::SyncDirectory(source))
+                if source.to_string() == "injected directory sync failure"
+        ));
+        assert!(
+            error
+                .repair_error()
+                .is_some_and(SnapshotReplaceError::destination_was_replaced)
+        );
+        assert_eq!(fs::read(&backup_path).unwrap(), backup_before);
+        let table = restore_int64_table_from_file(
+            &primary_path,
+            Schema::int64("reading", false),
+            1,
+            snapshot_codec,
+            payload_codec,
+        )
+        .unwrap();
+        assert_eq!(table.values(), &[Some(22)]);
+
         fs::remove_dir_all(directory).unwrap();
     }
 }
