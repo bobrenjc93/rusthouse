@@ -61,6 +61,9 @@ pub enum Statement {
         right: Select,
     },
     ShowTables,
+    ShowCreateTable {
+        name: String,
+    },
     DescribeTable {
         name: String,
     },
@@ -676,6 +679,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_show(&mut self) -> Result<Statement> {
+        if self.eat_keyword("CREATE") {
+            self.expect_keyword("TABLE")?;
+            let name = self.expect_identifier("table name")?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after SHOW CREATE TABLE <name>");
+            }
+            return Ok(Statement::ShowCreateTable { name });
+        }
+
         self.expect_keyword("TABLES")?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after SHOW TABLES");

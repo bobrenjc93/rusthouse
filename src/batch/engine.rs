@@ -300,6 +300,7 @@ impl Database {
                         resource:
                             "SELECT result bytes"
                             | "SHOW TABLES result bytes"
+                            | "SHOW CREATE TABLE result bytes"
                             | "DESCRIBE TABLE result bytes",
                         actual,
                         ..
@@ -385,6 +386,7 @@ impl Database {
                     resource:
                         "SELECT result bytes"
                         | "SHOW TABLES result bytes"
+                        | "SHOW CREATE TABLE result bytes"
                         | "DESCRIBE TABLE result bytes",
                     actual,
                     ..
@@ -454,6 +456,7 @@ impl Database {
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
             | Statement::ShowTables
+            | Statement::ShowCreateTable { .. }
             | Statement::DescribeTable { .. }) => self
                 .execute_query_statement_with_limits(statement, query_result_limits)
                 .map(StatementResult::Query),
@@ -477,6 +480,9 @@ impl Database {
                 self.execute_union_all(left, right, query_result_limits)
             }
             Statement::ShowTables => self.execute_show_tables(query_result_limits),
+            Statement::ShowCreateTable { name } => {
+                self.execute_show_create_table(&name, query_result_limits)
+            }
             Statement::DescribeTable { name } => {
                 self.execute_describe_table(&name, query_result_limits)
             }
@@ -484,7 +490,7 @@ impl Database {
             | Statement::DropTable { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
-                "read-only execution accepts only SELECT, SHOW TABLES, or DESCRIBE TABLE"
+                "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, or DESCRIBE TABLE"
                     .to_owned(),
             )),
         }
@@ -557,6 +563,54 @@ impl Database {
                 .into_iter()
                 .map(|name| vec![Value::String(name.to_owned())])
                 .collect(),
+        })
+    }
+
+    fn execute_show_create_table(
+        &self,
+        name: &str,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "statement";
+
+        let table = self.catalog.table(name)?;
+        let ddl_bytes = create_table_ddl_len(table);
+        let fixed_bytes = validate_result_shape_parts(
+            1,
+            1,
+            1,
+            RESULT_COLUMN_NAME.len(),
+            query_result_limits,
+            SHOW_CREATE_TABLE_RESULT_RESOURCES,
+        )?;
+        let bytes = fixed_bytes.saturating_add(ddl_bytes);
+        enforce_resource_limit(
+            SHOW_CREATE_TABLE_RESULT_RESOURCES.bytes,
+            bytes,
+            query_result_limits.max_bytes,
+        )?;
+
+        let mut ddl = String::with_capacity(ddl_bytes);
+        ddl.push_str("CREATE TABLE ");
+        ddl.push_str(table.name());
+        ddl.push_str(" (");
+        for (index, field) in table.schema().iter().enumerate() {
+            if index != 0 {
+                ddl.push_str(", ");
+            }
+            ddl.push_str(&field.name);
+            ddl.push(' ');
+            ddl.push_str(field.data_type.as_str());
+        }
+        ddl.push(')');
+        debug_assert_eq!(ddl.len(), ddl_bytes);
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: RESULT_COLUMN_NAME.to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(ddl)]],
         })
     }
 
@@ -798,8 +852,32 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. } => "SELECT",
         Statement::ShowTables => "SHOW TABLES",
+        Statement::ShowCreateTable { .. } => "SHOW CREATE TABLE",
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
     }
+}
+
+fn create_table_ddl_len(table: &Table) -> usize {
+    let fields_bytes = table
+        .schema()
+        .iter()
+        .map(|field| {
+            field
+                .name
+                .len()
+                .saturating_add(1)
+                .saturating_add(field.data_type.as_str().len())
+        })
+        .fold(0_usize, usize::saturating_add);
+    let delimiters = table.schema().len().saturating_sub(1).saturating_mul(2);
+
+    "CREATE TABLE "
+        .len()
+        .saturating_add(table.name().len())
+        .saturating_add(" (".len())
+        .saturating_add(fields_bytes)
+        .saturating_add(delimiters)
+        .saturating_add(")".len())
 }
 
 fn literal_result_name_len(value: &Value) -> usize {
@@ -1764,6 +1842,12 @@ const SHOW_TABLES_RESULT_RESOURCES: QueryResultResources = QueryResultResources 
     rows: "SHOW TABLES result rows",
     values: "SHOW TABLES result values",
     bytes: "SHOW TABLES result bytes",
+};
+
+const SHOW_CREATE_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResources {
+    rows: "SHOW CREATE TABLE result rows",
+    values: "SHOW CREATE TABLE result values",
+    bytes: "SHOW CREATE TABLE result bytes",
 };
 
 const DESCRIBE_TABLE_RESULT_RESOURCES: QueryResultResources = QueryResultResources {

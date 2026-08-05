@@ -43,6 +43,9 @@ expressions, `FROM`, and other trailing clauses are not supported.
 
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
+`SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
+bounded `String`, preserving the stored table and column display names and
+schema order while normalizing type spellings.
 `DESCRIBE TABLE <name>` returns the table's columns in schema order as `name`
 and `type` `String` columns. It uses case-insensitive table lookup and applies
 the normal result row, value, and byte limits before allocating result storage.
@@ -133,8 +136,8 @@ covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Every statement shares one in-memory catalog. Successful `CREATE`, `DROP`,
 `TRUNCATE`, and `INSERT` statements are silent, and each `SELECT`, `SHOW
-TABLES`, or `DESCRIBE TABLE` query is executed and emitted before the next
-statement. Table output uses
+TABLES`, `SHOW CREATE TABLE`, or `DESCRIBE TABLE` query is executed and emitted
+before the next statement. Table output uses
 bordered, human-readable columns, escapes control characters, renders SQL
 `NULL` as `NULL`, and separates multiple query results with a blank line. Each
 padded table is size-checked against a 16 MiB formatted-output limit before
@@ -181,10 +184,10 @@ return owned projection rows. Existing catalog failures remain typed, and lock
 poisoning is reported separately.
 
 `SharedDatabase` provides the same synchronization for the typed batch SQL
-engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, or
-`DESCRIBE TABLE`, takes a shared read lock, and returns an owned,
-resource-bounded result, so cloned
-handles can run analytical reads concurrently. Mutating batches passed to
+engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, `SHOW
+CREATE TABLE`, or `DESCRIBE TABLE`, takes a shared read lock, and returns an
+owned, resource-bounded result, so cloned handles can run analytical reads
+concurrently. Mutating batches passed to
 `execute` retain one write lock for the entire batch and cannot interleave.
 For transactional ingestion, `Database::execute_insert_batch` and the matching
 `SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every

@@ -227,6 +227,31 @@ fn batch_formats_emit_describe_table_metadata() {
 }
 
 #[test]
+fn batch_formats_emit_canonical_show_create_table_ddl() {
+    let sql = b"CREATE TABLE Metrics (id int64, score float64, active boolean, label string); \
+                SHOW CREATE TABLE metrics;";
+    let ddl = "CREATE TABLE Metrics (id Int64, score Float64, active Bool, label String)";
+
+    let csv = run(&["--format", "csv"], sql);
+    assert!(csv.status.success(), "{:?}", csv.stderr);
+    assert_eq!(
+        String::from_utf8(csv.stdout).unwrap(),
+        format!("statement\n\"{ddl}\"\n")
+    );
+    assert!(csv.stderr.is_empty());
+
+    let json = run(&["--format", "json"], sql);
+    assert!(json.status.success(), "{:?}", json.stderr);
+    assert_eq!(
+        String::from_utf8(json.stdout).unwrap(),
+        format!(
+            "{{\"columns\":[{{\"name\":\"statement\",\"type\":\"String\"}}],\"rows\":[[\"{ddl}\"]]}}\n"
+        )
+    );
+    assert!(json.stderr.is_empty());
+}
+
+#[test]
 fn batch_cli_keeps_drop_table_command_output_silent() {
     for format in ["table", "csv", "json"] {
         let output = run(
