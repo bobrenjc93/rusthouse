@@ -234,13 +234,11 @@ impl Table {
         for row in &rows {
             self.validate_row(row)?;
         }
-        for row in rows {
-            self.append_validated_row(row);
-        }
+        self.append_validated_rows(rows);
         Ok(())
     }
 
-    fn validate_row_capacity(&self, incoming_rows: usize) -> Result<()> {
+    pub(crate) fn validate_row_capacity(&self, incoming_rows: usize) -> Result<()> {
         if incoming_rows > self.row_cap.saturating_sub(self.row_count) {
             return Err(Error::ResourceLimitExceeded {
                 resource: "table rows",
@@ -249,6 +247,12 @@ impl Table {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn append_validated_rows(&mut self, rows: Vec<Vec<Value>>) {
+        for row in rows {
+            self.append_validated_row(row);
+        }
     }
 
     fn append_validated_row(&mut self, row: Vec<Value>) {

@@ -34,6 +34,9 @@ pub enum Error {
     },
     InvalidQuery(String),
     NumericOverflow(String),
+    InsertOnlyStatementRequired {
+        statement: &'static str,
+    },
     StatementLimitExceeded {
         statements: usize,
         max_statements: usize,
@@ -94,6 +97,10 @@ impl fmt::Display for Error {
             Self::NumericOverflow(operation) => {
                 write!(f, "numeric overflow while computing {operation}")
             }
+            Self::InsertOnlyStatementRequired { statement } => write!(
+                f,
+                "INSERT-only batch accepts only INSERT statements; found {statement}"
+            ),
             Self::StatementLimitExceeded {
                 statements,
                 max_statements,

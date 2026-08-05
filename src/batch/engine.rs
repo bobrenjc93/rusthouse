@@ -210,6 +210,17 @@ impl Database {
         self.execute_with_result_limit(sql, DEFAULT_MAX_RETAINED_RESULT_BYTES)
     }
 
+    /// Atomically executes a nonempty SQL batch containing only `INSERT` statements.
+    ///
+    /// Every target table, row shape, value type, finite floating-point value,
+    /// and cumulative per-table row count is validated before any row is
+    /// appended. A failure therefore leaves every table unchanged. Successful
+    /// statements are committed and reported in input order.
+    pub fn execute_insert_batch(&mut self, sql: &str) -> Result<Vec<StatementResult>> {
+        let statements = sql::parse(sql)?;
+        self.execute_insert_statements(statements)
+    }
+
     /// Executes a batch while bounding results retained for the caller.
     pub fn execute_with_result_limit(
         &mut self,
@@ -258,6 +269,52 @@ impl Database {
                 });
             }
             results.push(result);
+        }
+        Ok(results)
+    }
+
+    pub(crate) fn execute_insert_statements(
+        &mut self,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<StatementResult>> {
+        for statement in &statements {
+            if !matches!(statement, Statement::Insert { .. }) {
+                return Err(Error::InsertOnlyStatementRequired {
+                    statement: statement_name(statement),
+                });
+            }
+        }
+
+        let mut incoming_rows_by_table = HashMap::<String, usize>::new();
+        for statement in &statements {
+            let Statement::Insert { table, rows } = statement else {
+                unreachable!("non-INSERT statements were rejected")
+            };
+            let target = self.catalog.table(table)?;
+            let cumulative_rows = incoming_rows_by_table
+                .entry(table.to_ascii_lowercase())
+                .or_default();
+            *cumulative_rows = cumulative_rows.saturating_add(rows.len());
+            target.validate_row_capacity(*cumulative_rows)?;
+            for row in rows {
+                target.validate_row(row)?;
+            }
+        }
+
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let Statement::Insert { table, rows } = statement else {
+                unreachable!("non-INSERT statements were rejected")
+            };
+            let affected_rows = rows.len();
+            self.catalog
+                .table_mut(&table)
+                .expect("preflight resolved every INSERT target")
+                .append_validated_rows(rows);
+            results.push(StatementResult::Command {
+                tag: "INSERT",
+                affected_rows,
+            });
         }
         Ok(results)
     }
@@ -679,6 +736,21 @@ impl Database {
         }
 
         Ok(QueryResult { columns, rows })
+    }
+}
+
+fn statement_name(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::CreateTable { .. } => "CREATE TABLE",
+        Statement::DropTable { .. } => "DROP TABLE",
+        Statement::TruncateTable { .. } => "TRUNCATE TABLE",
+        Statement::Insert { .. } => "INSERT",
+        Statement::LiteralSelect(_)
+        | Statement::Select(_)
+        | Statement::CrossJoin(_)
+        | Statement::UnionAll { .. } => "SELECT",
+        Statement::ShowTables => "SHOW TABLES",
+        Statement::DescribeTable { .. } => "DESCRIBE TABLE",
     }
 }
 
@@ -2528,6 +2600,33 @@ mod tests {
             StatementResult::Query(result) => result,
             StatementResult::Command { .. } => panic!("expected query result"),
         }
+    }
+
+    #[test]
+    fn insert_batch_preflight_rejects_non_finite_ast_values_without_mutation() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE events (id Int64); CREATE TABLE samples (value Float64);")
+            .expect("setup");
+        let statements = vec![
+            Statement::Insert {
+                table: "events".to_owned(),
+                rows: vec![vec![Value::Int64(1)]],
+            },
+            Statement::Insert {
+                table: "samples".to_owned(),
+                rows: vec![vec![Value::Float64(f64::INFINITY)]],
+            },
+        ];
+
+        assert_eq!(
+            database.execute_insert_statements(statements),
+            Err(Error::InvalidQuery(
+                "column 'samples.value' cannot store a non-finite Float64".to_owned()
+            ))
+        );
+        assert_eq!(database.catalog().table("events").unwrap().row_count(), 0);
+        assert_eq!(database.catalog().table("samples").unwrap().row_count(), 0);
     }
 
     #[test]
