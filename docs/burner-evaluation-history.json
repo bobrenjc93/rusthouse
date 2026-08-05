@@ -730,6 +730,22 @@
         "eval_c88a7f3d": 35,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:430",
+      "recordedAt": "2026-08-05T08:52:27.207Z",
+      "label": "PR #430",
+      "kind": "leaf",
+      "prNumber": 430,
+      "title": "Use bounded selection for ordered ROW_NUMBER LIMIT",
+      "scores": {
+        "eval_9fbdfec0": 75,
+        "eval_29146f21": 90,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 35,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
