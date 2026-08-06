@@ -162,12 +162,25 @@ fn bearer_authenticated_query_returns_the_existing_json_result_shape() {
 
 #[test]
 fn bearer_authentication_also_protects_ping() {
-    let database = SharedDatabase::default();
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
 
-    let unauthorized = authenticated_exchange(
-        &database,
-        "correct-token",
-        b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    let unauthorized_request =
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    let body_offset = unauthorized_request.len() as u64 - 1;
+    let mut input = Cursor::new(unauthorized_request);
+    let mut unauthorized = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut unauthorized)
+        .expect("missing ping credentials produce a response");
+    assert_eq!(
+        input.position(),
+        body_offset,
+        "authentication failure must not consume a ping body"
     );
     assert_response(
         &unauthorized,
@@ -183,7 +196,7 @@ fn bearer_authentication_also_protects_ping() {
     assert_ping_response(&authenticated_exchange(
         &database,
         "correct-token",
-        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\naUtHoRiZaTiOn: bEaReR correct-token\r\n\r\n",
     ));
 }
 

@@ -44,7 +44,7 @@ impl Default for HttpQueryLimits {
     }
 }
 
-/// A transport failure while handling one HTTP query exchange.
+/// A transport failure while handling one HTTP query or health exchange.
 ///
 /// Request and query errors that can be represented on the wire are returned
 /// as HTTP responses and are not Rust errors. No response is written for a
@@ -109,7 +109,7 @@ pub fn handle_http_query(
     handle_http_query_with_limits(database, input, output, HttpQueryLimits::default())
 }
 
-/// Handles one HTTP query exchange with explicit resource limits.
+/// Handles one HTTP query or health exchange with explicit resource limits.
 ///
 /// See [`handle_http_query`] for the accepted protocol and response behavior.
 /// The response limit covers the status line, headers, empty line, and body.
