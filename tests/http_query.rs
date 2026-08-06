@@ -576,20 +576,35 @@ fn nonblocking_listener_waits_for_a_delayed_queued_request() {
     listener.set_nonblocking(true).unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap())
         .expect("client connection is queued before accept");
+    let complete_request = request(b"SELECT true AS ready;");
+    client
+        .write_all(&complete_request[..1])
+        .expect("incomplete request prefix is queued");
     let database = SharedDatabase::default();
     let server = thread::spawn(move || {
-        accept_http_query(
-            &database,
-            &listener,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        )
+        let accept_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match accept_http_query(
+                &database,
+                &listener,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ) {
+                Err(TcpQueryError::Accept(error))
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && Instant::now() < accept_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => break result,
+            }
+        }
     });
 
     thread::sleep(Duration::from_millis(100));
     client
-        .write_all(&request(b"SELECT true AS ready;"))
-        .expect("delayed request is written");
+        .write_all(&complete_request[1..])
+        .expect("delayed request remainder is written");
     client.shutdown(Shutdown::Write).unwrap();
     let mut response = Vec::new();
     client
