@@ -122,11 +122,98 @@ pub fn handle_http_query(
 /// [`handle_http_query`].
 pub fn handle_http_query_with_limits(
     database: &SharedDatabase,
-    mut input: impl Read,
+    input: impl Read,
+    output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_exchange(database, input, output, limits, None)
+}
+
+/// Handles one HTTP query or health exchange that requires a bearer token.
+///
+/// This is separate from [`handle_http_query`], which remains unauthenticated.
+/// Every request, including `GET /ping`, is authorized only when it has exactly
+/// one `Authorization` header whose value is `Bearer`, one or more spaces, and
+/// a token matching `expected_bearer_token`. Authentication failures receive
+/// the same response before the SQL body is read or the database is accessed.
+/// The configured token must be a nonempty RFC token68 value; invalid
+/// configurations are rejected as a server error without reading any input.
+///
+/// This function provides authentication only. The embedding application must
+/// provide TLS to keep the bearer token and query contents confidential in
+/// transit.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_bearer_token(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_bearer_token_and_limits(
+        database,
+        expected_bearer_token,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one bearer-authenticated HTTP exchange with explicit resource limits.
+///
+/// See [`handle_http_query_with_bearer_token`] for authentication behavior and
+/// [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_bearer_token_and_limits(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
     mut output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
-    let request = match read_request(&mut input, limits) {
+    if expected_bearer_token.is_empty() {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured bearer token must not be empty",
+            limits.max_response_bytes,
+        );
+    }
+    if !is_valid_bearer_token(expected_bearer_token.as_bytes()) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured bearer token is not valid token68",
+            limits.max_response_bytes,
+        );
+    }
+
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Some(expected_bearer_token.as_bytes()),
+    )
+}
+
+fn handle_http_query_exchange(
+    database: &SharedDatabase,
+    mut input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+    expected_bearer_token: Option<&[u8]>,
+) -> Result<(), HttpQueryError> {
+    let request = match read_request(&mut input, limits, expected_bearer_token) {
         Ok(request) => request,
         Err(RequestReadError::Io(error)) => return Err(HttpQueryError::Read(error)),
         Err(RequestReadError::Protocol(failure)) => {
@@ -187,9 +274,10 @@ pub fn handle_http_query_with_limits(
 fn read_request(
     input: &mut impl Read,
     limits: HttpQueryLimits,
+    expected_bearer_token: Option<&[u8]>,
 ) -> Result<HttpRequest, RequestReadError> {
     let header = read_header_block(input, limits.max_header_bytes)?;
-    let request = parse_headers(&header, limits.max_header_count)?;
+    let request = parse_headers(&header, limits.max_header_count, expected_bearer_token)?;
 
     match request.kind {
         RequestKind::Ping => {
@@ -314,6 +402,7 @@ enum RequestKind {
 fn parse_headers(
     header: &[u8],
     max_header_count: usize,
+    expected_bearer_token: Option<&[u8]>,
 ) -> Result<ParsedRequest, RequestReadError> {
     let Some(without_terminator) = header.strip_suffix(b"\r\n\r\n") else {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "malformed HTTP headers").into());
@@ -330,6 +419,8 @@ fn parse_headers(
     let mut header_count = 0_usize;
     let mut transfer_encoding_seen = false;
     let mut expect_seen = false;
+    let mut authorization = None;
+    let mut duplicate_authorization = false;
     while let Some(raw_line) = lines.next() {
         let line = strict_header_line(raw_line, lines.peek().is_some())?;
         header_count = header_count.saturating_add(1);
@@ -370,6 +461,26 @@ fn parse_headers(
                 return Err(RequestFailure::new(Status::BAD_REQUEST, "invalid Host header").into());
             }
             host_seen = true;
+        } else if expected_bearer_token.is_some()
+            && name.eq_ignore_ascii_case(b"authorization")
+            && authorization.replace(value).is_some()
+        {
+            duplicate_authorization = true;
+        }
+    }
+
+    if let Some(expected_bearer_token) = expected_bearer_token {
+        let authorized = !duplicate_authorization
+            && authorization
+                .and_then(parse_bearer_token)
+                .is_some_and(|provided| constant_work_eq(provided, expected_bearer_token));
+        if !authorized {
+            return Err(RequestFailure::with_headers(
+                Status::UNAUTHORIZED,
+                "bearer authentication required",
+                &[b"WWW-Authenticate: Bearer\r\n"],
+            )
+            .into());
         }
     }
 
@@ -392,6 +503,49 @@ fn parse_headers(
         kind,
         content_length,
     })
+}
+
+fn parse_bearer_token(value: &[u8]) -> Option<&[u8]> {
+    let scheme_length = b"Bearer".len();
+    if value.len() <= scheme_length || !value[..scheme_length].eq_ignore_ascii_case(b"Bearer") {
+        return None;
+    }
+
+    let separator_length = value[scheme_length..]
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count();
+    if separator_length == 0 {
+        return None;
+    }
+    let token = &value[scheme_length + separator_length..];
+    is_valid_bearer_token(token).then_some(token)
+}
+
+fn is_valid_bearer_token(token: &[u8]) -> bool {
+    let padding_start = token
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(token.len());
+    let (unencoded, padding) = token.split_at(padding_start);
+    !unencoded.is_empty()
+        && unencoded.iter().copied().all(is_bearer_token_byte)
+        && padding.iter().all(|byte| *byte == b'=')
+}
+
+fn is_bearer_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
+    let compared_bytes = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..compared_bytes {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
@@ -518,6 +672,7 @@ struct Status {
 impl Status {
     const OK: Self = Self::new(200, "OK");
     const BAD_REQUEST: Self = Self::new(400, "Bad Request");
+    const UNAUTHORIZED: Self = Self::new(401, "Unauthorized");
     const NOT_FOUND: Self = Self::new(404, "Not Found");
     const METHOD_NOT_ALLOWED: Self = Self::new(405, "Method Not Allowed");
     const LENGTH_REQUIRED: Self = Self::new(411, "Length Required");
