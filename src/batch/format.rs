@@ -480,7 +480,7 @@ fn write_json_value(output: &mut impl io::Write, value: &Value) -> io::Result<()
     }
 }
 
-fn write_json_string(output: &mut impl io::Write, value: &str) -> io::Result<()> {
+pub(crate) fn write_json_string(output: &mut impl io::Write, value: &str) -> io::Result<()> {
     output.write_all(b"\"")?;
     let mut unescaped_start = 0;
     for (index, character) in value.char_indices() {

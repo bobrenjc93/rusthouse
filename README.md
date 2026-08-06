@@ -203,6 +203,25 @@ Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
+## HTTP query exchange
+
+`handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
+exchange without opening a listener. It accepts exactly `POST /query`, requires
+a nonempty `Host` and one decimal `Content-Length`, rejects transfer encoding
+(including chunked requests), and returns `417 Expectation Failed` for
+`Expect` instead of waiting for a body whose sender may be awaiting an interim
+response. It sends the UTF-8 SQL body through `SharedDatabase::query`.
+Successful responses use the same compact JSON column metadata and
+positional-row shape as `--format json`; protocol and query failures return
+deterministic JSON error objects with an appropriate HTTP status.
+
+The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
+SQL body, and 16 MiB for the complete response including headers. The full
+response is prepared and checked before anything is written. Call
+`handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
+limits. This API deliberately owns only one exchange; listener, connection,
+timeout, and shutdown lifecycle remain the embedding application's concern.
+
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
 header must exactly match every schema column in order and case. Data fields
