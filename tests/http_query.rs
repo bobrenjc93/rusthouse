@@ -82,7 +82,66 @@ fn request_headers_are_case_insensitive_but_framing_is_strict() {
     assert_response(
         &exchange(&database, lf_only.as_bytes()),
         "HTTP/1.1 400 Bad Request",
-        r#"{"error":"request headers are incomplete"}"#,
+        r#"{"error":"HTTP headers require CRLF framing"}"#,
+    );
+}
+
+struct PrefixThenWouldBlock {
+    prefix: Cursor<Vec<u8>>,
+}
+
+impl PrefixThenWouldBlock {
+    fn new(prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            prefix: Cursor::new(prefix.into()),
+        }
+    }
+}
+
+impl Read for PrefixThenWouldBlock {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+            self.prefix.read(buffer)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "persistent connection has no more bytes yet",
+            ))
+        }
+    }
+}
+
+#[test]
+fn bare_lf_is_rejected_before_a_persistent_reader_needs_more_bytes() {
+    let database = SharedDatabase::default();
+    let input = PrefixThenWouldBlock::new(b"POST /query HTTP/1.1\n".to_vec());
+    let mut response = Vec::new();
+
+    handle_http_query(&database, input, &mut response).expect("bare LF produces a response");
+
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"HTTP headers require CRLF framing"}"#,
+    );
+}
+
+#[test]
+fn expect_is_rejected_before_reading_a_body_from_a_persistent_reader() {
+    let database = SharedDatabase::default();
+    let input = PrefixThenWouldBlock::new(
+        b"POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 9\r\nExpect: 100-continue\r\n\r\n"
+            .to_vec(),
+    );
+    let mut response = Vec::new();
+
+    handle_http_query(&database, input, &mut response)
+        .expect("Expect produces a final response before the body is read");
+
+    assert_response(
+        &response,
+        "HTTP/1.1 417 Expectation Failed",
+        r#"{"error":"Expect header is not supported"}"#,
     );
 }
 

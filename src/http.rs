@@ -86,7 +86,7 @@ impl StdError for HttpQueryError {
 ///
 /// The request must have CRLF framing, one nonempty `Host` header, and exactly
 /// one decimal `Content-Length`. Transfer encoding, including chunked bodies,
-/// is rejected. The body must be UTF-8 SQL and is passed to
+/// and `Expect` are rejected. The body must be UTF-8 SQL and is passed to
 /// [`SharedDatabase::query`], which accepts exactly one read-only statement.
 /// A successful response uses the same JSON result shape as the batch JSON
 /// formatter.
@@ -226,7 +226,19 @@ fn read_header_block(
                 )
                 .into());
             }
-            Ok(_) => header.push(byte[0]),
+            Ok(_) => {
+                let previous = header.last().copied();
+                if (byte[0] == b'\n' && previous != Some(b'\r'))
+                    || (previous == Some(b'\r') && byte[0] != b'\n')
+                {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "HTTP headers require CRLF framing",
+                    )
+                    .into());
+                }
+                header.push(byte[0]);
+            }
             Err(error) => return Err(RequestReadError::Io(error)),
         }
 
@@ -265,6 +277,7 @@ fn parse_headers(
     let mut host_seen = false;
     let mut header_count = 0_usize;
     let mut transfer_encoding_seen = false;
+    let mut expect_seen = false;
     while let Some(raw_line) = lines.next() {
         let line = strict_header_line(raw_line, lines.peek().is_some())?;
         header_count = header_count.saturating_add(1);
@@ -298,6 +311,8 @@ fn parse_headers(
             content_length = Some(parse_content_length(value)?);
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             transfer_encoding_seen = true;
+        } else if name.eq_ignore_ascii_case(b"expect") {
+            expect_seen = true;
         } else if name.eq_ignore_ascii_case(b"host") {
             if host_seen || value.is_empty() {
                 return Err(RequestFailure::new(Status::BAD_REQUEST, "invalid Host header").into());
@@ -310,6 +325,13 @@ fn parse_headers(
         return Err(
             RequestFailure::new(Status::BAD_REQUEST, "Transfer-Encoding is not supported").into(),
         );
+    }
+    if expect_seen {
+        return Err(RequestFailure::new(
+            Status::EXPECTATION_FAILED,
+            "Expect header is not supported",
+        )
+        .into());
     }
     if !host_seen {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "Host header is required").into());
@@ -436,6 +458,7 @@ impl Status {
     const METHOD_NOT_ALLOWED: Self = Self::new(405, "Method Not Allowed");
     const LENGTH_REQUIRED: Self = Self::new(411, "Length Required");
     const PAYLOAD_TOO_LARGE: Self = Self::new(413, "Payload Too Large");
+    const EXPECTATION_FAILED: Self = Self::new(417, "Expectation Failed");
     const REQUEST_HEADER_FIELDS_TOO_LARGE: Self = Self::new(431, "Request Header Fields Too Large");
     const INTERNAL_SERVER_ERROR: Self = Self::new(500, "Internal Server Error");
     const HTTP_VERSION_NOT_SUPPORTED: Self = Self::new(505, "HTTP Version Not Supported");
