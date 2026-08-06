@@ -2,7 +2,7 @@
 
 use std::error::Error as StdError;
 use std::fmt;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, QueryResult, QueryResultLimits, StatementResult,
@@ -183,6 +183,18 @@ impl SharedDatabase {
         self.read()?
             .execute_query_statement_with_result_limit(statement, max_result_bytes)
             .map_err(Into::into)
+    }
+
+    /// Reports whether a database read lock is immediately available.
+    ///
+    /// This check never waits, parses SQL, or accesses database contents. A
+    /// contended or poisoned lock is unavailable. The acquired read guard is
+    /// released before this method returns.
+    pub(crate) fn is_read_lock_available(&self) -> bool {
+        match self.inner.try_read() {
+            Ok(_guard) => true,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => false,
+        }
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, Database>, SharedDatabaseError> {

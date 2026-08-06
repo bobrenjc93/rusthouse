@@ -207,7 +207,7 @@ Read-only API misuse and lock poisoning are reported as distinct typed errors.
 ## HTTP query and health exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. Both supported routes require a nonempty
+exchange without opening a listener. All three supported routes require a nonempty
 `Host`, reject transfer encoding (including chunked requests), and return `417
 Expectation Failed` for `Expect` instead of waiting for a body whose sender
 may be awaiting an interim response.
@@ -226,9 +226,17 @@ successful ping reports that the HTTP exchange path is alive even when the
 database lock is unavailable. It is deliberately not a database-readiness or
 query-success check. Other method and target combinations are rejected.
 
+`GET /ready` is the database-readiness check. Like `/ping`, it accepts no body
+and returns the exact plain-text `200 OK` body `Ok.\n`, but only when a shared
+database read lock can be acquired immediately. It never waits for a writer and
+does not parse or execute SQL. Writer contention and lock poisoning return the
+same deterministic `503 Service Unavailable` JSON error. Use `/ping` for
+process-path liveness and `/ready` when routing work only to an instance that
+can immediately begin a database read.
+
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
 SQL body, and 16 MiB for the complete response including headers. Header limits
-apply to both routes, as does the complete-response limit. The full response is
+apply to all routes, as does the complete-response limit. The full response is
 prepared and checked before anything is written. Call
 `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
 limits. This API deliberately owns only one exchange; listener, connection,
@@ -237,7 +245,7 @@ timeout, and shutdown lifecycle remain the embedding application's concern.
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
 `handle_http_query_with_bearer_token_and_limits` for explicit resource limits.
-For either route, these separate handlers require exactly one case-insensitive
+For every route, these separate handlers require exactly one case-insensitive
 `Authorization` header with a `Bearer <token>` value; one or more spaces may
 separate the scheme and token. Configured tokens must be nonempty token68
 values. Missing, duplicate, malformed, and incorrect credentials receive the
