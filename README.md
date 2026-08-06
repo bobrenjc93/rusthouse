@@ -204,21 +204,32 @@ Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
-## HTTP query exchange
+## HTTP query and health exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. It accepts exactly `POST /query`, requires
-a nonempty `Host` and one decimal `Content-Length`, rejects transfer encoding
-(including chunked requests), and returns `417 Expectation Failed` for
-`Expect` instead of waiting for a body whose sender may be awaiting an interim
-response. It sends the UTF-8 SQL body through `SharedDatabase::query`.
-Successful responses use the same compact JSON column metadata and
-positional-row shape as `--format json`; protocol and query failures return
-deterministic JSON error objects with an appropriate HTTP status.
+exchange without opening a listener. Both supported routes require a nonempty
+`Host`, reject transfer encoding (including chunked requests), and return `417
+Expectation Failed` for `Expect` instead of waiting for a body whose sender
+may be awaiting an interim response.
+
+`POST /query` requires one decimal `Content-Length` and sends its UTF-8 SQL body
+through `SharedDatabase::query`. Successful responses use the same compact
+JSON column metadata and positional-row shape as `--format json`; protocol and
+query failures return deterministic JSON error objects with an appropriate
+HTTP status.
+
+`GET /ping` is the ClickHouse-compatible health check. It accepts no request
+body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
+with content type `text/plain; charset=utf-8` and the exact four-byte body
+`Ok.\n`. The handler neither queries the database nor acquires its lock, so a
+successful ping reports that the HTTP exchange path is alive even when the
+database lock is unavailable. It is deliberately not a database-readiness or
+query-success check. Other method and target combinations are rejected.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
-SQL body, and 16 MiB for the complete response including headers. The full
-response is prepared and checked before anything is written. Call
+SQL body, and 16 MiB for the complete response including headers. Header limits
+apply to both routes, as does the complete-response limit. The full response is
+prepared and checked before anything is written. Call
 `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
 limits. This API deliberately owns only one exchange; listener, connection,
 timeout, and shutdown lifecycle remain the embedding application's concern.

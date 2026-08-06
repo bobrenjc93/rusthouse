@@ -1,5 +1,8 @@
 use std::io::{self, Cursor, Read, Write};
+use std::sync::{Arc, RwLock};
+use std::thread;
 
+use rusthouse::batch::engine::Database;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
     handle_http_query_with_limits,
@@ -22,6 +25,20 @@ fn exchange(database: &SharedDatabase, request: &[u8]) -> Vec<u8> {
 }
 
 fn assert_response(response: &[u8], status: &str, expected_body: &str) {
+    assert_response_with_content_type(
+        response,
+        status,
+        "application/json",
+        expected_body.as_bytes(),
+    );
+}
+
+fn assert_response_with_content_type(
+    response: &[u8],
+    status: &str,
+    content_type: &str,
+    expected_body: &[u8],
+) {
     let separator = b"\r\n\r\n";
     let split = response
         .windows(separator.len())
@@ -31,10 +48,54 @@ fn assert_response(response: &[u8], status: &str, expected_body: &str) {
     let body = &response[split + separator.len()..];
 
     assert_eq!(headers.lines().next(), Some(status));
-    assert!(headers.contains("\r\nContent-Type: application/json\r\n"));
+    assert!(headers.contains(&format!("\r\nContent-Type: {content_type}\r\n")));
     assert!(headers.contains("\r\nConnection: close"));
     assert!(headers.contains(&format!("\r\nContent-Length: {}\r\n", body.len())));
-    assert_eq!(body, expected_body.as_bytes());
+    assert_eq!(body, expected_body);
+}
+
+fn assert_ping_response(response: &[u8]) {
+    assert_response_with_content_type(
+        response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"Ok.\n",
+    );
+}
+
+#[test]
+fn ping_returns_the_clickhouse_health_response_without_content_length() {
+    let database = SharedDatabase::default();
+
+    assert_ping_response(&exchange(
+        &database,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ));
+    assert_ping_response(&exchange(
+        &database,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    ));
+}
+
+#[test]
+fn ping_succeeds_when_the_database_lock_is_unavailable() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    assert_response(
+        &exchange(&database, &request(b"SHOW TABLES;")),
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_ping_response(&exchange(
+        &database,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ));
 }
 
 #[test]
@@ -211,6 +272,21 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
             .contains("\r\nAllow: POST\r\n")
     );
 
+    let ping_method = exchange(
+        &database,
+        b"POST /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &ping_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be GET for /ping"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&ping_method)
+            .unwrap()
+            .contains("\r\nAllow: GET\r\n")
+    );
+
     assert_response(
         &exchange(
             &database,
@@ -218,6 +294,11 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
         ),
         "HTTP/1.1 404 Not Found",
         r#"{"error":"request target must be /query"}"#,
+    );
+    assert_response(
+        &exchange(&database, b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be /ping"}"#,
     );
     assert_response(
         &exchange(
@@ -235,6 +316,42 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"Transfer-Encoding is not supported"}"#,
     );
+}
+
+#[test]
+fn ping_requires_host_http_1_1_and_an_empty_body() {
+    let database = SharedDatabase::default();
+    let cases: &[(&[u8], &str, &str)] = &[
+        (
+            b"GET /ping HTTP/1.1\r\n\r\n",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"Host header is required"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.1\r\nHost: \r\n\r\n",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"invalid Host header"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            "HTTP/1.1 505 HTTP Version Not Supported",
+            r#"{"error":"HTTP/1.1 is required"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"GET /ping does not accept a request body"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"Transfer-Encoding is not supported"}"#,
+        ),
+    ];
+
+    for (request, status, body) in cases {
+        assert_response(&exchange(&database, request), status, body);
+    }
 }
 
 #[test]
@@ -294,6 +411,65 @@ fn request_header_count_header_bytes_and_sql_body_are_bounded() {
         "HTTP/1.1 413 Payload Too Large",
         r#"{"error":"request body exceeds configured byte limit"}"#,
     );
+}
+
+#[test]
+fn ping_honors_exact_header_and_complete_response_byte_limits() {
+    let database = SharedDatabase::default();
+    let request = b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let expected_response = exchange(&database, request);
+
+    let mut response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_header_bytes: request.len(),
+            max_header_count: 1,
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(response, expected_response);
+
+    let mut header_overflow_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut header_overflow_response,
+        HttpQueryLimits {
+            max_header_bytes: request.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &header_overflow_response,
+        "HTTP/1.1 431 Request Header Fields Too Large",
+        r#"{"error":"request headers exceed configured byte limit"}"#,
+    );
+
+    let mut response_overflow_output = Vec::new();
+    let error = handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response_overflow_output,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the cap cannot hold either the ping or fixed limit response");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded {
+            max_bytes,
+            ..
+        } if max_bytes == expected_response.len() - 1
+    ));
+    assert!(response_overflow_output.is_empty());
 }
 
 #[test]
