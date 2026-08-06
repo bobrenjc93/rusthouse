@@ -64,6 +64,26 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
+fn csv_batch_filters_distinct_tuples_before_deduplication_and_limit() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (kind String, rank Int64, score Float64, active Bool); \
+          INSERT INTO events VALUES \
+              ('alpha', 0, 9.0, false), \
+              ('beta', 1, 2.5, true), \
+              ('beta', 2, 4.0, true), \
+              ('alpha', 7, 0.0, false), \
+              ('gamma', 3, 5.0, true); \
+          SELECT DISTINCT kind, active FROM events \
+          WHERE (active = true AND score >= 2.5) OR rank = 7 LIMIT 2;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"kind,active\nbeta,true\nalpha,false\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn tsv_batch_emits_all_types_nulls_empty_and_multiple_escaped_results() {
     let output = run(
         &["--format", "tsv"],

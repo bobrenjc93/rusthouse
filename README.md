@@ -62,11 +62,12 @@ rows in deterministic left-major order. This deliberately narrow form does
 not accept projections, predicates, aliases, or additional joins. The
 LIMIT-reduced Cartesian row, scalar-value, and estimated byte counts are all
 checked before result rows are materialized.
-`SELECT DISTINCT column [, ...] FROM table [LIMIT n]` supports tuples of
-physical columns of any supported types and returns unique tuples in
-deterministic first-seen order. Distinct tuples are collected under the
-grouped-query cap before `LIMIT` is applied, and the limited output remains
-subject to the normal result caps.
+`SELECT DISTINCT column [, ...] FROM table [WHERE predicate] [LIMIT n]`
+supports tuples of physical columns of any supported types and the same typed,
+composable comparison predicates as regular `SELECT`. Rows are filtered before
+unique tuples are retained in deterministic first-seen order. Distinct tuples
+are collected under the grouped-query cap before `LIMIT` is applied, and the
+limited output remains subject to the normal result caps.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
