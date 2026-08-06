@@ -103,6 +103,22 @@ fn bearer_authenticated_query_returns_the_existing_json_result_shape() {
 }
 
 #[test]
+fn bearer_scheme_accepts_one_or_more_spaces_before_the_token() {
+    let database = SharedDatabase::default();
+
+    for spaces in [" ", "  ", "    "] {
+        let authorization = format!("Authorization: Bearer{spaces}correct-token\r\n");
+        let (request, _) = request_with_authorization(b"SELECT true AS ready;", &authorization);
+
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"ready","type":"Bool"}],"rows":[[true]]}"#,
+        );
+    }
+}
+
+#[test]
 fn bearer_rejections_are_identical_and_do_not_consume_or_execute_the_body() {
     let database = SharedDatabase::default();
     database
@@ -199,6 +215,51 @@ fn empty_configured_bearer_token_is_rejected_before_input_or_database_access() {
         &response,
         "HTTP/1.1 500 Internal Server Error",
         r#"{"error":"configured bearer token must not be empty"}"#,
+    );
+}
+
+#[test]
+fn malformed_configured_bearer_tokens_are_rejected_before_reading_input() {
+    let database = SharedDatabase::default();
+    let invalid_tokens = ["secret:42", "abc=def", "two words", " ", "\t", "tökén"];
+    let mut expected_response = None;
+
+    for token in invalid_tokens {
+        let mut response = Vec::new();
+        handle_http_query_with_bearer_token(&database, token, FailingReader, &mut response)
+            .unwrap_or_else(|error| panic!("invalid configuration {token:?} responds: {error}"));
+
+        assert_response(
+            &response,
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":"configured bearer token is not valid token68"}"#,
+        );
+        if let Some(expected_response) = &expected_response {
+            assert_eq!(&response, expected_response);
+        } else {
+            expected_response = Some(response);
+        }
+    }
+
+    let expected_response = expected_response.expect("at least one invalid configuration");
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "secret:42",
+        FailingReader,
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
     );
 }
 

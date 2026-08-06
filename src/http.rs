@@ -130,10 +130,11 @@ pub fn handle_http_query_with_limits(
 ///
 /// This is separate from [`handle_http_query`], which remains unauthenticated.
 /// A request is authorized only when it has exactly one `Authorization` header
-/// whose value is `Bearer <token>` and whose token matches
+/// whose value is `Bearer`, one or more spaces, and a token matching
 /// `expected_bearer_token`. Authentication failures receive the same response
-/// before the SQL body is read or the database is accessed. An empty configured
-/// token is rejected as a server configuration error without reading any input.
+/// before the SQL body is read or the database is accessed. The configured
+/// token must be a nonempty RFC token68 value; invalid configurations are
+/// rejected as a server error without reading any input.
 ///
 /// This function provides authentication only. The embedding application must
 /// provide TLS to keep the bearer token and query contents confidential in
@@ -180,6 +181,15 @@ pub fn handle_http_query_with_bearer_token_and_limits(
             Status::INTERNAL_SERVER_ERROR,
             &[],
             "configured bearer token must not be empty",
+            limits.max_response_bytes,
+        );
+    }
+    if !is_valid_bearer_token(expected_bearer_token.as_bytes()) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured bearer token is not valid token68",
             limits.max_response_bytes,
         );
     }
@@ -448,26 +458,31 @@ fn parse_headers(
 }
 
 fn parse_bearer_token(value: &[u8]) -> Option<&[u8]> {
-    if value.len() <= b"Bearer ".len()
-        || !value[..b"Bearer".len()].eq_ignore_ascii_case(b"Bearer")
-        || value[b"Bearer".len()] != b' '
-    {
+    let scheme_length = b"Bearer".len();
+    if value.len() <= scheme_length || !value[..scheme_length].eq_ignore_ascii_case(b"Bearer") {
         return None;
     }
 
-    let token = &value[b"Bearer ".len()..];
+    let separator_length = value[scheme_length..]
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count();
+    if separator_length == 0 {
+        return None;
+    }
+    let token = &value[scheme_length + separator_length..];
+    is_valid_bearer_token(token).then_some(token)
+}
+
+fn is_valid_bearer_token(token: &[u8]) -> bool {
     let padding_start = token
         .iter()
         .position(|byte| *byte == b'=')
         .unwrap_or(token.len());
     let (unencoded, padding) = token.split_at(padding_start);
-    if unencoded.is_empty()
-        || !unencoded.iter().copied().all(is_bearer_token_byte)
-        || !padding.iter().all(|byte| *byte == b'=')
-    {
-        return None;
-    }
-    Some(token)
+    !unencoded.is_empty()
+        && unencoded.iter().copied().all(is_bearer_token_byte)
+        && padding.iter().all(|byte| *byte == b'=')
 }
 
 fn is_bearer_token_byte(byte: u8) -> bool {

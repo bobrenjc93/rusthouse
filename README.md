@@ -227,10 +227,12 @@ Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
 `handle_http_query_with_bearer_token_and_limits` for explicit resource limits.
 These separate handlers require exactly one case-insensitive `Authorization`
-header with a `Bearer <token>` value. Missing, duplicate, malformed, and
-incorrect credentials receive the same bounded `401 Unauthorized` response
-before the SQL body is read or the database lock is acquired. Empty configured
-tokens are rejected before any request input is read. The original
+header with a `Bearer <token>` value; one or more spaces may separate the scheme
+and token. Configured tokens must be nonempty token68 values. Missing,
+duplicate, malformed, and incorrect credentials receive the same bounded
+`401 Unauthorized` response before the SQL body is read or the database lock
+is acquired. Invalid configured tokens are rejected before any request input
+is read. The original
 `handle_http_query` APIs intentionally remain unauthenticated for existing
 in-process embeddings.
 
