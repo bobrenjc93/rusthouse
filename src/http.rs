@@ -1,4 +1,4 @@
-//! Transport-neutral handling for one bounded, read-only HTTP query exchange.
+//! Transport-neutral handling for one bounded HTTP query or health exchange.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -44,7 +44,7 @@ impl Default for HttpQueryLimits {
     }
 }
 
-/// A transport failure while handling one HTTP query exchange.
+/// A transport failure while handling one HTTP query or health exchange.
 ///
 /// Request and query errors that can be represented on the wire are returned
 /// as HTTP responses and are not Rust errors. No response is written for a
@@ -82,14 +82,17 @@ impl StdError for HttpQueryError {
     }
 }
 
-/// Handles one strict, read-only `POST /query HTTP/1.1` exchange.
+/// Handles one strict, bounded HTTP/1.1 exchange.
 ///
-/// The request must have CRLF framing, one nonempty `Host` header, and exactly
-/// one decimal `Content-Length`. Transfer encoding, including chunked bodies,
-/// and `Expect` are rejected. The body must be UTF-8 SQL and is passed to
-/// [`SharedDatabase::query`], which accepts exactly one read-only statement.
-/// A successful response uses the same JSON result shape as the batch JSON
-/// formatter.
+/// `POST /query` requires exactly one decimal `Content-Length`. Its body must
+/// be UTF-8 SQL and is passed to [`SharedDatabase::query`], which accepts
+/// exactly one read-only statement. A successful query response uses the same
+/// JSON result shape as the batch JSON formatter.
+///
+/// `GET /ping` accepts no request body and returns the ClickHouse-compatible
+/// plain-text body `Ok.\n`. It does not access or acquire a lock on the
+/// database. Both targets require CRLF framing and one nonempty `Host` header.
+/// Transfer encoding, including chunked bodies, and `Expect` are rejected.
 ///
 /// The handler does not open, close, or otherwise manage a listener or stream.
 /// It reads exactly the declared request body and emits at most one response.
@@ -106,7 +109,7 @@ pub fn handle_http_query(
     handle_http_query_with_limits(database, input, output, HttpQueryLimits::default())
 }
 
-/// Handles one HTTP query exchange with explicit resource limits.
+/// Handles one HTTP query or health exchange with explicit resource limits.
 ///
 /// See [`handle_http_query`] for the accepted protocol and response behavior.
 /// The response limit covers the status line, headers, empty line, and body.
@@ -119,12 +122,99 @@ pub fn handle_http_query(
 /// [`handle_http_query`].
 pub fn handle_http_query_with_limits(
     database: &SharedDatabase,
-    mut input: impl Read,
+    input: impl Read,
+    output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_exchange(database, input, output, limits, None)
+}
+
+/// Handles one HTTP query or health exchange that requires a bearer token.
+///
+/// This is separate from [`handle_http_query`], which remains unauthenticated.
+/// Every request, including `GET /ping`, is authorized only when it has exactly
+/// one `Authorization` header whose value is `Bearer`, one or more spaces, and
+/// a token matching `expected_bearer_token`. Authentication failures receive
+/// the same response before the SQL body is read or the database is accessed.
+/// The configured token must be a nonempty RFC token68 value; invalid
+/// configurations are rejected as a server error without reading any input.
+///
+/// This function provides authentication only. The embedding application must
+/// provide TLS to keep the bearer token and query contents confidential in
+/// transit.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_bearer_token(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_bearer_token_and_limits(
+        database,
+        expected_bearer_token,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one bearer-authenticated HTTP exchange with explicit resource limits.
+///
+/// See [`handle_http_query_with_bearer_token`] for authentication behavior and
+/// [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_bearer_token_and_limits(
+    database: &SharedDatabase,
+    expected_bearer_token: &str,
+    input: impl Read,
     mut output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
-    let sql = match read_request(&mut input, limits) {
-        Ok(sql) => sql,
+    if expected_bearer_token.is_empty() {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured bearer token must not be empty",
+            limits.max_response_bytes,
+        );
+    }
+    if !is_valid_bearer_token(expected_bearer_token.as_bytes()) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured bearer token is not valid token68",
+            limits.max_response_bytes,
+        );
+    }
+
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Some(expected_bearer_token.as_bytes()),
+    )
+}
+
+fn handle_http_query_exchange(
+    database: &SharedDatabase,
+    mut input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+    expected_bearer_token: Option<&[u8]>,
+) -> Result<(), HttpQueryError> {
+    let request = match read_request(&mut input, limits, expected_bearer_token) {
+        Ok(request) => request,
         Err(RequestReadError::Io(error)) => return Err(HttpQueryError::Read(error)),
         Err(RequestReadError::Protocol(failure)) => {
             return write_error_response(
@@ -135,6 +225,17 @@ pub fn handle_http_query_with_limits(
                 limits.max_response_bytes,
             );
         }
+    };
+
+    let HttpRequest::Query(sql) = request else {
+        return write_response(
+            &mut output,
+            Status::OK,
+            &[],
+            CONTENT_TYPE_TEXT,
+            b"Ok.\n".to_vec(),
+            limits.max_response_bytes,
+        );
     };
 
     match database.query(&sql) {
@@ -148,6 +249,7 @@ pub fn handle_http_query_with_limits(
                 &mut output,
                 Status::OK,
                 &[],
+                CONTENT_TYPE_JSON,
                 body.bytes,
                 limits.max_response_bytes,
             )
@@ -172,35 +274,61 @@ pub fn handle_http_query_with_limits(
 fn read_request(
     input: &mut impl Read,
     limits: HttpQueryLimits,
-) -> Result<String, RequestReadError> {
+    expected_bearer_token: Option<&[u8]>,
+) -> Result<HttpRequest, RequestReadError> {
     let header = read_header_block(input, limits.max_header_bytes)?;
-    let request = parse_headers(&header, limits.max_header_count)?;
-    if request.content_length > limits.max_sql_bytes {
-        return Err(RequestFailure::new(
-            Status::PAYLOAD_TOO_LARGE,
-            "request body exceeds configured byte limit",
-        )
-        .into());
-    }
+    let request = parse_headers(&header, limits.max_header_count, expected_bearer_token)?;
 
-    let mut body = vec![0; request.content_length];
-    let mut read = 0;
-    while read < body.len() {
-        match input.read(&mut body[read..]) {
-            Ok(0) => {
+    match request.kind {
+        RequestKind::Ping => {
+            if request.content_length.unwrap_or(0) != 0 {
                 return Err(RequestFailure::new(
                     Status::BAD_REQUEST,
-                    "request body is shorter than Content-Length",
+                    "GET /ping does not accept a request body",
                 )
                 .into());
             }
-            Ok(bytes) => read += bytes,
-            Err(error) => return Err(RequestReadError::Io(error)),
+            Ok(HttpRequest::Ping)
+        }
+        RequestKind::Query => {
+            let Some(content_length) = request.content_length else {
+                return Err(RequestFailure::new(
+                    Status::LENGTH_REQUIRED,
+                    "Content-Length header is required",
+                )
+                .into());
+            };
+            if content_length > limits.max_sql_bytes {
+                return Err(RequestFailure::new(
+                    Status::PAYLOAD_TOO_LARGE,
+                    "request body exceeds configured byte limit",
+                )
+                .into());
+            }
+
+            let mut body = vec![0; content_length];
+            let mut read = 0;
+            while read < body.len() {
+                match input.read(&mut body[read..]) {
+                    Ok(0) => {
+                        return Err(RequestFailure::new(
+                            Status::BAD_REQUEST,
+                            "request body is shorter than Content-Length",
+                        )
+                        .into());
+                    }
+                    Ok(bytes) => read += bytes,
+                    Err(error) => return Err(RequestReadError::Io(error)),
+                }
+            }
+
+            String::from_utf8(body)
+                .map(HttpRequest::Query)
+                .map_err(|_| {
+                    RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into()
+                })
         }
     }
-
-    String::from_utf8(body)
-        .map_err(|_| RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into())
 }
 
 fn read_header_block(
@@ -256,12 +384,25 @@ fn read_header_block(
 }
 
 struct ParsedRequest {
-    content_length: usize,
+    kind: RequestKind,
+    content_length: Option<usize>,
+}
+
+enum HttpRequest {
+    Query(String),
+    Ping,
+}
+
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Query,
+    Ping,
 }
 
 fn parse_headers(
     header: &[u8],
     max_header_count: usize,
+    expected_bearer_token: Option<&[u8]>,
 ) -> Result<ParsedRequest, RequestReadError> {
     let Some(without_terminator) = header.strip_suffix(b"\r\n\r\n") else {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "malformed HTTP headers").into());
@@ -271,13 +412,15 @@ fn parse_headers(
         return Err(RequestFailure::new(Status::BAD_REQUEST, "missing request line").into());
     };
     let request_line = strict_header_line(raw_request_line, lines.peek().is_some())?;
-    parse_request_line(request_line)?;
+    let kind = parse_request_line(request_line)?;
 
     let mut content_length = None;
     let mut host_seen = false;
     let mut header_count = 0_usize;
     let mut transfer_encoding_seen = false;
     let mut expect_seen = false;
+    let mut authorization = None;
+    let mut duplicate_authorization = false;
     while let Some(raw_line) = lines.next() {
         let line = strict_header_line(raw_line, lines.peek().is_some())?;
         header_count = header_count.saturating_add(1);
@@ -318,6 +461,26 @@ fn parse_headers(
                 return Err(RequestFailure::new(Status::BAD_REQUEST, "invalid Host header").into());
             }
             host_seen = true;
+        } else if expected_bearer_token.is_some()
+            && name.eq_ignore_ascii_case(b"authorization")
+            && authorization.replace(value).is_some()
+        {
+            duplicate_authorization = true;
+        }
+    }
+
+    if let Some(expected_bearer_token) = expected_bearer_token {
+        let authorized = !duplicate_authorization
+            && authorization
+                .and_then(parse_bearer_token)
+                .is_some_and(|provided| constant_work_eq(provided, expected_bearer_token));
+        if !authorized {
+            return Err(RequestFailure::with_headers(
+                Status::UNAUTHORIZED,
+                "bearer authentication required",
+                &[b"WWW-Authenticate: Bearer\r\n"],
+            )
+            .into());
         }
     }
 
@@ -336,17 +499,56 @@ fn parse_headers(
     if !host_seen {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "Host header is required").into());
     }
-    let Some(content_length) = content_length else {
-        return Err(RequestFailure::new(
-            Status::LENGTH_REQUIRED,
-            "Content-Length header is required",
-        )
-        .into());
-    };
-    Ok(ParsedRequest { content_length })
+    Ok(ParsedRequest {
+        kind,
+        content_length,
+    })
 }
 
-fn parse_request_line(line: &[u8]) -> Result<(), RequestReadError> {
+fn parse_bearer_token(value: &[u8]) -> Option<&[u8]> {
+    let scheme_length = b"Bearer".len();
+    if value.len() <= scheme_length || !value[..scheme_length].eq_ignore_ascii_case(b"Bearer") {
+        return None;
+    }
+
+    let separator_length = value[scheme_length..]
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count();
+    if separator_length == 0 {
+        return None;
+    }
+    let token = &value[scheme_length + separator_length..];
+    is_valid_bearer_token(token).then_some(token)
+}
+
+fn is_valid_bearer_token(token: &[u8]) -> bool {
+    let padding_start = token
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(token.len());
+    let (unencoded, padding) = token.split_at(padding_start);
+    !unencoded.is_empty()
+        && unencoded.iter().copied().all(is_bearer_token_byte)
+        && padding.iter().all(|byte| *byte == b'=')
+}
+
+fn is_bearer_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
+    let compared_bytes = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..compared_bytes {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
     let mut parts = line.split(|byte| *byte == b' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -363,18 +565,34 @@ fn parse_request_line(line: &[u8]) -> Result<(), RequestReadError> {
         )
         .into());
     }
-    if method != b"POST" {
-        return Err(RequestFailure::with_headers(
+    match (method, target) {
+        (b"POST", b"/query") => Ok(RequestKind::Query),
+        (b"GET", b"/ping") => Ok(RequestKind::Ping),
+        (_, b"/query") => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
             "method must be POST",
             &[b"Allow: POST\r\n"],
         )
-        .into());
+        .into()),
+        (_, b"/ping") => Err(RequestFailure::with_headers(
+            Status::METHOD_NOT_ALLOWED,
+            "method must be GET for /ping",
+            &[b"Allow: GET\r\n"],
+        )
+        .into()),
+        (b"POST", _) => {
+            Err(RequestFailure::new(Status::NOT_FOUND, "request target must be /query").into())
+        }
+        (b"GET", _) => {
+            Err(RequestFailure::new(Status::NOT_FOUND, "request target must be /ping").into())
+        }
+        _ => Err(RequestFailure::with_headers(
+            Status::METHOD_NOT_ALLOWED,
+            "method must be POST for /query or GET for /ping",
+            &[b"Allow: GET, POST\r\n"],
+        )
+        .into()),
     }
-    if target != b"/query" {
-        return Err(RequestFailure::new(Status::NOT_FOUND, "request target must be /query").into());
-    }
-    Ok(())
 }
 
 fn parse_content_length(value: &[u8]) -> Result<usize, RequestReadError> {
@@ -454,6 +672,7 @@ struct Status {
 impl Status {
     const OK: Self = Self::new(200, "OK");
     const BAD_REQUEST: Self = Self::new(400, "Bad Request");
+    const UNAUTHORIZED: Self = Self::new(401, "Unauthorized");
     const NOT_FOUND: Self = Self::new(404, "Not Found");
     const METHOD_NOT_ALLOWED: Self = Self::new(405, "Method Not Allowed");
     const LENGTH_REQUIRED: Self = Self::new(411, "Length Required");
@@ -508,6 +727,8 @@ impl From<RequestFailure> for RequestReadError {
 }
 
 const RESPONSE_LIMIT_MESSAGE: &str = "response exceeds configured byte limit";
+const CONTENT_TYPE_JSON: &[u8] = b"application/json";
+const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
 
 fn write_error_response(
     output: &mut impl Write,
@@ -520,17 +741,31 @@ fn write_error_response(
     body.extend_from_slice(b"{\"error\":");
     write_json_string(&mut body, message).expect("writing JSON to a Vec cannot fail");
     body.extend_from_slice(b"}");
-    write_response(output, status, extra_headers, body, max_response_bytes)
+    write_response(
+        output,
+        status,
+        extra_headers,
+        CONTENT_TYPE_JSON,
+        body,
+        max_response_bytes,
+    )
 }
 
 fn write_response(
     output: &mut impl Write,
     status: Status,
     extra_headers: &[&[u8]],
+    content_type: &[u8],
     body: Vec<u8>,
     max_response_bytes: usize,
 ) -> Result<(), HttpQueryError> {
-    match prepare_response(status, extra_headers, &body, max_response_bytes) {
+    match prepare_response(
+        status,
+        extra_headers,
+        content_type,
+        &body,
+        max_response_bytes,
+    ) {
         Ok(response) => output.write_all(&response).map_err(HttpQueryError::Write),
         Err(_) => write_response_limit_error(output, max_response_bytes),
     }
@@ -548,6 +783,7 @@ fn write_response_limit_error(
     let response = prepare_response(
         Status::INTERNAL_SERVER_ERROR,
         &[],
+        CONTENT_TYPE_JSON,
         &body,
         max_response_bytes,
     )
@@ -561,13 +797,16 @@ fn write_response_limit_error(
 fn prepare_response(
     status: Status,
     extra_headers: &[&[u8]],
+    content_type: &[u8],
     body: &[u8],
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, usize> {
     let mut header = Vec::new();
     write!(header, "HTTP/1.1 {} {}\r\n", status.code, status.reason)
         .expect("writing HTTP headers to a Vec cannot fail");
-    header.extend_from_slice(b"Content-Type: application/json\r\n");
+    header.extend_from_slice(b"Content-Type: ");
+    header.extend_from_slice(content_type);
+    header.extend_from_slice(b"\r\n");
     write!(header, "Content-Length: {}\r\n", body.len())
         .expect("writing HTTP headers to a Vec cannot fail");
     header.extend_from_slice(b"Connection: close\r\n");

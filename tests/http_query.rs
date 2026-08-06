@@ -1,7 +1,11 @@
 use std::io::{self, Cursor, Read, Write};
+use std::sync::{Arc, RwLock};
+use std::thread;
 
+use rusthouse::batch::engine::Database;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
+    handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_limits,
 };
 
@@ -21,7 +25,39 @@ fn exchange(database: &SharedDatabase, request: &[u8]) -> Vec<u8> {
     response
 }
 
+fn request_with_authorization(sql: &[u8], authorization_headers: &str) -> (Vec<u8>, u64) {
+    let mut request = format!(
+        "POST /query HTTP/1.1\r\nHost: localhost\r\n{authorization_headers}Content-Length: {}\r\n\r\n",
+        sql.len()
+    )
+    .into_bytes();
+    let body_offset = request.len() as u64;
+    request.extend_from_slice(sql);
+    (request, body_offset)
+}
+
+fn authenticated_exchange(database: &SharedDatabase, token: &str, request: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(database, token, Cursor::new(request), &mut response)
+        .expect("authenticated exchange succeeds");
+    response
+}
+
 fn assert_response(response: &[u8], status: &str, expected_body: &str) {
+    assert_response_with_content_type(
+        response,
+        status,
+        "application/json",
+        expected_body.as_bytes(),
+    );
+}
+
+fn assert_response_with_content_type(
+    response: &[u8],
+    status: &str,
+    content_type: &str,
+    expected_body: &[u8],
+) {
     let separator = b"\r\n\r\n";
     let split = response
         .windows(separator.len())
@@ -31,10 +67,54 @@ fn assert_response(response: &[u8], status: &str, expected_body: &str) {
     let body = &response[split + separator.len()..];
 
     assert_eq!(headers.lines().next(), Some(status));
-    assert!(headers.contains("\r\nContent-Type: application/json\r\n"));
+    assert!(headers.contains(&format!("\r\nContent-Type: {content_type}\r\n")));
     assert!(headers.contains("\r\nConnection: close"));
     assert!(headers.contains(&format!("\r\nContent-Length: {}\r\n", body.len())));
-    assert_eq!(body, expected_body.as_bytes());
+    assert_eq!(body, expected_body);
+}
+
+fn assert_ping_response(response: &[u8]) {
+    assert_response_with_content_type(
+        response,
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"Ok.\n",
+    );
+}
+
+#[test]
+fn ping_returns_the_clickhouse_health_response_without_content_length() {
+    let database = SharedDatabase::default();
+
+    assert_ping_response(&exchange(
+        &database,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ));
+    assert_ping_response(&exchange(
+        &database,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    ));
+}
+
+#[test]
+fn ping_succeeds_when_the_database_lock_is_unavailable() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    assert_response(
+        &exchange(&database, &request(b"SHOW TABLES;")),
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    assert_ping_response(&exchange(
+        &database,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ));
 }
 
 #[test]
@@ -55,6 +135,276 @@ fn valid_query_returns_the_existing_json_result_shape() {
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
     );
+}
+
+#[test]
+fn bearer_authenticated_query_returns_the_existing_json_result_shape() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, label String); \
+             INSERT INTO readings VALUES (2, 'two'), (1, 'one');",
+        )
+        .unwrap();
+    let (request, _) = request_with_authorization(
+        b"SELECT id, label FROM readings ORDER BY id;",
+        "Authorization: Bearer correct-token_42\r\n",
+    );
+
+    let response = authenticated_exchange(&database, "correct-token_42", &request);
+
+    assert_response(
+        &response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
+    );
+}
+
+#[test]
+fn bearer_authentication_also_protects_ping() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    let unauthorized_request =
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    let body_offset = unauthorized_request.len() as u64 - 1;
+    let mut input = Cursor::new(unauthorized_request);
+    let mut unauthorized = Vec::new();
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut unauthorized)
+        .expect("missing ping credentials produce a response");
+    assert_eq!(
+        input.position(),
+        body_offset,
+        "authentication failure must not consume a ping body"
+    );
+    assert_response(
+        &unauthorized,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&unauthorized)
+            .unwrap()
+            .contains("\r\nWWW-Authenticate: Bearer\r\n")
+    );
+
+    assert_ping_response(&authenticated_exchange(
+        &database,
+        "correct-token",
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\naUtHoRiZaTiOn: bEaReR correct-token\r\n\r\n",
+    ));
+}
+
+#[test]
+fn bearer_scheme_accepts_one_or_more_spaces_before_the_token() {
+    let database = SharedDatabase::default();
+
+    for spaces in [" ", "  ", "    "] {
+        let authorization = format!("Authorization: Bearer{spaces}correct-token\r\n");
+        let (request, _) = request_with_authorization(b"SELECT true AS ready;", &authorization);
+
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &request),
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"ready","type":"Bool"}],"rows":[[true]]}"#,
+        );
+    }
+}
+
+#[test]
+fn bearer_rejections_are_identical_and_do_not_consume_or_execute_the_body() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE retained (value Int64); INSERT INTO retained VALUES (7);")
+        .unwrap();
+    let rejected_headers = [
+        ("missing", ""),
+        (
+            "duplicate",
+            "Authorization: Bearer correct-token\r\nAuthorization: Bearer correct-token\r\n",
+        ),
+        ("wrong scheme", "Authorization: Basic correct-token\r\n"),
+        ("missing token", "Authorization: Bearer\r\n"),
+        (
+            "embedded whitespace",
+            "Authorization: Bearer two tokens\r\n",
+        ),
+        ("invalid padding", "Authorization: Bearer abc=def\r\n"),
+        ("incorrect", "Authorization: Bearer incorrect-token\r\n"),
+    ];
+    let mut expected_response = None;
+
+    for (name, headers) in rejected_headers {
+        let (request, body_offset) = request_with_authorization(b"DROP TABLE retained;", headers);
+        let mut input = Cursor::new(request);
+        let mut response = Vec::new();
+
+        handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+            .unwrap_or_else(|error| panic!("{name} credentials produce a response: {error}"));
+
+        assert_eq!(
+            input.position(),
+            body_offset,
+            "{name} credentials must not consume the SQL body"
+        );
+        assert_response(
+            &response,
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"bearer authentication required"}"#,
+        );
+        assert!(
+            std::str::from_utf8(&response)
+                .unwrap()
+                .contains("\r\nWWW-Authenticate: Bearer\r\n"),
+            "{name} response advertises bearer authentication"
+        );
+        if let Some(expected_response) = &expected_response {
+            assert_eq!(
+                &response, expected_response,
+                "credential failures must not disclose their rejection reason"
+            );
+        } else {
+            expected_response = Some(response);
+        }
+    }
+
+    assert_response(
+        &exchange(&database, &request(b"SELECT value FROM retained;")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+    );
+}
+
+#[test]
+fn bearer_rejection_does_not_lock_the_database() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+    let (request, _) =
+        request_with_authorization(b"SELECT 1;", "Authorization: Bearer incorrect-token\r\n");
+
+    let response = authenticated_exchange(&database, "correct-token", &request);
+
+    assert_response(
+        &response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+}
+
+#[test]
+fn empty_configured_bearer_token_is_rejected_before_input_or_database_access() {
+    let database = SharedDatabase::default();
+    let mut response = Vec::new();
+
+    handle_http_query_with_bearer_token(&database, "", FailingReader, &mut response)
+        .expect("invalid configuration produces a response without reading input");
+
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"configured bearer token must not be empty"}"#,
+    );
+}
+
+#[test]
+fn malformed_configured_bearer_tokens_are_rejected_before_reading_input() {
+    let database = SharedDatabase::default();
+    let invalid_tokens = ["secret:42", "abc=def", "two words", " ", "\t", "tökén"];
+    let mut expected_response = None;
+
+    for token in invalid_tokens {
+        let mut response = Vec::new();
+        handle_http_query_with_bearer_token(&database, token, FailingReader, &mut response)
+            .unwrap_or_else(|error| panic!("invalid configuration {token:?} responds: {error}"));
+
+        assert_response(
+            &response,
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{"error":"configured bearer token is not valid token68"}"#,
+        );
+        if let Some(expected_response) = &expected_response {
+            assert_eq!(&response, expected_response);
+        } else {
+            expected_response = Some(response);
+        }
+    }
+
+    let expected_response = expected_response.expect("at least one invalid configuration");
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "secret:42",
+        FailingReader,
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
+fn bearer_rejection_respects_the_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let (request, _) = request_with_authorization(b"SELECT 1;", "");
+    let unrestricted = authenticated_exchange(&database, "correct-token", &request);
+    let limits = HttpQueryLimits {
+        max_response_bytes: unrestricted.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut response = Vec::new();
+
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(&request),
+        &mut response,
+        limits,
+    )
+    .unwrap();
+
+    assert!(response.len() <= limits.max_response_bytes);
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+
+    let mut too_small_output = Vec::new();
+    let error = handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(&request),
+        &mut too_small_output,
+        HttpQueryLimits {
+            max_response_bytes: 0,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("even the fixed limit response cannot fit");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+    ));
+    assert!(too_small_output.is_empty());
 }
 
 #[test]
@@ -211,6 +561,21 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
             .contains("\r\nAllow: POST\r\n")
     );
 
+    let ping_method = exchange(
+        &database,
+        b"POST /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &ping_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be GET for /ping"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&ping_method)
+            .unwrap()
+            .contains("\r\nAllow: GET\r\n")
+    );
+
     assert_response(
         &exchange(
             &database,
@@ -218,6 +583,11 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
         ),
         "HTTP/1.1 404 Not Found",
         r#"{"error":"request target must be /query"}"#,
+    );
+    assert_response(
+        &exchange(&database, b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be /ping"}"#,
     );
     assert_response(
         &exchange(
@@ -235,6 +605,42 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"Transfer-Encoding is not supported"}"#,
     );
+}
+
+#[test]
+fn ping_requires_host_http_1_1_and_an_empty_body() {
+    let database = SharedDatabase::default();
+    let cases: &[(&[u8], &str, &str)] = &[
+        (
+            b"GET /ping HTTP/1.1\r\n\r\n",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"Host header is required"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.1\r\nHost: \r\n\r\n",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"invalid Host header"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            "HTTP/1.1 505 HTTP Version Not Supported",
+            r#"{"error":"HTTP/1.1 is required"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"GET /ping does not accept a request body"}"#,
+        ),
+        (
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 400 Bad Request",
+            r#"{"error":"Transfer-Encoding is not supported"}"#,
+        ),
+    ];
+
+    for (request, status, body) in cases {
+        assert_response(&exchange(&database, request), status, body);
+    }
 }
 
 #[test]
@@ -294,6 +700,65 @@ fn request_header_count_header_bytes_and_sql_body_are_bounded() {
         "HTTP/1.1 413 Payload Too Large",
         r#"{"error":"request body exceeds configured byte limit"}"#,
     );
+}
+
+#[test]
+fn ping_honors_exact_header_and_complete_response_byte_limits() {
+    let database = SharedDatabase::default();
+    let request = b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let expected_response = exchange(&database, request);
+
+    let mut response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_header_bytes: request.len(),
+            max_header_count: 1,
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(response, expected_response);
+
+    let mut header_overflow_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut header_overflow_response,
+        HttpQueryLimits {
+            max_header_bytes: request.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &header_overflow_response,
+        "HTTP/1.1 431 Request Header Fields Too Large",
+        r#"{"error":"request headers exceed configured byte limit"}"#,
+    );
+
+    let mut response_overflow_output = Vec::new();
+    let error = handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut response_overflow_output,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the cap cannot hold either the ping or fixed limit response");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded {
+            max_bytes,
+            ..
+        } if max_bytes == expected_response.len() - 1
+    ));
+    assert!(response_overflow_output.is_empty());
 }
 
 #[test]

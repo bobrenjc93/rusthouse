@@ -204,24 +204,54 @@ Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
-## HTTP query exchange
+## HTTP query and health exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. It accepts exactly `POST /query`, requires
-a nonempty `Host` and one decimal `Content-Length`, rejects transfer encoding
-(including chunked requests), and returns `417 Expectation Failed` for
-`Expect` instead of waiting for a body whose sender may be awaiting an interim
-response. It sends the UTF-8 SQL body through `SharedDatabase::query`.
-Successful responses use the same compact JSON column metadata and
-positional-row shape as `--format json`; protocol and query failures return
-deterministic JSON error objects with an appropriate HTTP status.
+exchange without opening a listener. Both supported routes require a nonempty
+`Host`, reject transfer encoding (including chunked requests), and return `417
+Expectation Failed` for `Expect` instead of waiting for a body whose sender
+may be awaiting an interim response.
+
+`POST /query` requires one decimal `Content-Length` and sends its UTF-8 SQL body
+through `SharedDatabase::query`. Successful responses use the same compact
+JSON column metadata and positional-row shape as `--format json`; protocol and
+query failures return deterministic JSON error objects with an appropriate
+HTTP status.
+
+`GET /ping` is the ClickHouse-compatible health check. It accepts no request
+body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
+with content type `text/plain; charset=utf-8` and the exact four-byte body
+`Ok.\n`. The handler neither queries the database nor acquires its lock, so a
+successful ping reports that the HTTP exchange path is alive even when the
+database lock is unavailable. It is deliberately not a database-readiness or
+query-success check. Other method and target combinations are rejected.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
-SQL body, and 16 MiB for the complete response including headers. The full
-response is prepared and checked before anything is written. Call
+SQL body, and 16 MiB for the complete response including headers. Header limits
+apply to both routes, as does the complete-response limit. The full response is
+prepared and checked before anything is written. Call
 `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
 limits. This API deliberately owns only one exchange; listener, connection,
 timeout, and shutdown lifecycle remain the embedding application's concern.
+
+Embedders that require a shared bearer credential can instead call
+`handle_http_query_with_bearer_token`, or
+`handle_http_query_with_bearer_token_and_limits` for explicit resource limits.
+For either route, these separate handlers require exactly one case-insensitive
+`Authorization` header with a `Bearer <token>` value; one or more spaces may
+separate the scheme and token. Configured tokens must be nonempty token68
+values. Missing, duplicate, malformed, and incorrect credentials receive the
+same bounded `401 Unauthorized` response before a request body is read or the
+database lock is acquired. Invalid configured tokens are rejected before any
+request input is read. The original
+`handle_http_query` APIs intentionally remain unauthenticated for existing
+in-process embeddings.
+
+Bearer authentication does not provide transport security. RustHouse does not
+terminate TLS, so an embedding must put this exchange behind TLS before sending
+tokens or queries over an untrusted network; otherwise both are exposed in
+plaintext. The handler provides neither sessions nor token issuance or
+rotation.
 
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
