@@ -65,9 +65,9 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST`, `LENGTH`, `ABS`, and the minimal unpartitioned `ROW_NUMBER` window forms
-/// provide bounded projections in ungrouped queries. An optional `AS` alias
-/// controls each result column name.
+/// `CAST`, `LENGTH`, `ABS`, `ROUND`, and the minimal unpartitioned `ROW_NUMBER`
+/// window forms provide bounded projections in ungrouped queries. An optional
+/// `AS` alias controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
 ///
@@ -1213,6 +1213,9 @@ enum ResolvedItem {
     Int64Abs {
         source: usize,
     },
+    Float64Round {
+        source: usize,
+    },
     RowNumber,
     Aggregate {
         state: usize,
@@ -1415,6 +1418,30 @@ fn resolve_select_items(
                     data_type: DataType::Int64,
                 });
             }
+            SelectItem::Round { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Float64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("ROUND argument '{name}'"),
+                        expected: DataType::Float64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "ROUND projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::Float64Round { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("ROUND({})", table.schema()[source].name)),
+                    data_type: DataType::Float64,
+                });
+            }
             SelectItem::RowNumber { alias, .. } => {
                 items.push(ResolvedItem::RowNumber);
                 result_columns.push(ResultColumn {
@@ -1591,6 +1618,9 @@ fn execute_projection(
                         ResolvedItem::Int64Abs { source } => {
                             Value::Int64(checked_int64_abs(int64_at(table, *source, *row))?)
                         }
+                        ResolvedItem::Float64Round { source } => {
+                            Value::Float64(float64_at(table, *source, *row).round())
+                        }
                         ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("projection does not contain aggregates")
@@ -1713,6 +1743,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
+                | ResolvedItem::Float64Round { .. }
                 | ResolvedItem::RowNumber => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
@@ -1762,6 +1793,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::Int64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Round { .. } => {
+                    unreachable!("ROUND projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
@@ -2183,6 +2217,9 @@ impl GroupedData<'_> {
                         ResolvedItem::Int64Abs { .. } => {
                             unreachable!("ABS projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::Float64Round { .. } => {
+                            unreachable!("ROUND projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::RowNumber => {
                             unreachable!(
                                 "ROW_NUMBER projections are restricted to ungrouped queries"
@@ -2502,6 +2539,11 @@ fn order_source_rows(
                 ResolvedItem::Int64Abs { source } => int64_at(table, source, left)
                     .unsigned_abs()
                     .cmp(&int64_at(table, source, right).unsigned_abs()),
+                ResolvedItem::Float64Round { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).round());
+                    let right = ValueRef::Float64(float64_at(table, source, right).round());
+                    left.cmp(&right)
+                }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections cannot be ordered")
                 }
@@ -2550,6 +2592,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::Int64Abs { .. } => {
                     unreachable!("ABS projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Round { .. } => {
+                    unreachable!("ROUND projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")

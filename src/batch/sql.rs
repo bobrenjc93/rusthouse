@@ -127,6 +127,10 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    Round {
+        name: String,
+        alias: Option<String>,
+    },
     /// A deliberately minimal unpartitioned `ROW_NUMBER` window projection.
     RowNumber {
         /// An optional, single, explicitly directed `Int64` source column.
@@ -1063,6 +1067,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::Abs { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("ROUND") {
+                let name = self.expect_identifier("Float64 column in ROUND")?;
+                self.expect(&TokenKind::RightParen, "')' after ROUND expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Round { name, alias });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -1098,6 +1109,13 @@ impl<'a> Parser<'a> {
             let argument = self.expect_identifier("Int64 column in ORDER BY ABS")?;
             self.expect(&TokenKind::RightParen, "')' after ORDER BY ABS expression")?;
             Ok(format!("ABS({argument})"))
+        } else if name.eq_ignore_ascii_case("ROUND") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("Float64 column in ORDER BY ROUND")?;
+            self.expect(
+                &TokenKind::RightParen,
+                "')' after ORDER BY ROUND expression",
+            )?;
+            Ok(format!("ROUND({argument})"))
         } else {
             Ok(name)
         }
