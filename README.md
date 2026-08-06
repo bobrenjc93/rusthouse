@@ -210,12 +210,11 @@ parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
 types, and callers provide complete-input byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. A `String` data field may be double-quoted so it can
-contain commas, and doubled quotes inside it decode to one quote (for example,
-`"say ""hello"""`). Headers and non-`String` fields must remain unquoted, and
-malformed quoting is rejected. Quoted strings cannot contain CR or LF: this
-single-line subset deliberately does not implement full RFC CSV record
-streaming. Any input, schema, value, limit, or remaining-capacity failure
-leaves the table unchanged.
+contain commas and LF or CRLF line endings, and doubled quotes inside it decode
+to one quote (for example, `"say ""hello"""`). Embedded line endings are
+retained exactly. Headers and non-`String` fields must remain unquoted, and
+malformed quoting is rejected. Any input, schema, value, limit, or
+remaining-capacity failure leaves the table unchanged.
 
 ## Snapshot envelope
 

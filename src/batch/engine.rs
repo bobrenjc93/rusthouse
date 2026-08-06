@@ -207,9 +207,9 @@ impl Database {
     /// The header must exactly match the target table's column names in schema
     /// order. Data fields are parsed using their `Int64`, finite `Float64`,
     /// `Bool`, or `String` schema types. A `String` data field may be
-    /// double-quoted, allowing commas and doubled (`""`) quote escapes. Headers
-    /// and non-`String` fields must remain unquoted. Only LF and CRLF record
-    /// endings are accepted; quoted strings cannot contain CR or LF.
+    /// double-quoted, allowing commas, LF or CRLF line endings, and doubled
+    /// (`""`) quote escapes. Headers and non-`String` fields must remain
+    /// unquoted. Only LF and CRLF line endings are accepted.
     ///
     /// The complete input, header, every row and value, configured limits, and
     /// remaining table capacity are validated before any physical column is
