@@ -1,7 +1,12 @@
 use std::io::{self, Cursor, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, TcpQueryError, TcpQuerySocketOption,
@@ -509,6 +514,97 @@ fn stalled_tcp_client_hits_the_read_timeout_and_is_closed() {
         .read_to_end(&mut remaining)
         .expect("server closes the timed-out connection");
     assert!(remaining.is_empty());
+}
+
+#[test]
+fn slow_drip_cannot_extend_the_absolute_read_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    let database = SharedDatabase::default();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let result = accept_http_query(
+            &database,
+            &listener,
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+        );
+        finished_tx.send((started.elapsed(), result)).unwrap();
+    });
+
+    let mut client = TcpStream::connect(address).expect("loopback client connects");
+    for _ in 0..5 {
+        client.write_all(b"P").expect("drip byte is written");
+        thread::sleep(Duration::from_millis(40));
+    }
+
+    let keep_dripping = Arc::new(AtomicBool::new(true));
+    let writer_flag = Arc::clone(&keep_dripping);
+    let writer = thread::spawn(move || {
+        let mut sent = 0;
+        while writer_flag.load(Ordering::Relaxed) {
+            if client.write_all(b"P").is_err() {
+                break;
+            }
+            sent += 1;
+            thread::sleep(Duration::from_millis(40));
+        }
+        sent
+    });
+
+    let finished = finished_rx.recv_timeout(Duration::from_millis(600));
+    keep_dripping.store(false, Ordering::Relaxed);
+    let drip_bytes = writer.join().expect("drip writer does not panic");
+    server.join().expect("server thread does not panic");
+    let (elapsed, result) = finished.expect("absolute deadline expires while bytes keep arriving");
+
+    assert!(drip_bytes > 0);
+    assert!(elapsed < Duration::from_millis(700));
+    match result.expect_err("slow-drip request reaches its fixed deadline") {
+        TcpQueryError::Exchange(HttpQueryError::Read(error)) => assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )),
+        other => panic!("expected a typed HTTP read error, got {other:?}"),
+    }
+}
+
+#[test]
+fn nonblocking_listener_waits_for_a_delayed_queued_request() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    listener.set_nonblocking(true).unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .expect("client connection is queued before accept");
+    let database = SharedDatabase::default();
+    let server = thread::spawn(move || {
+        accept_http_query(
+            &database,
+            &listener,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(100));
+    client
+        .write_all(&request(b"SELECT true AS ready;"))
+        .expect("delayed request is written");
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .expect("delayed request receives a response");
+    server
+        .join()
+        .expect("server thread does not panic")
+        .expect("accepted stream waits in blocking mode");
+
+    assert_response(
+        &response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"ready","type":"Bool"}],"rows":[[true]]}"#,
+    );
 }
 
 #[test]

@@ -3,8 +3,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
-use std::time::Duration;
+use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 use crate::batch::format::{write_json, write_json_string};
 use crate::{SharedDatabase, SharedDatabaseError};
@@ -87,6 +87,8 @@ impl StdError for HttpQueryError {
 /// The socket option that failed while preparing an accepted query client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpQuerySocketOption {
+    /// Blocking mode for deadline-controlled I/O.
+    BlockingMode,
     /// The finite timeout for request reads.
     ReadTimeout,
     /// The finite timeout for response writes.
@@ -96,6 +98,7 @@ pub enum TcpQuerySocketOption {
 impl fmt::Display for TcpQuerySocketOption {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BlockingMode => formatter.write_str("blocking mode"),
             Self::ReadTimeout => formatter.write_str("read timeout"),
             Self::WriteTimeout => formatter.write_str("write timeout"),
         }
@@ -145,11 +148,15 @@ impl StdError for TcpQueryError {
 
 /// Accepts and handles exactly one HTTP query client from `listener`.
 ///
-/// The accepted socket receives the caller-provided finite read and write
-/// timeouts before its request is passed to [`handle_http_query`]. The
-/// connection is closed before this function returns. This function does not
-/// loop or spawn threads; callers own repetition, concurrency, and listener
-/// shutdown policy.
+/// The accepted socket is normalized to blocking mode before its request is
+/// passed to [`handle_http_query`]. The caller-provided read and write timeouts
+/// become fixed deadlines measured from acceptance. Before each socket
+/// operation, the remaining duration is applied as its timeout, so partial
+/// progress does not extend either deadline. The connection is closed before
+/// this function returns.
+///
+/// This function does not loop or spawn threads; callers own repetition,
+/// concurrency, and listener shutdown policy.
 ///
 /// # Errors
 ///
@@ -165,6 +172,19 @@ pub fn accept_http_query(
     write_timeout: Duration,
 ) -> Result<(), TcpQueryError> {
     let (stream, _) = listener.accept().map_err(TcpQueryError::Accept)?;
+    let accepted_at = Instant::now();
+    stream
+        .set_nonblocking(false)
+        .map_err(|source| TcpQueryError::SocketConfiguration {
+            option: TcpQuerySocketOption::BlockingMode,
+            source,
+        })?;
+    let read_deadline = deadline(accepted_at, read_timeout, TcpQuerySocketOption::ReadTimeout)?;
+    let write_deadline = deadline(
+        accepted_at,
+        write_timeout,
+        TcpQuerySocketOption::WriteTimeout,
+    )?;
     stream
         .set_read_timeout(Some(read_timeout))
         .map_err(|source| TcpQueryError::SocketConfiguration {
@@ -178,9 +198,74 @@ pub fn accept_http_query(
             source,
         })?;
 
-    let result = handle_http_query(database, &stream, &stream);
+    let result = handle_http_query(
+        database,
+        DeadlineReader {
+            stream: &stream,
+            deadline: read_deadline,
+        },
+        DeadlineWriter {
+            stream: &stream,
+            deadline: write_deadline,
+        },
+    );
     drop(stream);
     result.map_err(TcpQueryError::Exchange)
+}
+
+fn deadline(
+    start: Instant,
+    timeout: Duration,
+    option: TcpQuerySocketOption,
+) -> Result<Instant, TcpQueryError> {
+    start
+        .checked_add(timeout)
+        .ok_or_else(|| TcpQueryError::SocketConfiguration {
+            option,
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TCP query timeout is too large for a deadline",
+            ),
+        })
+}
+
+fn remaining_timeout(deadline: Instant, message: &'static str) -> io::Result<Duration> {
+    match deadline.checked_duration_since(Instant::now()) {
+        Some(remaining) if !remaining.is_zero() => Ok(remaining),
+        _ => Err(io::Error::new(io::ErrorKind::TimedOut, message)),
+    }
+}
+
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = remaining_timeout(self.deadline, "TCP query read deadline exceeded")?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
+struct DeadlineWriter<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = remaining_timeout(self.deadline, "TCP query write deadline exceeded")?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let remaining = remaining_timeout(self.deadline, "TCP query write deadline exceeded")?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.flush()
+    }
 }
 
 /// Handles one strict, read-only `POST /query HTTP/1.1` exchange.

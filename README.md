@@ -223,12 +223,15 @@ response is prepared and checked before anything is written. Call
 limits.
 
 `accept_http_query` accepts exactly one client from a caller-provided
-`TcpListener`, applies caller-provided finite read and write timeouts, delegates
-one request to `handle_http_query`, and closes that connection before returning.
+`TcpListener`, normalizes the accepted stream to blocking mode, and turns the
+caller-provided read and write timeouts into absolute deadlines measured from
+acceptance. It reapplies each remaining deadline before every socket operation,
+so incremental traffic cannot renew the allowed time. The helper delegates one
+request to `handle_http_query` and closes that connection before returning.
 Accept, socket-configuration, and exchange failures remain distinct typed
-errors. It does not start a service or spawn threads: embedding applications
-own any accept-loop repetition or concurrency and decide when and how to shut
-down their listener.
+errors. It does not start a service or spawn threads: embedding applications own
+any accept-loop repetition or concurrency and decide when and how to shut down
+their listener.
 
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
