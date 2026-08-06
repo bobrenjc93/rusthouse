@@ -1,9 +1,8 @@
 //! Bounded ingestion for a typed `CSVWithNames` subset.
 //!
-//! Data fields with the `String` schema type may be double-quoted. Commas in a
-//! quoted string are data, and a double quote is decoded from `""`. This is
-//! intentionally not a general streaming CSV implementation: headers and
-//! non-`String` fields must be unquoted, and records cannot contain CR or LF.
+//! Data fields with the `String` schema type may be double-quoted. Commas and
+//! LF or CRLF line endings in a quoted string are data, and a double quote is
+//! decoded from `""`. Headers and non-`String` fields must be unquoted.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -55,7 +54,9 @@ impl Default for CsvIngestLimits {
 
 /// A failure while validating or appending typed `CSVWithNames` input.
 ///
-/// Line and column numbers are one-based. The header is line 1.
+/// Line numbers are one-based physical input lines, and column numbers are
+/// one-based schema positions. Data-record errors use the physical line on
+/// which the record begins. The header is line 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsvIngestError {
     /// The complete byte input exceeds its configured bound.
@@ -204,16 +205,16 @@ pub(crate) fn parse_rows(
         return Err(CsvIngestError::MissingHeader { line: 1 });
     }
 
-    let mut lines = input.split_inclusive('\n');
-    let header = line_contents(lines.next().expect("non-empty input has a line"), 1)?;
+    let mut physical_lines = input.split_inclusive('\n');
+    let raw_header = physical_lines.next().expect("non-empty input has a line");
+    let header = line_contents(raw_header, 1)?;
     validate_header(table, header)?;
 
     let expected_columns = table.schema().len();
     let mut rows = Vec::new();
     let mut value_count = 0_usize;
-    for (offset, raw_line) in lines.enumerate() {
-        let line = offset + 2;
-        let record = line_contents(raw_line, line)?;
+    for record in DataRecords::new(&input[raw_header.len()..], 2) {
+        let (record, line) = record?;
         let row_count = rows.len().saturating_add(1);
         if row_count > limits.max_rows {
             return Err(CsvIngestError::RowLimitExceeded {
@@ -258,6 +259,97 @@ pub(crate) fn parse_rows(
     }
 
     Ok(rows)
+}
+
+/// Produces logical data records while retaining line endings inside quoted
+/// fields. Quotes only open at the beginning of a field, matching the grammar
+/// enforced later by [`scan_record`].
+struct DataRecords<'a> {
+    input: &'a str,
+    offset: usize,
+    next_line: usize,
+}
+
+impl<'a> DataRecords<'a> {
+    const fn new(input: &'a str, first_line: usize) -> Self {
+        Self {
+            input,
+            offset: 0,
+            next_line: first_line,
+        }
+    }
+}
+
+impl<'a> Iterator for DataRecords<'a> {
+    type Item = Result<(&'a str, usize), CsvIngestError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.input.len() {
+            return None;
+        }
+
+        let bytes = self.input.as_bytes();
+        let record_start = self.offset;
+        let record_line = self.next_line;
+        let mut cursor = record_start;
+        let mut at_field_start = true;
+        let mut in_quotes = false;
+
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\r' => {
+                    if bytes.get(cursor + 1) != Some(&b'\n') {
+                        return Some(Err(CsvIngestError::InvalidLineEnding {
+                            line: self.next_line,
+                        }));
+                    }
+                    self.next_line = self.next_line.saturating_add(1);
+                    if in_quotes {
+                        cursor += 2;
+                    } else {
+                        let record = &self.input[record_start..cursor];
+                        self.offset = cursor + 2;
+                        return Some(Ok((record, record_line)));
+                    }
+                }
+                b'\n' => {
+                    self.next_line = self.next_line.saturating_add(1);
+                    if in_quotes {
+                        cursor += 1;
+                    } else {
+                        let record = &self.input[record_start..cursor];
+                        self.offset = cursor + 1;
+                        return Some(Ok((record, record_line)));
+                    }
+                }
+                b'"' if in_quotes && bytes.get(cursor + 1) == Some(&b'"') => {
+                    cursor += 2;
+                }
+                b'"' if in_quotes => {
+                    in_quotes = false;
+                    cursor += 1;
+                }
+                b'"' if at_field_start => {
+                    in_quotes = true;
+                    at_field_start = false;
+                    cursor += 1;
+                }
+                b',' if !in_quotes => {
+                    at_field_start = true;
+                    cursor += 1;
+                }
+                _ => {
+                    if !in_quotes {
+                        at_field_start = false;
+                    }
+                    cursor += 1;
+                }
+            }
+        }
+
+        self.offset = bytes.len();
+        Some(Ok((&self.input[record_start..], record_line)))
+    }
 }
 
 fn invalid_utf8(error: Utf8Error) -> CsvIngestError {
@@ -314,7 +406,7 @@ fn reject_quoting(field: &str, line: usize, column: usize) -> Result<(), CsvInge
     Ok(())
 }
 
-/// Visits the syntactically valid fields in one physical data record.
+/// Visits the syntactically valid fields in one logical data record.
 ///
 /// Quoted field contents exclude the surrounding quotes but retain doubled
 /// quotes so the caller can decode them only after limits and arity are known.

@@ -203,6 +203,25 @@ Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
+## HTTP query exchange
+
+`handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
+exchange without opening a listener. It accepts exactly `POST /query`, requires
+a nonempty `Host` and one decimal `Content-Length`, rejects transfer encoding
+(including chunked requests), and returns `417 Expectation Failed` for
+`Expect` instead of waiting for a body whose sender may be awaiting an interim
+response. It sends the UTF-8 SQL body through `SharedDatabase::query`.
+Successful responses use the same compact JSON column metadata and
+positional-row shape as `--format json`; protocol and query failures return
+deterministic JSON error objects with an appropriate HTTP status.
+
+The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
+SQL body, and 16 MiB for the complete response including headers. The full
+response is prepared and checked before anything is written. Call
+`handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
+limits. This API deliberately owns only one exchange; listener, connection,
+timeout, and shutdown lifecycle remain the embedding application's concern.
+
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
 header must exactly match every schema column in order and case. Data fields
@@ -210,12 +229,11 @@ parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
 types, and callers provide complete-input byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. A `String` data field may be double-quoted so it can
-contain commas, and doubled quotes inside it decode to one quote (for example,
-`"say ""hello"""`). Headers and non-`String` fields must remain unquoted, and
-malformed quoting is rejected. Quoted strings cannot contain CR or LF: this
-single-line subset deliberately does not implement full RFC CSV record
-streaming. Any input, schema, value, limit, or remaining-capacity failure
-leaves the table unchanged.
+contain commas and LF or CRLF line endings, and doubled quotes inside it decode
+to one quote (for example, `"say ""hello"""`). Embedded line endings are
+retained exactly. Headers and non-`String` fields must remain unquoted, and
+malformed quoting is rejected. Any input, schema, value, limit, or
+remaining-capacity failure leaves the table unchanged.
 
 ## Snapshot envelope
 

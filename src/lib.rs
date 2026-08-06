@@ -8,6 +8,7 @@ pub mod csv;
 pub mod distinct;
 pub mod execution;
 pub mod grouping;
+pub mod http;
 pub mod join;
 pub mod order;
 pub mod parser;
@@ -42,6 +43,11 @@ pub use execution::{
 };
 pub use grouping::{
     GroupedCountError, GroupedCountLimits, NullableI64GroupedCount, grouped_count_nullable_i64,
+};
+pub use http::{
+    DEFAULT_MAX_HTTP_HEADER_BYTES, DEFAULT_MAX_HTTP_HEADER_COUNT, DEFAULT_MAX_HTTP_RESPONSE_BYTES,
+    DEFAULT_MAX_HTTP_SQL_BYTES, HttpQueryError, HttpQueryLimits, handle_http_query,
+    handle_http_query_with_limits,
 };
 pub use join::{
     JoinError, JoinLimits, JoinRowPair, LeftOuterJoinRowPair, inner_equi_join_nullable_i64,
