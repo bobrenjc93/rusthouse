@@ -388,6 +388,27 @@ fn csv_batch_filters_grouped_rows_with_a_count_alias() {
 }
 
 #[test]
+fn csv_batch_filters_grouped_rows_with_a_float64_aggregate_alias() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE events (kind String, score Float64);
+          INSERT INTO events VALUES
+              ('a', 1.0), ('a', 2.0),
+              ('b', 4.0), ('b', 6.0),
+              ('c', 9.0);
+          SELECT kind, AVG(score) AS mean FROM events
+          GROUP BY kind
+          HAVING mean >= 1.5
+          ORDER BY mean DESC
+          LIMIT 2;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"kind,mean\nc,9.0\nb,5.0\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_emits_typed_nulls_for_empty_aggregate_inputs() {
     let output = run(
         &["--format", "csv"],

@@ -1226,21 +1226,19 @@ struct AggregateSpec {
     input_type: Option<DataType>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ResolvedHaving {
     state: usize,
     operator: ComparisonOperator,
-    value: i64,
+    value: Value,
 }
 
 impl ResolvedHaving {
-    fn evaluate(self, data: &GroupedData<'_>, group: usize) -> bool {
-        let value = match data.aggregates[self.state][group].as_ref() {
-            ValueRef::Int64(value) => value,
-            ValueRef::Null(DataType::Int64) => return false,
-            _ => unreachable!("HAVING is restricted to Int64 aggregates"),
+    fn evaluate(&self, data: &GroupedData<'_>, group: usize) -> bool {
+        let aggregate = data.aggregates[self.state][group].as_ref();
+        let Some(comparison) = aggregate.sql_cmp(self.value.as_ref()) else {
+            return false;
         };
-        let comparison = value.cmp(&self.value);
         match self.operator {
             ComparisonOperator::Equal => comparison == Ordering::Equal,
             ComparisonOperator::NotEqual => comparison != Ordering::Equal,
@@ -1499,23 +1497,47 @@ fn resolve_having(
 
     let ResolvedItem::Aggregate { state } = items[output] else {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected Int64 aggregate",
+            "HAVING alias '{}' must reference a projected numeric aggregate",
             requested.alias
         )));
     };
     let spec = &aggregate_specs[state];
-    let supported = aggregate_output_type(spec.function, spec.input_type) == DataType::Int64;
+    let supported = matches!(
+        aggregate_output_type(spec.function, spec.input_type),
+        DataType::Int64 | DataType::Float64
+    );
     if !supported {
         return Err(Error::InvalidQuery(format!(
-            "HAVING alias '{}' must reference a projected Int64 aggregate",
+            "HAVING alias '{}' must reference a projected numeric aggregate",
             requested.alias
         )));
+    }
+    match &requested.value {
+        Value::Int64(_) => {}
+        Value::Float64(value) if value.is_finite() => {}
+        Value::Float64(_) => {
+            return Err(Error::InvalidQuery(
+                "HAVING comparison Float64 thresholds must be finite".to_owned(),
+            ));
+        }
+        Value::Null(_) => {
+            return Err(Error::InvalidQuery(
+                "HAVING comparisons do not support NULL thresholds".to_owned(),
+            ));
+        }
+        value => {
+            return Err(Error::TypeMismatch {
+                context: "HAVING comparison threshold".to_owned(),
+                expected: "Int64 or Float64".to_owned(),
+                actual: value.data_type().to_string(),
+            });
+        }
     }
 
     Ok(ResolvedHaving {
         state,
         operator: requested.operator,
-        value: requested.value,
+        value: requested.value.clone(),
     })
 }
 
@@ -3083,6 +3105,14 @@ mod tests {
             .rows,
             vec![vec![Value::Int64(9)]]
         );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT AVG(amount) AS mean FROM events HAVING mean = 2"
+            )
+            .rows,
+            vec![vec![Value::Float64(2.0)]]
+        );
     }
 
     #[test]
@@ -3128,24 +3158,159 @@ mod tests {
     }
 
     #[test]
+    fn having_float64_sum_alias_supports_every_comparison_operator() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String, score Float64); \
+                 INSERT INTO events VALUES ('a', 1.5), ('b', 2.5), ('c', 3.5);",
+            )
+            .expect("setup");
+
+        let cases = [
+            ("=", &["b"][..]),
+            ("!=", &["a", "c"][..]),
+            ("<>", &["a", "c"][..]),
+            ("<", &["a"][..]),
+            ("<=", &["a", "b"][..]),
+            (">", &["c"][..]),
+            (">=", &["b", "c"][..]),
+        ];
+        for (operator, expected_kinds) in cases {
+            let result = query(
+                &mut database,
+                &format!(
+                    "SELECT kind, SUM(score) AS total FROM events \
+                     GROUP BY kind HAVING total {operator} +2.5e0 ORDER BY kind"
+                ),
+            );
+            let actual_kinds = result
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::String(value) => value.as_str(),
+                    _ => panic!("kind is a string"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_kinds, expected_kinds, "operator {operator}");
+        }
+    }
+
+    #[test]
+    fn having_all_float64_aggregate_aliases_support_grouped_and_global_inputs() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String, score Float64); \
+                 INSERT INTO events VALUES \
+                 ('a', 1.5), ('a', 2.5), \
+                 ('b', -2.0), ('b', 6.0), \
+                 ('c', 10.0);",
+            )
+            .expect("setup");
+
+        let grouped_cases = [
+            ("SUM", "total", ">", "4", &["c"][..]),
+            ("MIN", "low", "<", "0.0", &["b"][..]),
+            ("MAX", "high", ">=", "+6", &["b", "c"][..]),
+            ("AVG", "mean", "=", "2", &["a", "b"][..]),
+        ];
+        for (function, alias, operator, threshold, expected_kinds) in grouped_cases {
+            let result = query(
+                &mut database,
+                &format!(
+                    "SELECT kind, {function}(score) AS {alias} FROM events \
+                     GROUP BY kind HAVING {alias} {operator} {threshold} ORDER BY kind"
+                ),
+            );
+            let actual_kinds = result
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::String(value) => value.as_str(),
+                    _ => panic!("kind is a string"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_kinds, expected_kinds, "{function}");
+        }
+
+        let global_cases = [
+            ("SUM", "=", "18", Value::Float64(18.0)),
+            ("MIN", "=", "-2", Value::Float64(-2.0)),
+            ("MAX", ">=", "10.0", Value::Float64(10.0)),
+            ("AVG", ">", "3.5", Value::Float64(3.599_999_999_999_999_6)),
+        ];
+        for (function, operator, threshold, expected) in global_cases {
+            assert_eq!(
+                query(
+                    &mut database,
+                    &format!(
+                        "SELECT {function}(score) AS value FROM events \
+                         HAVING value {operator} {threshold}"
+                    ),
+                )
+                .rows,
+                vec![vec![expected]],
+                "global {function}"
+            );
+        }
+    }
+
+    #[test]
+    fn having_uses_exact_mixed_int64_float64_comparisons() {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE events (kind String, score Float64); \
+                 INSERT INTO events VALUES ('a', 9007199254740992.0);",
+            )
+            .expect("setup");
+
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT SUM(score) AS total FROM events HAVING total < 9007199254740993"
+            )
+            .rows,
+            vec![vec![Value::Float64(9_007_199_254_740_992.0)]]
+        );
+        assert!(
+            query(
+                &mut database,
+                "SELECT SUM(score) AS total FROM events HAVING total = 9007199254740993"
+            )
+            .rows
+            .is_empty()
+        );
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT COUNT(*) AS n FROM events HAVING n < 1.5"
+            )
+            .rows,
+            vec![vec![Value::Int64(1)]]
+        );
+    }
+
+    #[test]
     fn having_filters_before_ordering_and_limiting() {
         let mut database = Database::new();
         database
             .execute(
-                "CREATE TABLE events (kind String, amount Int64); \
+                "CREATE TABLE events (kind String, amount Float64); \
                  INSERT INTO events VALUES \
-                 ('a', 8), ('a', 9), ('b', 3), ('b', 4), ('c', 1);",
+                 ('a', 8.5), ('a', 9.5), ('b', 3.5), ('b', 4.5), ('c', 1.5);",
             )
             .expect("setup");
 
         let result = query(
             &mut database,
             "SELECT kind, MAX(amount) AS high FROM events \
-             GROUP BY kind HAVING high > 1 ORDER BY high ASC LIMIT 1",
+             GROUP BY kind HAVING high > 1.5 ORDER BY high ASC LIMIT 1",
         );
         assert_eq!(
             result.rows,
-            vec![vec![Value::String("b".to_owned()), Value::Int64(4)]]
+            vec![vec![Value::String("b".to_owned()), Value::Float64(4.5)]]
         );
     }
 
@@ -3171,23 +3336,11 @@ mod tests {
             ),
             (
                 "SELECT kind AS total, COUNT(*) AS n FROM events GROUP BY kind HAVING total > 0",
-                "HAVING alias 'total' must reference a projected Int64 aggregate",
-            ),
-            (
-                "SELECT kind, SUM(score) AS total FROM events GROUP BY kind HAVING total > 0",
-                "HAVING alias 'total' must reference a projected Int64 aggregate",
-            ),
-            (
-                "SELECT kind, MIN(score) AS low FROM events GROUP BY kind HAVING low > 0",
-                "HAVING alias 'low' must reference a projected Int64 aggregate",
+                "HAVING alias 'total' must reference a projected numeric aggregate",
             ),
             (
                 "SELECT kind, MAX(kind) AS high FROM events GROUP BY kind HAVING high > 0",
-                "HAVING alias 'high' must reference a projected Int64 aggregate",
-            ),
-            (
-                "SELECT kind, AVG(amount) AS mean FROM events GROUP BY kind HAVING mean > 0",
-                "HAVING alias 'mean' must reference a projected Int64 aggregate",
+                "HAVING alias 'high' must reference a projected numeric aggregate",
             ),
         ];
 
@@ -3201,10 +3354,56 @@ mod tests {
     }
 
     #[test]
+    fn direct_ast_having_rejects_invalid_threshold_values() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE events (amount Float64); INSERT INTO events VALUES (1.5);")
+            .expect("setup");
+        let Statement::Select(select) =
+            sql::parse("SELECT SUM(amount) AS total FROM events HAVING total > 1.0")
+                .expect("baseline query parses")
+                .remove(0)
+        else {
+            panic!("expected select");
+        };
+
+        let cases = [
+            (
+                Value::Float64(f64::INFINITY),
+                Error::InvalidQuery(
+                    "HAVING comparison Float64 thresholds must be finite".to_owned(),
+                ),
+            ),
+            (
+                Value::Null(DataType::Float64),
+                Error::InvalidQuery("HAVING comparisons do not support NULL thresholds".to_owned()),
+            ),
+            (
+                Value::String("1.0".to_owned()),
+                Error::TypeMismatch {
+                    context: "HAVING comparison threshold".to_owned(),
+                    expected: "Int64 or Float64".to_owned(),
+                    actual: "String".to_owned(),
+                },
+            ),
+        ];
+        for (value, expected) in cases {
+            let mut invalid = select.clone();
+            invalid.having.as_mut().expect("HAVING exists").value = value;
+            assert_eq!(
+                database
+                    .execute_statement(Statement::Select(invalid))
+                    .expect_err("invalid direct AST HAVING threshold"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn having_handles_empty_global_and_grouped_inputs() {
         let mut database = Database::new();
         database
-            .execute("CREATE TABLE events (kind String, amount Int64);")
+            .execute("CREATE TABLE events (kind String, amount Int64, score Float64);")
             .expect("setup");
 
         assert_eq!(
@@ -3258,6 +3457,42 @@ mod tests {
                 );
             }
         }
+
+        for function in ["SUM", "MIN", "MAX", "AVG"] {
+            assert_eq!(
+                query(
+                    &mut database,
+                    &format!("SELECT {function}(score) AS value FROM events")
+                )
+                .rows,
+                vec![vec![Value::Null(DataType::Float64)]],
+                "empty {function}(Float64) is NULL"
+            );
+            for operator in ["=", "!=", "<>", "<", "<=", ">", ">="] {
+                assert!(
+                    query(
+                        &mut database,
+                        &format!(
+                            "SELECT {function}(score) AS value FROM events \
+                             HAVING value {operator} 0.0"
+                        )
+                    )
+                    .rows
+                    .is_empty(),
+                    "NULL {function}(Float64) must make {operator} predicate false"
+                );
+            }
+        }
+
+        assert!(
+            query(
+                &mut database,
+                "SELECT kind, AVG(score) AS mean FROM events \
+                 GROUP BY kind HAVING mean > 0.0"
+            )
+            .rows
+            .is_empty()
+        );
     }
 
     #[test]

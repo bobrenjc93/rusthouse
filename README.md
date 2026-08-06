@@ -25,10 +25,11 @@ The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
-`ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a
-unique projected `COUNT(*)`, `COUNT(column)`, `SUM(Int64)`, `MIN(Int64)`, or
-`MAX(Int64)` alias to a signed `Int64` threshold in `HAVING`. Empty `SUM`,
-`MIN`, and `MAX` results are `NULL` and do not satisfy a `HAVING` predicate.
+`ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
+projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
+in `HAVING`. This includes `COUNT`, numeric `SUM`, numeric `MIN` and `MAX`, and
+`AVG`. Empty `SUM`, `MIN`, `MAX`, and `AVG` results are `NULL` and do not
+satisfy a `HAVING` predicate.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
