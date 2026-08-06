@@ -1,8 +1,11 @@
 use std::io::{self, Cursor, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
 
 use rusthouse::{
-    HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
-    handle_http_query_with_limits,
+    HttpQueryError, HttpQueryLimits, SharedDatabase, TcpQueryError, TcpQuerySocketOption,
+    accept_http_query, handle_http_query, handle_http_query_with_limits,
 };
 
 fn request(sql: &[u8]) -> Vec<u8> {
@@ -35,6 +38,34 @@ fn assert_response(response: &[u8], status: &str, expected_body: &str) {
     assert!(headers.contains("\r\nConnection: close"));
     assert!(headers.contains(&format!("\r\nContent-Length: {}\r\n", body.len())));
     assert_eq!(body, expected_body.as_bytes());
+}
+
+fn loopback_exchange(database: SharedDatabase, request: &[u8]) -> Vec<u8> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    let server = thread::spawn(move || {
+        accept_http_query(
+            &database,
+            &listener,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+    });
+
+    let mut client = TcpStream::connect(address).expect("loopback client connects");
+    client.write_all(request).expect("request is written");
+    client
+        .shutdown(Shutdown::Write)
+        .expect("request half closes");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .expect("response is read through connection close");
+    server
+        .join()
+        .expect("server thread does not panic")
+        .expect("TCP exchange succeeds");
+    response
 }
 
 #[test]
@@ -396,4 +427,125 @@ fn read_and_write_failures_remain_typed() {
         handle_http_query(&database, Cursor::new(request(b"SELECT 1;")), FailingWriter)
             .expect_err("writer failure is returned");
     assert!(matches!(write_error, HttpQueryError::Write(_)));
+}
+
+#[test]
+fn tcp_query_accepts_one_loopback_select_and_closes_the_connection() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, label String); \
+             INSERT INTO readings VALUES (2, 'two'), (1, 'one');",
+        )
+        .unwrap();
+
+    let response = loopback_exchange(
+        database,
+        &request(b"SELECT id, label FROM readings ORDER BY id;"),
+    );
+
+    assert_response(
+        &response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
+    );
+}
+
+#[test]
+fn tcp_query_returns_protocol_errors_over_loopback() {
+    let response = loopback_exchange(
+        SharedDatabase::default(),
+        b"GET /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+
+    assert_response(
+        &response,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be POST"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&response)
+            .unwrap()
+            .contains("\r\nAllow: POST\r\n")
+    );
+}
+
+#[test]
+fn stalled_tcp_client_hits_the_read_timeout_and_is_closed() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    let database = SharedDatabase::default();
+    let server = thread::spawn(move || {
+        accept_http_query(
+            &database,
+            &listener,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+    });
+
+    let mut client = TcpStream::connect(address).expect("loopback client connects");
+    client
+        .write_all(b"POST /query HTTP/1.1\r\nHost: localhost\r\n")
+        .expect("incomplete request prefix is written");
+
+    let error = server
+        .join()
+        .expect("server thread does not panic")
+        .expect_err("stalled request times out");
+    match error {
+        TcpQueryError::Exchange(HttpQueryError::Read(error)) => assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )),
+        other => panic!("expected a typed HTTP read error, got {other:?}"),
+    }
+
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut remaining = Vec::new();
+    client
+        .read_to_end(&mut remaining)
+        .expect("server closes the timed-out connection");
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn tcp_accept_and_socket_configuration_failures_remain_typed() {
+    let database = SharedDatabase::default();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    listener.set_nonblocking(true).unwrap();
+    let error = accept_http_query(
+        &database,
+        &listener,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .expect_err("nonblocking accept has no client");
+    assert!(matches!(error, TcpQueryError::Accept(_)));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let error = accept_http_query(&database, &listener, Duration::ZERO, Duration::from_secs(1))
+        .expect_err("zero read timeout is rejected");
+    assert!(matches!(
+        error,
+        TcpQueryError::SocketConfiguration {
+            option: TcpQuerySocketOption::ReadTimeout,
+            ..
+        }
+    ));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener binds");
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let error = accept_http_query(&database, &listener, Duration::from_secs(1), Duration::ZERO)
+        .expect_err("zero write timeout is rejected");
+    assert!(matches!(
+        error,
+        TcpQueryError::SocketConfiguration {
+            option: TcpQuerySocketOption::WriteTimeout,
+            ..
+        }
+    ));
 }

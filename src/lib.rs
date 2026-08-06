@@ -46,8 +46,8 @@ pub use grouping::{
 };
 pub use http::{
     DEFAULT_MAX_HTTP_HEADER_BYTES, DEFAULT_MAX_HTTP_HEADER_COUNT, DEFAULT_MAX_HTTP_RESPONSE_BYTES,
-    DEFAULT_MAX_HTTP_SQL_BYTES, HttpQueryError, HttpQueryLimits, handle_http_query,
-    handle_http_query_with_limits,
+    DEFAULT_MAX_HTTP_SQL_BYTES, HttpQueryError, HttpQueryLimits, TcpQueryError,
+    TcpQuerySocketOption, accept_http_query, handle_http_query, handle_http_query_with_limits,
 };
 pub use join::{
     JoinError, JoinLimits, JoinRowPair, LeftOuterJoinRowPair, inner_equi_join_nullable_i64,

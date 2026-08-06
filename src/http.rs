@@ -1,8 +1,10 @@
-//! Transport-neutral handling for one bounded, read-only HTTP query exchange.
+//! Handling for one bounded, read-only HTTP query exchange.
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::TcpListener;
+use std::time::Duration;
 
 use crate::batch::format::{write_json, write_json_string};
 use crate::{SharedDatabase, SharedDatabaseError};
@@ -80,6 +82,105 @@ impl StdError for HttpQueryError {
             Self::ResponseLimitExceeded { .. } => None,
         }
     }
+}
+
+/// The socket option that failed while preparing an accepted query client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpQuerySocketOption {
+    /// The finite timeout for request reads.
+    ReadTimeout,
+    /// The finite timeout for response writes.
+    WriteTimeout,
+}
+
+impl fmt::Display for TcpQuerySocketOption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadTimeout => formatter.write_str("read timeout"),
+            Self::WriteTimeout => formatter.write_str("write timeout"),
+        }
+    }
+}
+
+/// A transport failure while accepting and handling one TCP query client.
+#[derive(Debug)]
+pub enum TcpQueryError {
+    /// Accepting a client from the caller's listener failed.
+    Accept(io::Error),
+    /// Configuring a finite timeout on the accepted socket failed.
+    SocketConfiguration {
+        /// The socket option that could not be configured.
+        option: TcpQuerySocketOption,
+        /// The operating-system error returned for the option.
+        source: io::Error,
+    },
+    /// The accepted client's HTTP exchange failed.
+    Exchange(HttpQueryError),
+}
+
+impl fmt::Display for TcpQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accept(error) => write!(formatter, "could not accept TCP query client: {error}"),
+            Self::SocketConfiguration { option, source } => {
+                write!(
+                    formatter,
+                    "could not configure TCP query {option}: {source}"
+                )
+            }
+            Self::Exchange(error) => write!(formatter, "TCP query exchange failed: {error}"),
+        }
+    }
+}
+
+impl StdError for TcpQueryError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Accept(error) => Some(error),
+            Self::SocketConfiguration { source, .. } => Some(source),
+            Self::Exchange(error) => Some(error),
+        }
+    }
+}
+
+/// Accepts and handles exactly one HTTP query client from `listener`.
+///
+/// The accepted socket receives the caller-provided finite read and write
+/// timeouts before its request is passed to [`handle_http_query`]. The
+/// connection is closed before this function returns. This function does not
+/// loop or spawn threads; callers own repetition, concurrency, and listener
+/// shutdown policy.
+///
+/// # Errors
+///
+/// Returns [`TcpQueryError::Accept`] if the single accept fails,
+/// [`TcpQueryError::SocketConfiguration`] if either timeout cannot be applied,
+/// or [`TcpQueryError::Exchange`] if the HTTP exchange encounters a transport
+/// failure. A zero timeout is rejected by the socket API as a configuration
+/// error.
+pub fn accept_http_query(
+    database: &SharedDatabase,
+    listener: &TcpListener,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), TcpQueryError> {
+    let (stream, _) = listener.accept().map_err(TcpQueryError::Accept)?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|source| TcpQueryError::SocketConfiguration {
+            option: TcpQuerySocketOption::ReadTimeout,
+            source,
+        })?;
+    stream
+        .set_write_timeout(Some(write_timeout))
+        .map_err(|source| TcpQueryError::SocketConfiguration {
+            option: TcpQuerySocketOption::WriteTimeout,
+            source,
+        })?;
+
+    let result = handle_http_query(database, &stream, &stream);
+    drop(stream);
+    result.map_err(TcpQueryError::Exchange)
 }
 
 /// Handles one strict, read-only `POST /query HTTP/1.1` exchange.

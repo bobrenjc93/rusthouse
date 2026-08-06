@@ -220,8 +220,15 @@ The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
 SQL body, and 16 MiB for the complete response including headers. The full
 response is prepared and checked before anything is written. Call
 `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
-limits. This API deliberately owns only one exchange; listener, connection,
-timeout, and shutdown lifecycle remain the embedding application's concern.
+limits.
+
+`accept_http_query` accepts exactly one client from a caller-provided
+`TcpListener`, applies caller-provided finite read and write timeouts, delegates
+one request to `handle_http_query`, and closes that connection before returning.
+Accept, socket-configuration, and exchange failures remain distinct typed
+errors. It does not start a service or spawn threads: embedding applications
+own any accept-loop repetition or concurrency and decide when and how to shut
+down their listener.
 
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
