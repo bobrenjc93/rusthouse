@@ -210,7 +210,7 @@ pub enum ComparisonOperator {
 pub struct Having {
     pub alias: String,
     pub operator: ComparisonOperator,
-    pub value: i64,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1111,7 +1111,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_having_threshold(&mut self) -> Result<i64> {
+    fn parse_having_threshold(&mut self) -> Result<Value> {
         let position = self.position();
         let sign = if self.eat(&TokenKind::Minus) {
             "-"
@@ -1122,11 +1122,25 @@ impl<'a> Parser<'a> {
         };
         let number = self.take_number().ok_or_else(|| Error::Sql {
             position,
-            message: "expected a signed Int64 after HAVING comparison".to_owned(),
+            message: "expected a finite numeric threshold after HAVING comparison".to_owned(),
         })?;
         let threshold = format!("{sign}{number}");
 
-        threshold.parse::<i64>().map_err(|error| {
+        if threshold.contains(['.', 'e', 'E']) {
+            let value = threshold.parse::<f64>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid Float64 threshold '{threshold}' in HAVING comparison"),
+            })?;
+            if !value.is_finite() {
+                return Err(Error::Sql {
+                    position,
+                    message: format!("HAVING Float64 threshold '{threshold}' must be finite"),
+                });
+            }
+            return Ok(Value::Float64(value));
+        }
+
+        threshold.parse::<i64>().map(Value::Int64).map_err(|error| {
             let message = match error.kind() {
                 std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
                     format!("HAVING Int64 threshold '{threshold}' is outside the Int64 range")
@@ -1378,7 +1392,7 @@ mod tests {
             Some(Having {
                 alias: "rows".to_owned(),
                 operator: ComparisonOperator::GreaterOrEqual,
-                value: 2,
+                value: Value::Int64(2),
             })
         );
         assert_eq!(select.order_by[0].name, "total");
@@ -1416,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_every_having_comparison_operator_and_signed_int64_boundaries() {
+    fn parses_every_having_comparison_operator_and_finite_numeric_thresholds() {
         let cases = [
             ("=", ComparisonOperator::Equal),
             ("!=", ComparisonOperator::NotEqual),
@@ -1438,7 +1452,17 @@ mod tests {
             };
             let having = select.having.as_ref().expect("HAVING is parsed");
             assert_eq!(having.operator, expected, "{sql_operator}");
-            assert_eq!(having.value, i64::MAX, "{sql_operator}");
+            assert_eq!(having.value, Value::Int64(i64::MAX), "{sql_operator}");
+
+            let sql =
+                format!("SELECT AVG(amount) AS mean FROM events HAVING mean {sql_operator} +2.5e1");
+            let statements = parse(&sql).expect("valid Float64 HAVING threshold");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            let having = select.having.as_ref().expect("HAVING is parsed");
+            assert_eq!(having.operator, expected, "{sql_operator}");
+            assert_eq!(having.value, Value::Float64(25.0), "{sql_operator}");
         }
 
         let statements = parse(&format!(
@@ -1449,17 +1473,29 @@ mod tests {
         let Statement::Select(select) = &statements[0] else {
             panic!("expected select");
         };
-        assert_eq!(select.having.as_ref().unwrap().value, i64::MIN);
+        assert_eq!(
+            select.having.as_ref().unwrap().value,
+            Value::Int64(i64::MIN)
+        );
     }
 
     #[test]
     fn having_reports_typed_malformed_and_overflow_threshold_errors() {
-        let malformed = "SELECT SUM(amount) AS total FROM events HAVING total = 1.5";
+        let malformed = "SELECT SUM(amount) AS total FROM events HAVING total = 1e+";
         assert_eq!(
-            parse(malformed).expect_err("Float64 is not an Int64 threshold"),
+            parse(malformed).expect_err("malformed Float64 threshold"),
             Error::Sql {
-                position: malformed.find("1.5").unwrap(),
-                message: "invalid Int64 threshold '1.5' in HAVING comparison".to_owned(),
+                position: malformed.find("1e+").unwrap(),
+                message: "invalid Float64 threshold '1e+' in HAVING comparison".to_owned(),
+            }
+        );
+
+        let non_finite = "SELECT AVG(amount) AS mean FROM events HAVING mean > 1e999";
+        assert_eq!(
+            parse(non_finite).expect_err("non-finite Float64 threshold"),
+            Error::Sql {
+                position: non_finite.find("1e999").unwrap(),
+                message: "HAVING Float64 threshold '1e999' must be finite".to_owned(),
             }
         );
 
@@ -1481,15 +1517,17 @@ mod tests {
             parse(missing).expect_err("a sign must be followed by digits"),
             Error::Sql {
                 position: missing.find("-many").unwrap(),
-                message: "expected a signed Int64 after HAVING comparison".to_owned(),
+                message: "expected a finite numeric threshold after HAVING comparison".to_owned(),
             }
         );
     }
 
     #[test]
-    fn having_requires_an_int64_in_clause_order() {
+    fn having_requires_a_numeric_threshold_in_clause_order() {
         for sql in [
             "SELECT COUNT(*) AS n FROM events HAVING n = many",
+            "SELECT COUNT(*) AS n FROM events HAVING n = TRUE",
+            "SELECT COUNT(*) AS n FROM events HAVING n = '1'",
             "SELECT COUNT(*) AS n FROM events HAVING n = 1 GROUP BY kind",
             "SELECT COUNT(*) AS n FROM events ORDER BY n HAVING n = 1",
         ] {
