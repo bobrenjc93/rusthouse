@@ -1,7 +1,11 @@
 use std::io::{self, Cursor, Read, Write};
+use std::sync::{Arc, RwLock};
+use std::thread;
 
+use rusthouse::batch::engine::Database;
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
+    handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
     handle_http_query_with_limits,
 };
 
@@ -18,6 +22,24 @@ fn request(sql: &[u8]) -> Vec<u8> {
 fn exchange(database: &SharedDatabase, request: &[u8]) -> Vec<u8> {
     let mut response = Vec::new();
     handle_http_query(database, Cursor::new(request), &mut response).expect("exchange succeeds");
+    response
+}
+
+fn request_with_authorization(sql: &[u8], authorization_headers: &str) -> (Vec<u8>, u64) {
+    let mut request = format!(
+        "POST /query HTTP/1.1\r\nHost: localhost\r\n{authorization_headers}Content-Length: {}\r\n\r\n",
+        sql.len()
+    )
+    .into_bytes();
+    let body_offset = request.len() as u64;
+    request.extend_from_slice(sql);
+    (request, body_offset)
+}
+
+fn authenticated_exchange(database: &SharedDatabase, token: &str, request: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token(database, token, Cursor::new(request), &mut response)
+        .expect("authenticated exchange succeeds");
     response
 }
 
@@ -55,6 +77,175 @@ fn valid_query_returns_the_existing_json_result_shape() {
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
     );
+}
+
+#[test]
+fn bearer_authenticated_query_returns_the_existing_json_result_shape() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, label String); \
+             INSERT INTO readings VALUES (2, 'two'), (1, 'one');",
+        )
+        .unwrap();
+    let (request, _) = request_with_authorization(
+        b"SELECT id, label FROM readings ORDER BY id;",
+        "Authorization: Bearer correct-token_42\r\n",
+    );
+
+    let response = authenticated_exchange(&database, "correct-token_42", &request);
+
+    assert_response(
+        &response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
+    );
+}
+
+#[test]
+fn bearer_rejections_are_identical_and_do_not_consume_or_execute_the_body() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE retained (value Int64); INSERT INTO retained VALUES (7);")
+        .unwrap();
+    let rejected_headers = [
+        ("missing", ""),
+        (
+            "duplicate",
+            "Authorization: Bearer correct-token\r\nAuthorization: Bearer correct-token\r\n",
+        ),
+        ("wrong scheme", "Authorization: Basic correct-token\r\n"),
+        ("missing token", "Authorization: Bearer\r\n"),
+        (
+            "embedded whitespace",
+            "Authorization: Bearer two tokens\r\n",
+        ),
+        ("invalid padding", "Authorization: Bearer abc=def\r\n"),
+        ("incorrect", "Authorization: Bearer incorrect-token\r\n"),
+    ];
+    let mut expected_response = None;
+
+    for (name, headers) in rejected_headers {
+        let (request, body_offset) = request_with_authorization(b"DROP TABLE retained;", headers);
+        let mut input = Cursor::new(request);
+        let mut response = Vec::new();
+
+        handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut response)
+            .unwrap_or_else(|error| panic!("{name} credentials produce a response: {error}"));
+
+        assert_eq!(
+            input.position(),
+            body_offset,
+            "{name} credentials must not consume the SQL body"
+        );
+        assert_response(
+            &response,
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"bearer authentication required"}"#,
+        );
+        assert!(
+            std::str::from_utf8(&response)
+                .unwrap()
+                .contains("\r\nWWW-Authenticate: Bearer\r\n"),
+            "{name} response advertises bearer authentication"
+        );
+        if let Some(expected_response) = &expected_response {
+            assert_eq!(
+                &response, expected_response,
+                "credential failures must not disclose their rejection reason"
+            );
+        } else {
+            expected_response = Some(response);
+        }
+    }
+
+    assert_response(
+        &exchange(&database, &request(b"SELECT value FROM retained;")),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[7]]}"#,
+    );
+}
+
+#[test]
+fn bearer_rejection_does_not_lock_the_database() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+    let (request, _) =
+        request_with_authorization(b"SELECT 1;", "Authorization: Bearer incorrect-token\r\n");
+
+    let response = authenticated_exchange(&database, "correct-token", &request);
+
+    assert_response(
+        &response,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+}
+
+#[test]
+fn empty_configured_bearer_token_is_rejected_before_input_or_database_access() {
+    let database = SharedDatabase::default();
+    let mut response = Vec::new();
+
+    handle_http_query_with_bearer_token(&database, "", FailingReader, &mut response)
+        .expect("invalid configuration produces a response without reading input");
+
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"configured bearer token must not be empty"}"#,
+    );
+}
+
+#[test]
+fn bearer_rejection_respects_the_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let (request, _) = request_with_authorization(b"SELECT 1;", "");
+    let unrestricted = authenticated_exchange(&database, "correct-token", &request);
+    let limits = HttpQueryLimits {
+        max_response_bytes: unrestricted.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut response = Vec::new();
+
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(&request),
+        &mut response,
+        limits,
+    )
+    .unwrap();
+
+    assert!(response.len() <= limits.max_response_bytes);
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+
+    let mut too_small_output = Vec::new();
+    let error = handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(&request),
+        &mut too_small_output,
+        HttpQueryLimits {
+            max_response_bytes: 0,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("even the fixed limit response cannot fit");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+    ));
+    assert!(too_small_output.is_empty());
 }
 
 #[test]
