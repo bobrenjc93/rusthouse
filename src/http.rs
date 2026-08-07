@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 /// Default maximum number of request header fields.
 pub const DEFAULT_MAX_HTTP_HEADER_COUNT: usize = 64;
 
-/// Default maximum size of the SQL request body.
+/// Default maximum size of the decoded SQL request.
 pub const DEFAULT_MAX_HTTP_SQL_BYTES: usize = 1024 * 1024;
 
 /// Default maximum size of the complete HTTP response, including headers.
@@ -27,7 +27,7 @@ pub struct HttpQueryLimits {
     pub max_header_bytes: usize,
     /// Maximum number of request header fields.
     pub max_header_count: usize,
-    /// Maximum SQL body bytes declared by `Content-Length`.
+    /// Maximum SQL bytes in a POST body or decoded GET query parameter.
     pub max_sql_bytes: usize,
     /// Maximum bytes in the complete HTTP response, including its headers.
     pub max_response_bytes: usize,
@@ -84,11 +84,14 @@ impl StdError for HttpQueryError {
 
 /// Handles one strict, bounded HTTP/1.1 exchange.
 ///
-/// `POST /` and `POST /query` require exactly one decimal `Content-Length`.
-/// Their body must be UTF-8 SQL and is passed to [`SharedDatabase::query`],
-/// which accepts exactly one read-only statement. A successful query response
-/// uses the same JSON result shape as the batch JSON formatter unless exactly
-/// one `X-ClickHouse-Format` header requests `CSVWithNames` or
+/// `POST /` and `POST /query` require exactly one decimal `Content-Length` and
+/// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` carries
+/// the same SQL in its sole form-style query parameter: percent escapes are
+/// decoded, `+` becomes a space, and no request body is accepted. All three
+/// forms pass the SQL to [`SharedDatabase::query`], which accepts exactly one
+/// read-only statement. A successful query response uses the same JSON result
+/// shape as the batch JSON formatter unless exactly one
+/// `X-ClickHouse-Format` header requests `CSVWithNames` or
 /// `JSONCompactEachRow`. CSV responses use the batch CSV writer; positional
 /// JSON responses contain arrays separated by line feeds.
 ///
@@ -103,7 +106,9 @@ impl StdError for HttpQueryError {
 /// encoding, including chunked bodies, and `Expect` are rejected.
 ///
 /// The handler does not open, close, or otherwise manage a listener or stream.
-/// It reads exactly the declared request body and emits at most one response.
+/// Each call reads one header block, reads exactly the declared POST body when
+/// applicable, and emits at most one response. It never consumes a subsequent
+/// exchange from the input.
 ///
 /// # Errors
 ///
@@ -379,7 +384,7 @@ fn read_request(
             }
             Ok(HttpRequest::Metrics)
         }
-        RequestKind::Query => {
+        RequestKind::Query(QuerySource::Body) => {
             let Some(content_length) = request.content_length else {
                 return Err(RequestFailure::new(
                     Status::LENGTH_REQUIRED,
@@ -418,6 +423,25 @@ fn read_request(
                 })
                 .map_err(|_| {
                     RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into()
+                })
+        }
+        RequestKind::Query(QuerySource::UrlEncoded(encoded_sql)) => {
+            if request.content_length.unwrap_or(0) != 0 {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "GET /?query= does not accept a request body",
+                )
+                .into());
+            }
+
+            let sql = decode_query_parameter(&encoded_sql, limits.max_sql_bytes)?;
+            String::from_utf8(sql)
+                .map(|sql| HttpRequest::Query {
+                    sql,
+                    response_format: request.response_format,
+                })
+                .map_err(|_| {
+                    RequestFailure::new(Status::BAD_REQUEST, "SQL query is not valid UTF-8").into()
                 })
         }
     }
@@ -498,12 +522,16 @@ enum QueryResponseFormat {
     JsonCompactEachRow,
 }
 
-#[derive(Clone, Copy)]
 enum RequestKind {
-    Query,
+    Query(QuerySource),
     Ping,
     Ready,
     Metrics,
+}
+
+enum QuerySource {
+    Body,
+    UrlEncoded(Vec<u8>),
 }
 
 fn parse_headers(
@@ -612,7 +640,7 @@ fn parse_headers(
     if !host_seen {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "Host header is required").into());
     }
-    let response_format = if matches!(kind, RequestKind::Query) {
+    let response_format = if matches!(&kind, RequestKind::Query(_)) {
         if duplicate_clickhouse_format {
             return Err(RequestFailure::new(
                 Status::BAD_REQUEST,
@@ -702,8 +730,13 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
         )
         .into());
     }
+    const GET_QUERY_PREFIX: &[u8] = b"/?query=";
+
     match (method, target) {
-        (b"POST", b"/" | b"/query") => Ok(RequestKind::Query),
+        (b"POST", b"/" | b"/query") => Ok(RequestKind::Query(QuerySource::Body)),
+        (b"GET", target) if target.starts_with(GET_QUERY_PREFIX) => Ok(RequestKind::Query(
+            QuerySource::UrlEncoded(target[GET_QUERY_PREFIX.len()..].to_vec()),
+        )),
         (b"GET", b"/ping") => Ok(RequestKind::Ping),
         (b"GET", b"/ready") => Ok(RequestKind::Ready),
         (b"GET", b"/metrics") => Ok(RequestKind::Metrics),
@@ -711,6 +744,12 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
             Status::METHOD_NOT_ALLOWED,
             "method must be POST",
             &[b"Allow: POST\r\n"],
+        )
+        .into()),
+        (_, target) if target.starts_with(GET_QUERY_PREFIX) => Err(RequestFailure::with_headers(
+            Status::METHOD_NOT_ALLOWED,
+            "method must be GET for /?query=",
+            &[b"Allow: GET\r\n"],
         )
         .into()),
         (_, b"/ping") => Err(RequestFailure::with_headers(
@@ -745,6 +784,72 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
             &[b"Allow: GET, POST\r\n"],
         )
         .into()),
+    }
+}
+
+fn decode_query_parameter(
+    encoded: &[u8],
+    max_sql_bytes: usize,
+) -> Result<Vec<u8>, RequestReadError> {
+    let mut decoded = Vec::with_capacity(encoded.len().min(max_sql_bytes));
+    let mut index = 0_usize;
+    while index < encoded.len() {
+        let byte = match encoded[index] {
+            b'&' => {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "GET query target must contain exactly one query parameter",
+                )
+                .into());
+            }
+            b'+' => b' ',
+            b'%' => {
+                let Some(hex) = encoded.get(index + 1..index + 3) else {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "query parameter contains malformed percent encoding",
+                    )
+                    .into());
+                };
+                let Some(high) = decode_hex_digit(hex[0]) else {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "query parameter contains malformed percent encoding",
+                    )
+                    .into());
+                };
+                let Some(low) = decode_hex_digit(hex[1]) else {
+                    return Err(RequestFailure::new(
+                        Status::BAD_REQUEST,
+                        "query parameter contains malformed percent encoding",
+                    )
+                    .into());
+                };
+                index += 2;
+                (high << 4) | low
+            }
+            byte => byte,
+        };
+
+        if decoded.len() == max_sql_bytes {
+            return Err(RequestFailure::new(
+                Status::PAYLOAD_TOO_LARGE,
+                "SQL query exceeds configured byte limit",
+            )
+            .into());
+        }
+        decoded.push(byte);
+        index += 1;
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
