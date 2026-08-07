@@ -3056,6 +3056,11 @@ enum CompiledPredicate {
         operator: ComparisonOperator,
         right: CompiledOperand,
     },
+    LikePrefix {
+        column: usize,
+        prefix: String,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -3082,6 +3087,11 @@ impl CompiledPredicate {
                     ComparisonOperator::GreaterOrEqual => comparison != Ordering::Less,
                 }
             }
+            Self::LikePrefix {
+                column,
+                prefix,
+                negated,
+            } => string_at(table, *column, row).starts_with(prefix.as_str()) != *negated,
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
@@ -3142,6 +3152,22 @@ fn compile_predicate_with_polarity(
                     *operator
                 },
                 right,
+            })
+        }
+        Predicate::LikePrefix { column, prefix } => {
+            let column_index = table.column_index(column)?;
+            let actual = table.schema()[column_index].data_type;
+            if actual != DataType::String {
+                return Err(Error::TypeMismatch {
+                    context: format!("WHERE LIKE column '{column}'"),
+                    expected: DataType::String.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+            Ok(CompiledPredicate::LikePrefix {
+                column: column_index,
+                prefix: prefix.clone(),
+                negated,
             })
         }
         Predicate::Not(predicate) => compile_predicate_with_polarity(table, predicate, !negated),

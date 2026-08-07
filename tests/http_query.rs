@@ -151,6 +151,26 @@ fn query_reports_the_configured_scan_limit_over_http() {
 }
 
 #[test]
+fn query_executes_unicode_prefix_like_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             INSERT INTO events VALUES (1, 'snow 雪'), (2, 'snowman'), (3, 'Snow');",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT label FROM events WHERE label LIKE 'snow%' ORDER BY label;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"label","type":"String"}],"rows":[["snow 雪"],["snowman"]]}"#,
+    );
+}
+
+#[test]
 fn ping_returns_the_clickhouse_health_response_without_content_length() {
     let database = SharedDatabase::default();
 
