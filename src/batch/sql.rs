@@ -1379,9 +1379,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
-        if !self.eat_keyword("NOT") {
+        // `not` remains a valid column name, so a following comparison
+        // operator makes this token the left operand rather than unary syntax.
+        if !self.at_keyword("NOT") || self.next_token_is_comparison_operator() {
             return self.parse_predicate_atom();
         }
+        self.advance();
 
         if self.predicate_depth >= MAX_PREDICATE_DEPTH {
             return self.error(format!(
@@ -1394,6 +1397,19 @@ impl<'a> Parser<'a> {
         let predicate = predicate?;
         self.record_predicate_node()?;
         Ok(Predicate::Not(Box::new(predicate)))
+    }
+
+    fn next_token_is_comparison_operator(&self) -> bool {
+        let mut lexer = self.lexer;
+        matches!(
+            Self::next_or_invalid(&mut lexer).kind,
+            TokenKind::Equal
+                | TokenKind::NotEqual
+                | TokenKind::Less
+                | TokenKind::LessOrEqual
+                | TokenKind::Greater
+                | TokenKind::GreaterOrEqual
+        )
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {

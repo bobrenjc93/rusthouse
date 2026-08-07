@@ -186,6 +186,50 @@ fn executes_nested_and_chained_not_for_regular_and_distinct_queries() {
 }
 
 #[test]
+fn preserves_not_as_a_column_operand_in_regular_and_distinct_queries() {
+    for operator in ["=", "!=", "<>", "<", "<=", ">", ">="] {
+        let parsed = predicate(&format!("SELECT not FROM samples WHERE not {operator} 1"));
+        let Predicate::Comparison { left, .. } = parsed else {
+            panic!("not must remain the left comparison operand for {operator}");
+        };
+        assert_eq!(left, Operand::Column("not".to_owned()), "{operator}");
+    }
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (not Int64); \
+             INSERT INTO samples VALUES (1), (2), (1), (3);",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(&mut database, "SELECT not FROM samples WHERE not = 1").rows,
+        [vec![Value::Int64(1)], vec![Value::Int64(1)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT not FROM samples WHERE not <> 2",
+        )
+        .rows,
+        [vec![Value::Int64(1)], vec![Value::Int64(3)]]
+    );
+    assert_eq!(
+        query(&mut database, "SELECT not FROM samples WHERE NOT not = 1").rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(3)]]
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT not FROM samples WHERE NOT not >= 2",
+        )
+        .rows,
+        [vec![Value::Int64(1)]]
+    );
+}
+
+#[test]
 fn not_preserves_comparison_type_and_null_literal_rules() {
     let mut database = Database::new();
     database
@@ -238,7 +282,7 @@ fn rejects_malformed_unary_not_predicates() {
         "SELECT id FROM events WHERE NOT (id = 1",
         "SELECT id FROM events WHERE NOT NOT",
         "SELECT DISTINCT id FROM events WHERE NOT LIMIT 1",
-        "SELECT DISTINCT id FROM events WHERE NOT = 1",
+        "SELECT DISTINCT id FROM events WHERE NOT *",
     ] {
         assert!(
             matches!(parse(sql), Err(Error::Sql { .. })),
