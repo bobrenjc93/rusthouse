@@ -1658,19 +1658,19 @@ impl<'a> Parser<'a> {
         let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
             position,
             message: format!(
-                "unknown CAST target type '{type_name}'; expected Int64, Float64, or Bool"
+                "unknown CAST target type '{type_name}'; expected Int64, Float64, Bool, or String"
             ),
         })?;
         if matches!(
             target_type,
-            DataType::Int64 | DataType::Float64 | DataType::Bool
+            DataType::Int64 | DataType::Float64 | DataType::Bool | DataType::String
         ) {
             Ok(target_type)
         } else {
             Err(Error::Sql {
                 position,
                 message: format!(
-                    "unsupported CAST target type '{type_name}'; expected Int64, Float64, or Bool"
+                    "unsupported CAST target type '{type_name}'; expected Int64, Float64, Bool, or String"
                 ),
             })
         }
