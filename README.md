@@ -11,7 +11,7 @@ The first useful release should support:
 - typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
-- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
+- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
 - a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
   and JSONCompactEachRow output;
 - durable local snapshots with an explicit, documented file format;
@@ -40,6 +40,15 @@ not satisfy `IS NOT NULL`, and remain unknown (and therefore excluded) in a
 numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
+
+Regular ungrouped, non-window projections support
+`LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
+and `ORDER BY` happen before rows are skipped. Ordered pagination uses the
+existing bounded top-k selection with a checked `count + offset` bound, and
+scalar projections are evaluated only for returned rows. Both values are
+nonnegative `usize` integers. `OFFSET` requires `LIMIT` and is deliberately not
+supported for aggregate or grouped queries, `DISTINCT`, `ROW_NUMBER`, literal
+selects, or cross joins.
 
 `CREATE TABLE IF NOT EXISTS <name> (...)` creates the table normally when its
 case-insensitive name is absent. If that name is already registered, it returns
@@ -446,6 +455,10 @@ persists the column name, nullability, and table row cap. It has independent
 UTF-8 name-byte, row-cap/current-row, and payload-byte bounds; decoding checks
 the complete format before constructing a table. The original row-only payload
 format remains unchanged for existing callers.
+`restore_int64_table_payload_from_file` is the bounded reopen path for this
+self-describing format. It recovers the schema, nullability, row cap, and rows
+without caller-supplied table metadata, rejects non-regular and oversized files
+before decoding, and keeps open, read, envelope, and payload failures distinct.
 `restore_int64_table_from_file` reopens a row-only payload with a hard envelope
 read bound and restores a table only after the envelope, payload, caller schema,
 and caller row cap have all been validated. An explicit-backup helper tries
@@ -463,10 +476,11 @@ flush semantics there.
 existing `Int64Table` with `NullableI64PayloadCodec`, then uses that atomic
 replacement operation. Its typed error distinguishes payload encoding from
 replacement failures, and every pre-rename failure preserves the destination.
-Those high-level save/restore helpers continue to use the row-only payload, so
-their schema and table row-cap metadata remain caller-supplied. The
-self-describing codec can instead be composed directly with the envelope's
-`encode`, `create_new_file`, and Unix `replace_file` APIs.
+The save helper and legacy restore helpers continue to use the row-only
+payload, so their schema and table row-cap metadata remain caller-supplied. The
+self-describing codec composes directly with the envelope's `encode`,
+`create_new_file`, and Unix `replace_file` APIs; files written by those APIs are
+reopened with `restore_int64_table_payload_from_file`.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary

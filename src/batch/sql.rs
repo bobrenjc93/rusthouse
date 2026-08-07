@@ -122,6 +122,9 @@ pub struct Select {
     pub having: Option<Having>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+    /// Rows skipped after filtering and ordering. This is only populated for
+    /// the narrow `LIMIT <count> OFFSET <offset>` projection shape.
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,6 +308,31 @@ fn validate_row_number_shape(select: &Select, position: usize) -> Result<()> {
         }),
         None => Ok(()),
     }
+}
+
+fn validate_offset_shape(select: &Select, position: usize) -> Result<()> {
+    if select.offset.is_none() {
+        return Ok(());
+    }
+
+    let unsupported = select.distinct
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.items.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Aggregate { .. } | SelectItem::RowNumber { .. }
+            )
+        });
+    if unsupported {
+        return Err(Error::Sql {
+            position,
+            message: "OFFSET is only supported for ungrouped, non-DISTINCT, non-window SELECT projections"
+                .to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Parse one or more semicolon-separated SQL statements.
@@ -1120,6 +1148,21 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let offset_position = self.position();
+        let offset = if limit.is_some() && self.eat_keyword("OFFSET") {
+            let position = self.position();
+            let number = self.take_number().ok_or_else(|| Error::Sql {
+                position,
+                message: "expected a non-negative integer after OFFSET".to_owned(),
+            })?;
+            Some(number.parse::<usize>().map_err(|_| Error::Sql {
+                position,
+                message: format!("invalid OFFSET '{number}'"),
+            })?)
+        } else {
+            None
+        };
+
         let select = Select {
             distinct: false,
             items,
@@ -1129,8 +1172,10 @@ impl<'a> Parser<'a> {
             having,
             order_by,
             limit,
+            offset,
         };
         validate_row_number_shape(&select, self.position())?;
+        validate_offset_shape(&select, offset_position)?;
         Ok(select)
     }
 
@@ -1206,6 +1251,7 @@ impl<'a> Parser<'a> {
             having: None,
             order_by,
             limit,
+            offset: None,
         })
     }
 
