@@ -573,6 +573,77 @@ fn url_encoded_get_query_retains_the_complete_response_limit() {
 }
 
 #[test]
+fn every_query_form_streams_typed_json_each_row() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE typed_values (id Int64, score Float64, active Bool, label String); \
+             INSERT INTO typed_values VALUES (-7, 2.0, false, 'quote\"\\line\nsnow 雪'), \
+                                               (0, -1.25, true, '');",
+        )
+        .unwrap();
+    let sql = b"SELECT id, score, active, label FROM typed_values ORDER BY id;";
+    let requests = [
+        request_for_target_with_headers(
+            "/",
+            sql,
+            "X-ClickHouse-Format: JSONEachRow\r\n",
+        ),
+        request_for_target_with_headers(
+            "/query",
+            sql,
+            "X-ClickHouse-Format: JSONEachRow\r\n",
+        ),
+        b"GET /?query=SELECT+id%2C+score%2C+active%2C+label+FROM+typed_values+ORDER+BY+id%3B HTTP/1.1\r\nHost: localhost\r\nx-cLiCkHoUsE-fOrMaT:\tJSONEachRow \r\n\r\n".to_vec(),
+    ];
+    let expected = concat!(
+        "{\"id\":-7,\"score\":2.0,\"active\":false,\"label\":\"quote\\\"\\\\line\\nsnow 雪\"}\n",
+        "{\"id\":0,\"score\":-1.25,\"active\":true,\"label\":\"\"}\n",
+    );
+
+    for request in requests {
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
+fn json_each_row_handles_escaped_keys_nulls_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute("CREATE TABLE empty_values (id Int64, score Float64, active Bool, label String);")
+        .unwrap();
+
+    let escaped = request_for_target_with_headers(
+        "/query",
+        b"SELECT 'quote\"\\line\nsnow \xE9\x9B\xAA';",
+        "X-ClickHouse-Format: JSONEachRow\r\n",
+    );
+    assert_response(
+        &exchange(&database, &escaped),
+        "HTTP/1.1 200 OK",
+        "{\"'quote\\\"\\\\line\\nsnow 雪'\":\"quote\\\"\\\\line\\nsnow 雪\"}\n",
+    );
+
+    let nulls = request_for_target_with_headers(
+        "/query",
+        b"SELECT MIN(id) AS missing_id, MIN(score) AS missing_score, MIN(active) AS missing_active, MIN(label) AS missing_label FROM empty_values;",
+        "X-ClickHouse-Format: JSONEachRow\r\n",
+    );
+    assert_response(
+        &exchange(&database, &nulls),
+        "HTTP/1.1 200 OK",
+        "{\"missing_id\":null,\"missing_score\":null,\"missing_active\":null,\"missing_label\":null}\n",
+    );
+
+    let empty = request_for_target_with_headers(
+        "/query",
+        b"SELECT id, score, active, label FROM empty_values;",
+        "X-ClickHouse-Format: JSONEachRow\r\n",
+    );
+    assert_response(&exchange(&database, &empty), "HTTP/1.1 200 OK", "");
+}
+
+#[test]
 fn both_query_routes_stream_typed_json_compact_each_row_and_empty_results() {
     let database = SharedDatabase::default();
     database
@@ -731,6 +802,24 @@ fn both_query_routes_return_tab_separated_with_names_for_all_value_types_and_emp
 }
 
 #[test]
+fn bearer_authenticated_get_query_honors_json_each_row() {
+    let database = SharedDatabase::default();
+    let unauthorized = b"GET /?query=SELECT+%2B7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: JSONEachRow\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let authorized = b"GET /?query=SELECT+%2B7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\nX-ClickHouse-Format: JSONEachRow\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", authorized),
+        "HTTP/1.1 200 OK",
+        "{\"value\":7}\n",
+    );
+}
+
+#[test]
 fn bearer_authenticated_queries_honor_json_compact_each_row() {
     let database = SharedDatabase::default();
     let sql = b"SELECT -7 AS integer;";
@@ -817,12 +906,16 @@ fn bearer_authenticated_queries_honor_tab_separated_with_names_on_both_routes() 
 }
 
 #[test]
-fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
+fn query_forms_reject_duplicate_and_unsupported_clickhouse_formats() {
     let database = SharedDatabase::default();
     let duplicate_headers = [
         concat!(
             "X-ClickHouse-Format: JSONCompactEachRow\r\n",
             "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: JSONEachRow\r\n",
+            "X-ClickHouse-Format: JSONEachRow\r\n",
         ),
         concat!(
             "X-ClickHouse-Format: JSONCompactEachRow\r\n",
@@ -863,7 +956,9 @@ fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
         }
 
         for unsupported in [
-            "JSONEachRow",
+            "jsoneachrow",
+            "JsonEachRow",
+            "JSONEACHROW",
             "jsoncompacteachrow",
             "csvwithnames",
             "tabseparatedwithnames",
@@ -882,6 +977,59 @@ fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
             );
         }
     }
+
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: JSONEachRow\r\nx-clickhouse-format: JSONEachRow\r\n\r\n",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"duplicate X-ClickHouse-Format header"}"#,
+    );
+}
+
+#[test]
+fn json_each_row_honors_the_exact_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));
+    let request = request_for_target_with_headers(
+        "/query",
+        sql.as_bytes(),
+        "X-ClickHouse-Format: JSONEachRow\r\n",
+    );
+    let expected_response = exchange(&database, &request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the exact complete JSONEachRow response size is accepted");
+    assert_eq!(exact_response, expected_response);
+
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
 }
 
 #[test]

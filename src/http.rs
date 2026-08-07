@@ -5,7 +5,8 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use crate::batch::format::{
-    write_csv, write_json, write_json_compact_each_row, write_json_string, write_tsv,
+    write_csv, write_json, write_json_compact_each_row, write_json_each_row_with_limit,
+    write_json_string, write_tsv,
 };
 use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
@@ -94,9 +95,9 @@ impl StdError for HttpQueryError {
 /// read-only statement. A successful query response uses the same JSON result
 /// shape as the batch JSON formatter unless exactly one
 /// `X-ClickHouse-Format` header requests `CSVWithNames`,
-/// `TabSeparatedWithNames`, or `JSONCompactEachRow`. CSV and TSV responses use
-/// the corresponding batch writers; positional JSON responses contain arrays
-/// separated by line feeds.
+/// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
+/// and row-oriented JSON responses use the corresponding batch writers;
+/// positional JSON responses contain arrays separated by line feeds.
 ///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
 /// for retained tables, columns, and rows. It takes a nonblocking, consistent
@@ -308,21 +309,31 @@ fn handle_http_query_exchange(
     match database.query(&sql) {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
-            let (write_result, content_type) = match response_format {
-                QueryResponseFormat::Json => (write_json(&mut body, &result), CONTENT_TYPE_JSON),
+            let (write_failed, content_type) = match response_format {
+                QueryResponseFormat::Json => {
+                    (write_json(&mut body, &result).is_err(), CONTENT_TYPE_JSON)
+                }
                 QueryResponseFormat::CsvWithNames => {
-                    (write_csv(&mut body, &result), CONTENT_TYPE_CSV)
+                    (write_csv(&mut body, &result).is_err(), CONTENT_TYPE_CSV)
                 }
                 QueryResponseFormat::TabSeparatedWithNames => {
-                    (write_tsv(&mut body, &result), CONTENT_TYPE_TSV)
+                    (write_tsv(&mut body, &result).is_err(), CONTENT_TYPE_TSV)
                 }
+                QueryResponseFormat::JsonEachRow => (
+                    write_json_each_row_with_limit(&mut body, &result, limits.max_response_bytes)
+                        .is_err(),
+                    CONTENT_TYPE_JSON,
+                ),
                 QueryResponseFormat::JsonCompactEachRow => (
-                    write_json_compact_each_row(&mut body, &result),
+                    write_json_compact_each_row(&mut body, &result).is_err(),
                     CONTENT_TYPE_JSON,
                 ),
             };
-            if write_result.is_err() {
-                debug_assert!(body.limit_exceeded);
+            if write_failed {
+                debug_assert!(
+                    body.limit_exceeded
+                        || matches!(response_format, QueryResponseFormat::JsonEachRow)
+                );
                 return write_response_limit_error(&mut output, limits.max_response_bytes);
             }
             write_response(
@@ -526,6 +537,7 @@ enum QueryResponseFormat {
     Json,
     CsvWithNames,
     TabSeparatedWithNames,
+    JsonEachRow,
     JsonCompactEachRow,
 }
 
@@ -659,6 +671,7 @@ fn parse_headers(
             None => QueryResponseFormat::Json,
             Some(b"CSVWithNames") => QueryResponseFormat::CsvWithNames,
             Some(b"TabSeparatedWithNames") => QueryResponseFormat::TabSeparatedWithNames,
+            Some(b"JSONEachRow") => QueryResponseFormat::JsonEachRow,
             Some(b"JSONCompactEachRow") => QueryResponseFormat::JsonCompactEachRow,
             Some(_) => {
                 return Err(RequestFailure::new(
