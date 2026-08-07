@@ -31,6 +31,16 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    SelectionIndexOutOfBounds {
+        selection_position: usize,
+        row_index: usize,
+        input_rows: usize,
+    },
+    SelectionNotStrictlyIncreasing {
+        selection_position: usize,
+        previous_row_index: usize,
+        row_index: usize,
+    },
     TypeMismatch {
         context: String,
         expected: String,
@@ -103,6 +113,22 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "row for table '{table}' has {actual} values; expected {expected}"
+            ),
+            Self::SelectionIndexOutOfBounds {
+                selection_position,
+                row_index,
+                input_rows,
+            } => write!(
+                f,
+                "row selection index {row_index} at position {selection_position} is out of bounds for {input_rows} input rows"
+            ),
+            Self::SelectionNotStrictlyIncreasing {
+                selection_position,
+                previous_row_index,
+                row_index,
+            } => write!(
+                f,
+                "row selection index {row_index} at position {selection_position} is not greater than the previous index {previous_row_index}"
             ),
             Self::TypeMismatch {
                 context,
