@@ -86,6 +86,8 @@ pub enum Statement {
     },
     /// Exactly one typed literal with no `FROM` or other clauses.
     LiteralSelect(LiteralSelect),
+    /// Exact ClickHouse-compatible `SELECT version() [AS alias]` probe.
+    VersionSelect(VersionSelect),
     Select(Select),
     /// A deliberately narrow, two-table Cartesian product.
     CrossJoin(CrossJoin),
@@ -119,6 +121,12 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiteralSelect {
     pub value: Value,
+    pub alias: Option<String>,
+}
+
+/// `SELECT version() [AS <alias>]`, with no arguments or trailing clauses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionSelect {
     pub alias: Option<String>,
 }
 
@@ -706,6 +714,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<Statement> {
+        if self.at_version_call_start() {
+            return self.parse_version_select();
+        }
         if self.at_literal_start() {
             return self.parse_literal_select();
         }
@@ -745,6 +756,33 @@ impl<'a> Parser<'a> {
         } else {
             Ok(Statement::UnionAll { left, right })
         }
+    }
+
+    fn parse_version_select(&mut self) -> Result<Statement> {
+        const SHAPE: &str = "version() SELECT supports exactly SELECT version() with an optional AS alias and no trailing clauses";
+
+        self.reserve_ast_list_item()?;
+        self.expect_keyword("VERSION")?;
+        self.expect(&TokenKind::LeftParen, "'(' after version")?;
+        self.expect(
+            &TokenKind::RightParen,
+            "')' after the empty version argument list",
+        )?;
+        let alias = self.parse_alias()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error(SHAPE);
+        }
+
+        Ok(Statement::VersionSelect(VersionSelect { alias }))
+    }
+
+    fn at_version_call_start(&self) -> bool {
+        if !self.at_keyword("VERSION") {
+            return false;
+        }
+
+        let mut lexer = self.lexer;
+        matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
     }
 
     fn parse_literal_select(&mut self) -> Result<Statement> {
@@ -1435,14 +1473,17 @@ impl<'a> Parser<'a> {
                 let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
                     position: type_position,
                     message: format!(
-                        "unknown CAST target type '{type_name}'; expected Int64 or Float64"
+                        "unknown CAST target type '{type_name}'; expected Int64, Float64, or Bool"
                     ),
                 })?;
-                if !matches!(target_type, DataType::Int64 | DataType::Float64) {
+                if !matches!(
+                    target_type,
+                    DataType::Int64 | DataType::Float64 | DataType::Bool
+                ) {
                     return Err(Error::Sql {
                         position: type_position,
                         message: format!(
-                            "unsupported CAST target type '{type_name}'; expected Int64 or Float64"
+                            "unsupported CAST target type '{type_name}'; expected Int64, Float64, or Bool"
                         ),
                     });
                 }

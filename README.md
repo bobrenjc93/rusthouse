@@ -113,6 +113,13 @@ exactly one literal expression and an optional `AS` alias: expression lists,
 bare `NULL`, operator expressions, `FROM`, and other trailing clauses are not
 supported.
 
+The exact case-insensitive probe `SELECT version() [AS <alias>]` returns the
+RustHouse package semantic version as one `String` row. Its result column is
+named `version()` unless an alias is supplied. Arguments, expression lists,
+`FROM`, `WHERE`, `ORDER BY`, `LIMIT`, and other trailing clauses are rejected;
+the probe charges one SQL AST list item and uses the normal query row, value,
+byte, retained-result, and formatted-output limits.
+
 `SHOW TABLES` returns the catalog's display names in deterministic,
 case-insensitive order as one `String` column.
 `SHOW CREATE TABLE <name>` returns one canonical `CREATE TABLE` statement as a
@@ -163,13 +170,15 @@ result column name and can be used in `ORDER BY`. `WHERE`, expression ordering,
 and `LIMIT` select rows before subtraction, so overflow in an excluded row does
 not fail the query. A selected overflow or non-`Int64` argument is a typed error.
 
-`SELECT` projections support `CAST(int64_column AS Float64)` and
-`CAST(float64_column AS Int64)`. Float-to-integer casts truncate finite values
-toward zero and report typed numeric-overflow errors outside the `Int64`
-range. Add an explicit `AS alias`; otherwise, the result column is named
-`CAST(<column> AS <type>)`. `WHERE`, `ORDER BY`, and `LIMIT` select rows before
-checked conversion. `CAST` projections are currently limited to ungrouped
-queries: they cannot be combined with aggregate projections or `GROUP BY`.
+`SELECT` projections support `CAST(int64_column AS Float64)`,
+`CAST(float64_column AS Int64)`, and `CAST(int64_column AS Bool)`. Integer zero
+becomes `false`, and every nonzero integer, including both `Int64` extrema,
+becomes `true`. Float-to-integer casts truncate finite values toward zero and
+report typed numeric-overflow errors outside the `Int64` range. Add an explicit
+`AS alias`; otherwise, the result column is named `CAST(<column> AS <type>)`.
+`WHERE`, `ORDER BY`, and `LIMIT` select rows before conversion. `CAST`
+projections are currently limited to ungrouped queries: they cannot be combined
+with aggregate projections or `GROUP BY`.
 `LENGTH(string_column)` is another ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named

@@ -8,6 +8,7 @@ use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
     self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
     HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
+    VersionSelect,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
@@ -587,6 +588,7 @@ impl Database {
                 rows,
             } => self.execute_insert_statement(table, Some(columns), rows),
             statement @ (Statement::LiteralSelect(_)
+            | Statement::VersionSelect(_)
             | Statement::Select(_)
             | Statement::CrossJoin(_)
             | Statement::UnionAll { .. }
@@ -608,6 +610,9 @@ impl Database {
         match statement {
             Statement::LiteralSelect(select) => {
                 self.execute_literal_select(select, query_result_limits)
+            }
+            Statement::VersionSelect(select) => {
+                self.execute_version_select(select, query_result_limits)
             }
             Statement::Select(select) => self.execute_select(select, query_result_limits),
             Statement::CrossJoin(cross_join) => {
@@ -698,6 +703,40 @@ impl Database {
         Ok(QueryResult {
             columns,
             rows: vec![vec![value]],
+        })
+    }
+
+    fn execute_version_select(
+        &self,
+        select: VersionSelect,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<QueryResult> {
+        const RESULT_COLUMN_NAME: &str = "version()";
+        const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+        let column_name = select
+            .alias
+            .unwrap_or_else(|| RESULT_COLUMN_NAME.to_owned());
+        let fixed_bytes = validate_result_shape_parts(
+            1,
+            1,
+            1,
+            column_name.len(),
+            query_result_limits,
+            SELECT_RESULT_RESOURCES,
+        )?;
+        enforce_resource_limit(
+            SELECT_RESULT_RESOURCES.bytes,
+            fixed_bytes.saturating_add(PACKAGE_VERSION.len()),
+            query_result_limits.max_bytes,
+        )?;
+
+        Ok(QueryResult {
+            columns: vec![ResultColumn {
+                name: column_name,
+                data_type: DataType::String,
+            }],
+            rows: vec![vec![Value::String(PACKAGE_VERSION.to_owned())]],
         })
     }
 
@@ -1092,6 +1131,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
+        | Statement::VersionSelect(_)
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
@@ -1652,6 +1692,9 @@ enum ResolvedItem {
     CastFloat64ToInt64 {
         source: usize,
     },
+    CastInt64ToBool {
+        source: usize,
+    },
     StringLength {
         source: usize,
     },
@@ -1839,9 +1882,10 @@ fn resolve_select_items(
                 let expected = match target_type {
                     DataType::Float64 => DataType::Int64,
                     DataType::Int64 => DataType::Float64,
-                    DataType::Bool | DataType::String => {
+                    DataType::Bool => DataType::Int64,
+                    DataType::String => {
                         return Err(Error::InvalidQuery(
-                            "only CAST(Int64 AS Float64) and CAST(Float64 AS Int64) are supported"
+                            "only CAST(Int64 AS Float64), CAST(Float64 AS Int64), and CAST(Int64 AS Bool) are supported"
                                 .to_owned(),
                         ));
                     }
@@ -1862,7 +1906,8 @@ fn resolve_select_items(
                 items.push(match target_type {
                     DataType::Float64 => ResolvedItem::CastInt64ToFloat64 { source },
                     DataType::Int64 => ResolvedItem::CastFloat64ToInt64 { source },
-                    DataType::Bool | DataType::String => unreachable!("CAST target is validated"),
+                    DataType::Bool => ResolvedItem::CastInt64ToBool { source },
+                    DataType::String => unreachable!("CAST target is validated"),
                 });
                 result_columns.push(ResultColumn {
                     name: alias.clone().unwrap_or_else(|| {
@@ -2197,6 +2242,9 @@ fn execute_projection(
                         ResolvedItem::CastFloat64ToInt64 { source } => Value::Int64(
                             checked_float64_to_int64(float64_at(table, *source, *row))?,
                         ),
+                        ResolvedItem::CastInt64ToBool { source } => {
+                            Value::Bool(int64_at(table, *source, *row) != 0)
+                        }
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
@@ -2338,6 +2386,7 @@ fn validate_projection_result_limits(
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
+                | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
@@ -2389,7 +2438,8 @@ fn validate_grouped_result_limits(
                     )
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
-                | ResolvedItem::CastFloat64ToInt64 { .. } => {
+                | ResolvedItem::CastFloat64ToInt64 { .. }
+                | ResolvedItem::CastInt64ToBool { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
@@ -2840,7 +2890,8 @@ impl GroupedData<'_> {
                             )
                         }
                         ResolvedItem::CastInt64ToFloat64 { .. }
-                        | ResolvedItem::CastFloat64ToInt64 { .. } => {
+                        | ResolvedItem::CastFloat64ToInt64 { .. }
+                        | ResolvedItem::CastInt64ToBool { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
                         ResolvedItem::StringLength { .. } => {
@@ -3180,6 +3231,9 @@ fn order_source_rows(
                     let right = ValueRef::Float64(float64_at(table, source, right).trunc());
                     left.cmp(&right)
                 }
+                ResolvedItem::CastInt64ToBool { source } => {
+                    (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
+                }
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
@@ -3250,7 +3304,8 @@ fn order_grouped_rows(
                     )
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
-                | ResolvedItem::CastFloat64ToInt64 { .. } => {
+                | ResolvedItem::CastFloat64ToInt64 { .. }
+                | ResolvedItem::CastInt64ToBool { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
