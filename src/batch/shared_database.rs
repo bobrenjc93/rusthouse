@@ -39,7 +39,7 @@ pub enum SharedDatabaseError {
     QueryStatementCount { statements: usize },
     /// The read-only query API received a mutating statement.
     ReadOnlyStatementRequired { statement: &'static str },
-    /// A nonblocking query could not immediately acquire a database read lock.
+    /// A nonblocking operation could not immediately acquire its database lock.
     DatabaseBusy,
     /// A thread panicked while it held the database write lock.
     LockPoisoned,
@@ -105,8 +105,9 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// executes one `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`,
 /// or `EXISTS TABLE` under a shared read lock. [`Self::try_query`] accepts the
 /// same input but returns [`SharedDatabaseError::DatabaseBusy`] instead of
-/// waiting for a writer. Results own their columns and values and remain valid
-/// after the lock is released.
+/// waiting for a writer. [`Self::try_execute_insert_batch`] similarly attempts
+/// one nonblocking write lock for an atomic `INSERT`-only batch. Results own
+/// their columns and values and remain valid after the lock is released.
 ///
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
@@ -211,6 +212,22 @@ impl SharedDatabase {
     ) -> Result<Vec<StatementResult>, SharedDatabaseError> {
         let statements = sql::parse(input)?;
         self.write()?
+            .execute_insert_statements(statements)
+            .map_err(Into::into)
+    }
+
+    /// Attempts to atomically execute a nonempty, `INSERT`-only batch without waiting.
+    ///
+    /// Parsing completes before the single write-lock attempt. Preflight and
+    /// ordered commit both occur while the same write guard is retained. If a
+    /// reader or writer prevents immediate lock acquisition, this returns
+    /// [`SharedDatabaseError::DatabaseBusy`] without applying any rows.
+    pub fn try_execute_insert_batch(
+        &self,
+        input: &str,
+    ) -> Result<Vec<StatementResult>, SharedDatabaseError> {
+        let statements = sql::parse(input)?;
+        self.try_write()?
             .execute_insert_statements(statements)
             .map_err(Into::into)
     }
@@ -335,6 +352,14 @@ impl SharedDatabase {
         self.inner
             .write()
             .map_err(|_| SharedDatabaseError::LockPoisoned)
+    }
+
+    fn try_write(&self) -> Result<RwLockWriteGuard<'_, Database>, SharedDatabaseError> {
+        match self.inner.try_write() {
+            Ok(database) => Ok(database),
+            Err(TryLockError::WouldBlock) => Err(SharedDatabaseError::DatabaseBusy),
+            Err(TryLockError::Poisoned(_)) => Err(SharedDatabaseError::LockPoisoned),
+        }
     }
 }
 

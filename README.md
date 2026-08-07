@@ -302,9 +302,13 @@ For transactional ingestion, `Database::execute_insert_batch` and the matching
 statement and cumulative per-table row cap, then commit in statement order.
 Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
+`SharedDatabase::try_execute_insert_batch` performs the same parsing and atomic
+execution after one nonblocking write-lock attempt. An active reader or writer
+returns the typed `DatabaseBusy` error without applying any rows, while lock
+poisoning remains distinct.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
-## HTTP query, health, and metrics exchanges
+## HTTP query, insert, health, and metrics exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
 exchange without opening a listener. Every accepted request form requires a
@@ -327,6 +331,16 @@ positional-row shape as `--format json`; protocol and query failures return
 deterministic JSON error objects with an appropriate HTTP status. All other
 targets and query-string shapes are rejected.
 
+The bearer-authenticated handlers additionally expose exact `POST /insert`.
+It requires one decimal `Content-Length`, applies the same UTF-8 SQL body and
+request limits as `POST /query`, and executes a nonempty `INSERT`-only batch
+through `SharedDatabase::try_execute_insert_batch`. The database preflights the
+entire batch before commit, so syntax, target, shape, type, capacity, empty
+batch, or mixed-statement failures return `400 Bad Request` without applying
+any rows. Success returns `200 OK` with an empty plain-text body. The route is
+not recognized by `handle_http_query` or `handle_http_query_with_limits`, and
+query routes remain read-only even when their request is authenticated.
+
 HTTP query admission never waits for the database lock. After request parsing,
 authentication, SQL decoding, and read-only statement validation, each query
 makes one immediate shared read-lock attempt. Concurrent readers are admitted;
@@ -335,6 +349,13 @@ body `{"error":"database is unavailable"}`. A poisoned lock remains a `500
 Internal Server Error`, and SQL errors remain `400 Bad Request`. Authentication,
 format negotiation, SQL/result resource limits, and the complete HTTP response
 limit retain their existing ordering and behavior.
+
+HTTP insert admission likewise never waits. After authentication, bounded body
+reading, and full SQL parsing, it makes one immediate write-lock attempt. Any
+active reader or writer returns the same deterministic `503 Service
+Unavailable`; a poisoned lock returns `500 Internal Server Error`. Validation
+and commit occur under the acquired write lock so concurrent work cannot expose
+or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
@@ -385,16 +406,16 @@ text format version 0.0.4. The snapshot attempts one database read lock and
 never waits for a writer; lock contention and poisoning return the same
 deterministic `503 Service Unavailable` response as `/ready`.
 
-The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
-POST body or decoded GET SQL, and 16 MiB for the complete response including
+The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
+POST SQL body or decoded GET SQL, and 16 MiB for the complete response including
 headers. Header limits apply to all routes, as does the complete-response
 limit. The full response is prepared and checked before anything is written.
 Call `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller
 embedding limits. Each call reads exactly one header block and, only for a POST
-query, exactly its declared body; it emits at most one final `Connection: close`
-response and never reads or handles a subsequent request. This single-exchange
-API deliberately leaves listener, connection, timeout, and shutdown lifecycle
-to the embedding application.
+query or authenticated insert, exactly its declared body; it emits at most one
+final `Connection: close` response and never reads or handles a subsequent
+request. This single-exchange API deliberately leaves listener, connection,
+timeout, and shutdown lifecycle to the embedding application.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
@@ -407,7 +428,7 @@ credentials receive the same bounded `401 Unauthorized` response before a
 request body is read or the database lock is acquired. Invalid configured
 tokens are rejected before any request input is read. The original
 `handle_http_query` APIs intentionally remain unauthenticated for existing
-in-process embeddings.
+in-process read-only embeddings and do not expose `/insert`.
 
 Bearer authentication does not provide transport security. RustHouse does not
 terminate TLS, so an embedding must put this exchange behind TLS before sending
