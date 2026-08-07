@@ -92,6 +92,11 @@ as typed errors.
 unaliased expression or alias, `WHERE`, and `LIMIT`. Filtering and limiting
 select rows before output evaluation, so an excluded `i64::MIN` does not fail
 the query; a selected `i64::MIN` reports a typed numeric-overflow error.
+`ROUND(float64_column)` is an ungrouped scalar projection that returns a
+`Float64` rounded to an integral value. Values exactly halfway between two
+integers are rounded away from zero. It supports an optional `AS alias`,
+ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`; non-
+`Float64` arguments are rejected with a typed error.
 
 `ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
 non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
