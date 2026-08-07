@@ -1,8 +1,9 @@
 # Snapshot envelope format
 
 RustHouse snapshots use a versioned binary envelope. The envelope provides a
-corruption and resource boundary. The first defined payload serializes nullable
-`Int64` rows; catalog serialization remains outside this format.
+corruption and resource boundary. One payload serializes nullable `Int64` rows,
+and a separate self-describing payload serializes one bounded `Int64Table`.
+Catalog serialization remains outside this format.
 
 ## Version 1 layout
 
@@ -108,6 +109,42 @@ length and declared row count before allocation, validates every tag and value,
 rejects truncation and trailing data, and only then allocates the decoded row
 vector. The payload-byte limit includes the row-count field, tags, and values.
 
+## Self-describing Int64 table payload
+
+`Int64TablePayloadCodec` defines an additive payload format for one complete
+`Int64Table`. It does not alter or replace the nullable row payload above. All
+integers are little-endian, the column name is UTF-8, and rows use the same
+`NULL` and present-value tags as the row-only format.
+
+For a column name containing `N` bytes, the layout is:
+
+| Offset | Size | Field | Value |
+| ---: | ---: | --- | --- |
+| 0 | 8 | Payload magic | ASCII `RHITBLP` followed by `00` |
+| 8 | 2 | Payload version | `1` (`u16`) |
+| 10 | 1 | Column type tag | `0x01` (`Int64`) |
+| 11 | 1 | Nullability tag | `0x00` (not nullable) or `0x01` (nullable) |
+| 12 | 8 | Column-name length | `N` (`u64`) |
+| 20 | `N` | Column name | Exactly `N` UTF-8 bytes |
+| `20 + N` | 8 | Row cap | Maximum rows accepted by the restored table (`u64`) |
+| `28 + N` | 8 | Row count | Current number of rows (`u64`) |
+| `36 + N` | Variable | Rows | Exactly `row count` tagged rows |
+
+Callers configure inclusive maximum name bytes, rows, and payload bytes. The
+row limit applies independently to both the persisted row cap and current row
+count. Encoding checks all three limits before allocation. Decoding first
+checks the complete input against the payload-byte limit, then validates magic,
+version, the known type and nullability tags, name length and UTF-8, row cap,
+row count, every row tag and value, schema nullability, truncation, and trailing
+bytes. Only after that complete validation pass does it allocate decoded rows
+and construct the table. Unknown type, nullability, and row tags are rejected.
+
+This payload contains exactly one one-column `Int64Table`. Its stored name is
+the column name, not a catalog table name. It cannot represent a catalog,
+multiple tables, or the batch engine's multi-column and non-`Int64` schemas.
+It composes directly with `SnapshotCodec` for checksummed envelopes and, on
+Unix, atomic replacement through `SnapshotCodec::replace_file`.
+
 ## Restoring one Int64 table
 
 `restore_int64_table` composes a caller-configured `SnapshotCodec` and
@@ -116,7 +153,9 @@ decodes the complete envelope and payload before atomically appending the rows
 to a new table. Envelope, payload, schema nullability, and row-cap failures are
 reported as distinct typed error variants; a failure never returns a partially
 populated table. The payload contains row values but no schema or row-cap
-metadata, so reopening always requires the caller to supply both.
+metadata, so this legacy row-only restore path always requires the caller to
+supply both. Self-describing table payloads are decoded with
+`Int64TablePayloadCodec` instead.
 
 `restore_int64_table_from_file` provides the bounded filesystem entry point.
 It requires a regular file so FIFOs and devices cannot block or hide trailing

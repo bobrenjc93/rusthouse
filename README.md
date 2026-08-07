@@ -405,11 +405,16 @@ schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 magic value, format version, declared length, and CRC-32 checksum.
 `NullableI64PayloadCodec` provides the first deterministic storage payload: a
 bounded row count and tagged nullable `Int64` values.
-`restore_int64_table_from_file` reopens one of these files with a hard envelope
-read bound and restores a table only after the envelope, payload, schema, and
-row cap have all been validated. An explicit-backup helper tries that same
-bounded restore against a caller-supplied backup only when the primary fails,
-and preserves both typed failures if neither file is valid.
+`Int64TablePayloadCodec` is a separate, self-describing payload that also
+persists the column name, nullability, and table row cap. It has independent
+UTF-8 name-byte, row-cap/current-row, and payload-byte bounds; decoding checks
+the complete format before constructing a table. The original row-only payload
+format remains unchanged for existing callers.
+`restore_int64_table_from_file` reopens a row-only payload with a hard envelope
+read bound and restores a table only after the envelope, payload, caller schema,
+and caller row cap have all been validated. An explicit-backup helper tries
+that same bounded restore against a caller-supplied backup only when the primary
+fails, and preserves both typed failures if neither file is valid.
 On Unix, `SnapshotCodec::replace_file` atomically creates or replaces an
 envelope through an exclusively created, synchronized sibling temporary file,
 then synchronizes the parent directory. Directory-relative operations remain
@@ -422,12 +427,16 @@ flush semantics there.
 existing `Int64Table` with `NullableI64PayloadCodec`, then uses that atomic
 replacement operation. Its typed error distinguishes payload encoding from
 replacement failures, and every pre-rename failure preserves the destination.
-Snapshots contain row values only; schema and table row-cap metadata are not
-serialized and remain caller-supplied when the file is restored.
+Those high-level save/restore helpers continue to use the row-only payload, so
+their schema and table row-cap metadata remain caller-supplied. The
+self-describing codec can instead be composed directly with the envelope's
+`encode`, `create_new_file`, and Unix `replace_file` APIs.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary
-without yet choosing catalog serialization. The
+without yet choosing catalog serialization. A self-describing payload still
+contains exactly one one-column `Int64Table`; it does not store a catalog,
+catalog table name, or multiple tables. The
 exact layouts are documented in [docs/snapshot-format.md](docs/snapshot-format.md).
 
 ## CSV ingestion
