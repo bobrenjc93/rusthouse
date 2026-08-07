@@ -63,6 +63,10 @@ pub enum Statement {
         source: String,
         destination: String,
     },
+    DropColumn {
+        table: String,
+        column: String,
+    },
     TruncateTable {
         name: String,
     },
@@ -982,19 +986,28 @@ impl<'a> Parser<'a> {
     fn parse_alter(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let table = self.expect_identifier("table name")?;
-        self.expect_keyword("RENAME")?;
-        self.expect_keyword("COLUMN")?;
-        let source = self.expect_identifier("source column name")?;
-        self.expect_keyword("TO")?;
-        let destination = self.expect_identifier("destination column name")?;
-        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
-            return self.error("unexpected trailing input after ALTER TABLE RENAME COLUMN");
+        if self.eat_keyword("RENAME") {
+            self.expect_keyword("COLUMN")?;
+            let source = self.expect_identifier("source column name")?;
+            self.expect_keyword("TO")?;
+            let destination = self.expect_identifier("destination column name")?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after ALTER TABLE RENAME COLUMN");
+            }
+            return Ok(Statement::RenameColumn {
+                table,
+                source,
+                destination,
+            });
         }
-        Ok(Statement::RenameColumn {
-            table,
-            source,
-            destination,
-        })
+
+        self.expect_keyword("DROP")?;
+        self.expect_keyword("COLUMN")?;
+        let column = self.expect_identifier("column name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after ALTER TABLE DROP COLUMN");
+        }
+        Ok(Statement::DropColumn { table, column })
     }
 
     fn parse_rename(&mut self) -> Result<Statement> {

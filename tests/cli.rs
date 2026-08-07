@@ -471,6 +471,32 @@ fn csv_batch_observes_a_renamed_column_in_data_and_schema_queries() {
 }
 
 #[test]
+fn csv_batch_observes_a_dropped_column_in_data_and_schema_queries() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE Metrics (id Int64, score Float64, active Bool); \
+          INSERT INTO metrics VALUES (7, 2.5, true); \
+          ALTER TABLE METRICS DROP COLUMN SCORE; \
+          SELECT id, active FROM metrics; \
+          SHOW CREATE TABLE metrics; \
+          DESCRIBE TABLE metrics;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"id,active\n\
+          7,true\n\
+          statement\n\
+          \"CREATE TABLE Metrics (id Int64, active Bool)\"\n\
+          name,type\n\
+          id,Int64\n\
+          active,Bool\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn table_batch_observes_truncate_between_query_results() {
     let output = run(
         &["--format", "table"],
