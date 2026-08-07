@@ -1,8 +1,8 @@
 //! Bounded ingestion for a typed `CSVWithNames` subset.
 //!
-//! Data fields with the `String` schema type may be double-quoted. Commas and
-//! LF or CRLF line endings in a quoted string are data, and a double quote is
-//! decoded from `""`. Headers and non-`String` fields must be unquoted.
+//! Data fields may be double-quoted. Commas and LF or CRLF line endings in a
+//! quoted field are data, and a double quote is decoded from `""` before the
+//! field is parsed according to its schema type. Headers must be unquoted.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -89,7 +89,7 @@ pub enum CsvIngestError {
         expected: usize,
         actual: usize,
     },
-    /// Quoting was used in a header or for a non-`String` data field.
+    /// Quoting was used in a header.
     QuotingNotSupported { line: usize, column: usize },
     /// A quote was unclosed or used outside the quoted-field grammar.
     MalformedQuoting { line: usize, column: usize },
@@ -245,10 +245,12 @@ pub(crate) fn parse_rows(
         scan_record(record, line, |column, field, quoted| {
             let data_type = table.schema()[column - 1].data_type;
             if quoted {
-                if data_type != DataType::String {
-                    return Err(CsvIngestError::QuotingNotSupported { line, column });
+                let decoded = field.replace("\"\"", "\"");
+                if data_type == DataType::String {
+                    row.push(Value::String(decoded));
+                } else {
+                    row.push(parse_value(&decoded, data_type, line, column)?);
                 }
-                row.push(Value::String(field.replace("\"\"", "\"")));
             } else {
                 row.push(parse_value(field, data_type, line, column)?);
             }
