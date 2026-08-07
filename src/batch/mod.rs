@@ -13,6 +13,7 @@ pub mod value;
 
 pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 pub use shared_database::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
+pub use storage::TableLimits;
 
 use std::error::Error as StdError;
 use std::fmt;
