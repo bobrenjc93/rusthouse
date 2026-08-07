@@ -303,7 +303,7 @@ fn drop_table_is_a_shared_database_mutation() {
         .expect("setup succeeds");
 
     assert_eq!(
-        database.query("DROP TABLE victim;"),
+        database.query("DROP TABLE IF EXISTS victim;"),
         Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "DROP TABLE",
         })
@@ -318,7 +318,7 @@ fn drop_table_is_a_shared_database_mutation() {
 
     assert_eq!(
         database
-            .execute("DROP TABLE vIcTiM;")
+            .execute("DROP TABLE IF EXISTS vIcTiM;")
             .expect("execute accepts the mutation"),
         [StatementResult::Command {
             tag: "DROP TABLE",
@@ -330,6 +330,15 @@ fn drop_table_is_a_shared_database_mutation() {
         Err(SharedDatabaseError::Sql(Error::TableNotFound(
             "Victim".to_owned()
         )))
+    );
+    assert_eq!(
+        database
+            .execute("dRoP tAbLe iF eXiStS VICTIM;")
+            .expect("a missing conditional drop is a no-op"),
+        [StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }]
     );
     assert!(database.query("SELECT id FROM retained;").is_ok());
 }

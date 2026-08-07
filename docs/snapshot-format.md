@@ -70,6 +70,15 @@ directory-sync failure is different: the destination has already been
 replaced and is visible, but the rename's durability after a system crash is
 uncertain.
 
+`save_int64_table_to_file` is the Unix-only composed table save operation. It
+first encodes an existing `Int64Table` through `NullableI64PayloadCodec`, then
+passes the complete payload to `SnapshotCodec::replace_file`. Its typed error
+distinguishes payload encoding from replacement failures. Because payload
+encoding completes before replacement begins, and replacement cleans up its
+temporary file before every failed rename, an existing destination is
+preserved on every pre-rename failure. A post-rename directory-sync error
+explicitly reports that the destination was already replaced.
+
 ## Nullable Int64 row payload
 
 `NullableI64PayloadCodec` defines a deterministic payload for one nullable
@@ -106,7 +115,8 @@ vector. The payload-byte limit includes the row-count field, tags, and values.
 decodes the complete envelope and payload before atomically appending the rows
 to a new table. Envelope, payload, schema nullability, and row-cap failures are
 reported as distinct typed error variants; a failure never returns a partially
-populated table.
+populated table. The payload contains row values but no schema or row-cap
+metadata, so reopening always requires the caller to supply both.
 
 `restore_int64_table_from_file` provides the bounded filesystem entry point.
 It requires a regular file so FIFOs and devices cannot block or hide trailing

@@ -44,6 +44,11 @@ a successful no-op command and retains the existing display name, schema, rows,
 and row cap even when the requested schema differs. Plain `CREATE TABLE`
 continues to report an error for an existing case-insensitive name.
 
+`DROP TABLE IF EXISTS <name>` removes a matching table using the same
+case-insensitive name resolution as ordinary `DROP TABLE`. If the table is
+already absent, it returns the normal successful zero-row command result;
+plain `DROP TABLE` continues to report a missing-table error.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
@@ -361,6 +366,12 @@ stage errors clean up failures before the rename and separately report
 post-rename directory-sync uncertainty. The API is not exposed on Windows
 because RustHouse does not yet implement the required directory-handle and
 flush semantics there.
+`save_int64_table_to_file` is the Unix-only high-level save path: it encodes an
+existing `Int64Table` with `NullableI64PayloadCodec`, then uses that atomic
+replacement operation. Its typed error distinguishes payload encoding from
+replacement failures, and every pre-rename failure preserves the destination.
+Snapshots contain row values only; schema and table row-cap metadata are not
+serialized and remain caller-supplied when the file is restored.
 `Catalog::restore_int64_table_from_file` registers a validated table under a
 caller-supplied exact name while also enforcing the catalog's table-count and
 per-table row limits. These define the current persistence corruption boundary

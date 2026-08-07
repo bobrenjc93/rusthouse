@@ -329,6 +329,64 @@ impl fmt::Display for NullableI64PayloadError {
 
 impl Error for NullableI64PayloadError {}
 
+/// An error produced while atomically saving an [`Int64Table`] snapshot file.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum Int64TableFileSaveError {
+    /// The table rows could not be encoded as a nullable `Int64` payload.
+    Payload(NullableI64PayloadError),
+    /// The encoded payload could not atomically replace the destination.
+    Replace(SnapshotReplaceError),
+}
+
+#[cfg(unix)]
+impl Int64TableFileSaveError {
+    /// Returns whether the destination was replaced before this error occurred.
+    ///
+    /// Only a replacement-stage directory-sync failure returns `true`. Payload
+    /// encoding and every replacement failure before the rename return `false`.
+    pub const fn destination_was_replaced(&self) -> bool {
+        match self {
+            Self::Payload(_) => false,
+            Self::Replace(error) => error.destination_was_replaced(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for Int64TableFileSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Payload(error) => write!(formatter, "could not encode table payload: {error}"),
+            Self::Replace(error) => write!(formatter, "could not replace table snapshot: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Error for Int64TableFileSaveError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Payload(error) => Some(error),
+            Self::Replace(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<NullableI64PayloadError> for Int64TableFileSaveError {
+    fn from(error: NullableI64PayloadError) -> Self {
+        Self::Payload(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<SnapshotReplaceError> for Int64TableFileSaveError {
+    fn from(error: SnapshotReplaceError) -> Self {
+        Self::Replace(error)
+    }
+}
+
 /// An error produced while restoring an [`Int64Table`] from an envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64TableRestoreError {
@@ -1157,6 +1215,29 @@ impl Drop for TemporarySnapshot<'_> {
             let _ = self.directory.remove(&self.name);
         }
     }
+}
+
+/// Atomically saves one bounded [`Int64Table`] snapshot file on Unix.
+///
+/// The table's rows are encoded with `payload_codec` before any filesystem
+/// access, then [`SnapshotCodec::replace_file`] atomically creates or replaces
+/// `path`. Payload encoding failures and replacement-stage failures remain
+/// distinct. Every failure before a successful rename preserves an existing
+/// destination; a post-rename directory-sync failure reports that replacement
+/// through [`Int64TableFileSaveError::destination_was_replaced`].
+///
+/// Only row values are persisted. The schema and restored table row cap remain
+/// caller-supplied when reopening with [`restore_int64_table_from_file`].
+#[cfg(unix)]
+pub fn save_int64_table_to_file(
+    path: impl AsRef<Path>,
+    table: &Int64Table,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64PayloadCodec,
+) -> Result<(), Int64TableFileSaveError> {
+    let payload = payload_codec.encode(table.values())?;
+    snapshot_codec.replace_file(path, &payload)?;
+    Ok(())
 }
 
 /// Restores one bounded `Int64` table from a snapshot envelope.

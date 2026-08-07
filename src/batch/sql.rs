@@ -50,6 +50,10 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    /// `DROP TABLE IF EXISTS`; a missing case-insensitive name is a no-op.
+    DropTableIfExists {
+        name: String,
+    },
     RenameTable {
         source: String,
         destination: String,
@@ -817,11 +821,29 @@ impl<'a> Parser<'a> {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
+        let if_exists = if self.at_keyword("IF") {
+            let lexer = self.lexer;
+            let current = self.current.clone();
+            self.advance();
+            if self.eat_keyword("EXISTS") {
+                true
+            } else {
+                self.lexer = lexer;
+                self.current = current;
+                false
+            }
+        } else {
+            false
+        };
         let name = self.expect_identifier("table name")?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after DROP TABLE");
         }
-        Ok(Statement::DropTable { name })
+        if if_exists {
+            Ok(Statement::DropTableIfExists { name })
+        } else {
+            Ok(Statement::DropTable { name })
+        }
     }
 
     fn parse_rename(&mut self) -> Result<Statement> {
