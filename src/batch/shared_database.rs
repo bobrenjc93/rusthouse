@@ -106,8 +106,10 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// or `EXISTS TABLE` under a shared read lock. [`Self::try_query`] accepts the
 /// same input but returns [`SharedDatabaseError::DatabaseBusy`] instead of
 /// waiting for a writer. [`Self::try_execute_insert_batch`] similarly attempts
-/// one nonblocking write lock for an atomic `INSERT`-only batch. Results own
-/// their columns and values and remain valid after the lock is released.
+/// one nonblocking write lock for an atomic `INSERT`-only batch, and
+/// [`Self::try_ingest_csv_with_names`] does the same for `CSVWithNames`
+/// ingestion. Results own their columns and values and remain valid after the
+/// lock is released.
 ///
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
@@ -248,6 +250,44 @@ impl SharedDatabase {
             .map_err(Into::into)
     }
 
+    /// Attempts one bounded, atomic `CSVWithNames` ingestion without waiting.
+    ///
+    /// Exactly one immediate write-lock attempt occurs before table lookup or
+    /// input access. The acquired guard is retained through parsing, limit and
+    /// capacity validation, and commit. An active reader or writer therefore
+    /// returns [`SharedDatabaseError::DatabaseBusy`] without inspecting the
+    /// table or input, while lock poisoning and CSV ingestion failures retain
+    /// their distinct typed errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusthouse::batch::csv::CsvIngestLimits;
+    /// use rusthouse::SharedDatabase;
+    ///
+    /// let database = SharedDatabase::default();
+    /// database.execute("CREATE TABLE readings (value Int64);")?;
+    /// let input = b"value\n7\n";
+    /// let rows = database.try_ingest_csv_with_names(
+    ///     "readings",
+    ///     input,
+    ///     CsvIngestLimits::new(input.len(), 1, 1),
+    /// )?;
+    /// assert_eq!(rows, 1);
+    /// # Ok::<(), rusthouse::SharedDatabaseError>(())
+    /// ```
+    pub fn try_ingest_csv_with_names(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        let mut database = self.try_write()?;
+        database
+            .ingest_csv_with_names(table, input, limits)
+            .map_err(Into::into)
+    }
+
     /// Atomically ingests bounded `TabSeparatedWithNames` bytes under one write lock.
     ///
     /// The lock is retained through parsing, limit and capacity validation, and
@@ -377,6 +417,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
+        | Statement::UnionDistinct { .. }
         | Statement::ShowTables
         | Statement::ShowCreateTable { .. }
         | Statement::DescribeTable { .. }
