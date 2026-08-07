@@ -75,7 +75,7 @@ impl Default for QueryResultLimits {
 /// A reusable in-memory SQL database.
 ///
 /// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`, `ABS`,
-/// `ROUND`, `FLOOR`, and the minimal unpartitioned `ROW_NUMBER` window forms
+/// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window forms
 /// provide bounded projections in ungrouped queries. An optional `AS` alias
 /// controls each result column name.
 ///
@@ -1271,6 +1271,9 @@ enum ResolvedItem {
     Float64Floor {
         source: usize,
     },
+    Float64Ceil {
+        source: usize,
+    },
     RowNumber,
     Aggregate {
         state: usize,
@@ -1552,6 +1555,30 @@ fn resolve_select_items(
                     data_type: DataType::Float64,
                 });
             }
+            SelectItem::Ceil { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Float64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("CEIL argument '{name}'"),
+                        expected: DataType::Float64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "CEIL projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::Float64Ceil { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("CEIL({})", table.schema()[source].name)),
+                    data_type: DataType::Float64,
+                });
+            }
             SelectItem::RowNumber { alias, .. } => {
                 items.push(ResolvedItem::RowNumber);
                 result_columns.push(ResultColumn {
@@ -1737,6 +1764,9 @@ fn execute_projection(
                         ResolvedItem::Float64Floor { source } => {
                             Value::Float64(float64_at(table, *source, *row).floor())
                         }
+                        ResolvedItem::Float64Ceil { source } => {
+                            Value::Float64(float64_at(table, *source, *row).ceil())
+                        }
                         ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
                             unreachable!("projection does not contain aggregates")
@@ -1862,6 +1892,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
                 | ResolvedItem::Float64Floor { .. }
+                | ResolvedItem::Float64Ceil { .. }
                 | ResolvedItem::RowNumber => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
@@ -1922,6 +1953,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::Float64Floor { .. } => {
                     unreachable!("FLOOR projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Ceil { .. } => {
+                    unreachable!("CEIL projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
@@ -2368,6 +2402,9 @@ impl GroupedData<'_> {
                         ResolvedItem::Float64Floor { .. } => {
                             unreachable!("FLOOR projections are restricted to ungrouped queries")
                         }
+                        ResolvedItem::Float64Ceil { .. } => {
+                            unreachable!("CEIL projections are restricted to ungrouped queries")
+                        }
                         ResolvedItem::RowNumber => {
                             unreachable!(
                                 "ROW_NUMBER projections are restricted to ungrouped queries"
@@ -2703,6 +2740,11 @@ fn order_source_rows(
                     let right = ValueRef::Float64(float64_at(table, source, right).floor());
                     left.cmp(&right)
                 }
+                ResolvedItem::Float64Ceil { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).ceil());
+                    let right = ValueRef::Float64(float64_at(table, source, right).ceil());
+                    left.cmp(&right)
+                }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections cannot be ordered")
                 }
@@ -2762,6 +2804,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::Float64Floor { .. } => {
                     unreachable!("FLOOR projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Ceil { .. } => {
+                    unreachable!("CEIL projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")

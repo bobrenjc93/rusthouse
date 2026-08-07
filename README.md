@@ -111,6 +111,10 @@ ordering by the unaliased expression or alias, `WHERE`, and `LIMIT`; non-
 greatest integral `Float64` less than or equal to each finite input. It supports
 an optional `AS alias`, ordering by the unaliased expression or alias, `WHERE`,
 and `LIMIT`; non-`Float64` arguments are rejected with a typed error.
+`CEIL(float64_column)` has the same ungrouped projection shape and returns the
+least integral `Float64` greater than or equal to each finite input. It supports
+an optional `AS alias`, ordering by the unaliased expression or alias, `WHERE`,
+and `LIMIT`; non-`Float64` arguments are rejected with a typed error.
 
 `ROW_NUMBER() OVER ()` adds a one-based `Int64` sequence to an ungrouped,
 non-`DISTINCT` projection and accepts an optional `AS alias`. The ordered form
