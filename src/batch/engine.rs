@@ -13,7 +13,10 @@ use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
 use crate::batch::value::{DataType, Value, ValueRef};
 
-pub use crate::batch::storage::DEFAULT_MAX_ROWS_PER_TABLE;
+pub use crate::batch::storage::{
+    DEFAULT_MAX_CELLS_PER_TABLE, DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_ROWS_PER_TABLE,
+    TableLimits,
+};
 
 /// Maximum estimated heap retained by the collecting [`Database::execute`] API.
 pub const DEFAULT_MAX_RETAINED_RESULT_BYTES: usize = 64 * 1024 * 1024;
@@ -140,7 +143,7 @@ impl Default for QueryResultLimits {
 pub struct Database {
     catalog: Catalog,
     query_result_limits: QueryResultLimits,
-    max_rows_per_table: usize,
+    table_limits: TableLimits,
 }
 
 impl Default for Database {
@@ -148,7 +151,7 @@ impl Default for Database {
         Self {
             catalog: Catalog::new(),
             query_result_limits: QueryResultLimits::default(),
-            max_rows_per_table: DEFAULT_MAX_ROWS_PER_TABLE,
+            table_limits: TableLimits::default(),
         }
     }
 }
@@ -185,14 +188,25 @@ impl Database {
         Self {
             catalog: Catalog::new(),
             query_result_limits,
-            max_rows_per_table: DEFAULT_MAX_ROWS_PER_TABLE,
+            table_limits: TableLimits::default(),
         }
     }
 
-    /// Creates an empty database with an explicit row cap for each created table.
+    /// Creates an empty database with an explicit row cap and default column and cell caps.
     pub fn with_max_rows_per_table(max_rows_per_table: usize) -> Self {
         Self {
-            max_rows_per_table,
+            table_limits: TableLimits {
+                max_rows: max_rows_per_table,
+                ..TableLimits::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Creates an empty database with explicit persistent limits for each table.
+    pub fn with_table_limits(table_limits: TableLimits) -> Self {
+        Self {
+            table_limits,
             ..Self::default()
         }
     }
@@ -210,7 +224,13 @@ impl Database {
     /// Returns the maximum number of rows retained by each created table.
     #[must_use]
     pub const fn max_rows_per_table(&self) -> usize {
-        self.max_rows_per_table
+        self.table_limits.max_rows
+    }
+
+    /// Returns the persistent resource limits applied to each created table.
+    #[must_use]
+    pub const fn table_limits(&self) -> TableLimits {
+        self.table_limits
     }
 
     /// Atomically appends a bounded, typed `CSVWithNames` input.
@@ -487,17 +507,17 @@ impl Database {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.catalog
-                    .create_table_with_row_cap(name, columns, self.max_rows_per_table)?;
+                    .create_table_with_limits(name, columns, self.table_limits)?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
                     affected_rows: 0,
                 })
             }
             Statement::CreateTableIfNotExists { name, columns } => {
-                self.catalog.create_table_if_not_exists_with_row_cap(
+                self.catalog.create_table_if_not_exists_with_limits(
                     name,
                     columns,
-                    self.max_rows_per_table,
+                    self.table_limits,
                 )?;
                 Ok(StatementResult::Command {
                     tag: "CREATE TABLE",
@@ -534,6 +554,13 @@ impl Database {
                 destination,
             } => {
                 self.catalog.rename_column(&table, &source, destination)?;
+                Ok(StatementResult::Command {
+                    tag: "ALTER TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::AddColumn { table, column } => {
+                self.catalog.add_column(&table, column)?;
                 Ok(StatementResult::Command {
                     tag: "ALTER TABLE",
                     affected_rows: 0,
@@ -608,6 +635,7 @@ impl Database {
             | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
             | Statement::RenameColumn { .. }
+            | Statement::AddColumn { .. }
             | Statement::DropColumn { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. }
@@ -1058,7 +1086,9 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
         Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
-        Statement::RenameColumn { .. } | Statement::DropColumn { .. } => "ALTER TABLE",
+        Statement::RenameColumn { .. }
+        | Statement::AddColumn { .. }
+        | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)

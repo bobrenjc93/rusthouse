@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use super::csv::{CsvIngestError, CsvIngestLimits};
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, QueryResult, QueryResultLimits, StatementResult,
+    TableLimits,
 };
 use super::error::Error;
 use super::sql::{self, Statement};
@@ -154,10 +155,16 @@ impl SharedDatabase {
         Self::new(Database::with_query_result_limits(query_result_limits))
     }
 
-    /// Creates an empty shared database with an explicit per-table row cap.
+    /// Creates an empty shared database with an explicit row cap and default column and cell caps.
     #[must_use]
     pub fn with_max_rows_per_table(max_rows_per_table: usize) -> Self {
         Self::new(Database::with_max_rows_per_table(max_rows_per_table))
+    }
+
+    /// Creates an empty shared database with explicit persistent per-table limits.
+    #[must_use]
+    pub fn with_table_limits(table_limits: TableLimits) -> Self {
+        Self::new(Database::with_table_limits(table_limits))
     }
 
     /// Wraps an existing synchronized database allocation.
@@ -177,6 +184,11 @@ impl SharedDatabase {
     /// Returns the maximum number of rows retained by each created table.
     pub fn max_rows_per_table(&self) -> Result<usize, SharedDatabaseError> {
         Ok(self.read()?.max_rows_per_table())
+    }
+
+    /// Returns the persistent resource limits applied to each created table.
+    pub fn table_limits(&self) -> Result<TableLimits, SharedDatabaseError> {
+        Ok(self.read()?.table_limits())
     }
 
     /// Takes a consistent metrics snapshot without waiting for the database lock.
@@ -435,11 +447,11 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::RenameTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "RENAME TABLE",
         }),
-        Statement::RenameColumn { .. } | Statement::DropColumn { .. } => {
-            Err(SharedDatabaseError::ReadOnlyStatementRequired {
-                statement: "ALTER TABLE",
-            })
-        }
+        Statement::RenameColumn { .. }
+        | Statement::AddColumn { .. }
+        | Statement::DropColumn { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "ALTER TABLE",
+        }),
         Statement::TruncateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "TRUNCATE TABLE",
         }),
