@@ -278,8 +278,13 @@ poisoning is reported separately.
 engine. Its `query` method accepts exactly one `SELECT`, `SHOW TABLES`, `SHOW
 CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE`, takes a shared read lock,
 and returns an owned, resource-bounded result, so cloned handles can run
-analytical reads concurrently. Mutating batches passed to
-`execute` retain one write lock for the entire batch and cannot interleave.
+analytical reads concurrently. `try_query` and `try_query_with_result_limit`
+accept and validate the same single read-only statement before making one
+nonblocking read-lock attempt. They return the typed `DatabaseBusy` error when
+a writer prevents immediate lock acquisition, while lock poisoning, SQL
+failures, and resource-limit failures remain distinguishable. Mutating batches
+passed to `execute` retain one write lock for the entire batch and cannot
+interleave.
 For transactional ingestion, `Database::execute_insert_batch` and the matching
 `SharedDatabase` method accept a nonempty `INSERT`-only batch, preflight every
 statement and cumulative per-table row cap, then commit in statement order.
