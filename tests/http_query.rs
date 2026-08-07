@@ -220,6 +220,27 @@ fn query_executes_inclusive_between_over_http() {
 }
 
 #[test]
+fn query_executes_typed_in_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, label String); \
+             INSERT INTO readings VALUES \
+             (1, 'cold'), (2, 'warm'), (3, 'hot'), (4, 'warm');",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT DISTINCT label FROM readings WHERE id IN (2, 3, 4) ORDER BY label;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"label","type":"String"}],"rows":[["hot"],["warm"]]}"#,
+    );
+}
+
+#[test]
 fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database

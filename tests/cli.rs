@@ -173,6 +173,27 @@ fn json_cli_executes_inclusive_between_for_distinct_where() {
 }
 
 #[test]
+fn json_cli_executes_typed_in_for_regular_and_distinct_where() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE events (id Int64, label String, active Bool); \
+          INSERT INTO events VALUES \
+          (1, 'one', true), (2, 'two', false), (3, 'three', true), (4, 'two', true); \
+          SELECT id FROM events WHERE id IN (1, 3) ORDER BY id; \
+          SELECT DISTINCT label FROM events \
+          WHERE NOT active IN (false) AND label IN ('two', 'three') ORDER BY label;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1],[3]]}\n\
+          {\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"three\"],[\"two\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_projects_ascii_lowercase_strings() {
     let output = run(
         &["--format", "json"],
