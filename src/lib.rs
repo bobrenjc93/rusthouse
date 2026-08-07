@@ -77,7 +77,10 @@ pub use snapshot::{
     restore_int64_table_from_file_with_backup, restore_int64_table_payload_from_file,
 };
 #[cfg(unix)]
-pub use snapshot::{Int64TableFileSaveError, SnapshotReplaceError, save_int64_table_to_file};
+pub use snapshot::{
+    Int64TableFileSaveError, Int64TableRleFileSaveError, SnapshotReplaceError,
+    save_int64_table_rle_to_file, save_int64_table_to_file,
+};
 mod storage;
 
 pub use storage::{ColumnSchema, DataType, InsertError, Int64Table, Schema};
