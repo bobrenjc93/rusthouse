@@ -263,6 +263,7 @@ fn not_preserves_comparison_type_and_null_literal_rules() {
         having: None,
         order_by: Vec::new(),
         limit: None,
+        offset: None,
     });
     assert_eq!(
         database.execute_statement(statement),

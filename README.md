@@ -11,7 +11,7 @@ The first useful release should support:
 - typed tables with `Int64`, `Float64`, `Bool`, and `String` columns;
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
-- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
+- projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, `LIMIT`, and narrow `OFFSET` pagination;
 - a batch/interactive CLI with readable table, CSV, TSV, JSON, JSONEachRow,
   and JSONCompactEachRow output;
 - durable local snapshots with an explicit, documented file format;
@@ -40,6 +40,15 @@ not satisfy `IS NOT NULL`, and remain unknown (and therefore excluded) in a
 numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
+
+Regular ungrouped, non-window projections support
+`LIMIT <count> OFFSET <offset>` in addition to plain `LIMIT`. `WHERE` filtering
+and `ORDER BY` happen before rows are skipped. Ordered pagination uses the
+existing bounded top-k selection with a checked `count + offset` bound, and
+scalar projections are evaluated only for returned rows. Both values are
+nonnegative `usize` integers. `OFFSET` requires `LIMIT` and is deliberately not
+supported for aggregate or grouped queries, `DISTINCT`, `ROW_NUMBER`, literal
+selects, or cross joins.
 
 `CREATE TABLE IF NOT EXISTS <name> (...)` creates the table normally when its
 case-insensitive name is absent. If that name is already registered, it returns
