@@ -241,6 +241,60 @@ fn query_executes_typed_in_over_http() {
 }
 
 #[test]
+fn float64_to_bool_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (value Float64); \
+             INSERT INTO readings VALUES (-0.0), (-0.25), (0.25);",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(value AS Bool) AS enabled FROM readings ORDER BY enabled;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"enabled","type":"Bool"}],"rows":[[false],[true],[true]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"enabled\nfalse\ntrue\ntrue\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"enabled\nfalse\ntrue\ntrue\n",
+    );
+
+    for (format, expected) in [
+        (
+            "JSONEachRow",
+            "{\"enabled\":false}\n{\"enabled\":true}\n{\"enabled\":true}\n",
+        ),
+        ("JSONCompactEachRow", "[false]\n[true]\n[true]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database

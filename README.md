@@ -194,13 +194,15 @@ and `LIMIT` select rows before subtraction, so overflow in an excluded row does
 not fail the query. A selected overflow or non-`Int64` argument is a typed error.
 
 `SELECT` projections support `CAST(int64_column AS Float64)`,
-`CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`, and
-`CAST(int64_column AS Bool)`, plus `CAST(bool_column AS String)`. The String cast
-produces the exact lowercase values `false` and `true`. Boolean `false` becomes
-`0` and `true` becomes `1`; integer zero becomes `false`, and every nonzero
-integer, including both `Int64` extrema, becomes `true`. Float-to-integer casts
-truncate finite values toward zero and report typed numeric-overflow errors
-outside the `Int64` range.
+`CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`,
+`CAST(int64_column AS Bool)`, `CAST(float64_column AS Bool)`, and
+`CAST(bool_column AS String)`. The String cast produces the exact lowercase
+values `false` and `true`. Boolean `false` becomes `0` and `true` becomes `1`;
+integer zero becomes `false`, and every nonzero integer, including both `Int64`
+extrema, becomes `true`. For `Float64`, positive and negative zero become
+`false`, while every finite nonzero value becomes `true`. Float-to-integer
+casts truncate finite values toward zero and report typed numeric-overflow
+errors outside the `Int64` range.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
