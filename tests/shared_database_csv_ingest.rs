@@ -216,6 +216,45 @@ fn try_ingest_preserves_csv_limits_and_table_capacity_without_partial_rows() {
 }
 
 #[test]
+fn try_ingested_rows_are_visible_to_union_distinct_queries() {
+    let database = SharedDatabase::with_max_rows_per_table(3);
+    database
+        .execute(
+            "CREATE TABLE older (id Int64, label String); \
+             CREATE TABLE newer (id Int64, label String);",
+        )
+        .expect("create both import targets");
+    let older = b"id,label\n1,first\n1,first\n2,second\n";
+    let newer = b"id,label\n2,second\n3,third\n3,third\n";
+
+    assert_eq!(
+        database
+            .try_ingest_csv_with_names("older", older, CsvIngestLimits::new(older.len(), 3, 6),),
+        Ok(3)
+    );
+    assert_eq!(
+        database
+            .try_ingest_csv_with_names("newer", newer, CsvIngestLimits::new(newer.len(), 3, 6),),
+        Ok(3)
+    );
+
+    assert_eq!(
+        database
+            .query(
+                "SELECT id, label FROM older \
+                 UNION DISTINCT SELECT id, label FROM newer",
+            )
+            .expect("query both imported tables")
+            .rows,
+        [
+            vec![Value::Int64(1), Value::String("first".to_owned())],
+            vec![Value::Int64(2), Value::String("second".to_owned())],
+            vec![Value::Int64(3), Value::String("third".to_owned())],
+        ]
+    );
+}
+
+#[test]
 fn try_ingestion_holds_one_write_lock_through_input_access_and_atomic_append() {
     let mut initial = Database::with_max_rows_per_table(1);
     initial.execute("CREATE TABLE metrics (id Int64);").unwrap();
