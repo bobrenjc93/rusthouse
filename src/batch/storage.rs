@@ -244,6 +244,26 @@ impl Table {
         Ok(())
     }
 
+    /// Removes one schema field and its aligned physical column.
+    ///
+    /// Resolution is case-insensitive. The column lookup and the invariant
+    /// that a table retains at least one column are checked before either
+    /// vector is changed.
+    pub fn drop_column(&mut self, column: &str) -> Result<()> {
+        let column_index = self.column_index(column)?;
+        if self.schema.len() == 1 {
+            return Err(Error::InvalidQuery(format!(
+                "cannot drop the only column from table '{}'",
+                self.name
+            )));
+        }
+
+        debug_assert_eq!(self.schema.len(), self.columns.len());
+        self.schema.remove(column_index);
+        self.columns.remove(column_index);
+        Ok(())
+    }
+
     /// Checks a row without mutating any physical column.
     pub(crate) fn validate_row(&self, row: &[Value]) -> Result<()> {
         if row.len() != self.schema.len() {

@@ -70,6 +70,13 @@ invalid, reserved, or colliding destination fail before mutation, preserving
 the column's type, data, schema position, and table row cap. A trailing
 semicolon is optional.
 
+`ALTER TABLE <table> DROP COLUMN <column>` removes one schema field and its
+matching typed physical vector using case-insensitive table and column lookup.
+The remaining columns keep their schema order and row order, while the table's
+row count and configured row cap are unchanged. Missing tables or columns and
+attempts to remove a table's sole column fail before mutation. A trailing
+semicolon is optional.
+
 Literal-only queries use `SELECT <literal> [AS <alias>]` and return one typed
 column with one row. `Int64` literals are optionally signed base-10 integers,
 such as `-7`; `Float64` literals are optionally signed, finite decimal or
