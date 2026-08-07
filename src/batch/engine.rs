@@ -1773,6 +1773,9 @@ enum ResolvedItem {
     CastInt64ToBool {
         source: usize,
     },
+    CastFloat64ToBool {
+        source: usize,
+    },
     CastBoolToString {
         source: usize,
     },
@@ -1973,6 +1976,9 @@ fn resolve_select_items(
                     (DataType::Int64, DataType::Bool) => {
                         Some(ResolvedItem::CastInt64ToBool { source })
                     }
+                    (DataType::Float64, DataType::Bool) => {
+                        Some(ResolvedItem::CastFloat64ToBool { source })
+                    }
                     (DataType::Bool, DataType::String) => {
                         Some(ResolvedItem::CastBoolToString { source })
                     }
@@ -1980,7 +1986,8 @@ fn resolve_select_items(
                 };
                 let Some(resolved) = resolved else {
                     let expected = match target_type {
-                        DataType::Float64 | DataType::Bool => "Int64",
+                        DataType::Float64 => "Int64",
+                        DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64 or Bool",
                         DataType::String => "Bool",
                     };
@@ -2336,6 +2343,9 @@ fn execute_projection(
                         ResolvedItem::CastInt64ToBool { source } => {
                             Value::Bool(int64_at(table, *source, *row) != 0)
                         }
+                        ResolvedItem::CastFloat64ToBool { source } => {
+                            Value::Bool(float64_at(table, *source, *row) != 0.0)
+                        }
                         ResolvedItem::CastBoolToString { source } => {
                             Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
                         }
@@ -2482,6 +2492,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -2540,6 +2551,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -2998,6 +3010,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastFloat64ToInt64 { .. }
                         | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
+                        | ResolvedItem::CastFloat64ToBool { .. }
                         | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
@@ -3344,6 +3357,9 @@ fn order_source_rows(
                 ResolvedItem::CastInt64ToBool { source } => {
                     (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
                 }
+                ResolvedItem::CastFloat64ToBool { source } => (float64_at(table, source, left)
+                    != 0.0)
+                    .cmp(&(float64_at(table, source, right) != 0.0)),
                 ResolvedItem::CastBoolToString { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
@@ -3420,6 +3436,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
