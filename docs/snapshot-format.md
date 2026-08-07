@@ -143,9 +143,23 @@ This payload contains exactly one one-column `Int64Table`. Its stored name is
 the column name, not a catalog table name. It cannot represent a catalog,
 multiple tables, or the batch engine's multi-column and non-`Int64` schemas.
 It composes directly with `SnapshotCodec` for checksummed envelopes and, on
-Unix, atomic replacement through `SnapshotCodec::replace_file`.
+Unix, atomic replacement through `SnapshotCodec::replace_file`. A file written
+with `SnapshotCodec::create_new_file` or `replace_file` can be reopened with
+`restore_int64_table_payload_from_file`; the helper obtains the column schema,
+nullability, row cap, and rows entirely from the validated payload.
 
 ## Restoring one Int64 table
+
+`restore_int64_table_payload_from_file` is the bounded filesystem entry point
+for a self-describing table payload. It accepts only a path and the independent
+envelope and table-payload codecs: callers do not provide a schema or row cap.
+It requires a regular file, rejects a file larger than the 22-byte envelope
+header plus the configured envelope payload limit before reading its contents,
+and never reads beyond that bound. After reading, it rejects truncated,
+corrupt, or trailing envelope input before decoding the complete table payload.
+Open, non-regular-file, read, oversized-file, envelope, and payload errors are
+separate typed variants. A table is returned only after the payload codec has
+validated its schema metadata, nullability, row cap, rows, and exact boundary.
 
 `restore_int64_table` composes a caller-configured `SnapshotCodec` and
 `NullableI64PayloadCodec` with a caller-supplied schema and table row cap. It

@@ -499,6 +499,57 @@ impl fmt::Display for Int64TablePayloadError {
 
 impl Error for Int64TablePayloadError {}
 
+/// An error produced while restoring a self-describing [`Int64Table`] file.
+#[derive(Debug)]
+pub enum Int64TablePayloadFileRestoreError {
+    /// The snapshot path could not be opened for reading.
+    Open(io::Error),
+    /// The snapshot path does not identify a regular file.
+    NotRegularFile,
+    /// The opened snapshot file could not be inspected or read completely.
+    Read(io::Error),
+    /// The file is larger than the envelope header plus the envelope limit.
+    FileTooLarge { file_len: u64, max_file_len: usize },
+    /// The snapshot envelope could not be decoded.
+    Envelope(SnapshotError),
+    /// The envelope payload was not a valid self-describing `Int64` table.
+    Payload(Int64TablePayloadError),
+}
+
+impl fmt::Display for Int64TablePayloadFileRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "could not open snapshot file: {error}"),
+            Self::NotRegularFile => write!(formatter, "snapshot path is not a regular file"),
+            Self::Read(error) => write!(formatter, "could not read snapshot file: {error}"),
+            Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => write!(
+                formatter,
+                "snapshot file has {file_len} bytes, exceeding the limit of {max_file_len}"
+            ),
+            Self::Envelope(error) => {
+                write!(formatter, "could not decode snapshot envelope: {error}")
+            }
+            Self::Payload(error) => {
+                write!(formatter, "could not decode Int64 table payload: {error}")
+            }
+        }
+    }
+}
+
+impl Error for Int64TablePayloadFileRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(error) | Self::Read(error) => Some(error),
+            Self::Envelope(error) => Some(error),
+            Self::Payload(error) => Some(error),
+            Self::NotRegularFile | Self::FileTooLarge { .. } => None,
+        }
+    }
+}
+
 /// An error produced while atomically saving an [`Int64Table`] snapshot file.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -1724,6 +1775,30 @@ pub fn save_int64_table_to_file(
     Ok(())
 }
 
+/// Opens a bounded snapshot file and restores its self-describing `Int64` table.
+///
+/// The envelope is bounded by `snapshot_codec`, while the persisted column
+/// name, nullability, row cap, rows, and payload bytes are independently
+/// bounded and decoded by `payload_codec`. No schema or row cap is supplied by
+/// the caller. The path must identify a regular file, and at most the envelope
+/// header plus the configured envelope payload limit is read. Open, read,
+/// envelope, and table-payload failures remain distinct, and all validation
+/// completes before a table is returned.
+pub fn restore_int64_table_payload_from_file(
+    path: impl AsRef<Path>,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: Int64TablePayloadCodec,
+) -> Result<Int64Table, Int64TablePayloadFileRestoreError> {
+    let envelope = read_bounded_snapshot_file(path.as_ref(), snapshot_codec.max_payload_len())
+        .map_err(Int64TablePayloadFileRestoreError::from)?;
+    let payload = snapshot_codec
+        .decode(&envelope)
+        .map_err(Int64TablePayloadFileRestoreError::Envelope)?;
+    payload_codec
+        .decode(payload)
+        .map_err(Int64TablePayloadFileRestoreError::Payload)
+}
+
 /// Restores one bounded `Int64` table from a snapshot envelope.
 ///
 /// The supplied codecs retain independent envelope-byte, payload-byte, and
@@ -1785,18 +1860,8 @@ pub fn restore_int64_table_from_file(
     snapshot_codec: SnapshotCodec,
     payload_codec: NullableI64PayloadCodec,
 ) -> Result<Int64Table, Int64TableFileRestoreError> {
-    let path = path.as_ref();
-    let mut file = open_regular_snapshot_file(path)?;
-    let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(snapshot_codec.max_payload_len());
-    let file_len = bounded_file_len(&file, max_file_len)?;
-    let capacity = usize::try_from(file_len).unwrap_or(max_file_len);
-    let mut envelope = Vec::with_capacity(capacity);
-    Read::take(&mut file, u64::try_from(max_file_len).unwrap_or(u64::MAX))
-        .read_to_end(&mut envelope)
-        .map_err(Int64TableFileRestoreError::Read)?;
-
-    // Check the opened file again in case it grew after the first size check.
-    bounded_file_len(&file, max_file_len)?;
+    let envelope = read_bounded_snapshot_file(path.as_ref(), snapshot_codec.max_payload_len())
+        .map_err(Int64TableFileRestoreError::from)?;
 
     restore_int64_table(&envelope, schema, row_cap, snapshot_codec, payload_codec)
         .map_err(Int64TableFileRestoreError::Restore)
@@ -1847,21 +1912,81 @@ pub fn restore_int64_table_from_file_with_backup(
     }
 }
 
-fn open_regular_snapshot_file(path: &Path) -> Result<File, Int64TableFileRestoreError> {
+#[derive(Debug)]
+enum SnapshotFileReadError {
+    Open(io::Error),
+    NotRegularFile,
+    Read(io::Error),
+    FileTooLarge { file_len: u64, max_file_len: usize },
+}
+
+impl From<SnapshotFileReadError> for Int64TableFileRestoreError {
+    fn from(error: SnapshotFileReadError) -> Self {
+        match error {
+            SnapshotFileReadError::Open(error) => Self::Open(error),
+            SnapshotFileReadError::NotRegularFile => Self::NotRegularFile,
+            SnapshotFileReadError::Read(error) => Self::Read(error),
+            SnapshotFileReadError::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            },
+        }
+    }
+}
+
+impl From<SnapshotFileReadError> for Int64TablePayloadFileRestoreError {
+    fn from(error: SnapshotFileReadError) -> Self {
+        match error {
+            SnapshotFileReadError::Open(error) => Self::Open(error),
+            SnapshotFileReadError::NotRegularFile => Self::NotRegularFile,
+            SnapshotFileReadError::Read(error) => Self::Read(error),
+            SnapshotFileReadError::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            },
+        }
+    }
+}
+
+fn read_bounded_snapshot_file(
+    path: &Path,
+    max_payload_len: usize,
+) -> Result<Vec<u8>, SnapshotFileReadError> {
+    let mut file = open_regular_snapshot_file(path)?;
+    let max_file_len = SNAPSHOT_HEADER_LEN.saturating_add(max_payload_len);
+    let file_len = bounded_file_len(&file, max_file_len)?;
+    let capacity = usize::try_from(file_len).unwrap_or(max_file_len);
+    let mut envelope = Vec::with_capacity(capacity);
+    Read::take(&mut file, u64::try_from(max_file_len).unwrap_or(u64::MAX))
+        .read_to_end(&mut envelope)
+        .map_err(SnapshotFileReadError::Read)?;
+
+    // Check the opened file again in case it grew after the first size check.
+    bounded_file_len(&file, max_file_len)?;
+    Ok(envelope)
+}
+
+fn open_regular_snapshot_file(path: &Path) -> Result<File, SnapshotFileReadError> {
     require_regular_snapshot_path(path)?;
     open_regular_snapshot_path(path)
 }
 
-fn require_regular_snapshot_path(path: &Path) -> Result<(), Int64TableFileRestoreError> {
-    let metadata = fs::metadata(path).map_err(Int64TableFileRestoreError::Open)?;
+fn require_regular_snapshot_path(path: &Path) -> Result<(), SnapshotFileReadError> {
+    let metadata = fs::metadata(path).map_err(SnapshotFileReadError::Open)?;
     if !metadata.is_file() {
-        return Err(Int64TableFileRestoreError::NotRegularFile);
+        return Err(SnapshotFileReadError::NotRegularFile);
     }
 
     Ok(())
 }
 
-fn open_regular_snapshot_path(path: &Path) -> Result<File, Int64TableFileRestoreError> {
+fn open_regular_snapshot_path(path: &Path) -> Result<File, SnapshotFileReadError> {
     let mut options = OpenOptions::new();
     options.read(true);
 
@@ -1874,27 +1999,25 @@ fn open_regular_snapshot_path(path: &Path) -> Result<File, Int64TableFileRestore
         options.custom_flags(libc::O_NONBLOCK);
     }
 
-    let file = options
-        .open(path)
-        .map_err(Int64TableFileRestoreError::Open)?;
-    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+    let file = options.open(path).map_err(SnapshotFileReadError::Open)?;
+    let metadata = file.metadata().map_err(SnapshotFileReadError::Read)?;
     if !metadata.is_file() {
-        return Err(Int64TableFileRestoreError::NotRegularFile);
+        return Err(SnapshotFileReadError::NotRegularFile);
     }
 
     Ok(file)
 }
 
-fn bounded_file_len(file: &File, max_file_len: usize) -> Result<u64, Int64TableFileRestoreError> {
-    let metadata = file.metadata().map_err(Int64TableFileRestoreError::Read)?;
+fn bounded_file_len(file: &File, max_file_len: usize) -> Result<u64, SnapshotFileReadError> {
+    let metadata = file.metadata().map_err(SnapshotFileReadError::Read)?;
     if !metadata.is_file() {
-        return Err(Int64TableFileRestoreError::NotRegularFile);
+        return Err(SnapshotFileReadError::NotRegularFile);
     }
 
     let file_len = metadata.len();
     let max_file_len_u64 = u64::try_from(max_file_len).unwrap_or(u64::MAX);
     if file_len > max_file_len_u64 {
-        return Err(Int64TableFileRestoreError::FileTooLarge {
+        return Err(SnapshotFileReadError::FileTooLarge {
             file_len,
             max_file_len,
         });
@@ -2159,10 +2282,7 @@ mod tests {
             .expect("opening the replacement FIFO must not block");
         worker.join().unwrap();
 
-        assert!(matches!(
-            result,
-            Err(Int64TableFileRestoreError::NotRegularFile)
-        ));
+        assert!(matches!(result, Err(SnapshotFileReadError::NotRegularFile)));
         fs::remove_dir_all(directory).unwrap();
     }
 }
