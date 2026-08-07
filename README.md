@@ -399,6 +399,18 @@ type rules as unquoted fields, and embedded line endings are retained exactly.
 Headers must remain unquoted, and malformed quoting is rejected. Any input,
 schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 
+`Database::ingest_tsv_with_names` provides the corresponding bounded,
+multi-column `TabSeparatedWithNames` importer, with
+`SharedDatabase::ingest_tsv_with_names` retaining one write lock for the same
+atomic operation. The decoded header must exactly match every schema column in
+order and case. Data rows accept the same `Int64`, finite `Float64`, exact
+lowercase `Bool`, and `String` types, with LF or CRLF record endings. Fields
+decode the escape sequences emitted by RustHouse's TSV writer: `\\`, `\t`,
+`\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Callers supply complete-input byte,
+row, and total-value limits. Invalid UTF-8, line endings, escapes, headers,
+field counts, typed values, configured limits, or remaining table capacity are
+rejected before any row is appended.
+
 ## Snapshot envelope
 
 `SnapshotCodec` encodes and validates bounded byte payloads using an explicit
