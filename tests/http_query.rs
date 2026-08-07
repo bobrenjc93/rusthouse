@@ -2152,7 +2152,8 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
     database
         .execute(
             "CREATE TABLE events (id Int64, label String); \
-             CREATE TABLE readings (value Float64);",
+             CREATE TABLE readings (value Float64); \
+             ALTER TABLE events RENAME COLUMN label TO name;",
         )
         .unwrap();
     let (request, _) = request_with_authorization_for_target(
@@ -2172,10 +2173,10 @@ fn authenticated_insert_route_commits_a_batch_and_returns_an_empty_response() {
     assert_response(
         &exchange(
             &database,
-            &request_for_target("/query", b"SELECT id, label FROM events ORDER BY id;"),
+            &request_for_target("/query", b"SELECT id, name FROM events ORDER BY id;"),
         ),
         "HTTP/1.1 200 OK",
-        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"],[3,"three"]]}"#,
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"name","type":"String"}],"rows":[[1,"one"],[2,"two"],[3,"three"]]}"#,
     );
     assert_response(
         &exchange(
@@ -2204,6 +2205,10 @@ fn authenticated_insert_route_rolls_back_invalid_and_mixed_batches() {
         (
             b"INSERT INTO events VALUES (2); SELECT id FROM events;",
             r#"{"error":"INSERT-only batch accepts only INSERT statements; found SELECT"}"#,
+        ),
+        (
+            b"INSERT INTO events VALUES (3); ALTER TABLE events RENAME COLUMN id TO event_id;",
+            r#"{"error":"INSERT-only batch accepts only INSERT statements; found ALTER TABLE"}"#,
         ),
     ];
 
