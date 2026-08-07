@@ -510,6 +510,11 @@ schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 multi-column `TabSeparatedWithNames` importer, with
 `SharedDatabase::ingest_tsv_with_names` likewise retaining one write lock
 through table lookup, bounded parsing, capacity validation, and atomic append.
+At parity with CSV ingestion, `SharedDatabase::try_ingest_tsv_with_names` makes
+one immediate write-lock attempt before table lookup or input access and returns
+the typed `DatabaseBusy` error rather than waiting for an active reader or
+writer. Lock poisoning and typed TSV, limit, and table-capacity failures remain
+distinct, and every failure preserves all existing rows.
 The decoded header must exactly match every schema column in order and case.
 Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
 `String` types, with LF or CRLF record endings. Fields decode the escape
