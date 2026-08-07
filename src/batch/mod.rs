@@ -10,6 +10,7 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
+pub use format::DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES;
 pub use shared_database::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 use std::error::Error as StdError;
@@ -18,8 +19,8 @@ use std::io::{self, Read, Write};
 
 use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, Database, StatementResult};
 use format::{
-    TableWriteError, write_csv, write_json, write_json_compact_each_row, write_json_each_row,
-    write_table_with_affixes, write_tsv,
+    JsonEachRowWriteError, TableWriteError, write_csv, write_json, write_json_compact_each_row,
+    write_json_each_row, write_table_with_affixes, write_tsv,
 };
 
 /// Default maximum SQL batch size accepted from standard input.
@@ -44,6 +45,8 @@ pub enum BatchError {
     Sql(error::Error),
     /// A padded table result crossed the formatted-output byte limit.
     TableOutputLimitExceeded { bytes: usize, max_bytes: usize },
+    /// A JSONEachRow result crossed the formatted-output byte limit.
+    JsonEachRowOutputLimitExceeded { bytes: usize, max_bytes: usize },
     /// Writing human-readable table output failed.
     WriteTable(io::Error),
     /// Writing CSV output failed.
@@ -71,6 +74,10 @@ impl fmt::Display for BatchError {
             Self::TableOutputLimitExceeded { bytes, max_bytes } => write!(
                 formatter,
                 "table output requires at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
+            Self::JsonEachRowOutputLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "JSONEachRow output requires at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
             ),
             Self::WriteTable(error) => {
                 write!(formatter, "could not write table to stdout: {error}")
@@ -101,7 +108,9 @@ impl StdError for BatchError {
             | Self::WriteJsonCompactEachRow(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
-            Self::InputLimitExceeded { .. } | Self::TableOutputLimitExceeded { .. } => None,
+            Self::InputLimitExceeded { .. }
+            | Self::TableOutputLimitExceeded { .. }
+            | Self::JsonEachRowOutputLimitExceeded { .. } => None,
         }
     }
 }
@@ -303,8 +312,7 @@ fn run_batch_with_limit(
                     output.write_all(b"\n").map_err(BatchError::WriteJson)?;
                 }
                 BatchOutputFormat::JsonEachRow => {
-                    write_json_each_row(&mut output, &query)
-                        .map_err(BatchError::WriteJsonEachRow)?;
+                    write_json_each_row(&mut output, &query).map_err(batch_json_each_row_error)?;
                 }
                 BatchOutputFormat::JsonCompactEachRow => {
                     write_json_compact_each_row(&mut output, &query)
@@ -322,6 +330,15 @@ fn batch_table_error(error: TableWriteError) -> BatchError {
             BatchError::TableOutputLimitExceeded { bytes, max_bytes }
         }
         TableWriteError::Write(error) => BatchError::WriteTable(error),
+    }
+}
+
+fn batch_json_each_row_error(error: JsonEachRowWriteError) -> BatchError {
+    match error {
+        JsonEachRowWriteError::OutputLimitExceeded { bytes, max_bytes } => {
+            BatchError::JsonEachRowOutputLimitExceeded { bytes, max_bytes }
+        }
+        JsonEachRowWriteError::Write(error) => BatchError::WriteJsonEachRow(error),
     }
 }
 
@@ -461,6 +478,31 @@ mod tests {
         };
         assert_eq!(source.kind(), io::ErrorKind::Other);
         assert_eq!(output.written, 8);
+    }
+
+    #[test]
+    fn json_each_row_batch_rejects_repeated_key_amplification_before_writing() {
+        const ROWS: usize = 10_000;
+        let alias = "a".repeat(DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES / ROWS + 64);
+        let mut sql =
+            String::from("CREATE TABLE repeated (value String); INSERT INTO repeated VALUES ('')");
+        for _ in 1..ROWS {
+            sql.push_str(",('')");
+        }
+        sql.push_str("; SELECT value AS ");
+        sql.push_str(&alias);
+        sql.push_str(" FROM repeated;");
+        let mut output = Vec::new();
+
+        let error = run_json_each_row_batch(sql.as_bytes(), &mut output)
+            .expect_err("repeated output keys cross the formatted byte limit");
+
+        let BatchError::JsonEachRowOutputLimitExceeded { bytes, max_bytes } = error else {
+            panic!("expected a typed JSONEachRow output limit error");
+        };
+        assert!(bytes > DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES);
+        assert_eq!(max_bytes, DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES);
+        assert!(output.is_empty());
     }
 
     #[test]

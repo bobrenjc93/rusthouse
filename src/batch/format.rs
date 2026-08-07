@@ -2,8 +2,11 @@ use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::{fmt, io};
 
-use crate::batch::engine::QueryResult;
+use crate::batch::engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, QueryResult};
 use crate::batch::value::Value;
+
+/// Maximum bytes emitted for one JSONEachRow result by the default writer.
+pub const DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES: usize = DEFAULT_MAX_QUERY_RESULT_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -476,29 +479,156 @@ pub fn write_json(output: &mut impl io::Write, result: &QueryResult) -> io::Resu
 
 fn render_json_each_row(result: &QueryResult) -> String {
     let mut output = Vec::new();
-    write_json_each_row(&mut output, result).expect("writing JSONEachRow to a Vec cannot fail");
+    write_json_each_row(&mut output, result)
+        .expect("JSONEachRow output is within the default formatted-output limit");
     String::from_utf8(output).expect("JSONEachRow rendering preserves UTF-8")
+}
+
+/// A typed failure while sizing or streaming JSONEachRow output.
+#[derive(Debug)]
+pub enum JsonEachRowWriteError {
+    /// The exact escaped output size exceeds the configured byte bound.
+    OutputLimitExceeded { bytes: usize, max_bytes: usize },
+    /// Writing the already size-checked output failed.
+    Write(io::Error),
+}
+
+impl fmt::Display for JsonEachRowWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutputLimitExceeded { bytes, max_bytes } => write!(
+                formatter,
+                "JSONEachRow output requires at least {bytes} bytes, exceeding the limit of {max_bytes} bytes"
+            ),
+            Self::Write(error) => write!(formatter, "could not write JSONEachRow output: {error}"),
+        }
+    }
+}
+
+impl StdError for JsonEachRowWriteError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            Self::OutputLimitExceeded { .. } => None,
+        }
+    }
 }
 
 /// Streams one column-name-keyed JSON object per result row.
 ///
 /// Column names and string values are JSON-escaped, SQL `NULL` is emitted as
 /// JSON `null`, and native numbers and booleans retain their JSON scalar types.
-/// Every row is terminated by a line feed; an empty result emits no bytes.
-pub fn write_json_each_row(output: &mut impl io::Write, result: &QueryResult) -> io::Result<()> {
+/// Every row is terminated by a line feed; an empty result emits no bytes. The
+/// exact escaped size is checked against
+/// [`DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES`] before the first byte is written.
+pub fn write_json_each_row(
+    output: &mut impl io::Write,
+    result: &QueryResult,
+) -> Result<(), JsonEachRowWriteError> {
+    write_json_each_row_with_limit(output, result, DEFAULT_MAX_JSON_EACH_ROW_OUTPUT_BYTES)
+}
+
+/// Streams JSONEachRow after checking its exact escaped size against a bound.
+///
+/// Sizing includes repeated column names, punctuation, scalar rendering, and
+/// line feeds. A rejected result never produces partial output.
+pub fn write_json_each_row_with_limit(
+    output: &mut impl io::Write,
+    result: &QueryResult,
+    max_output_bytes: usize,
+) -> Result<(), JsonEachRowWriteError> {
+    let Some(output_bytes) = json_each_row_rendered_bytes(result) else {
+        return Err(json_each_row_output_limit_overflow(max_output_bytes));
+    };
+    if output_bytes > max_output_bytes {
+        return Err(JsonEachRowWriteError::OutputLimitExceeded {
+            bytes: output_bytes,
+            max_bytes: max_output_bytes,
+        });
+    }
+
     for row in &result.rows {
-        output.write_all(b"{")?;
+        output
+            .write_all(b"{")
+            .map_err(JsonEachRowWriteError::Write)?;
         for (column_index, value) in row.iter().enumerate() {
             if column_index > 0 {
-                output.write_all(b",")?;
+                output
+                    .write_all(b",")
+                    .map_err(JsonEachRowWriteError::Write)?;
             }
-            write_json_string(output, &result.columns[column_index].name)?;
-            output.write_all(b":")?;
-            write_json_value(output, value)?;
+            write_json_string(output, &result.columns[column_index].name)
+                .map_err(JsonEachRowWriteError::Write)?;
+            output
+                .write_all(b":")
+                .map_err(JsonEachRowWriteError::Write)?;
+            write_json_value(output, value).map_err(JsonEachRowWriteError::Write)?;
         }
-        output.write_all(b"}\n")?;
+        output
+            .write_all(b"}\n")
+            .map_err(JsonEachRowWriteError::Write)?;
     }
     Ok(())
+}
+
+fn json_each_row_rendered_bytes(result: &QueryResult) -> Option<usize> {
+    let emitted_columns = result.rows.iter().map(Vec::len).max().unwrap_or(0);
+    if emitted_columns > result.columns.len() {
+        return None;
+    }
+
+    let mut member_prefix_bytes = Vec::with_capacity(emitted_columns.checked_add(1)?);
+    member_prefix_bytes.push(0_usize);
+    for (column_index, column) in result.columns.iter().take(emitted_columns).enumerate() {
+        let bytes = member_prefix_bytes
+            .last()
+            .copied()?
+            .checked_add(usize::from(column_index > 0))?
+            .checked_add(json_string_rendered_bytes(&column.name)?)?
+            .checked_add(1)?;
+        member_prefix_bytes.push(bytes);
+    }
+
+    result.rows.iter().try_fold(0_usize, |output_bytes, row| {
+        let row_bytes = row.iter().try_fold(
+            3_usize.checked_add(*member_prefix_bytes.get(row.len())?)?,
+            |row_bytes, value| row_bytes.checked_add(json_value_rendered_bytes(value)?),
+        )?;
+        output_bytes.checked_add(row_bytes)
+    })
+}
+
+fn json_each_row_output_limit_overflow(max_output_bytes: usize) -> JsonEachRowWriteError {
+    JsonEachRowWriteError::OutputLimitExceeded {
+        bytes: max_output_bytes.saturating_add(1),
+        max_bytes: max_output_bytes,
+    }
+}
+
+fn json_value_rendered_bytes(value: &Value) -> Option<usize> {
+    Some(match value {
+        Value::Null(_) => 4,
+        Value::Int64(value) => value.to_string().len(),
+        Value::Float64(value) => Value::Float64(*value).as_display_string().len(),
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::String(value) => json_string_rendered_bytes(value)?,
+    })
+}
+
+fn json_string_rendered_bytes(value: &str) -> Option<usize> {
+    value.chars().try_fold(2_usize, |bytes, character| {
+        let character_bytes = match character {
+            '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+            character if character.is_control() => {
+                let significant_hex_digits =
+                    (u32::BITS - (character as u32).leading_zeros()).div_ceil(4) as usize;
+                significant_hex_digits.max(4).checked_add(2)?
+            }
+            character => character.len_utf8(),
+        };
+        bytes.checked_add(character_bytes)
+    })
 }
 
 fn render_json_compact_each_row(result: &QueryResult) -> String {
@@ -846,6 +976,41 @@ mod tests {
 
         assert!(output.is_empty());
         assert_eq!(render(&result, OutputFormat::JsonEachRow), String::new());
+    }
+
+    #[test]
+    fn json_each_row_accepts_exact_and_rejects_exceeded_escaped_output_limits() {
+        let result = QueryResult {
+            columns: vec![ResultColumn {
+                name: "key\"\n\u{01}雪".to_owned(),
+                data_type: DataType::String,
+            }],
+            rows: vec![
+                vec![Value::String("\"\\\n\u{01}雪".to_owned())],
+                vec![Value::Null(DataType::String)],
+            ],
+        };
+        let expected = concat!(
+            "{\"key\\\"\\n\\u0001雪\":\"\\\"\\\\\\n\\u0001雪\"}\n",
+            "{\"key\\\"\\n\\u0001雪\":null}\n",
+        );
+        let mut exact_output = Vec::new();
+
+        write_json_each_row_with_limit(&mut exact_output, &result, expected.len())
+            .expect("the exact escaped output limit is accepted");
+
+        assert_eq!(exact_output, expected.as_bytes());
+
+        let mut rejected_output = Vec::new();
+        let error =
+            write_json_each_row_with_limit(&mut rejected_output, &result, expected.len() - 1)
+                .expect_err("one byte below the escaped output size is rejected");
+        assert!(matches!(
+            error,
+            JsonEachRowWriteError::OutputLimitExceeded { bytes, max_bytes }
+                if bytes == expected.len() && max_bytes == expected.len() - 1
+        ));
+        assert!(rejected_output.is_empty());
     }
 
     #[test]

@@ -201,7 +201,9 @@ metadata and positional rows. Numbers and booleans use native JSON values, SQL
 JSONEachRow output follows ClickHouse's row-oriented streaming shape: it emits
 one object per row, using JSON-escaped output column names as keys. Numbers and
 booleans remain native JSON values, SQL `NULL` is `null`, and strings use the
-same JSON escaping as `--format json`. Empty results emit no rows, and rows from
+same JSON escaping as `--format json`. Each result's exact escaped size,
+including its repeated keys, is checked against a 16 MiB formatted-output
+limit before any bytes are written. Empty results emit no rows, and rows from
 multiple results continue in statement order.
 JSONCompactEachRow output follows ClickHouse's positional streaming shape: it
 omits column metadata and emits one JSON array per row. Numbers and booleans
