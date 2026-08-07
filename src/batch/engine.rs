@@ -6,9 +6,9 @@ use crate::batch::catalog::Catalog;
 use crate::batch::csv::{self, CsvIngestError, CsvIngestLimits};
 use crate::batch::error::{Error, Result};
 use crate::batch::sql::{
-    self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin, Having,
-    HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate, Select, SelectItem, Statement,
-    VersionSelect,
+    self, AggregateArgument, AggregateFunction, ComparisonOperator, CrossJoin,
+    DeleteComparisonPredicate, Having, HavingPredicate, LiteralSelect, Operand, OrderBy, Predicate,
+    Select, SelectItem, Statement, VersionSelect,
 };
 use crate::batch::storage::{Column, Table};
 use crate::batch::tsv::{self, TsvIngestError, TsvIngestLimits};
@@ -45,7 +45,7 @@ pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
 /// Resource limits for source scans, query-result materialization, and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
-    /// Maximum rows in the source table of one table-backed `SELECT`.
+    /// Maximum rows in the source table of one table-backed `SELECT` or `DELETE`.
     ///
     /// This is checked before row inspection and matching-row index allocation.
     /// `WHERE` and `LIMIT` therefore cannot reduce the charged scan. Each
@@ -587,9 +587,7 @@ impl Database {
                 literal,
             } => self.execute_delete_statement(
                 table,
-                column,
-                ComparisonOperator::Equal,
-                literal,
+                comparison_predicate(column, ComparisonOperator::Equal, literal),
                 query_result_limits,
             ),
             Statement::DeleteComparison {
@@ -597,9 +595,23 @@ impl Database {
                 column,
                 operator,
                 literal,
-            } => {
-                self.execute_delete_statement(table, column, operator, literal, query_result_limits)
-            }
+            } => self.execute_delete_statement(
+                table,
+                comparison_predicate(column, operator, literal),
+                query_result_limits,
+            ),
+            Statement::DeleteConjunction {
+                table,
+                first,
+                second,
+            } => self.execute_delete_statement(
+                table,
+                Predicate::And(
+                    Box::new(delete_comparison_predicate(first)),
+                    Box::new(delete_comparison_predicate(second)),
+                ),
+                query_result_limits,
+            ),
             Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
             Statement::InsertWithColumns {
                 table,
@@ -664,6 +676,7 @@ impl Database {
             | Statement::TruncateTable { .. }
             | Statement::Delete { .. }
             | Statement::DeleteComparison { .. }
+            | Statement::DeleteConjunction { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -693,16 +706,9 @@ impl Database {
     fn execute_delete_statement(
         &mut self,
         table: String,
-        column: String,
-        operator: ComparisonOperator,
-        literal: Value,
+        predicate: Predicate,
         query_result_limits: QueryResultLimits,
     ) -> Result<StatementResult> {
-        let predicate = Predicate::Comparison {
-            left: Operand::Column(column),
-            operator,
-            right: Operand::Literal(literal),
-        };
         let row_indexes = {
             let target = self.catalog.table(&table)?;
             let predicate = compile_predicate(target, &predicate)?;
@@ -1183,7 +1189,9 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
-        Statement::Delete { .. } | Statement::DeleteComparison { .. } => "DELETE",
+        Statement::Delete { .. }
+        | Statement::DeleteComparison { .. }
+        | Statement::DeleteConjunction { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
@@ -1196,6 +1204,18 @@ fn statement_name(statement: &Statement) -> &'static str {
         Statement::DescribeTable { .. } => "DESCRIBE TABLE",
         Statement::ExistsTable { .. } => "EXISTS TABLE",
     }
+}
+
+fn comparison_predicate(column: String, operator: ComparisonOperator, literal: Value) -> Predicate {
+    Predicate::Comparison {
+        left: Operand::Column(column),
+        operator,
+        right: Operand::Literal(literal),
+    }
+}
+
+fn delete_comparison_predicate(comparison: DeleteComparisonPredicate) -> Predicate {
+    comparison_predicate(comparison.column, comparison.operator, comparison.literal)
 }
 
 fn create_table_ddl_len(table: &Table) -> usize {
@@ -1753,6 +1773,9 @@ enum ResolvedItem {
     CastInt64ToBool {
         source: usize,
     },
+    CastFloat64ToBool {
+        source: usize,
+    },
     CastBoolToString {
         source: usize,
     },
@@ -1953,6 +1976,9 @@ fn resolve_select_items(
                     (DataType::Int64, DataType::Bool) => {
                         Some(ResolvedItem::CastInt64ToBool { source })
                     }
+                    (DataType::Float64, DataType::Bool) => {
+                        Some(ResolvedItem::CastFloat64ToBool { source })
+                    }
                     (DataType::Bool, DataType::String) => {
                         Some(ResolvedItem::CastBoolToString { source })
                     }
@@ -1960,7 +1986,8 @@ fn resolve_select_items(
                 };
                 let Some(resolved) = resolved else {
                     let expected = match target_type {
-                        DataType::Float64 | DataType::Bool => "Int64",
+                        DataType::Float64 => "Int64",
+                        DataType::Bool => "Int64 or Float64",
                         DataType::Int64 => "Float64 or Bool",
                         DataType::String => "Bool",
                     };
@@ -2316,6 +2343,9 @@ fn execute_projection(
                         ResolvedItem::CastInt64ToBool { source } => {
                             Value::Bool(int64_at(table, *source, *row) != 0)
                         }
+                        ResolvedItem::CastFloat64ToBool { source } => {
+                            Value::Bool(float64_at(table, *source, *row) != 0.0)
+                        }
                         ResolvedItem::CastBoolToString { source } => {
                             Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
                         }
@@ -2462,6 +2492,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -2520,6 +2551,7 @@ fn validate_grouped_result_limits(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -2978,6 +3010,7 @@ impl GroupedData<'_> {
                         | ResolvedItem::CastFloat64ToInt64 { .. }
                         | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. }
+                        | ResolvedItem::CastFloat64ToBool { .. }
                         | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
@@ -3324,6 +3357,9 @@ fn order_source_rows(
                 ResolvedItem::CastInt64ToBool { source } => {
                     (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
                 }
+                ResolvedItem::CastFloat64ToBool { source } => (float64_at(table, source, left)
+                    != 0.0)
+                    .cmp(&(float64_at(table, source, right) != 0.0)),
                 ResolvedItem::CastBoolToString { source } => {
                     bool_at(table, source, left).cmp(&bool_at(table, source, right))
                 }
@@ -3400,6 +3436,7 @@ fn order_grouped_rows(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastFloat64ToBool { .. }
                 | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }

@@ -89,6 +89,12 @@ pub enum Statement {
         operator: ComparisonOperator,
         literal: Value,
     },
+    /// Exactly two typed comparisons joined by `AND`.
+    DeleteConjunction {
+        table: String,
+        first: DeleteComparisonPredicate,
+        second: DeleteComparisonPredicate,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -323,6 +329,14 @@ pub enum ComparisonOperator {
     LessOrEqual,
     Greater,
     GreaterOrEqual,
+}
+
+/// One column-to-literal comparison in a two-comparison `DELETE` predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteComparisonPredicate {
+    pub column: String,
+    pub operator: ComparisonOperator,
+    pub literal: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1176,26 +1190,51 @@ impl<'a> Parser<'a> {
         self.expect_keyword("FROM")?;
         let table = self.expect_identifier("table name")?;
         self.expect_keyword("WHERE")?;
-        let column = self.expect_identifier("column name")?;
-        let operator = self.parse_comparison_operator()?;
-        let literal = self.parse_literal()?;
+        self.predicate_depth = 0;
+        self.predicate_nodes = 0;
+        let first = self.parse_delete_comparison()?;
+        if self.eat_keyword("AND") {
+            let second = self.parse_delete_comparison()?;
+            self.record_predicate_node()?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self
+                    .error("DELETE supports at most two comparisons joined by exactly one AND");
+            }
+            return Ok(Statement::DeleteConjunction {
+                table,
+                first,
+                second,
+            });
+        }
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error(
-                "DELETE supports exactly DELETE FROM <table> WHERE <column> <comparison> <literal>",
+                "DELETE supports one comparison or two comparisons joined by exactly one AND",
             );
         }
-        Ok(match operator {
+        Ok(match first.operator {
             ComparisonOperator::Equal => Statement::Delete {
                 table,
-                column,
-                literal,
+                column: first.column,
+                literal: first.literal,
             },
             operator => Statement::DeleteComparison {
                 table,
-                column,
+                column: first.column,
                 operator,
-                literal,
+                literal: first.literal,
             },
+        })
+    }
+
+    fn parse_delete_comparison(&mut self) -> Result<DeleteComparisonPredicate> {
+        let column = self.expect_identifier("column name")?;
+        let operator = self.parse_comparison_operator()?;
+        let literal = self.parse_literal()?;
+        self.record_predicate_node()?;
+        Ok(DeleteComparisonPredicate {
+            column,
+            operator,
+            literal,
         })
     }
 
