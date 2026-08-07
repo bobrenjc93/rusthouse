@@ -64,7 +64,7 @@ fn csv_batch_emits_typed_projection_and_all_scalar_aggregates() {
 }
 
 #[test]
-fn csv_batch_filters_distinct_tuples_before_deduplication_and_limit() {
+fn csv_batch_filters_orders_and_limits_distinct_tuples() {
     let output = run(
         &["--format", "csv"],
         b"CREATE TABLE events (kind String, rank Int64, score Float64, active Bool); \
@@ -75,11 +75,12 @@ fn csv_batch_filters_distinct_tuples_before_deduplication_and_limit() {
               ('alpha', 7, 0.0, false), \
               ('gamma', 3, 5.0, true); \
           SELECT DISTINCT kind, active FROM events \
-          WHERE (active = true AND score >= 2.5) OR rank = 7 LIMIT 2;",
+          WHERE (active = true AND score >= 2.5) OR rank = 7 \
+          ORDER BY active ASC, kind DESC LIMIT 2;",
     );
 
     assert!(output.status.success(), "{:?}", output.stderr);
-    assert_eq!(output.stdout, b"kind,active\nbeta,true\nalpha,false\n");
+    assert_eq!(output.stdout, b"kind,active\nalpha,false\ngamma,true\n");
     assert!(output.stderr.is_empty());
 }
 
