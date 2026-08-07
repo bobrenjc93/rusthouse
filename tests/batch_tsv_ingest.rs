@@ -1,3 +1,8 @@
+use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
+
 use rusthouse::batch::engine::{Database, QueryResult, ResultColumn, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::format::write_tsv;
@@ -65,6 +70,22 @@ fn expected_result() -> QueryResult {
     }
 }
 
+fn shared_database(row_cap: usize) -> SharedDatabase {
+    let database = SharedDatabase::with_max_rows_per_table(row_cap);
+    database
+        .execute("CREATE TABLE metrics (id Int64, score Float64, active Bool, label String);")
+        .expect("create typed table");
+    database
+}
+
+struct InaccessibleInput;
+
+impl AsRef<[u8]> for InaccessibleInput {
+    fn as_ref(&self) -> &[u8] {
+        panic!("contended or poisoned ingestion must not access its input")
+    }
+}
+
 #[test]
 fn writer_output_round_trips_all_types_and_escapes_with_lf_and_crlf() {
     let expected = expected_result();
@@ -115,6 +136,168 @@ fn exact_byte_row_value_and_table_limits_succeed() {
     assert_eq!(
         query(&mut database, "SELECT id FROM metrics ORDER BY id;").rows,
         [vec![Value::Int64(1)], vec![Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn try_ingest_writer_output_succeeds_at_exact_limits() {
+    let expected = expected_result();
+    let mut input = Vec::new();
+    write_tsv(&mut input, &expected).expect("write TabSeparatedWithNames");
+    let database = shared_database(2);
+
+    assert_eq!(
+        database
+            .try_ingest_tsv_with_names("metrics", &input, TsvIngestLimits::new(input.len(), 2, 8),)
+            .expect("ingest writer output at exact byte, row, value, and table limits"),
+        2
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, score, active, label FROM metrics ORDER BY id;")
+            .expect("query imported rows"),
+        expected
+    );
+}
+
+#[test]
+fn try_ingest_late_tsv_error_is_typed_and_rolls_back_every_parsed_row() {
+    let database = shared_database(3);
+    database
+        .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
+        .unwrap();
+    let input = b"id\tscore\tactive\tlabel\n1\t1.5\ttrue\tvalid\n2\tNaN\tfalse\tlate\n";
+
+    assert_eq!(
+        database.try_ingest_tsv_with_names(
+            "metrics",
+            input,
+            TsvIngestLimits::new(input.len(), 2, 8),
+        ),
+        Err(SharedDatabaseError::TsvIngest(
+            TsvIngestError::InvalidValue {
+                line: 3,
+                column: 2,
+                expected: DataType::Float64,
+            }
+        ))
+    );
+    assert_eq!(
+        database
+            .query("SELECT id, label FROM metrics;")
+            .unwrap()
+            .rows,
+        [vec![Value::Int64(9), Value::String("existing".to_owned())]]
+    );
+}
+
+#[test]
+fn try_ingest_returns_busy_without_lookup_or_input_access_for_reader_and_writer() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+
+    let reader = inner.read().unwrap();
+    let (reader_sender, reader_receiver) = mpsc::channel();
+    let reader_database = database.clone();
+    let reader_worker = thread::spawn(move || {
+        reader_sender
+            .send(reader_database.try_ingest_tsv_with_names(
+                "missing",
+                InaccessibleInput,
+                TsvIngestLimits::new(0, 0, 0),
+            ))
+            .unwrap();
+    });
+    let reader_result = reader_receiver.recv_timeout(Duration::from_secs(2));
+    drop(reader);
+    reader_worker.join().unwrap();
+    assert_eq!(
+        reader_result,
+        Ok(Err(SharedDatabaseError::DatabaseBusy)),
+        "reader contention must return without waiting"
+    );
+
+    let writer = inner.write().unwrap();
+    let (writer_sender, writer_receiver) = mpsc::channel();
+    let writer_database = database.clone();
+    let writer_worker = thread::spawn(move || {
+        writer_sender
+            .send(writer_database.try_ingest_tsv_with_names(
+                "missing",
+                InaccessibleInput,
+                TsvIngestLimits::new(0, 0, 0),
+            ))
+            .unwrap();
+    });
+    let writer_result = writer_receiver.recv_timeout(Duration::from_secs(2));
+    drop(writer);
+    writer_worker.join().unwrap();
+    assert_eq!(
+        writer_result,
+        Ok(Err(SharedDatabaseError::DatabaseBusy)),
+        "writer contention must return without waiting"
+    );
+}
+
+#[test]
+fn try_ingest_preserves_tsv_limits_and_table_capacity_without_partial_rows() {
+    let database = shared_database(2);
+    database
+        .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
+        .unwrap();
+    let input = b"id\tscore\tactive\tlabel\n1\t1.5\ttrue\tone\n2\t2.5\tfalse\ttwo\n";
+
+    assert_eq!(
+        database.try_ingest_tsv_with_names(
+            "metrics",
+            input,
+            TsvIngestLimits::new(input.len(), 1, 8),
+        ),
+        Err(SharedDatabaseError::TsvIngest(
+            TsvIngestError::RowLimitExceeded {
+                line: 3,
+                rows: 2,
+                max_rows: 1,
+            }
+        ))
+    );
+    assert_eq!(
+        database.try_ingest_tsv_with_names(
+            "metrics",
+            input,
+            TsvIngestLimits::new(input.len(), 2, 8),
+        ),
+        Err(SharedDatabaseError::TsvIngest(TsvIngestError::Database(
+            Error::ResourceLimitExceeded {
+                resource: "table rows",
+                actual: 3,
+                max: 2,
+            }
+        )))
+    );
+    assert_eq!(
+        database.query("SELECT id FROM metrics;").unwrap().rows,
+        [vec![Value::Int64(9)]]
+    );
+}
+
+#[test]
+fn try_ingestion_reports_lock_poisoning_before_lookup_or_input_access() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    assert_eq!(
+        database.try_ingest_tsv_with_names(
+            "missing",
+            InaccessibleInput,
+            TsvIngestLimits::new(0, 0, 0),
+        ),
+        Err(SharedDatabaseError::LockPoisoned)
     );
 }
 

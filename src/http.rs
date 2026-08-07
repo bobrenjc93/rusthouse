@@ -106,7 +106,8 @@ impl StdError for HttpQueryError {
 /// [`SharedDatabase::try_execute_insert_batch`], which atomically executes a
 /// nonempty `INSERT`-only batch after one nonblocking write-lock attempt.
 /// Success returns an empty `200 OK` response. The unauthenticated handlers do
-/// not expose this route.
+/// not expose this route. The `X-ClickHouse-Key`-authenticated handlers expose
+/// the same authenticated route set.
 ///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
 /// for retained tables, columns, and rows. It takes a nonblocking, consistent
@@ -152,7 +153,7 @@ pub fn handle_http_query_with_limits(
     output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
-    handle_http_query_exchange(database, input, output, limits, None)
+    handle_http_query_exchange(database, input, output, limits, Authentication::None)
 }
 
 /// Handles one HTTP query, insert, health, or metrics exchange that requires a bearer token.
@@ -211,6 +212,7 @@ pub fn handle_http_query_with_bearer_token_and_limits(
             &mut output,
             Status::INTERNAL_SERVER_ERROR,
             &[],
+            &[],
             "configured bearer token must not be empty",
             limits.max_response_bytes,
         );
@@ -219,6 +221,7 @@ pub fn handle_http_query_with_bearer_token_and_limits(
         return write_error_response(
             &mut output,
             Status::INTERNAL_SERVER_ERROR,
+            &[],
             &[],
             "configured bearer token is not valid token68",
             limits.max_response_bytes,
@@ -230,8 +233,114 @@ pub fn handle_http_query_with_bearer_token_and_limits(
         input,
         output,
         limits,
-        Some(expected_bearer_token.as_bytes()),
+        Authentication::Bearer(expected_bearer_token.as_bytes()),
     )
+}
+
+/// Handles one HTTP query, insert, health, or metrics exchange that requires
+/// an `X-ClickHouse-Key` credential.
+///
+/// This is separate from [`handle_http_query`] and the bearer-authenticated
+/// handlers. Every request, including `GET /ping`, `GET /ready`, and
+/// `GET /metrics`, is authorized only when it has exactly one
+/// case-insensitive `X-ClickHouse-Key` header whose value matches
+/// `expected_clickhouse_key`. Header values are compared case-sensitively.
+/// Missing, duplicate, empty, and incorrect credentials receive the same
+/// `401 Unauthorized` response with an `X-ClickHouse-Key` authentication
+/// challenge before the SQL body is read or the database is accessed. Every
+/// response includes `Cache-Control: private, no-store` so authenticated GET
+/// results cannot be reused by a shared cache.
+///
+/// The configured key must be a nonempty HTTP field value without leading or
+/// trailing optional whitespace. Invalid configurations are rejected as a
+/// server error without reading any input. This function provides
+/// authentication only; the embedding application must provide TLS to keep
+/// the key and query contents confidential in transit.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_clickhouse_key(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_key_and_limits(
+        database,
+        expected_clickhouse_key,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one `X-ClickHouse-Key`-authenticated HTTP exchange with explicit
+/// resource limits.
+///
+/// See [`handle_http_query_with_clickhouse_key`] for authentication behavior
+/// and [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_clickhouse_key_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    if expected_clickhouse_key.is_empty() {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            CLICKHOUSE_KEY_RESPONSE_HEADERS,
+            "configured ClickHouse key must not be empty",
+            limits.max_response_bytes,
+        );
+    }
+    if !is_valid_clickhouse_key(expected_clickhouse_key.as_bytes()) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            CLICKHOUSE_KEY_RESPONSE_HEADERS,
+            "configured ClickHouse key is not a valid HTTP header value",
+            limits.max_response_bytes,
+        );
+    }
+
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Authentication::ClickHouseKey(expected_clickhouse_key.as_bytes()),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Authentication<'a> {
+    None,
+    Bearer(&'a [u8]),
+    ClickHouseKey(&'a [u8]),
+}
+
+impl Authentication<'_> {
+    const fn exposes_insert(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn response_headers(self) -> &'static [&'static [u8]] {
+        match self {
+            Self::ClickHouseKey(_) => CLICKHOUSE_KEY_RESPONSE_HEADERS,
+            Self::None | Self::Bearer(_) => &[],
+        }
+    }
 }
 
 fn handle_http_query_exchange(
@@ -239,9 +348,10 @@ fn handle_http_query_exchange(
     mut input: impl Read,
     mut output: impl Write,
     limits: HttpQueryLimits,
-    expected_bearer_token: Option<&[u8]>,
+    authentication: Authentication<'_>,
 ) -> Result<(), HttpQueryError> {
-    let request = match read_request(&mut input, limits, expected_bearer_token) {
+    let response_headers = authentication.response_headers();
+    let request = match read_request(&mut input, limits, authentication) {
         Ok(request) => request,
         Err(RequestReadError::Io(error)) => return Err(HttpQueryError::Read(error)),
         Err(RequestReadError::Protocol(failure)) => {
@@ -249,6 +359,7 @@ fn handle_http_query_exchange(
                 &mut output,
                 failure.status,
                 failure.extra_headers,
+                response_headers,
                 failure.message,
                 limits.max_response_bytes,
             );
@@ -261,6 +372,7 @@ fn handle_http_query_exchange(
                 &mut output,
                 Status::OK,
                 &[],
+                response_headers,
                 CONTENT_TYPE_TEXT,
                 b"Ok.\n".to_vec(),
                 limits.max_response_bytes,
@@ -271,6 +383,7 @@ fn handle_http_query_exchange(
                 &mut output,
                 Status::OK,
                 &[],
+                response_headers,
                 CONTENT_TYPE_TEXT,
                 b"Ok.\n".to_vec(),
                 limits.max_response_bytes,
@@ -281,6 +394,7 @@ fn handle_http_query_exchange(
                 &mut output,
                 Status::SERVICE_UNAVAILABLE,
                 &[],
+                response_headers,
                 "database is unavailable",
                 limits.max_response_bytes,
             );
@@ -291,6 +405,7 @@ fn handle_http_query_exchange(
                     &mut output,
                     Status::SERVICE_UNAVAILABLE,
                     &[],
+                    response_headers,
                     "database is unavailable",
                     limits.max_response_bytes,
                 );
@@ -298,12 +413,17 @@ fn handle_http_query_exchange(
             let mut body = BoundedVec::new(limits.max_response_bytes);
             if write_prometheus_metrics(&mut body, metrics).is_err() {
                 debug_assert!(body.limit_exceeded);
-                return write_response_limit_error(&mut output, limits.max_response_bytes);
+                return write_response_limit_error(
+                    &mut output,
+                    response_headers,
+                    limits.max_response_bytes,
+                );
             }
             return write_response(
                 &mut output,
                 Status::OK,
                 &[],
+                response_headers,
                 CONTENT_TYPE_PROMETHEUS,
                 body.bytes,
                 limits.max_response_bytes,
@@ -313,13 +433,18 @@ fn handle_http_query_exchange(
             let success_response = match prepare_response(
                 Status::OK,
                 &[],
+                response_headers,
                 CONTENT_TYPE_TEXT,
                 &[],
                 limits.max_response_bytes,
             ) {
                 Ok(response) => response,
                 Err(_) => {
-                    return write_response_limit_error(&mut output, limits.max_response_bytes);
+                    return write_response_limit_error(
+                        &mut output,
+                        response_headers,
+                        limits.max_response_bytes,
+                    );
                 }
             };
             return match database.try_execute_insert_batch(&sql) {
@@ -330,6 +455,7 @@ fn handle_http_query_exchange(
                     &mut output,
                     Status::SERVICE_UNAVAILABLE,
                     &[],
+                    response_headers,
                     "database is unavailable",
                     limits.max_response_bytes,
                 ),
@@ -337,6 +463,7 @@ fn handle_http_query_exchange(
                     &mut output,
                     Status::INTERNAL_SERVER_ERROR,
                     &[],
+                    response_headers,
                     "database is unavailable",
                     limits.max_response_bytes,
                 ),
@@ -344,6 +471,7 @@ fn handle_http_query_exchange(
                     &mut output,
                     Status::BAD_REQUEST,
                     &[],
+                    response_headers,
                     &error.to_string(),
                     limits.max_response_bytes,
                 ),
@@ -383,12 +511,17 @@ fn handle_http_query_exchange(
                     body.limit_exceeded
                         || matches!(response_format, QueryResponseFormat::JsonEachRow)
                 );
-                return write_response_limit_error(&mut output, limits.max_response_bytes);
+                return write_response_limit_error(
+                    &mut output,
+                    response_headers,
+                    limits.max_response_bytes,
+                );
             }
             write_response(
                 &mut output,
                 Status::OK,
                 &[],
+                response_headers,
                 content_type,
                 body.bytes,
                 limits.max_response_bytes,
@@ -398,6 +531,7 @@ fn handle_http_query_exchange(
             &mut output,
             Status::SERVICE_UNAVAILABLE,
             &[],
+            response_headers,
             "database is unavailable",
             limits.max_response_bytes,
         ),
@@ -405,6 +539,7 @@ fn handle_http_query_exchange(
             &mut output,
             Status::INTERNAL_SERVER_ERROR,
             &[],
+            response_headers,
             "database is unavailable",
             limits.max_response_bytes,
         ),
@@ -412,6 +547,7 @@ fn handle_http_query_exchange(
             &mut output,
             Status::BAD_REQUEST,
             &[],
+            response_headers,
             &error.to_string(),
             limits.max_response_bytes,
         ),
@@ -421,10 +557,10 @@ fn handle_http_query_exchange(
 fn read_request(
     input: &mut impl Read,
     limits: HttpQueryLimits,
-    expected_bearer_token: Option<&[u8]>,
+    authentication: Authentication<'_>,
 ) -> Result<HttpRequest, RequestReadError> {
     let header = read_header_block(input, limits.max_header_bytes)?;
-    let request = parse_headers(&header, limits.max_header_count, expected_bearer_token)?;
+    let request = parse_headers(&header, limits.max_header_count, authentication)?;
 
     match request.kind {
         RequestKind::Ping => {
@@ -626,7 +762,7 @@ enum QuerySource {
 fn parse_headers(
     header: &[u8],
     max_header_count: usize,
-    expected_bearer_token: Option<&[u8]>,
+    authentication: Authentication<'_>,
 ) -> Result<ParsedRequest, RequestReadError> {
     let Some(without_terminator) = header.strip_suffix(b"\r\n\r\n") else {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "malformed HTTP headers").into());
@@ -636,7 +772,7 @@ fn parse_headers(
         return Err(RequestFailure::new(Status::BAD_REQUEST, "missing request line").into());
     };
     let request_line = strict_header_line(raw_request_line, lines.peek().is_some())?;
-    let kind = parse_request_line(request_line, expected_bearer_token.is_some())?;
+    let kind = parse_request_line(request_line, authentication.exposes_insert())?;
 
     let mut content_length = None;
     let mut host_seen = false;
@@ -645,6 +781,8 @@ fn parse_headers(
     let mut expect_seen = false;
     let mut authorization = None;
     let mut duplicate_authorization = false;
+    let mut clickhouse_key = None;
+    let mut duplicate_clickhouse_key = false;
     let mut clickhouse_format = None;
     let mut duplicate_clickhouse_format = false;
     while let Some(raw_line) = lines.next() {
@@ -687,11 +825,16 @@ fn parse_headers(
                 return Err(RequestFailure::new(Status::BAD_REQUEST, "invalid Host header").into());
             }
             host_seen = true;
-        } else if expected_bearer_token.is_some()
+        } else if matches!(authentication, Authentication::Bearer(_))
             && name.eq_ignore_ascii_case(b"authorization")
             && authorization.replace(value).is_some()
         {
             duplicate_authorization = true;
+        } else if matches!(authentication, Authentication::ClickHouseKey(_))
+            && name.eq_ignore_ascii_case(b"x-clickhouse-key")
+            && clickhouse_key.replace(value).is_some()
+        {
+            duplicate_clickhouse_key = true;
         } else if name.eq_ignore_ascii_case(b"x-clickhouse-format")
             && clickhouse_format.replace(value).is_some()
         {
@@ -699,18 +842,34 @@ fn parse_headers(
         }
     }
 
-    if let Some(expected_bearer_token) = expected_bearer_token {
-        let authorized = !duplicate_authorization
-            && authorization
-                .and_then(parse_bearer_token)
-                .is_some_and(|provided| constant_work_eq(provided, expected_bearer_token));
-        if !authorized {
-            return Err(RequestFailure::with_headers(
-                Status::UNAUTHORIZED,
-                "bearer authentication required",
-                &[b"WWW-Authenticate: Bearer\r\n"],
-            )
-            .into());
+    match authentication {
+        Authentication::None => {}
+        Authentication::Bearer(expected_bearer_token) => {
+            let authorized = !duplicate_authorization
+                && authorization
+                    .and_then(parse_bearer_token)
+                    .is_some_and(|provided| constant_work_eq(provided, expected_bearer_token));
+            if !authorized {
+                return Err(RequestFailure::with_headers(
+                    Status::UNAUTHORIZED,
+                    "bearer authentication required",
+                    &[b"WWW-Authenticate: Bearer\r\n"],
+                )
+                .into());
+            }
+        }
+        Authentication::ClickHouseKey(expected_clickhouse_key) => {
+            let key_matches = clickhouse_key.is_some_and(|provided| {
+                !provided.is_empty() && constant_work_eq(provided, expected_clickhouse_key)
+            });
+            if duplicate_clickhouse_key || !key_matches {
+                return Err(RequestFailure::with_headers(
+                    Status::UNAUTHORIZED,
+                    "X-ClickHouse-Key authentication required",
+                    &[b"WWW-Authenticate: X-ClickHouse-Key\r\n"],
+                )
+                .into());
+            }
         }
     }
 
@@ -791,6 +950,12 @@ fn is_valid_bearer_token(token: &[u8]) -> bool {
 
 fn is_bearer_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn is_valid_clickhouse_key(key: &[u8]) -> bool {
+    !key.is_empty()
+        && trim_optional_whitespace(key) == key
+        && key.iter().copied().all(is_header_value_byte)
 }
 
 fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1087,6 +1252,7 @@ impl From<RequestFailure> for RequestReadError {
 }
 
 const RESPONSE_LIMIT_MESSAGE: &str = "response exceeds configured byte limit";
+const CLICKHOUSE_KEY_RESPONSE_HEADERS: &[&[u8]] = &[b"Cache-Control: private, no-store\r\n"];
 const CONTENT_TYPE_CSV: &[u8] = b"text/csv; charset=utf-8";
 const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
@@ -1113,6 +1279,7 @@ fn write_error_response(
     output: &mut impl Write,
     status: Status,
     extra_headers: &[&[u8]],
+    response_headers: &[&[u8]],
     message: &str,
     max_response_bytes: usize,
 ) -> Result<(), HttpQueryError> {
@@ -1124,6 +1291,7 @@ fn write_error_response(
         output,
         status,
         extra_headers,
+        response_headers,
         CONTENT_TYPE_JSON,
         body,
         max_response_bytes,
@@ -1134,6 +1302,7 @@ fn write_response(
     output: &mut impl Write,
     status: Status,
     extra_headers: &[&[u8]],
+    response_headers: &[&[u8]],
     content_type: &[u8],
     body: Vec<u8>,
     max_response_bytes: usize,
@@ -1141,17 +1310,19 @@ fn write_response(
     match prepare_response(
         status,
         extra_headers,
+        response_headers,
         content_type,
         &body,
         max_response_bytes,
     ) {
         Ok(response) => output.write_all(&response).map_err(HttpQueryError::Write),
-        Err(_) => write_response_limit_error(output, max_response_bytes),
+        Err(_) => write_response_limit_error(output, response_headers, max_response_bytes),
     }
 }
 
 fn write_response_limit_error(
     output: &mut impl Write,
+    response_headers: &[&[u8]],
     max_response_bytes: usize,
 ) -> Result<(), HttpQueryError> {
     let mut body = Vec::new();
@@ -1162,6 +1333,7 @@ fn write_response_limit_error(
     let response = prepare_response(
         Status::INTERNAL_SERVER_ERROR,
         &[],
+        response_headers,
         CONTENT_TYPE_JSON,
         &body,
         max_response_bytes,
@@ -1176,6 +1348,7 @@ fn write_response_limit_error(
 fn prepare_response(
     status: Status,
     extra_headers: &[&[u8]],
+    response_headers: &[&[u8]],
     content_type: &[u8],
     body: &[u8],
     max_response_bytes: usize,
@@ -1191,6 +1364,9 @@ fn prepare_response(
     header.extend_from_slice(b"Connection: close\r\n");
     for extra_header in extra_headers {
         header.extend_from_slice(extra_header);
+    }
+    for response_header in response_headers {
+        header.extend_from_slice(response_header);
     }
     header.extend_from_slice(b"\r\n");
 
