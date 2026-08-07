@@ -394,15 +394,19 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::RenameTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "RENAME TABLE",
         }),
-        Statement::RenameColumn { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
-            statement: "ALTER TABLE",
-        }),
+        Statement::RenameColumn { .. } | Statement::DropColumn { .. } => {
+            Err(SharedDatabaseError::ReadOnlyStatementRequired {
+                statement: "ALTER TABLE",
+            })
+        }
         Statement::TruncateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "TRUNCATE TABLE",
         }),
-        Statement::Insert { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
-            statement: "INSERT",
-        }),
+        Statement::Insert { .. } | Statement::InsertWithColumns { .. } => {
+            Err(SharedDatabaseError::ReadOnlyStatementRequired {
+                statement: "INSERT",
+            })
+        }
     }
 }
 

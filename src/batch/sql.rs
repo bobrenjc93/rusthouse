@@ -13,7 +13,7 @@ pub const DEFAULT_MAX_BATCH_STATEMENTS: usize = 4_096;
 pub const DEFAULT_MAX_INSERT_ROWS: usize = 100_000;
 /// Maximum `INSERT` scalar values stored across one parsed batch.
 pub const DEFAULT_MAX_INSERT_VALUES: usize = 1_000_000;
-/// Maximum items stored in variable-length schema and query lists across a batch.
+/// Maximum items stored in variable-length schema, INSERT-column, and query lists.
 pub const DEFAULT_MAX_AST_LIST_ITEMS: usize = 100_000;
 
 /// Allocation limits applied while constructing a SQL batch AST.
@@ -63,11 +63,21 @@ pub enum Statement {
         source: String,
         destination: String,
     },
+    DropColumn {
+        table: String,
+        column: String,
+    },
     TruncateTable {
         name: String,
     },
     Insert {
         table: String,
+        rows: Vec<Vec<Value>>,
+    },
+    /// `INSERT` with a complete explicit input-column order.
+    InsertWithColumns {
+        table: String,
+        columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
     /// Exactly one typed literal with no `FROM` or other clauses.
@@ -982,19 +992,28 @@ impl<'a> Parser<'a> {
     fn parse_alter(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let table = self.expect_identifier("table name")?;
-        self.expect_keyword("RENAME")?;
-        self.expect_keyword("COLUMN")?;
-        let source = self.expect_identifier("source column name")?;
-        self.expect_keyword("TO")?;
-        let destination = self.expect_identifier("destination column name")?;
-        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
-            return self.error("unexpected trailing input after ALTER TABLE RENAME COLUMN");
+        if self.eat_keyword("RENAME") {
+            self.expect_keyword("COLUMN")?;
+            let source = self.expect_identifier("source column name")?;
+            self.expect_keyword("TO")?;
+            let destination = self.expect_identifier("destination column name")?;
+            if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+                return self.error("unexpected trailing input after ALTER TABLE RENAME COLUMN");
+            }
+            return Ok(Statement::RenameColumn {
+                table,
+                source,
+                destination,
+            });
         }
-        Ok(Statement::RenameColumn {
-            table,
-            source,
-            destination,
-        })
+
+        self.expect_keyword("DROP")?;
+        self.expect_keyword("COLUMN")?;
+        let column = self.expect_identifier("column name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after ALTER TABLE DROP COLUMN");
+        }
+        Ok(Statement::DropColumn { table, column })
     }
 
     fn parse_rename(&mut self) -> Result<Statement> {
@@ -1023,6 +1042,20 @@ impl<'a> Parser<'a> {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
+        let columns = if self.eat(&TokenKind::LeftParen) {
+            let mut columns = Vec::new();
+            loop {
+                self.reserve_ast_list_item()?;
+                columns.push(self.expect_identifier("column name in INSERT column list")?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after INSERT column list")?;
+            Some(columns)
+        } else {
+            None
+        };
         self.expect_keyword("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -1058,7 +1091,14 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(Statement::Insert { table, rows })
+        match columns {
+            Some(columns) => Ok(Statement::InsertWithColumns {
+                table,
+                columns,
+                rows,
+            }),
+            None => Ok(Statement::Insert { table, rows }),
+        }
     }
 
     fn parse_select(&mut self) -> Result<Select> {
@@ -2069,6 +2109,75 @@ mod tests {
         };
         assert_eq!(rows[0][1], Value::String("it's good".to_owned()));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_explicit_insert_columns_without_changing_value_order() {
+        let statements = parse(
+            "INSERT INTO metrics (LABEL, active, score, id) \
+             VALUES ('first', true, 2.5, 7), ('second', false, 4.0, 8)",
+        )
+        .expect("valid INSERT column list");
+        let Statement::InsertWithColumns {
+            table,
+            columns,
+            rows,
+        } = &statements[0]
+        else {
+            panic!("expected insert");
+        };
+        assert_eq!(table, "metrics");
+        assert_eq!(
+            columns,
+            &vec![
+                "LABEL".to_owned(),
+                "active".to_owned(),
+                "score".to_owned(),
+                "id".to_owned(),
+            ]
+        );
+        assert_eq!(
+            rows[0],
+            [
+                Value::String("first".to_owned()),
+                Value::Bool(true),
+                Value::Float64(2.5),
+                Value::Int64(7),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_insert_column_lists_are_syntax_checked_and_ast_bounded() {
+        for sql in [
+            "INSERT INTO t () VALUES (1)",
+            "INSERT INTO t (id,) VALUES (1)",
+            "INSERT INTO t (id value) VALUES (1)",
+            "INSERT INTO t (id) (1)",
+        ] {
+            assert!(parse(sql).is_err(), "{sql:?} must be rejected");
+        }
+
+        let limits = BatchSqlLimits {
+            max_statements: 1,
+            max_insert_rows: 1,
+            max_insert_values: 2,
+            max_ast_list_items: 1,
+        };
+        assert!(parse_with_limits("INSERT INTO t (id) VALUES (1)", limits).is_ok());
+        assert_eq!(
+            parse_with_limits("INSERT INTO t (id, label) VALUES (1, 'one')", limits)
+                .expect_err("second named column exceeds the AST list limit"),
+            Error::ResourceLimitExceeded {
+                resource: "SQL AST list items",
+                actual: 2,
+                max: 1,
+            }
+        );
+        assert!(
+            parse_with_limits("INSERT INTO t VALUES (1, 'one')", limits).is_ok(),
+            "positional INSERT does not allocate a column-name list"
+        );
     }
 
     #[test]
