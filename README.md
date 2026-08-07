@@ -241,16 +241,17 @@ Read-only API misuse and lock poisoning are reported as distinct typed errors.
 ## HTTP query and health exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. All three supported routes require a nonempty
+exchange without opening a listener. All four supported routes require a nonempty
 `Host`, reject transfer encoding (including chunked requests), and return `417
 Expectation Failed` for `Expect` instead of waiting for a body whose sender
 may be awaiting an interim response.
 
-`POST /query` requires one decimal `Content-Length` and sends its UTF-8 SQL body
-through `SharedDatabase::query`. Successful responses use the same compact
-JSON column metadata and positional-row shape as `--format json`; protocol and
-query failures return deterministic JSON error objects with an appropriate
-HTTP status.
+`POST /` and `POST /query` are equivalent query routes. Each requires one
+decimal `Content-Length` and sends its UTF-8 SQL body through
+`SharedDatabase::query`. Successful responses use the same compact JSON column
+metadata and positional-row shape as `--format json`; protocol and query
+failures return deterministic JSON error objects with an appropriate HTTP
+status. Targets are exact, so a query string or any other suffix is rejected.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
