@@ -12,7 +12,8 @@ The first useful release should support:
 - a genuinely columnar in-memory representation;
 - `CREATE TABLE`, `INSERT INTO ... VALUES`, and `SELECT`;
 - projections, `WHERE` comparisons, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `GROUP BY`, `ORDER BY`, and `LIMIT`;
-- a batch/interactive CLI with readable table, CSV, TSV, and JSON output;
+- a batch/interactive CLI with readable table, CSV, TSV, JSON, and
+  JSONCompactEachRow output;
 - durable local snapshots with an explicit, documented file format;
 - an HTTP endpoint for executing SQL;
 - deterministic tests and a small benchmark that demonstrate analytical behavior.
@@ -158,8 +159,9 @@ and output bounds.
 ## Command-line session
 
 `rusthouse --format table`, `rusthouse --format csv`, `rusthouse --format tsv`,
-and `rusthouse --format json` read one complete SQL batch from standard input
-through EOF, with explicit limits of 64 MiB and 4,096 statements. Parsing is
+`rusthouse --format json`, and `rusthouse --format JSONCompactEachRow` read one
+complete SQL batch from standard input through EOF, with explicit limits of 64
+MiB and 4,096 statements. Parsing is
 lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
@@ -177,6 +179,11 @@ typed rows; commas, quotes, and newlines in strings are CSV-escaped. JSON output
 is newline-delimited, with one compact object per query containing typed column
 metadata and positional rows. Numbers and booleans use native JSON values, SQL
 `NULL` becomes `null`, and strings are JSON-escaped.
+JSONCompactEachRow output follows ClickHouse's positional streaming shape: it
+omits column metadata and emits one JSON array per row. Numbers and booleans
+remain native JSON values, SQL `NULL` is `null`, and strings use the same JSON
+escaping as `--format json`. Empty results emit no rows, and rows from multiple
+results continue in statement order.
 TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
@@ -217,6 +224,7 @@ printf '%s\n' \
 
 Use `--format csv` instead to emit the same query results as CSVWithNames.
 Use `--format tsv` for ClickHouse-style TabSeparatedWithNames output.
+Use `--format JSONCompactEachRow` for one positional JSON array per result row.
 Use `--format table` for bordered output intended for direct terminal reading.
 
 For concurrent in-process access, `SharedCatalog` wraps a catalog in an
@@ -241,16 +249,17 @@ Read-only API misuse and lock poisoning are reported as distinct typed errors.
 ## HTTP query and health exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. All three supported routes require a nonempty
+exchange without opening a listener. All four supported routes require a nonempty
 `Host`, reject transfer encoding (including chunked requests), and return `417
 Expectation Failed` for `Expect` instead of waiting for a body whose sender
 may be awaiting an interim response.
 
-`POST /query` requires one decimal `Content-Length` and sends its UTF-8 SQL body
-through `SharedDatabase::query`. Successful responses use the same compact
-JSON column metadata and positional-row shape as `--format json`; protocol and
-query failures return deterministic JSON error objects with an appropriate
-HTTP status.
+`POST /` and `POST /query` are equivalent query routes. Each requires one
+decimal `Content-Length` and sends its UTF-8 SQL body through
+`SharedDatabase::query`. Successful responses use the same compact JSON column
+metadata and positional-row shape as `--format json`; protocol and query
+failures return deterministic JSON error objects with an appropriate HTTP
+status. Targets are exact, so a query string or any other suffix is rejected.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`

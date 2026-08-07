@@ -84,10 +84,10 @@ impl StdError for HttpQueryError {
 
 /// Handles one strict, bounded HTTP/1.1 exchange.
 ///
-/// `POST /query` requires exactly one decimal `Content-Length`. Its body must
-/// be UTF-8 SQL and is passed to [`SharedDatabase::query`], which accepts
-/// exactly one read-only statement. A successful query response uses the same
-/// JSON result shape as the batch JSON formatter.
+/// `POST /` and `POST /query` require exactly one decimal `Content-Length`.
+/// Their body must be UTF-8 SQL and is passed to [`SharedDatabase::query`],
+/// which accepts exactly one read-only statement. A successful query response
+/// uses the same JSON result shape as the batch JSON formatter.
 ///
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
@@ -603,10 +603,10 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
         .into());
     }
     match (method, target) {
-        (b"POST", b"/query") => Ok(RequestKind::Query),
+        (b"POST", b"/" | b"/query") => Ok(RequestKind::Query),
         (b"GET", b"/ping") => Ok(RequestKind::Ping),
         (b"GET", b"/ready") => Ok(RequestKind::Ready),
-        (_, b"/query") => Err(RequestFailure::with_headers(
+        (_, b"/" | b"/query") => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
             "method must be POST",
             &[b"Allow: POST\r\n"],
@@ -625,7 +625,7 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
         )
         .into()),
         (b"POST", _) => {
-            Err(RequestFailure::new(Status::NOT_FOUND, "request target must be /query").into())
+            Err(RequestFailure::new(Status::NOT_FOUND, "request target must be / or /query").into())
         }
         (b"GET", _) => Err(RequestFailure::new(
             Status::NOT_FOUND,
@@ -634,7 +634,7 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
         .into()),
         _ => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
-            "method must be POST for /query or GET for /ping or /ready",
+            "method must be POST for / or /query or GET for /ping or /ready",
             &[b"Allow: GET, POST\r\n"],
         )
         .into()),

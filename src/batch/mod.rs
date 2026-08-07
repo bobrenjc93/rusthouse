@@ -17,7 +17,10 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use engine::{DEFAULT_MAX_QUERY_RESULT_BYTES, Database, StatementResult};
-use format::{TableWriteError, write_csv, write_json, write_table_with_affixes, write_tsv};
+use format::{
+    TableWriteError, write_csv, write_json, write_json_compact_each_row, write_table_with_affixes,
+    write_tsv,
+};
 
 /// Default maximum SQL batch size accepted from standard input.
 ///
@@ -49,6 +52,8 @@ pub enum BatchError {
     WriteTsv(io::Error),
     /// Writing newline-delimited JSON output failed.
     WriteJson(io::Error),
+    /// Writing JSONCompactEachRow output failed.
+    WriteJsonCompactEachRow(io::Error),
 }
 
 impl fmt::Display for BatchError {
@@ -71,6 +76,10 @@ impl fmt::Display for BatchError {
             Self::Write(error) => write!(formatter, "could not write CSV to stdout: {error}"),
             Self::WriteTsv(error) => write!(formatter, "could not write TSV to stdout: {error}"),
             Self::WriteJson(error) => write!(formatter, "could not write JSON to stdout: {error}"),
+            Self::WriteJsonCompactEachRow(error) => write!(
+                formatter,
+                "could not write JSONCompactEachRow to stdout: {error}"
+            ),
         }
     }
 }
@@ -82,7 +91,8 @@ impl StdError for BatchError {
             | Self::WriteTable(error)
             | Self::Write(error)
             | Self::WriteTsv(error)
-            | Self::WriteJson(error) => Some(error),
+            | Self::WriteJson(error)
+            | Self::WriteJsonCompactEachRow(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Sql(error) => Some(error),
             Self::InputLimitExceeded { .. } | Self::TableOutputLimitExceeded { .. } => None,
@@ -175,12 +185,40 @@ pub fn run_json_batch_with_limit(
     run_batch_with_limit(input, output, max_input_bytes, BatchOutputFormat::Json)
 }
 
+/// Reads one bounded SQL batch to EOF and emits JSONCompactEachRow.
+///
+/// Setup and mutation statements are silent. Every row from every query result
+/// is emitted as one positional JSON array followed by a line feed. Empty query
+/// results emit no bytes.
+pub fn run_json_compact_each_row_batch(
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), BatchError> {
+    run_json_compact_each_row_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
+}
+
+/// Executes the JSONCompactEachRow batch protocol with an explicit input byte
+/// limit.
+pub fn run_json_compact_each_row_batch_with_limit(
+    input: impl Read,
+    output: impl Write,
+    max_input_bytes: usize,
+) -> Result<(), BatchError> {
+    run_batch_with_limit(
+        input,
+        output,
+        max_input_bytes,
+        BatchOutputFormat::JsonCompactEachRow,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BatchOutputFormat {
     Table,
     Csv,
     Tsv,
     Json,
+    JsonCompactEachRow,
 }
 
 fn run_batch_with_limit(
@@ -233,6 +271,10 @@ fn run_batch_with_limit(
                 BatchOutputFormat::Json => {
                     write_json(&mut output, &query).map_err(BatchError::WriteJson)?;
                     output.write_all(b"\n").map_err(BatchError::WriteJson)?;
+                }
+                BatchOutputFormat::JsonCompactEachRow => {
+                    write_json_compact_each_row(&mut output, &query)
+                        .map_err(BatchError::WriteJsonCompactEachRow)?;
                 }
             }
         }
@@ -340,6 +382,37 @@ mod tests {
         };
         assert_eq!(source.kind(), io::ErrorKind::Other);
         assert_eq!(output.written, 32);
+    }
+
+    #[test]
+    fn json_compact_each_row_batch_streams_empty_and_multiple_results() {
+        let input = b"CREATE TABLE t (n Int64);\n\
+            SELECT n FROM t;\n\
+            INSERT INTO t VALUES (2), (1);\n\
+            SELECT n FROM t ORDER BY n;\n\
+            SELECT MIN(n) AS missing FROM t WHERE n < 0;\n";
+        let mut output = Vec::new();
+
+        run_json_compact_each_row_batch(&input[..], &mut output).expect("batch succeeds");
+
+        assert_eq!(output, b"[1]\n[2]\n[null]\n");
+    }
+
+    #[test]
+    fn json_compact_each_row_batch_preserves_typed_short_writer_failures() {
+        let mut output = FailAfterBytes {
+            remaining: 6,
+            written: 0,
+        };
+
+        let error = run_json_compact_each_row_batch(&b"SELECT 'escaped' AS text;"[..], &mut output)
+            .expect_err("writer stops during the JSONCompactEachRow result");
+
+        let BatchError::WriteJsonCompactEachRow(source) = error else {
+            panic!("expected a typed JSONCompactEachRow write error");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::Other);
+        assert_eq!(output.written, 6);
     }
 
     #[test]
