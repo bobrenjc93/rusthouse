@@ -24,7 +24,8 @@ The early implementation should favor Rust's standard library and a small depend
 
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
-multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
+multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
+comparisons with unary `NOT`, `AND`, and `OR`,
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
@@ -85,10 +86,12 @@ LIMIT-reduced Cartesian row, scalar-value, and estimated byte counts are all
 checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison predicates as regular `SELECT`. Rows are filtered before
-unique tuples are retained in deterministic first-seen order. Distinct tuples
-are collected under the grouped-query cap before `LIMIT` is applied, and the
-limited output remains subject to the normal result caps.
+composable comparison predicates, including unary `NOT`, as regular `SELECT`.
+`NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
+are filtered before unique tuples are retained in deterministic first-seen
+order. Distinct tuples are collected under the grouped-query cap before
+`LIMIT` is applied, and the limited output remains subject to the normal result
+caps.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
@@ -185,6 +188,8 @@ lazy and bounds all `INSERT` ASTs in a batch to 100,000
 rows and 1,000,000 scalar values. A separate cumulative 100,000-item limit
 covers `CREATE` columns plus `SELECT`, `GROUP BY`, and `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
+Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
+combined levels of parenthesized or unary-`NOT` nesting.
 Every statement shares one in-memory catalog. Successful `CREATE`, `DROP`,
 `TRUNCATE`, and `INSERT` statements are silent, and each `SELECT`, `SHOW
 TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` query is

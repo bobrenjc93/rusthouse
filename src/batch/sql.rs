@@ -225,6 +225,7 @@ pub enum Predicate {
         operator: ComparisonOperator,
         right: Operand,
     },
+    Not(Box<Self>),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -1368,13 +1369,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and_predicate(&mut self) -> Result<Predicate> {
-        let mut predicate = self.parse_predicate_atom()?;
+        let mut predicate = self.parse_not_predicate()?;
         while self.eat_keyword("AND") {
-            let right = self.parse_predicate_atom()?;
+            let right = self.parse_not_predicate()?;
             self.record_predicate_node()?;
             predicate = Predicate::And(Box::new(predicate), Box::new(right));
         }
         Ok(predicate)
+    }
+
+    fn parse_not_predicate(&mut self) -> Result<Predicate> {
+        if !self.eat_keyword("NOT") {
+            return self.parse_predicate_atom();
+        }
+
+        if self.predicate_depth >= MAX_PREDICATE_DEPTH {
+            return self.error(format!(
+                "predicate nesting exceeds limit of {MAX_PREDICATE_DEPTH}"
+            ));
+        }
+        self.predicate_depth += 1;
+        let predicate = self.parse_not_predicate();
+        self.predicate_depth -= 1;
+        let predicate = predicate?;
+        self.record_predicate_node()?;
+        Ok(Predicate::Not(Box::new(predicate)))
     }
 
     fn parse_predicate_atom(&mut self) -> Result<Predicate> {
