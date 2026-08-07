@@ -1,6 +1,6 @@
 use rusthouse::batch::engine::{Database, QueryResult, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{Predicate, Statement, parse};
+use rusthouse::batch::sql::{ComparisonOperator, Operand, Predicate, Statement, parse};
 use rusthouse::batch::value::{DataType, Value};
 
 fn query(database: &mut Database, sql: &str) -> QueryResult {
@@ -48,6 +48,60 @@ fn parses_regular_and_distinct_prefix_like_without_the_terminal_wildcard() {
             prefix: "yes".to_owned(),
         },
         "not remains usable as a column name before LIKE",
+    );
+    assert_eq!(
+        predicate("SELECT like FROM samples WHERE NOT like = 'a'"),
+        Predicate::Not(Box::new(Predicate::Comparison {
+            left: Operand::Column("like".to_owned()),
+            operator: ComparisonOperator::Equal,
+            right: Operand::Literal(Value::String("a".to_owned())),
+        })),
+        "LIKE remains usable as a column name under unary NOT",
+    );
+    assert_eq!(
+        predicate("SELECT like FROM samples WHERE NOT like LIKE 'a%'"),
+        Predicate::Not(Box::new(Predicate::LikePrefix {
+            column: "like".to_owned(),
+            prefix: "a".to_owned(),
+        })),
+        "a contextual LIKE column can itself use the LIKE operator",
+    );
+}
+
+#[test]
+fn contextual_not_and_like_columns_remain_unambiguous() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, like String, not String); \
+             INSERT INTO samples VALUES \
+             (1, 'a', 'yes-one'), (2, 'b', 'no'), (3, 'b', 'yes-two');",
+        )
+        .expect("setup");
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM samples WHERE NOT like = 'a' ORDER BY id",
+        )
+        .rows,
+        [vec![Value::Int64(2)], vec![Value::Int64(3)]],
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT DISTINCT like FROM samples WHERE NOT like = 'a'",
+        )
+        .rows,
+        [vec![Value::String("b".to_owned())]],
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id FROM samples WHERE not LIKE 'yes%' ORDER BY id",
+        )
+        .rows,
+        [vec![Value::Int64(1)], vec![Value::Int64(3)]],
     );
 }
 

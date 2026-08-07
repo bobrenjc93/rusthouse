@@ -1495,8 +1495,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
-        // `not` remains a valid column name, so a following comparison or LIKE
-        // operator makes this token the left operand rather than unary syntax.
+        // `not` remains a valid column name, so a following comparison operator
+        // makes this token the left operand rather than unary syntax. `like` is
+        // also a valid column name; only `NOT LIKE <String pattern>` is the
+        // infix form with a column named `not`.
         if !self.at_keyword("NOT") || self.next_token_is_predicate_operator() {
             return self.parse_predicate_atom();
         }
@@ -1524,7 +1526,9 @@ impl<'a> Parser<'a> {
             | TokenKind::LessOrEqual
             | TokenKind::Greater
             | TokenKind::GreaterOrEqual => true,
-            TokenKind::Identifier(keyword) => keyword.eq_ignore_ascii_case("LIKE"),
+            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("LIKE") => {
+                matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::String(_))
+            }
             _ => false,
         }
     }
