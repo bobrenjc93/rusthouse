@@ -1029,7 +1029,9 @@ fn literal_result_name_len(value: &Value) -> usize {
         Value::Float64(value) => float64_result_name_len(*value),
         Value::Bool(true) => 4,
         Value::Bool(false) => 5,
-        Value::Null(_) => 4,
+        Value::Null(data_type) => "CAST(NULL AS )"
+            .len()
+            .saturating_add(data_type.as_str().len()),
     }
 }
 
@@ -1067,13 +1069,14 @@ fn float64_result_name_len(value: f64) -> usize {
 
 fn validate_literal_select_value(value: &Value) -> Result<()> {
     match value {
-        Value::Null(_) => Err(Error::InvalidQuery(
-            "literal SELECT does not support NULL".to_owned(),
-        )),
         Value::Float64(value) if !value.is_finite() => Err(Error::InvalidQuery(
             "literal SELECT Float64 must be finite".to_owned(),
         )),
-        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) | Value::String(_) => Ok(()),
+        Value::Null(_)
+        | Value::Int64(_)
+        | Value::Float64(_)
+        | Value::Bool(_)
+        | Value::String(_) => Ok(()),
     }
 }
 
@@ -1091,9 +1094,8 @@ fn literal_result_name(value: &Value) -> String {
             name.push('\'');
             name
         }
-        Value::Null(_) | Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => {
-            value.as_display_string()
-        }
+        Value::Null(data_type) => format!("CAST(NULL AS {})", data_type.as_str()),
+        Value::Int64(_) | Value::Float64(_) | Value::Bool(_) => value.as_display_string(),
     }
 }
 
