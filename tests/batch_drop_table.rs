@@ -13,18 +13,27 @@ fn query(database: &mut Database, sql: &str) -> QueryResult {
 
 #[test]
 fn parses_exact_drop_table_syntax_with_optional_semicolon_and_casing() {
-    for (sql, expected_name, if_exists) in [
-        ("DROP TABLE events", "events", false),
-        ("drop table Events;", "Events", false),
-        ("DROP TABLE IF EXISTS events", "events", true),
-        ("drop table if exists Events;", "Events", true),
-        ("DrOp TaBlE iF eXiStS EVENTS", "EVENTS", true),
+    for (sql, expected_name) in [
+        ("DROP TABLE events", "events"),
+        ("drop table Events;", "Events"),
     ] {
         assert_eq!(
             parse(sql).expect("valid DROP TABLE"),
             [Statement::DropTable {
                 name: expected_name.to_owned(),
-                if_exists,
+            }]
+        );
+    }
+
+    for (sql, expected_name) in [
+        ("DROP TABLE IF EXISTS events", "events"),
+        ("drop table if exists Events;", "Events"),
+        ("DrOp TaBlE iF eXiStS EVENTS", "EVENTS"),
+    ] {
+        assert_eq!(
+            parse(sql).expect("valid conditional DROP TABLE"),
+            [Statement::DropTableIfExists {
+                name: expected_name.to_owned(),
             }]
         );
     }
@@ -33,8 +42,27 @@ fn parses_exact_drop_table_syntax_with_optional_semicolon_and_casing() {
         parse("DROP TABLE IF").expect("IF remains a legal table name"),
         [Statement::DropTable {
             name: "IF".to_owned(),
-            if_exists: false,
         }]
+    );
+}
+
+#[test]
+fn original_drop_table_ast_shape_remains_directly_executable() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64);")
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database
+            .execute_statement(Statement::DropTable {
+                name: "EVENTS".to_owned(),
+            })
+            .expect("the original public AST shape remains supported"),
+        StatementResult::Command {
+            tag: "DROP TABLE",
+            affected_rows: 0,
+        }
     );
 }
 

@@ -232,9 +232,11 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
                 statement: "CREATE TABLE",
             })
         }
-        Statement::DropTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
-            statement: "DROP TABLE",
-        }),
+        Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => {
+            Err(SharedDatabaseError::ReadOnlyStatementRequired {
+                statement: "DROP TABLE",
+            })
+        }
         Statement::RenameTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "RENAME TABLE",
         }),

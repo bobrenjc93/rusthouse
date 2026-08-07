@@ -452,12 +452,15 @@ impl Database {
                     affected_rows: 0,
                 })
             }
-            Statement::DropTable { name, if_exists } => {
-                if if_exists {
-                    self.catalog.drop_table_if_exists(&name);
-                } else {
-                    self.catalog.drop_table(&name)?;
-                }
+            Statement::DropTable { name } => {
+                self.catalog.drop_table(&name)?;
+                Ok(StatementResult::Command {
+                    tag: "DROP TABLE",
+                    affected_rows: 0,
+                })
+            }
+            Statement::DropTableIfExists { name } => {
+                self.catalog.drop_table_if_exists(&name);
                 Ok(StatementResult::Command {
                     tag: "DROP TABLE",
                     affected_rows: 0,
@@ -531,6 +534,7 @@ impl Database {
             Statement::CreateTable { .. }
             | Statement::CreateTableIfNotExists { .. }
             | Statement::DropTable { .. }
+            | Statement::DropTableIfExists { .. }
             | Statement::RenameTable { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
@@ -919,7 +923,7 @@ impl Database {
 fn statement_name(statement: &Statement) -> &'static str {
     match statement {
         Statement::CreateTable { .. } | Statement::CreateTableIfNotExists { .. } => "CREATE TABLE",
-        Statement::DropTable { .. } => "DROP TABLE",
+        Statement::DropTable { .. } | Statement::DropTableIfExists { .. } => "DROP TABLE",
         Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } => "INSERT",

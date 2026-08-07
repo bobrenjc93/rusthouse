@@ -49,8 +49,10 @@ pub enum Statement {
     },
     DropTable {
         name: String,
-        /// Suppress the missing-table error for `DROP TABLE IF EXISTS`.
-        if_exists: bool,
+    },
+    /// `DROP TABLE IF EXISTS`; a missing case-insensitive name is a no-op.
+    DropTableIfExists {
+        name: String,
     },
     RenameTable {
         source: String,
@@ -837,7 +839,11 @@ impl<'a> Parser<'a> {
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
             return self.error("unexpected trailing input after DROP TABLE");
         }
-        Ok(Statement::DropTable { name, if_exists })
+        if if_exists {
+            Ok(Statement::DropTableIfExists { name })
+        } else {
+            Ok(Statement::DropTable { name })
+        }
     }
 
     fn parse_rename(&mut self) -> Result<Statement> {
