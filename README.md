@@ -162,11 +162,12 @@ column names and strings use ClickHouse's backslash escapes.
 A table-backed `SELECT` inspects at most 1,000,000 source rows by default. This
 scanned-row limit is checked against the full source table before matching-row
 indices are allocated, so `WHERE` selectivity and `LIMIT` do not reduce it;
-each `UNION ALL` operand has its own source scan. It is distinct from the
-10,000-row output limit, which applies after filtering, grouping, ordering,
-and `LIMIT`. Query output is also checked before cloning against a limit of
-250,000 values and an estimated 16 MiB. Grouped queries additionally allow
-100,000 groups and bound grouped keys to 500,000 cells and an estimated 32 MiB. Their
+each `UNION ALL` operand and each `CROSS JOIN` input has its own source scan.
+It is distinct from the 10,000-row output limit, which applies after filtering,
+grouping, ordering, and `LIMIT`. Query output is also checked before cloning
+against a limit of 250,000 values and an estimated 16 MiB. Grouped queries
+additionally allow 100,000 groups and bound grouped keys to 500,000 cells and
+an estimated 32 MiB. Their
 grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
 estimated 32 MiB limits, including cloned string extrema. The collecting

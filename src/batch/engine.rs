@@ -42,9 +42,9 @@ pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub struct QueryResultLimits {
     /// Maximum rows in the source table of one table-backed `SELECT`.
     ///
-    /// This is checked before predicate evaluation and matching-row index
-    /// allocation. `WHERE` and `LIMIT` therefore cannot reduce the charged
-    /// scan, and each `UNION ALL` operand is checked independently.
+    /// This is checked before row inspection and matching-row index allocation.
+    /// `WHERE` and `LIMIT` therefore cannot reduce the charged scan. Each
+    /// `UNION ALL` operand and each `CROSS JOIN` input is checked independently.
     pub max_scan_rows: usize,
     pub max_rows: usize,
     pub max_values: usize,
@@ -727,11 +727,7 @@ impl Database {
         // The source bound is deliberately independent of WHERE and LIMIT:
         // both are evaluated only after the executor has admitted the full
         // source scan. Check before allocating the matching-row index vector.
-        enforce_resource_limit(
-            "SELECT scanned rows",
-            table.row_count(),
-            query_result_limits.max_scan_rows,
-        )?;
+        enforce_select_scan_limit(table, query_result_limits)?;
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
@@ -827,6 +823,8 @@ impl Database {
     ) -> Result<QueryResult> {
         let left = self.catalog.table(&cross_join.left_table)?;
         let right = self.catalog.table(&cross_join.right_table)?;
+        enforce_select_scan_limit(left, query_result_limits)?;
+        enforce_select_scan_limit(right, query_result_limits)?;
         let columns = left
             .schema()
             .iter()
@@ -1936,6 +1934,14 @@ fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> 
     } else {
         Ok(())
     }
+}
+
+fn enforce_select_scan_limit(table: &Table, limits: QueryResultLimits) -> Result<()> {
+    enforce_resource_limit(
+        "SELECT scanned rows",
+        table.row_count(),
+        limits.max_scan_rows,
+    )
 }
 
 fn execute_grouped<'a>(
