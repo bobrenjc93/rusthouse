@@ -282,14 +282,18 @@ metadata and positional-row shape as `--format json`; protocol and query
 failures return deterministic JSON error objects with an appropriate HTTP
 status. Targets are exact, so a query string or any other suffix is rejected.
 
-Either query route also accepts one optional
-`X-ClickHouse-Format: JSONCompactEachRow` header. When present, a successful
-response has content type `application/json` and contains one positional JSON
-array per row, each followed by a line feed; column metadata is omitted and an
-empty result has an empty body. Header names are case-insensitive, but the
-format value must use that exact spelling. Duplicate format headers and all
-other format values receive deterministic `400 Bad Request` JSON errors. When
-the header is absent, the existing JSON response shape is unchanged.
+Either query route also accepts one optional `X-ClickHouse-Format` header with
+the exact value `CSVWithNames` or `JSONCompactEachRow`. `CSVWithNames` responses
+have content type `text/csv; charset=utf-8` and use the same header, typed-value,
+`NULL`, and field-escaping behavior as `--format csv`; an empty result still
+contains its column-name header. `JSONCompactEachRow` responses have content
+type `application/json` and contain one positional JSON array per row, each
+followed by a line feed; column metadata is omitted and an empty result has an
+empty body. Header names are case-insensitive, but format values are
+case-sensitive and must use one of those exact spellings. Duplicate format
+headers and all other format values receive deterministic `400 Bad Request`
+JSON errors. When the header is absent, the existing JSON response shape is
+unchanged.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
