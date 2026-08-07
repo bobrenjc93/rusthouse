@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use rusthouse::batch::engine::Database;
+use rusthouse::batch::engine::{Database, QueryResultLimits};
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
@@ -80,6 +80,29 @@ fn assert_ok_health_response(response: &[u8]) {
         "HTTP/1.1 200 OK",
         "text/plain; charset=utf-8",
         b"Ok.\n",
+    );
+}
+
+#[test]
+fn query_reports_the_configured_scan_limit_over_http() {
+    let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE values_table (value Int64); \
+             INSERT INTO values_table VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT value FROM values_table WHERE value = 3 LIMIT 1;"),
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"SELECT scanned rows requires at least 3, exceeding the limit of 2"}"#,
     );
 }
 
