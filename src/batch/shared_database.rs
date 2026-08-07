@@ -495,7 +495,9 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::TruncateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "TRUNCATE TABLE",
         }),
-        Statement::Delete { .. } | Statement::DeleteComparison { .. } => {
+        Statement::Delete { .. }
+        | Statement::DeleteComparison { .. }
+        | Statement::DeleteConjunction { .. } => {
             Err(SharedDatabaseError::ReadOnlyStatementRequired {
                 statement: "DELETE",
             })

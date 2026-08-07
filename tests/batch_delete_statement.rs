@@ -1,6 +1,6 @@
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
-use rusthouse::batch::sql::{ComparisonOperator, Statement, parse};
+use rusthouse::batch::sql::{ComparisonOperator, DeleteComparisonPredicate, Statement, parse};
 use rusthouse::batch::storage::Column;
 use rusthouse::batch::value::{DataType, Value};
 use rusthouse::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
@@ -86,6 +86,26 @@ fn parses_exact_comparison_delete_for_every_operator_and_literal_type() {
 }
 
 #[test]
+fn parses_exactly_two_delete_comparisons_joined_by_and() {
+    assert_eq!(
+        parse("DELETE FROM Events WHERE id >= 2 AND label <> 'skip';"),
+        Ok(vec![Statement::DeleteConjunction {
+            table: "Events".to_owned(),
+            first: DeleteComparisonPredicate {
+                column: "id".to_owned(),
+                operator: ComparisonOperator::GreaterOrEqual,
+                literal: Value::Int64(2),
+            },
+            second: DeleteComparisonPredicate {
+                column: "label".to_owned(),
+                operator: ComparisonOperator::NotEqual,
+                literal: Value::String("skip".to_owned()),
+            },
+        }])
+    );
+}
+
+#[test]
 fn rejects_every_non_exact_delete_shape() {
     for sql in [
         "DELETE events WHERE id = 1",
@@ -96,9 +116,26 @@ fn rejects_every_non_exact_delete_shape() {
         "DELETE FROM events WHERE 1 < id",
         "DELETE FROM events WHERE id = other_id",
         "DELETE FROM events WHERE id = NULL",
-        "DELETE FROM events WHERE id = 1 AND active = true",
         "DELETE FROM events WHERE id = 1 ORDER BY id",
         "DELETE FROM events WHERE id = 1 LIMIT 1",
+    ] {
+        assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
+    }
+}
+
+#[test]
+fn rejects_malformed_or_extra_delete_predicates() {
+    for sql in [
+        "DELETE FROM events WHERE id = 1 AND",
+        "DELETE FROM events WHERE id = 1 AND active",
+        "DELETE FROM events WHERE id = 1 AND active == true",
+        "DELETE FROM events WHERE id = 1 AND 2 = id",
+        "DELETE FROM events WHERE id = 1 AND active = other_column",
+        "DELETE FROM events WHERE id = 1 AND active = NULL",
+        "DELETE FROM events WHERE id = 1 AND AND active = true",
+        "DELETE FROM events WHERE id = 1 OR active = true",
+        "DELETE FROM events WHERE id = 1 AND active = true AND label = 'x'",
+        "DELETE FROM events WHERE (id = 1) AND active = true",
     ] {
         assert!(matches!(parse(sql), Err(Error::Sql { .. })), "{sql}");
     }
@@ -166,6 +203,43 @@ fn executes_every_comparison_operator_across_every_physical_type() {
                 "{data_type} {operator}"
             );
         }
+    }
+}
+
+#[test]
+fn conjunction_deletes_only_rows_matching_mixed_typed_columns() {
+    let cases = [
+        ("id >= 2 AND score < 4.0", &[1, 4][..], "Int64 and Float64"),
+        (
+            "active = true AND label != 'alpha'",
+            &[1, 2, 4][..],
+            "Bool and String",
+        ),
+    ];
+
+    for (predicate, remaining_ids, description) in cases {
+        let mut database = Database::new();
+        database
+            .execute(
+                "CREATE TABLE Events (id Int64, score Float64, active Bool, label String); \
+                 INSERT INTO Events VALUES \
+                    (1, 1.5, true, 'alpha'), \
+                    (2, 2.5, false, 'beta'), \
+                    (3, 3.5, true, 'gamma'), \
+                    (4, 4.5, false, 'zulu');",
+            )
+            .expect("setup succeeds");
+
+        let affected_rows = 4 - remaining_ids.len();
+        assert_eq!(
+            database.execute(&format!("DELETE FROM events WHERE {predicate}")),
+            Ok(vec![StatementResult::Command {
+                tag: "DELETE",
+                affected_rows,
+            }]),
+            "{description}"
+        );
+        assert_eq!(ids(&database, "events"), remaining_ids, "{description}");
     }
 }
 
@@ -306,6 +380,87 @@ fn invalid_types_and_scan_limit_errors_never_delete_rows() {
 }
 
 #[test]
+fn conjunction_validation_and_scan_failures_never_delete_rows() {
+    let limits = QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    };
+    let mut database = Database::with_query_result_limits(limits);
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, score Float64, active Bool); \
+             INSERT INTO events VALUES \
+                (1, 1.5, true), (2, 2.5, false), (3, 3.5, true);",
+        )
+        .expect("setup succeeds");
+
+    let failures = [
+        (
+            "DELETE FROM events WHERE id = true AND active = true",
+            Error::TypeMismatch {
+                context: "WHERE comparison".to_owned(),
+                expected: "Int64".to_owned(),
+                actual: "Bool".to_owned(),
+            },
+        ),
+        (
+            "DELETE FROM events WHERE id >= 2 AND absent = true",
+            Error::ColumnNotFound {
+                table: "events".to_owned(),
+                column: "absent".to_owned(),
+            },
+        ),
+        (
+            "DELETE FROM events WHERE id >= 2 AND active = 1",
+            Error::TypeMismatch {
+                context: "WHERE comparison".to_owned(),
+                expected: "Bool".to_owned(),
+                actual: "Int64".to_owned(),
+            },
+        ),
+        (
+            "DELETE FROM events WHERE id >= 2 AND active = true",
+            Error::ResourceLimitExceeded {
+                resource: "DELETE scanned rows",
+                actual: 3,
+                max: 2,
+            },
+        ),
+    ];
+
+    for (sql, error) in failures {
+        assert_eq!(database.execute(sql), Err(error), "{sql}");
+        assert_eq!(ids(&database, "events"), [1, 2, 3], "{sql}");
+    }
+
+    assert_eq!(
+        database.execute_statement(Statement::DeleteConjunction {
+            table: "events".to_owned(),
+            first: DeleteComparisonPredicate {
+                column: "id".to_owned(),
+                operator: ComparisonOperator::GreaterOrEqual,
+                literal: Value::Int64(2),
+            },
+            second: DeleteComparisonPredicate {
+                column: "score".to_owned(),
+                operator: ComparisonOperator::Less,
+                literal: Value::Float64(f64::NAN),
+            },
+        }),
+        Err(Error::InvalidQuery(
+            "WHERE comparison Float64 literals must be finite".to_owned()
+        ))
+    );
+    assert_eq!(ids(&database, "events"), [1, 2, 3]);
+
+    assert!(matches!(
+        database.execute("DELETE FROM events WHERE id >= 2 AND active = true AND score > 0.0"),
+        Err(Error::Sql { .. })
+    ));
+    assert_eq!(ids(&database, "events"), [1, 2, 3]);
+}
+
+#[test]
 fn original_public_equality_delete_ast_shape_remains_directly_executable() {
     let mut database = Database::new();
     database
@@ -336,6 +491,7 @@ fn insert_only_execution_rejects_delete_without_mutation() {
     for sql in [
         "DELETE FROM events WHERE id = 1",
         "DELETE FROM events WHERE id >= 1",
+        "DELETE FROM events WHERE id >= 1 AND id < 2",
     ] {
         assert_eq!(
             database.execute_insert_batch(sql),
@@ -359,7 +515,7 @@ fn shared_database_executes_delete_under_its_write_lock() {
         .expect("setup succeeds");
 
     assert_eq!(
-        deleting_handle.execute("DELETE FROM EVENTS WHERE label <> 'keep';"),
+        deleting_handle.execute("DELETE FROM EVENTS WHERE id >= 2 AND label <> 'keep';"),
         Ok(vec![StatementResult::Command {
             tag: "DELETE",
             affected_rows: 2,
@@ -381,7 +537,7 @@ fn shared_database_executes_delete_under_its_write_lock() {
         [vec![Value::Int64(1), Value::String("keep".to_owned())]]
     );
     assert_eq!(
-        database.query("DELETE FROM events WHERE id >= 1"),
+        database.query("DELETE FROM events WHERE id >= 1 AND label = 'keep'"),
         Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "DELETE",
         })
