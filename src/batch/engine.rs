@@ -390,26 +390,31 @@ impl Database {
         }
 
         let mut incoming_rows_by_table = HashMap::<String, usize>::new();
-        for statement in &statements {
-            let Statement::Insert { table, rows } = statement else {
+        let mut prepared = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let Statement::Insert {
+                table,
+                columns,
+                rows,
+            } = statement
+            else {
                 unreachable!("non-INSERT statements were rejected")
             };
-            let target = self.catalog.table(table)?;
+            let target = self.catalog.table(&table)?;
+            let rows = target.prepare_insert_rows(columns.as_deref(), rows)?;
             let cumulative_rows = incoming_rows_by_table
                 .entry(table.to_ascii_lowercase())
                 .or_default();
             *cumulative_rows = cumulative_rows.saturating_add(rows.len());
             target.validate_row_capacity(*cumulative_rows)?;
-            for row in rows {
+            for row in &rows {
                 target.validate_row(row)?;
             }
+            prepared.push((table, rows));
         }
 
-        let mut results = Vec::with_capacity(statements.len());
-        for statement in statements {
-            let Statement::Insert { table, rows } = statement else {
-                unreachable!("non-INSERT statements were rejected")
-            };
+        let mut results = Vec::with_capacity(prepared.len());
+        for (table, rows) in prepared {
             let affected_rows = rows.len();
             self.catalog
                 .table_mut(&table)
@@ -537,7 +542,15 @@ impl Database {
                     affected_rows,
                 })
             }
-            Statement::Insert { table, rows } => {
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
+                let rows = self
+                    .catalog
+                    .table(&table)?
+                    .prepare_insert_rows(columns.as_deref(), rows)?;
                 let affected_rows = rows.len();
                 let target = self.catalog.table_mut(&table)?;
                 target.insert_rows(rows)?;
@@ -3332,10 +3345,12 @@ mod tests {
         let statements = vec![
             Statement::Insert {
                 table: "events".to_owned(),
+                columns: None,
                 rows: vec![vec![Value::Int64(1)]],
             },
             Statement::Insert {
                 table: "samples".to_owned(),
+                columns: None,
                 rows: vec![vec![Value::Float64(f64::INFINITY)]],
             },
         ];
