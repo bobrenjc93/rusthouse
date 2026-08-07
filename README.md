@@ -270,19 +270,27 @@ Read-only API misuse and lock poisoning are reported as distinct typed errors.
 ## HTTP query, health, and metrics exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. All five supported routes require a nonempty
-`Host`, reject transfer encoding (including chunked requests), and return `417
-Expectation Failed` for `Expect` instead of waiting for a body whose sender
-may be awaiting an interim response.
+exchange without opening a listener. Every accepted request form requires a
+nonempty `Host`, rejects transfer encoding (including chunked requests), and
+returns `417 Expectation Failed` for `Expect` instead of waiting for a body
+whose sender may be awaiting an interim response.
 
 `POST /` and `POST /query` are equivalent query routes. Each requires one
 decimal `Content-Length` and sends its UTF-8 SQL body through
-`SharedDatabase::query`. Successful responses use the same compact JSON column
-metadata and positional-row shape as `--format json`; protocol and query
-failures return deterministic JSON error objects with an appropriate HTTP
-status. Targets are exact, so a query string or any other suffix is rejected.
+`SharedDatabase::query`. The standard ClickHouse-style
+`GET /?query=<percent-encoded SQL>` form does the same with exactly one query
+parameter and no body (`Content-Length` may be omitted or be zero). Its value
+uses form-style decoding: each `%HH` escape becomes one byte and `+` becomes a
+space, followed by strict UTF-8 validation. Malformed escapes, invalid UTF-8,
+and an unencoded `&` introducing any extra parameter are rejected. The decoded
+SQL is subject to the same SQL byte limit as a POST body, and all query forms
+use the read-only, exactly-one-statement `SharedDatabase::query` path.
+Successful responses use the same compact JSON column metadata and
+positional-row shape as `--format json`; protocol and query failures return
+deterministic JSON error objects with an appropriate HTTP status. All other
+targets and query-string shapes are rejected.
 
-Either query route also accepts one optional `X-ClickHouse-Format` header with
+Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames` or `JSONCompactEachRow`. `CSVWithNames` responses
 have content type `text/csv; charset=utf-8` and use the same header, typed-value,
 `NULL`, and field-escaping behavior as `--format csv`; an empty result still
@@ -321,12 +329,15 @@ never waits for a writer; lock contention and poisoning return the same
 deterministic `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
-SQL body, and 16 MiB for the complete response including headers. Header limits
-apply to all routes, as does the complete-response limit. The full response is
-prepared and checked before anything is written. Call
-`handle_http_query_with_limits` with `HttpQueryLimits` to set smaller embedding
-limits. This API deliberately owns only one exchange; listener, connection,
-timeout, and shutdown lifecycle remain the embedding application's concern.
+POST body or decoded GET SQL, and 16 MiB for the complete response including
+headers. Header limits apply to all routes, as does the complete-response
+limit. The full response is prepared and checked before anything is written.
+Call `handle_http_query_with_limits` with `HttpQueryLimits` to set smaller
+embedding limits. Each call reads exactly one header block and, only for a POST
+query, exactly its declared body; it emits at most one final `Connection: close`
+response and never reads or handles a subsequent request. This single-exchange
+API deliberately leaves listener, connection, timeout, and shutdown lifecycle
+to the embedding application.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

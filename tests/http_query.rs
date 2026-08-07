@@ -447,6 +447,132 @@ fn root_query_returns_the_existing_json_result_shape() {
 }
 
 #[test]
+fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
+    let database = SharedDatabase::default();
+    let request =
+        b"GET /?query=SELECT+%27snow+%E9%9B%AA%27+AS+label%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    assert_eq!(
+        exchange(&database, request),
+        concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/json\r\n",
+            "Content-Length: 68\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            r#"{"columns":[{"name":"label","type":"String"}],"rows":[["snow 雪"]]}"#,
+        )
+        .as_bytes(),
+    );
+}
+
+#[test]
+fn url_encoded_get_query_consumes_exactly_one_wire_exchange() {
+    let database = SharedDatabase::default();
+    const QUERY: &[u8] = b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut wire = QUERY.to_vec();
+    wire.extend_from_slice(b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let mut input = Cursor::new(wire);
+    let mut response = Vec::new();
+
+    handle_http_query(&database, &mut input, &mut response).unwrap();
+
+    assert_eq!(input.position(), QUERY.len() as u64);
+    assert_response(
+        &response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"1","type":"Int64"}],"rows":[[1]]}"#,
+    );
+}
+
+#[test]
+fn url_encoded_get_query_retains_bearer_authentication_and_format_negotiation() {
+    let database = SharedDatabase::default();
+    let unauthorized = b"GET /?query=SELECT+%2B7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Format: CSVWithNames\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let authorized = b"GET /?query=SELECT+%2B7+AS+value%3B HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\nX-ClickHouse-Format: CSVWithNames\r\n\r\n";
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", authorized),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"value\n7\n",
+    );
+}
+
+#[test]
+fn url_encoded_get_query_rejects_malformed_encoding_utf8_parameters_and_bodies() {
+    let database = SharedDatabase::default();
+    let cases: &[(&[u8], &str)] = &[
+        (
+            b"GET /?query=SELECT+1% HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"query parameter contains malformed percent encoding"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"query parameter contains malformed percent encoding"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%GG HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"query parameter contains malformed percent encoding"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+%FF HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"SQL query is not valid UTF-8"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B&format=CSV HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            r#"{"error":"GET query target must contain exactly one query parameter"}"#,
+        ),
+        (
+            b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+            r#"{"error":"GET /?query= does not accept a request body"}"#,
+        ),
+    ];
+
+    for (request, body) in cases {
+        assert_response(
+            &exchange(&database, request),
+            "HTTP/1.1 400 Bad Request",
+            body,
+        );
+    }
+}
+
+#[test]
+fn url_encoded_get_query_retains_the_complete_response_limit() {
+    let database = SharedDatabase::default();
+    let request = format!(
+        "GET /?query=SELECT+%27{}%27+AS+value%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "x".repeat(1_000),
+    );
+    let limits = HttpQueryLimits {
+        max_response_bytes: 512,
+        ..HttpQueryLimits::default()
+    };
+    let mut response = Vec::new();
+
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request.as_bytes()),
+        &mut response,
+        limits,
+    )
+    .unwrap();
+
+    assert!(response.len() <= limits.max_response_bytes);
+    assert_response(
+        &response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
 fn both_query_routes_stream_typed_json_compact_each_row_and_empty_results() {
     let database = SharedDatabase::default();
     database
@@ -1371,6 +1497,23 @@ fn request_header_count_header_bytes_and_sql_body_are_bounded() {
         "HTTP/1.1 413 Payload Too Large",
         r#"{"error":"request body exceeds configured byte limit"}"#,
     );
+
+    response.clear();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(b"GET /?query=SELECT+1%3B HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: 8,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"SQL query exceeds configured byte limit"}"#,
+    );
 }
 
 #[test]
@@ -1566,6 +1709,14 @@ fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
 
     assert_response(
         &exchange(&database, &request_for_target("/", b"DROP TABLE retained;")),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /?query=DROP+TABLE+retained%3B HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
