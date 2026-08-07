@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::batch::error::{Error, Result};
 use crate::batch::storage::{
     ColumnDef, is_reserved_column_name, is_sql_identifier_continue, is_sql_identifier_start,
@@ -282,10 +284,28 @@ pub enum Predicate {
     Or(Box<Self>, Box<Self>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Operand {
     Column(String),
+    /// A column name shared by comparisons produced from one lowered `IN`
+    /// atom. This is semantically identical to [`Self::Column`], but prevents
+    /// the source identifier bytes from being copied into every list leaf.
+    SharedColumn(Arc<str>),
     Literal(Value),
+}
+
+impl PartialEq for Operand {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Column(left), Self::Column(right)) => left == right,
+            (Self::Column(left), Self::SharedColumn(right))
+            | (Self::SharedColumn(right), Self::Column(left)) => left == right.as_ref(),
+            (Self::SharedColumn(left), Self::SharedColumn(right)) => left == right,
+            (Self::Literal(left), Self::Literal(right)) => left == right,
+            (Self::Column(_) | Self::SharedColumn(_), Self::Literal(_))
+            | (Self::Literal(_), Self::Column(_) | Self::SharedColumn(_)) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1783,6 +1803,9 @@ impl<'a> Parser<'a> {
                 let lower_bound = Self::next_or_invalid(&mut lexer);
                 Self::token_can_start_literal(&lower_bound.kind)
             }
+            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("IN") => {
+                matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen)
+            }
             _ => false,
         }
     }
@@ -1830,6 +1853,34 @@ impl<'a> Parser<'a> {
                     right: Operand::Literal(upper),
                 }),
             ));
+        }
+        if self.eat_keyword("IN") {
+            let Operand::Column(column) = left else {
+                return self.error("IN left operand must be a column");
+            };
+            self.expect(&TokenKind::LeftParen, "'(' before IN list")?;
+            if self.at(&TokenKind::RightParen) {
+                return self.error("IN list must contain at least one literal");
+            }
+
+            let mut literals = Vec::new();
+            loop {
+                // IN retains every literal until lowering, so each one uses the
+                // cumulative variable-length AST-list budget. Its executable
+                // form adds one equality per literal and one OR after the first.
+                self.reserve_ast_list_item()?;
+                literals.push(self.parse_literal()?);
+                self.record_predicate_node()?;
+                if literals.len() > 1 {
+                    self.record_predicate_node()?;
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RightParen, "')' after IN list")?;
+
+            return Ok(lower_in_predicate(column, literals));
         }
         if self.eat_keyword("LIKE") {
             let Operand::Column(column) = left else {
@@ -2055,6 +2106,36 @@ impl<'a> Parser<'a> {
             message: message.into(),
         })
     }
+}
+
+fn lower_in_predicate(column: String, literals: Vec<Value>) -> Predicate {
+    fn lower(
+        column: &Arc<str>,
+        literals: &mut std::vec::IntoIter<Value>,
+        literal_count: usize,
+    ) -> Predicate {
+        if literal_count == 1 {
+            let Some(literal) = literals.next() else {
+                unreachable!("IN lowering receives the parsed literal count");
+            };
+            return Predicate::Comparison {
+                left: Operand::SharedColumn(Arc::clone(column)),
+                operator: ComparisonOperator::Equal,
+                right: Operand::Literal(literal),
+            };
+        }
+
+        let left_count = literal_count / 2;
+        Predicate::Or(
+            Box::new(lower(column, literals, left_count)),
+            Box::new(lower(column, literals, literal_count - left_count)),
+        )
+    }
+
+    let literal_count = literals.len();
+    debug_assert!(literal_count > 0);
+    let column = Arc::<str>::from(column);
+    lower(&column, &mut literals.into_iter(), literal_count)
 }
 
 pub(crate) fn int64_subtraction_name(column: &str, literal: i64) -> String {

@@ -3665,19 +3665,19 @@ const fn invert_comparison(operator: ComparisonOperator) -> ComparisonOperator {
 }
 
 fn compile_operand(table: &Table, operand: &Operand) -> Result<CompiledOperand> {
-    match operand {
-        Operand::Column(name) => {
-            let index = table.column_index(name)?;
-            Ok(CompiledOperand::Column {
-                index,
-                data_type: table.schema()[index].data_type,
-            })
-        }
+    let name = match operand {
+        Operand::Column(name) => name.as_str(),
+        Operand::SharedColumn(name) => name.as_ref(),
         Operand::Literal(value) => {
             validate_predicate_literal_value(value)?;
-            Ok(CompiledOperand::Literal(value.clone()))
+            return Ok(CompiledOperand::Literal(value.clone()));
         }
-    }
+    };
+    let index = table.column_index(name)?;
+    Ok(CompiledOperand::Column {
+        index,
+        data_type: table.schema()[index].data_type,
+    })
 }
 
 fn validate_predicate_literal_value(value: &Value) -> Result<()> {
