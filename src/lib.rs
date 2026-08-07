@@ -80,8 +80,9 @@ pub use snapshot::{
 };
 #[cfg(unix)]
 pub use snapshot::{
-    Int64TableFileSaveError, Int64TableRleFileSaveError, SnapshotReplaceError,
-    save_int64_table_rle_to_file, save_int64_table_to_file,
+    Int64TableFileSaveError, Int64TablePayloadFileSaveError, Int64TableRleFileSaveError,
+    SnapshotReplaceError, save_int64_table_payload_to_file, save_int64_table_rle_to_file,
+    save_int64_table_to_file,
 };
 mod storage;
 
