@@ -20,7 +20,7 @@ pub use aggregate::{
     AggregateError, AggregateLimits, NullableI64Aggregates, NullableI64Counts, RowSelection,
     aggregate_nullable_i64, count_nullable_i64, min_nullable_i64,
 };
-pub use batch::{SharedDatabase, SharedDatabaseError};
+pub use batch::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 pub use catalog::{
     Catalog, CatalogCsvIngestError, CatalogCsvReaderIngestError, CatalogError, CatalogLimits,
     CatalogSnapshotRestoreError,
