@@ -53,16 +53,17 @@ numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
-`DELETE FROM <table> WHERE <column> = <literal>` removes rows matching one
-typed equality predicate. Table and column lookup are case-insensitive, and
-the literal accepts the same finite `Int64`, `Float64`, `Bool`, and `String`
-forms as `WHERE`. The full source row count is checked against the configured
-scan limit before any row is inspected or changed. Missing names, type errors,
-and scan-limit failures leave the table unchanged; after validation and the
-bounded scan, all matching row indexes are passed to one atomic deletion.
-Other predicates, clauses, and bare `NULL` are not supported by this narrow
-form. A successful command reports its deleted-row count through the library
-API and is silent in formatted CLI output.
+`DELETE FROM <table> WHERE <column> <comparison> <literal>` removes rows
+matching one typed comparison. Supported operators are `=`, `!=`, `<>`, `<`,
+`<=`, `>`, and `>=`; `!=` and `<>` are equivalent. Table and column lookup are
+case-insensitive, and the literal accepts the same finite `Int64`, `Float64`,
+`Bool`, and `String` forms as `WHERE`. The full source row count is checked
+against the configured scan limit before any row is inspected or changed.
+Missing names, type errors, and scan-limit failures leave the table unchanged;
+after validation and the bounded scan, all matching row indexes are passed to
+one atomic deletion. Other predicates, clauses, and bare `NULL` are not
+supported by this narrow form. A successful command reports its deleted-row
+count through the library API and is silent in formatted CLI output.
 
 `INSERT INTO <table> (<columns>) VALUES ...` accepts a complete explicit
 column list in any order. Names resolve case-insensitively, every schema column
@@ -194,16 +195,19 @@ not fail the query. A selected overflow or non-`Int64` argument is a typed error
 
 `SELECT` projections support `CAST(int64_column AS Float64)`,
 `CAST(float64_column AS Int64)`, `CAST(bool_column AS Int64)`, and
-`CAST(int64_column AS Bool)`. Boolean `false` becomes `0` and `true` becomes
-`1`; integer zero becomes `false`, and every nonzero integer, including both
-`Int64` extrema, becomes `true`. Float-to-integer casts truncate finite values
-toward zero and report typed numeric-overflow errors outside the `Int64` range.
+`CAST(int64_column AS Bool)`, plus `CAST(bool_column AS String)`. The String cast
+produces the exact lowercase values `false` and `true`. Boolean `false` becomes
+`0` and `true` becomes `1`; integer zero becomes `false`, and every nonzero
+integer, including both `Int64` extrema, becomes `true`. Float-to-integer casts
+truncate finite values toward zero and report typed numeric-overflow errors
+outside the `Int64` range.
 Add an explicit `AS alias`; otherwise, the result column is named
 `CAST(<column> AS <type>)`. `WHERE`, ordering by the normalized expression or
 its alias, and `LIMIT`/`OFFSET` select rows before conversion. `CAST` projections
 are currently limited to ungrouped queries: they cannot be combined with
-aggregate projections or `GROUP BY`. No other source/target type pairs are
-accepted.
+aggregate projections or `GROUP BY`. The four or five generated `String`
+payload bytes are charged against the result-byte limit before materialization.
+No other source/target type pairs are accepted.
 `LENGTH(string_column)` is another ungrouped scalar projection and returns the
 string's UTF-8 byte length as `Int64` without allocating a transformed string.
 It accepts an optional `AS alias`; otherwise, the result column is named
@@ -321,7 +325,7 @@ TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
 column names and strings use ClickHouse's backslash escapes.
-A table-backed `SELECT` or equality `DELETE` inspects at most 1,000,000 source
+A table-backed `SELECT` or comparison `DELETE` inspects at most 1,000,000 source
 rows by default. This scanned-row limit is checked against the full source
 table before matching-row indices are allocated, so `WHERE` selectivity and
 `LIMIT` do not reduce it; each `UNION` operand and each `CROSS JOIN` input has
