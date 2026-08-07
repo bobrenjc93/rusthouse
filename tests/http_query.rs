@@ -98,6 +98,25 @@ fn assert_response_with_content_type(
     assert_eq!(body, expected_body);
 }
 
+fn assert_response_header(response: &[u8], expected_header: &str) {
+    let response = std::str::from_utf8(response).expect("response is UTF-8");
+    let (headers, _) = response
+        .split_once("\r\n\r\n")
+        .expect("response has an empty header line");
+    assert_eq!(
+        headers
+            .lines()
+            .filter(|line| *line == expected_header)
+            .count(),
+        1,
+        "expected exactly one {expected_header:?} response header"
+    );
+}
+
+fn assert_clickhouse_key_response_is_not_cacheable(response: &[u8]) {
+    assert_response_header(response, "Cache-Control: private, no-store");
+}
+
 fn assert_ok_health_response(response: &[u8]) {
     assert_response_with_content_type(
         response,
@@ -1608,44 +1627,63 @@ fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
         "x-cLiCkHoUsE-kEy: correct key:42\r\n",
     );
 
+    let insert_response = clickhouse_key_exchange(&database, key, &insert);
     assert_response_with_content_type(
-        &clickhouse_key_exchange(&database, key, &insert),
+        &insert_response,
         "HTTP/1.1 200 OK",
         "text/plain; charset=utf-8",
         b"",
     );
+    assert_clickhouse_key_response_is_not_cacheable(&insert_response);
 
     let query = request_for_target_with_headers(
         "/query",
         b"SELECT id FROM events;",
         "X-ClickHouse-Key: correct key:42\r\n",
     );
+    let post_query_response = clickhouse_key_exchange(&database, key, &query);
     assert_response(
-        &clickhouse_key_exchange(&database, key, &query),
+        &post_query_response,
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#,
     );
+    assert_clickhouse_key_response_is_not_cacheable(&post_query_response);
 
-    assert_ok_health_response(&clickhouse_key_exchange(
+    let get_query_response = clickhouse_key_exchange(
+        &database,
+        key,
+        b"GET /?query=SELECT+id+FROM+events%3B HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
+    );
+    assert_response(
+        &get_query_response,
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&get_query_response);
+
+    let ping_response = clickhouse_key_exchange(
         &database,
         key,
         b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
-    ));
-    assert_ok_health_response(&clickhouse_key_exchange(
+    );
+    assert_ok_health_response(&ping_response);
+    assert_clickhouse_key_response_is_not_cacheable(&ping_response);
+
+    let ready_response = clickhouse_key_exchange(
         &database,
         key,
         b"GET /ready HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
-    ));
-    assert_ok_metrics_response(
-        &clickhouse_key_exchange(
-            &database,
-            key,
-            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
-        ),
-        1,
-        1,
-        1,
     );
+    assert_ok_health_response(&ready_response);
+    assert_clickhouse_key_response_is_not_cacheable(&ready_response);
+
+    let metrics_response = clickhouse_key_exchange(
+        &database,
+        key,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
+    );
+    assert_ok_metrics_response(&metrics_response, 1, 1, 1);
+    assert_clickhouse_key_response_is_not_cacheable(&metrics_response);
 }
 
 #[test]
@@ -1687,6 +1725,8 @@ fn clickhouse_key_rejections_are_identical_and_stop_before_the_body() {
             "HTTP/1.1 401 Unauthorized",
             r#"{"error":"X-ClickHouse-Key authentication required"}"#,
         );
+        assert_response_header(&response, "WWW-Authenticate: X-ClickHouse-Key");
+        assert_clickhouse_key_response_is_not_cacheable(&response);
         if let Some(expected_response) = &expected_response {
             assert_eq!(
                 &response, expected_response,
@@ -1792,9 +1832,11 @@ fn clickhouse_key_rejection_respects_the_complete_response_cap() {
     )
     .unwrap();
     assert_eq!(exact_response, unrestricted);
+    assert_response_header(&exact_response, "WWW-Authenticate: X-ClickHouse-Key");
+    assert_clickhouse_key_response_is_not_cacheable(&exact_response);
 
     let mut too_small_output = Vec::new();
-    let error = handle_http_query_with_clickhouse_key_and_limits(
+    handle_http_query_with_clickhouse_key_and_limits(
         &database,
         "correct-key",
         Cursor::new(&request),
@@ -1804,13 +1846,31 @@ fn clickhouse_key_rejection_respects_the_complete_response_cap() {
             ..HttpQueryLimits::default()
         },
     )
-    .expect_err("neither the rejection nor fixed limit response can fit");
+    .expect("the shorter fixed response-limit error fits");
+    assert_response(
+        &too_small_output,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+    assert_clickhouse_key_response_is_not_cacheable(&too_small_output);
+
+    let mut zero_limit_output = Vec::new();
+    let error = handle_http_query_with_clickhouse_key_and_limits(
+        &database,
+        "correct-key",
+        Cursor::new(&request),
+        &mut zero_limit_output,
+        HttpQueryLimits {
+            max_response_bytes: 0,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("even the fixed limit response cannot fit");
     assert!(matches!(
         error,
-        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
-            if max_bytes == unrestricted.len() - 1
+        HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
     ));
-    assert!(too_small_output.is_empty());
+    assert!(zero_limit_output.is_empty());
 }
 
 #[test]

@@ -491,11 +491,16 @@ configured key must be nonempty, contain only HTTP field-value bytes, and have
 no leading or trailing optional whitespace; spaces and punctuation inside the
 key are accepted. Configuration is validated before request input is read.
 Missing, duplicate, empty, and incorrect request credentials all receive the
-same bounded `401 Unauthorized` response. Secret comparisons inspect the full
-length of the longer value, and authentication finishes before a SQL body is
-read or any database lock is attempted. Supplying `X-ClickHouse-Key` to a
-bearer handler does not replace `Authorization`, and supplying `Authorization`
-to a key handler does not replace `X-ClickHouse-Key`.
+same bounded `401 Unauthorized` response with the challenge
+`WWW-Authenticate: X-ClickHouse-Key`. Every response from these key handlers
+includes `Cache-Control: private, no-store`, preventing authenticated GET query
+results or operational responses from being retained or replayed by a shared
+cache; this header counts toward the complete response-byte limit. Secret
+comparisons inspect the full length of the longer value, and authentication
+finishes before a SQL body is read or any database lock is attempted.
+Supplying `X-ClickHouse-Key` to a bearer handler does not replace
+`Authorization`, and supplying `Authorization` to a key handler does not
+replace `X-ClickHouse-Key`.
 
 These authentication mechanisms do not provide transport security. RustHouse
 does not terminate TLS, so an embedding must put the exchange behind TLS before
