@@ -84,6 +84,24 @@ fn csv_batch_filters_distinct_tuples_before_deduplication_and_limit() {
 }
 
 #[test]
+fn json_cli_projects_ascii_lowercase_strings() {
+    let output = run(
+        &["--format", "json"],
+        "CREATE TABLE samples (label String); \
+         INSERT INTO samples VALUES (''), ('MiXeD'), ('ÉCLAIR'), ('東京ABC'); \
+         SELECT LOWER(label) AS normalized FROM samples ORDER BY normalized;"
+            .as_bytes(),
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"columns\":[{\"name\":\"normalized\",\"type\":\"String\"}],\"rows\":[[\"\"],[\"mixed\"],[\"Éclair\"],[\"東京abc\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn tsv_batch_emits_all_types_nulls_empty_and_multiple_escaped_results() {
     let output = run(
         &["--format", "tsv"],
