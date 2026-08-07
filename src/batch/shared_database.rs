@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
+use super::csv::{CsvIngestError, CsvIngestLimits};
 use super::engine::{
     DEFAULT_MAX_RETAINED_RESULT_BYTES, Database, QueryResult, QueryResultLimits, StatementResult,
 };
@@ -30,6 +31,8 @@ pub struct DatabaseMetrics {
 pub enum SharedDatabaseError {
     /// Parsing or executing the SQL batch failed.
     Sql(Error),
+    /// The database rejected a CSV ingestion request.
+    CsvIngest(CsvIngestError),
     /// The database rejected a TSV ingestion request.
     TsvIngest(TsvIngestError),
     /// The read-only query API received zero or multiple statements.
@@ -46,6 +49,7 @@ impl fmt::Display for SharedDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sql(error) => error.fmt(formatter),
+            Self::CsvIngest(error) => write!(formatter, "database CSV ingestion failed: {error}"),
             Self::TsvIngest(error) => write!(formatter, "database TSV ingestion failed: {error}"),
             Self::QueryStatementCount { statements } => write!(
                 formatter,
@@ -65,6 +69,7 @@ impl StdError for SharedDatabaseError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Sql(error) => Some(error),
+            Self::CsvIngest(error) => Some(error),
             Self::TsvIngest(error) => Some(error),
             Self::QueryStatementCount { .. }
             | Self::ReadOnlyStatementRequired { .. }
@@ -77,6 +82,12 @@ impl StdError for SharedDatabaseError {
 impl From<Error> for SharedDatabaseError {
     fn from(error: Error) -> Self {
         Self::Sql(error)
+    }
+}
+
+impl From<CsvIngestError> for SharedDatabaseError {
+    fn from(error: CsvIngestError) -> Self {
+        Self::CsvIngest(error)
     }
 }
 
@@ -100,7 +111,9 @@ impl From<TsvIngestError> for SharedDatabaseError {
 /// A batch passed to [`Self::execute`] is not a rollback transaction: once
 /// parsing succeeds, earlier statements remain applied if a later statement
 /// fails. [`Self::execute_insert_batch`] provides atomic preflight and commit
-/// for the narrower `INSERT`-only case.
+/// for the narrower `INSERT`-only case. [`Self::ingest_csv_with_names`] and
+/// [`Self::ingest_tsv_with_names`] retain a write lock through their complete
+/// bounded, atomic import operations.
 ///
 /// # Examples
 ///
@@ -199,6 +212,22 @@ impl SharedDatabase {
         let statements = sql::parse(input)?;
         self.write()?
             .execute_insert_statements(statements)
+            .map_err(Into::into)
+    }
+
+    /// Atomically ingests bounded `CSVWithNames` bytes under one write lock.
+    ///
+    /// The lock is retained through table lookup, parsing, limit and capacity
+    /// validation, and the final append, so concurrent operations cannot
+    /// expose partial input or change the table between validation and commit.
+    pub fn ingest_csv_with_names(
+        &self,
+        table: &str,
+        input: impl AsRef<[u8]>,
+        limits: CsvIngestLimits,
+    ) -> Result<usize, SharedDatabaseError> {
+        self.write()?
+            .ingest_csv_with_names(table, input, limits)
             .map_err(Into::into)
     }
 

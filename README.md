@@ -305,18 +305,27 @@ whose sender may be awaiting an interim response.
 
 `POST /` and `POST /query` are equivalent query routes. Each requires one
 decimal `Content-Length` and sends its UTF-8 SQL body through
-`SharedDatabase::query`. The standard ClickHouse-style
+`SharedDatabase::try_query`. The standard ClickHouse-style
 `GET /?query=<percent-encoded SQL>` form does the same with exactly one query
 parameter and no body (`Content-Length` may be omitted or be zero). Its value
 uses form-style decoding: each `%HH` escape becomes one byte and `+` becomes a
 space, followed by strict UTF-8 validation. Malformed escapes, invalid UTF-8,
 and an unencoded `&` introducing any extra parameter are rejected. The decoded
 SQL is subject to the same SQL byte limit as a POST body, and all query forms
-use the read-only, exactly-one-statement `SharedDatabase::query` path.
+use the read-only, exactly-one-statement `SharedDatabase::try_query` path.
 Successful responses use the same compact JSON column metadata and
 positional-row shape as `--format json`; protocol and query failures return
 deterministic JSON error objects with an appropriate HTTP status. All other
 targets and query-string shapes are rejected.
+
+HTTP query admission never waits for the database lock. After request parsing,
+authentication, SQL decoding, and read-only statement validation, each query
+makes one immediate shared read-lock attempt. Concurrent readers are admitted;
+an active writer returns `503 Service Unavailable` with the deterministic JSON
+body `{"error":"database is unavailable"}`. A poisoned lock remains a `500
+Internal Server Error`, and SQL errors remain `400 Bad Request`. Authentication,
+format negotiation, SQL/result resource limits, and the complete HTTP response
+limit retain their existing ordering and behavior.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
@@ -398,10 +407,13 @@ plaintext. The handler provides neither sessions nor token issuance or
 rotation.
 
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
-bounded, multi-column `CSVWithNames` subset to an existing batch table. Its
-header must exactly match every schema column in order and case. Data fields
-parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
-types, and callers provide complete-input byte, row, and total-value limits.
+bounded, multi-column `CSVWithNames` subset to an existing batch table.
+`SharedDatabase::ingest_csv_with_names` is the synchronized equivalent and
+retains one write lock through table lookup, bounded parsing, capacity
+validation, and the atomic append. The header must exactly match every schema
+column in order and case. Data fields parse according to the table's `Int64`,
+finite `Float64`, `Bool`, and `String` types, and callers provide complete-input
+byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
 CRLF records are accepted. Any data field may be double-quoted so it can contain
 commas and LF or CRLF line endings, and doubled quotes inside it decode to one
@@ -412,15 +424,16 @@ schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 
 `Database::ingest_tsv_with_names` provides the corresponding bounded,
 multi-column `TabSeparatedWithNames` importer, with
-`SharedDatabase::ingest_tsv_with_names` retaining one write lock for the same
-atomic operation. The decoded header must exactly match every schema column in
-order and case. Data rows accept the same `Int64`, finite `Float64`, exact
-lowercase `Bool`, and `String` types, with LF or CRLF record endings. Fields
-decode the escape sequences emitted by RustHouse's TSV writer: `\\`, `\t`,
-`\r`, `\n`, `\0`, `\b`, `\f`, and `\'`. Callers supply complete-input byte,
-row, and total-value limits. Invalid UTF-8, line endings, escapes, headers,
-field counts, typed values, configured limits, or remaining table capacity are
-rejected before any row is appended.
+`SharedDatabase::ingest_tsv_with_names` likewise retaining one write lock
+through table lookup, bounded parsing, capacity validation, and atomic append.
+The decoded header must exactly match every schema column in order and case.
+Data rows accept the same `Int64`, finite `Float64`, exact lowercase `Bool`, and
+`String` types, with LF or CRLF record endings. Fields decode the escape
+sequences emitted by RustHouse's TSV writer: `\\`, `\t`, `\r`, `\n`, `\0`,
+`\b`, `\f`, and `\'`. Callers supply complete-input byte, row, and total-value
+limits. Invalid UTF-8, line endings, escapes, headers, field counts, typed
+values, configured limits, or remaining table capacity are rejected before any
+row is appended.
 
 ## Snapshot envelope
 
