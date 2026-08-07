@@ -93,6 +93,24 @@ fn parses_cast_as_a_bounded_select_item_with_an_optional_alias() {
     assert_eq!(select.order_by[0].name, "CAST(enabled AS Int64)");
     assert!(select.order_by[0].descending);
 
+    let statements = parse(
+        "SELECT CAST(enabled AS String) AS text FROM samples \
+         ORDER BY cast(enabled as string)",
+    )
+    .expect("valid Bool-to-String CAST with expression ordering");
+    let Statement::Select(select) = &statements[0] else {
+        panic!("expected SELECT");
+    };
+    assert_eq!(
+        select.items,
+        [SelectItem::Cast {
+            name: "enabled".to_owned(),
+            target_type: DataType::String,
+            alias: Some("text".to_owned()),
+        }]
+    );
+    assert_eq!(select.order_by[0].name, "CAST(enabled AS String)");
+
     let limits = BatchSqlLimits {
         max_ast_list_items: 1,
         ..BatchSqlLimits::default()
@@ -485,6 +503,77 @@ fn bool_to_int64_maps_both_values_after_filtering_ordering_and_pagination() {
 }
 
 #[test]
+fn bool_to_string_maps_both_values_after_filtering_ordering_and_pagination() {
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (id Int64, enabled Bool); \
+             INSERT INTO samples VALUES \
+             (1, true), (2, false), (3, true), (4, false), (5, true);",
+        )
+        .expect("setup");
+
+    let all = query(&mut database, "SELECT CAST(enabled AS String) FROM samples");
+    assert_eq!(
+        all.columns,
+        [ResultColumn {
+            name: "CAST(enabled AS String)".to_owned(),
+            data_type: DataType::String,
+        }]
+    );
+    assert_eq!(
+        all.rows,
+        [
+            vec![Value::String("true".to_owned())],
+            vec![Value::String("false".to_owned())],
+            vec![Value::String("true".to_owned())],
+            vec![Value::String("false".to_owned())],
+            vec![Value::String("true".to_owned())],
+        ]
+    );
+
+    let aliased = query(
+        &mut database,
+        "SELECT id, CAST(enabled AS String) AS enabled_text FROM samples \
+         WHERE id >= 2 ORDER BY enabled_text, id DESC LIMIT 2 OFFSET 1",
+    );
+    assert_eq!(
+        aliased.columns,
+        [
+            ResultColumn {
+                name: "id".to_owned(),
+                data_type: DataType::Int64,
+            },
+            ResultColumn {
+                name: "enabled_text".to_owned(),
+                data_type: DataType::String,
+            },
+        ]
+    );
+    assert_eq!(
+        aliased.rows,
+        [
+            vec![Value::Int64(2), Value::String("false".to_owned())],
+            vec![Value::Int64(5), Value::String("true".to_owned())],
+        ]
+    );
+
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, CAST(enabled AS String) FROM samples \
+             ORDER BY CAST(enabled AS String) DESC, id LIMIT 3",
+        )
+        .rows,
+        [
+            vec![Value::Int64(1), Value::String("true".to_owned())],
+            vec![Value::Int64(3), Value::String("true".to_owned())],
+            vec![Value::Int64(5), Value::String("true".to_owned())],
+        ]
+    );
+}
+
+#[test]
 fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
     let mut database = Database::new();
     database
@@ -556,6 +645,29 @@ fn rejects_unknown_and_invalid_cast_inputs_with_typed_errors() {
             "column {name}"
         );
     }
+
+    assert_eq!(
+        database.execute("SELECT CAST(missing AS String) FROM samples"),
+        Err(Error::ColumnNotFound {
+            table: "samples".to_owned(),
+            column: "missing".to_owned(),
+        })
+    );
+    for (name, actual) in [
+        ("i", DataType::Int64),
+        ("f", DataType::Float64),
+        ("s", DataType::String),
+    ] {
+        assert_eq!(
+            database.execute(&format!("SELECT CAST({name} AS String) FROM samples")),
+            Err(Error::TypeMismatch {
+                context: format!("CAST argument '{name}'"),
+                expected: "Bool".to_owned(),
+                actual: actual.to_string(),
+            }),
+            "column {name}"
+        );
+    }
 }
 
 #[test]
@@ -566,7 +678,6 @@ fn rejects_malformed_or_unsupported_cast_syntax() {
         "SELECT CAST(reading Float64) FROM samples",
         "SELECT CAST(reading AS) FROM samples",
         "SELECT CAST(reading AS Missing) FROM samples",
-        "SELECT CAST(reading AS String) FROM samples",
         "SELECT CAST(reading AS Float64 FROM samples",
         "SELECT CAST(reading AS Float64) converted FROM samples",
         "SELECT CAST(CAST(reading AS Float64) AS Float64) FROM samples",
@@ -720,6 +831,50 @@ fn bool_to_int64_cast_obeys_result_caps() {
 }
 
 #[test]
+fn bool_to_string_cast_accounts_for_each_payload_before_allocation() {
+    let result_name = "text";
+    let fixed_bytes = std::mem::size_of::<ResultColumn>()
+        + result_name.len()
+        + std::mem::size_of::<Vec<Value>>()
+        + std::mem::size_of::<Value>();
+    let sql = "SELECT CAST(enabled AS String) AS text FROM samples";
+
+    for (literal, rendered) in [(false, "false"), (true, "true")] {
+        let setup =
+            format!("CREATE TABLE samples (enabled Bool); INSERT INTO samples VALUES ({literal});");
+        let exact_bytes = fixed_bytes + rendered.len();
+        let mut exact = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 1,
+            max_values: 1,
+            max_bytes: exact_bytes,
+            ..QueryResultLimits::default()
+        });
+        exact.execute(&setup).expect("setup");
+        assert_eq!(
+            query(&mut exact, sql).rows,
+            [vec![Value::String(rendered.to_owned())]]
+        );
+
+        let mut limited = Database::with_query_result_limits(QueryResultLimits {
+            max_rows: 1,
+            max_values: 1,
+            max_bytes: exact_bytes - 1,
+            ..QueryResultLimits::default()
+        });
+        limited.execute(&setup).expect("setup");
+        assert_eq!(
+            limited.execute(sql),
+            Err(Error::ResourceLimitExceeded {
+                resource: "SELECT result bytes",
+                actual: exact_bytes,
+                max: exact_bytes - 1,
+            }),
+            "{rendered} payload"
+        );
+    }
+}
+
+#[test]
 fn cast_remains_an_ordinary_projection() {
     let mut database = Database::new();
     database
@@ -743,6 +898,12 @@ fn cast_remains_an_ordinary_projection() {
     );
     assert_eq!(
         database.execute("SELECT CAST(enabled AS Int64), COUNT(*) FROM samples GROUP BY enabled"),
+        Err(Error::InvalidQuery(
+            "CAST projections are only supported in ungrouped SELECT queries".to_owned()
+        ))
+    );
+    assert_eq!(
+        database.execute("SELECT CAST(enabled AS String), COUNT(*) FROM samples GROUP BY enabled"),
         Err(Error::InvalidQuery(
             "CAST projections are only supported in ungrouped SELECT queries".to_owned()
         ))
@@ -875,5 +1036,56 @@ fn emits_bool_to_int64_in_all_cli_formats() {
     assert_eq!(
         String::from_utf8(json_compact_each_row).unwrap(),
         "[0]\n[1]\n[1]\n"
+    );
+}
+
+#[test]
+fn emits_bool_to_string_in_all_cli_formats() {
+    let sql = "CREATE TABLE samples (enabled Bool); \
+               INSERT INTO samples VALUES (true), (false); \
+               SELECT CAST(enabled AS String) AS text \
+               FROM samples ORDER BY text;";
+
+    let mut table = Vec::new();
+    run_table_batch(sql.as_bytes(), &mut table).expect("table batch succeeds");
+    assert_eq!(
+        String::from_utf8(table).unwrap(),
+        "+-------+\n\
+         | text  |\n\
+         +-------+\n\
+         | false |\n\
+         | true  |\n\
+         +-------+\n"
+    );
+
+    let mut csv = Vec::new();
+    run_csv_batch(sql.as_bytes(), &mut csv).expect("CSV batch succeeds");
+    assert_eq!(String::from_utf8(csv).unwrap(), "text\nfalse\ntrue\n");
+
+    let mut tsv = Vec::new();
+    run_tsv_batch(sql.as_bytes(), &mut tsv).expect("TSV batch succeeds");
+    assert_eq!(String::from_utf8(tsv).unwrap(), "text\nfalse\ntrue\n");
+
+    let mut json = Vec::new();
+    run_json_batch(sql.as_bytes(), &mut json).expect("JSON batch succeeds");
+    assert_eq!(
+        String::from_utf8(json).unwrap(),
+        "{\"columns\":[{\"name\":\"text\",\"type\":\"String\"}],\"rows\":[[\"false\"],[\"true\"]]}\n"
+    );
+
+    let mut json_each_row = Vec::new();
+    run_json_each_row_batch(sql.as_bytes(), &mut json_each_row)
+        .expect("JSONEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_each_row).unwrap(),
+        "{\"text\":\"false\"}\n{\"text\":\"true\"}\n"
+    );
+
+    let mut json_compact_each_row = Vec::new();
+    run_json_compact_each_row_batch(sql.as_bytes(), &mut json_compact_each_row)
+        .expect("JSONCompactEachRow batch succeeds");
+    assert_eq!(
+        String::from_utf8(json_compact_each_row).unwrap(),
+        "[\"false\"]\n[\"true\"]\n"
     );
 }

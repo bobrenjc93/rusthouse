@@ -1753,6 +1753,9 @@ enum ResolvedItem {
     CastInt64ToBool {
         source: usize,
     },
+    CastBoolToString {
+        source: usize,
+    },
     StringLength {
         source: usize,
     },
@@ -1937,12 +1940,6 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                if *target_type == DataType::String {
-                    return Err(Error::InvalidQuery(
-                        "only CAST(Int64 AS Float64), CAST(Float64 AS Int64), CAST(Bool AS Int64), and CAST(Int64 AS Bool) are supported"
-                            .to_owned(),
-                    ));
-                }
                 let resolved = match (actual, *target_type) {
                     (DataType::Int64, DataType::Float64) => {
                         Some(ResolvedItem::CastInt64ToFloat64 { source })
@@ -1956,13 +1953,16 @@ fn resolve_select_items(
                     (DataType::Int64, DataType::Bool) => {
                         Some(ResolvedItem::CastInt64ToBool { source })
                     }
+                    (DataType::Bool, DataType::String) => {
+                        Some(ResolvedItem::CastBoolToString { source })
+                    }
                     _ => None,
                 };
                 let Some(resolved) = resolved else {
                     let expected = match target_type {
                         DataType::Float64 | DataType::Bool => "Int64",
                         DataType::Int64 => "Float64 or Bool",
-                        DataType::String => unreachable!("String target is rejected above"),
+                        DataType::String => "Bool",
                     };
                     return Err(Error::TypeMismatch {
                         context: format!("CAST argument '{name}'"),
@@ -2316,6 +2316,9 @@ fn execute_projection(
                         ResolvedItem::CastInt64ToBool { source } => {
                             Value::Bool(int64_at(table, *source, *row) != 0)
                         }
+                        ResolvedItem::CastBoolToString { source } => {
+                            Value::String(bool_string(bool_at(table, *source, *row)).to_owned())
+                        }
                         ResolvedItem::StringLength { source } => Value::Int64(
                             string_length_to_i64(string_at(table, *source, *row).len())?,
                         ),
@@ -2459,6 +2462,7 @@ fn validate_projection_result_limits(
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastBoolToString { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
@@ -2474,6 +2478,9 @@ fn validate_projection_result_limits(
                     bytes = bytes.saturating_add(value.len());
                     enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
                 }
+            } else if let ResolvedItem::CastBoolToString { source } = item {
+                bytes = bytes.saturating_add(bool_string(bool_at(table, *source, *row)).len());
+                enforce_resource_limit("SELECT result bytes", bytes, limits.max_bytes)?;
             }
         }
     }
@@ -2512,7 +2519,8 @@ fn validate_grouped_result_limits(
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
-                | ResolvedItem::CastInt64ToBool { .. } => {
+                | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
@@ -2969,7 +2977,8 @@ impl GroupedData<'_> {
                         ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
                         | ResolvedItem::CastBoolToInt64 { .. }
-                        | ResolvedItem::CastInt64ToBool { .. } => {
+                        | ResolvedItem::CastInt64ToBool { .. }
+                        | ResolvedItem::CastBoolToString { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
                         ResolvedItem::StringLength { .. } => {
@@ -3315,6 +3324,9 @@ fn order_source_rows(
                 ResolvedItem::CastInt64ToBool { source } => {
                     (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
                 }
+                ResolvedItem::CastBoolToString { source } => {
+                    bool_at(table, source, left).cmp(&bool_at(table, source, right))
+                }
                 ResolvedItem::StringLength { source } => string_at(table, source, left)
                     .len()
                     .cmp(&string_at(table, source, right).len()),
@@ -3387,7 +3399,8 @@ fn order_grouped_rows(
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::CastBoolToInt64 { .. }
-                | ResolvedItem::CastInt64ToBool { .. } => {
+                | ResolvedItem::CastInt64ToBool { .. }
+                | ResolvedItem::CastBoolToString { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::StringLength { .. } => {
@@ -3446,6 +3459,10 @@ fn bool_at(table: &Table, source: usize, row: usize) -> bool {
         unreachable!("CAST input type is resolved")
     };
     values[row]
+}
+
+fn bool_string(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
 fn checked_float64_to_int64(value: f64) -> Result<i64> {

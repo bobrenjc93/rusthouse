@@ -292,6 +292,57 @@ fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
 }
 
 #[test]
+fn bool_to_string_cast_is_visible_in_every_http_query_format() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE flags (enabled Bool); \
+             INSERT INTO flags VALUES (true), (false);",
+        )
+        .expect("setup");
+    let sql = b"SELECT CAST(enabled AS String) AS text FROM flags ORDER BY text;";
+
+    assert_response(
+        &exchange(&database, &request(sql)),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"text","type":"String"}],"rows":[["false"],["true"]]}"#,
+    );
+
+    let csv =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+    assert_response_with_content_type(
+        &exchange(&database, &csv),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"text\nfalse\ntrue\n",
+    );
+
+    let tsv = request_for_target_with_headers(
+        "/query",
+        sql,
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &exchange(&database, &tsv),
+        "HTTP/1.1 200 OK",
+        "text/tab-separated-values; charset=utf-8",
+        b"text\nfalse\ntrue\n",
+    );
+
+    for (format, expected) in [
+        ("JSONEachRow", "{\"text\":\"false\"}\n{\"text\":\"true\"}\n"),
+        ("JSONCompactEachRow", "[\"false\"]\n[\"true\"]\n"),
+    ] {
+        let request = request_for_target_with_headers(
+            "/query",
+            sql,
+            &format!("X-ClickHouse-Format: {format}\r\n"),
+        );
+        assert_response(&exchange(&database, &request), "HTTP/1.1 200 OK", expected);
+    }
+}
+
+#[test]
 fn ping_returns_the_clickhouse_health_response_without_content_length() {
     let database = SharedDatabase::default();
 
