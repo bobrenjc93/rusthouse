@@ -137,7 +137,7 @@ pub fn handle_http_query_with_limits(
     handle_http_query_exchange(database, input, output, limits, None)
 }
 
-/// Handles one HTTP query or health exchange that requires a bearer token.
+/// Handles one HTTP query, health, or metrics exchange that requires a bearer token.
 ///
 /// This is separate from [`handle_http_query`], which remains unauthenticated.
 /// Every request, including `GET /ping`, `GET /ready`, and `GET /metrics`, is

@@ -267,7 +267,7 @@ Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
-## HTTP query and health exchanges
+## HTTP query, health, and metrics exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
 exchange without opening a listener. All five supported routes require a nonempty
