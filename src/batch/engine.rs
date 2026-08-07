@@ -584,6 +584,17 @@ impl Database {
             Statement::Delete {
                 table,
                 column,
+                literal,
+            } => self.execute_delete_statement(
+                table,
+                column,
+                ComparisonOperator::Equal,
+                literal,
+                query_result_limits,
+            ),
+            Statement::DeleteComparison {
+                table,
+                column,
                 operator,
                 literal,
             } => {
@@ -652,6 +663,7 @@ impl Database {
             | Statement::DropColumn { .. }
             | Statement::TruncateTable { .. }
             | Statement::Delete { .. }
+            | Statement::DeleteComparison { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -1171,7 +1183,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
-        Statement::Delete { .. } => "DELETE",
+        Statement::Delete { .. } | Statement::DeleteComparison { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)

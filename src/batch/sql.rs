@@ -76,8 +76,14 @@ pub enum Statement {
     TruncateTable {
         name: String,
     },
-    /// Exact comparison deletion: `DELETE FROM <table> WHERE <column> <op> <literal>`.
+    /// Exact equality deletion: `DELETE FROM <table> WHERE <column> = <literal>`.
     Delete {
+        table: String,
+        column: String,
+        literal: Value,
+    },
+    /// Exact non-equality deletion: `DELETE FROM <table> WHERE <column> <op> <literal>`.
+    DeleteComparison {
         table: String,
         column: String,
         operator: ComparisonOperator,
@@ -1178,11 +1184,18 @@ impl<'a> Parser<'a> {
                 "DELETE supports exactly DELETE FROM <table> WHERE <column> <comparison> <literal>",
             );
         }
-        Ok(Statement::Delete {
-            table,
-            column,
-            operator,
-            literal,
+        Ok(match operator {
+            ComparisonOperator::Equal => Statement::Delete {
+                table,
+                column,
+                literal,
+            },
+            operator => Statement::DeleteComparison {
+                table,
+                column,
+                operator,
+                literal,
+            },
         })
     }
 

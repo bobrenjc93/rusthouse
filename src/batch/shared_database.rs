@@ -495,9 +495,11 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         Statement::TruncateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "TRUNCATE TABLE",
         }),
-        Statement::Delete { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
-            statement: "DELETE",
-        }),
+        Statement::Delete { .. } | Statement::DeleteComparison { .. } => {
+            Err(SharedDatabaseError::ReadOnlyStatementRequired {
+                statement: "DELETE",
+            })
+        }
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => {
             Err(SharedDatabaseError::ReadOnlyStatementRequired {
                 statement: "INSERT",

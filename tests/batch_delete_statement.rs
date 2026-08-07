@@ -18,65 +18,70 @@ fn parses_exact_comparison_delete_for_every_operator_and_literal_type() {
     let cases = [
         (
             "DELETE FROM events WHERE id = -7",
-            "events",
-            "id",
-            ComparisonOperator::Equal,
-            Value::Int64(-7),
+            Statement::Delete {
+                table: "events".to_owned(),
+                column: "id".to_owned(),
+                literal: Value::Int64(-7),
+            },
         ),
         (
             "delete from Events where score != +2.5e1;",
-            "Events",
-            "score",
-            ComparisonOperator::NotEqual,
-            Value::Float64(25.0),
+            Statement::DeleteComparison {
+                table: "Events".to_owned(),
+                column: "score".to_owned(),
+                operator: ComparisonOperator::NotEqual,
+                literal: Value::Float64(25.0),
+            },
         ),
         (
             "DELETE FROM events WHERE active <> TRUE;",
-            "events",
-            "active",
-            ComparisonOperator::NotEqual,
-            Value::Bool(true),
+            Statement::DeleteComparison {
+                table: "events".to_owned(),
+                column: "active".to_owned(),
+                operator: ComparisonOperator::NotEqual,
+                literal: Value::Bool(true),
+            },
         ),
         (
             "DELETE FROM events WHERE label < 'it''s here';",
-            "events",
-            "label",
-            ComparisonOperator::Less,
-            Value::String("it's here".to_owned()),
+            Statement::DeleteComparison {
+                table: "events".to_owned(),
+                column: "label".to_owned(),
+                operator: ComparisonOperator::Less,
+                literal: Value::String("it's here".to_owned()),
+            },
         ),
         (
             "DELETE FROM events WHERE id <= 7;",
-            "events",
-            "id",
-            ComparisonOperator::LessOrEqual,
-            Value::Int64(7),
+            Statement::DeleteComparison {
+                table: "events".to_owned(),
+                column: "id".to_owned(),
+                operator: ComparisonOperator::LessOrEqual,
+                literal: Value::Int64(7),
+            },
         ),
         (
             "DELETE FROM events WHERE score > 2.5;",
-            "events",
-            "score",
-            ComparisonOperator::Greater,
-            Value::Float64(2.5),
+            Statement::DeleteComparison {
+                table: "events".to_owned(),
+                column: "score".to_owned(),
+                operator: ComparisonOperator::Greater,
+                literal: Value::Float64(2.5),
+            },
         ),
         (
             "DELETE FROM events WHERE active >= false;",
-            "events",
-            "active",
-            ComparisonOperator::GreaterOrEqual,
-            Value::Bool(false),
+            Statement::DeleteComparison {
+                table: "events".to_owned(),
+                column: "active".to_owned(),
+                operator: ComparisonOperator::GreaterOrEqual,
+                literal: Value::Bool(false),
+            },
         ),
     ];
 
-    for (sql, table, column, operator, literal) in cases {
-        assert_eq!(
-            parse(sql).expect("valid comparison DELETE"),
-            [Statement::Delete {
-                table: table.to_owned(),
-                column: column.to_owned(),
-                operator,
-                literal,
-            }]
-        );
+    for (sql, statement) in cases {
+        assert_eq!(parse(sql).expect("valid comparison DELETE"), [statement]);
     }
 }
 
@@ -287,7 +292,7 @@ fn invalid_types_and_scan_limit_errors_never_delete_rows() {
     assert_eq!(ids(&database, "events"), [1, 2, 3]);
 
     assert_eq!(
-        database.execute_statement(Statement::Delete {
+        database.execute_statement(Statement::DeleteComparison {
             table: "events".to_owned(),
             column: "id".to_owned(),
             operator: ComparisonOperator::LessOrEqual,
@@ -301,19 +306,45 @@ fn invalid_types_and_scan_limit_errors_never_delete_rows() {
 }
 
 #[test]
+fn original_public_equality_delete_ast_shape_remains_directly_executable() {
+    let mut database = Database::new();
+    database
+        .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2), (2);")
+        .expect("setup succeeds");
+
+    assert_eq!(
+        database.execute_statement(Statement::Delete {
+            table: "events".to_owned(),
+            column: "id".to_owned(),
+            literal: Value::Int64(2),
+        }),
+        Ok(StatementResult::Command {
+            tag: "DELETE",
+            affected_rows: 2,
+        })
+    );
+    assert_eq!(ids(&database, "events"), [1]);
+}
+
+#[test]
 fn insert_only_execution_rejects_delete_without_mutation() {
     let mut database = Database::new();
     database
         .execute("CREATE TABLE events (id Int64); INSERT INTO events VALUES (1), (2);")
         .expect("setup succeeds");
 
-    assert_eq!(
-        database.execute_insert_batch("DELETE FROM events WHERE id = 1"),
-        Err(Error::InsertOnlyStatementRequired {
-            statement: "DELETE",
-        })
-    );
-    assert_eq!(ids(&database, "events"), [1, 2]);
+    for sql in [
+        "DELETE FROM events WHERE id = 1",
+        "DELETE FROM events WHERE id >= 1",
+    ] {
+        assert_eq!(
+            database.execute_insert_batch(sql),
+            Err(Error::InsertOnlyStatementRequired {
+                statement: "DELETE",
+            })
+        );
+        assert_eq!(ids(&database, "events"), [1, 2]);
+    }
 }
 
 #[test]
