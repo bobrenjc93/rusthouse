@@ -74,9 +74,10 @@ impl Default for QueryResultLimits {
 
 /// A reusable in-memory SQL database.
 ///
-/// `CAST`, `LENGTH`, `ABS`, `ROUND`, `FLOOR`, and the minimal unpartitioned
-/// `ROW_NUMBER` window forms provide bounded projections in ungrouped queries.
-/// An optional `AS` alias controls each result column name.
+/// Checked `Int64` column-minus-literal expressions, `CAST`, `LENGTH`, `ABS`,
+/// `ROUND`, `FLOOR`, `CEIL`, and the minimal unpartitioned `ROW_NUMBER` window forms
+/// provide bounded projections in ungrouped queries. An optional `AS` alias
+/// controls each result column name.
 ///
 /// A literal-only query returns one inferred, typed column and one row:
 ///
@@ -1248,6 +1249,10 @@ enum ResolvedItem {
         source: usize,
         group_position: Option<usize>,
     },
+    Int64Subtract {
+        source: usize,
+        literal: i64,
+    },
     CastInt64ToFloat64 {
         source: usize,
     },
@@ -1264,6 +1269,9 @@ enum ResolvedItem {
         source: usize,
     },
     Float64Floor {
+        source: usize,
+    },
+    Float64Ceil {
         source: usize,
     },
     RowNumber,
@@ -1377,6 +1385,37 @@ fn resolve_select_items(
                         .clone()
                         .unwrap_or_else(|| table.schema()[source].name.clone()),
                     data_type: table.schema()[source].data_type,
+                });
+            }
+            SelectItem::Int64Subtract {
+                name,
+                literal,
+                alias,
+            } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Int64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("Int64 subtraction argument '{name}'"),
+                        expected: DataType::Int64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "Int64 subtraction projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::Int64Subtract {
+                    source,
+                    literal: *literal,
+                });
+                result_columns.push(ResultColumn {
+                    name: alias.clone().unwrap_or_else(|| {
+                        sql::int64_subtraction_name(&table.schema()[source].name, *literal)
+                    }),
+                    data_type: DataType::Int64,
                 });
             }
             SelectItem::Cast {
@@ -1513,6 +1552,30 @@ fn resolve_select_items(
                     name: alias
                         .clone()
                         .unwrap_or_else(|| format!("FLOOR({})", table.schema()[source].name)),
+                    data_type: DataType::Float64,
+                });
+            }
+            SelectItem::Ceil { name, alias } => {
+                let source = table.column_index(name)?;
+                let actual = table.schema()[source].data_type;
+                if actual != DataType::Float64 {
+                    return Err(Error::TypeMismatch {
+                        context: format!("CEIL argument '{name}'"),
+                        expected: DataType::Float64.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
+                if has_aggregate || !group_columns.is_empty() {
+                    return Err(Error::InvalidQuery(
+                        "CEIL projections are only supported in ungrouped SELECT queries"
+                            .to_owned(),
+                    ));
+                }
+                items.push(ResolvedItem::Float64Ceil { source });
+                result_columns.push(ResultColumn {
+                    name: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("CEIL({})", table.schema()[source].name)),
                     data_type: DataType::Float64,
                 });
             }
@@ -1680,6 +1743,9 @@ fn execute_projection(
                 .map(|item| {
                     Ok(match item {
                         ResolvedItem::Column { source, .. } => table.columns()[*source].value(*row),
+                        ResolvedItem::Int64Subtract { source, literal } => Value::Int64(
+                            checked_int64_subtract(int64_at(table, *source, *row), *literal)?,
+                        ),
                         ResolvedItem::CastInt64ToFloat64 { source } => {
                             Value::Float64(int64_at(table, *source, *row) as f64)
                         }
@@ -1697,6 +1763,9 @@ fn execute_projection(
                         }
                         ResolvedItem::Float64Floor { source } => {
                             Value::Float64(float64_at(table, *source, *row).floor())
+                        }
+                        ResolvedItem::Float64Ceil { source } => {
+                            Value::Float64(float64_at(table, *source, *row).ceil())
                         }
                         ResolvedItem::RowNumber => Value::Int64(checked_row_number(row_number)?),
                         ResolvedItem::Aggregate { .. } => {
@@ -1816,12 +1885,14 @@ fn validate_projection_result_limits(
         for item in items {
             let source = match item {
                 ResolvedItem::Column { source, .. } => Some(*source),
-                ResolvedItem::CastInt64ToFloat64 { .. }
+                ResolvedItem::Int64Subtract { .. }
+                | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
                 | ResolvedItem::Float64Round { .. }
                 | ResolvedItem::Float64Floor { .. }
+                | ResolvedItem::Float64Ceil { .. }
                 | ResolvedItem::RowNumber => None,
                 ResolvedItem::Aggregate { .. } => {
                     unreachable!("ungrouped projections cannot contain aggregates")
@@ -1862,6 +1933,11 @@ fn validate_grouped_result_limits(
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Int64Subtract { .. } => {
+                    unreachable!(
+                        "Int64 subtraction projections are restricted to ungrouped queries"
+                    )
+                }
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
@@ -1877,6 +1953,9 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::Float64Floor { .. } => {
                     unreachable!("FLOOR projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Ceil { .. } => {
+                    unreachable!("CEIL projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
@@ -2302,6 +2381,11 @@ impl GroupedData<'_> {
                             group_position: None,
                             ..
                         } => unreachable!("grouped columns are validated"),
+                        ResolvedItem::Int64Subtract { .. } => {
+                            unreachable!(
+                                "Int64 subtraction projections are restricted to ungrouped queries"
+                            )
+                        }
                         ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
@@ -2317,6 +2401,9 @@ impl GroupedData<'_> {
                         }
                         ResolvedItem::Float64Floor { .. } => {
                             unreachable!("FLOOR projections are restricted to ungrouped queries")
+                        }
+                        ResolvedItem::Float64Ceil { .. } => {
+                            unreachable!("CEIL projections are restricted to ungrouped queries")
                         }
                         ResolvedItem::RowNumber => {
                             unreachable!(
@@ -2621,6 +2708,12 @@ fn order_source_rows(
         for order in ordering {
             let comparison = match items[order.output] {
                 ResolvedItem::Column { source, .. } => table.columns()[source].cmp_at(left, right),
+                // Subtracting one constant is monotonic over mathematical
+                // integers. Compare the source values so overflow is checked
+                // only after ORDER BY and LIMIT have selected output rows.
+                ResolvedItem::Int64Subtract { source, .. } => {
+                    int64_at(table, source, left).cmp(&int64_at(table, source, right))
+                }
                 ResolvedItem::CastInt64ToFloat64 { source } => {
                     let left = ValueRef::Float64(int64_at(table, source, left) as f64);
                     let right = ValueRef::Float64(int64_at(table, source, right) as f64);
@@ -2645,6 +2738,11 @@ fn order_source_rows(
                 ResolvedItem::Float64Floor { source } => {
                     let left = ValueRef::Float64(float64_at(table, source, left).floor());
                     let right = ValueRef::Float64(float64_at(table, source, right).floor());
+                    left.cmp(&right)
+                }
+                ResolvedItem::Float64Ceil { source } => {
+                    let left = ValueRef::Float64(float64_at(table, source, left).ceil());
+                    let right = ValueRef::Float64(float64_at(table, source, right).ceil());
                     left.cmp(&right)
                 }
                 ResolvedItem::RowNumber => {
@@ -2686,6 +2784,11 @@ fn order_grouped_rows(
                     group_position: None,
                     ..
                 } => unreachable!("grouped columns are validated"),
+                ResolvedItem::Int64Subtract { .. } => {
+                    unreachable!(
+                        "Int64 subtraction projections are restricted to ungrouped queries"
+                    )
+                }
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
@@ -2701,6 +2804,9 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::Float64Floor { .. } => {
                     unreachable!("FLOOR projections are restricted to ungrouped queries")
+                }
+                ResolvedItem::Float64Ceil { .. } => {
+                    unreachable!("CEIL projections are restricted to ungrouped queries")
                 }
                 ResolvedItem::RowNumber => {
                     unreachable!("ROW_NUMBER projections are restricted to ungrouped queries")
@@ -2759,6 +2865,12 @@ fn checked_int64_abs(value: i64) -> Result<i64> {
     value
         .checked_abs()
         .ok_or_else(|| Error::NumericOverflow("ABS(Int64)".to_owned()))
+}
+
+fn checked_int64_subtract(value: i64, literal: i64) -> Result<i64> {
+    value
+        .checked_sub(literal)
+        .ok_or_else(|| Error::NumericOverflow("Int64 subtraction".to_owned()))
 }
 
 fn sort_and_limit(
