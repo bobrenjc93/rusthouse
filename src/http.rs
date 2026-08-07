@@ -106,7 +106,8 @@ impl StdError for HttpQueryError {
 /// [`SharedDatabase::try_execute_insert_batch`], which atomically executes a
 /// nonempty `INSERT`-only batch after one nonblocking write-lock attempt.
 /// Success returns an empty `200 OK` response. The unauthenticated handlers do
-/// not expose this route.
+/// not expose this route. The `X-ClickHouse-Key`-authenticated handlers expose
+/// the same authenticated route set.
 ///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
 /// for retained tables, columns, and rows. It takes a nonblocking, consistent
@@ -152,7 +153,7 @@ pub fn handle_http_query_with_limits(
     output: impl Write,
     limits: HttpQueryLimits,
 ) -> Result<(), HttpQueryError> {
-    handle_http_query_exchange(database, input, output, limits, None)
+    handle_http_query_exchange(database, input, output, limits, Authentication::None)
 }
 
 /// Handles one HTTP query, insert, health, or metrics exchange that requires a bearer token.
@@ -230,8 +231,102 @@ pub fn handle_http_query_with_bearer_token_and_limits(
         input,
         output,
         limits,
-        Some(expected_bearer_token.as_bytes()),
+        Authentication::Bearer(expected_bearer_token.as_bytes()),
     )
+}
+
+/// Handles one HTTP query, insert, health, or metrics exchange that requires
+/// an `X-ClickHouse-Key` credential.
+///
+/// This is separate from [`handle_http_query`] and the bearer-authenticated
+/// handlers. Every request, including `GET /ping`, `GET /ready`, and
+/// `GET /metrics`, is authorized only when it has exactly one
+/// case-insensitive `X-ClickHouse-Key` header whose value matches
+/// `expected_clickhouse_key`. Header values are compared case-sensitively.
+/// Missing, duplicate, empty, and incorrect credentials receive the same
+/// response before the SQL body is read or the database is accessed.
+///
+/// The configured key must be a nonempty HTTP field value without leading or
+/// trailing optional whitespace. Invalid configurations are rejected as a
+/// server error without reading any input. This function provides
+/// authentication only; the embedding application must provide TLS to keep
+/// the key and query contents confidential in transit.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_clickhouse_key(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    output: impl Write,
+) -> Result<(), HttpQueryError> {
+    handle_http_query_with_clickhouse_key_and_limits(
+        database,
+        expected_clickhouse_key,
+        input,
+        output,
+        HttpQueryLimits::default(),
+    )
+}
+
+/// Handles one `X-ClickHouse-Key`-authenticated HTTP exchange with explicit
+/// resource limits.
+///
+/// See [`handle_http_query_with_clickhouse_key`] for authentication behavior
+/// and [`handle_http_query_with_limits`] for resource-limit behavior.
+///
+/// # Errors
+///
+/// Returns [`HttpQueryError`] under the same conditions as
+/// [`handle_http_query`].
+pub fn handle_http_query_with_clickhouse_key_and_limits(
+    database: &SharedDatabase,
+    expected_clickhouse_key: &str,
+    input: impl Read,
+    mut output: impl Write,
+    limits: HttpQueryLimits,
+) -> Result<(), HttpQueryError> {
+    if expected_clickhouse_key.is_empty() {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured ClickHouse key must not be empty",
+            limits.max_response_bytes,
+        );
+    }
+    if !is_valid_clickhouse_key(expected_clickhouse_key.as_bytes()) {
+        return write_error_response(
+            &mut output,
+            Status::INTERNAL_SERVER_ERROR,
+            &[],
+            "configured ClickHouse key is not a valid HTTP header value",
+            limits.max_response_bytes,
+        );
+    }
+
+    handle_http_query_exchange(
+        database,
+        input,
+        output,
+        limits,
+        Authentication::ClickHouseKey(expected_clickhouse_key.as_bytes()),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Authentication<'a> {
+    None,
+    Bearer(&'a [u8]),
+    ClickHouseKey(&'a [u8]),
+}
+
+impl Authentication<'_> {
+    const fn exposes_insert(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 fn handle_http_query_exchange(
@@ -239,9 +334,9 @@ fn handle_http_query_exchange(
     mut input: impl Read,
     mut output: impl Write,
     limits: HttpQueryLimits,
-    expected_bearer_token: Option<&[u8]>,
+    authentication: Authentication<'_>,
 ) -> Result<(), HttpQueryError> {
-    let request = match read_request(&mut input, limits, expected_bearer_token) {
+    let request = match read_request(&mut input, limits, authentication) {
         Ok(request) => request,
         Err(RequestReadError::Io(error)) => return Err(HttpQueryError::Read(error)),
         Err(RequestReadError::Protocol(failure)) => {
@@ -421,10 +516,10 @@ fn handle_http_query_exchange(
 fn read_request(
     input: &mut impl Read,
     limits: HttpQueryLimits,
-    expected_bearer_token: Option<&[u8]>,
+    authentication: Authentication<'_>,
 ) -> Result<HttpRequest, RequestReadError> {
     let header = read_header_block(input, limits.max_header_bytes)?;
-    let request = parse_headers(&header, limits.max_header_count, expected_bearer_token)?;
+    let request = parse_headers(&header, limits.max_header_count, authentication)?;
 
     match request.kind {
         RequestKind::Ping => {
@@ -626,7 +721,7 @@ enum QuerySource {
 fn parse_headers(
     header: &[u8],
     max_header_count: usize,
-    expected_bearer_token: Option<&[u8]>,
+    authentication: Authentication<'_>,
 ) -> Result<ParsedRequest, RequestReadError> {
     let Some(without_terminator) = header.strip_suffix(b"\r\n\r\n") else {
         return Err(RequestFailure::new(Status::BAD_REQUEST, "malformed HTTP headers").into());
@@ -636,7 +731,7 @@ fn parse_headers(
         return Err(RequestFailure::new(Status::BAD_REQUEST, "missing request line").into());
     };
     let request_line = strict_header_line(raw_request_line, lines.peek().is_some())?;
-    let kind = parse_request_line(request_line, expected_bearer_token.is_some())?;
+    let kind = parse_request_line(request_line, authentication.exposes_insert())?;
 
     let mut content_length = None;
     let mut host_seen = false;
@@ -645,6 +740,8 @@ fn parse_headers(
     let mut expect_seen = false;
     let mut authorization = None;
     let mut duplicate_authorization = false;
+    let mut clickhouse_key = None;
+    let mut duplicate_clickhouse_key = false;
     let mut clickhouse_format = None;
     let mut duplicate_clickhouse_format = false;
     while let Some(raw_line) = lines.next() {
@@ -687,11 +784,16 @@ fn parse_headers(
                 return Err(RequestFailure::new(Status::BAD_REQUEST, "invalid Host header").into());
             }
             host_seen = true;
-        } else if expected_bearer_token.is_some()
+        } else if matches!(authentication, Authentication::Bearer(_))
             && name.eq_ignore_ascii_case(b"authorization")
             && authorization.replace(value).is_some()
         {
             duplicate_authorization = true;
+        } else if matches!(authentication, Authentication::ClickHouseKey(_))
+            && name.eq_ignore_ascii_case(b"x-clickhouse-key")
+            && clickhouse_key.replace(value).is_some()
+        {
+            duplicate_clickhouse_key = true;
         } else if name.eq_ignore_ascii_case(b"x-clickhouse-format")
             && clickhouse_format.replace(value).is_some()
         {
@@ -699,18 +801,33 @@ fn parse_headers(
         }
     }
 
-    if let Some(expected_bearer_token) = expected_bearer_token {
-        let authorized = !duplicate_authorization
-            && authorization
-                .and_then(parse_bearer_token)
-                .is_some_and(|provided| constant_work_eq(provided, expected_bearer_token));
-        if !authorized {
-            return Err(RequestFailure::with_headers(
-                Status::UNAUTHORIZED,
-                "bearer authentication required",
-                &[b"WWW-Authenticate: Bearer\r\n"],
-            )
-            .into());
+    match authentication {
+        Authentication::None => {}
+        Authentication::Bearer(expected_bearer_token) => {
+            let authorized = !duplicate_authorization
+                && authorization
+                    .and_then(parse_bearer_token)
+                    .is_some_and(|provided| constant_work_eq(provided, expected_bearer_token));
+            if !authorized {
+                return Err(RequestFailure::with_headers(
+                    Status::UNAUTHORIZED,
+                    "bearer authentication required",
+                    &[b"WWW-Authenticate: Bearer\r\n"],
+                )
+                .into());
+            }
+        }
+        Authentication::ClickHouseKey(expected_clickhouse_key) => {
+            let key_matches = clickhouse_key.is_some_and(|provided| {
+                !provided.is_empty() && constant_work_eq(provided, expected_clickhouse_key)
+            });
+            if duplicate_clickhouse_key || !key_matches {
+                return Err(RequestFailure::new(
+                    Status::UNAUTHORIZED,
+                    "X-ClickHouse-Key authentication required",
+                )
+                .into());
+            }
         }
     }
 
@@ -791,6 +908,12 @@ fn is_valid_bearer_token(token: &[u8]) -> bool {
 
 fn is_bearer_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn is_valid_clickhouse_key(key: &[u8]) -> bool {
+    !key.is_empty()
+        && trim_optional_whitespace(key) == key
+        && key.iter().copied().all(is_header_value_byte)
 }
 
 fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {

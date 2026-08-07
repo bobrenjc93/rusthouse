@@ -381,15 +381,16 @@ positional-row shape as `--format json`; protocol and query failures return
 deterministic JSON error objects with an appropriate HTTP status. All other
 targets and query-string shapes are rejected.
 
-The bearer-authenticated handlers additionally expose exact `POST /insert`.
-It requires one decimal `Content-Length`, applies the same UTF-8 SQL body and
-request limits as `POST /query`, and executes a nonempty `INSERT`-only batch
-through `SharedDatabase::try_execute_insert_batch`. The database preflights the
-entire batch before commit, so syntax, target, shape, type, capacity, empty
-batch, or mixed-statement failures return `400 Bad Request` without applying
-any rows. Success returns `200 OK` with an empty plain-text body. The route is
-not recognized by `handle_http_query` or `handle_http_query_with_limits`, and
-query routes remain read-only even when their request is authenticated.
+The bearer- and `X-ClickHouse-Key`-authenticated handlers additionally expose
+exact `POST /insert`. It requires one decimal `Content-Length`, applies the
+same UTF-8 SQL body and request limits as `POST /query`, and executes a
+nonempty `INSERT`-only batch through
+`SharedDatabase::try_execute_insert_batch`. The database preflights the entire
+batch before commit, so syntax, target, shape, type, capacity, empty batch, or
+mixed-statement failures return `400 Bad Request` without applying any rows.
+Success returns `200 OK` with an empty plain-text body. The route is not
+recognized by `handle_http_query` or `handle_http_query_with_limits`, and query
+routes remain read-only even when their request is authenticated.
 
 HTTP query admission never waits for the database lock. After request parsing,
 authentication, SQL decoding, and read-only statement validation, each query
@@ -480,11 +481,27 @@ tokens are rejected before any request input is read. The original
 `handle_http_query` APIs intentionally remain unauthenticated for existing
 in-process read-only embeddings and do not expose `/insert`.
 
-Bearer authentication does not provide transport security. RustHouse does not
-terminate TLS, so an embedding must put this exchange behind TLS before sending
-tokens or queries over an untrusted network; otherwise both are exposed in
-plaintext. The handler provides neither sessions nor token issuance or
-rotation.
+For ClickHouse HTTP credential compatibility, embedders can instead call
+`handle_http_query_with_clickhouse_key`, or
+`handle_http_query_with_clickhouse_key_and_limits` for explicit resource
+limits. These are separate variants: every query, insert, ping, readiness, and
+metrics request must carry exactly one `X-ClickHouse-Key` header. Header-name
+matching is case-insensitive and key-value matching is case-sensitive. A
+configured key must be nonempty, contain only HTTP field-value bytes, and have
+no leading or trailing optional whitespace; spaces and punctuation inside the
+key are accepted. Configuration is validated before request input is read.
+Missing, duplicate, empty, and incorrect request credentials all receive the
+same bounded `401 Unauthorized` response. Secret comparisons inspect the full
+length of the longer value, and authentication finishes before a SQL body is
+read or any database lock is attempted. Supplying `X-ClickHouse-Key` to a
+bearer handler does not replace `Authorization`, and supplying `Authorization`
+to a key handler does not replace `X-ClickHouse-Key`.
+
+These authentication mechanisms do not provide transport security. RustHouse
+does not terminate TLS, so an embedding must put the exchange behind TLS before
+sending keys, tokens, or queries over an untrusted network; otherwise they are
+exposed in plaintext. The handlers provide neither sessions nor credential
+issuance or rotation.
 
 The typed engine's `Database::ingest_csv_with_names` API atomically appends a
 bounded, multi-column `CSVWithNames` subset to an existing batch table.

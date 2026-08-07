@@ -7,6 +7,7 @@ use rusthouse::batch::engine::{Database, QueryResultLimits};
 use rusthouse::{
     HttpQueryError, HttpQueryLimits, SharedDatabase, handle_http_query,
     handle_http_query_with_bearer_token, handle_http_query_with_bearer_token_and_limits,
+    handle_http_query_with_clickhouse_key, handle_http_query_with_clickhouse_key_and_limits,
     handle_http_query_with_limits,
 };
 
@@ -57,6 +58,13 @@ fn authenticated_exchange(database: &SharedDatabase, token: &str, request: &[u8]
     let mut response = Vec::new();
     handle_http_query_with_bearer_token(database, token, Cursor::new(request), &mut response)
         .expect("authenticated exchange succeeds");
+    response
+}
+
+fn clickhouse_key_exchange(database: &SharedDatabase, key: &str, request: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    handle_http_query_with_clickhouse_key(database, key, Cursor::new(request), &mut response)
+        .expect("ClickHouse-key-authenticated exchange succeeds");
     response
 }
 
@@ -1585,6 +1593,222 @@ fn bearer_rejection_respects_the_complete_response_cap() {
     assert!(matches!(
         error,
         HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+    ));
+    assert!(too_small_output.is_empty());
+}
+
+#[test]
+fn clickhouse_key_authentication_wires_query_insert_and_operational_routes() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let key = "correct key:42";
+    let (insert, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (7);",
+        "x-cLiCkHoUsE-kEy: correct key:42\r\n",
+    );
+
+    assert_response_with_content_type(
+        &clickhouse_key_exchange(&database, key, &insert),
+        "HTTP/1.1 200 OK",
+        "text/plain; charset=utf-8",
+        b"",
+    );
+
+    let query = request_for_target_with_headers(
+        "/query",
+        b"SELECT id FROM events;",
+        "X-ClickHouse-Key: correct key:42\r\n",
+    );
+    assert_response(
+        &clickhouse_key_exchange(&database, key, &query),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[7]]}"#,
+    );
+
+    assert_ok_health_response(&clickhouse_key_exchange(
+        &database,
+        key,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
+    ));
+    assert_ok_health_response(&clickhouse_key_exchange(
+        &database,
+        key,
+        b"GET /ready HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
+    ));
+    assert_ok_metrics_response(
+        &clickhouse_key_exchange(
+            &database,
+            key,
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: correct key:42\r\n\r\n",
+        ),
+        1,
+        1,
+        1,
+    );
+}
+
+#[test]
+fn clickhouse_key_rejections_are_identical_and_stop_before_the_body() {
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let rejected_headers = [
+        ("missing", ""),
+        ("empty", "X-ClickHouse-Key:\r\n"),
+        ("whitespace only", "X-ClickHouse-Key: \t \r\n"),
+        ("incorrect", "X-ClickHouse-Key: incorrect\r\n"),
+        ("wrong case", "X-ClickHouse-Key: Correct-Key\r\n"),
+        ("bearer only", "Authorization: Bearer correct-key\r\n"),
+        (
+            "duplicate",
+            "X-ClickHouse-Key: correct-key\r\nx-clickhouse-key: correct-key\r\n",
+        ),
+    ];
+    let mut expected_response = None;
+
+    for (name, headers) in rejected_headers {
+        let (request, body_offset) = request_with_authorization_for_target(
+            "/insert",
+            b"INSERT INTO events VALUES (1);",
+            headers,
+        );
+        let mut input = Cursor::new(request);
+        let mut response = Vec::new();
+        handle_http_query_with_clickhouse_key(&database, "correct-key", &mut input, &mut response)
+            .unwrap_or_else(|error| panic!("{name} credentials produce a response: {error}"));
+
+        assert_eq!(
+            input.position(),
+            body_offset,
+            "{name} credentials must not consume the SQL body"
+        );
+        assert_response(
+            &response,
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+        );
+        if let Some(expected_response) = &expected_response {
+            assert_eq!(
+                &response, expected_response,
+                "credential failures must not disclose their rejection reason"
+            );
+        } else {
+            expected_response = Some(response);
+        }
+    }
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+
+    let (key_only_request, _) = request_with_authorization(
+        b"SELECT id FROM events;",
+        "X-ClickHouse-Key: correct-key\r\n",
+    );
+    assert_response(
+        &authenticated_exchange(&database, "correct-key", &key_only_request),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+}
+
+#[test]
+fn clickhouse_key_authentication_precedes_database_lock_access() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+
+    assert_response(
+        &clickhouse_key_exchange(
+            &database,
+            "correct-key",
+            b"GET /ready HTTP/1.1\r\nHost: localhost\r\nX-ClickHouse-Key: incorrect\r\n\r\n",
+        ),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"X-ClickHouse-Key authentication required"}"#,
+    );
+}
+
+#[test]
+fn invalid_configured_clickhouse_keys_are_rejected_before_input() {
+    let database = SharedDatabase::default();
+    let cases = [
+        ("", "configured ClickHouse key must not be empty"),
+        (
+            " leading",
+            "configured ClickHouse key is not a valid HTTP header value",
+        ),
+        (
+            "trailing ",
+            "configured ClickHouse key is not a valid HTTP header value",
+        ),
+        (
+            "line\nbreak",
+            "configured ClickHouse key is not a valid HTTP header value",
+        ),
+        (
+            "sëcret",
+            "configured ClickHouse key is not a valid HTTP header value",
+        ),
+    ];
+
+    for (key, message) in cases {
+        let mut response = Vec::new();
+        handle_http_query_with_clickhouse_key(&database, key, FailingReader, &mut response)
+            .unwrap_or_else(|error| panic!("invalid configuration {key:?} responds: {error}"));
+        assert_response(
+            &response,
+            "HTTP/1.1 500 Internal Server Error",
+            &format!(r#"{{"error":"{message}"}}"#),
+        );
+    }
+}
+
+#[test]
+fn clickhouse_key_rejection_respects_the_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let request = request(b"SELECT 1;");
+    let unrestricted = clickhouse_key_exchange(&database, "correct-key", &request);
+    let mut exact_response = Vec::new();
+
+    handle_http_query_with_clickhouse_key_and_limits(
+        &database,
+        "correct-key",
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: unrestricted.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(exact_response, unrestricted);
+
+    let mut too_small_output = Vec::new();
+    let error = handle_http_query_with_clickhouse_key_and_limits(
+        &database,
+        "correct-key",
+        Cursor::new(&request),
+        &mut too_small_output,
+        HttpQueryLimits {
+            max_response_bytes: unrestricted.len() - 1,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("neither the rejection nor fixed limit response can fit");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == unrestricted.len() - 1
     ));
     assert!(too_small_output.is_empty());
 }
