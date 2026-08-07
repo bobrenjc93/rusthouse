@@ -417,6 +417,7 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         | Statement::Select(_)
         | Statement::CrossJoin(_)
         | Statement::UnionAll { .. }
+        | Statement::UnionDistinct { .. }
         | Statement::ShowTables
         | Statement::ShowCreateTable { .. }
         | Statement::DescribeTable { .. }

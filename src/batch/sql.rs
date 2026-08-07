@@ -90,6 +90,11 @@ pub enum Statement {
         left: Select,
         right: Select,
     },
+    /// Exactly two `SELECT` operands combined with duplicate elimination.
+    UnionDistinct {
+        left: Select,
+        right: Select,
+    },
     ShowTables,
     ShowCreateTable {
         name: String,
@@ -706,15 +711,30 @@ impl<'a> Parser<'a> {
             return Ok(Statement::Select(left));
         }
 
-        self.expect_keyword("ALL")?;
+        let distinct = if self.eat_keyword("ALL") {
+            false
+        } else {
+            self.expect_keyword("DISTINCT")?;
+            true
+        };
         self.expect_keyword("SELECT")?;
         let right = self.parse_select()?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
-            return self
-                .error("UNION ALL supports exactly two SELECT operands and no outer clauses");
+            let operation = if distinct {
+                "UNION DISTINCT"
+            } else {
+                "UNION ALL"
+            };
+            return self.error(format!(
+                "{operation} supports exactly two SELECT operands and no outer clauses"
+            ));
         }
 
-        Ok(Statement::UnionAll { left, right })
+        if distinct {
+            Ok(Statement::UnionDistinct { left, right })
+        } else {
+            Ok(Statement::UnionAll { left, right })
+        }
     }
 
     fn parse_literal_select(&mut self) -> Result<Statement> {

@@ -288,6 +288,27 @@ fn csv_batch_emits_one_left_named_union_all_result() {
 }
 
 #[test]
+fn csv_batch_emits_left_named_union_distinct_rows_in_first_seen_order() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE first (id Int64, label String);
+          CREATE TABLE second (id Int64, label String);
+          INSERT INTO first VALUES (1, 'first'), (1, 'first'), (2, 'second');
+          INSERT INTO second VALUES (2, 'second'), (3, 'third'), (3, 'third');
+          SELECT id AS event_id, label AS description FROM first
+          UNION DISTINCT
+          SELECT id AS ignored, label AS also_ignored FROM second;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"event_id,description\n1,first\n2,second\n3,third\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn csv_batch_emits_typed_cross_join_in_left_major_order() {
     let output = run(
         &["--format", "csv"],

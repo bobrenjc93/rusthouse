@@ -40,6 +40,10 @@ pub enum Error {
         left: usize,
         right: usize,
     },
+    UnionDistinctColumnCountMismatch {
+        left: usize,
+        right: usize,
+    },
     InvalidQuery(String),
     NumericOverflow(String),
     InsertOnlyStatementRequired {
@@ -111,6 +115,10 @@ impl fmt::Display for Error {
             Self::UnionColumnCountMismatch { left, right } => write!(
                 f,
                 "UNION ALL column count mismatch: left operand has {left}, right operand has {right}"
+            ),
+            Self::UnionDistinctColumnCountMismatch { left, right } => write!(
+                f,
+                "UNION DISTINCT column count mismatch: left operand has {left}, right operand has {right}"
             ),
             Self::InvalidQuery(message) => write!(f, "invalid query: {message}"),
             Self::NumericOverflow(operation) => {
