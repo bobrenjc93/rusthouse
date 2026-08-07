@@ -1,4 +1,4 @@
-//! Transport-neutral handling for one bounded HTTP query, health, or metrics exchange.
+//! Transport-neutral handling for one bounded HTTP query, insert, health, or metrics exchange.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -47,7 +47,7 @@ impl Default for HttpQueryLimits {
     }
 }
 
-/// A transport failure while handling one HTTP query, health, or metrics exchange.
+/// A transport failure while handling one HTTP query, insert, health, or metrics exchange.
 ///
 /// Request and query errors that can be represented on the wire are returned
 /// as HTTP responses and are not Rust errors. No response is written for a
@@ -101,6 +101,13 @@ impl StdError for HttpQueryError {
 /// and row-oriented JSON responses use the corresponding batch writers;
 /// positional JSON responses contain arrays separated by line feeds.
 ///
+/// The bearer-authenticated handlers additionally accept exact `POST /insert`
+/// requests with the same body framing and limits. They pass the SQL to
+/// [`SharedDatabase::try_execute_insert_batch`], which atomically executes a
+/// nonempty `INSERT`-only batch after one nonblocking write-lock attempt.
+/// Success returns an empty `200 OK` response. The unauthenticated handlers do
+/// not expose this route.
+///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
 /// for retained tables, columns, and rows. It takes a nonblocking, consistent
 /// database metrics snapshot; lock contention and poisoning return `503`.
@@ -148,7 +155,7 @@ pub fn handle_http_query_with_limits(
     handle_http_query_exchange(database, input, output, limits, None)
 }
 
-/// Handles one HTTP query, health, or metrics exchange that requires a bearer token.
+/// Handles one HTTP query, insert, health, or metrics exchange that requires a bearer token.
 ///
 /// This is separate from [`handle_http_query`], which remains unauthenticated.
 /// Every request, including `GET /ping`, `GET /ready`, and `GET /metrics`, is
@@ -302,6 +309,39 @@ fn handle_http_query_exchange(
                 limits.max_response_bytes,
             );
         }
+        HttpRequest::Insert { sql } => {
+            return match database.try_execute_insert_batch(&sql) {
+                Ok(_) => write_response(
+                    &mut output,
+                    Status::OK,
+                    &[],
+                    CONTENT_TYPE_TEXT,
+                    Vec::new(),
+                    limits.max_response_bytes,
+                ),
+                Err(SharedDatabaseError::DatabaseBusy) => write_error_response(
+                    &mut output,
+                    Status::SERVICE_UNAVAILABLE,
+                    &[],
+                    "database is unavailable",
+                    limits.max_response_bytes,
+                ),
+                Err(SharedDatabaseError::LockPoisoned) => write_error_response(
+                    &mut output,
+                    Status::INTERNAL_SERVER_ERROR,
+                    &[],
+                    "database is unavailable",
+                    limits.max_response_bytes,
+                ),
+                Err(error) => write_error_response(
+                    &mut output,
+                    Status::BAD_REQUEST,
+                    &[],
+                    &error.to_string(),
+                    limits.max_response_bytes,
+                ),
+            };
+        }
         HttpRequest::Query {
             sql,
             response_format,
@@ -411,45 +451,15 @@ fn read_request(
             Ok(HttpRequest::Metrics)
         }
         RequestKind::Query(QuerySource::Body) => {
-            let Some(content_length) = request.content_length else {
-                return Err(RequestFailure::new(
-                    Status::LENGTH_REQUIRED,
-                    "Content-Length header is required",
-                )
-                .into());
-            };
-            if content_length > limits.max_sql_bytes {
-                return Err(RequestFailure::new(
-                    Status::PAYLOAD_TOO_LARGE,
-                    "request body exceeds configured byte limit",
-                )
-                .into());
-            }
-
-            let mut body = vec![0; content_length];
-            let mut read = 0;
-            while read < body.len() {
-                match input.read(&mut body[read..]) {
-                    Ok(0) => {
-                        return Err(RequestFailure::new(
-                            Status::BAD_REQUEST,
-                            "request body is shorter than Content-Length",
-                        )
-                        .into());
-                    }
-                    Ok(bytes) => read += bytes,
-                    Err(error) => return Err(RequestReadError::Io(error)),
-                }
-            }
-
-            String::from_utf8(body)
-                .map(|sql| HttpRequest::Query {
-                    sql,
-                    response_format: request.response_format,
-                })
-                .map_err(|_| {
-                    RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into()
-                })
+            let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
+            Ok(HttpRequest::Query {
+                sql,
+                response_format: request.response_format,
+            })
+        }
+        RequestKind::Insert => {
+            let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
+            Ok(HttpRequest::Insert { sql })
         }
         RequestKind::Query(QuerySource::UrlEncoded(encoded_sql)) => {
             if request.content_length.unwrap_or(0) != 0 {
@@ -471,6 +481,46 @@ fn read_request(
                 })
         }
     }
+}
+
+fn read_sql_body(
+    input: &mut impl Read,
+    content_length: Option<usize>,
+    max_sql_bytes: usize,
+) -> Result<String, RequestReadError> {
+    let Some(content_length) = content_length else {
+        return Err(RequestFailure::new(
+            Status::LENGTH_REQUIRED,
+            "Content-Length header is required",
+        )
+        .into());
+    };
+    if content_length > max_sql_bytes {
+        return Err(RequestFailure::new(
+            Status::PAYLOAD_TOO_LARGE,
+            "request body exceeds configured byte limit",
+        )
+        .into());
+    }
+
+    let mut body = vec![0; content_length];
+    let mut read = 0;
+    while read < body.len() {
+        match input.read(&mut body[read..]) {
+            Ok(0) => {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "request body is shorter than Content-Length",
+                )
+                .into());
+            }
+            Ok(bytes) => read += bytes,
+            Err(error) => return Err(RequestReadError::Io(error)),
+        }
+    }
+
+    String::from_utf8(body)
+        .map_err(|_| RequestFailure::new(Status::BAD_REQUEST, "SQL body is not valid UTF-8").into())
 }
 
 fn read_header_block(
@@ -536,6 +586,9 @@ enum HttpRequest {
         sql: String,
         response_format: QueryResponseFormat,
     },
+    Insert {
+        sql: String,
+    },
     Ping,
     Ready,
     Metrics,
@@ -552,6 +605,7 @@ enum QueryResponseFormat {
 
 enum RequestKind {
     Query(QuerySource),
+    Insert,
     Ping,
     Ready,
     Metrics,
@@ -575,7 +629,7 @@ fn parse_headers(
         return Err(RequestFailure::new(Status::BAD_REQUEST, "missing request line").into());
     };
     let request_line = strict_header_line(raw_request_line, lines.peek().is_some())?;
-    let kind = parse_request_line(request_line)?;
+    let kind = parse_request_line(request_line, expected_bearer_token.is_some())?;
 
     let mut content_length = None;
     let mut host_seen = false;
@@ -743,7 +797,10 @@ fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
+fn parse_request_line(
+    line: &[u8],
+    authenticated_insert_enabled: bool,
+) -> Result<RequestKind, RequestReadError> {
     let mut parts = line.split(|byte| *byte == b' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -764,6 +821,7 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
 
     match (method, target) {
         (b"POST", b"/" | b"/query") => Ok(RequestKind::Query(QuerySource::Body)),
+        (b"POST", b"/insert") if authenticated_insert_enabled => Ok(RequestKind::Insert),
         (b"GET", target) if target.starts_with(GET_QUERY_PREFIX) => Ok(RequestKind::Query(
             QuerySource::UrlEncoded(target[GET_QUERY_PREFIX.len()..].to_vec()),
         )),
@@ -798,6 +856,12 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
             Status::METHOD_NOT_ALLOWED,
             "method must be GET for /metrics",
             &[b"Allow: GET\r\n"],
+        )
+        .into()),
+        (_, b"/insert") if authenticated_insert_enabled => Err(RequestFailure::with_headers(
+            Status::METHOD_NOT_ALLOWED,
+            "method must be POST for /insert",
+            &[b"Allow: POST\r\n"],
         )
         .into()),
         (b"POST", _) => {
