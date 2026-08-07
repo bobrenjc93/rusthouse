@@ -456,6 +456,54 @@ fn csv_batch_emits_typed_nulls_for_empty_aggregate_inputs() {
 }
 
 #[test]
+fn batch_formats_apply_having_nullness_to_empty_and_populated_aggregates() {
+    let sql = b"CREATE TABLE samples (value Int64);
+        SELECT SUM(value) AS total FROM samples
+        HAVING total IS NULL ORDER BY total LIMIT 1;
+        INSERT INTO samples VALUES (7);
+        SELECT SUM(value) AS total FROM samples
+        HAVING total IS NOT NULL ORDER BY total DESC LIMIT 1;";
+    let cases = [
+        ("csv", "total\nNULL\ntotal\n7\n"),
+        ("tsv", "total\n\\N\ntotal\n7\n"),
+        (
+            "json",
+            concat!(
+                "{\"columns\":[{\"name\":\"total\",\"type\":\"Int64\"}],\"rows\":[[null]]}\n",
+                "{\"columns\":[{\"name\":\"total\",\"type\":\"Int64\"}],\"rows\":[[7]]}\n",
+            ),
+        ),
+        (
+            "table",
+            concat!(
+                "+-------+\n",
+                "| total |\n",
+                "+-------+\n",
+                "| NULL  |\n",
+                "+-------+\n",
+                "\n",
+                "+-------+\n",
+                "| total |\n",
+                "+-------+\n",
+                "| 7     |\n",
+                "+-------+\n",
+            ),
+        ),
+    ];
+
+    for (format, expected) in cases {
+        let output = run(&["--format", format], sql);
+        assert!(output.status.success(), "{format}: {:?}", output.stderr);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{format}"
+        );
+        assert!(output.stderr.is_empty(), "{format}");
+    }
+}
+
+#[test]
 fn json_batch_emits_escaped_typed_results_null_aggregates_and_show_tables() {
     let output = run(
         &["--format", "json"],

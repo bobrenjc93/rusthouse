@@ -28,8 +28,12 @@ multi-row `INSERT INTO ... VALUES`, typed projections and comparisons,
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
 in `HAVING`. This includes `COUNT`, numeric `SUM`, numeric `MIN` and `MAX`, and
-`AVG`. Empty `SUM`, `MIN`, `MAX`, and `AVG` results are `NULL` and do not
-satisfy a `HAVING` predicate.
+`AVG`. `HAVING aggregate_alias IS NULL` and `IS NOT NULL` test the finalized
+value of any projected aggregate, including `String` or `Bool` `MIN` and `MAX`.
+HAVING filtering happens before `ORDER BY` and `LIMIT`. Empty `SUM`, `MIN`,
+`MAX`, and `AVG` results are typed `NULL` values: they satisfy `IS NULL`, do
+not satisfy `IS NOT NULL`, and remain unknown (and therefore excluded) in a
+numeric HAVING comparison. `COUNT` is always non-`NULL`.
 String literals escape a quote by doubling it, so semicolons and line breaks
 inside literals do not split a batch.
 
