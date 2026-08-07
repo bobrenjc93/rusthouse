@@ -584,8 +584,11 @@ impl Database {
             Statement::Delete {
                 table,
                 column,
+                operator,
                 literal,
-            } => self.execute_delete_statement(table, column, literal, query_result_limits),
+            } => {
+                self.execute_delete_statement(table, column, operator, literal, query_result_limits)
+            }
             Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
             Statement::InsertWithColumns {
                 table,
@@ -679,12 +682,13 @@ impl Database {
         &mut self,
         table: String,
         column: String,
+        operator: ComparisonOperator,
         literal: Value,
         query_result_limits: QueryResultLimits,
     ) -> Result<StatementResult> {
         let predicate = Predicate::Comparison {
             left: Operand::Column(column),
-            operator: ComparisonOperator::Equal,
+            operator,
             right: Operand::Literal(literal),
         };
         let row_indexes = {

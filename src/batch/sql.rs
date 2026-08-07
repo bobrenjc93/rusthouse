@@ -76,10 +76,11 @@ pub enum Statement {
     TruncateTable {
         name: String,
     },
-    /// Exact equality deletion: `DELETE FROM <table> WHERE <column> = <literal>`.
+    /// Exact comparison deletion: `DELETE FROM <table> WHERE <column> <op> <literal>`.
     Delete {
         table: String,
         column: String,
+        operator: ComparisonOperator,
         literal: Value,
     },
     Insert {
@@ -1170,15 +1171,17 @@ impl<'a> Parser<'a> {
         let table = self.expect_identifier("table name")?;
         self.expect_keyword("WHERE")?;
         let column = self.expect_identifier("column name")?;
-        self.expect(&TokenKind::Equal, "'=' in DELETE equality predicate")?;
+        let operator = self.parse_comparison_operator()?;
         let literal = self.parse_literal()?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
-            return self
-                .error("DELETE supports exactly DELETE FROM <table> WHERE <column> = <literal>");
+            return self.error(
+                "DELETE supports exactly DELETE FROM <table> WHERE <column> <comparison> <literal>",
+            );
         }
         Ok(Statement::Delete {
             table,
             column,
+            operator,
             literal,
         })
     }
@@ -1944,7 +1947,7 @@ impl<'a> Parser<'a> {
             TokenKind::LessOrEqual => ComparisonOperator::LessOrEqual,
             TokenKind::Greater => ComparisonOperator::Greater,
             TokenKind::GreaterOrEqual => ComparisonOperator::GreaterOrEqual,
-            _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
+            _ => return self.error("expected comparison operator (=, !=, <>, <, <=, >, or >=)"),
         };
         self.advance();
         Ok(operator)
