@@ -338,6 +338,23 @@ fn batch_cli_keeps_drop_table_command_output_silent() {
 }
 
 #[test]
+fn batch_cli_supports_an_idempotent_conditional_drop_lifecycle() {
+    let output = run(
+        &["--format", "tsv"],
+        b"DROP TABLE IF EXISTS temporary; \
+          CREATE TABLE temporary (id Int64); \
+          INSERT INTO temporary VALUES (1); \
+          DROP TABLE IF EXISTS TEMPORARY; \
+          drop table if exists temporary; \
+          EXISTS TABLE temporary;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"result\nfalse\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn batch_cli_keeps_truncate_table_command_output_silent() {
     for format in ["table", "csv", "tsv", "json", "JSONCompactEachRow"] {
         let output = run(
