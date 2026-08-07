@@ -823,8 +823,18 @@ impl Database {
                 selected_groups.retain(|group| having.evaluate(&grouped, *group));
             }
             if select.distinct {
-                if let Some(limit) = select.limit {
-                    selected_groups.truncate(limit);
+                if ordering.is_empty() {
+                    if let Some(limit) = select.limit {
+                        selected_groups.truncate(limit);
+                    }
+                } else {
+                    order_grouped_rows(
+                        &mut selected_groups,
+                        &grouped,
+                        &items,
+                        &ordering,
+                        select.limit,
+                    );
                 }
             } else {
                 order_grouped_rows(
@@ -1101,13 +1111,9 @@ fn validate_distinct_shape(select: &Select) -> Result<()> {
             .items
             .iter()
             .all(|item| matches!(item, SelectItem::Column { alias: None, .. }));
-    if !unaliased_columns
-        || !select.group_by.is_empty()
-        || select.having.is_some()
-        || !select.order_by.is_empty()
-    {
+    if !unaliased_columns || !select.group_by.is_empty() || select.having.is_some() {
         return Err(Error::InvalidQuery(
-            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, and an optional LIMIT".to_owned(),
+            "SELECT DISTINCT supports one or more unaliased columns, an optional WHERE predicate, optional ordering by projected physical columns, and an optional LIMIT".to_owned(),
         ));
     }
 

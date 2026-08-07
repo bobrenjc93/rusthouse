@@ -1038,7 +1038,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_distinct_select(&mut self) -> Result<Select> {
-        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, and an optional LIMIT";
+        const SHAPE: &str = "SELECT DISTINCT supports one or more unaliased columns followed by FROM <table>, an optional WHERE predicate, an optional ORDER BY projected_column [ASC|DESC] list, and an optional LIMIT";
 
         let mut items = Vec::new();
         loop {
@@ -1061,6 +1061,25 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+
+        let mut order_by = Vec::new();
+        if self.eat_keyword("ORDER") {
+            self.expect_keyword("BY")?;
+            loop {
+                self.reserve_ast_list_item()?;
+                let name = self.expect_identifier("projected physical column after ORDER BY")?;
+                let descending = if self.eat_keyword("DESC") {
+                    true
+                } else {
+                    self.eat_keyword("ASC");
+                    false
+                };
+                order_by.push(OrderBy { name, descending });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
 
         let limit = if self.eat_keyword("LIMIT") {
             let position = self.position();
@@ -1088,7 +1107,7 @@ impl<'a> Parser<'a> {
             predicate,
             group_by: Vec::new(),
             having: None,
-            order_by: Vec::new(),
+            order_by,
             limit,
         })
     }

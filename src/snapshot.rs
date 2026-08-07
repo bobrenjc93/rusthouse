@@ -1,9 +1,9 @@
-//! Versioned, bounded snapshot envelopes and nullable `Int64` row payloads.
+//! Versioned, bounded snapshot envelopes and `Int64` payloads.
 //!
 //! This module does not serialize a catalog. It can create and sync a new
 //! envelope file, atomically replace an envelope through a sibling temporary
-//! file on Unix, then reopen one bounded `Int64` table from that file. See
-//! `docs/snapshot-format.md` for the stable binary layouts.
+//! file on Unix, and encode either row-only data or one self-describing bounded
+//! `Int64` table. See `docs/snapshot-format.md` for the stable binary layouts.
 
 use std::error::Error;
 #[cfg(unix)]
@@ -50,6 +50,40 @@ pub const NULLABLE_I64_NULL_TAG: u8 = 0;
 
 /// Tag identifying a present value in a nullable `Int64` payload.
 pub const NULLABLE_I64_VALUE_TAG: u8 = 1;
+
+/// Magic bytes at the start of a self-describing `Int64` table payload.
+pub const INT64_TABLE_PAYLOAD_MAGIC: [u8; 8] = *b"RHITBLP\0";
+
+/// The self-describing `Int64` table payload version emitted and accepted.
+pub const INT64_TABLE_PAYLOAD_VERSION: u16 = 1;
+
+/// Number of fixed bytes in a self-describing `Int64` table payload.
+///
+/// The column name bytes follow the first 20 fixed bytes. The row cap and row
+/// count account for the remaining 16 fixed bytes and follow the name.
+pub const INT64_TABLE_PAYLOAD_FIXED_LEN: usize = INT64_TABLE_PAYLOAD_MAGIC.len()
+    + std::mem::size_of::<u16>()
+    + 2 * std::mem::size_of::<u8>()
+    + 3 * std::mem::size_of::<u64>();
+
+/// Tag identifying the only column type supported by the table payload.
+pub const INT64_TABLE_INT64_TAG: u8 = 1;
+
+/// Tag identifying a non-nullable column in the table payload.
+pub const INT64_TABLE_NOT_NULL_TAG: u8 = 0;
+
+/// Tag identifying a nullable column in the table payload.
+pub const INT64_TABLE_NULLABLE_TAG: u8 = 1;
+
+const INT64_TABLE_PAYLOAD_VERSION_OFFSET: usize = INT64_TABLE_PAYLOAD_MAGIC.len();
+const INT64_TABLE_PAYLOAD_TYPE_OFFSET: usize =
+    INT64_TABLE_PAYLOAD_VERSION_OFFSET + std::mem::size_of::<u16>();
+const INT64_TABLE_PAYLOAD_NULLABILITY_OFFSET: usize =
+    INT64_TABLE_PAYLOAD_TYPE_OFFSET + std::mem::size_of::<u8>();
+const INT64_TABLE_PAYLOAD_NAME_LENGTH_OFFSET: usize =
+    INT64_TABLE_PAYLOAD_NULLABILITY_OFFSET + std::mem::size_of::<u8>();
+const INT64_TABLE_PAYLOAD_NAME_OFFSET: usize =
+    INT64_TABLE_PAYLOAD_NAME_LENGTH_OFFSET + std::mem::size_of::<u64>();
 
 /// An error produced while encoding or decoding a snapshot envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +362,142 @@ impl fmt::Display for NullableI64PayloadError {
 }
 
 impl Error for NullableI64PayloadError {}
+
+/// An error produced while encoding or decoding one self-describing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Int64TablePayloadError {
+    /// The column name exceeds the codec's configured UTF-8 byte bound.
+    NameTooLong { name_len: u64, max_name_len: usize },
+    /// The persisted row cap exceeds the codec's configured row bound.
+    RowCapLimitExceeded { row_cap: u64, max_rows: usize },
+    /// The current row count exceeds the codec's configured row bound.
+    RowLimitExceeded { row_count: u64, max_rows: usize },
+    /// The encoded payload exceeds the codec's configured byte bound.
+    PayloadTooLarge {
+        payload_len: u64,
+        max_payload_len: usize,
+    },
+    /// The payload ends before a complete declared field or row is present.
+    Truncated {
+        expected_len: usize,
+        actual_len: usize,
+    },
+    /// The payload is not a self-describing `Int64` table payload.
+    IncompatibleMagic {
+        found: [u8; INT64_TABLE_PAYLOAD_MAGIC.len()],
+    },
+    /// The payload version is not supported by this codec.
+    UnsupportedVersion { found: u16, supported: u16 },
+    /// The column uses a type tag this codec does not know.
+    UnknownColumnTypeTag { tag: u8 },
+    /// The column uses a nullability tag this codec does not know.
+    UnknownNullabilityTag { tag: u8 },
+    /// The declared column name bytes are not valid UTF-8.
+    InvalidColumnNameUtf8 {
+        valid_up_to: usize,
+        error_len: Option<usize>,
+    },
+    /// The current row count is larger than the persisted table row cap.
+    RowsExceedRowCap { row_count: u64, row_cap: u64 },
+    /// A row uses a tag that is not defined by the payload format.
+    UnknownRowTag { row_index: usize, tag: u8 },
+    /// A `NULL` row was encoded for a non-nullable column.
+    NullNotAllowed { row_index: usize },
+    /// Bytes remain after the declared rows have been decoded.
+    TrailingData {
+        expected_len: usize,
+        actual_len: usize,
+    },
+}
+
+impl fmt::Display for Int64TablePayloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameTooLong {
+                name_len,
+                max_name_len,
+            } => write!(
+                formatter,
+                "Int64 table payload column name has {name_len} bytes, exceeding the limit of {max_name_len}"
+            ),
+            Self::RowCapLimitExceeded { row_cap, max_rows } => write!(
+                formatter,
+                "Int64 table payload row cap is {row_cap}, exceeding the limit of {max_rows}"
+            ),
+            Self::RowLimitExceeded {
+                row_count,
+                max_rows,
+            } => write!(
+                formatter,
+                "Int64 table payload has {row_count} rows, exceeding the limit of {max_rows}"
+            ),
+            Self::PayloadTooLarge {
+                payload_len,
+                max_payload_len,
+            } => write!(
+                formatter,
+                "Int64 table payload has {payload_len} bytes, exceeding the limit of {max_payload_len}"
+            ),
+            Self::Truncated {
+                expected_len,
+                actual_len,
+            } => write!(
+                formatter,
+                "Int64 table payload is truncated: expected at least {expected_len} bytes, found {actual_len}"
+            ),
+            Self::IncompatibleMagic { found } => {
+                write!(
+                    formatter,
+                    "incompatible Int64 table payload magic: {found:02x?}"
+                )
+            }
+            Self::UnsupportedVersion { found, supported } => write!(
+                formatter,
+                "unsupported Int64 table payload version {found}; this codec supports version {supported}"
+            ),
+            Self::UnknownColumnTypeTag { tag } => {
+                write!(formatter, "unknown Int64 table column type tag {tag:#04x}")
+            }
+            Self::UnknownNullabilityTag { tag } => {
+                write!(formatter, "unknown Int64 table nullability tag {tag:#04x}")
+            }
+            Self::InvalidColumnNameUtf8 {
+                valid_up_to,
+                error_len,
+            } => match error_len {
+                Some(error_len) => write!(
+                    formatter,
+                    "Int64 table column name is not UTF-8 at byte {valid_up_to} (invalid sequence length {error_len})"
+                ),
+                None => write!(
+                    formatter,
+                    "Int64 table column name has an incomplete UTF-8 sequence at byte {valid_up_to}"
+                ),
+            },
+            Self::RowsExceedRowCap { row_count, row_cap } => write!(
+                formatter,
+                "Int64 table payload has {row_count} rows, exceeding its persisted row cap of {row_cap}"
+            ),
+            Self::UnknownRowTag { row_index, tag } => write!(
+                formatter,
+                "Int64 table payload row {row_index} has unknown tag {tag:#04x}"
+            ),
+            Self::NullNotAllowed { row_index } => write!(
+                formatter,
+                "Int64 table payload row {row_index} is NULL, but the column is not nullable"
+            ),
+            Self::TrailingData {
+                expected_len,
+                actual_len,
+            } => write!(
+                formatter,
+                "Int64 table payload has trailing data: expected {expected_len} bytes, found {actual_len}"
+            ),
+        }
+    }
+}
+
+impl Error for Int64TablePayloadError {}
 
 /// An error produced while atomically saving an [`Int64Table`] snapshot file.
 #[cfg(unix)]
@@ -735,6 +905,320 @@ impl NullableI64PayloadCodec {
         }
 
         Ok(rows)
+    }
+}
+
+/// Encodes and decodes one bounded, self-describing [`Int64Table`].
+///
+/// Unlike [`NullableI64PayloadCodec`], this additive payload format includes
+/// the column name, nullability, and table row cap. Decoding validates the
+/// complete payload before allocating rows or constructing the table. It can
+/// be passed directly to [`SnapshotCodec`] for checksummed envelopes and
+/// atomic file replacement.
+///
+/// # Examples
+///
+/// ```
+/// use rusthouse::{Int64Table, Int64TablePayloadCodec, Schema, SnapshotCodec};
+///
+/// let mut table = Int64Table::new(Schema::int64("reading", true), 4);
+/// table.append_batch(&[Some(-7), None])?;
+/// let table_codec = Int64TablePayloadCodec::new(32, 4, 128);
+/// let snapshot_codec = SnapshotCodec::new(128);
+///
+/// let payload = table_codec.encode(&table)?;
+/// let envelope = snapshot_codec.encode(&payload)?;
+/// let reopened = table_codec.decode(snapshot_codec.decode(&envelope)?)?;
+///
+/// assert_eq!(reopened, table);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Int64TablePayloadCodec {
+    max_name_len: usize,
+    max_rows: usize,
+    max_payload_len: usize,
+}
+
+impl Int64TablePayloadCodec {
+    /// Creates a codec with inclusive column-name, row, and payload-byte limits.
+    ///
+    /// `max_name_len` counts UTF-8 bytes. `max_rows` bounds both the persisted
+    /// row cap and the current row count.
+    pub const fn new(max_name_len: usize, max_rows: usize, max_payload_len: usize) -> Self {
+        Self {
+            max_name_len,
+            max_rows,
+            max_payload_len,
+        }
+    }
+
+    /// Returns the maximum column-name length accepted, in UTF-8 bytes.
+    pub const fn max_name_len(self) -> usize {
+        self.max_name_len
+    }
+
+    /// Returns the maximum persisted row cap and current row count accepted.
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    /// Returns the maximum encoded payload size accepted, in bytes.
+    pub const fn max_payload_len(self) -> usize {
+        self.max_payload_len
+    }
+
+    /// Encodes one table, including its one-column schema and row cap.
+    pub fn encode(self, table: &Int64Table) -> Result<Vec<u8>, Int64TablePayloadError> {
+        let column = table.schema().column();
+        let name = column.name().as_bytes();
+        let name_len = u64::try_from(name.len()).unwrap_or(u64::MAX);
+        if name.len() > self.max_name_len {
+            return Err(Int64TablePayloadError::NameTooLong {
+                name_len,
+                max_name_len: self.max_name_len,
+            });
+        }
+
+        let row_cap = u64::try_from(table.row_cap()).unwrap_or(u64::MAX);
+        if table.row_cap() > self.max_rows {
+            return Err(Int64TablePayloadError::RowCapLimitExceeded {
+                row_cap,
+                max_rows: self.max_rows,
+            });
+        }
+
+        let row_count = u64::try_from(table.row_count()).unwrap_or(u64::MAX);
+        if table.row_count() > self.max_rows {
+            return Err(Int64TablePayloadError::RowLimitExceeded {
+                row_count,
+                max_rows: self.max_rows,
+            });
+        }
+
+        let fixed_len = INT64_TABLE_PAYLOAD_FIXED_LEN.checked_add(name.len());
+        let payload_len = fixed_len.and_then(|fixed_len| {
+            table.values().iter().try_fold(fixed_len, |length, value| {
+                let row_len = if value.is_some() {
+                    std::mem::size_of::<u8>() + std::mem::size_of::<i64>()
+                } else {
+                    std::mem::size_of::<u8>()
+                };
+                length.checked_add(row_len)
+            })
+        });
+        let Some(payload_len) = payload_len else {
+            return Err(Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::MAX,
+                max_payload_len: self.max_payload_len,
+            });
+        };
+        if payload_len > self.max_payload_len {
+            return Err(Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(payload_len).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&INT64_TABLE_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&INT64_TABLE_PAYLOAD_VERSION.to_le_bytes());
+        payload.push(INT64_TABLE_INT64_TAG);
+        payload.push(if column.is_nullable() {
+            INT64_TABLE_NULLABLE_TAG
+        } else {
+            INT64_TABLE_NOT_NULL_TAG
+        });
+        payload.extend_from_slice(&name_len.to_le_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&row_cap.to_le_bytes());
+        payload.extend_from_slice(&row_count.to_le_bytes());
+        for value in table.values() {
+            match value {
+                None => payload.push(NULLABLE_I64_NULL_TAG),
+                Some(value) => {
+                    payload.push(NULLABLE_I64_VALUE_TAG);
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        Ok(payload)
+    }
+
+    /// Validates and decodes one complete self-describing table payload.
+    ///
+    /// Payload bytes, every declared bound, UTF-8, tags, nullability, row cap,
+    /// truncation, and trailing data are checked in a validation pass before
+    /// row allocation and table construction begin.
+    pub fn decode(self, payload: &[u8]) -> Result<Int64Table, Int64TablePayloadError> {
+        if payload.len() > self.max_payload_len {
+            return Err(Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+        if payload.len() < INT64_TABLE_PAYLOAD_NAME_OFFSET {
+            return Err(Int64TablePayloadError::Truncated {
+                expected_len: INT64_TABLE_PAYLOAD_NAME_OFFSET,
+                actual_len: payload.len(),
+            });
+        }
+
+        let found_magic = read_array::<{ INT64_TABLE_PAYLOAD_MAGIC.len() }>(payload, 0);
+        if found_magic != INT64_TABLE_PAYLOAD_MAGIC {
+            return Err(Int64TablePayloadError::IncompatibleMagic { found: found_magic });
+        }
+
+        let version =
+            u16::from_le_bytes(read_array::<2>(payload, INT64_TABLE_PAYLOAD_VERSION_OFFSET));
+        if version != INT64_TABLE_PAYLOAD_VERSION {
+            return Err(Int64TablePayloadError::UnsupportedVersion {
+                found: version,
+                supported: INT64_TABLE_PAYLOAD_VERSION,
+            });
+        }
+
+        let type_tag = payload[INT64_TABLE_PAYLOAD_TYPE_OFFSET];
+        if type_tag != INT64_TABLE_INT64_TAG {
+            return Err(Int64TablePayloadError::UnknownColumnTypeTag { tag: type_tag });
+        }
+
+        let nullable = match payload[INT64_TABLE_PAYLOAD_NULLABILITY_OFFSET] {
+            INT64_TABLE_NOT_NULL_TAG => false,
+            INT64_TABLE_NULLABLE_TAG => true,
+            tag => return Err(Int64TablePayloadError::UnknownNullabilityTag { tag }),
+        };
+
+        let declared_name_len = u64::from_le_bytes(read_array::<8>(
+            payload,
+            INT64_TABLE_PAYLOAD_NAME_LENGTH_OFFSET,
+        ));
+        let name_len = usize::try_from(declared_name_len).map_err(|_| {
+            Int64TablePayloadError::NameTooLong {
+                name_len: declared_name_len,
+                max_name_len: self.max_name_len,
+            }
+        })?;
+        if name_len > self.max_name_len {
+            return Err(Int64TablePayloadError::NameTooLong {
+                name_len: declared_name_len,
+                max_name_len: self.max_name_len,
+            });
+        }
+
+        let name_end = INT64_TABLE_PAYLOAD_NAME_OFFSET
+            .checked_add(name_len)
+            .ok_or(Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::MAX,
+                max_payload_len: self.max_payload_len,
+            })?;
+        if payload.len() < name_end {
+            return Err(Int64TablePayloadError::Truncated {
+                expected_len: name_end,
+                actual_len: payload.len(),
+            });
+        }
+        let name = std::str::from_utf8(&payload[INT64_TABLE_PAYLOAD_NAME_OFFSET..name_end])
+            .map_err(|error| Int64TablePayloadError::InvalidColumnNameUtf8 {
+                valid_up_to: error.valid_up_to(),
+                error_len: error.error_len(),
+            })?;
+
+        let rows_offset = name_end.checked_add(2 * std::mem::size_of::<u64>()).ok_or(
+            Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::MAX,
+                max_payload_len: self.max_payload_len,
+            },
+        )?;
+        if rows_offset > self.max_payload_len {
+            return Err(Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(rows_offset).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+        if payload.len() < rows_offset {
+            return Err(Int64TablePayloadError::Truncated {
+                expected_len: rows_offset,
+                actual_len: payload.len(),
+            });
+        }
+
+        let declared_row_cap = u64::from_le_bytes(read_array::<8>(payload, name_end));
+        let row_cap = usize::try_from(declared_row_cap).map_err(|_| {
+            Int64TablePayloadError::RowCapLimitExceeded {
+                row_cap: declared_row_cap,
+                max_rows: self.max_rows,
+            }
+        })?;
+        if row_cap > self.max_rows {
+            return Err(Int64TablePayloadError::RowCapLimitExceeded {
+                row_cap: declared_row_cap,
+                max_rows: self.max_rows,
+            });
+        }
+
+        let row_count_offset = name_end + std::mem::size_of::<u64>();
+        let declared_row_count = u64::from_le_bytes(read_array::<8>(payload, row_count_offset));
+        let row_count = usize::try_from(declared_row_count).map_err(|_| {
+            Int64TablePayloadError::RowLimitExceeded {
+                row_count: declared_row_count,
+                max_rows: self.max_rows,
+            }
+        })?;
+        if row_count > self.max_rows {
+            return Err(Int64TablePayloadError::RowLimitExceeded {
+                row_count: declared_row_count,
+                max_rows: self.max_rows,
+            });
+        }
+        if row_count > row_cap {
+            return Err(Int64TablePayloadError::RowsExceedRowCap {
+                row_count: declared_row_count,
+                row_cap: declared_row_cap,
+            });
+        }
+
+        let minimum_len =
+            rows_offset
+                .checked_add(row_count)
+                .ok_or(Int64TablePayloadError::PayloadTooLarge {
+                    payload_len: u64::MAX,
+                    max_payload_len: self.max_payload_len,
+                })?;
+        if minimum_len > self.max_payload_len {
+            return Err(Int64TablePayloadError::PayloadTooLarge {
+                payload_len: u64::try_from(minimum_len).unwrap_or(u64::MAX),
+                max_payload_len: self.max_payload_len,
+            });
+        }
+        if payload.len() < minimum_len {
+            return Err(Int64TablePayloadError::Truncated {
+                expected_len: minimum_len,
+                actual_len: payload.len(),
+            });
+        }
+
+        validate_int64_table_rows(payload, rows_offset, row_count, nullable)?;
+
+        let mut rows = Vec::with_capacity(row_count);
+        let mut offset = rows_offset;
+        for _ in 0..row_count {
+            let tag = payload[offset];
+            offset += std::mem::size_of::<u8>();
+            if tag == NULLABLE_I64_NULL_TAG {
+                rows.push(None);
+            } else {
+                rows.push(Some(i64::from_le_bytes(read_array::<8>(payload, offset))));
+                offset += std::mem::size_of::<i64>();
+            }
+        }
+
+        let mut table = Int64Table::new(Schema::int64(name, nullable), row_cap);
+        table
+            .append_batch(&rows)
+            .expect("the complete table payload was validated before construction");
+        Ok(table)
     }
 }
 
@@ -1454,6 +1938,54 @@ fn validate_nullable_i64_rows(
 
     if payload.len() > offset {
         return Err(NullableI64PayloadError::TrailingData {
+            expected_len: offset,
+            actual_len: payload.len(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_int64_table_rows(
+    payload: &[u8],
+    rows_offset: usize,
+    row_count: usize,
+    nullable: bool,
+) -> Result<(), Int64TablePayloadError> {
+    let mut offset = rows_offset;
+    for row_index in 0..row_count {
+        let tag_end = offset.saturating_add(std::mem::size_of::<u8>());
+        let Some(&tag) = payload.get(offset) else {
+            return Err(Int64TablePayloadError::Truncated {
+                expected_len: tag_end,
+                actual_len: payload.len(),
+            });
+        };
+        offset = tag_end;
+
+        match tag {
+            NULLABLE_I64_NULL_TAG if !nullable => {
+                return Err(Int64TablePayloadError::NullNotAllowed { row_index });
+            }
+            NULLABLE_I64_NULL_TAG => {}
+            NULLABLE_I64_VALUE_TAG => {
+                let value_end = offset.saturating_add(std::mem::size_of::<i64>());
+                if payload.len() < value_end {
+                    return Err(Int64TablePayloadError::Truncated {
+                        expected_len: value_end,
+                        actual_len: payload.len(),
+                    });
+                }
+                offset = value_end;
+            }
+            tag => {
+                return Err(Int64TablePayloadError::UnknownRowTag { row_index, tag });
+            }
+        }
+    }
+
+    if payload.len() > offset {
+        return Err(Int64TablePayloadError::TrailingData {
             expected_len: offset,
             actual_len: payload.len(),
         });
