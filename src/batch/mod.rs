@@ -10,7 +10,7 @@ pub mod sql;
 pub mod storage;
 pub mod value;
 
-pub use shared_database::{SharedDatabase, SharedDatabaseError};
+pub use shared_database::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 use std::error::Error as StdError;
 use std::fmt;

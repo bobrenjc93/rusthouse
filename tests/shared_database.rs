@@ -6,7 +6,7 @@ use std::time::Duration;
 use rusthouse::batch::engine::{Database, QueryResultLimits, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::value::Value;
-use rusthouse::{SharedDatabase, SharedDatabaseError};
+use rusthouse::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 fn scalar_counts(results: &[StatementResult]) -> Vec<i64> {
     results
@@ -227,6 +227,76 @@ fn shared_queries_enforce_the_scan_limit_before_where_and_limit() {
             max: 2,
         }))
     );
+}
+
+#[test]
+fn metrics_snapshot_tracks_retained_tables_columns_and_rows() {
+    let database = SharedDatabase::default();
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 0,
+            column_count: 0,
+            retained_row_count: 0,
+        })
+    );
+
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             CREATE TABLE flags (active Bool); \
+             INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
+             INSERT INTO flags VALUES (true);",
+        )
+        .unwrap();
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 2,
+            column_count: 3,
+            retained_row_count: 3,
+        })
+    );
+
+    database
+        .execute("TRUNCATE TABLE events; DROP TABLE flags;")
+        .unwrap();
+    assert_eq!(
+        database.metrics_snapshot(),
+        Some(DatabaseMetrics {
+            table_count: 1,
+            column_count: 2,
+            retained_row_count: 0,
+        })
+    );
+}
+
+#[test]
+fn metrics_snapshot_returns_immediately_unavailable_for_contention_and_poisoning() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let writer = inner.write().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || sender.send(worker_database.metrics_snapshot()).unwrap());
+
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)),
+        Ok(None),
+        "the snapshot must not wait for a writer"
+    );
+    drop(writer);
+    worker.join().unwrap();
+    assert!(database.metrics_snapshot().is_some());
+
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+    assert_eq!(poisoned_database.metrics_snapshot(), None);
 }
 
 #[test]

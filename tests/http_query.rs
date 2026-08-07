@@ -99,6 +99,34 @@ fn assert_ok_health_response(response: &[u8]) {
     );
 }
 
+fn metrics_body(tables: usize, columns: usize, retained_rows: usize) -> String {
+    format!(
+        "# HELP rusthouse_tables Number of tables retained by the database.\n\
+         # TYPE rusthouse_tables gauge\n\
+         rusthouse_tables {tables}\n\
+         # HELP rusthouse_columns Number of columns retained by the database.\n\
+         # TYPE rusthouse_columns gauge\n\
+         rusthouse_columns {columns}\n\
+         # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
+         # TYPE rusthouse_retained_rows gauge\n\
+         rusthouse_retained_rows {retained_rows}\n"
+    )
+}
+
+fn assert_ok_metrics_response(
+    response: &[u8],
+    tables: usize,
+    columns: usize,
+    retained_rows: usize,
+) {
+    assert_response_with_content_type(
+        response,
+        "HTTP/1.1 200 OK",
+        "text/plain; version=0.0.4; charset=utf-8",
+        metrics_body(tables, columns, retained_rows).as_bytes(),
+    );
+}
+
 #[test]
 fn query_reports_the_configured_scan_limit_over_http() {
     let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
@@ -247,7 +275,7 @@ fn ready_requires_the_exact_get_target_and_an_empty_body() {
             b"GET /ready?details HTTP/1.1\r\nHost: localhost\r\n\r\n",
         ),
         "HTTP/1.1 404 Not Found",
-        r#"{"error":"request target must be /ping or /ready"}"#,
+        r#"{"error":"request target must be /ping, /ready, or /metrics"}"#,
     );
 }
 
@@ -266,6 +294,116 @@ fn bearer_authentication_protects_ready() {
         "correct-token",
         b"GET /ready HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
     ));
+}
+
+#[test]
+fn metrics_reports_state_changes_as_prometheus_gauges() {
+    let database = SharedDatabase::default();
+    const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 0, 0, 0);
+    database
+        .execute(
+            "CREATE TABLE events (id Int64, label String); \
+             CREATE TABLE flags (active Bool); \
+             INSERT INTO events VALUES (1, 'one'), (2, 'two'); \
+             INSERT INTO flags VALUES (true);",
+        )
+        .unwrap();
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 2, 3, 3);
+
+    database
+        .execute("TRUNCATE TABLE events; DROP TABLE flags;")
+        .unwrap();
+    assert_ok_metrics_response(&exchange(&database, REQUEST), 1, 2, 0);
+}
+
+#[test]
+fn metrics_returns_the_same_503_for_writer_contention_and_poisoning() {
+    const REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    let contended_inner = Arc::new(RwLock::new(Database::new()));
+    let contended_database = SharedDatabase::from_arc(Arc::clone(&contended_inner));
+    let mut writer = Some(contended_inner.write().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = contended_database.clone();
+    let worker = thread::spawn(move || sender.send(exchange(&worker_database, REQUEST)).unwrap());
+    let contended_response = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(response) => response,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("metrics snapshot blocked behind a writer: {error}");
+        }
+    };
+    assert_response(
+        &contended_response,
+        "HTTP/1.1 503 Service Unavailable",
+        r#"{"error":"database is unavailable"}"#,
+    );
+    drop(writer.take());
+    worker.join().unwrap();
+
+    let poisoned_inner = Arc::new(RwLock::new(Database::new()));
+    let poisoned_database = SharedDatabase::from_arc(Arc::clone(&poisoned_inner));
+    let poisoner = thread::spawn(move || {
+        let _guard = poisoned_inner.write().unwrap();
+        panic!("poison the database lock");
+    });
+    assert!(poisoner.join().is_err());
+    assert_eq!(exchange(&poisoned_database, REQUEST), contended_response);
+}
+
+#[test]
+fn metrics_requires_exact_get_without_a_body_and_retains_bearer_authentication() {
+    let database = SharedDatabase::default();
+    let wrong_method = exchange(
+        &database,
+        b"POST /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &wrong_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be GET for /metrics"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&wrong_method)
+            .unwrap()
+            .contains("\r\nAllow: GET\r\n")
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /metrics?details HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be /ping, /ready, or /metrics"}"#,
+    );
+    assert_response(
+        &exchange(
+            &database,
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx",
+        ),
+        "HTTP/1.1 400 Bad Request",
+        r#"{"error":"GET /metrics does not accept a request body"}"#,
+    );
+
+    let unauthenticated = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", unauthenticated),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    assert_ok_metrics_response(
+        &authenticated_exchange(
+            &database,
+            "correct-token",
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer correct-token\r\n\r\n",
+        ),
+        0,
+        0,
+        0,
+    );
 }
 
 #[test]
@@ -353,6 +491,63 @@ fn both_query_routes_stream_typed_json_compact_each_row_and_empty_results() {
 }
 
 #[test]
+fn both_query_routes_return_csv_with_names_for_all_value_types_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE typed_values (integer Int64, score Float64, active Bool, label String); \
+             INSERT INTO typed_values VALUES \
+                 (-9223372036854775808, 2.0, false, 'comma, \"quote\"\ncarriage\rsnow 雪'), \
+                 (7, -1.25, true, ''); \
+             CREATE TABLE empty_values (integer Int64, score Float64, active Bool, label String);",
+        )
+        .unwrap();
+    let expected = concat!(
+        "integer,score,active,label\n",
+        "-9223372036854775808,2.0,false,\"comma, \"\"quote\"\"\ncarriage\rsnow 雪\"\n",
+        "7,-1.25,true,\n",
+    );
+
+    for target in ["/", "/query"] {
+        let typed_request = request_for_target_with_headers(
+            target,
+            b"SELECT integer, score, active, label FROM typed_values ORDER BY integer;",
+            "X-ClickHouse-Format: CSVWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &exchange(&database, &typed_request),
+            "HTTP/1.1 200 OK",
+            "text/csv; charset=utf-8",
+            expected.as_bytes(),
+        );
+
+        let null_request = request_for_target_with_headers(
+            target,
+            b"SELECT MIN(integer) AS missing_integer, MIN(score) AS missing_float, MIN(active) AS missing_boolean, MIN(label) AS missing_string FROM empty_values;",
+            "X-ClickHouse-Format: CSVWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &exchange(&database, &null_request),
+            "HTTP/1.1 200 OK",
+            "text/csv; charset=utf-8",
+            b"missing_integer,missing_float,missing_boolean,missing_string\nNULL,NULL,NULL,NULL\n",
+        );
+
+        let empty_request = request_for_target_with_headers(
+            target,
+            b"SELECT integer, score, active, label FROM empty_values;",
+            "X-ClickHouse-Format: CSVWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &exchange(&database, &empty_request),
+            "HTTP/1.1 200 OK",
+            "text/csv; charset=utf-8",
+            b"integer,score,active,label\n",
+        );
+    }
+}
+
+#[test]
 fn bearer_authenticated_queries_honor_json_compact_each_row() {
     let database = SharedDatabase::default();
     let sql = b"SELECT -7 AS integer;";
@@ -381,6 +576,32 @@ fn bearer_authenticated_queries_honor_json_compact_each_row() {
 }
 
 #[test]
+fn bearer_authenticated_queries_honor_csv_with_names() {
+    let database = SharedDatabase::default();
+    let sql = b"SELECT -7 AS integer;";
+    let unauthorized =
+        request_for_target_with_headers("/query", sql, "X-ClickHouse-Format: CSVWithNames\r\n");
+
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &unauthorized),
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+
+    let (authorized, _) = request_with_authorization(
+        sql,
+        "Authorization: Bearer correct-token\r\n\
+         X-ClickHouse-Format: CSVWithNames\r\n",
+    );
+    assert_response_with_content_type(
+        &authenticated_exchange(&database, "correct-token", &authorized),
+        "HTTP/1.1 200 OK",
+        "text/csv; charset=utf-8",
+        b"integer\n-7\n",
+    );
+}
+
+#[test]
 fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
     let database = SharedDatabase::default();
     let duplicate_headers = [
@@ -394,6 +615,14 @@ fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
         ),
         concat!(
             "X-ClickHouse-Format: JSONEachRow\r\n",
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: CSVWithNames\r\n",
+            "X-ClickHouse-Format: CSVWithNames\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: CSVWithNames\r\n",
             "X-ClickHouse-Format: JSONCompactEachRow\r\n",
         ),
     ];
@@ -410,7 +639,13 @@ fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
             );
         }
 
-        for unsupported in ["JSONEachRow", "jsoncompacteachrow", ""] {
+        for unsupported in [
+            "JSONEachRow",
+            "jsoncompacteachrow",
+            "csvwithnames",
+            "CSV",
+            "",
+        ] {
             let headers = format!("X-ClickHouse-Format: {unsupported}\r\n");
             assert_response(
                 &exchange(
@@ -446,6 +681,50 @@ fn json_compact_each_row_honors_the_complete_response_cap() {
         },
     )
     .expect("the exact complete response size is accepted");
+    assert_eq!(exact_response, expected_response);
+
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
+fn csv_with_names_honors_the_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));
+    let request = request_for_target_with_headers(
+        "/query",
+        sql.as_bytes(),
+        "X-ClickHouse-Format: CSVWithNames\r\n",
+    );
+    let expected_response = exchange(&database, &request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the exact complete CSV response size is accepted");
     assert_eq!(exact_response, expected_response);
 
     let limits = HttpQueryLimits {
@@ -979,7 +1258,7 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
     assert_response(
         &exchange(&database, b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n"),
         "HTTP/1.1 404 Not Found",
-        r#"{"error":"request target must be /ping or /ready"}"#,
+        r#"{"error":"request target must be /ping, /ready, or /metrics"}"#,
     );
     assert_response(
         &exchange(
@@ -1220,6 +1499,62 @@ fn ready_honors_exact_header_and_complete_response_byte_limits() {
         } if max_bytes == expected_response.len() - 1
     ));
     assert!(response_overflow_output.is_empty());
+}
+
+#[test]
+fn metrics_honors_the_complete_response_byte_limit() {
+    let database = SharedDatabase::default();
+    let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let expected_response = exchange(&database, request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(exact_response, expected_response);
+
+    let mut capped_response = Vec::new();
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the bounded limit response fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+
+    let mut too_small_output = Vec::new();
+    let error = handle_http_query_with_limits(
+        &database,
+        Cursor::new(request),
+        &mut too_small_output,
+        HttpQueryLimits {
+            max_response_bytes: 0,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("even the fixed response-limit error cannot fit");
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes: 0, .. }
+    ));
+    assert!(too_small_output.is_empty());
 }
 
 #[test]

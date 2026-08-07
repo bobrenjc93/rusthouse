@@ -10,6 +10,20 @@ use super::engine::{
 use super::error::Error;
 use super::sql::{self, Statement};
 
+/// An instantaneous count of data retained by a [`SharedDatabase`].
+///
+/// The counts describe one consistent database read-lock acquisition. They do
+/// not include query results or configured capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseMetrics {
+    /// Number of registered tables.
+    pub table_count: usize,
+    /// Number of schema columns across all registered tables.
+    pub column_count: usize,
+    /// Number of rows retained across all registered tables.
+    pub retained_row_count: usize,
+}
+
 /// An error produced while accessing a [`SharedDatabase`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedDatabaseError {
@@ -130,6 +144,25 @@ impl SharedDatabase {
     /// Returns the maximum number of rows retained by each created table.
     pub fn max_rows_per_table(&self) -> Result<usize, SharedDatabaseError> {
         Ok(self.read()?.max_rows_per_table())
+    }
+
+    /// Takes a consistent metrics snapshot without waiting for the database lock.
+    ///
+    /// Returns `None` when a read lock is not immediately available or when the
+    /// lock is poisoned. The acquired read guard is released before this method
+    /// returns.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> Option<DatabaseMetrics> {
+        let database = match self.inner.try_read() {
+            Ok(database) => database,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return None,
+        };
+        let catalog = database.catalog();
+        Some(DatabaseMetrics {
+            table_count: catalog.table_count(),
+            column_count: catalog.column_count(),
+            retained_row_count: catalog.retained_row_count(),
+        })
     }
 
     /// Parses and executes a complete SQL batch under one database lock.

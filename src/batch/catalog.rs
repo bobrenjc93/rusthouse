@@ -141,6 +141,24 @@ impl Catalog {
         self.tables.len()
     }
 
+    /// Returns the number of columns retained across all registered tables.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.tables
+            .values()
+            .map(|table| table.schema().len())
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    /// Returns the number of rows retained across all registered tables.
+    #[must_use]
+    pub fn retained_row_count(&self) -> usize {
+        self.tables
+            .values()
+            .map(Table::row_count)
+            .fold(0_usize, usize::saturating_add)
+    }
+
     /// Returns the combined byte length of all display names without allocating.
     #[must_use]
     pub fn table_name_bytes(&self) -> usize {
@@ -188,6 +206,8 @@ mod tests {
     fn table_names_are_sorted_without_changing_display_case() {
         let mut catalog = Catalog::new();
         assert_eq!(catalog.table_count(), 0);
+        assert_eq!(catalog.column_count(), 0);
+        assert_eq!(catalog.retained_row_count(), 0);
         assert_eq!(catalog.table_name_bytes(), 0);
 
         for name in ["zebra", "Alpha", "beta"] {
@@ -203,6 +223,8 @@ mod tests {
         }
 
         assert_eq!(catalog.table_count(), 3);
+        assert_eq!(catalog.column_count(), 3);
+        assert_eq!(catalog.retained_row_count(), 0);
         assert_eq!(catalog.table_name_bytes(), 14);
         assert_eq!(catalog.table_names(), ["Alpha", "beta", "zebra"]);
     }

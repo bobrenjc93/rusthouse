@@ -267,10 +267,10 @@ Any validation or resource failure leaves all tables unchanged; the shared
 form retains one write lock across preflight and commit.
 Read-only API misuse and lock poisoning are reported as distinct typed errors.
 
-## HTTP query and health exchanges
+## HTTP query, health, and metrics exchanges
 
 `handle_http_query` handles one transport-neutral `Read`/`Write` HTTP/1.1
-exchange without opening a listener. All four supported routes require a nonempty
+exchange without opening a listener. All five supported routes require a nonempty
 `Host`, reject transfer encoding (including chunked requests), and return `417
 Expectation Failed` for `Expect` instead of waiting for a body whose sender
 may be awaiting an interim response.
@@ -282,14 +282,18 @@ metadata and positional-row shape as `--format json`; protocol and query
 failures return deterministic JSON error objects with an appropriate HTTP
 status. Targets are exact, so a query string or any other suffix is rejected.
 
-Either query route also accepts one optional
-`X-ClickHouse-Format: JSONCompactEachRow` header. When present, a successful
-response has content type `application/json` and contains one positional JSON
-array per row, each followed by a line feed; column metadata is omitted and an
-empty result has an empty body. Header names are case-insensitive, but the
-format value must use that exact spelling. Duplicate format headers and all
-other format values receive deterministic `400 Bad Request` JSON errors. When
-the header is absent, the existing JSON response shape is unchanged.
+Either query route also accepts one optional `X-ClickHouse-Format` header with
+the exact value `CSVWithNames` or `JSONCompactEachRow`. `CSVWithNames` responses
+have content type `text/csv; charset=utf-8` and use the same header, typed-value,
+`NULL`, and field-escaping behavior as `--format csv`; an empty result still
+contains its column-name header. `JSONCompactEachRow` responses have content
+type `application/json` and contain one positional JSON array per row, each
+followed by a line feed; column metadata is omitted and an empty result has an
+empty body. Header names are case-insensitive, but format values are
+case-sensitive and must use one of those exact spellings. Duplicate format
+headers and all other format values receive deterministic `400 Bad Request`
+JSON errors. When the header is absent, the existing JSON response shape is
+unchanged.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
@@ -307,6 +311,15 @@ same deterministic `503 Service Unavailable` JSON error. Use `/ping` for
 process-path liveness and `/ready` when routing work only to an instance that
 can immediately begin a database read.
 
+`GET /metrics` exposes a consistent, nonblocking Prometheus text snapshot. It
+accepts no body and returns exactly three unlabeled gauges:
+`rusthouse_tables`, `rusthouse_columns`, and `rusthouse_retained_rows`. They
+report the registered table count, the schema-column count across all tables,
+and the row count retained across all tables. The response uses Prometheus
+text format version 0.0.4. The snapshot attempts one database read lock and
+never waits for a writer; lock contention and poisoning return the same
+deterministic `503 Service Unavailable` response as `/ready`.
+
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for the
 SQL body, and 16 MiB for the complete response including headers. Header limits
 apply to all routes, as does the complete-response limit. The full response is
@@ -318,13 +331,13 @@ timeout, and shutdown lifecycle remain the embedding application's concern.
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or
 `handle_http_query_with_bearer_token_and_limits` for explicit resource limits.
-For every route, these separate handlers require exactly one case-insensitive
-`Authorization` header with a `Bearer <token>` value; one or more spaces may
-separate the scheme and token. Configured tokens must be nonempty token68
-values. Missing, duplicate, malformed, and incorrect credentials receive the
-same bounded `401 Unauthorized` response before a request body is read or the
-database lock is acquired. Invalid configured tokens are rejected before any
-request input is read. The original
+For every route, including `/metrics`, these separate handlers require exactly
+one case-insensitive `Authorization` header with a `Bearer <token>` value; one
+or more spaces may separate the scheme and token. Configured tokens must be
+nonempty token68 values. Missing, duplicate, malformed, and incorrect
+credentials receive the same bounded `401 Unauthorized` response before a
+request body is read or the database lock is acquired. Invalid configured
+tokens are rejected before any request input is read. The original
 `handle_http_query` APIs intentionally remain unauthenticated for existing
 in-process embeddings.
 

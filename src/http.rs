@@ -1,11 +1,11 @@
-//! Transport-neutral handling for one bounded HTTP query or health exchange.
+//! Transport-neutral handling for one bounded HTTP query, health, or metrics exchange.
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use crate::batch::format::{write_json, write_json_compact_each_row, write_json_string};
-use crate::{SharedDatabase, SharedDatabaseError};
+use crate::batch::format::{write_csv, write_json, write_json_compact_each_row, write_json_string};
+use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
 /// empty line.
@@ -44,7 +44,7 @@ impl Default for HttpQueryLimits {
     }
 }
 
-/// A transport failure while handling one HTTP query or health exchange.
+/// A transport failure while handling one HTTP query, health, or metrics exchange.
 ///
 /// Request and query errors that can be represented on the wire are returned
 /// as HTTP responses and are not Rust errors. No response is written for a
@@ -88,9 +88,13 @@ impl StdError for HttpQueryError {
 /// Their body must be UTF-8 SQL and is passed to [`SharedDatabase::query`],
 /// which accepts exactly one read-only statement. A successful query response
 /// uses the same JSON result shape as the batch JSON formatter unless exactly
-/// one `X-ClickHouse-Format: JSONCompactEachRow` header requests positional
-/// JSON arrays separated by line feeds.
+/// one `X-ClickHouse-Format` header requests `CSVWithNames` or
+/// `JSONCompactEachRow`. CSV responses use the batch CSV writer; positional
+/// JSON responses contain arrays separated by line feeds.
 ///
+/// `GET /metrics` accepts no request body and returns three Prometheus gauges
+/// for retained tables, columns, and rows. It takes a nonblocking, consistent
+/// database metrics snapshot; lock contention and poisoning return `503`.
 /// `GET /ping` accepts no request body and returns the ClickHouse-compatible
 /// plain-text body `Ok.\n`. It does not access or acquire a lock on the
 /// database. `GET /ready` also accepts no body and returns the same successful
@@ -113,7 +117,7 @@ pub fn handle_http_query(
     handle_http_query_with_limits(database, input, output, HttpQueryLimits::default())
 }
 
-/// Handles one HTTP query or health exchange with explicit resource limits.
+/// Handles one HTTP query, health, or metrics exchange with explicit resource limits.
 ///
 /// See [`handle_http_query`] for the accepted protocol and response behavior.
 /// The response limit covers the status line, headers, empty line, and body.
@@ -133,12 +137,13 @@ pub fn handle_http_query_with_limits(
     handle_http_query_exchange(database, input, output, limits, None)
 }
 
-/// Handles one HTTP query or health exchange that requires a bearer token.
+/// Handles one HTTP query, health, or metrics exchange that requires a bearer token.
 ///
 /// This is separate from [`handle_http_query`], which remains unauthenticated.
-/// Every request, including `GET /ping` and `GET /ready`, is authorized only
-/// when it has exactly one `Authorization` header whose value is `Bearer`, one
-/// or more spaces, and a token matching `expected_bearer_token`.
+/// Every request, including `GET /ping`, `GET /ready`, and `GET /metrics`, is
+/// authorized only when it has exactly one `Authorization` header whose value
+/// is `Bearer`, one or more spaces, and a token matching
+/// `expected_bearer_token`.
 /// Authentication failures receive the same response before the SQL body is
 /// read or the database is accessed. The configured token must be a nonempty
 /// RFC token68 value; invalid configurations are rejected as a server error
@@ -262,6 +267,30 @@ fn handle_http_query_exchange(
                 limits.max_response_bytes,
             );
         }
+        HttpRequest::Metrics => {
+            let Some(metrics) = database.metrics_snapshot() else {
+                return write_error_response(
+                    &mut output,
+                    Status::SERVICE_UNAVAILABLE,
+                    &[],
+                    "database is unavailable",
+                    limits.max_response_bytes,
+                );
+            };
+            let mut body = BoundedVec::new(limits.max_response_bytes);
+            if write_prometheus_metrics(&mut body, metrics).is_err() {
+                debug_assert!(body.limit_exceeded);
+                return write_response_limit_error(&mut output, limits.max_response_bytes);
+            }
+            return write_response(
+                &mut output,
+                Status::OK,
+                &[],
+                CONTENT_TYPE_PROMETHEUS,
+                body.bytes,
+                limits.max_response_bytes,
+            );
+        }
         HttpRequest::Query {
             sql,
             response_format,
@@ -271,11 +300,15 @@ fn handle_http_query_exchange(
     match database.query(&sql) {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
-            let write_result = match response_format {
-                QueryResponseFormat::Json => write_json(&mut body, &result),
-                QueryResponseFormat::JsonCompactEachRow => {
-                    write_json_compact_each_row(&mut body, &result)
+            let (write_result, content_type) = match response_format {
+                QueryResponseFormat::Json => (write_json(&mut body, &result), CONTENT_TYPE_JSON),
+                QueryResponseFormat::CsvWithNames => {
+                    (write_csv(&mut body, &result), CONTENT_TYPE_CSV)
                 }
+                QueryResponseFormat::JsonCompactEachRow => (
+                    write_json_compact_each_row(&mut body, &result),
+                    CONTENT_TYPE_JSON,
+                ),
             };
             if write_result.is_err() {
                 debug_assert!(body.limit_exceeded);
@@ -285,7 +318,7 @@ fn handle_http_query_exchange(
                 &mut output,
                 Status::OK,
                 &[],
-                CONTENT_TYPE_JSON,
+                content_type,
                 body.bytes,
                 limits.max_response_bytes,
             )
@@ -335,6 +368,16 @@ fn read_request(
                 .into());
             }
             Ok(HttpRequest::Ready)
+        }
+        RequestKind::Metrics => {
+            if request.content_length.unwrap_or(0) != 0 {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "GET /metrics does not accept a request body",
+                )
+                .into());
+            }
+            Ok(HttpRequest::Metrics)
         }
         RequestKind::Query => {
             let Some(content_length) = request.content_length else {
@@ -445,11 +488,13 @@ enum HttpRequest {
     },
     Ping,
     Ready,
+    Metrics,
 }
 
 #[derive(Clone, Copy)]
 enum QueryResponseFormat {
     Json,
+    CsvWithNames,
     JsonCompactEachRow,
 }
 
@@ -458,6 +503,7 @@ enum RequestKind {
     Query,
     Ping,
     Ready,
+    Metrics,
 }
 
 fn parse_headers(
@@ -576,6 +622,7 @@ fn parse_headers(
         }
         match clickhouse_format {
             None => QueryResponseFormat::Json,
+            Some(b"CSVWithNames") => QueryResponseFormat::CsvWithNames,
             Some(b"JSONCompactEachRow") => QueryResponseFormat::JsonCompactEachRow,
             Some(_) => {
                 return Err(RequestFailure::new(
@@ -659,6 +706,7 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
         (b"POST", b"/" | b"/query") => Ok(RequestKind::Query),
         (b"GET", b"/ping") => Ok(RequestKind::Ping),
         (b"GET", b"/ready") => Ok(RequestKind::Ready),
+        (b"GET", b"/metrics") => Ok(RequestKind::Metrics),
         (_, b"/" | b"/query") => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
             "method must be POST",
@@ -677,17 +725,23 @@ fn parse_request_line(line: &[u8]) -> Result<RequestKind, RequestReadError> {
             &[b"Allow: GET\r\n"],
         )
         .into()),
+        (_, b"/metrics") => Err(RequestFailure::with_headers(
+            Status::METHOD_NOT_ALLOWED,
+            "method must be GET for /metrics",
+            &[b"Allow: GET\r\n"],
+        )
+        .into()),
         (b"POST", _) => {
             Err(RequestFailure::new(Status::NOT_FOUND, "request target must be / or /query").into())
         }
         (b"GET", _) => Err(RequestFailure::new(
             Status::NOT_FOUND,
-            "request target must be /ping or /ready",
+            "request target must be /ping, /ready, or /metrics",
         )
         .into()),
         _ => Err(RequestFailure::with_headers(
             Status::METHOD_NOT_ALLOWED,
-            "method must be POST for / or /query or GET for /ping or /ready",
+            "method must be POST for / or /query or GET for /ping, /ready, or /metrics",
             &[b"Allow: GET, POST\r\n"],
         )
         .into()),
@@ -827,8 +881,26 @@ impl From<RequestFailure> for RequestReadError {
 }
 
 const RESPONSE_LIMIT_MESSAGE: &str = "response exceeds configured byte limit";
+const CONTENT_TYPE_CSV: &[u8] = b"text/csv; charset=utf-8";
 const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 const CONTENT_TYPE_TEXT: &[u8] = b"text/plain; charset=utf-8";
+const CONTENT_TYPE_PROMETHEUS: &[u8] = b"text/plain; version=0.0.4; charset=utf-8";
+
+fn write_prometheus_metrics(output: &mut impl Write, metrics: DatabaseMetrics) -> io::Result<()> {
+    writeln!(
+        output,
+        "# HELP rusthouse_tables Number of tables retained by the database.\n\
+         # TYPE rusthouse_tables gauge\n\
+         rusthouse_tables {}\n\
+         # HELP rusthouse_columns Number of columns retained by the database.\n\
+         # TYPE rusthouse_columns gauge\n\
+         rusthouse_columns {}\n\
+         # HELP rusthouse_retained_rows Number of rows retained across all tables.\n\
+         # TYPE rusthouse_retained_rows gauge\n\
+         rusthouse_retained_rows {}",
+        metrics.table_count, metrics.column_count, metrics.retained_row_count,
+    )
+}
 
 fn write_error_response(
     output: &mut impl Write,
