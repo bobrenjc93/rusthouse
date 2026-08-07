@@ -674,6 +674,63 @@ fn both_query_routes_return_csv_with_names_for_all_value_types_and_empty_results
 }
 
 #[test]
+fn both_query_routes_return_tab_separated_with_names_for_all_value_types_and_empty_results() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE typed_values (integer Int64, score Float64, active Bool, label String); \
+             INSERT INTO typed_values VALUES \
+                 (-9223372036854775808, 2.0, false, 'slash\\tab\tcarriage\rline\nnul\0backspace\u{08}formfeed\u{0c}apostrophe'' snow 雪'), \
+                 (7, -1.25, true, ''); \
+             CREATE TABLE empty_values (integer Int64, score Float64, active Bool, label String);",
+        )
+        .unwrap();
+    let expected = concat!(
+        "integer\tscore\tactive\tlabel\n",
+        "-9223372036854775808\t2.0\tfalse\tslash\\\\tab\\tcarriage\\rline\\nnul\\0backspace\\bformfeed\\fapostrophe\\' snow 雪\n",
+        "7\t-1.25\ttrue\t\n",
+    );
+
+    for target in ["/", "/query"] {
+        let typed_request = request_for_target_with_headers(
+            target,
+            b"SELECT integer, score, active, label FROM typed_values ORDER BY integer;",
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &exchange(&database, &typed_request),
+            "HTTP/1.1 200 OK",
+            "text/tab-separated-values; charset=utf-8",
+            expected.as_bytes(),
+        );
+
+        let null_request = request_for_target_with_headers(
+            target,
+            b"SELECT MIN(integer) AS missing_integer, MIN(score) AS missing_float, MIN(active) AS missing_boolean, MIN(label) AS missing_string FROM empty_values;",
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &exchange(&database, &null_request),
+            "HTTP/1.1 200 OK",
+            "text/tab-separated-values; charset=utf-8",
+            b"missing_integer\tmissing_float\tmissing_boolean\tmissing_string\n\\N\t\\N\t\\N\t\\N\n",
+        );
+
+        let empty_request = request_for_target_with_headers(
+            target,
+            b"SELECT integer, score, active, label FROM empty_values;",
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &exchange(&database, &empty_request),
+            "HTTP/1.1 200 OK",
+            "text/tab-separated-values; charset=utf-8",
+            b"integer\tscore\tactive\tlabel\n",
+        );
+    }
+}
+
+#[test]
 fn bearer_authenticated_queries_honor_json_compact_each_row() {
     let database = SharedDatabase::default();
     let sql = b"SELECT -7 AS integer;";
@@ -728,6 +785,38 @@ fn bearer_authenticated_queries_honor_csv_with_names() {
 }
 
 #[test]
+fn bearer_authenticated_queries_honor_tab_separated_with_names_on_both_routes() {
+    let database = SharedDatabase::default();
+    let sql = b"SELECT -7 AS integer;";
+
+    for target in ["/", "/query"] {
+        let unauthorized = request_for_target_with_headers(
+            target,
+            sql,
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response(
+            &authenticated_exchange(&database, "correct-token", &unauthorized),
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":"bearer authentication required"}"#,
+        );
+
+        let (authorized, _) = request_with_authorization_for_target(
+            target,
+            sql,
+            "Authorization: Bearer correct-token\r\n\
+             X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        );
+        assert_response_with_content_type(
+            &authenticated_exchange(&database, "correct-token", &authorized),
+            "HTTP/1.1 200 OK",
+            "text/tab-separated-values; charset=utf-8",
+            b"integer\n-7\n",
+        );
+    }
+}
+
+#[test]
 fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
     let database = SharedDatabase::default();
     let duplicate_headers = [
@@ -751,6 +840,14 @@ fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
             "X-ClickHouse-Format: CSVWithNames\r\n",
             "X-ClickHouse-Format: JSONCompactEachRow\r\n",
         ),
+        concat!(
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+        ),
+        concat!(
+            "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+            "X-ClickHouse-Format: JSONCompactEachRow\r\n",
+        ),
     ];
 
     for target in ["/", "/query"] {
@@ -769,6 +866,8 @@ fn query_routes_reject_duplicate_and_unsupported_clickhouse_formats() {
             "JSONEachRow",
             "jsoncompacteachrow",
             "csvwithnames",
+            "tabseparatedwithnames",
+            "TabSeparated",
             "CSV",
             "",
         ] {
@@ -851,6 +950,50 @@ fn csv_with_names_honors_the_complete_response_cap() {
         },
     )
     .expect("the exact complete CSV response size is accepted");
+    assert_eq!(exact_response, expected_response);
+
+    let limits = HttpQueryLimits {
+        max_response_bytes: expected_response.len() - 1,
+        ..HttpQueryLimits::default()
+    };
+    let mut capped_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut capped_response,
+        limits,
+    )
+    .expect("the fixed response-limit error fits");
+    assert!(capped_response.len() <= limits.max_response_bytes);
+    assert_response(
+        &capped_response,
+        "HTTP/1.1 500 Internal Server Error",
+        r#"{"error":"response exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
+fn tab_separated_with_names_honors_the_exact_complete_response_cap() {
+    let database = SharedDatabase::default();
+    let sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));
+    let request = request_for_target_with_headers(
+        "/query",
+        sql.as_bytes(),
+        "X-ClickHouse-Format: TabSeparatedWithNames\r\n",
+    );
+    let expected_response = exchange(&database, &request);
+
+    let mut exact_response = Vec::new();
+    handle_http_query_with_limits(
+        &database,
+        Cursor::new(&request),
+        &mut exact_response,
+        HttpQueryLimits {
+            max_response_bytes: expected_response.len(),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect("the exact complete TSV response size is accepted");
     assert_eq!(exact_response, expected_response);
 
     let limits = HttpQueryLimits {

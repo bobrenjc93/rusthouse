@@ -300,17 +300,22 @@ deterministic JSON error objects with an appropriate HTTP status. All other
 targets and query-string shapes are rejected.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
-the exact value `CSVWithNames` or `JSONCompactEachRow`. `CSVWithNames` responses
-have content type `text/csv; charset=utf-8` and use the same header, typed-value,
-`NULL`, and field-escaping behavior as `--format csv`; an empty result still
-contains its column-name header. `JSONCompactEachRow` responses have content
-type `application/json` and contain one positional JSON array per row, each
-followed by a line feed; column metadata is omitted and an empty result has an
-empty body. Header names are case-insensitive, but format values are
-case-sensitive and must use one of those exact spellings. Duplicate format
-headers and all other format values receive deterministic `400 Bad Request`
-JSON errors. When the header is absent, the existing JSON response shape is
-unchanged.
+the exact value `CSVWithNames`, `TabSeparatedWithNames`, or
+`JSONCompactEachRow`. `CSVWithNames` responses have content type
+`text/csv; charset=utf-8` and use the same header, typed-value, `NULL`, and
+field-escaping behavior as `--format csv`; an empty result still contains its
+column-name header. `TabSeparatedWithNames` responses similarly use the
+existing `--format tsv` writer and content type
+`text/tab-separated-values; charset=utf-8`: column names and typed rows are
+tab-separated, `NULL` is `\N`, ClickHouse backslash escaping is applied, and an
+empty result still contains its escaped column-name header.
+`JSONCompactEachRow` responses have content type `application/json` and contain
+one positional JSON array per row, each followed by a line feed; column
+metadata is omitted and an empty result has an empty body. Header names are
+case-insensitive, but format values are case-sensitive and must use one of
+those exact spellings. Duplicate format headers and all other format values
+receive deterministic `400 Bad Request` JSON errors. When the header is absent,
+the existing JSON response shape is unchanged.
 
 `GET /ping` is the ClickHouse-compatible health check. It accepts no request
 body (`Content-Length` may be omitted or be exactly zero) and returns `200 OK`
