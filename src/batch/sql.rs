@@ -82,6 +82,13 @@ pub enum Statement {
         column: String,
         literal: Value,
     },
+    /// Exact non-equality deletion: `DELETE FROM <table> WHERE <column> <op> <literal>`.
+    DeleteComparison {
+        table: String,
+        column: String,
+        operator: ComparisonOperator,
+        literal: Value,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -1170,16 +1177,25 @@ impl<'a> Parser<'a> {
         let table = self.expect_identifier("table name")?;
         self.expect_keyword("WHERE")?;
         let column = self.expect_identifier("column name")?;
-        self.expect(&TokenKind::Equal, "'=' in DELETE equality predicate")?;
+        let operator = self.parse_comparison_operator()?;
         let literal = self.parse_literal()?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
-            return self
-                .error("DELETE supports exactly DELETE FROM <table> WHERE <column> = <literal>");
+            return self.error(
+                "DELETE supports exactly DELETE FROM <table> WHERE <column> <comparison> <literal>",
+            );
         }
-        Ok(Statement::Delete {
-            table,
-            column,
-            literal,
+        Ok(match operator {
+            ComparisonOperator::Equal => Statement::Delete {
+                table,
+                column,
+                literal,
+            },
+            operator => Statement::DeleteComparison {
+                table,
+                column,
+                operator,
+                literal,
+            },
         })
     }
 
@@ -1944,7 +1960,7 @@ impl<'a> Parser<'a> {
             TokenKind::LessOrEqual => ComparisonOperator::LessOrEqual,
             TokenKind::Greater => ComparisonOperator::Greater,
             TokenKind::GreaterOrEqual => ComparisonOperator::GreaterOrEqual,
-            _ => return self.error("expected comparison operator (=, !=, <, <=, >, or >=)"),
+            _ => return self.error("expected comparison operator (=, !=, <>, <, <=, >, or >=)"),
         };
         self.advance();
         Ok(operator)
