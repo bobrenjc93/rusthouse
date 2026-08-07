@@ -11,6 +11,7 @@ use crate::batch::format::{
     write_json_string, write_tsv,
 };
 use crate::batch::storage::validate_table_name;
+use crate::batch::tsv::{TsvIngestError, TsvIngestLimits};
 use crate::{DatabaseMetrics, SharedDatabase, SharedDatabaseError};
 
 /// Default maximum size of the request line and headers, including the final
@@ -39,6 +40,11 @@ pub struct HttpQueryLimits {
     ///
     /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
     pub csv_ingest_limits: CsvIngestLimits,
+    /// Byte, row, and value limits for one `POST /insert/<table>`
+    /// `TabSeparatedWithNames` body.
+    ///
+    /// The HTTP body must independently fit within [`Self::max_sql_bytes`].
+    pub tsv_ingest_limits: TsvIngestLimits,
     /// Maximum bytes in the complete HTTP response, including its headers.
     pub max_response_bytes: usize,
 }
@@ -50,6 +56,7 @@ impl Default for HttpQueryLimits {
             max_header_count: DEFAULT_MAX_HTTP_HEADER_COUNT,
             max_sql_bytes: DEFAULT_MAX_HTTP_SQL_BYTES,
             csv_ingest_limits: CsvIngestLimits::default(),
+            tsv_ingest_limits: TsvIngestLimits::default(),
             max_response_bytes: DEFAULT_MAX_HTTP_RESPONSE_BYTES,
         }
     }
@@ -113,11 +120,13 @@ impl StdError for HttpQueryError {
 /// requests with the same body framing and limits. They pass the SQL to
 /// [`SharedDatabase::try_execute_insert_batch`], which atomically executes a
 /// nonempty `INSERT`-only batch after one nonblocking write-lock attempt. Exact
-/// `POST /insert/<table>` requests instead treat the bounded body as
-/// `CSVWithNames` and pass it with [`HttpQueryLimits::csv_ingest_limits`] to
-/// [`SharedDatabase::try_ingest_csv_with_names`]. Success returns an empty
-/// `200 OK` response. The unauthenticated handlers do not expose either route.
-/// The `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
+/// `POST /insert/<table>` requests treat the bounded body as `CSVWithNames` by
+/// default. An exact `X-ClickHouse-Format: TabSeparatedWithNames` header selects
+/// TSV input instead; `CSVWithNames` may also be selected explicitly. The
+/// corresponding independent ingestion limits and nonblocking
+/// [`SharedDatabase`] importer are used. Success returns an empty `200 OK`
+/// response. The unauthenticated handlers do not expose either route. The
+/// `X-ClickHouse-Key`-authenticated handlers expose the same authenticated
 /// route set.
 ///
 /// `GET /metrics` accepts no request body and returns three Prometheus gauges
@@ -488,7 +497,11 @@ fn handle_http_query_exchange(
                 ),
             };
         }
-        HttpRequest::CsvInsert { table, body } => {
+        HttpRequest::TableInsert {
+            table,
+            body,
+            input_format,
+        } => {
             let success_response = match prepare_response(
                 Status::OK,
                 &[],
@@ -506,8 +519,15 @@ fn handle_http_query_exchange(
                     );
                 }
             };
-            return match database.try_ingest_csv_with_names(&table, body, limits.csv_ingest_limits)
-            {
+            let result = match input_format {
+                TableInsertFormat::CsvWithNames => {
+                    database.try_ingest_csv_with_names(&table, body, limits.csv_ingest_limits)
+                }
+                TableInsertFormat::TabSeparatedWithNames => {
+                    database.try_ingest_tsv_with_names(&table, body, limits.tsv_ingest_limits)
+                }
+            };
+            return match result {
                 Ok(_) => output
                     .write_all(&success_response)
                     .map_err(HttpQueryError::Write),
@@ -664,14 +684,26 @@ fn read_request(
             let sql = read_sql_body(input, request.content_length, limits.max_sql_bytes)?;
             Ok(HttpRequest::Insert { sql })
         }
-        RequestKind::CsvInsert(table) => {
-            let body = read_csv_body(
-                input,
-                request.content_length,
-                limits.max_sql_bytes,
-                limits.csv_ingest_limits,
-            )?;
-            Ok(HttpRequest::CsvInsert { table, body })
+        RequestKind::TableInsert(table) => {
+            let body = match request.table_insert_format {
+                TableInsertFormat::CsvWithNames => read_csv_body(
+                    input,
+                    request.content_length,
+                    limits.max_sql_bytes,
+                    limits.csv_ingest_limits,
+                )?,
+                TableInsertFormat::TabSeparatedWithNames => read_tsv_body(
+                    input,
+                    request.content_length,
+                    limits.max_sql_bytes,
+                    limits.tsv_ingest_limits,
+                )?,
+            };
+            Ok(HttpRequest::TableInsert {
+                table,
+                body,
+                input_format: request.table_insert_format,
+            })
         }
         RequestKind::Query(QuerySource::UrlEncoded(encoded_sql)) => {
             if request.content_length.unwrap_or(0) != 0 {
@@ -727,6 +759,27 @@ fn read_csv_body(
             SharedDatabaseError::CsvIngest(CsvIngestError::ByteLimitExceeded {
                 bytes: content_length,
                 max_bytes: csv_limits.max_bytes,
+            })
+            .to_string(),
+        )
+        .into());
+    }
+    read_body_with_length(input, content_length)
+}
+
+fn read_tsv_body(
+    input: &mut impl Read,
+    content_length: Option<usize>,
+    max_http_body_bytes: usize,
+    tsv_limits: TsvIngestLimits,
+) -> Result<Vec<u8>, RequestReadError> {
+    let content_length = bounded_body_length(content_length, max_http_body_bytes)?;
+    if content_length > tsv_limits.max_bytes {
+        return Err(RequestFailure::owned(
+            Status::BAD_REQUEST,
+            SharedDatabaseError::TsvIngest(TsvIngestError::ByteLimitExceeded {
+                bytes: content_length,
+                max_bytes: tsv_limits.max_bytes,
             })
             .to_string(),
         )
@@ -835,6 +888,7 @@ struct ParsedRequest {
     kind: RequestKind,
     content_length: Option<usize>,
     response_format: QueryResponseFormat,
+    table_insert_format: TableInsertFormat,
 }
 
 enum HttpRequest {
@@ -845,9 +899,10 @@ enum HttpRequest {
     Insert {
         sql: String,
     },
-    CsvInsert {
+    TableInsert {
         table: String,
         body: Vec<u8>,
+        input_format: TableInsertFormat,
     },
     Ping,
     Ready,
@@ -866,10 +921,16 @@ enum QueryResponseFormat {
 enum RequestKind {
     Query(QuerySource),
     Insert,
-    CsvInsert(String),
+    TableInsert(String),
     Ping,
     Ready,
     Metrics,
+}
+
+#[derive(Clone, Copy)]
+enum TableInsertFormat {
+    CsvWithNames,
+    TabSeparatedWithNames,
 }
 
 enum QuerySource {
@@ -1031,10 +1092,33 @@ fn parse_headers(
     } else {
         QueryResponseFormat::Json
     };
+    let table_insert_format = if matches!(&kind, RequestKind::TableInsert(_)) {
+        if duplicate_clickhouse_format {
+            return Err(RequestFailure::new(
+                Status::BAD_REQUEST,
+                "duplicate X-ClickHouse-Format header",
+            )
+            .into());
+        }
+        match clickhouse_format {
+            None | Some(b"CSVWithNames") => TableInsertFormat::CsvWithNames,
+            Some(b"TabSeparatedWithNames") => TableInsertFormat::TabSeparatedWithNames,
+            Some(_) => {
+                return Err(RequestFailure::new(
+                    Status::BAD_REQUEST,
+                    "unsupported X-ClickHouse-Format header",
+                )
+                .into());
+            }
+        }
+    } else {
+        TableInsertFormat::CsvWithNames
+    };
     Ok(ParsedRequest {
         kind,
         content_length,
         response_format,
+        table_insert_format,
     })
 }
 
@@ -1113,8 +1197,8 @@ fn parse_request_line(
         (b"POST", b"/" | b"/query") => Ok(RequestKind::Query(QuerySource::Body)),
         (b"POST", b"/insert") if authenticated_insert_enabled => Ok(RequestKind::Insert),
         (b"POST", target) if authenticated_insert_enabled && target.starts_with(b"/insert/") => {
-            parse_csv_insert_target(target)
-                .map(|table| RequestKind::CsvInsert(table.to_owned()))
+            parse_table_insert_target(target)
+                .map(|table| RequestKind::TableInsert(table.to_owned()))
                 .ok_or_else(|| {
                     RequestReadError::from(RequestFailure::new(
                         Status::NOT_FOUND,
@@ -1165,7 +1249,7 @@ fn parse_request_line(
         )
         .into()),
         (_, target)
-            if authenticated_insert_enabled && parse_csv_insert_target(target).is_some() =>
+            if authenticated_insert_enabled && parse_table_insert_target(target).is_some() =>
         {
             Err(RequestFailure::with_headers(
                 Status::METHOD_NOT_ALLOWED,
@@ -1191,7 +1275,7 @@ fn parse_request_line(
     }
 }
 
-fn parse_csv_insert_target(target: &[u8]) -> Option<&str> {
+fn parse_table_insert_target(target: &[u8]) -> Option<&str> {
     let table = target.strip_prefix(b"/insert/")?;
     let table = std::str::from_utf8(table).ok()?;
     validate_table_name(table).is_ok().then_some(table)

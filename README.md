@@ -25,10 +25,15 @@ The early implementation should favor Rust's standard library and a small depend
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
-comparisons with unary `NOT`, `AND`, and `OR`, plus case-sensitive String prefix
-and containment predicates of the exact forms `column LIKE 'prefix%'` and
-`column LIKE '%substring%'`. Prefixes and substrings may be empty or Unicode.
-Other placements of `%` and patterns with excess wildcards are rejected.
+comparisons with unary `NOT`, `AND`, and `OR`. The exact inclusive range form
+`column BETWEEN lower_literal AND upper_literal` accepts the same typed literals
+as comparisons, binds as one predicate atom, and is equivalent to
+`column >= lower_literal AND column <= upper_literal`. Bounds are not reordered,
+so a lower bound greater than its upper bound matches no rows. Case-sensitive
+String prefix and containment predicates use the exact forms
+`column LIKE 'prefix%'` and `column LIKE '%substring%'`. Prefixes and substrings
+may be empty or Unicode. Other placements of `%` and patterns with excess
+wildcards are rejected.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
@@ -163,8 +168,8 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, prefix `LIKE`, and contains `LIKE` predicates, including
-unary `NOT`, as regular `SELECT`.
+composable comparison, inclusive `BETWEEN`, prefix `LIKE`, and contains `LIKE`
+predicates, including unary `NOT`, as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -275,7 +280,9 @@ covers `CREATE` and explicit `INSERT` columns plus `SELECT`, `GROUP BY`, and
 `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
-combined levels of parenthesized or unary-`NOT` nesting.
+combined levels of parenthesized or unary-`NOT` nesting. A `BETWEEN` atom is
+lowered to two inclusive comparisons joined by `AND`, and all three expanded
+nodes count toward the 256-node limit.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
@@ -418,17 +425,21 @@ recognized by `handle_http_query` or `handle_http_query_with_limits`, and query
 routes remain read-only even when their request is authenticated.
 
 Those authenticated handlers also expose exact `POST /insert/<table>` for
-`CSVWithNames` ingestion. `<table>` is one literal RustHouse SQL identifier;
-extra path segments, query strings, and percent-encoded names are not accepted.
-The request requires one decimal `Content-Length`, and its body starts with an
-unquoted header that exactly matches the target table's schema, followed by
-typed CSV records. For example, `POST /insert/events` with the body
-`id,label\n1,"one, quoted"\n` imports one row into `events`. No content-type or
-format header is required: this route always treats the body as
-`CSVWithNames`. It calls `SharedDatabase::try_ingest_csv_with_names`, so typed
-CSV, schema, capacity, and configured CSV-limit failures return `400 Bad
-Request` and append no rows. Success returns the same empty `200 OK` response
-as the SQL insert route. The unauthenticated handlers do not recognize it.
+`CSVWithNames` or `TabSeparatedWithNames` ingestion. `<table>` is one literal
+RustHouse SQL identifier; extra path segments, query strings, and
+percent-encoded names are not accepted. The request requires one decimal
+`Content-Length`, and its body starts with a header that exactly matches the
+target table's schema, followed by typed records. With no format header the
+body remains `CSVWithNames`, so `POST /insert/events` with
+`id,label\n1,"one, quoted"\n` imports one CSV row as before. An exact,
+case-sensitive `X-ClickHouse-Format: TabSeparatedWithNames` selects TSV input;
+`X-ClickHouse-Format: CSVWithNames` may select CSV explicitly. Duplicate,
+differently cased, and other format values return `400 Bad Request`. The route
+calls the corresponding `SharedDatabase::try_ingest_*_with_names` method, so
+typed input, schema, capacity, and format-specific limit failures return `400
+Bad Request` and append no rows. Success returns the same empty `200 OK`
+response as the SQL insert route. The unauthenticated handlers do not recognize
+it.
 
 HTTP query admission never waits for the database lock. After request parsing,
 authentication, SQL decoding, and read-only statement validation, each query
@@ -441,11 +452,12 @@ limit retain their existing ordering and behavior.
 
 HTTP insert admission likewise never waits. After authentication and bounded
 body reading, the SQL route completes SQL parsing before its immediate
-write-lock attempt; the CSV route passes the bounded bytes to the ingestion API,
-which attempts the lock before table lookup and CSV parsing. Any active reader
-or writer returns the same deterministic `503 Service Unavailable`; a poisoned
-lock returns `500 Internal Server Error`. Validation and commit occur under the
-acquired write lock so concurrent work cannot expose or cause a partial batch.
+write-lock attempt; the CSV and TSV routes pass their bounded bytes to the
+selected ingestion API, which attempts the lock before table lookup or parsing.
+Any active reader or writer returns the same deterministic `503 Service
+Unavailable`; a poisoned lock returns `500 Internal Server Error`. Validation
+and commit occur under the acquired write lock so concurrent work cannot expose
+or cause a partial batch.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
@@ -498,19 +510,20 @@ deterministic `503 Service Unavailable` response as `/ready`.
 
 The default limits are 16 KiB and 64 fields for request headers, 1 MiB for a
 POST body or decoded GET SQL, and 16 MiB for the complete response including
-headers. CSV insertion additionally applies the ingestion defaults of 8 MiB,
-100,000 rows, and 1,000,000 values; the default 1 MiB HTTP body cap is reached
-first for byte size. `HttpQueryLimits::csv_ingest_limits` configures those CSV
-bounds independently. For CSV insertion, the declared `Content-Length` must
-fit both byte caps before the handler allocates or reads the body. Header limits
-apply to all routes, as does the complete-response limit. The full response is
-prepared and checked before anything is written. Call an authenticated
-handler's `*_and_limits` variant with `HttpQueryLimits` to set explicit
-insertion limits. Each call reads exactly one header block and, only for a POST
-query or authenticated insert, exactly its declared body; it emits at most one
-final `Connection: close` response and never reads or handles a subsequent
-request. This single-exchange API deliberately leaves listener, connection,
-timeout, and shutdown lifecycle to the embedding application.
+headers. CSV and TSV insertion each additionally apply their own ingestion
+defaults of 8 MiB, 100,000 rows, and 1,000,000 values; the default 1 MiB HTTP
+body cap is reached first for byte size. `HttpQueryLimits::csv_ingest_limits`
+and `HttpQueryLimits::tsv_ingest_limits` configure the two formats independently.
+For table insertion, the declared `Content-Length` must fit the HTTP byte cap
+and the selected format's byte cap before the handler allocates or reads the
+body. Header limits apply to all routes, as does the complete-response limit.
+The full response is prepared and checked before anything is written. Call an
+authenticated handler's `*_and_limits` variant with `HttpQueryLimits` to set
+explicit insertion limits. Each call reads exactly one header block and, only
+for a POST query or authenticated insert, exactly its declared body; it emits at
+most one final `Connection: close` response and never reads or handles a
+subsequent request. This single-exchange API deliberately leaves listener,
+connection, timeout, and shutdown lifecycle to the embedding application.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

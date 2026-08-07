@@ -155,6 +155,24 @@ fn json_cli_executes_contains_like_for_regular_and_distinct_where() {
 }
 
 #[test]
+fn json_cli_executes_inclusive_between_for_distinct_where() {
+    let output = run(
+        &["--format", "json"],
+        b"CREATE TABLE ranges (id Int64, label String); \
+          INSERT INTO ranges VALUES \
+          (1, 'outside'), (2, 'inside'), (3, 'inside'), (4, 'edge'), (5, 'outside'); \
+          SELECT DISTINCT label FROM ranges WHERE id BETWEEN 2 AND 4 ORDER BY label;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"{\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"edge\"],[\"inside\"]]}\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn json_cli_projects_ascii_lowercase_strings() {
     let output = run(
         &["--format", "json"],
