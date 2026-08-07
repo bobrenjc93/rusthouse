@@ -72,6 +72,17 @@ directory-sync failure is different: the destination has already been
 replaced and is visible, but the rename's durability after a system crash is
 uncertain.
 
+`save_int64_table_payload_to_file` is the Unix-only self-describing table save
+operation. It first encodes the complete schema, row cap, and rows through
+`Int64TablePayloadCodec`, then passes the complete payload to
+`SnapshotCodec::replace_file`. Its typed error distinguishes table-payload
+encoding from replacement failures. Because encoding completes before
+replacement begins, every pre-rename failure preserves an existing
+destination. A post-rename directory-sync error explicitly reports that the
+destination was already replaced. The matching bounded reopen operation is
+`restore_int64_table_payload_from_file` and requires no caller-supplied schema
+or row cap.
+
 `save_int64_table_to_file` is the Unix-only composed table save operation. It
 first encodes an existing `Int64Table` through `NullableI64PayloadCodec`, then
 passes the complete payload to `SnapshotCodec::replace_file`. Its typed error
@@ -200,11 +211,12 @@ and construct the table. Unknown type, nullability, and row tags are rejected.
 This payload contains exactly one one-column `Int64Table`. Its stored name is
 the column name, not a catalog table name. It cannot represent a catalog,
 multiple tables, or the batch engine's multi-column and non-`Int64` schemas.
-It composes directly with `SnapshotCodec` for checksummed envelopes and, on
-Unix, atomic replacement through `SnapshotCodec::replace_file`. A file written
-with `SnapshotCodec::create_new_file` or `replace_file` can be reopened with
-`restore_int64_table_payload_from_file`; the helper obtains the column schema,
-nullability, row cap, and rows entirely from the validated payload.
+It composes directly with `SnapshotCodec` for checksummed envelopes. On Unix,
+`save_int64_table_payload_to_file` performs the complete atomic save operation;
+the lower-level `SnapshotCodec::replace_file` remains available. Files written
+with either replacement API or `SnapshotCodec::create_new_file` can be reopened
+with `restore_int64_table_payload_from_file`; the helper obtains the column
+schema, nullability, row cap, and rows entirely from the validated payload.
 
 ## Restoring one Int64 table
 
