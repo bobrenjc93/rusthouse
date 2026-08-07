@@ -74,6 +74,12 @@ pub enum Statement {
     TruncateTable {
         name: String,
     },
+    /// Exact equality deletion: `DELETE FROM <table> WHERE <column> = <literal>`.
+    Delete {
+        table: String,
+        column: String,
+        literal: Value,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -696,6 +702,8 @@ impl<'a> Parser<'a> {
             self.parse_rename()
         } else if self.eat_keyword("TRUNCATE") {
             self.parse_truncate()
+        } else if self.eat_keyword("DELETE") {
+            self.parse_delete()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
@@ -708,7 +716,7 @@ impl<'a> Parser<'a> {
             self.parse_exists()
         } else {
             self.error(
-                "expected CREATE, ALTER, DROP, RENAME, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS",
+                "expected CREATE, ALTER, DROP, RENAME, TRUNCATE, DELETE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS",
             )
         }
     }
@@ -1131,6 +1139,24 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after TRUNCATE TABLE");
         }
         Ok(Statement::TruncateTable { name })
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect_keyword("FROM")?;
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("WHERE")?;
+        let column = self.expect_identifier("column name")?;
+        self.expect(&TokenKind::Equal, "'=' in DELETE equality predicate")?;
+        let literal = self.parse_literal()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self
+                .error("DELETE supports exactly DELETE FROM <table> WHERE <column> = <literal>");
+        }
+        Ok(Statement::Delete {
+            table,
+            column,
+            literal,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {

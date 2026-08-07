@@ -581,6 +581,11 @@ impl Database {
                     affected_rows,
                 })
             }
+            Statement::Delete {
+                table,
+                column,
+                literal,
+            } => self.execute_delete_statement(table, column, literal, query_result_limits),
             Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
             Statement::InsertWithColumns {
                 table,
@@ -643,6 +648,7 @@ impl Database {
             | Statement::AddColumn { .. }
             | Statement::DropColumn { .. }
             | Statement::TruncateTable { .. }
+            | Statement::Delete { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -665,6 +671,38 @@ impl Database {
         self.catalog.table_mut(&table)?.insert_rows(rows)?;
         Ok(StatementResult::Command {
             tag: "INSERT",
+            affected_rows,
+        })
+    }
+
+    fn execute_delete_statement(
+        &mut self,
+        table: String,
+        column: String,
+        literal: Value,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<StatementResult> {
+        let predicate = Predicate::Comparison {
+            left: Operand::Column(column),
+            operator: ComparisonOperator::Equal,
+            right: Operand::Literal(literal),
+        };
+        let row_indexes = {
+            let target = self.catalog.table(&table)?;
+            let predicate = compile_predicate(target, &predicate)?;
+            enforce_scan_limit(target, query_result_limits, "DELETE scanned rows")?;
+            (0..target.row_count())
+                .filter(|row| predicate.evaluate(target, *row))
+                .collect::<Vec<_>>()
+        };
+
+        let affected_rows = self
+            .catalog
+            .table_mut(&table)
+            .expect("DELETE target was resolved before its bounded scan")
+            .delete_rows(&row_indexes)?;
+        Ok(StatementResult::Command {
+            tag: "DELETE",
             affected_rows,
         })
     }
@@ -1129,6 +1167,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
+        Statement::Delete { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
@@ -2591,11 +2630,15 @@ fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> 
 }
 
 fn enforce_select_scan_limit(table: &Table, limits: QueryResultLimits) -> Result<()> {
-    enforce_resource_limit(
-        "SELECT scanned rows",
-        table.row_count(),
-        limits.max_scan_rows,
-    )
+    enforce_scan_limit(table, limits, "SELECT scanned rows")
+}
+
+fn enforce_scan_limit(
+    table: &Table,
+    limits: QueryResultLimits,
+    resource: &'static str,
+) -> Result<()> {
+    enforce_resource_limit(resource, table.row_count(), limits.max_scan_rows)
 }
 
 fn execute_grouped<'a>(
