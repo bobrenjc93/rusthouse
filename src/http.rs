@@ -1,10 +1,11 @@
 //! Transport-neutral handling for one bounded HTTP query, insert, health, or metrics exchange.
 
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read, Write};
 
-use crate::batch::csv::CsvIngestLimits;
+use crate::batch::csv::{CsvIngestError, CsvIngestLimits};
 use crate::batch::format::{
     write_csv, write_json, write_json_compact_each_row, write_json_each_row_with_limit,
     write_json_string, write_tsv,
@@ -370,7 +371,7 @@ fn handle_http_query_exchange(
                 failure.status,
                 failure.extra_headers,
                 response_headers,
-                failure.message,
+                failure.message.as_ref(),
                 limits.max_response_bytes,
             );
         }
@@ -664,7 +665,12 @@ fn read_request(
             Ok(HttpRequest::Insert { sql })
         }
         RequestKind::CsvInsert(table) => {
-            let body = read_bounded_body(input, request.content_length, limits.max_sql_bytes)?;
+            let body = read_csv_body(
+                input,
+                request.content_length,
+                limits.max_sql_bytes,
+                limits.csv_ingest_limits,
+            )?;
             Ok(HttpRequest::CsvInsert { table, body })
         }
         RequestKind::Query(QuerySource::UrlEncoded(encoded_sql)) => {
@@ -704,6 +710,35 @@ fn read_bounded_body(
     content_length: Option<usize>,
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, RequestReadError> {
+    let content_length = bounded_body_length(content_length, max_body_bytes)?;
+    read_body_with_length(input, content_length)
+}
+
+fn read_csv_body(
+    input: &mut impl Read,
+    content_length: Option<usize>,
+    max_http_body_bytes: usize,
+    csv_limits: CsvIngestLimits,
+) -> Result<Vec<u8>, RequestReadError> {
+    let content_length = bounded_body_length(content_length, max_http_body_bytes)?;
+    if content_length > csv_limits.max_bytes {
+        return Err(RequestFailure::owned(
+            Status::BAD_REQUEST,
+            SharedDatabaseError::CsvIngest(CsvIngestError::ByteLimitExceeded {
+                bytes: content_length,
+                max_bytes: csv_limits.max_bytes,
+            })
+            .to_string(),
+        )
+        .into());
+    }
+    read_body_with_length(input, content_length)
+}
+
+fn bounded_body_length(
+    content_length: Option<usize>,
+    max_body_bytes: usize,
+) -> Result<usize, RequestReadError> {
     let Some(content_length) = content_length else {
         return Err(RequestFailure::new(
             Status::LENGTH_REQUIRED,
@@ -718,7 +753,13 @@ fn read_bounded_body(
         )
         .into());
     }
+    Ok(content_length)
+}
 
+fn read_body_with_length(
+    input: &mut impl Read,
+    content_length: usize,
+) -> Result<Vec<u8>, RequestReadError> {
     let mut body = vec![0; content_length];
     let mut read = 0;
     while read < body.len() {
@@ -1317,7 +1358,7 @@ impl Status {
 
 struct RequestFailure {
     status: Status,
-    message: &'static str,
+    message: Cow<'static, str>,
     extra_headers: &'static [&'static [u8]],
 }
 
@@ -1325,7 +1366,15 @@ impl RequestFailure {
     const fn new(status: Status, message: &'static str) -> Self {
         Self {
             status,
-            message,
+            message: Cow::Borrowed(message),
+            extra_headers: &[],
+        }
+    }
+
+    fn owned(status: Status, message: String) -> Self {
+        Self {
+            status,
+            message: Cow::Owned(message),
             extra_headers: &[],
         }
     }
@@ -1337,7 +1386,7 @@ impl RequestFailure {
     ) -> Self {
         Self {
             status,
-            message,
+            message: Cow::Borrowed(message),
             extra_headers,
         }
     }

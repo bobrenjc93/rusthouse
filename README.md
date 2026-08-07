@@ -486,15 +486,16 @@ POST body or decoded GET SQL, and 16 MiB for the complete response including
 headers. CSV insertion additionally applies the ingestion defaults of 8 MiB,
 100,000 rows, and 1,000,000 values; the default 1 MiB HTTP body cap is reached
 first for byte size. `HttpQueryLimits::csv_ingest_limits` configures those CSV
-bounds independently. Header limits apply to all routes, as does the
-complete-response limit. The full response is prepared and checked before
-anything is written. Call an authenticated handler's `*_and_limits` variant
-with `HttpQueryLimits` to set explicit insertion limits. Each call reads exactly
-one header block and, only for a POST query or authenticated insert, exactly its
-declared body; it emits at most one final `Connection: close` response and never
-reads or handles a subsequent request. This single-exchange API deliberately
-leaves listener, connection, timeout, and shutdown lifecycle to the embedding
-application.
+bounds independently. For CSV insertion, the declared `Content-Length` must
+fit both byte caps before the handler allocates or reads the body. Header limits
+apply to all routes, as does the complete-response limit. The full response is
+prepared and checked before anything is written. Call an authenticated
+handler's `*_and_limits` variant with `HttpQueryLimits` to set explicit
+insertion limits. Each call reads exactly one header block and, only for a POST
+query or authenticated insert, exactly its declared body; it emits at most one
+final `Connection: close` response and never reads or handles a subsequent
+request. This single-exchange API deliberately leaves listener, connection,
+timeout, and shutdown lifecycle to the embedding application.
 
 Embedders that require a shared bearer credential can instead call
 `handle_http_query_with_bearer_token`, or

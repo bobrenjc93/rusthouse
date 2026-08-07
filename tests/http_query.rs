@@ -2969,15 +2969,35 @@ fn csv_insert_preserves_http_and_csv_ingest_limits_without_partial_rows() {
         r#"{"error":"request body exceeds configured byte limit"}"#,
     );
 
-    let csv_limit_cases = [
-        (
-            CsvIngestLimits::new(csv.len() - 1, 2, 4),
-            format!(
-                r#"{{"error":"database CSV ingestion failed: CSV input is {} bytes, exceeding the limit of {} bytes"}}"#,
-                csv.len(),
-                csv.len() - 1,
-            ),
+    let mut input = Cursor::new(&request);
+    let mut response = Vec::new();
+    handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            csv_ingest_limits: CsvIngestLimits::new(csv.len() - 1, 2, 4),
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        input.position(),
+        body_offset,
+        "the CSV byte cap must be checked before reading the body"
+    );
+    assert_response(
+        &response,
+        "HTTP/1.1 400 Bad Request",
+        &format!(
+            r#"{{"error":"database CSV ingestion failed: CSV input is {} bytes, exceeding the limit of {} bytes"}}"#,
+            csv.len(),
+            csv.len() - 1,
         ),
+    );
+
+    let csv_limit_cases = [
         (
             CsvIngestLimits::new(csv.len(), 1, 4),
             r#"{"error":"database CSV ingestion failed: CSV record at line 3 raises the row count to 2, exceeding the limit of 1"}"#.to_owned(),
