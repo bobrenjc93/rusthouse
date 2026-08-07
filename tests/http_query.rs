@@ -2445,6 +2445,51 @@ fn authenticated_insert_route_preserves_the_sql_body_limit() {
 }
 
 #[test]
+fn authenticated_insert_route_preflights_the_response_cap_before_commit() {
+    let (request, _) = request_with_authorization_for_target(
+        "/insert",
+        b"INSERT INTO events VALUES (1);",
+        "Authorization: Bearer correct-token\r\n",
+    );
+    let sizing_database = SharedDatabase::default();
+    sizing_database
+        .execute("CREATE TABLE events (id Int64);")
+        .unwrap();
+    let success_response = authenticated_exchange(&sizing_database, "correct-token", &request);
+
+    let database = SharedDatabase::default();
+    database.execute("CREATE TABLE events (id Int64);").unwrap();
+    let max_response_bytes = success_response.len() - 1;
+    let mut response = Vec::new();
+    let error = handle_http_query_with_bearer_token_and_limits(
+        &database,
+        "correct-token",
+        Cursor::new(request),
+        &mut response,
+        HttpQueryLimits {
+            max_response_bytes,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .expect_err("the fixed success response exceeds the cap");
+
+    assert!(matches!(
+        error,
+        HttpQueryError::ResponseLimitExceeded { max_bytes, .. }
+            if max_bytes == max_response_bytes
+    ));
+    assert!(response.is_empty());
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/query", b"SELECT id FROM events;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[]}"#,
+    );
+}
+
+#[test]
 fn complete_response_is_capped_before_any_bytes_are_written() {
     let database = SharedDatabase::default();
     let large_sql = format!("SELECT '{}' AS value;", "x".repeat(1_000));

@@ -310,15 +310,22 @@ fn handle_http_query_exchange(
             );
         }
         HttpRequest::Insert { sql } => {
+            let success_response = match prepare_response(
+                Status::OK,
+                &[],
+                CONTENT_TYPE_TEXT,
+                &[],
+                limits.max_response_bytes,
+            ) {
+                Ok(response) => response,
+                Err(_) => {
+                    return write_response_limit_error(&mut output, limits.max_response_bytes);
+                }
+            };
             return match database.try_execute_insert_batch(&sql) {
-                Ok(_) => write_response(
-                    &mut output,
-                    Status::OK,
-                    &[],
-                    CONTENT_TYPE_TEXT,
-                    Vec::new(),
-                    limits.max_response_bytes,
-                ),
+                Ok(_) => output
+                    .write_all(&success_response)
+                    .map_err(HttpQueryError::Write),
                 Err(SharedDatabaseError::DatabaseBusy) => write_error_response(
                     &mut output,
                     Status::SERVICE_UNAVAILABLE,
