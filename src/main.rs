@@ -7,10 +7,10 @@ const HELP: &str = "RustHouse bounded SQL query session
 Usage: rusthouse [OPTIONS]
 
 With no options, reads the legacy line-oriented Int64 session from stdin.
-With --format table, --format csv, --format tsv, or --format json, reads one
-semicolon-delimited SQL batch through EOF and prints one result for each
-SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE query.
-CREATE, DROP, RENAME, TRUNCATE, and INSERT remain silent.
+With --format table, --format csv, --format tsv, --format json, or --format
+JSONCompactEachRow, reads one semicolon-delimited SQL batch through EOF and
+prints results for SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, and
+EXISTS TABLE queries. CREATE, DROP, RENAME, TRUNCATE, and INSERT remain silent.
 
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table
@@ -26,6 +26,8 @@ Options:
   --format csv   Emit CSVWithNames-compatible query results
   --format tsv   Emit TabSeparatedWithNames query results
   --format json  Emit newline-delimited JSON query results
+  --format JSONCompactEachRow
+                 Emit one positional JSON array per result row
   -h, --help     Print help
 ";
 
@@ -79,6 +81,14 @@ fn main() -> ExitCode {
                 Err(error) => fail(&error),
             }
         }
+        Ok(Action::JsonCompactEachRowBatch) => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            match rusthouse::batch::run_json_compact_each_row_batch(stdin.lock(), stdout.lock()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(&error),
+            }
+        }
         Err(argument) => fail(&format_args!(
             "unexpected argument '{}'; use --help for usage",
             argument.to_string_lossy()
@@ -93,6 +103,7 @@ enum Action {
     CsvBatch,
     TsvBatch,
     JsonBatch,
+    JsonCompactEachRowBatch,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, OsString> {
@@ -113,6 +124,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, OsStri
         }
         (Some(format), Some(value), None) if format == "--format" && value == "json" => {
             Ok(Action::JsonBatch)
+        }
+        (Some(format), Some(value), None)
+            if format == "--format" && value == "JSONCompactEachRow" =>
+        {
+            Ok(Action::JsonCompactEachRowBatch)
         }
         (Some(argument), _, _) => Err(argument),
         (None, Some(_), _) | (None, None, Some(_)) => {
