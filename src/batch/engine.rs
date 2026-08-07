@@ -16,6 +16,8 @@ pub use crate::batch::storage::DEFAULT_MAX_ROWS_PER_TABLE;
 
 /// Maximum estimated heap retained by the collecting [`Database::execute`] API.
 pub const DEFAULT_MAX_RETAINED_RESULT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum source rows inspected by one table-backed `SELECT`.
+pub const DEFAULT_MAX_QUERY_SCAN_ROWS: usize = DEFAULT_MAX_ROWS_PER_TABLE;
 /// Maximum rows materialized by one `SELECT`.
 pub const DEFAULT_MAX_QUERY_RESULT_ROWS: usize = 10_000;
 /// Maximum scalar cells materialized by one `SELECT`.
@@ -35,9 +37,15 @@ pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_CELLS: usize = 500_000;
 /// Maximum estimated aggregate state heap retained by one grouped `SELECT`.
 pub const DEFAULT_MAX_QUERY_AGGREGATE_STATE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Resource limits for query-result materialization and grouped working state.
+/// Resource limits for source scans, query-result materialization, and grouped working state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryResultLimits {
+    /// Maximum rows in the source table of one table-backed `SELECT`.
+    ///
+    /// This is checked before row inspection and matching-row index allocation.
+    /// `WHERE` and `LIMIT` therefore cannot reduce the charged scan. Each
+    /// `UNION ALL` operand and each `CROSS JOIN` input is checked independently.
+    pub max_scan_rows: usize,
     pub max_rows: usize,
     pub max_values: usize,
     pub max_bytes: usize,
@@ -51,6 +59,7 @@ pub struct QueryResultLimits {
 impl Default for QueryResultLimits {
     fn default() -> Self {
         Self {
+            max_scan_rows: DEFAULT_MAX_QUERY_SCAN_ROWS,
             max_rows: DEFAULT_MAX_QUERY_RESULT_ROWS,
             max_values: DEFAULT_MAX_QUERY_RESULT_VALUES,
             max_bytes: DEFAULT_MAX_QUERY_RESULT_BYTES,
@@ -169,7 +178,7 @@ impl Database {
         Self::default()
     }
 
-    /// Creates an empty database with explicit per-query materialization limits.
+    /// Creates an empty database with explicit per-query resource limits.
     pub fn with_query_result_limits(query_result_limits: QueryResultLimits) -> Self {
         Self {
             catalog: Catalog::new(),
@@ -715,6 +724,10 @@ impl Database {
             validate_union_schema(prefix.columns, &result_columns)?;
         }
 
+        // The source bound is deliberately independent of WHERE and LIMIT:
+        // both are evaluated only after the executor has admitted the full
+        // source scan. Check before allocating the matching-row index vector.
+        enforce_select_scan_limit(table, query_result_limits)?;
         let mut matching_rows = (0..table.row_count())
             .filter(|row| {
                 predicate
@@ -810,6 +823,8 @@ impl Database {
     ) -> Result<QueryResult> {
         let left = self.catalog.table(&cross_join.left_table)?;
         let right = self.catalog.table(&cross_join.right_table)?;
+        enforce_select_scan_limit(left, query_result_limits)?;
+        enforce_select_scan_limit(right, query_result_limits)?;
         let columns = left
             .schema()
             .iter()
@@ -1919,6 +1934,14 @@ fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> 
     } else {
         Ok(())
     }
+}
+
+fn enforce_select_scan_limit(table: &Table, limits: QueryResultLimits) -> Result<()> {
+    enforce_resource_limit(
+        "SELECT scanned rows",
+        table.row_count(),
+        limits.max_scan_rows,
+    )
 }
 
 fn execute_grouped<'a>(

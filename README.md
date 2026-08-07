@@ -159,18 +159,25 @@ TSV output follows ClickHouse's `TabSeparatedWithNames` shape: every result has
 an escaped header and typed rows, SQL `NULL` is `\N`, and backslashes, tabs,
 carriage returns, line feeds, NUL, backspace, form feed, and apostrophes in
 column names and strings use ClickHouse's backslash escapes.
-A query result is checked before cloning against limits of 10,000 rows, 250,000
-values, and an estimated 16 MiB. Grouped queries additionally allow 100,000
-groups and bound grouped keys to 500,000 cells and an estimated 32 MiB. Their
+A table-backed `SELECT` inspects at most 1,000,000 source rows by default. This
+scanned-row limit is checked against the full source table before matching-row
+indices are allocated, so `WHERE` selectivity and `LIMIT` do not reduce it;
+each `UNION ALL` operand and each `CROSS JOIN` input has its own source scan.
+It is distinct from the 10,000-row output limit, which applies after filtering,
+grouping, ordering, and `LIMIT`. Query output is also checked before cloning
+against a limit of 250,000 values and an estimated 16 MiB. Grouped queries
+additionally allow 100,000 groups and bound grouped keys to 500,000 cells and
+an estimated 32 MiB. Their
 grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
 estimated 32 MiB limits, including cloned string extrema. The collecting
 library API separately caps all retained query results at an estimated 64 MiB.
 Typed batch tables also retain at most 1,000,000 rows each by default.
-`Database::with_max_rows_per_table` and the matching `SharedDatabase`
-constructor configure this per-table cap; an oversized `INSERT` is rejected
-atomically before any of its rows are appended, and `TRUNCATE TABLE` restores
-the table's full capacity.
+`Database::with_query_result_limits` and the matching `SharedDatabase`
+constructor configure the scan and output limits.
+`Database::with_max_rows_per_table` and its shared counterpart configure the
+separate per-table cap; an oversized `INSERT` is rejected atomically before any
+of its rows are appended, and `TRUNCATE TABLE` restores the table's full capacity.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row

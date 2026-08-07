@@ -207,6 +207,29 @@ fn configured_and_retained_result_limits_are_enforced() {
 }
 
 #[test]
+fn shared_queries_enforce_the_scan_limit_before_where_and_limit() {
+    let database = SharedDatabase::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE values_table (value Int64); \
+             INSERT INTO values_table VALUES (1), (2), (3);",
+        )
+        .unwrap();
+
+    assert_eq!(
+        database.query("SELECT value FROM values_table WHERE value = 3 LIMIT 1;"),
+        Err(SharedDatabaseError::Sql(Error::ResourceLimitExceeded {
+            resource: "SELECT scanned rows",
+            actual: 3,
+            max: 2,
+        }))
+    );
+}
+
+#[test]
 fn sql_errors_are_preserved_and_poisoning_is_typed() {
     let database = SharedDatabase::default();
     assert_eq!(

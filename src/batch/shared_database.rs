@@ -101,7 +101,7 @@ impl SharedDatabase {
         Self::from_arc(Arc::new(RwLock::new(database)))
     }
 
-    /// Creates an empty shared database with explicit per-query result limits.
+    /// Creates an empty shared database with explicit per-query resource limits.
     #[must_use]
     pub fn with_query_result_limits(query_result_limits: QueryResultLimits) -> Self {
         Self::new(Database::with_query_result_limits(query_result_limits))
@@ -122,7 +122,7 @@ impl SharedDatabase {
         Self { inner }
     }
 
-    /// Returns the per-query result limits configured on the database.
+    /// Returns the per-query resource limits configured on the database.
     pub fn query_result_limits(&self) -> Result<QueryResultLimits, SharedDatabaseError> {
         Ok(self.read()?.query_result_limits())
     }

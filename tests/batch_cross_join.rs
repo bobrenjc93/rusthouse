@@ -175,6 +175,56 @@ fn database_with_limits(limits: QueryResultLimits) -> Database {
 }
 
 #[test]
+fn enforces_each_input_scan_limit_before_limit_and_accepts_the_boundary() {
+    let mut database = Database::with_query_result_limits(QueryResultLimits {
+        max_scan_rows: 2,
+        ..QueryResultLimits::default()
+    });
+    database
+        .execute(
+            "CREATE TABLE left_boundary (id Int64); \
+             CREATE TABLE left_oversized (id Int64); \
+             CREATE TABLE right_boundary (flag Bool); \
+             CREATE TABLE right_oversized (flag Bool); \
+             INSERT INTO left_boundary VALUES (1), (2); \
+             INSERT INTO left_oversized VALUES (1), (2), (3); \
+             INSERT INTO right_boundary VALUES (true), (false); \
+             INSERT INTO right_oversized VALUES (true), (false), (true);",
+        )
+        .expect("setup is not subject to SELECT scan limits");
+    let expected = Error::ResourceLimitExceeded {
+        resource: "SELECT scanned rows",
+        actual: 3,
+        max: 2,
+    };
+
+    assert_eq!(
+        database
+            .execute(
+                "SELECT * FROM left_oversized \
+                 CROSS JOIN right_boundary LIMIT 0",
+            )
+            .expect_err("LIMIT 0 cannot bypass the left input scan bound"),
+        expected
+    );
+    assert_eq!(
+        database
+            .execute(
+                "SELECT * FROM left_boundary \
+                 CROSS JOIN right_oversized LIMIT 0",
+            )
+            .expect_err("LIMIT 0 cannot bypass the right input scan bound"),
+        expected
+    );
+
+    let result = query(
+        &mut database,
+        "SELECT * FROM left_boundary CROSS JOIN right_boundary LIMIT 1",
+    );
+    assert_eq!(result.rows, [vec![Value::Int64(1), Value::Bool(true)]]);
+}
+
+#[test]
 fn validates_limit_reduced_row_value_and_byte_counts_at_exact_boundaries() {
     const ROWS: usize = 3;
     const COLUMNS: usize = 5;
