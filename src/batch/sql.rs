@@ -139,6 +139,10 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    Ceil {
+        name: String,
+        alias: Option<String>,
+    },
     /// A deliberately minimal unpartitioned `ROW_NUMBER` window projection.
     RowNumber {
         /// An optional, single, explicitly directed `Int64` source column.
@@ -1100,6 +1104,13 @@ impl<'a> Parser<'a> {
                 return Ok(SelectItem::Floor { name, alias });
             }
 
+            if name.eq_ignore_ascii_case("CEIL") {
+                let name = self.expect_identifier("Float64 column in CEIL")?;
+                self.expect(&TokenKind::RightParen, "')' after CEIL expression")?;
+                let alias = self.parse_alias()?;
+                return Ok(SelectItem::Ceil { name, alias });
+            }
+
             let function = AggregateFunction::parse(&name).ok_or_else(|| Error::Sql {
                 position,
                 message: format!("unknown aggregate function '{name}'"),
@@ -1149,6 +1160,10 @@ impl<'a> Parser<'a> {
                 "')' after ORDER BY FLOOR expression",
             )?;
             Ok(format!("FLOOR({argument})"))
+        } else if name.eq_ignore_ascii_case("CEIL") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("Float64 column in ORDER BY CEIL")?;
+            self.expect(&TokenKind::RightParen, "')' after ORDER BY CEIL expression")?;
+            Ok(format!("CEIL({argument})"))
         } else {
             Ok(name)
         }
