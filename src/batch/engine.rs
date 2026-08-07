@@ -805,6 +805,8 @@ impl Database {
     ) -> Result<QueryResult> {
         validate_distinct_shape(&select)?;
         validate_row_number_shape(&select)?;
+        validate_offset_shape(&select)?;
+        let selection_limit = checked_selection_limit(select.limit, select.offset)?;
         let table = self.catalog.table(&select.table)?;
         let predicate = select
             .predicate
@@ -849,7 +851,7 @@ impl Database {
             validate_row_number_count(matching_rows.len())?;
         }
         if let Some(ordering) = window_ordering {
-            order_window_rows(&mut matching_rows, table, ordering, select.limit);
+            order_window_rows(&mut matching_rows, table, ordering, selection_limit);
         }
 
         let grouped = select.distinct || !group_columns.is_empty() || !aggregate_specs.is_empty();
@@ -867,7 +869,7 @@ impl Database {
             }
             if select.distinct {
                 if ordering.is_empty() {
-                    if let Some(limit) = select.limit {
+                    if let Some(limit) = selection_limit {
                         selected_groups.truncate(limit);
                     }
                 } else {
@@ -876,7 +878,7 @@ impl Database {
                         &grouped,
                         &items,
                         &ordering,
-                        select.limit,
+                        selection_limit,
                     );
                 }
             } else {
@@ -885,7 +887,7 @@ impl Database {
                     &grouped,
                     &items,
                     &ordering,
-                    select.limit,
+                    selection_limit,
                 );
             }
             validate_grouped_result_limits(
@@ -898,7 +900,14 @@ impl Database {
             )?;
             grouped.project(&selected_groups, &items)
         } else {
-            order_source_rows(&mut matching_rows, table, &items, &ordering, select.limit);
+            order_source_rows(
+                &mut matching_rows,
+                table,
+                &items,
+                &ordering,
+                selection_limit,
+            );
+            apply_offset(&mut matching_rows, select.offset.unwrap_or(0));
             validate_projection_result_limits(
                 table,
                 &matching_rows,
@@ -1199,6 +1208,58 @@ fn validate_row_number_shape(select: &Select) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_offset_shape(select: &Select) -> Result<()> {
+    let Some(_) = select.offset else {
+        return Ok(());
+    };
+    if select.limit.is_none() {
+        return Err(Error::InvalidQuery(
+            "OFFSET requires LIMIT <count>".to_owned(),
+        ));
+    }
+    if select.distinct
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.items.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Aggregate { .. } | SelectItem::RowNumber { .. }
+            )
+        })
+    {
+        return Err(Error::InvalidQuery(
+            "OFFSET is only supported for ungrouped, non-DISTINCT, non-window SELECT projections"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_selection_limit(limit: Option<usize>, offset: Option<usize>) -> Result<Option<usize>> {
+    let Some(limit) = limit else {
+        debug_assert!(offset.is_none(), "OFFSET without LIMIT is rejected");
+        return Ok(None);
+    };
+    limit
+        .checked_add(offset.unwrap_or(0))
+        .map(Some)
+        .ok_or_else(|| Error::NumericOverflow("LIMIT + OFFSET selection bound".to_owned()))
+}
+
+fn apply_offset(rows: &mut Vec<usize>, offset: usize) {
+    if offset == 0 {
+        return;
+    }
+    if offset >= rows.len() {
+        rows.clear();
+        return;
+    }
+
+    let remaining = rows.len() - offset;
+    rows.copy_within(offset.., 0);
+    rows.truncate(remaining);
 }
 
 #[derive(Debug, Clone, Copy)]

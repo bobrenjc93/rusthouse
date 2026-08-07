@@ -565,6 +565,7 @@ fn direct_ast_distinct_rejects_incomparable_predicate_literals_without_panicking
             having: None,
             order_by: Vec::new(),
             limit: None,
+            offset: None,
         })
     };
 
