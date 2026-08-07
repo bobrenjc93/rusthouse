@@ -480,6 +480,11 @@ row is appended.
 magic value, format version, declared length, and CRC-32 checksum.
 `NullableI64PayloadCodec` provides the first deterministic storage payload: a
 bounded row count and tagged nullable `Int64` values.
+`NullableI64RlePayloadCodec` is a separate versioned payload that compresses
+maximal consecutive runs of `NULL` or one repeated `Int64`. Independent row,
+run, and byte limits bound decompression; the complete run stream, checked row
+sum, and exact byte boundary are validated before decoded rows are allocated.
+It does not change the original row payload or the snapshot envelope format.
 `Int64TablePayloadCodec` is a separate, self-describing payload that also
 persists the column name, nullability, and table row cap. It has independent
 UTF-8 name-byte, row-cap/current-row, and payload-byte bounds; decoding checks
