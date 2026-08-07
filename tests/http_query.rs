@@ -467,6 +467,109 @@ fn root_query_returns_the_existing_json_result_shape() {
 }
 
 #[test]
+fn every_query_route_returns_503_without_waiting_for_a_writer() {
+    let inner = Arc::new(RwLock::new(Database::new()));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut writer = Some(inner.write().unwrap());
+    let requests = [
+        request_for_target("/", b"SHOW TABLES;"),
+        request_for_target_with_headers(
+            "/query",
+            b"SHOW TABLES;",
+            "X-ClickHouse-Format: CSVWithNames\r\n",
+        ),
+        b"GET /?query=SHOW+TABLES%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+    ];
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        let responses = requests
+            .iter()
+            .map(|request| exchange(&worker_database, request))
+            .collect::<Vec<_>>();
+        sender.send(responses).unwrap();
+    });
+
+    let responses = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(writer.take());
+            worker.join().unwrap();
+            panic!("HTTP query admission blocked behind a writer: {error}");
+        }
+    };
+    assert_eq!(writer.as_ref().unwrap().catalog().table_count(), 0);
+    for response in &responses {
+        assert_response(
+            response,
+            "HTTP/1.1 503 Service Unavailable",
+            r#"{"error":"database is unavailable"}"#,
+        );
+    }
+    assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
+
+    drop(writer.take());
+    worker.join().unwrap();
+}
+
+#[test]
+fn every_query_route_admits_a_concurrent_reader() {
+    let mut initial = Database::new();
+    initial
+        .execute(
+            "CREATE TABLE readings (value Int64); \
+             INSERT INTO readings VALUES (11);",
+        )
+        .unwrap();
+    let inner = Arc::new(RwLock::new(initial));
+    let database = SharedDatabase::from_arc(Arc::clone(&inner));
+    let mut existing_reader = Some(inner.read().unwrap());
+    let requests = [
+        request_for_target("/", b"SELECT value FROM readings;"),
+        request_for_target("/query", b"SELECT value FROM readings;"),
+        b"GET /?query=SELECT+value+FROM+readings%3B HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+    ];
+    let (sender, receiver) = mpsc::channel();
+    let worker_database = database.clone();
+    let worker = thread::spawn(move || {
+        let responses = requests
+            .iter()
+            .map(|request| exchange(&worker_database, request))
+            .collect::<Vec<_>>();
+        sender.send(responses).unwrap();
+    });
+
+    let responses = match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(responses) => responses,
+        Err(error) => {
+            drop(existing_reader.take());
+            worker.join().unwrap();
+            panic!("HTTP query blocked behind an existing reader: {error}");
+        }
+    };
+    assert_eq!(
+        existing_reader
+            .as_ref()
+            .unwrap()
+            .catalog()
+            .table("readings")
+            .unwrap()
+            .row_count(),
+        1
+    );
+    for response in responses {
+        assert_response(
+            &response,
+            "HTTP/1.1 200 OK",
+            r#"{"columns":[{"name":"value","type":"Int64"}],"rows":[[11]]}"#,
+        );
+    }
+
+    drop(existing_reader.take());
+    worker.join().unwrap();
+}
+
+#[test]
 fn url_encoded_get_query_decodes_percent_escapes_and_plus_on_the_exact_wire() {
     let database = SharedDatabase::default();
     let request =

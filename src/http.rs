@@ -91,9 +91,11 @@ impl StdError for HttpQueryError {
 /// carry UTF-8 SQL in their body. `GET /?query=<percent-encoded SQL>` carries
 /// the same SQL in its sole form-style query parameter: percent escapes are
 /// decoded, `+` becomes a space, and no request body is accepted. All three
-/// forms pass the SQL to [`SharedDatabase::query`], which accepts exactly one
-/// read-only statement. A successful query response uses the same JSON result
-/// shape as the batch JSON formatter unless exactly one
+/// forms pass the SQL to [`SharedDatabase::try_query`], which accepts exactly
+/// one read-only statement and makes one nonblocking read-lock attempt. Writer
+/// contention returns `503 Service Unavailable`; lock poisoning remains a
+/// `500 Internal Server Error`. A successful query response uses the same JSON
+/// result shape as the batch JSON formatter unless exactly one
 /// `X-ClickHouse-Format` header requests `CSVWithNames`,
 /// `TabSeparatedWithNames`, `JSONEachRow`, or `JSONCompactEachRow`. CSV, TSV,
 /// and row-oriented JSON responses use the corresponding batch writers;
@@ -306,7 +308,7 @@ fn handle_http_query_exchange(
         } => (sql, response_format),
     };
 
-    match database.query(&sql) {
+    match database.try_query(&sql) {
         Ok(result) => {
             let mut body = BoundedVec::new(limits.max_response_bytes);
             let (write_failed, content_type) = match response_format {
@@ -345,6 +347,13 @@ fn handle_http_query_exchange(
                 limits.max_response_bytes,
             )
         }
+        Err(SharedDatabaseError::DatabaseBusy) => write_error_response(
+            &mut output,
+            Status::SERVICE_UNAVAILABLE,
+            &[],
+            "database is unavailable",
+            limits.max_response_bytes,
+        ),
         Err(SharedDatabaseError::LockPoisoned) => write_error_response(
             &mut output,
             Status::INTERNAL_SERVER_ERROR,

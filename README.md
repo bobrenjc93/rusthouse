@@ -305,18 +305,27 @@ whose sender may be awaiting an interim response.
 
 `POST /` and `POST /query` are equivalent query routes. Each requires one
 decimal `Content-Length` and sends its UTF-8 SQL body through
-`SharedDatabase::query`. The standard ClickHouse-style
+`SharedDatabase::try_query`. The standard ClickHouse-style
 `GET /?query=<percent-encoded SQL>` form does the same with exactly one query
 parameter and no body (`Content-Length` may be omitted or be zero). Its value
 uses form-style decoding: each `%HH` escape becomes one byte and `+` becomes a
 space, followed by strict UTF-8 validation. Malformed escapes, invalid UTF-8,
 and an unencoded `&` introducing any extra parameter are rejected. The decoded
 SQL is subject to the same SQL byte limit as a POST body, and all query forms
-use the read-only, exactly-one-statement `SharedDatabase::query` path.
+use the read-only, exactly-one-statement `SharedDatabase::try_query` path.
 Successful responses use the same compact JSON column metadata and
 positional-row shape as `--format json`; protocol and query failures return
 deterministic JSON error objects with an appropriate HTTP status. All other
 targets and query-string shapes are rejected.
+
+HTTP query admission never waits for the database lock. After request parsing,
+authentication, SQL decoding, and read-only statement validation, each query
+makes one immediate shared read-lock attempt. Concurrent readers are admitted;
+an active writer returns `503 Service Unavailable` with the deterministic JSON
+body `{"error":"database is unavailable"}`. A poisoned lock remains a `500
+Internal Server Error`, and SQL errors remain `400 Bad Request`. Authentication,
+format negotiation, SQL/result resource limits, and the complete HTTP response
+limit retain their existing ordering and behavior.
 
 Every query form also accepts one optional `X-ClickHouse-Format` header with
 the exact value `CSVWithNames`, `TabSeparatedWithNames`, `JSONEachRow`, or
