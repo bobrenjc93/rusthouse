@@ -537,8 +537,13 @@ flush semantics there.
 existing `Int64Table` with `NullableI64PayloadCodec`, then uses that atomic
 replacement operation. Its typed error distinguishes payload encoding from
 replacement failures, and every pre-rename failure preserves the destination.
-The save helper and legacy restore helpers continue to use the row-only
-payload, so their schema and table row-cap metadata remain caller-supplied. The
+`save_int64_table_rle_to_file` is the opt-in compressed counterpart. It uses
+`NullableI64RlePayloadCodec` with the same atomic replacement guarantees and
+keeps RLE encoding and replacement failures typed separately. RLE files remain
+row-only and must be decoded with the RLE codec; the legacy high-level restore
+helper intentionally continues to accept only the uncompressed row format.
+Both save helpers and the legacy restore helpers use row-only payloads, so
+their schema and table row-cap metadata remain caller-supplied. The
 self-describing codec composes directly with the envelope's `encode`,
 `create_new_file`, and Unix `replace_file` APIs; files written by those APIs are
 reopened with `restore_int64_table_payload_from_file`.

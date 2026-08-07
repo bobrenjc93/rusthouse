@@ -81,6 +81,17 @@ temporary file before every failed rename, an existing destination is
 preserved on every pre-rename failure. A post-rename directory-sync error
 explicitly reports that the destination was already replaced.
 
+`save_int64_table_rle_to_file` provides the same Unix-only atomic save contract
+using `NullableI64RlePayloadCodec`. It is an explicit format choice: the helper
+persists row values as the versioned RLE payload documented below, retains
+distinct RLE-encoding and replacement errors, and preserves the destination on
+every pre-rename failure. The payload does not contain schema or row-cap
+metadata. To reopen it, decode the bounded envelope with `SnapshotCodec`,
+decode its payload with the same bounded `NullableI64RlePayloadCodec`, and
+construct the table with caller-supplied schema and row cap. The existing
+`restore_int64_table_from_file` helper is not format-detecting and continues to
+expect `NullableI64PayloadCodec` bytes.
+
 ## Nullable Int64 row payload
 
 `NullableI64PayloadCodec` defines a deterministic payload for one nullable
