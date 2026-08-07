@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::batch::error::{Error, Result};
 use crate::batch::storage::{
     ColumnDef, is_reserved_column_name, is_sql_identifier_continue, is_sql_identifier_start,
@@ -282,10 +284,28 @@ pub enum Predicate {
     Or(Box<Self>, Box<Self>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Operand {
     Column(String),
+    /// A column name shared by comparisons produced from one lowered `IN`
+    /// atom. This is semantically identical to [`Self::Column`], but prevents
+    /// the source identifier bytes from being copied into every list leaf.
+    SharedColumn(Arc<str>),
     Literal(Value),
+}
+
+impl PartialEq for Operand {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Column(left), Self::Column(right)) => left == right,
+            (Self::Column(left), Self::SharedColumn(right))
+            | (Self::SharedColumn(right), Self::Column(left)) => left == right.as_ref(),
+            (Self::SharedColumn(left), Self::SharedColumn(right)) => left == right,
+            (Self::Literal(left), Self::Literal(right)) => left == right,
+            (Self::Column(_) | Self::SharedColumn(_), Self::Literal(_))
+            | (Self::Literal(_), Self::Column(_) | Self::SharedColumn(_)) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2090,7 +2110,7 @@ impl<'a> Parser<'a> {
 
 fn lower_in_predicate(column: String, literals: Vec<Value>) -> Predicate {
     fn lower(
-        column: &str,
+        column: &Arc<str>,
         literals: &mut std::vec::IntoIter<Value>,
         literal_count: usize,
     ) -> Predicate {
@@ -2099,7 +2119,7 @@ fn lower_in_predicate(column: String, literals: Vec<Value>) -> Predicate {
                 unreachable!("IN lowering receives the parsed literal count");
             };
             return Predicate::Comparison {
-                left: Operand::Column(column.to_owned()),
+                left: Operand::SharedColumn(Arc::clone(column)),
                 operator: ComparisonOperator::Equal,
                 right: Operand::Literal(literal),
             };
@@ -2114,6 +2134,7 @@ fn lower_in_predicate(column: String, literals: Vec<Value>) -> Predicate {
 
     let literal_count = literals.len();
     debug_assert!(literal_count > 0);
+    let column = Arc::<str>::from(column);
     lower(&column, &mut literals.into_iter(), literal_count)
 }
 

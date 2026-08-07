@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rusthouse::batch::engine::{Database, QueryResult, StatementResult};
 use rusthouse::batch::error::Error;
 use rusthouse::batch::sql::{
@@ -34,7 +36,7 @@ fn comparison(column: &str, value: Value) -> Predicate {
 fn collect_in_literals<'a>(predicate: &'a Predicate, output: &mut Vec<&'a Value>) -> usize {
     match predicate {
         Predicate::Comparison {
-            left: Operand::Column(_),
+            left: Operand::SharedColumn(_),
             operator: ComparisonOperator::Equal,
             right: Operand::Literal(value),
         } => {
@@ -49,6 +51,21 @@ fn collect_in_literals<'a>(predicate: &'a Predicate, output: &mut Vec<&'a Value>
                 "each lowered OR split must be balanced",
             );
             left_leaves + right_leaves
+        }
+        unexpected => panic!("unexpected IN lowering node: {unexpected:?}"),
+    }
+}
+
+fn collect_shared_columns<'a>(predicate: &'a Predicate, output: &mut Vec<&'a Arc<str>>) {
+    match predicate {
+        Predicate::Comparison {
+            left: Operand::SharedColumn(column),
+            operator: ComparisonOperator::Equal,
+            right: Operand::Literal(_),
+        } => output.push(column),
+        Predicate::Or(left, right) => {
+            collect_shared_columns(left, output);
+            collect_shared_columns(right, output);
         }
         unexpected => panic!("unexpected IN lowering node: {unexpected:?}"),
     }
@@ -97,6 +114,33 @@ fn lowers_nonempty_in_lists_to_balanced_equality_or_trees() {
         literals.into_iter().cloned().collect::<Vec<_>>(),
         (0..127).map(Value::Int64).collect::<Vec<_>>(),
         "balanced lowering preserves literal order",
+    );
+}
+
+#[test]
+fn maximum_in_list_retains_one_long_column_identifier_allocation() {
+    const LONG_IDENTIFIER_BYTES: usize = 256 * 1024;
+    const MAX_IN_LITERALS: usize = 128;
+
+    let column = format!("c{}", "x".repeat(LONG_IDENTIFIER_BYTES - 1));
+    let sql = format!(
+        "SELECT id FROM events WHERE {column} IN ({})",
+        (0..MAX_IN_LITERALS)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let lowered = predicate(&sql);
+    let mut retained_columns = Vec::new();
+    collect_shared_columns(&lowered, &mut retained_columns);
+
+    assert_eq!(retained_columns.len(), MAX_IN_LITERALS);
+    assert_eq!(retained_columns[0].len(), LONG_IDENTIFIER_BYTES);
+    assert!(
+        retained_columns
+            .iter()
+            .all(|candidate| Arc::ptr_eq(retained_columns[0], candidate)),
+        "all leaves at the predicate-node boundary must share one identifier allocation",
     );
 }
 

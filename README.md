@@ -290,7 +290,8 @@ combined levels of parenthesized or unary-`NOT` nesting. A `BETWEEN` atom is
 lowered to two inclusive comparisons joined by `AND`, and all three expanded
 nodes count toward the 256-node limit. An `IN` atom is lowered to one equality
 per literal and a balanced set of joining `OR` nodes; every expanded node also
-counts toward that limit.
+counts toward that limit, while all leaves share one retained copy of the
+column identifier.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS
