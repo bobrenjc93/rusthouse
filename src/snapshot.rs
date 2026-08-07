@@ -2439,7 +2439,7 @@ pub fn restore_int64_table_from_file(
 
 /// Opens a bounded RLE snapshot file and restores one `Int64` table from it.
 ///
-/// This is the matching reopen path for [`save_int64_table_rle_to_file`]. The
+/// This is the matching reopen path for `save_int64_table_rle_to_file`. The
 /// RLE payload contains rows only, so the schema and table row cap are supplied
 /// by the caller. At most the envelope header plus `snapshot_codec`'s payload
 /// limit is read, and the path must identify a regular file. The envelope and
