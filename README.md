@@ -25,10 +25,15 @@ The early implementation should favor Rust's standard library and a small depend
 The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
-comparisons with unary `NOT`, `AND`, and `OR`, plus case-sensitive String prefix
-and containment predicates of the exact forms `column LIKE 'prefix%'` and
-`column LIKE '%substring%'`. Prefixes and substrings may be empty or Unicode.
-Other placements of `%` and patterns with excess wildcards are rejected.
+comparisons with unary `NOT`, `AND`, and `OR`. The exact inclusive range form
+`column BETWEEN lower_literal AND upper_literal` accepts the same typed literals
+as comparisons, binds as one predicate atom, and is equivalent to
+`column >= lower_literal AND column <= upper_literal`. Bounds are not reordered,
+so a lower bound greater than its upper bound matches no rows. Case-sensitive
+String prefix and containment predicates use the exact forms
+`column LIKE 'prefix%'` and `column LIKE '%substring%'`. Prefixes and substrings
+may be empty or Unicode. Other placements of `%` and patterns with excess
+wildcards are rejected.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
@@ -163,8 +168,8 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison, prefix `LIKE`, and contains `LIKE` predicates, including
-unary `NOT`, as regular `SELECT`.
+composable comparison, inclusive `BETWEEN`, prefix `LIKE`, and contains `LIKE`
+predicates, including unary `NOT`, as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -275,7 +280,9 @@ covers `CREATE` and explicit `INSERT` columns plus `SELECT`, `GROUP BY`, and
 `ORDER BY` lists, so
 compact input cannot expand into an unbounded retained token or AST graph.
 Each `WHERE` predicate additionally allows at most 256 expression nodes and 64
-combined levels of parenthesized or unary-`NOT` nesting.
+combined levels of parenthesized or unary-`NOT` nesting. A `BETWEEN` atom is
+lowered to two inclusive comparisons joined by `AND`, and all three expanded
+nodes count toward the 256-node limit.
 Every statement shares one in-memory catalog. Successful `CREATE`, `ALTER`,
 `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, and `INSERT` statements are silent, and
 each `SELECT`, `SHOW TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS

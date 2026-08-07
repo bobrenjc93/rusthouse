@@ -1741,7 +1741,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_not_predicate(&mut self) -> Result<Predicate> {
-        // `not` remains a valid column name, so a following comparison operator
+        // `not` remains a valid column name, so a following predicate operator
         // makes this token the left operand rather than unary syntax. `like` is
         // also a valid column name; only `NOT LIKE <String pattern>` is the
         // infix form with a column named `not`.
@@ -1775,6 +1775,7 @@ impl<'a> Parser<'a> {
             TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("LIKE") => {
                 matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::String(_))
             }
+            TokenKind::Identifier(keyword) if keyword.eq_ignore_ascii_case("BETWEEN") => true,
             _ => false,
         }
     }
@@ -1795,6 +1796,34 @@ impl<'a> Parser<'a> {
         }
 
         let left = self.parse_operand()?;
+        if self.eat_keyword("BETWEEN") {
+            let Operand::Column(column) = left else {
+                return self.error("BETWEEN left operand must be a column");
+            };
+            let lower = self.parse_literal()?;
+            self.expect_keyword("AND")?;
+            let upper = self.parse_literal()?;
+
+            // BETWEEN is one syntactic predicate atom, but its lowered form has
+            // two comparisons and one AND. Charge every executable AST node
+            // before allocating the expanded tree.
+            self.record_predicate_node()?;
+            self.record_predicate_node()?;
+            self.record_predicate_node()?;
+
+            return Ok(Predicate::And(
+                Box::new(Predicate::Comparison {
+                    left: Operand::Column(column.clone()),
+                    operator: ComparisonOperator::GreaterOrEqual,
+                    right: Operand::Literal(lower),
+                }),
+                Box::new(Predicate::Comparison {
+                    left: Operand::Column(column),
+                    operator: ComparisonOperator::LessOrEqual,
+                    right: Operand::Literal(upper),
+                }),
+            ));
+        }
         if self.eat_keyword("LIKE") {
             let Operand::Column(column) = left else {
                 return self.error("LIKE left operand must be a column");

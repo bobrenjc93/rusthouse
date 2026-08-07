@@ -199,6 +199,26 @@ fn query_executes_unicode_contains_like_over_http() {
 }
 
 #[test]
+fn query_executes_inclusive_between_over_http() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, score Float64); \
+             INSERT INTO readings VALUES (1, 1.0), (2, 2.5), (3, 4.0), (4, 5.0);",
+        )
+        .expect("setup");
+
+    assert_response(
+        &exchange(
+            &database,
+            &request(b"SELECT id FROM readings WHERE score BETWEEN 2.5 AND 4 ORDER BY id;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"}],"rows":[[2],[3]]}"#,
+    );
+}
+
+#[test]
 fn bool_to_int64_cast_is_visible_in_every_http_query_format() {
     let database = SharedDatabase::default();
     database
