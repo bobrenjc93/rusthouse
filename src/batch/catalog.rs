@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::batch::error::{Error, Result};
-use crate::batch::storage::{ColumnDef, DEFAULT_MAX_ROWS_PER_TABLE, Table, validate_table_name};
+use crate::batch::storage::{
+    ColumnDef, DEFAULT_MAX_ROWS_PER_TABLE, Table, TableLimits, validate_table_name,
+};
 
 /// An in-memory collection of named tables.
 #[derive(Debug, Default)]
@@ -41,10 +43,27 @@ impl Catalog {
         schema: Vec<ColumnDef>,
         row_cap: usize,
     ) -> Result<bool> {
+        self.create_table_if_not_exists_with_limits(
+            name,
+            schema,
+            TableLimits {
+                max_rows: row_cap,
+                ..TableLimits::default()
+            },
+        )
+    }
+
+    /// Creates a table with explicit limits unless its name is already registered.
+    pub fn create_table_if_not_exists_with_limits(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        limits: TableLimits,
+    ) -> Result<bool> {
         if self.table_exists(&name) {
             return Ok(false);
         }
-        self.create_table_with_row_cap(name, schema, row_cap)?;
+        self.create_table_with_limits(name, schema, limits)?;
         Ok(true)
     }
 
@@ -55,11 +74,28 @@ impl Catalog {
         schema: Vec<ColumnDef>,
         row_cap: usize,
     ) -> Result<()> {
+        self.create_table_with_limits(
+            name,
+            schema,
+            TableLimits {
+                max_rows: row_cap,
+                ..TableLimits::default()
+            },
+        )
+    }
+
+    /// Creates a table with explicit persistent resource limits.
+    pub fn create_table_with_limits(
+        &mut self,
+        name: String,
+        schema: Vec<ColumnDef>,
+        limits: TableLimits,
+    ) -> Result<()> {
         let key = normalize(&name);
         if self.tables.contains_key(&key) {
             return Err(Error::TableAlreadyExists(name));
         }
-        let table = Table::with_row_cap(name, schema, row_cap)?;
+        let table = Table::with_limits(name, schema, limits)?;
         self.tables.insert(key, table);
         Ok(())
     }
@@ -122,6 +158,11 @@ impl Catalog {
     /// only the column's stored display name.
     pub fn rename_column(&mut self, table: &str, source: &str, destination: String) -> Result<()> {
         self.table_mut(table)?.rename_column(source, destination)
+    }
+
+    /// Adds one typed column using case-insensitive table and column resolution.
+    pub fn add_column(&mut self, table: &str, column: ColumnDef) -> Result<()> {
+        self.table_mut(table)?.add_column(column)
     }
 
     /// Drops one column using case-insensitive table and column resolution.

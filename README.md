@@ -70,6 +70,19 @@ case-insensitive name resolution as ordinary `DROP TABLE`. If the table is
 already absent, it returns the normal successful zero-row command result;
 plain `DROP TABLE` continues to report a missing-table error.
 
+`ALTER TABLE <table> ADD COLUMN <name> <type>` appends an `Int64`, `Float64`,
+`Bool`, or `String` field to the end of the schema and creates its matching
+physical column. Existing rows are backfilled with the ClickHouse-style
+non-null default for that type: `0`, `0.0`, `false`, or an empty String.
+Table and collision lookup are case-insensitive; the stored column spelling is
+preserved. Invalid, reserved, or already-used names and missing tables fail
+before mutation, leaving schema, data, row count, and row cap unchanged. New
+inserts must provide a value for the extended schema under the existing
+complete-row rules. Default expressions, nullable storage, placement clauses,
+and `IF NOT EXISTS` are not supported. Each addition is preflighted against the
+table's persistent column and physical-cell caps before its default vector is
+allocated. A trailing semicolon is optional.
+
 `ALTER TABLE <table> RENAME COLUMN <source> TO <destination>` changes only the
 stored column display name. Table, source-column, destination-collision, and
 subsequent query resolution are case-insensitive; a case-only rename updates
@@ -281,12 +294,18 @@ grouped-key accounting includes the reusable lookup probe for tuples wider
 than two columns. Aggregate working state has separate 500,000-cell and
 estimated 32 MiB limits, including cloned string extrema. The collecting
 library API separately caps all retained query results at an estimated 64 MiB.
-Typed batch tables also retain at most 1,000,000 rows each by default.
+Typed batch tables also retain at most 1,000,000 rows, 1,024 physical columns,
+and 4,000,000 physical scalar cells each by default. The cell count is the
+current row count multiplied by the schema width, so repeated `ADD COLUMN` and
+`INSERT` calls cannot grow storage without a cumulative bound. CREATE, INSERT,
+and ADD COLUMN reject an exceeded cap before allocating or changing table
+state; DROP COLUMN and TRUNCATE TABLE restore reusable cell capacity.
 `Database::with_query_result_limits` and the matching `SharedDatabase`
 constructor configure the scan and output limits.
 `Database::with_max_rows_per_table` and its shared counterpart configure the
-separate per-table cap; an oversized `INSERT` is rejected atomically before any
-of its rows are appended, and `TRUNCATE TABLE` restores the table's full capacity.
+row cap while retaining the default column and cell caps. `TableLimits` with
+`Database::with_table_limits` or `SharedDatabase::with_table_limits` configures
+all three per-table caps.
 
 Running `rusthouse` without options retains the legacy line-oriented `Int64`
 session. It reads one statement from each nonempty input line and prints a row
@@ -537,8 +556,13 @@ flush semantics there.
 existing `Int64Table` with `NullableI64PayloadCodec`, then uses that atomic
 replacement operation. Its typed error distinguishes payload encoding from
 replacement failures, and every pre-rename failure preserves the destination.
-The save helper and legacy restore helpers continue to use the row-only
-payload, so their schema and table row-cap metadata remain caller-supplied. The
+`save_int64_table_rle_to_file` is the opt-in compressed counterpart. It uses
+`NullableI64RlePayloadCodec` with the same atomic replacement guarantees and
+keeps RLE encoding and replacement failures typed separately. RLE files remain
+row-only and must be decoded with the RLE codec; the legacy high-level restore
+helper intentionally continues to accept only the uncompressed row format.
+Both save helpers and the legacy restore helpers use row-only payloads, so
+their schema and table row-cap metadata remain caller-supplied. The
 self-describing codec composes directly with the envelope's `encode`,
 `create_new_file`, and Unix `replace_file` APIs; files written by those APIs are
 reopened with `restore_int64_table_payload_from_file`.

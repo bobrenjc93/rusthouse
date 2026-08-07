@@ -5,6 +5,42 @@ use crate::batch::value::{DataType, Value, ValueRef};
 
 /// Default maximum number of rows retained by one typed batch table.
 pub const DEFAULT_MAX_ROWS_PER_TABLE: usize = 1_000_000;
+/// Default maximum number of physical columns retained by one typed batch table.
+pub const DEFAULT_MAX_COLUMNS_PER_TABLE: usize = 1_024;
+/// Default maximum number of physical scalar cells retained by one typed batch table.
+pub const DEFAULT_MAX_CELLS_PER_TABLE: usize = 4_000_000;
+
+/// Persistent resource limits applied to one typed batch table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableLimits {
+    /// Maximum rows retained by the table.
+    pub max_rows: usize,
+    /// Maximum physical columns retained by the table.
+    pub max_columns: usize,
+    /// Maximum `rows * columns` physical scalar cells retained by the table.
+    pub max_cells: usize,
+}
+
+impl TableLimits {
+    #[must_use]
+    pub const fn new(max_rows: usize, max_columns: usize, max_cells: usize) -> Self {
+        Self {
+            max_rows,
+            max_columns,
+            max_cells,
+        }
+    }
+}
+
+impl Default for TableLimits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_ROWS_PER_TABLE,
+            DEFAULT_MAX_COLUMNS_PER_TABLE,
+            DEFAULT_MAX_CELLS_PER_TABLE,
+        )
+    }
+}
 
 /// A named, typed field in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,22 +172,41 @@ pub struct Table {
     schema: Vec<ColumnDef>,
     columns: Vec<Column>,
     row_count: usize,
-    row_cap: usize,
+    limits: TableLimits,
 }
 
 impl Table {
-    /// Creates an empty table with the finite default row cap.
+    /// Creates an empty table with finite default row, column, and cell caps.
     pub fn new(name: String, schema: Vec<ColumnDef>) -> Result<Self> {
-        Self::with_row_cap(name, schema, DEFAULT_MAX_ROWS_PER_TABLE)
+        Self::with_limits(name, schema, TableLimits::default())
     }
 
-    /// Creates an empty table with an explicit maximum retained row count.
+    /// Creates an empty table with an explicit row cap and default column and cell caps.
     pub fn with_row_cap(name: String, schema: Vec<ColumnDef>, row_cap: usize) -> Result<Self> {
+        Self::with_limits(
+            name,
+            schema,
+            TableLimits {
+                max_rows: row_cap,
+                ..TableLimits::default()
+            },
+        )
+    }
+
+    /// Creates an empty table with explicit persistent resource limits.
+    pub fn with_limits(name: String, schema: Vec<ColumnDef>, limits: TableLimits) -> Result<Self> {
         validate_table_name(&name)?;
         if schema.is_empty() {
             return Err(Error::InvalidQuery(
                 "a table must contain at least one column".to_owned(),
             ));
+        }
+        if schema.len() > limits.max_columns {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "table columns",
+                actual: schema.len(),
+                max: limits.max_columns,
+            });
         }
         let mut column_names = HashSet::with_capacity(schema.len());
         for field in &schema {
@@ -175,7 +230,7 @@ impl Table {
             schema,
             columns,
             row_count: 0,
-            row_cap,
+            limits,
         })
     }
 
@@ -207,7 +262,31 @@ impl Table {
     /// Returns the maximum number of rows this table can retain.
     #[must_use]
     pub fn row_cap(&self) -> usize {
-        self.row_cap
+        self.limits.max_rows
+    }
+
+    /// Returns all persistent resource limits for this table.
+    #[must_use]
+    pub const fn limits(&self) -> TableLimits {
+        self.limits
+    }
+
+    /// Returns the maximum number of physical columns this table can retain.
+    #[must_use]
+    pub const fn column_cap(&self) -> usize {
+        self.limits.max_columns
+    }
+
+    /// Returns the maximum number of physical scalar cells this table can retain.
+    #[must_use]
+    pub const fn cell_cap(&self) -> usize {
+        self.limits.max_cells
+    }
+
+    /// Returns the number of physical scalar cells currently retained.
+    #[must_use]
+    pub fn retained_cell_count(&self) -> usize {
+        self.row_count.saturating_mul(self.schema.len())
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
@@ -314,6 +393,57 @@ impl Table {
         Ok(())
     }
 
+    /// Appends one schema field and an aligned physical column of defaults.
+    ///
+    /// Name validation and case-insensitive collision detection complete
+    /// before either the schema or physical columns are changed. Existing
+    /// rows receive ClickHouse-style non-null defaults for the new type.
+    pub fn add_column(&mut self, field: ColumnDef) -> Result<()> {
+        validate_sql_identifier(&field.name, "column name")?;
+        if is_reserved_column_name(&field.name) {
+            return Err(Error::ReservedIdentifier {
+                identifier: field.name,
+                context: "column name".to_owned(),
+            });
+        }
+        if self
+            .schema
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&field.name))
+        {
+            return Err(Error::DuplicateColumn(field.name));
+        }
+
+        let column_count = self.schema.len().saturating_add(1);
+        if column_count > self.limits.max_columns {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "table columns",
+                actual: column_count,
+                max: self.limits.max_columns,
+            });
+        }
+        let cell_count = self.row_count.saturating_mul(column_count);
+        if cell_count > self.limits.max_cells {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "table cells",
+                actual: cell_count,
+                max: self.limits.max_cells,
+            });
+        }
+
+        let column = match field.data_type {
+            DataType::Int64 => Column::Int64(vec![0; self.row_count]),
+            DataType::Float64 => Column::Float64(vec![0.0; self.row_count]),
+            DataType::Bool => Column::Bool(vec![false; self.row_count]),
+            DataType::String => Column::String(vec![String::new(); self.row_count]),
+        };
+
+        debug_assert_eq!(self.schema.len(), self.columns.len());
+        self.schema.push(field);
+        self.columns.push(column);
+        Ok(())
+    }
+
     /// Removes one schema field and its aligned physical column.
     ///
     /// Resolution is case-insensitive. The column lookup and the invariant
@@ -389,11 +519,20 @@ impl Table {
     }
 
     pub(crate) fn validate_row_capacity(&self, incoming_rows: usize) -> Result<()> {
-        if incoming_rows > self.row_cap.saturating_sub(self.row_count) {
+        if incoming_rows > self.limits.max_rows.saturating_sub(self.row_count) {
             return Err(Error::ResourceLimitExceeded {
                 resource: "table rows",
                 actual: self.row_count.saturating_add(incoming_rows),
-                max: self.row_cap,
+                max: self.limits.max_rows,
+            });
+        }
+        let row_count = self.row_count.saturating_add(incoming_rows);
+        let cell_count = row_count.saturating_mul(self.schema.len());
+        if cell_count > self.limits.max_cells {
+            return Err(Error::ResourceLimitExceeded {
+                resource: "table cells",
+                actual: cell_count,
+                max: self.limits.max_cells,
             });
         }
         Ok(())
