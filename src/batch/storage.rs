@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::batch::error::{Error, Result};
 use crate::batch::value::{DataType, Value, ValueRef};
@@ -134,6 +134,8 @@ impl Column {
 pub struct Table {
     name: String,
     schema: Vec<ColumnDef>,
+    /// ASCII-lowercased schema names mapped to physical column positions.
+    column_indices: HashMap<String, usize>,
     columns: Vec<Column>,
     row_count: usize,
     row_cap: usize,
@@ -153,8 +155,8 @@ impl Table {
                 "a table must contain at least one column".to_owned(),
             ));
         }
-        let mut column_names = HashSet::with_capacity(schema.len());
-        for field in &schema {
+        let mut column_indices = HashMap::with_capacity(schema.len());
+        for (index, field) in schema.iter().enumerate() {
             validate_sql_identifier(&field.name, "column name")?;
             if is_reserved_column_name(&field.name) {
                 return Err(Error::ReservedIdentifier {
@@ -162,7 +164,10 @@ impl Table {
                     context: "column name".to_owned(),
                 });
             }
-            if !column_names.insert(field.name.to_ascii_lowercase()) {
+            if column_indices
+                .insert(field.name.to_ascii_lowercase(), index)
+                .is_some()
+            {
                 return Err(Error::DuplicateColumn(field.name.clone()));
             }
         }
@@ -173,6 +178,7 @@ impl Table {
         Ok(Self {
             name,
             schema,
+            column_indices,
             columns,
             row_count: 0,
             row_cap,
@@ -211,9 +217,9 @@ impl Table {
     }
 
     pub fn column_index(&self, name: &str) -> Result<usize> {
-        self.schema
-            .iter()
-            .position(|field| field.name.eq_ignore_ascii_case(name))
+        self.column_indices
+            .get(&name.to_ascii_lowercase())
+            .copied()
             .ok_or_else(|| Error::ColumnNotFound {
                 table: self.name.clone(),
                 column: name.to_owned(),
@@ -234,13 +240,23 @@ impl Table {
                 context: "column name".to_owned(),
             });
         }
-        if self.schema.iter().enumerate().any(|(index, field)| {
-            index != source_index && field.name.eq_ignore_ascii_case(&destination)
-        }) {
+        let destination_key = destination.to_ascii_lowercase();
+        if self
+            .column_indices
+            .get(&destination_key)
+            .is_some_and(|index| *index != source_index)
+        {
             return Err(Error::DuplicateColumn(destination));
         }
 
+        let source_key = self.schema[source_index].name.to_ascii_lowercase();
         self.schema[source_index].name = destination;
+        if source_key != destination_key {
+            let removed = self.column_indices.remove(&source_key);
+            debug_assert_eq!(removed, Some(source_index));
+            let replaced = self.column_indices.insert(destination_key, source_index);
+            debug_assert_eq!(replaced, None);
+        }
         Ok(())
     }
 
@@ -462,5 +478,39 @@ mod tests {
         );
         assert_eq!(table.row_count(), 1);
         assert!(matches!(&table.columns()[0], Column::Int64(v) if v == &[1]));
+    }
+
+    #[test]
+    fn resolves_adversarial_wide_insert_lists_through_the_schema_index() {
+        const COLUMN_COUNT: usize = 5_000;
+        let common_prefix = "a".repeat(1_000);
+        let schema = (0..COLUMN_COUNT)
+            .map(|index| ColumnDef {
+                name: format!("{common_prefix}{index:04}"),
+                data_type: DataType::Int64,
+            })
+            .collect::<Vec<_>>();
+        let insert_columns = schema
+            .iter()
+            .rev()
+            .map(|field| field.name.to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        let insert_values = (0..COLUMN_COUNT)
+            .rev()
+            .map(|index| Value::Int64(index as i64))
+            .collect::<Vec<_>>();
+        let table = Table::new("wide".to_owned(), schema).expect("wide schema is valid");
+
+        let prepared = table
+            .prepare_insert_rows(Some(&insert_columns), vec![insert_values])
+            .expect("wide complete column list resolves and reorders");
+
+        assert_eq!(prepared.len(), 1);
+        assert!(
+            prepared[0]
+                .iter()
+                .enumerate()
+                .all(|(index, value)| value == &Value::Int64(index as i64))
+        );
     }
 }
