@@ -1210,6 +1210,22 @@
         "eval_c88a7f3d": 45,
         "eval_d04acec3": 90
       }
+    },
+    {
+      "key": "pr:501",
+      "recordedAt": "2026-08-07T09:09:39.922Z",
+      "label": "PR #501",
+      "kind": "composite",
+      "prNumber": 501,
+      "title": "YOLO generation 42: 2 reviewed improvements",
+      "scores": {
+        "eval_9fbdfec0": 90,
+        "eval_29146f21": 95,
+        "eval_d43b14a4": 100,
+        "eval_63df825b": 85,
+        "eval_c88a7f3d": 45,
+        "eval_d04acec3": 90
+      }
     }
   ]
 }
