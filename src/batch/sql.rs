@@ -74,6 +74,12 @@ pub enum Statement {
     TruncateTable {
         name: String,
     },
+    /// Exact equality deletion: `DELETE FROM <table> WHERE <column> = <literal>`.
+    Delete {
+        table: String,
+        column: String,
+        literal: Value,
+    },
     Insert {
         table: String,
         rows: Vec<Vec<Value>>,
@@ -696,6 +702,8 @@ impl<'a> Parser<'a> {
             self.parse_rename()
         } else if self.eat_keyword("TRUNCATE") {
             self.parse_truncate()
+        } else if self.eat_keyword("DELETE") {
+            self.parse_delete()
         } else if self.eat_keyword("INSERT") {
             self.parse_insert()
         } else if self.eat_keyword("SELECT") {
@@ -708,7 +716,7 @@ impl<'a> Parser<'a> {
             self.parse_exists()
         } else {
             self.error(
-                "expected CREATE, ALTER, DROP, RENAME, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS",
+                "expected CREATE, ALTER, DROP, RENAME, TRUNCATE, DELETE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS",
             )
         }
     }
@@ -1133,6 +1141,24 @@ impl<'a> Parser<'a> {
         Ok(Statement::TruncateTable { name })
     }
 
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect_keyword("FROM")?;
+        let table = self.expect_identifier("table name")?;
+        self.expect_keyword("WHERE")?;
+        let column = self.expect_identifier("column name")?;
+        self.expect(&TokenKind::Equal, "'=' in DELETE equality predicate")?;
+        let literal = self.parse_literal()?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self
+                .error("DELETE supports exactly DELETE FROM <table> WHERE <column> = <literal>");
+        }
+        Ok(Statement::Delete {
+            table,
+            column,
+            literal,
+        })
+    }
+
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_identifier("table name")?;
@@ -1468,25 +1494,7 @@ impl<'a> Parser<'a> {
             if name.eq_ignore_ascii_case("CAST") {
                 let name = self.expect_identifier("column in CAST")?;
                 self.expect_keyword("AS")?;
-                let type_position = self.position();
-                let type_name = self.expect_identifier("target type in CAST")?;
-                let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
-                    position: type_position,
-                    message: format!(
-                        "unknown CAST target type '{type_name}'; expected Int64, Float64, or Bool"
-                    ),
-                })?;
-                if !matches!(
-                    target_type,
-                    DataType::Int64 | DataType::Float64 | DataType::Bool
-                ) {
-                    return Err(Error::Sql {
-                        position: type_position,
-                        message: format!(
-                            "unsupported CAST target type '{type_name}'; expected Int64, Float64, or Bool"
-                        ),
-                    });
-                }
+                let target_type = self.parse_column_cast_target_type()?;
                 self.expect(&TokenKind::RightParen, "')' after CAST expression")?;
                 let alias = self.parse_alias()?;
                 return Ok(SelectItem::Cast {
@@ -1609,8 +1617,38 @@ impl<'a> Parser<'a> {
             let argument = self.expect_identifier("Float64 column in ORDER BY CEIL")?;
             self.expect(&TokenKind::RightParen, "')' after ORDER BY CEIL expression")?;
             Ok(format!("CEIL({argument})"))
+        } else if name.eq_ignore_ascii_case("CAST") && self.eat(&TokenKind::LeftParen) {
+            let argument = self.expect_identifier("column in ORDER BY CAST")?;
+            self.expect_keyword("AS")?;
+            let target_type = self.parse_column_cast_target_type()?;
+            self.expect(&TokenKind::RightParen, "')' after ORDER BY CAST expression")?;
+            Ok(format!("CAST({argument} AS {target_type})"))
         } else {
             Ok(name)
+        }
+    }
+
+    fn parse_column_cast_target_type(&mut self) -> Result<DataType> {
+        let position = self.position();
+        let type_name = self.expect_identifier("target type in CAST")?;
+        let target_type = DataType::parse(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown CAST target type '{type_name}'; expected Int64, Float64, or Bool"
+            ),
+        })?;
+        if matches!(
+            target_type,
+            DataType::Int64 | DataType::Float64 | DataType::Bool
+        ) {
+            Ok(target_type)
+        } else {
+            Err(Error::Sql {
+                position,
+                message: format!(
+                    "unsupported CAST target type '{type_name}'; expected Int64, Float64, or Bool"
+                ),
+            })
         }
     }
 

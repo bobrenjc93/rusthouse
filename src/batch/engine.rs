@@ -581,6 +581,11 @@ impl Database {
                     affected_rows,
                 })
             }
+            Statement::Delete {
+                table,
+                column,
+                literal,
+            } => self.execute_delete_statement(table, column, literal, query_result_limits),
             Statement::Insert { table, rows } => self.execute_insert_statement(table, None, rows),
             Statement::InsertWithColumns {
                 table,
@@ -643,6 +648,7 @@ impl Database {
             | Statement::AddColumn { .. }
             | Statement::DropColumn { .. }
             | Statement::TruncateTable { .. }
+            | Statement::Delete { .. }
             | Statement::Insert { .. }
             | Statement::InsertWithColumns { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -665,6 +671,38 @@ impl Database {
         self.catalog.table_mut(&table)?.insert_rows(rows)?;
         Ok(StatementResult::Command {
             tag: "INSERT",
+            affected_rows,
+        })
+    }
+
+    fn execute_delete_statement(
+        &mut self,
+        table: String,
+        column: String,
+        literal: Value,
+        query_result_limits: QueryResultLimits,
+    ) -> Result<StatementResult> {
+        let predicate = Predicate::Comparison {
+            left: Operand::Column(column),
+            operator: ComparisonOperator::Equal,
+            right: Operand::Literal(literal),
+        };
+        let row_indexes = {
+            let target = self.catalog.table(&table)?;
+            let predicate = compile_predicate(target, &predicate)?;
+            enforce_scan_limit(target, query_result_limits, "DELETE scanned rows")?;
+            (0..target.row_count())
+                .filter(|row| predicate.evaluate(target, *row))
+                .collect::<Vec<_>>()
+        };
+
+        let affected_rows = self
+            .catalog
+            .table_mut(&table)
+            .expect("DELETE target was resolved before its bounded scan")
+            .delete_rows(&row_indexes)?;
+        Ok(StatementResult::Command {
+            tag: "DELETE",
             affected_rows,
         })
     }
@@ -1129,6 +1167,7 @@ fn statement_name(statement: &Statement) -> &'static str {
         | Statement::AddColumn { .. }
         | Statement::DropColumn { .. } => "ALTER TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
+        Statement::Delete { .. } => "DELETE",
         Statement::Insert { .. } | Statement::InsertWithColumns { .. } => "INSERT",
         Statement::LiteralSelect(_)
         | Statement::VersionSelect(_)
@@ -1692,6 +1731,9 @@ enum ResolvedItem {
     CastFloat64ToInt64 {
         source: usize,
     },
+    CastBoolToInt64 {
+        source: usize,
+    },
     CastInt64ToBool {
         source: usize,
     },
@@ -1879,36 +1921,46 @@ fn resolve_select_items(
             } => {
                 let source = table.column_index(name)?;
                 let actual = table.schema()[source].data_type;
-                let expected = match target_type {
-                    DataType::Float64 => DataType::Int64,
-                    DataType::Int64 => DataType::Float64,
-                    DataType::Bool => DataType::Int64,
-                    DataType::String => {
-                        return Err(Error::InvalidQuery(
-                            "only CAST(Int64 AS Float64), CAST(Float64 AS Int64), and CAST(Int64 AS Bool) are supported"
-                                .to_owned(),
-                        ));
+                if *target_type == DataType::String {
+                    return Err(Error::InvalidQuery(
+                        "only CAST(Int64 AS Float64), CAST(Float64 AS Int64), CAST(Bool AS Int64), and CAST(Int64 AS Bool) are supported"
+                            .to_owned(),
+                    ));
+                }
+                let resolved = match (actual, *target_type) {
+                    (DataType::Int64, DataType::Float64) => {
+                        Some(ResolvedItem::CastInt64ToFloat64 { source })
                     }
+                    (DataType::Float64, DataType::Int64) => {
+                        Some(ResolvedItem::CastFloat64ToInt64 { source })
+                    }
+                    (DataType::Bool, DataType::Int64) => {
+                        Some(ResolvedItem::CastBoolToInt64 { source })
+                    }
+                    (DataType::Int64, DataType::Bool) => {
+                        Some(ResolvedItem::CastInt64ToBool { source })
+                    }
+                    _ => None,
                 };
-                if actual != expected {
+                let Some(resolved) = resolved else {
+                    let expected = match target_type {
+                        DataType::Float64 | DataType::Bool => "Int64",
+                        DataType::Int64 => "Float64 or Bool",
+                        DataType::String => unreachable!("String target is rejected above"),
+                    };
                     return Err(Error::TypeMismatch {
                         context: format!("CAST argument '{name}'"),
-                        expected: expected.to_string(),
+                        expected: expected.to_owned(),
                         actual: actual.to_string(),
                     });
-                }
+                };
                 if has_aggregate || !group_columns.is_empty() {
                     return Err(Error::InvalidQuery(
                         "CAST projections are only supported in ungrouped SELECT queries"
                             .to_owned(),
                     ));
                 }
-                items.push(match target_type {
-                    DataType::Float64 => ResolvedItem::CastInt64ToFloat64 { source },
-                    DataType::Int64 => ResolvedItem::CastFloat64ToInt64 { source },
-                    DataType::Bool => ResolvedItem::CastInt64ToBool { source },
-                    DataType::String => unreachable!("CAST target is validated"),
-                });
+                items.push(resolved);
                 result_columns.push(ResultColumn {
                     name: alias.clone().unwrap_or_else(|| {
                         format!("CAST({} AS {target_type})", table.schema()[source].name)
@@ -2242,6 +2294,9 @@ fn execute_projection(
                         ResolvedItem::CastFloat64ToInt64 { source } => Value::Int64(
                             checked_float64_to_int64(float64_at(table, *source, *row))?,
                         ),
+                        ResolvedItem::CastBoolToInt64 { source } => {
+                            Value::Int64(if bool_at(table, *source, *row) { 1 } else { 0 })
+                        }
                         ResolvedItem::CastInt64ToBool { source } => {
                             Value::Bool(int64_at(table, *source, *row) != 0)
                         }
@@ -2386,6 +2441,7 @@ fn validate_projection_result_limits(
                 ResolvedItem::Int64Subtract { .. }
                 | ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
+                | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. }
                 | ResolvedItem::StringLength { .. }
                 | ResolvedItem::Int64Abs { .. }
@@ -2439,6 +2495,7 @@ fn validate_grouped_result_limits(
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
+                | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -2591,11 +2648,15 @@ fn enforce_resource_limit(resource: &'static str, actual: usize, max: usize) -> 
 }
 
 fn enforce_select_scan_limit(table: &Table, limits: QueryResultLimits) -> Result<()> {
-    enforce_resource_limit(
-        "SELECT scanned rows",
-        table.row_count(),
-        limits.max_scan_rows,
-    )
+    enforce_scan_limit(table, limits, "SELECT scanned rows")
+}
+
+fn enforce_scan_limit(
+    table: &Table,
+    limits: QueryResultLimits,
+    resource: &'static str,
+) -> Result<()> {
+    enforce_resource_limit(resource, table.row_count(), limits.max_scan_rows)
 }
 
 fn execute_grouped<'a>(
@@ -2891,6 +2952,7 @@ impl GroupedData<'_> {
                         }
                         ResolvedItem::CastInt64ToFloat64 { .. }
                         | ResolvedItem::CastFloat64ToInt64 { .. }
+                        | ResolvedItem::CastBoolToInt64 { .. }
                         | ResolvedItem::CastInt64ToBool { .. } => {
                             unreachable!("CAST projections are restricted to ungrouped queries")
                         }
@@ -3231,6 +3293,9 @@ fn order_source_rows(
                     let right = ValueRef::Float64(float64_at(table, source, right).trunc());
                     left.cmp(&right)
                 }
+                ResolvedItem::CastBoolToInt64 { source } => {
+                    bool_at(table, source, left).cmp(&bool_at(table, source, right))
+                }
                 ResolvedItem::CastInt64ToBool { source } => {
                     (int64_at(table, source, left) != 0).cmp(&(int64_at(table, source, right) != 0))
                 }
@@ -3305,6 +3370,7 @@ fn order_grouped_rows(
                 }
                 ResolvedItem::CastInt64ToFloat64 { .. }
                 | ResolvedItem::CastFloat64ToInt64 { .. }
+                | ResolvedItem::CastBoolToInt64 { .. }
                 | ResolvedItem::CastInt64ToBool { .. } => {
                     unreachable!("CAST projections are restricted to ungrouped queries")
                 }
@@ -3354,6 +3420,13 @@ fn int64_at(table: &Table, source: usize, row: usize) -> i64 {
 
 fn float64_at(table: &Table, source: usize, row: usize) -> f64 {
     let Column::Float64(values) = &table.columns()[source] else {
+        unreachable!("CAST input type is resolved")
+    };
+    values[row]
+}
+
+fn bool_at(table: &Table, source: usize, row: usize) -> bool {
+    let Column::Bool(values) = &table.columns()[source] else {
         unreachable!("CAST input type is resolved")
     };
     values[row]

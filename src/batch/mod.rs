@@ -120,10 +120,10 @@ impl StdError for BatchError {
 /// Reads one bounded SQL batch to EOF and emits human-readable result tables.
 ///
 /// `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE
-/// TABLE`, and `INSERT` statements are silent. Each `SELECT`, `SHOW TABLES`,
-/// `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` result is rendered
-/// with the existing table formatter. Results remain in statement order and
-/// are separated by one blank line.
+/// TABLE`, `DELETE`, and `INSERT` statements are silent. Each `SELECT`, `SHOW
+/// TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` result is
+/// rendered with the existing table formatter. Results remain in statement
+/// order and are separated by one blank line.
 pub fn run_table_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
     run_table_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
 }
@@ -141,10 +141,11 @@ pub fn run_table_batch_with_limit(
 /// Reads one bounded SQL batch to EOF and emits CSVWithNames for every query.
 ///
 /// `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE
-/// TABLE`, and `INSERT` statements are silent. `SELECT`, `SHOW TABLES`, `SHOW
-/// CREATE TABLE`, `DESCRIBE TABLE`, and `EXISTS TABLE` produce query results.
-/// All statements share one in-memory catalog, and the SQL parser handles
-/// semicolons inside string literals rather than splitting on raw bytes.
+/// TABLE`, `DELETE`, and `INSERT` statements are silent. `SELECT`, `SHOW
+/// TABLES`, `SHOW CREATE TABLE`, `DESCRIBE TABLE`, and `EXISTS TABLE` produce
+/// query results. All statements share one in-memory catalog, and the SQL
+/// parser handles semicolons inside string literals rather than splitting on
+/// raw bytes.
 pub fn run_csv_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
     run_batch_with_limit(
         input,
@@ -167,7 +168,7 @@ pub fn run_csv_batch_with_limit(
 /// every query.
 ///
 /// `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE
-/// TABLE`, and `INSERT` statements are silent. Each query result has its own
+/// TABLE`, `DELETE`, and `INSERT` statements are silent. Each query result has its own
 /// escaped header followed by typed rows; SQL `NULL` is emitted as `\N`.
 pub fn run_tsv_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
     run_tsv_batch_with_limit(input, output, DEFAULT_MAX_BATCH_BYTES)
@@ -185,7 +186,7 @@ pub fn run_tsv_batch_with_limit(
 /// Reads one bounded SQL batch to EOF and emits one JSON object per query.
 ///
 /// `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE
-/// TABLE`, and `INSERT` statements are silent. Each `SELECT`, `SHOW TABLES`,
+/// TABLE`, `DELETE`, and `INSERT` statements are silent. Each `SELECT`, `SHOW TABLES`,
 /// `SHOW CREATE TABLE`, `DESCRIBE TABLE`, or `EXISTS TABLE` result is rendered
 /// on one line with column metadata and positional rows.
 pub fn run_json_batch(input: impl Read, output: impl Write) -> Result<(), BatchError> {
