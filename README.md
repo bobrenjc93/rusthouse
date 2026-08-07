@@ -76,6 +76,12 @@ limited output remains subject to the normal result caps.
 Empty aggregate inputs produce one row: `COUNT` is zero and `SUM`, `MIN`,
 `MAX`, and `AVG` are typed `NULL` values.
 
+`int64_column - signed_int64_literal` is a checked, ungrouped scalar projection.
+It accepts an optional `AS alias`; otherwise, its normalized expression is the
+result column name and can be used in `ORDER BY`. `WHERE`, expression ordering,
+and `LIMIT` select rows before subtraction, so overflow in an excluded row does
+not fail the query. A selected overflow or non-`Int64` argument is a typed error.
+
 `SELECT` projections support `CAST(int64_column AS Float64)` and
 `CAST(float64_column AS Int64)`. Float-to-integer casts truncate finite values
 toward zero and report typed numeric-overflow errors outside the `Int64`

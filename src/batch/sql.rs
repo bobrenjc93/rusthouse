@@ -118,6 +118,12 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    /// A checked `Int64` column-minus-literal expression.
+    Int64Subtract {
+        name: String,
+        literal: i64,
+        alias: Option<String>,
+    },
     Cast {
         name: String,
         target_type: DataType,
@@ -1116,6 +1122,14 @@ impl<'a> Parser<'a> {
                 argument,
                 alias,
             })
+        } else if self.eat(&TokenKind::Minus) {
+            let literal = self.parse_signed_int64_literal("subtraction expression")?;
+            let alias = self.parse_alias()?;
+            Ok(SelectItem::Int64Subtract {
+                name,
+                literal,
+                alias,
+            })
         } else {
             let alias = self.parse_alias()?;
             Ok(SelectItem::Column { name, alias })
@@ -1124,7 +1138,10 @@ impl<'a> Parser<'a> {
 
     fn parse_order_by_name(&mut self) -> Result<String> {
         let name = self.expect_identifier("ORDER BY output column, expression, or alias")?;
-        if name.eq_ignore_ascii_case("LENGTH") && self.eat(&TokenKind::LeftParen) {
+        if self.eat(&TokenKind::Minus) {
+            let literal = self.parse_signed_int64_literal("ORDER BY subtraction expression")?;
+            Ok(int64_subtraction_name(&name, literal))
+        } else if name.eq_ignore_ascii_case("LENGTH") && self.eat(&TokenKind::LeftParen) {
             let argument = self.expect_identifier("String column in ORDER BY LENGTH")?;
             self.expect(
                 &TokenKind::RightParen,
@@ -1160,6 +1177,26 @@ impl<'a> Parser<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    fn parse_signed_int64_literal(&mut self, context: &str) -> Result<i64> {
+        let position = self.position();
+        let sign = if self.eat(&TokenKind::Minus) {
+            "-"
+        } else if self.eat(&TokenKind::Plus) {
+            "+"
+        } else {
+            ""
+        };
+        let number = self.take_number().ok_or_else(|| Error::Sql {
+            position,
+            message: format!("expected a signed Int64 literal in {context}"),
+        })?;
+        let literal = format!("{sign}{number}");
+        literal.parse::<i64>().map_err(|_| Error::Sql {
+            position,
+            message: format!("invalid Int64 literal '{literal}' in {context}"),
+        })
     }
 
     fn parse_having_threshold(&mut self) -> Result<Value> {
@@ -1418,6 +1455,10 @@ impl<'a> Parser<'a> {
             message: message.into(),
         })
     }
+}
+
+pub(crate) fn int64_subtraction_name(column: &str, literal: i64) -> String {
+    format!("{column} - {literal}")
 }
 
 #[cfg(test)]
