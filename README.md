@@ -26,8 +26,9 @@ The semicolon-delimited batch engine in `rusthouse::batch` supports typed,
 multi-column `Int64`, `Float64`, `Bool`, and `String` tables. It executes
 multi-row `INSERT INTO ... VALUES`, typed projections and composable `WHERE`
 comparisons with unary `NOT`, `AND`, and `OR`, plus case-sensitive String prefix
-predicates of the exact form `column LIKE 'prefix%'`. A prefix may be empty or
-Unicode, and the pattern must contain exactly one `%`, in the terminal position.
+and containment predicates of the exact forms `column LIKE 'prefix%'` and
+`column LIKE '%substring%'`. Prefixes and substrings may be empty or Unicode.
+Other placements of `%` and patterns with excess wildcards are rejected.
 `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG`, plus `GROUP BY`, multi-column
 `ORDER BY`, and `LIMIT`. Grouped results can be filtered by comparing a unique
 projected numeric aggregate alias to a finite `Int64` or `Float64` threshold
@@ -144,8 +145,8 @@ checked before result rows are materialized.
 `SELECT DISTINCT column [, ...] FROM table [WHERE predicate]`
 `[ORDER BY projected_column [ASC|DESC] [, ...]] [LIMIT n]`
 supports tuples of physical columns of any supported types and the same typed,
-composable comparison and prefix `LIKE` predicates, including unary `NOT`, as
-regular `SELECT`.
+composable comparison, prefix `LIKE`, and contains `LIKE` predicates, including
+unary `NOT`, as regular `SELECT`.
 `NOT` binds more tightly than `AND`, which binds more tightly than `OR`. Rows
 are filtered before unique tuples are retained in deterministic first-seen
 order when no ordering is requested. `ORDER BY` accepts only projected physical
@@ -585,9 +586,13 @@ replacement operation. Its typed error distinguishes payload encoding from
 replacement failures, and every pre-rename failure preserves the destination.
 `save_int64_table_rle_to_file` is the opt-in compressed counterpart. It uses
 `NullableI64RlePayloadCodec` with the same atomic replacement guarantees and
-keeps RLE encoding and replacement failures typed separately. RLE files remain
-row-only and must be decoded with the RLE codec; the legacy high-level restore
-helper intentionally continues to accept only the uncompressed row format.
+keeps RLE encoding and replacement failures typed separately.
+`restore_int64_table_rle_from_file` is its bounded reopen path: it accepts the
+row-only format's caller-supplied schema and row cap, rejects non-regular and
+oversized files before decoding, and keeps filesystem, envelope, RLE payload,
+nullability, and capacity failures typed without returning partial tables. The
+legacy high-level restore helper intentionally continues to accept only the
+uncompressed row format.
 Both save helpers and the legacy restore helpers use row-only payloads, so
 their schema and table row-cap metadata remain caller-supplied. The
 self-describing codec composes directly with the envelope's `encode`,

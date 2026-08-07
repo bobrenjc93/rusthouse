@@ -86,11 +86,11 @@ using `NullableI64RlePayloadCodec`. It is an explicit format choice: the helper
 persists row values as the versioned RLE payload documented below, retains
 distinct RLE-encoding and replacement errors, and preserves the destination on
 every pre-rename failure. The payload does not contain schema or row-cap
-metadata. To reopen it, decode the bounded envelope with `SnapshotCodec`,
-decode its payload with the same bounded `NullableI64RlePayloadCodec`, and
-construct the table with caller-supplied schema and row cap. The existing
-`restore_int64_table_from_file` helper is not format-detecting and continues to
-expect `NullableI64PayloadCodec` bytes.
+metadata. `restore_int64_table_rle_from_file` is the matching bounded reopen
+helper and therefore requires a caller-supplied schema and row cap as well as
+the envelope and RLE codecs. The existing `restore_int64_table_from_file`
+helper is not format-detecting and continues to expect
+`NullableI64PayloadCodec` bytes.
 
 ## Nullable Int64 row payload
 
@@ -239,6 +239,17 @@ limit, and reads no more than that bound. Open, non-regular-file, read,
 oversized-file, and restoration failures remain distinct. After the bounded
 read it delegates to `restore_int64_table`, retaining the same all-or-nothing
 validation behavior.
+
+`restore_int64_table_rle_from_file` provides the corresponding bounded entry
+point for row-only RLE snapshots written by `save_int64_table_rle_to_file`.
+Like the uncompressed helper, it requires the caller to provide the schema and
+restored table row cap because neither is stored in the payload. It rejects
+non-regular files and files larger than the 22-byte envelope header plus the
+configured envelope payload limit, and never reads beyond that bound. It then
+validates the exact envelope and complete RLE run stream before atomically
+appending all decoded rows to a new table. Open, read, oversized-file,
+envelope, RLE-payload, schema-nullability, and table-capacity failures remain
+typed; no error returns a partially populated table.
 
 `Catalog::restore_int64_table_from_file` applies the catalog's per-table row
 cap and registers the restored table under a caller-supplied exact name only

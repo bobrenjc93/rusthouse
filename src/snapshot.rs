@@ -824,6 +824,61 @@ impl From<SnapshotReplaceError> for Int64TableRleFileSaveError {
     }
 }
 
+/// An error produced while restoring an RLE-compressed [`Int64Table`] file.
+#[derive(Debug)]
+pub enum Int64TableRleFileRestoreError {
+    /// The snapshot path could not be opened for reading.
+    Open(io::Error),
+    /// The snapshot path does not identify a regular file.
+    NotRegularFile,
+    /// The opened snapshot file could not be inspected or read completely.
+    Read(io::Error),
+    /// The file is larger than the envelope header plus the payload limit.
+    FileTooLarge { file_len: u64, max_file_len: usize },
+    /// The snapshot envelope could not be decoded.
+    Envelope(SnapshotError),
+    /// The envelope payload was not a valid nullable `Int64` RLE payload.
+    Payload(NullableI64RlePayloadError),
+    /// The decoded rows violated the requested schema or table row cap.
+    Table(InsertError),
+}
+
+impl fmt::Display for Int64TableRleFileRestoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "could not open snapshot file: {error}"),
+            Self::NotRegularFile => write!(formatter, "snapshot path is not a regular file"),
+            Self::Read(error) => write!(formatter, "could not read snapshot file: {error}"),
+            Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => write!(
+                formatter,
+                "snapshot file has {file_len} bytes, exceeding the limit of {max_file_len}"
+            ),
+            Self::Envelope(error) => {
+                write!(formatter, "could not decode snapshot envelope: {error}")
+            }
+            Self::Payload(error) => {
+                write!(formatter, "could not decode RLE table payload: {error}")
+            }
+            Self::Table(error) => write!(formatter, "could not restore table rows: {error}"),
+        }
+    }
+}
+
+impl Error for Int64TableRleFileRestoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Open(error) | Self::Read(error) => Some(error),
+            Self::Envelope(error) => Some(error),
+            Self::Payload(error) => Some(error),
+            Self::Table(error) => Some(error),
+            Self::NotRegularFile | Self::FileTooLarge { .. } => None,
+        }
+    }
+}
+
 /// An error produced while restoring an [`Int64Table`] from an envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Int64TableRestoreError {
@@ -2382,6 +2437,39 @@ pub fn restore_int64_table_from_file(
         .map_err(Int64TableFileRestoreError::Restore)
 }
 
+/// Opens a bounded RLE snapshot file and restores one `Int64` table from it.
+///
+/// This is the matching reopen path for `save_int64_table_rle_to_file`. The
+/// RLE payload contains rows only, so the schema and table row cap are supplied
+/// by the caller. At most the envelope header plus `snapshot_codec`'s payload
+/// limit is read, and the path must identify a regular file. The envelope and
+/// complete compressed payload are validated before the decoded rows are
+/// appended atomically to a new table. Open, read, envelope, RLE-payload,
+/// schema-nullability, and row-capacity failures remain typed, and no failure
+/// returns a partially populated table.
+pub fn restore_int64_table_rle_from_file(
+    path: impl AsRef<Path>,
+    schema: Schema,
+    row_cap: usize,
+    snapshot_codec: SnapshotCodec,
+    payload_codec: NullableI64RlePayloadCodec,
+) -> Result<Int64Table, Int64TableRleFileRestoreError> {
+    let envelope = read_bounded_snapshot_file(path.as_ref(), snapshot_codec.max_payload_len())
+        .map_err(Int64TableRleFileRestoreError::from)?;
+    let payload = snapshot_codec
+        .decode(&envelope)
+        .map_err(Int64TableRleFileRestoreError::Envelope)?;
+    let rows = payload_codec
+        .decode(payload)
+        .map_err(Int64TableRleFileRestoreError::Payload)?;
+
+    let mut table = Int64Table::new(schema, row_cap);
+    table
+        .append_batch(&rows)
+        .map_err(Int64TableRleFileRestoreError::Table)?;
+    Ok(table)
+}
+
 /// Restores one bounded `Int64` table from a primary or explicit backup file.
 ///
 /// The primary is attempted first. A valid primary is returned immediately and
@@ -2453,6 +2541,23 @@ impl From<SnapshotFileReadError> for Int64TableFileRestoreError {
 }
 
 impl From<SnapshotFileReadError> for Int64TablePayloadFileRestoreError {
+    fn from(error: SnapshotFileReadError) -> Self {
+        match error {
+            SnapshotFileReadError::Open(error) => Self::Open(error),
+            SnapshotFileReadError::NotRegularFile => Self::NotRegularFile,
+            SnapshotFileReadError::Read(error) => Self::Read(error),
+            SnapshotFileReadError::FileTooLarge {
+                file_len,
+                max_file_len,
+            } => Self::FileTooLarge {
+                file_len,
+                max_file_len,
+            },
+        }
+    }
+}
+
+impl From<SnapshotFileReadError> for Int64TableRleFileRestoreError {
     fn from(error: SnapshotFileReadError) -> Self {
         match error {
             SnapshotFileReadError::Open(error) => Self::Open(error),

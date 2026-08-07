@@ -117,13 +117,13 @@ fn csv_batch_pages_filtered_ordered_rows_with_limit_offset() {
 }
 
 #[test]
-fn json_cli_executes_prefix_like_for_regular_and_distinct_where() {
+fn json_cli_executes_contains_like_for_regular_and_distinct_where() {
     let output = run(
         &["--format", "json"],
         "CREATE TABLE events (id Int64, label String); \
          INSERT INTO events VALUES (1, '東京'), (2, '東京駅'), (3, 'Alpha'), (4, 'alpha'), (5, '東京'); \
-         SELECT id FROM events WHERE label LIKE '東京%' ORDER BY id LIMIT 2; \
-         SELECT DISTINCT label FROM events WHERE NOT label LIKE 'A%' ORDER BY label;"
+         SELECT id FROM events WHERE label LIKE '%京%' ORDER BY id LIMIT 2; \
+         SELECT DISTINCT label FROM events WHERE NOT label LIKE '%lph%' ORDER BY label;"
             .as_bytes(),
     );
 
@@ -131,7 +131,7 @@ fn json_cli_executes_prefix_like_for_regular_and_distinct_where() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "{\"columns\":[{\"name\":\"id\",\"type\":\"Int64\"}],\"rows\":[[1],[2]]}\n\
-         {\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"alpha\"],[\"東京\"],[\"東京駅\"]]}\n"
+         {\"columns\":[{\"name\":\"label\",\"type\":\"String\"}],\"rows\":[[\"東京\"],[\"東京駅\"]]}\n"
     );
     assert!(output.stderr.is_empty());
 }

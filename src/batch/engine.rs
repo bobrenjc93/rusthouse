@@ -3370,6 +3370,11 @@ enum CompiledPredicate {
         prefix: String,
         negated: bool,
     },
+    LikeContains {
+        column: usize,
+        substring: String,
+        negated: bool,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -3401,6 +3406,11 @@ impl CompiledPredicate {
                 prefix,
                 negated,
             } => string_at(table, *column, row).starts_with(prefix.as_str()) != *negated,
+            Self::LikeContains {
+                column,
+                substring,
+                negated,
+            } => string_at(table, *column, row).contains(substring.as_str()) != *negated,
             Self::And(left, right) => left.evaluate(table, row) && right.evaluate(table, row),
             Self::Or(left, right) => left.evaluate(table, row) || right.evaluate(table, row),
         }
@@ -3476,6 +3486,22 @@ fn compile_predicate_with_polarity(
             Ok(CompiledPredicate::LikePrefix {
                 column: column_index,
                 prefix: prefix.clone(),
+                negated,
+            })
+        }
+        Predicate::LikeContains { column, substring } => {
+            let column_index = table.column_index(column)?;
+            let actual = table.schema()[column_index].data_type;
+            if actual != DataType::String {
+                return Err(Error::TypeMismatch {
+                    context: format!("WHERE LIKE column '{column}'"),
+                    expected: DataType::String.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+            Ok(CompiledPredicate::LikeContains {
+                column: column_index,
+                substring: substring.clone(),
                 negated,
             })
         }
