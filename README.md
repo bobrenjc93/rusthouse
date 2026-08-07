@@ -328,12 +328,12 @@ header must exactly match every schema column in order and case. Data fields
 parse according to the table's `Int64`, finite `Float64`, `Bool`, and `String`
 types, and callers provide complete-input byte, row, and total-value limits.
 Boolean fields are the exact lowercase tokens `true` and `false`. Both LF and
-CRLF records are accepted. A `String` data field may be double-quoted so it can
-contain commas and LF or CRLF line endings, and doubled quotes inside it decode
-to one quote (for example, `"say ""hello"""`). Embedded line endings are
-retained exactly. Headers and non-`String` fields must remain unquoted, and
-malformed quoting is rejected. Any input, schema, value, limit, or
-remaining-capacity failure leaves the table unchanged.
+CRLF records are accepted. Any data field may be double-quoted so it can contain
+commas and LF or CRLF line endings, and doubled quotes inside it decode to one
+quote (for example, `"say ""hello"""`). Decoded contents use the same schema
+type rules as unquoted fields, and embedded line endings are retained exactly.
+Headers must remain unquoted, and malformed quoting is rejected. Any input,
+schema, value, limit, or remaining-capacity failure leaves the table unchanged.
 
 ## Snapshot envelope
 

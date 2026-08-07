@@ -80,6 +80,69 @@ fn ingests_all_four_types_with_lf_and_crlf_and_selects_them_back() {
 }
 
 #[test]
+fn ingests_quoted_scalars_and_mixed_fields_with_lf_and_crlf() {
+    let mut database = database(4);
+    let lf = concat!(
+        "id,score,active,label\n",
+        "\"-9223372036854775808\",\"2.5\",\"true\",\"quoted\"\n",
+        "7,-3e2,\"false\",plain\n",
+    )
+    .as_bytes();
+    let crlf = concat!(
+        "id,score,active,label\r\n",
+        "\"+0\",0.125,true,\"\"\r\n",
+        "9,\"4.5\",\"false\",mixed\r\n",
+    )
+    .as_bytes();
+
+    assert_eq!(
+        database
+            .ingest_csv_with_names("metrics", lf, generous_limits(lf))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        database
+            .ingest_csv_with_names("metrics", crlf, generous_limits(crlf))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        query(
+            &mut database,
+            "SELECT id, score, active, label FROM metrics ORDER BY id;",
+        )
+        .rows,
+        [
+            vec![
+                Value::Int64(i64::MIN),
+                Value::Float64(2.5),
+                Value::Bool(true),
+                Value::String("quoted".to_owned()),
+            ],
+            vec![
+                Value::Int64(0),
+                Value::Float64(0.125),
+                Value::Bool(true),
+                Value::String(String::new()),
+            ],
+            vec![
+                Value::Int64(7),
+                Value::Float64(-300.0),
+                Value::Bool(false),
+                Value::String("plain".to_owned()),
+            ],
+            vec![
+                Value::Int64(9),
+                Value::Float64(4.5),
+                Value::Bool(false),
+                Value::String("mixed".to_owned()),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn decodes_single_line_quoted_strings_among_typed_fields() {
     let input = concat!(
         "id,score,active,label\n",
@@ -471,12 +534,20 @@ fn malformed_rows_and_typed_values_roll_back_prior_parsed_records() {
             },
         ),
         (
-            format!("{HEADER}\n1,1.0,true,ok\n2,\"2.0\",false,bad\n").into_bytes(),
-            CsvIngestError::QuotingNotSupported { line: 3, column: 2 },
+            format!("{HEADER}\n1,1.0,true,ok\n2,\"not-a-float\",false,bad\n").into_bytes(),
+            CsvIngestError::InvalidValue {
+                line: 3,
+                column: 2,
+                expected: DataType::Float64,
+            },
         ),
         (
             format!("{HEADER}\n1,\"2.0\nstill quoted\",false,bad\n").into_bytes(),
-            CsvIngestError::QuotingNotSupported { line: 2, column: 2 },
+            CsvIngestError::InvalidValue {
+                line: 2,
+                column: 2,
+                expected: DataType::Float64,
+            },
         ),
         (
             format!("{HEADER}\n1,1.0,true,ok\n2,2.0,false,unquoted\"quote\n").into_bytes(),
@@ -499,6 +570,97 @@ fn malformed_rows_and_typed_values_roll_back_prior_parsed_records() {
                 .rows
                 .is_empty(),
             "a valid record before a malformed one must not be appended"
+        );
+    }
+}
+
+#[test]
+fn invalid_quoted_scalar_values_report_their_schema_types() {
+    let cases = [
+        (
+            "\"not-an-int\",2.0,true,bad",
+            CsvIngestError::InvalidValue {
+                line: 3,
+                column: 1,
+                expected: DataType::Int64,
+            },
+        ),
+        (
+            "2,\"NaN\",true,bad",
+            CsvIngestError::InvalidValue {
+                line: 3,
+                column: 2,
+                expected: DataType::Float64,
+            },
+        ),
+        (
+            "2,\"1e999\",true,bad",
+            CsvIngestError::InvalidValue {
+                line: 3,
+                column: 2,
+                expected: DataType::Float64,
+            },
+        ),
+        (
+            "2,2.0,\"TRUE\",bad",
+            CsvIngestError::InvalidValue {
+                line: 3,
+                column: 3,
+                expected: DataType::Bool,
+            },
+        ),
+    ];
+
+    for (invalid_row, expected) in cases {
+        let input = format!("{HEADER}\n1,1.0,true,valid\n{invalid_row}\n");
+        let mut database = database(3);
+
+        assert_eq!(
+            database.ingest_csv_with_names(
+                "metrics",
+                input.as_bytes(),
+                generous_limits(input.as_bytes()),
+            ),
+            Err(expected),
+            "input: {input:?}",
+        );
+        assert!(
+            query(&mut database, "SELECT id FROM metrics;")
+                .rows
+                .is_empty(),
+            "a quoted type error must roll back earlier parsed rows",
+        );
+    }
+}
+
+#[test]
+fn late_quoted_type_error_rolls_back_for_lf_and_crlf() {
+    for line_ending in ["\n", "\r\n"] {
+        let input = format!(
+            "{HEADER}{line_ending}\"1\",\"1.0\",\"true\",\"valid\"{line_ending}2,\"NaN\",false,bad{line_ending}"
+        );
+        let mut database = database(4);
+        database
+            .execute("INSERT INTO metrics VALUES (9, 9.0, true, 'existing');")
+            .unwrap();
+
+        assert_eq!(
+            database.ingest_csv_with_names(
+                "metrics",
+                input.as_bytes(),
+                generous_limits(input.as_bytes()),
+            ),
+            Err(CsvIngestError::InvalidValue {
+                line: 3,
+                column: 2,
+                expected: DataType::Float64,
+            }),
+            "line ending: {line_ending:?}",
+        );
+        assert_eq!(
+            query(&mut database, "SELECT id, label FROM metrics;").rows,
+            [vec![Value::Int64(9), Value::String("existing".to_owned()),]],
+            "line ending: {line_ending:?}",
         );
     }
 }
