@@ -644,7 +644,7 @@ impl<'a> Parser<'a> {
         if self.at_literal_start() {
             return self.parse_literal_select();
         }
-        if self.at_typed_null_cast_start() {
+        if self.at_complete_typed_null_select() {
             return self.parse_typed_null_select();
         }
 
@@ -690,20 +690,12 @@ impl<'a> Parser<'a> {
         self.expect_keyword("AS")?;
         let position = self.position();
         let type_name = self.expect_identifier("target type in typed NULL CAST")?;
-        let data_type = match type_name.to_ascii_uppercase().as_str() {
-            "INT64" => DataType::Int64,
-            "FLOAT64" => DataType::Float64,
-            "BOOL" => DataType::Bool,
-            "STRING" => DataType::String,
-            _ => {
-                return Err(Error::Sql {
-                    position,
-                    message: format!(
-                        "unknown typed NULL CAST target type '{type_name}'; expected Int64, Float64, Bool, or String"
-                    ),
-                });
-            }
-        };
+        let data_type = Self::typed_null_cast_data_type(&type_name).ok_or_else(|| Error::Sql {
+            position,
+            message: format!(
+                "unknown typed NULL CAST target type '{type_name}'; expected Int64, Float64, Bool, or String"
+            ),
+        })?;
         self.expect(&TokenKind::RightParen, "')' after typed NULL CAST")?;
         let alias = self.parse_alias()?;
         if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
@@ -716,22 +708,65 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn at_typed_null_cast_start(&self) -> bool {
+    fn at_complete_typed_null_select(&self) -> bool {
         if !self.at_keyword("CAST") {
             return false;
         }
 
         let mut lexer = self.lexer;
-        matches!(
-            (
+        if !matches!(Self::next_or_invalid(&mut lexer).kind, TokenKind::LeftParen) {
+            return false;
+        }
+        if !matches!(
+            Self::next_or_invalid(&mut lexer).kind,
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("NULL")
+        ) {
+            return false;
+        }
+        if !matches!(
+            Self::next_or_invalid(&mut lexer).kind,
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("AS")
+        ) {
+            return false;
+        }
+        let TokenKind::Identifier(type_name) = Self::next_or_invalid(&mut lexer).kind else {
+            return false;
+        };
+        if Self::typed_null_cast_data_type(&type_name).is_none()
+            || !matches!(
                 Self::next_or_invalid(&mut lexer).kind,
-                Self::next_or_invalid(&mut lexer).kind,
-            ),
-            (
-                TokenKind::LeftParen,
-                TokenKind::Identifier(value),
-            ) if value.eq_ignore_ascii_case("NULL")
-        )
+                TokenKind::RightParen
+            )
+        {
+            return false;
+        }
+
+        match Self::next_or_invalid(&mut lexer).kind {
+            TokenKind::Semicolon | TokenKind::End => true,
+            TokenKind::Identifier(value) if value.eq_ignore_ascii_case("AS") => {
+                matches!(
+                    (
+                        Self::next_or_invalid(&mut lexer).kind,
+                        Self::next_or_invalid(&mut lexer).kind,
+                    ),
+                    (
+                        TokenKind::Identifier(_),
+                        TokenKind::Semicolon | TokenKind::End,
+                    )
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn typed_null_cast_data_type(type_name: &str) -> Option<DataType> {
+        match type_name.to_ascii_uppercase().as_str() {
+            "INT64" => Some(DataType::Int64),
+            "FLOAT64" => Some(DataType::Float64),
+            "BOOL" => Some(DataType::Bool),
+            "STRING" => Some(DataType::String),
+            _ => None,
+        }
     }
 
     fn at_literal_start(&self) -> bool {

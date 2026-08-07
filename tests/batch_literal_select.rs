@@ -122,7 +122,6 @@ fn rejects_expression_lists_unsupported_literals_and_trailing_clauses() {
         "SELECT CAST(NULL AS UInt64)",
         "SELECT CAST(NULL AS Boolean)",
         "SELECT CAST(NULL AS Int64), 1",
-        "SELECT CAST(NULL AS Int64) FROM values_table",
         "SELECT CAST(NULL AS Int64) WHERE true",
         "SELECT CAST(NULL AS Int64) LIMIT 1",
         "SELECT CAST(NULL AS Int64) UNION ALL SELECT 1",

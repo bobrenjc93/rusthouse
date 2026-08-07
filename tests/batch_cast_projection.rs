@@ -75,6 +75,41 @@ fn parses_cast_as_a_bounded_select_item_with_an_optional_alias() {
 }
 
 #[test]
+fn cast_of_a_null_named_column_remains_a_table_projection() {
+    let statements = parse("SELECT CAST(NULL AS Int64) AS converted FROM samples")
+        .expect("NULL remains a legal CAST column identifier");
+    let Statement::Select(select) = &statements[0] else {
+        panic!("expected a table-backed SELECT");
+    };
+    assert_eq!(
+        select.items,
+        [SelectItem::Cast {
+            name: "NULL".to_owned(),
+            target_type: DataType::Int64,
+            alias: Some("converted".to_owned()),
+        }]
+    );
+    assert_eq!(select.table, "samples");
+
+    let mut database = Database::new();
+    database
+        .execute(
+            "CREATE TABLE samples (NULL Float64); \
+             INSERT INTO samples VALUES (2.5);",
+        )
+        .expect("setup succeeds");
+    let result = query(&mut database, "SELECT CAST(NULL AS Int64) FROM samples");
+    assert_eq!(
+        result.columns,
+        [ResultColumn {
+            name: "CAST(NULL AS Int64)".to_owned(),
+            data_type: DataType::Int64,
+        }]
+    );
+    assert_eq!(result.rows, [vec![Value::Int64(2)]]);
+}
+
+#[test]
 fn float64_to_int64_truncates_fractions_signs_and_boundary_values() {
     let mut database = Database::new();
     database
