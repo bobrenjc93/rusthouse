@@ -7,10 +7,11 @@ const HELP: &str = "RustHouse bounded SQL query session
 Usage: rusthouse [OPTIONS]
 
 With no options, reads the legacy line-oriented Int64 session from stdin.
-With --format table, --format csv, --format tsv, --format json, or --format
-JSONCompactEachRow, reads one semicolon-delimited SQL batch through EOF and
-prints results for SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, and
-EXISTS TABLE queries. CREATE, DROP, RENAME, TRUNCATE, and INSERT remain silent.
+With --format table, --format csv, --format tsv, --format json, --format
+JSONEachRow, or --format JSONCompactEachRow, reads one semicolon-delimited SQL
+batch through EOF and prints results for SELECT, SHOW TABLES, SHOW CREATE TABLE,
+DESCRIBE TABLE, and EXISTS TABLE queries. CREATE, DROP, RENAME, TRUNCATE, and
+INSERT remain silent.
 
 Limits:
   legacy: 65536 input bytes, 1024 statements, 64 tables, 1024 rows per table
@@ -19,6 +20,7 @@ Limits:
   batch schema/query AST lists: 100000 items
   batch SELECT: 10000 rows, 250000 values, 16777216 estimated result bytes
   batch table output: 16777216 formatted bytes per result
+  batch JSONEachRow output: 16777216 formatted bytes per result
   batch grouped SELECT: 100000 groups, 500000 aggregate cells, 33554432 state bytes
 
 Options:
@@ -26,6 +28,8 @@ Options:
   --format csv   Emit CSVWithNames-compatible query results
   --format tsv   Emit TabSeparatedWithNames query results
   --format json  Emit newline-delimited JSON query results
+  --format JSONEachRow
+                 Emit one column-name-keyed JSON object per result row
   --format JSONCompactEachRow
                  Emit one positional JSON array per result row
   -h, --help     Print help
@@ -81,6 +85,14 @@ fn main() -> ExitCode {
                 Err(error) => fail(&error),
             }
         }
+        Ok(Action::JsonEachRowBatch) => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            match rusthouse::batch::run_json_each_row_batch(stdin.lock(), stdout.lock()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(&error),
+            }
+        }
         Ok(Action::JsonCompactEachRowBatch) => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -103,6 +115,7 @@ enum Action {
     CsvBatch,
     TsvBatch,
     JsonBatch,
+    JsonEachRowBatch,
     JsonCompactEachRowBatch,
 }
 
@@ -124,6 +137,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, OsStri
         }
         (Some(format), Some(value), None) if format == "--format" && value == "json" => {
             Ok(Action::JsonBatch)
+        }
+        (Some(format), Some(value), None) if format == "--format" && value == "JSONEachRow" => {
+            Ok(Action::JsonEachRowBatch)
         }
         (Some(format), Some(value), None)
             if format == "--format" && value == "JSONCompactEachRow" =>
