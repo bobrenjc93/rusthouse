@@ -11,8 +11,12 @@ use rusthouse::{
 };
 
 fn request(sql: &[u8]) -> Vec<u8> {
+    request_for_target("/query", sql)
+}
+
+fn request_for_target(target: &str, sql: &[u8]) -> Vec<u8> {
     let mut request = format!(
-        "POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
         sql.len()
     )
     .into_bytes();
@@ -27,8 +31,16 @@ fn exchange(database: &SharedDatabase, request: &[u8]) -> Vec<u8> {
 }
 
 fn request_with_authorization(sql: &[u8], authorization_headers: &str) -> (Vec<u8>, u64) {
+    request_with_authorization_for_target("/query", sql, authorization_headers)
+}
+
+fn request_with_authorization_for_target(
+    target: &str,
+    sql: &[u8],
+    authorization_headers: &str,
+) -> (Vec<u8>, u64) {
     let mut request = format!(
-        "POST /query HTTP/1.1\r\nHost: localhost\r\n{authorization_headers}Content-Length: {}\r\n\r\n",
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\n{authorization_headers}Content-Length: {}\r\n\r\n",
         sql.len()
     )
     .into_bytes();
@@ -273,6 +285,26 @@ fn valid_query_returns_the_existing_json_result_shape() {
 }
 
 #[test]
+fn root_query_returns_the_existing_json_result_shape() {
+    let database = SharedDatabase::default();
+    database
+        .execute(
+            "CREATE TABLE readings (id Int64, label String); \
+             INSERT INTO readings VALUES (2, 'two'), (1, 'one');",
+        )
+        .unwrap();
+
+    assert_response(
+        &exchange(
+            &database,
+            &request_for_target("/", b"SELECT id, label FROM readings ORDER BY id;"),
+        ),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
+    );
+}
+
+#[test]
 fn bearer_authenticated_query_returns_the_existing_json_result_shape() {
     let database = SharedDatabase::default();
     database
@@ -292,6 +324,38 @@ fn bearer_authenticated_query_returns_the_existing_json_result_shape() {
         &response,
         "HTTP/1.1 200 OK",
         r#"{"columns":[{"name":"id","type":"Int64"},{"name":"label","type":"String"}],"rows":[[1,"one"],[2,"two"]]}"#,
+    );
+}
+
+#[test]
+fn bearer_authentication_protects_root_queries() {
+    let database = SharedDatabase::default();
+    let sql = b"SELECT true AS ready;";
+    let (missing_credentials, body_offset) = request_with_authorization_for_target("/", sql, "");
+    let mut input = Cursor::new(missing_credentials);
+    let mut unauthorized = Vec::new();
+
+    handle_http_query_with_bearer_token(&database, "correct-token", &mut input, &mut unauthorized)
+        .expect("missing root credentials produce a response");
+
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &unauthorized,
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":"bearer authentication required"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&unauthorized)
+            .unwrap()
+            .contains("\r\nWWW-Authenticate: Bearer\r\n")
+    );
+
+    let (authorized, _) =
+        request_with_authorization_for_target("/", sql, "Authorization: Bearer correct-token\r\n");
+    assert_response(
+        &authenticated_exchange(&database, "correct-token", &authorized),
+        "HTTP/1.1 200 OK",
+        r#"{"columns":[{"name":"ready","type":"Bool"}],"rows":[[true]]}"#,
     );
 }
 
@@ -645,6 +709,11 @@ fn malformed_and_truncated_requests_have_deterministic_responses() {
             r#"{"error":"Content-Length header is required"}"#,
         ),
         (
+            b"POST / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "HTTP/1.1 411 Length Required",
+            r#"{"error":"Content-Length header is required"}"#,
+        ),
+        (
             b"POST /query HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.1 400 Bad Request",
             r#"{"error":"Host header is required"}"#,
@@ -696,6 +765,30 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
             .contains("\r\nAllow: POST\r\n")
     );
 
+    let root_method = exchange(
+        &database,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_response(
+        &root_method,
+        "HTTP/1.1 405 Method Not Allowed",
+        r#"{"error":"method must be POST"}"#,
+    );
+    assert!(
+        std::str::from_utf8(&root_method)
+            .unwrap()
+            .contains("\r\nAllow: POST\r\n")
+    );
+
+    assert_response(
+        &exchange(
+            &database,
+            b"POST /?query HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        ),
+        "HTTP/1.1 404 Not Found",
+        r#"{"error":"request target must be / or /query"}"#,
+    );
+
     let ping_method = exchange(
         &database,
         b"POST /ping HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
@@ -717,7 +810,7 @@ fn method_target_version_and_chunked_encoding_are_rejected() {
             b"POST /other HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
         ),
         "HTTP/1.1 404 Not Found",
-        r#"{"error":"request target must be /query"}"#,
+        r#"{"error":"request target must be / or /query"}"#,
     );
     assert_response(
         &exchange(&database, b"GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n"),
@@ -838,6 +931,33 @@ fn request_header_count_header_bytes_and_sql_body_are_bounded() {
 }
 
 #[test]
+fn oversized_root_query_is_rejected_before_its_body_is_read() {
+    let database = SharedDatabase::default();
+    let request = request_for_target("/", b"SELECT 1;");
+    let body_offset = request.len() as u64 - b"SELECT 1;".len() as u64;
+    let mut input = Cursor::new(request);
+    let mut response = Vec::new();
+
+    handle_http_query_with_limits(
+        &database,
+        &mut input,
+        &mut response,
+        HttpQueryLimits {
+            max_sql_bytes: 4,
+            ..HttpQueryLimits::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(input.position(), body_offset);
+    assert_response(
+        &response,
+        "HTTP/1.1 413 Payload Too Large",
+        r#"{"error":"request body exceeds configured byte limit"}"#,
+    );
+}
+
+#[test]
 fn ping_honors_exact_header_and_complete_response_byte_limits() {
     let database = SharedDatabase::default();
     let request = b"GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -939,14 +1059,14 @@ fn ready_honors_exact_header_and_complete_response_byte_limits() {
 }
 
 #[test]
-fn mutating_and_multi_statement_sql_are_rejected_without_side_effects() {
+fn query_routes_reject_mutating_and_multi_statement_sql_without_side_effects() {
     let database = SharedDatabase::default();
     database
         .execute("CREATE TABLE retained (value Int64); INSERT INTO retained VALUES (7);")
         .unwrap();
 
     assert_response(
-        &exchange(&database, &request(b"DROP TABLE retained;")),
+        &exchange(&database, &request_for_target("/", b"DROP TABLE retained;")),
         "HTTP/1.1 400 Bad Request",
         r#"{"error":"read-only query accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE; found DROP TABLE"}"#,
     );
@@ -974,7 +1094,7 @@ fn complete_response_is_capped_before_any_bytes_are_written() {
 
     handle_http_query_with_limits(
         &database,
-        Cursor::new(request(large_sql.as_bytes())),
+        Cursor::new(request_for_target("/", large_sql.as_bytes())),
         &mut response,
         limits,
     )
@@ -990,7 +1110,7 @@ fn complete_response_is_capped_before_any_bytes_are_written() {
     let mut too_small_output = Vec::new();
     let error = handle_http_query_with_limits(
         &database,
-        Cursor::new(request(b"SELECT 1;")),
+        Cursor::new(request_for_target("/", b"SELECT 1;")),
         &mut too_small_output,
         HttpQueryLimits {
             max_response_bytes: 0,
