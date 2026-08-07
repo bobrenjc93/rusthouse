@@ -336,6 +336,31 @@ fn batch_cli_keeps_truncate_table_command_output_silent() {
 }
 
 #[test]
+fn csv_batch_observes_the_complete_rename_table_lifecycle() {
+    let output = run(
+        &["--format", "csv"],
+        b"CREATE TABLE OldName (id Int64, label String); \
+          INSERT INTO OldName VALUES (7, 'kept'); \
+          RENAME TABLE oldname TO NewName; \
+          SELECT id, label FROM newname; \
+          SHOW TABLES; \
+          SHOW CREATE TABLE NEWNAME;",
+    );
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        b"id,label\n\
+          7,kept\n\
+          name\n\
+          NewName\n\
+          statement\n\
+          \"CREATE TABLE NewName (id Int64, label String)\"\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn table_batch_observes_truncate_between_query_results() {
     let output = run(
         &["--format", "table"],
@@ -428,6 +453,54 @@ fn csv_batch_emits_typed_nulls_for_empty_aggregate_inputs() {
           rows,total,first,high,mean\n0,NULL,NULL,NULL,NULL\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn batch_formats_apply_having_nullness_to_empty_and_populated_aggregates() {
+    let sql = b"CREATE TABLE samples (value Int64);
+        SELECT SUM(value) AS total FROM samples
+        HAVING total IS NULL ORDER BY total LIMIT 1;
+        INSERT INTO samples VALUES (7);
+        SELECT SUM(value) AS total FROM samples
+        HAVING total IS NOT NULL ORDER BY total DESC LIMIT 1;";
+    let cases = [
+        ("csv", "total\nNULL\ntotal\n7\n"),
+        ("tsv", "total\n\\N\ntotal\n7\n"),
+        (
+            "json",
+            concat!(
+                "{\"columns\":[{\"name\":\"total\",\"type\":\"Int64\"}],\"rows\":[[null]]}\n",
+                "{\"columns\":[{\"name\":\"total\",\"type\":\"Int64\"}],\"rows\":[[7]]}\n",
+            ),
+        ),
+        (
+            "table",
+            concat!(
+                "+-------+\n",
+                "| total |\n",
+                "+-------+\n",
+                "| NULL  |\n",
+                "+-------+\n",
+                "\n",
+                "+-------+\n",
+                "| total |\n",
+                "+-------+\n",
+                "| 7     |\n",
+                "+-------+\n",
+            ),
+        ),
+    ];
+
+    for (format, expected) in cases {
+        let output = run(&["--format", format], sql);
+        assert!(output.status.success(), "{format}: {:?}", output.stderr);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{format}"
+        );
+        assert!(output.stderr.is_empty(), "{format}");
+    }
 }
 
 #[test]

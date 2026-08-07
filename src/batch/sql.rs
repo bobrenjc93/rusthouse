@@ -45,6 +45,10 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    RenameTable {
+        source: String,
+        destination: String,
+    },
     TruncateTable {
         name: String,
     },
@@ -231,8 +235,17 @@ pub enum ComparisonOperator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Having {
     pub alias: String,
-    pub operator: ComparisonOperator,
-    pub value: Value,
+    pub predicate: HavingPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HavingPredicate {
+    Comparison {
+        operator: ComparisonOperator,
+        value: Value,
+    },
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,6 +605,8 @@ impl<'a> Parser<'a> {
             self.parse_create()
         } else if self.eat_keyword("DROP") {
             self.parse_drop()
+        } else if self.eat_keyword("RENAME") {
+            self.parse_rename()
         } else if self.eat_keyword("TRUNCATE") {
             self.parse_truncate()
         } else if self.eat_keyword("INSERT") {
@@ -605,7 +620,9 @@ impl<'a> Parser<'a> {
         } else if self.eat_keyword("EXISTS") {
             self.parse_exists()
         } else {
-            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS")
+            self.error(
+                "expected CREATE, DROP, RENAME, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS",
+            )
         }
     }
 
@@ -779,6 +796,20 @@ impl<'a> Parser<'a> {
         Ok(Statement::DropTable { name })
     }
 
+    fn parse_rename(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let source = self.expect_identifier("source table name")?;
+        self.expect_keyword("TO")?;
+        let destination = self.expect_identifier("destination table name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after RENAME TABLE");
+        }
+        Ok(Statement::RenameTable {
+            source,
+            destination,
+        })
+    }
+
     fn parse_truncate(&mut self) -> Result<Statement> {
         self.expect_keyword("TABLE")?;
         let name = self.expect_identifier("table name")?;
@@ -889,13 +920,21 @@ impl<'a> Parser<'a> {
 
         let having = if self.eat_keyword("HAVING") {
             let alias = self.expect_identifier("aggregate alias after HAVING")?;
-            let operator = self.parse_comparison_operator()?;
-            let value = self.parse_having_threshold()?;
-            Some(Having {
-                alias,
-                operator,
-                value,
-            })
+            let predicate = if self.eat_keyword("IS") {
+                let is_not_null = self.eat_keyword("NOT");
+                self.expect_keyword("NULL")?;
+                if is_not_null {
+                    HavingPredicate::IsNotNull
+                } else {
+                    HavingPredicate::IsNull
+                }
+            } else {
+                HavingPredicate::Comparison {
+                    operator: self.parse_comparison_operator()?,
+                    value: self.parse_having_threshold()?,
+                }
+            };
+            Some(Having { alias, predicate })
         } else {
             None
         };
@@ -1498,8 +1537,10 @@ mod tests {
             select.having,
             Some(Having {
                 alias: "rows".to_owned(),
-                operator: ComparisonOperator::GreaterOrEqual,
-                value: Value::Int64(2),
+                predicate: HavingPredicate::Comparison {
+                    operator: ComparisonOperator::GreaterOrEqual,
+                    value: Value::Int64(2),
+                },
             })
         );
         assert_eq!(select.order_by[0].name, "total");
@@ -1558,8 +1599,14 @@ mod tests {
                 panic!("expected select");
             };
             let having = select.having.as_ref().expect("HAVING is parsed");
-            assert_eq!(having.operator, expected, "{sql_operator}");
-            assert_eq!(having.value, Value::Int64(i64::MAX), "{sql_operator}");
+            assert_eq!(
+                having.predicate,
+                HavingPredicate::Comparison {
+                    operator: expected,
+                    value: Value::Int64(i64::MAX),
+                },
+                "{sql_operator}"
+            );
 
             let sql =
                 format!("SELECT AVG(amount) AS mean FROM events HAVING mean {sql_operator} +2.5e1");
@@ -1568,8 +1615,14 @@ mod tests {
                 panic!("expected select");
             };
             let having = select.having.as_ref().expect("HAVING is parsed");
-            assert_eq!(having.operator, expected, "{sql_operator}");
-            assert_eq!(having.value, Value::Float64(25.0), "{sql_operator}");
+            assert_eq!(
+                having.predicate,
+                HavingPredicate::Comparison {
+                    operator: expected,
+                    value: Value::Float64(25.0),
+                },
+                "{sql_operator}"
+            );
         }
 
         let statements = parse(&format!(
@@ -1581,9 +1634,52 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(
-            select.having.as_ref().unwrap().value,
-            Value::Int64(i64::MIN)
+            select.having.as_ref().unwrap().predicate,
+            HavingPredicate::Comparison {
+                operator: ComparisonOperator::GreaterOrEqual,
+                value: Value::Int64(i64::MIN),
+            }
         );
+    }
+
+    #[test]
+    fn parses_having_is_null_and_is_not_null_case_insensitively() {
+        let cases = [
+            ("IS NULL", HavingPredicate::IsNull),
+            ("is not null", HavingPredicate::IsNotNull),
+        ];
+
+        for (syntax, expected) in cases {
+            let sql = format!(
+                "SELECT SUM(amount) AS Total FROM events HAVING total {syntax} ORDER BY Total LIMIT 1"
+            );
+            let statements = parse(&sql).expect("valid HAVING nullness predicate");
+            let Statement::Select(select) = &statements[0] else {
+                panic!("expected select");
+            };
+            assert_eq!(
+                select.having,
+                Some(Having {
+                    alias: "total".to_owned(),
+                    predicate: expected,
+                })
+            );
+            assert_eq!(select.order_by[0].name, "Total");
+            assert_eq!(select.limit, Some(1));
+        }
+    }
+
+    #[test]
+    fn having_nullness_requires_the_exact_is_null_shape() {
+        for sql in [
+            "SELECT SUM(amount) AS total FROM events HAVING total IS",
+            "SELECT SUM(amount) AS total FROM events HAVING total IS NOT",
+            "SELECT SUM(amount) AS total FROM events HAVING total IS TRUE",
+            "SELECT SUM(amount) AS total FROM events HAVING total NOT NULL",
+            "SELECT SUM(amount) AS total FROM events HAVING total IS NULL NULL",
+        ] {
+            assert!(parse(sql).is_err(), "{sql:?} must be rejected");
+        }
     }
 
     #[test]
