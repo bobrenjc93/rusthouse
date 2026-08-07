@@ -447,6 +447,16 @@ impl Database {
                     affected_rows: 0,
                 })
             }
+            Statement::RenameTable {
+                source,
+                destination,
+            } => {
+                self.catalog.rename_table(&source, destination)?;
+                Ok(StatementResult::Command {
+                    tag: "RENAME TABLE",
+                    affected_rows: 0,
+                })
+            }
             Statement::TruncateTable { name } => {
                 let affected_rows = self.catalog.table_mut(&name)?.truncate();
                 Ok(StatementResult::Command {
@@ -504,6 +514,7 @@ impl Database {
             }
             Statement::CreateTable { .. }
             | Statement::DropTable { .. }
+            | Statement::RenameTable { .. }
             | Statement::TruncateTable { .. }
             | Statement::Insert { .. } => Err(Error::InvalidQuery(
                 "read-only execution accepts only SELECT, SHOW TABLES, SHOW CREATE TABLE, DESCRIBE TABLE, or EXISTS TABLE"
@@ -892,6 +903,7 @@ fn statement_name(statement: &Statement) -> &'static str {
     match statement {
         Statement::CreateTable { .. } => "CREATE TABLE",
         Statement::DropTable { .. } => "DROP TABLE",
+        Statement::RenameTable { .. } => "RENAME TABLE",
         Statement::TruncateTable { .. } => "TRUNCATE TABLE",
         Statement::Insert { .. } => "INSERT",
         Statement::LiteralSelect(_)

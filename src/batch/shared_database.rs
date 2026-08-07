@@ -167,8 +167,8 @@ impl SharedDatabase {
     /// Parses and executes exactly one read-only query under a read lock.
     ///
     /// The returned result owns all of its columns and values. `CREATE TABLE`,
-    /// `DROP TABLE`, `TRUNCATE TABLE`, `INSERT`, empty input, and multi-statement
-    /// input are rejected before the lock is acquired.
+    /// `DROP TABLE`, `RENAME TABLE`, `TRUNCATE TABLE`, `INSERT`, empty input,
+    /// and multi-statement input are rejected before the lock is acquired.
     pub fn query(&self, input: &str) -> Result<QueryResult, SharedDatabaseError> {
         self.query_with_result_limit(input, DEFAULT_MAX_RETAINED_RESULT_BYTES)
     }
@@ -232,6 +232,9 @@ fn parse_query_statement(input: &str) -> Result<Statement, SharedDatabaseError> 
         }),
         Statement::DropTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "DROP TABLE",
+        }),
+        Statement::RenameTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
+            statement: "RENAME TABLE",
         }),
         Statement::TruncateTable { .. } => Err(SharedDatabaseError::ReadOnlyStatementRequired {
             statement: "TRUNCATE TABLE",

@@ -45,6 +45,10 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    RenameTable {
+        source: String,
+        destination: String,
+    },
     TruncateTable {
         name: String,
     },
@@ -592,6 +596,8 @@ impl<'a> Parser<'a> {
             self.parse_create()
         } else if self.eat_keyword("DROP") {
             self.parse_drop()
+        } else if self.eat_keyword("RENAME") {
+            self.parse_rename()
         } else if self.eat_keyword("TRUNCATE") {
             self.parse_truncate()
         } else if self.eat_keyword("INSERT") {
@@ -605,7 +611,9 @@ impl<'a> Parser<'a> {
         } else if self.eat_keyword("EXISTS") {
             self.parse_exists()
         } else {
-            self.error("expected CREATE, DROP, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS")
+            self.error(
+                "expected CREATE, DROP, RENAME, TRUNCATE, INSERT, SELECT, SHOW, DESCRIBE, or EXISTS",
+            )
         }
     }
 
@@ -777,6 +785,20 @@ impl<'a> Parser<'a> {
             return self.error("unexpected trailing input after DROP TABLE");
         }
         Ok(Statement::DropTable { name })
+    }
+
+    fn parse_rename(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let source = self.expect_identifier("source table name")?;
+        self.expect_keyword("TO")?;
+        let destination = self.expect_identifier("destination table name")?;
+        if !self.at(&TokenKind::Semicolon) && !self.at(&TokenKind::End) {
+            return self.error("unexpected trailing input after RENAME TABLE");
+        }
+        Ok(Statement::RenameTable {
+            source,
+            destination,
+        })
     }
 
     fn parse_truncate(&mut self) -> Result<Statement> {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::batch::error::{Error, Result};
-use crate::batch::storage::{ColumnDef, DEFAULT_MAX_ROWS_PER_TABLE, Table};
+use crate::batch::storage::{ColumnDef, DEFAULT_MAX_ROWS_PER_TABLE, Table, validate_table_name};
 
 /// An in-memory collection of named tables.
 #[derive(Debug, Default)]
@@ -41,6 +41,41 @@ impl Catalog {
             .remove(&normalize(name))
             .map(|_| ())
             .ok_or_else(|| Error::TableNotFound(name.to_owned()))
+    }
+
+    /// Renames one table after validating the complete catalog change.
+    ///
+    /// Resolution is case-insensitive. A destination that resolves to a
+    /// different table is rejected without changing either table. When both
+    /// names resolve to the same key, only the table's display case changes.
+    pub fn rename_table(&mut self, source: &str, destination: String) -> Result<()> {
+        let source_key = normalize(source);
+        let destination_key = normalize(&destination);
+
+        if !self.tables.contains_key(&source_key) {
+            return Err(Error::TableNotFound(source.to_owned()));
+        }
+        if source_key != destination_key && self.tables.contains_key(&destination_key) {
+            return Err(Error::TableAlreadyExists(destination));
+        }
+        validate_table_name(&destination)?;
+
+        if source_key == destination_key {
+            self.tables
+                .get_mut(&source_key)
+                .expect("the rename source was preflighted")
+                .set_name(destination);
+            return Ok(());
+        }
+
+        let mut table = self
+            .tables
+            .remove(&source_key)
+            .expect("the rename source was preflighted");
+        table.set_name(destination);
+        let replaced = self.tables.insert(destination_key, table);
+        debug_assert!(replaced.is_none(), "the rename destination was preflighted");
+        Ok(())
     }
 
     pub fn table(&self, name: &str) -> Result<&Table> {
